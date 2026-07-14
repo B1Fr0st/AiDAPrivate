@@ -315,6 +315,12 @@ baseline_engine_integration_t::create(
     if (!settings_validation)
         return workspace_result_t<std::shared_ptr<baseline_engine_integration_t>>::failure(
             settings_validation.error());
+    if (config.admit_managed_metadata &&
+        !config.managed_reader_limits.valid())
+        return workspace_result_t<std::shared_ptr<baseline_engine_integration_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                "managed baseline reader limits are invalid",
+                "baseline_engine_integration"));
     auto impl = std::make_unique<impl_t>(workspace, config);
     auto integration = std::shared_ptr<baseline_engine_integration_t>(
         new baseline_engine_integration_t(std::move(impl)));
@@ -366,6 +372,42 @@ baseline_engine_integration_t::start_baseline(
     if (!budget_check) {
         return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
             budget_check.error());
+    }
+    if (config_.admit_managed_metadata) {
+        const auto publication = workspace_->analysis_publication();
+        if (!publication || !publication->snapshot || !publication->provider)
+            return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                    "managed admission requires a coherent workspace publication",
+                    "start_baseline.managed"));
+        if (!publication->managed_artifacts) {
+            const auto target_revision = publication->analysis_revision == 0
+                ? 1ULL : publication->analysis_revision;
+            auto managed = build_managed_artifact_publication(
+                workspace_->identity(), *publication->provider,
+                publication->snapshot->image, publication->generation,
+                target_revision, publication->overlay_revision,
+                config_.managed_reader_limits, workspace_->cancellation_token());
+            if (!managed) {
+                std::lock_guard<std::mutex> lock(impl_->state.snapshot_mutex);
+                impl_->state.metrics_snapshot.managed_admission_failures++;
+                return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
+                    managed.error());
+            }
+            if (managed.value()) {
+                auto published = workspace_->publish_managed_artifacts(
+                    publication->generation, publication->analysis_revision,
+                    managed.take_value(), true);
+                if (!published) {
+                    std::lock_guard<std::mutex> lock(impl_->state.snapshot_mutex);
+                    impl_->state.metrics_snapshot.managed_admission_failures++;
+                    return workspace_result_t<aida::infra::taskflow_runtime::job_handle_t>::failure(
+                        published.error());
+                }
+                std::lock_guard<std::mutex> lock(impl_->state.snapshot_mutex);
+                impl_->state.metrics_snapshot.managed_admissions++;
+            }
+        }
     }
     impl_->state.cancellation_active.store(false, std::memory_order_release);
     impl_->state.active_generation.store(workspace_->generation(),

@@ -21,7 +21,9 @@ This ledger is the source-controlled aggregation index for C03 dependencies. `ai
 | nlohmann JSON | 3.12.0 | production | MIT | `.deps/licenses/nlohmann-json-3.12.0-LICENSE.MIT` |
 | nlohmann JSON Schema Validator | 2.4.0 | production | MIT | `.deps/json-schema-validator-2.4.0/LICENSE` |
 | LLVM Demangle and Support | 22.1.8 | production | Apache-2.0 WITH LLVM-exception | `.deps/llvm-project-llvmorg-22.1.8/LICENSE.TXT` |
+| Microsoft.NETCore.App | 10.0.9 win-x64 | production managed worker runtime | Microsoft .NET Library License plus third-party notices | `.deps/dotnet-sdk-10.0.301-win-x64/LICENSE.txt` and `.deps/dotnet-sdk-10.0.301-win-x64/ThirdPartyNotices.txt` |
 | .NET SDK | 10.0.301 | build-only | Microsoft .NET Library License | `.deps/dotnet-sdk-10.0.301-win-x64/LICENSE.txt` |
+| PyInstaller | 6.21.0 | build-only frozen Camoufox reverse-MCP freezer | GPL-2.0-or-later with bootloader exception | `.deps/.camoufox-reverse-mcp-build-venv/Lib/site-packages/pyinstaller-6.21.0.dist-info/licenses/COPYING.txt` |
 | ICSharpCode.Decompiler | 10.1.0.8386 | production managed worker | MIT | `.deps/nuget-offline/ICSharpCode.Decompiler.10.1.0.8386.nupkg` package metadata declares `MIT` |
 | System.Collections.Immutable | 9.0.0 | production managed worker | MIT plus third-party notices | `.deps/nuget-offline/System.Collections.Immutable.9.0.0.nupkg::LICENSE.TXT` and `.deps/nuget-offline/System.Collections.Immutable.9.0.0.nupkg::THIRD-PARTY-NOTICES.TXT` |
 | System.Reflection.Metadata | 9.0.0 | production managed worker | MIT plus third-party notices | `.deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg::LICENSE.TXT` and `.deps/nuget-offline/System.Reflection.Metadata.9.0.0.nupkg::THIRD-PARTY-NOTICES.TXT` |

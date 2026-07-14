@@ -63,9 +63,25 @@ namespace aida::ui::components {
 		accent
 	};
 
+	enum class presentation_kind_t {
+		empty,
+		loading,
+		error
+	};
+
+	enum class splitter_axis_t {
+		x,
+		y
+	};
+
 	struct action_chip_result_t {
 		bool clicked = false;
 		bool removed = false;
+	};
+
+	struct view_header_result_t {
+		bool primary_clicked = false;
+		bool secondary_clicked = false;
 	};
 
 	namespace detail {
@@ -302,8 +318,8 @@ namespace aida::ui::components {
 		float flash = st.flash.tick(aida::ui::clock::dt());
 		if (clicked) st.flash.trigger();
 
-		float scale = 1.f - (1.f - 0.97f) * prs;
-		float lift  = hov * 1.5f - prs * 1.5f;
+		float scale = 1.f - (1.f - 0.985f) * prs;
+		float lift  = hov * 0.5f - prs * 0.5f;
 		ImVec2 ca = ImVec2(a.x + (1.f - scale) * w * 0.5f, a.y + (1.f - scale) * h * 0.5f - lift);
 		ImVec2 cb = ImVec2(b.x - (1.f - scale) * w * 0.5f, b.y - (1.f - scale) * h * 0.5f - lift);
 
@@ -341,13 +357,13 @@ namespace aida::ui::components {
 				break;
 			}
 			case button_kind_t::secondary:
-				fill = aida::ui::lighten(t.panel_header, t.is_dark ? 10 : -6);
+				fill = aida::ui::lighten(t.panel_header, t.is_dark ? 5 : -4);
 				border = t.border_strong;
 				text_col = t.text_primary;
 				break;
 			case button_kind_t::ghost:
-				fill = aida::ui::with_alpha(t.panel_header, 0.62f);
-				border = aida::ui::with_alpha(t.border_strong, 0.85f);
+				fill = t.bg_elevated;
+				border = t.border_subtle;
 				text_col = t.text_primary;
 				break;
 			case button_kind_t::destructive:
@@ -358,8 +374,8 @@ namespace aida::ui::components {
 		}
 
 		if (!primary_or_accent) {
-			ImU32 hover_blend_top = aida::ui::mix(fill, hover_top, hov * 0.55f);
-			ImU32 hover_blend_bot = aida::ui::mix(fill, hover_bot, hov * 0.55f);
+			ImU32 hover_blend_top = aida::ui::mix(fill, hover_top, hov * 0.22f);
+			ImU32 hover_blend_bot = aida::ui::mix(fill, hover_bot, hov * 0.22f);
 			ImU32 fill_flat = aida::ui::mix(hover_blend_top, hover_blend_bot, 0.5f);
 			dl->AddRectFilled(ca, cb, aida::ui::with_alpha(fill_flat, alpha), radius);
 			ImU32 top_hi = aida::ui::with_alpha(IM_COL32(255, 255, 255, t.is_dark ? 26 : 60),
@@ -646,7 +662,7 @@ namespace aida::ui::components {
 	                        const char* placeholder = nullptr,
 	                        bool password = false, ImVec2 size = ImVec2(0.f, 0.f)) {
 		const auto& t = aida::ui::resolved();
-		float h = size.y > 0.f ? size.y : 36.f;
+		float h = size.y > 0.f ? size.y : aida::ui::metrics::control::input_h;
 		float w = size.x > 0.f ? size.x : ImGui::GetContentRegionAvail().x;
 
 		ImGui::PushID(label);
@@ -659,7 +675,7 @@ namespace aida::ui::components {
 		ImVec2 b = ImVec2(pos.x + w, pos.y + h);
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
-		dl->AddRectFilled(a, b, t.panel_header, 8.f);
+		dl->AddRectFilled(a, b, t.bg_elevated, aida::ui::metrics::radius::sm);
 
 		bool active = ImGui::GetActiveID() == ImGui::GetID("##in");
 		bool hovered = !active && ImGui::IsMouseHoveringRect(a, b, false);
@@ -667,7 +683,7 @@ namespace aida::ui::components {
 		float active_v = act.tick(active, aida::ui::clock::dt(), aida::motion::spring::balanced);
 		float focus_v = active_v > hover_v * 0.55f ? active_v : hover_v * 0.55f;
 		ImU32 border = aida::ui::mix(t.border_subtle, t.border_focus, focus_v);
-		dl->AddRect(a, b, border, 8.f, 0, 1.f + active_v * 0.8f);
+		dl->AddRect(a, b, border, aida::ui::metrics::radius::sm, 0, 1.f + active_v * 0.8f);
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 12.f, a.y + (h - ImGui::GetFontSize()) * 0.5f));
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
@@ -697,7 +713,7 @@ namespace aida::ui::components {
 	inline bool input_int(const char* label, int* value, ImVec2 size = ImVec2(0.f, 0.f)) {
 		if (!value) return false;
 		const auto& t = aida::ui::resolved();
-		float h = size.y > 0.f ? size.y : 36.f;
+		float h = size.y > 0.f ? size.y : aida::ui::metrics::control::input_h;
 		float w = size.x > 0.f ? size.x : ImGui::GetContentRegionAvail().x;
 
 		ImGui::PushID(label);
@@ -710,7 +726,7 @@ namespace aida::ui::components {
 		ImVec2 b = ImVec2(pos.x + w, pos.y + h);
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
-		dl->AddRectFilled(a, b, t.panel_header, 8.f);
+		dl->AddRectFilled(a, b, t.bg_elevated, aida::ui::metrics::radius::sm);
 
 		bool active = ImGui::GetActiveID() == ImGui::GetID("##ii");
 		bool hovered = !active && ImGui::IsMouseHoveringRect(a, b, false);
@@ -718,7 +734,7 @@ namespace aida::ui::components {
 		float active_v = act.tick(active, aida::ui::clock::dt(), aida::motion::spring::balanced);
 		float focus_v = active_v > hover_v * 0.55f ? active_v : hover_v * 0.55f;
 		ImU32 border = aida::ui::mix(t.border_subtle, t.border_focus, focus_v);
-		dl->AddRect(a, b, border, 8.f, 0, 1.f + active_v * 0.8f);
+		dl->AddRect(a, b, border, aida::ui::metrics::radius::sm, 0, 1.f + active_v * 0.8f);
 
 		ImGui::SetCursorScreenPos(ImVec2(a.x + 12.f, a.y + (h - ImGui::GetFontSize()) * 0.5f));
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
@@ -1053,6 +1069,408 @@ namespace aida::ui::components {
 		return clicked;
 	}
 
+	inline ImU32 status_soft_color(status_kind_t kind) {
+		const auto& t = aida::ui::resolved();
+		switch (kind) {
+			case status_kind_t::success: return t.success_soft;
+			case status_kind_t::warning: return t.warning_soft;
+			case status_kind_t::error: return t.error_soft;
+			case status_kind_t::info: return t.info_soft;
+			case status_kind_t::accent: return aida::ui::with_alpha(t.accent_u32, 0.24f);
+			case status_kind_t::neutral: return aida::ui::with_alpha(t.text_secondary, 0.12f);
+		}
+		return aida::ui::with_alpha(t.text_secondary, 0.12f);
+	}
+
+	inline view_header_result_t view_header(const char* title, const char* subtitle = nullptr,
+		const char* primary_action = nullptr, const char* secondary_action = nullptr,
+		status_kind_t status = status_kind_t::neutral) {
+		view_header_result_t result;
+		const auto& t = aida::ui::resolved();
+		const char* safe_title = title ? title : "";
+		ImFont* font = ImGui::GetFont();
+		float title_fs = detail::ui_fs() * aida::ui::metrics::typography::view_title_scale;
+		float body_fs = detail::ui_fs() * aida::ui::metrics::typography::caption_scale;
+		float h = subtitle && *subtitle ? aida::ui::metrics::panel::view_header_h : aida::ui::metrics::panel::header_h;
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		float w = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
+		ImVec2 end = ImVec2(pos.x + w, pos.y + h);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		dl->AddRectFilled(pos, end, t.bg_elevated, aida::ui::metrics::radius::md);
+		dl->AddRect(pos, end, t.border_subtle, aida::ui::metrics::radius::md, 0, aida::ui::metrics::panel::border);
+		ImU32 marker = status == status_kind_t::neutral ? t.accent_u32 : status_color(status);
+		dl->AddRectFilled(ImVec2(pos.x, pos.y + 8.f), ImVec2(pos.x + 3.f, end.y - 8.f), marker, 1.5f);
+		float text_x = pos.x + aida::ui::metrics::spacing::lg;
+		float title_y = subtitle && *subtitle ? pos.y + 10.f : pos.y + (h - title_fs) * 0.5f;
+		dl->AddText(font, title_fs, ImVec2(text_x, title_y), t.text_primary, safe_title);
+		if (subtitle && *subtitle) {
+			dl->AddText(font, body_fs, ImVec2(text_x, pos.y + 33.f), t.text_secondary, subtitle);
+		}
+
+		float primary_w = primary_action && *primary_action
+			? detail::calc_display_text_width(font, detail::sz_font(size_t_::sm), primary_action) + 28.f : 0.f;
+		float secondary_w = secondary_action && *secondary_action
+			? detail::calc_display_text_width(font, detail::sz_font(size_t_::sm), secondary_action) + 28.f : 0.f;
+		float action_h = aida::ui::metrics::control::height_sm;
+		float action_y = pos.y + (h - action_h) * 0.5f;
+		float action_x = end.x - aida::ui::metrics::spacing::md - primary_w - secondary_w;
+		if (primary_w > 0.f && secondary_w > 0.f) action_x -= aida::ui::metrics::spacing::sm;
+		ImGui::PushID(safe_title);
+		if (secondary_w > 0.f) {
+			ImGui::SetCursorScreenPos(ImVec2(action_x, action_y));
+			result.secondary_clicked = button(secondary_action, button_kind_t::ghost, size_t_::sm,
+				ImVec2(secondary_w, action_h));
+			action_x += secondary_w + aida::ui::metrics::spacing::sm;
+		}
+		if (primary_w > 0.f) {
+			ImGui::SetCursorScreenPos(ImVec2(action_x, action_y));
+			result.primary_clicked = button(primary_action, button_kind_t::primary, size_t_::sm,
+				ImVec2(primary_w, action_h));
+		}
+		ImGui::PopID();
+		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y + aida::ui::metrics::spacing::sm));
+		return result;
+	}
+
+	inline bool begin_toolbar(const char* id, float height = aida::ui::metrics::toolbar::height) {
+		const auto& t = aida::ui::resolved();
+		float h = height > 0.f ? height : aida::ui::metrics::toolbar::height;
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(t.bg_elevated));
+		ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(t.border_subtle));
+		ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, aida::ui::metrics::radius::sm);
+		ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, aida::ui::metrics::panel::border);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+			ImVec2(aida::ui::metrics::toolbar::padding_x, aida::ui::metrics::toolbar::padding_y));
+		return ImGui::BeginChild(id && *id ? id : "##toolbar", ImVec2(0.f, h), true,
+			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	}
+
+	inline void end_toolbar() {
+		ImGui::EndChild();
+		ImGui::PopStyleVar(3);
+		ImGui::PopStyleColor(2);
+	}
+
+	inline bool begin_toolbar_surface(const char* id,
+		float height = aida::ui::metrics::toolbar::height) {
+		return begin_toolbar(id, height);
+	}
+
+	inline void end_toolbar_surface() {
+		end_toolbar();
+	}
+
+	inline void begin_toolbar_group(const char* id) {
+		ImGui::PushID(id && *id ? id : "toolbar_group");
+		ImGui::BeginGroup();
+	}
+
+	inline void end_toolbar_group(bool trailing_separator = true) {
+		ImGui::EndGroup();
+		ImGui::PopID();
+		if (!trailing_separator) return;
+		ImGui::SameLine(0.f, aida::ui::metrics::toolbar::group_gap);
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImGui::Dummy(ImVec2(1.f, aida::ui::metrics::toolbar::separator_h));
+		ImGui::GetWindowDrawList()->AddLine(pos,
+			ImVec2(pos.x, pos.y + aida::ui::metrics::toolbar::separator_h),
+			aida::ui::resolved().border_subtle, 1.f);
+		ImGui::SameLine(0.f, aida::ui::metrics::toolbar::group_gap);
+	}
+
+	inline bool search_field(const char* id, char* buffer, size_t buffer_size,
+		const char* hint = "Search", float width = 0.f, bool* cleared = nullptr) {
+		if (!buffer || buffer_size == 0) return false;
+		const auto& t = aida::ui::resolved();
+		float w = width > 0.f ? width : ImGui::GetContentRegionAvail().x;
+		if (w < 72.f) w = 72.f;
+		float h = aida::ui::metrics::control::search_h;
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImVec2 end = ImVec2(pos.x + w, pos.y + h);
+		bool has_value = buffer[0] != '\0';
+		float icon_area = 30.f;
+		float clear_area = has_value ? 28.f : 8.f;
+		ImGui::PushID(id && *id ? id : "search");
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(t.bg_elevated));
+		ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImGui::ColorConvertU32ToFloat4(t.panel_header));
+		ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImGui::ColorConvertU32ToFloat4(t.panel_header));
+		ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(t.border_subtle));
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(icon_area, (h - ImGui::GetFontSize()) * 0.5f));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, aida::ui::metrics::radius::sm);
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
+		ImGui::SetNextItemWidth(w);
+		bool changed = ImGui::InputTextWithHint("##input", hint ? hint : "", buffer, buffer_size);
+		bool active = ImGui::IsItemActive();
+		ImGui::PopStyleVar(3);
+		ImGui::PopStyleColor(4);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		ImU32 icon_col = active ? t.accent_u32 : t.text_dim;
+		ImVec2 center = ImVec2(pos.x + 13.f, pos.y + h * 0.5f - 1.f);
+		dl->AddCircle(center, 4.5f, icon_col, 16, 1.4f);
+		dl->AddLine(ImVec2(center.x + 3.2f, center.y + 3.2f),
+			ImVec2(center.x + 7.f, center.y + 7.f), icon_col, 1.4f);
+		bool did_clear = false;
+		if (has_value) {
+			ImGui::SetCursorScreenPos(ImVec2(end.x - clear_area, pos.y + 2.f));
+			ImGui::InvisibleButton("##clear", ImVec2(clear_area - 2.f, h - 4.f));
+			bool hovered = ImGui::IsItemHovered();
+			ImU32 clear_col = hovered ? t.text_primary : t.text_dim;
+			float cx = end.x - 14.f;
+			float cy = pos.y + h * 0.5f;
+			dl->AddLine(ImVec2(cx - 3.f, cy - 3.f), ImVec2(cx + 3.f, cy + 3.f), clear_col, 1.4f);
+			dl->AddLine(ImVec2(cx - 3.f, cy + 3.f), ImVec2(cx + 3.f, cy - 3.f), clear_col, 1.4f);
+			if (ImGui::IsItemClicked()) {
+				buffer[0] = '\0';
+				changed = true;
+				did_clear = true;
+			}
+		}
+		if (cleared) *cleared = did_clear;
+		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y));
+		ImGui::PopID();
+		return changed;
+	}
+
+	inline bool inline_notice(const char* id, const char* title, const char* message,
+		status_kind_t kind = status_kind_t::info, const char* action_label = nullptr) {
+		const auto& t = aida::ui::resolved();
+		const char* safe_title = title ? title : "";
+		const char* safe_message = message ? message : "";
+		ImFont* font = ImGui::GetFont();
+		float title_fs = detail::sz_font(size_t_::sm);
+		float message_fs = detail::ui_fs() * aida::ui::metrics::typography::caption_scale;
+		float w = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
+		float h = *safe_message ? 52.f : 40.f;
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImVec2 end = ImVec2(pos.x + w, pos.y + h);
+		ImU32 color = status_color(kind);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		dl->AddRectFilled(pos, end, status_soft_color(kind), aida::ui::metrics::radius::sm);
+		dl->AddRect(pos, end, aida::ui::with_alpha(color, 0.56f), aida::ui::metrics::radius::sm, 0, 1.f);
+		dl->AddRectFilled(pos, ImVec2(pos.x + 3.f, end.y), color, aida::ui::metrics::radius::sm);
+		dl->AddCircleFilled(ImVec2(pos.x + 16.f, pos.y + (*safe_message ? 18.f : h * 0.5f)), 3.f, color, 12);
+		float text_x = pos.x + 28.f;
+		dl->AddText(font, title_fs, ImVec2(text_x, pos.y + (*safe_message ? 9.f : (h - title_fs) * 0.5f)),
+			t.text_primary, safe_title);
+		if (*safe_message) {
+			dl->AddText(font, message_fs, ImVec2(text_x, pos.y + 29.f), t.text_secondary, safe_message);
+		}
+		bool clicked = false;
+		if (action_label && *action_label) {
+			float action_w = detail::calc_display_text_width(font, detail::sz_font(size_t_::sm), action_label) + 24.f;
+			ImGui::PushID(id && *id ? id : safe_title);
+			ImGui::SetCursorScreenPos(ImVec2(end.x - action_w - 8.f, pos.y + (h - 28.f) * 0.5f));
+			clicked = button(action_label, button_kind_t::ghost, size_t_::sm, ImVec2(action_w, 28.f));
+			ImGui::PopID();
+		}
+		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y + aida::ui::metrics::spacing::sm));
+		return clicked;
+	}
+
+	inline bool property_row(const char* id, const char* label, const char* value,
+		bool selectable = false, bool selected = false, status_kind_t value_kind = status_kind_t::neutral) {
+		const auto& t = aida::ui::resolved();
+		const char* safe_label = label ? label : "";
+		const char* safe_value = value ? value : "";
+		float w = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
+		float h = aida::ui::metrics::row::inspector;
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImGui::PushID(id && *id ? id : safe_label);
+		ImGui::InvisibleButton("##property", ImVec2(w, h));
+		bool hovered = ImGui::IsItemHovered();
+		bool clicked = selectable && ImGui::IsItemClicked();
+		ImGui::PopID();
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		ImVec2 end = ImVec2(pos.x + w, pos.y + h);
+		if (selected) dl->AddRectFilled(pos, end, t.selection, aida::ui::metrics::radius::xs);
+		else if (hovered) dl->AddRectFilled(pos, end, t.hover_wash, aida::ui::metrics::radius::xs);
+		dl->AddLine(ImVec2(pos.x, end.y), end, t.border_subtle, 1.f);
+		float fs = detail::ui_fs() * aida::ui::metrics::typography::body_scale;
+		float y = pos.y + (h - fs) * 0.5f;
+		dl->AddText(ImGui::GetFont(), fs, ImVec2(pos.x + 8.f, y), t.text_secondary, safe_label);
+		ImU32 value_color = value_kind == status_kind_t::neutral ? t.text_primary : status_color(value_kind);
+		dl->PushClipRect(ImVec2(pos.x + aida::ui::metrics::row::property_label_w, pos.y), end, true);
+		dl->AddText(ImGui::GetFont(), fs,
+			ImVec2(pos.x + aida::ui::metrics::row::property_label_w, y), value_color, safe_value);
+		dl->PopClipRect();
+		return clicked;
+	}
+
+	inline bool splitter(const char* id, splitter_axis_t axis, float* primary_size,
+		float min_size, float max_size, float length = 0.f,
+		float thickness = aida::ui::metrics::splitter::thickness) {
+		if (!primary_size || max_size < min_size) return false;
+		const auto& t = aida::ui::resolved();
+		ImVec2 avail = ImGui::GetContentRegionAvail();
+		float extent = length > 0.f ? length : (axis == splitter_axis_t::x ? avail.y : avail.x);
+		if (extent < 1.f) extent = 1.f;
+		float hit = (std::max)(thickness, aida::ui::metrics::splitter::visible);
+		ImVec2 size = axis == splitter_axis_t::x ? ImVec2(hit, extent) : ImVec2(extent, hit);
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImGui::PushID(id && *id ? id : "splitter");
+		ImGui::InvisibleButton("##splitter", size);
+		bool hovered = ImGui::IsItemHovered();
+		bool active = ImGui::IsItemActive();
+		bool changed = false;
+		if (active) {
+			float delta = axis == splitter_axis_t::x ? ImGui::GetIO().MouseDelta.x : ImGui::GetIO().MouseDelta.y;
+			float next = *primary_size + delta;
+			if (next < min_size) next = min_size;
+			if (next > max_size) next = max_size;
+			changed = next != *primary_size;
+			*primary_size = next;
+		}
+		if (hovered || active) {
+			ImGui::SetMouseCursor(axis == splitter_axis_t::x ? ImGuiMouseCursor_ResizeEW : ImGuiMouseCursor_ResizeNS);
+		}
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		ImU32 color = active ? t.accent_u32 : (hovered ? t.accent_dim : t.border_subtle);
+		if (axis == splitter_axis_t::x) {
+			float x = pos.x + hit * 0.5f;
+			dl->AddLine(ImVec2(x, pos.y), ImVec2(x, pos.y + extent), color,
+				hovered || active ? 2.f : aida::ui::metrics::splitter::visible);
+		} else {
+			float y = pos.y + hit * 0.5f;
+			dl->AddLine(ImVec2(pos.x, y), ImVec2(pos.x + extent, y), color,
+				hovered || active ? 2.f : aida::ui::metrics::splitter::visible);
+		}
+		ImGui::PopID();
+		return changed;
+	}
+
+	inline bool begin_status_bar(const char* id, float height = aida::ui::metrics::status_bar::height) {
+		const auto& t = aida::ui::resolved();
+		float h = height > 0.f ? height : aida::ui::metrics::status_bar::height;
+		ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(t.title_bar));
+		ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(t.border_subtle));
+		ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+			ImVec2(aida::ui::metrics::status_bar::padding_x, 2.f));
+		return ImGui::BeginChild(id && *id ? id : "##status_bar", ImVec2(0.f, h), true,
+			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	}
+
+	inline void end_status_bar() {
+		ImGui::EndChild();
+		ImGui::PopStyleVar(3);
+		ImGui::PopStyleColor(2);
+	}
+
+	inline bool status_item(const char* id, const char* label, const char* value = nullptr,
+		status_kind_t kind = status_kind_t::neutral, bool interactive = false,
+		bool trailing_separator = true) {
+		const auto& t = aida::ui::resolved();
+		const char* safe_label = label ? label : "";
+		const char* safe_value = value ? value : "";
+		ImFont* font = ImGui::GetFont();
+		float fs = detail::ui_fs() * aida::ui::metrics::typography::caption_scale;
+		float label_w = font->CalcTextSizeA(fs, FLT_MAX, 0.f, safe_label).x;
+		float value_w = *safe_value ? font->CalcTextSizeA(fs, FLT_MAX, 0.f, safe_value).x + 5.f : 0.f;
+		float dot_w = kind == status_kind_t::neutral ? 0.f : 10.f;
+		float w = label_w + value_w + dot_w + 10.f;
+		float h = (std::max)(20.f, fs + 4.f);
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImGui::PushID(id && *id ? id : safe_label);
+		ImGui::InvisibleButton("##status_item", ImVec2(w, h));
+		bool hovered = ImGui::IsItemHovered();
+		bool clicked = interactive && ImGui::IsItemClicked();
+		ImGui::PopID();
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		if (interactive && hovered) {
+			dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), t.hover_wash, aida::ui::metrics::radius::xs);
+		}
+		float x = pos.x + 5.f;
+		if (dot_w > 0.f) {
+			dl->AddCircleFilled(ImVec2(x + 3.f, pos.y + h * 0.5f), 2.5f, status_color(kind), 12);
+			x += dot_w;
+		}
+		float y = pos.y + (h - fs) * 0.5f;
+		dl->AddText(font, fs, ImVec2(x, y), t.text_secondary, safe_label);
+		x += label_w;
+		if (*safe_value) dl->AddText(font, fs, ImVec2(x + 5.f, y), t.text_primary, safe_value);
+		if (trailing_separator) {
+			ImGui::SameLine(0.f, aida::ui::metrics::status_bar::item_gap);
+			ImVec2 sep = ImGui::GetCursorScreenPos();
+			ImGui::Dummy(ImVec2(1.f, 14.f));
+			dl->AddLine(sep, ImVec2(sep.x, sep.y + 14.f), t.border_subtle, 1.f);
+			ImGui::SameLine(0.f, aida::ui::metrics::status_bar::item_gap);
+		}
+		return clicked;
+	}
+
+	inline bool presentation(const char* id, presentation_kind_t kind, const char* title,
+		const char* message = nullptr, const char* action_label = nullptr,
+		ImVec2 size = ImVec2(0.f, 0.f)) {
+		const auto& t = aida::ui::resolved();
+		const char* safe_title = title ? title : "";
+		const char* safe_message = message ? message : "";
+		float w = size.x > 0.f ? size.x : ImGui::GetContentRegionAvail().x;
+		float h = size.y > 0.f ? size.y : 152.f;
+		if (w < 1.f) w = 1.f;
+		float min_h = action_label && *action_label ? 132.f : (*safe_message ? 112.f : 96.f);
+		if (h < min_h) h = min_h;
+		ImVec2 pos = ImGui::GetCursorScreenPos();
+		ImVec2 end = ImVec2(pos.x + w, pos.y + h);
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		dl->AddRectFilled(pos, end, t.bg_elevated, aida::ui::metrics::radius::md);
+		dl->AddRect(pos, end, t.border_subtle, aida::ui::metrics::radius::md, 0, 1.f);
+		float center_x = pos.x + w * 0.5f;
+		float icon_y = pos.y + 30.f;
+		if (kind == presentation_kind_t::loading) {
+			render_progress_ring(ImVec2(center_x, icon_y), 9.f, 2.f, 0.f, true);
+		} else {
+			ImU32 color = kind == presentation_kind_t::error ? t.error : t.text_dim;
+			dl->AddCircle(ImVec2(center_x, icon_y), 10.f, aida::ui::with_alpha(color, 0.72f), 24, 1.5f);
+			if (kind == presentation_kind_t::error) {
+				dl->AddLine(ImVec2(center_x, icon_y - 4.f), ImVec2(center_x, icon_y + 2.f), color, 1.7f);
+				dl->AddCircleFilled(ImVec2(center_x, icon_y + 5.f), 1.f, color, 8);
+			} else {
+				dl->AddLine(ImVec2(center_x - 4.f, icon_y), ImVec2(center_x + 4.f, icon_y), color, 1.5f);
+			}
+		}
+		ImFont* font = ImGui::GetFont();
+		float title_fs = detail::ui_fs() * aida::ui::metrics::typography::title_scale;
+		float body_fs = detail::ui_fs() * aida::ui::metrics::typography::caption_scale;
+		float title_w = font->CalcTextSizeA(title_fs, FLT_MAX, 0.f, safe_title).x;
+		dl->AddText(font, title_fs, ImVec2(center_x - title_w * 0.5f, pos.y + 50.f), t.text_primary, safe_title);
+		if (*safe_message) {
+			float message_w = font->CalcTextSizeA(body_fs, FLT_MAX, 0.f, safe_message).x;
+			float max_message_w = w - 24.f;
+			float message_x = message_w < max_message_w ? center_x - message_w * 0.5f : pos.x + 12.f;
+			dl->PushClipRect(ImVec2(pos.x + 12.f, pos.y), ImVec2(end.x - 12.f, end.y), true);
+			dl->AddText(font, body_fs, ImVec2(message_x, pos.y + 75.f), t.text_secondary, safe_message);
+			dl->PopClipRect();
+		}
+		bool clicked = false;
+		if (action_label && *action_label && kind != presentation_kind_t::loading) {
+			float action_w = detail::calc_display_text_width(font, detail::sz_font(size_t_::sm), action_label) + 28.f;
+			ImGui::PushID(id && *id ? id : safe_title);
+			ImGui::SetCursorScreenPos(ImVec2(center_x - action_w * 0.5f, end.y - 40.f));
+			clicked = button(action_label,
+				kind == presentation_kind_t::error ? button_kind_t::secondary : button_kind_t::primary,
+				size_t_::sm, ImVec2(action_w, 28.f));
+			ImGui::PopID();
+		}
+		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y + aida::ui::metrics::spacing::sm));
+		return clicked;
+	}
+
+	inline bool empty_state(const char* id, const char* title, const char* message = nullptr,
+		const char* action_label = nullptr, ImVec2 size = ImVec2(0.f, 0.f)) {
+		return presentation(id, presentation_kind_t::empty, title, message, action_label, size);
+	}
+
+	inline void loading_state(const char* id, const char* title, const char* message = nullptr,
+		ImVec2 size = ImVec2(0.f, 0.f)) {
+		presentation(id, presentation_kind_t::loading, title, message, nullptr, size);
+	}
+
+	inline bool error_state(const char* id, const char* title, const char* message = nullptr,
+		const char* retry_label = nullptr, ImVec2 size = ImVec2(0.f, 0.f)) {
+		return presentation(id, presentation_kind_t::error, title, message, retry_label, size);
+	}
+
 }
 
 namespace aida::ui {
@@ -1089,10 +1507,32 @@ namespace aida::ui {
 	using components::control_height;
 	using components::display_text_width;
 	using components::status_color;
+	using components::status_soft_color;
+	using components::view_header;
+	using components::begin_toolbar;
+	using components::end_toolbar;
+	using components::begin_toolbar_surface;
+	using components::end_toolbar_surface;
+	using components::begin_toolbar_group;
+	using components::end_toolbar_group;
+	using components::search_field;
+	using components::inline_notice;
+	using components::property_row;
+	using components::splitter;
+	using components::begin_status_bar;
+	using components::end_status_bar;
+	using components::status_item;
+	using components::presentation;
+	using components::empty_state;
+	using components::loading_state;
+	using components::error_state;
 	using components::button_kind_t;
 	using components::pill_kind_t;
 	using components::status_kind_t;
+	using components::presentation_kind_t;
+	using components::splitter_axis_t;
 	using components::size_t_;
 	using components::control_frame_t;
 	using components::action_chip_result_t;
+	using components::view_header_result_t;
 }

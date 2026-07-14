@@ -223,6 +223,57 @@ std::optional<packed_page_header_t> packed_page_header_t::decode(
     return header;
 }
 
+std::array<std::uint8_t, packed_record_page_prefix_size>
+packed_record_page_prefix_t::encode() const noexcept {
+    std::array<std::uint8_t, packed_record_page_prefix_size> output{};
+    auto write_u16 = [&](std::size_t offset, std::uint16_t value) {
+        output[offset] = static_cast<std::uint8_t>(value);
+        output[offset + 1] = static_cast<std::uint8_t>(value >> 8U);
+    };
+    auto write_u32 = [&](std::size_t offset, std::uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            output[offset + shift / 8] = static_cast<std::uint8_t>(value >> shift);
+    };
+    auto write_u64 = [&](std::size_t offset, std::uint64_t value) {
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            output[offset + shift / 8] = static_cast<std::uint8_t>(value >> shift);
+    };
+    write_u32(0, magic);
+    write_u16(4, version);
+    write_u16(6, flags);
+    write_u32(8, ordinal_begin);
+    write_u32(12, record_count);
+    write_u64(16, address_value_min);
+    write_u64(24, address_value_max);
+    return output;
+}
+
+std::optional<packed_record_page_prefix_t>
+packed_record_page_prefix_t::decode(
+    const std::uint8_t* data, std::size_t size) noexcept {
+    if (!data || size < packed_record_page_prefix_size)
+        return std::nullopt;
+    packed_record_page_prefix_t prefix;
+    prefix.magic = read_u32_le(data);
+    prefix.version = static_cast<std::uint16_t>(data[4]) |
+        static_cast<std::uint16_t>(data[5] << 8U);
+    prefix.flags = static_cast<std::uint16_t>(data[6]) |
+        static_cast<std::uint16_t>(data[7] << 8U);
+    prefix.ordinal_begin = read_u32_le(data + 8);
+    prefix.record_count = read_u32_le(data + 12);
+    prefix.address_value_min = read_u64_le(data + 16);
+    prefix.address_value_max = read_u64_le(data + 24);
+    if (prefix.magic != packed_record_page_magic ||
+        prefix.version != packed_record_page_version || prefix.flags != 0 ||
+        (prefix.record_count == 0 &&
+         (prefix.address_value_min != 0 || prefix.address_value_max != 0)) ||
+        (prefix.record_count != 0 &&
+         prefix.address_value_min > prefix.address_value_max)) {
+        return std::nullopt;
+    }
+    return prefix;
+}
+
 std::array<std::uint8_t, 28> packed_page_checkpoint_t::encode() const noexcept {
     std::array<std::uint8_t, 28> output{};
     auto* cursor = output.data();
@@ -260,7 +311,7 @@ workspace_result_t<packed_page_batch_t> packed_page_codec_t::encode_batch(
     if (codec_stop_requested(stop_requested))
         return workspace_result_t<packed_page_batch_t>::failure(
             codec_cancelled_error("packed_page_codec.encode_batch"));
-    if (options.page_size < packed_page_header_size + 16 ||
+    if (options.page_size < packed_page_header_size + packed_record_page_prefix_size + 16 ||
         options.page_size > packed_page_max_payload + packed_page_header_size) {
         return workspace_result_t<packed_page_batch_t>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
@@ -287,7 +338,8 @@ workspace_result_t<packed_page_batch_t> packed_page_codec_t::encode_batch(
                                  "encoded payload exceeds the generation byte limit",
                                  "packed_page_codec.encode_batch"));
     }
-    const std::uint32_t payload_capacity = options.page_size - packed_page_header_size;
+    const std::uint32_t payload_capacity = options.page_size - packed_page_header_size -
+        packed_record_page_prefix_size;
     const std::uint64_t page_count_64 = data.empty() ? 1ULL :
         1ULL + (static_cast<std::uint64_t>(data.size()) - 1ULL) / payload_capacity;
     if (page_count_64 == 0 || page_count_64 > packed_generation_max_pages) {
@@ -318,7 +370,10 @@ workspace_result_t<packed_page_batch_t> packed_page_codec_t::encode_batch(
         page.header.overlay_revision = options.overlay_revision;
         const std::size_t begin = static_cast<std::size_t>(page_index) * payload_capacity;
         const std::size_t end = (std::min)(data.size(), begin + payload_capacity);
-        page.payload.assign(data.begin() + begin, data.begin() + end);
+        packed_record_page_prefix_t prefix;
+        const auto encoded_prefix = prefix.encode();
+        page.payload.insert(page.payload.end(), encoded_prefix.begin(), encoded_prefix.end());
+        page.payload.insert(page.payload.end(), data.begin() + begin, data.begin() + end);
         page.header.payload_length = static_cast<std::uint32_t>(page.payload.size());
         auto checksum = compute_page_checksum_cancellable(
             page.header, page.payload, stop_requested);
@@ -337,7 +392,7 @@ workspace_result_t<packed_page_batch_t> packed_page_codec_t::encode_batch(
     if (!batch_checksum)
         return workspace_result_t<packed_page_batch_t>::failure(batch_checksum.error());
     batch.checkpoint.batch_checksum = batch_checksum.value();
-    batch.checkpoint.total_records = page_count;
+    batch.checkpoint.total_records = 0;
     batch.checkpoint.total_payload_bytes = total_payload_bytes;
     batch.checkpoint.created_utc_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -366,7 +421,12 @@ workspace_result_t<std::vector<std::uint8_t>> packed_page_codec_t::decode_batch(
         if (codec_stop_requested(stop_requested))
             return workspace_result_t<std::vector<std::uint8_t>>::failure(
                 codec_cancelled_error("packed_page_codec.decode_batch"));
-        if (!checked_add_u64(estimated_size, page.payload.size(), estimated_size) ||
+        auto prefix = packed_record_page_prefix_t::decode(
+            page.payload.data(), page.payload.size());
+        if (!prefix || !checked_add_u64(
+                estimated_size,
+                page.payload.size() - packed_record_page_prefix_size,
+                estimated_size) ||
             estimated_size > packed_generation_max_payload_bytes) {
             return workspace_result_t<std::vector<std::uint8_t>>::failure(
                 make_workspace_error(workspace_error_code_t::limit_exceeded,
@@ -392,7 +452,8 @@ workspace_result_t<std::vector<std::uint8_t>> packed_page_codec_t::decode_batch(
                                      "page index sequence is broken",
                                      "packed_page_codec.decode_batch"));
         }
-        for (std::size_t offset = 0; offset < page.payload.size();
+        for (std::size_t offset = packed_record_page_prefix_size;
+             offset < page.payload.size();
              offset += kCancellationStride) {
             if (codec_stop_requested(stop_requested))
                 return workspace_result_t<std::vector<std::uint8_t>>::failure(
@@ -439,6 +500,8 @@ workspace_result_t<void> packed_page_codec_t::verify_page(
                                  "packed_page_codec.verify_page"));
     }
     if (page.payload.size() > packed_page_max_payload ||
+        (page.header.page_type != packed_page_checkpoint_type &&
+         page.payload.size() < packed_record_page_prefix_size) ||
         page.header.payload_length != page.payload.size()) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
@@ -458,7 +521,87 @@ workspace_result_t<void> packed_page_codec_t::verify_page(
         error.details.emplace_back("actual_checksum", std::to_string(page.header.checksum));
         return workspace_result_t<void>::failure(std::move(error));
     }
+    if (page.header.page_type != packed_page_checkpoint_type &&
+        !packed_record_page_prefix_t::decode(
+            page.payload.data(), page.payload.size())) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "page record prefix is invalid",
+                                 "packed_page_codec.verify_page"));
+    }
     return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> packed_page_codec_t::seal_page(
+    packed_page_t& page,
+    const packed_stop_predicate_t& stop_requested) {
+    page.header.magic = packed_page_magic;
+    page.header.version = packed_page_blob_version;
+    page.header.payload_length = static_cast<std::uint32_t>(page.payload.size());
+    page.header.checksum = 0;
+    if (!valid_page_type(page.header.page_type) ||
+        page.header.page_type == packed_page_checkpoint_type ||
+        page.header.generation == 0 || page.header.page_count == 0 ||
+        page.header.page_count > packed_generation_max_pages ||
+        page.header.page_index >= page.header.page_count ||
+        page.payload.size() < packed_record_page_prefix_size ||
+        page.payload.size() > packed_page_max_payload ||
+        !packed_record_page_prefix_t::decode(
+            page.payload.data(), page.payload.size())) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "page cannot be sealed because its bounded invariants are invalid",
+                                 "packed_page_codec.seal_page"));
+    }
+    auto checksum = compute_page_checksum_cancellable(
+        page.header, page.payload, stop_requested);
+    if (!checksum)
+        return workspace_result_t<void>::failure(checksum.error());
+    page.header.checksum = checksum.value();
+    return verify_page(page, stop_requested);
+}
+
+workspace_result_t<packed_record_page_prefix_t>
+packed_page_codec_t::record_prefix(
+    const packed_page_t& page,
+    const packed_stop_predicate_t& stop_requested) {
+    auto verified = verify_page(page, stop_requested);
+    if (!verified)
+        return workspace_result_t<packed_record_page_prefix_t>::failure(
+            verified.error());
+    auto decoded = packed_record_page_prefix_t::decode(
+        page.payload.data(), page.payload.size());
+    if (!decoded) {
+        return workspace_result_t<packed_record_page_prefix_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "page record prefix could not be decoded",
+                                 "packed_page_codec.record_prefix"));
+    }
+    return workspace_result_t<packed_record_page_prefix_t>::success(*decoded);
+}
+
+workspace_result_t<std::vector<std::uint8_t>>
+packed_page_codec_t::record_payload(
+    const packed_page_t& page,
+    const packed_stop_predicate_t& stop_requested) {
+    auto prefix = record_prefix(page, stop_requested);
+    if (!prefix)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            prefix.error());
+    std::vector<std::uint8_t> output;
+    output.reserve(page.payload.size() - packed_record_page_prefix_size);
+    for (std::size_t offset = packed_record_page_prefix_size;
+         offset < page.payload.size();) {
+        if (codec_stop_requested(stop_requested))
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                codec_cancelled_error("packed_page_codec.record_payload"));
+        const auto end = (std::min)(page.payload.size(), offset + kCancellationStride);
+        output.insert(output.end(), page.payload.data() + offset,
+                      page.payload.data() + end);
+        offset = end;
+    }
+    return workspace_result_t<std::vector<std::uint8_t>>::success(
+        std::move(output));
 }
 
 workspace_result_t<void> packed_page_codec_t::verify_batch(
@@ -498,6 +641,7 @@ workspace_result_t<void> packed_page_codec_t::verify_batch(
                                  "packed_page_codec.verify_batch"));
     }
     std::uint64_t total_payload_bytes = 0;
+    std::uint64_t total_records = 0;
     for (std::size_t index = 0; index < batch.pages.size(); ++index) {
         if (codec_stop_requested(stop_requested))
             return workspace_result_t<void>::failure(
@@ -524,8 +668,18 @@ workspace_result_t<void> packed_page_codec_t::verify_batch(
                                      "batch payload exceeds the bounded byte limit",
                                      "packed_page_codec.verify_batch"));
         }
+        auto prefix = packed_record_page_prefix_t::decode(
+            page.payload.data(), page.payload.size());
+        if (!prefix || !checked_add_u64(
+                total_records, prefix->record_count, total_records) ||
+            total_records > packed_generation_max_records) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "batch record metadata is invalid",
+                                     "packed_page_codec.verify_batch"));
+        }
     }
-    if (batch.checkpoint.total_records != batch.pages.size() ||
+    if (batch.checkpoint.total_records != total_records ||
         batch.checkpoint.total_payload_bytes != total_payload_bytes) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
@@ -556,7 +710,6 @@ packed_page_codec_t::build_warm_open_index(
         return workspace_result_t<std::vector<packed_page_index_entry_t>>::failure(verified.error());
     std::vector<packed_page_index_entry_t> entries;
     entries.reserve(batch.pages.size());
-    std::uint64_t ordinal_begin = 0;
     for (const auto& page : batch.pages) {
         if (codec_stop_requested(stop_requested))
             return workspace_result_t<std::vector<packed_page_index_entry_t>>::failure(
@@ -564,28 +717,19 @@ packed_page_codec_t::build_warm_open_index(
         packed_page_index_entry_t entry;
         entry.domain = static_cast<std::uint16_t>(page.header.page_type);
         entry.page_index = page.header.page_index;
-        if (ordinal_begin > (std::numeric_limits<std::uint32_t>::max)()) {
+        auto prefix = packed_record_page_prefix_t::decode(
+            page.payload.data(), page.payload.size());
+        if (!prefix) {
             return workspace_result_t<std::vector<packed_page_index_entry_t>>::failure(
-                make_workspace_error(workspace_error_code_t::range_overflow,
-                                     "warm-open ordinal exceeds the index representation",
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "warm-open record prefix is invalid",
                                      "packed_page_codec.build_warm_open_index"));
         }
-        entry.ordinal_begin = static_cast<std::uint32_t>(ordinal_begin);
-        entry.count = page.header.payload_length;
-        if (page.payload.size() >= sizeof(std::uint64_t)) {
-            const auto first_address = read_u64_le(page.payload.data());
-            const std::size_t last_offset = page.payload.size() - sizeof(std::uint64_t);
-            const auto last_address = read_u64_le(page.payload.data() + last_offset);
-            entry.address_value_min = (std::min)(first_address, last_address);
-            entry.address_value_max = (std::max)(first_address, last_address);
-        }
+        entry.ordinal_begin = prefix->ordinal_begin;
+        entry.count = prefix->record_count;
+        entry.address_value_min = prefix->address_value_min;
+        entry.address_value_max = prefix->address_value_max;
         entries.push_back(entry);
-        if (!checked_add_u64(ordinal_begin, page.payload.size(), ordinal_begin)) {
-            return workspace_result_t<std::vector<packed_page_index_entry_t>>::failure(
-                make_workspace_error(workspace_error_code_t::range_overflow,
-                                     "warm-open ordinal accumulation overflowed",
-                                     "packed_page_codec.build_warm_open_index"));
-        }
     }
     return workspace_result_t<std::vector<packed_page_index_entry_t>>::success(std::move(entries));
 }
@@ -680,6 +824,7 @@ workspace_result_t<packed_page_batch_t> packed_page_codec_t::encode_multi_domain
     combined.overlay_revision = options.overlay_revision;
     std::uint32_t global_page_index = 0;
     std::uint64_t total_payload_bytes = 0;
+    std::uint64_t total_records = 0;
     std::unordered_set<std::uint32_t> encoded_domains;
     for (const auto& [domain_type, domain_data] : domains) {
         if (codec_stop_requested(stop_requested))
@@ -696,6 +841,15 @@ workspace_result_t<packed_page_batch_t> packed_page_codec_t::encode_multi_domain
             domain_type, domain_data, options, stop_requested);
         if (!domain_batch)
             return domain_batch;
+        if (!checked_add_u64(total_records,
+                             domain_batch.value().checkpoint.total_records,
+                             total_records) ||
+            total_records > packed_generation_max_records) {
+            return workspace_result_t<packed_page_batch_t>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "combined record count exceeds its bounded limit",
+                                     "packed_page_codec.encode_multi_domain_batch"));
+        }
         for (auto& page : domain_batch.value().pages) {
             if (codec_stop_requested(stop_requested))
                 return workspace_result_t<packed_page_batch_t>::failure(
@@ -732,7 +886,7 @@ workspace_result_t<packed_page_batch_t> packed_page_codec_t::encode_multi_domain
     if (!batch_checksum)
         return workspace_result_t<packed_page_batch_t>::failure(batch_checksum.error());
     combined.checkpoint.batch_checksum = batch_checksum.value();
-    combined.checkpoint.total_records = global_page_index;
+    combined.checkpoint.total_records = total_records;
     combined.checkpoint.total_payload_bytes = total_payload_bytes;
     combined.checkpoint.created_utc_ms = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -969,8 +1123,18 @@ packed_page_codec_t::decode_multi_domain_publication(
                         "packed_page_codec.decode_multi_domain_publication"));
         }
         auto& output = decoded[static_cast<packed_page_type_t>(index->domain)];
+        if (page.payload.size() < packed_record_page_prefix_size) {
+            return workspace_result_t<
+                std::vector<std::pair<packed_page_type_t, std::vector<std::uint8_t>>>>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed page record prefix is truncated",
+                        "packed_page_codec.decode_multi_domain_publication"));
+        }
+        const auto record_payload_size =
+            page.payload.size() - packed_record_page_prefix_size;
         std::uint64_t updated_size = 0;
-        if (!checked_add_u64(output.size(), page.payload.size(), updated_size) ||
+        if (!checked_add_u64(output.size(), record_payload_size, updated_size) ||
             updated_size > packed_generation_max_payload_bytes ||
             updated_size > static_cast<std::uint64_t>(
                 (std::numeric_limits<std::size_t>::max)())) {
@@ -982,7 +1146,8 @@ packed_page_codec_t::decode_multi_domain_publication(
                         "packed_page_codec.decode_multi_domain_publication"));
         }
         output.reserve(static_cast<std::size_t>(updated_size));
-        for (std::size_t offset = 0; offset < page.payload.size();) {
+        for (std::size_t offset = packed_record_page_prefix_size;
+             offset < page.payload.size();) {
             if (codec_stop_requested(stop_requested)) {
                 return workspace_result_t<
                     std::vector<std::pair<packed_page_type_t, std::vector<std::uint8_t>>>>::failure(

@@ -17,6 +17,7 @@ class workspace_persistence_candidate_t;
 
 struct persistence_queue_limits_t {
     std::size_t max_pending_operations = 1024;
+    std::uint64_t max_pending_bytes = 1ULL << 30;
     std::size_t max_operations_per_drain = 64;
     std::chrono::milliseconds max_drain_wall_time{25};
 };
@@ -47,6 +48,8 @@ struct persistence_queue_snapshot_t {
     std::uint64_t cancelled = 0;
     std::uint64_t drain_tasks = 0;
     std::size_t pending = 0;
+    std::uint64_t pending_bytes = 0;
+    std::uint64_t active_bytes = 0;
     bool accepting = false;
     bool drain_active = false;
 };
@@ -64,7 +67,8 @@ public:
     persistence_queue_t& operator=(const persistence_queue_t&) = delete;
 
     persistence_ticket_t enqueue(std::string label, persistence_operation_t operation,
-                                 cancellation_token_t cancel = {});
+                                 cancellation_token_t cancel = {},
+                                 std::uint64_t reservation_bytes = 0);
     persistence_queue_snapshot_t snapshot() const;
     bool idle() const;
 

@@ -34,6 +34,7 @@ struct persistence_queue_t::state_t {
         persistence_operation_t operation;
         cancellation_token_t cancel;
         std::promise<workspace_result_t<void>> promise;
+        std::uint64_t reservation_bytes = 0;
     };
 
     binary_id_t workspace_id;
@@ -55,6 +56,8 @@ struct persistence_queue_t::state_t {
     std::uint64_t rejected = 0;
     std::uint64_t cancelled = 0;
     std::uint64_t drain_tasks = 0;
+    std::uint64_t pending_bytes = 0;
+    std::uint64_t active_bytes = 0;
 };
 
 namespace {
@@ -89,6 +92,8 @@ void run_drain(const std::shared_ptr<queue_state_t>& state,
         for (std::size_t index = 0; index < count; ++index) {
             batch.push_back(std::move(state->pending.front()));
             state->pending.pop_front();
+            state->pending_bytes -= batch.back()->reservation_bytes;
+            state->active_bytes += batch.back()->reservation_bytes;
         }
         state->active_batch = batch;
     }
@@ -139,6 +144,7 @@ void run_drain(const std::shared_ptr<queue_state_t>& state,
         }
         {
             std::lock_guard<std::mutex> lock(state->mutex);
+            state->active_bytes -= queued->reservation_bytes;
             if (success)
                 ++state->completed;
             else if (cancelled)
@@ -155,8 +161,11 @@ void run_drain(const std::shared_ptr<queue_state_t>& state,
 
     if (processed < batch.size()) {
         std::lock_guard<std::mutex> lock(state->mutex);
-        for (std::size_t index = batch.size(); index > processed; --index)
+        for (std::size_t index = batch.size(); index > processed; --index) {
+            state->active_bytes -= batch[index - 1]->reservation_bytes;
+            state->pending_bytes += batch[index - 1]->reservation_bytes;
             state->pending.push_front(std::move(batch[index - 1]));
+        }
     }
 
     bool schedule_more = false;
@@ -215,6 +224,7 @@ void schedule_drain(const std::shared_ptr<queue_state_t>& state) {
         rejected.assign(std::make_move_iterator(state->pending.begin()),
                         std::make_move_iterator(state->pending.end()));
         state->pending.clear();
+        state->pending_bytes = 0;
         state->rejected += rejected.size();
         state->idle_cv.notify_all();
     }
@@ -234,7 +244,8 @@ persistence_queue_t::create(binary_id_t workspace_id, persistence_queue_limits_t
                         "persistence queue requires a non-empty workspace identity",
                         "persistence_queue"));
     }
-    if (limits.max_pending_operations == 0 || limits.max_operations_per_drain == 0 ||
+    if (limits.max_pending_operations == 0 || limits.max_pending_bytes == 0 ||
+        limits.max_operations_per_drain == 0 ||
         limits.max_drain_wall_time <= std::chrono::milliseconds::zero()) {
         return workspace_result_t<std::shared_ptr<persistence_queue_t>>::failure(
             queue_error(workspace_error_code_t::invalid_argument,
@@ -259,7 +270,8 @@ persistence_queue_t::~persistence_queue_t() {
 
 persistence_ticket_t persistence_queue_t::enqueue(std::string label,
                                                    persistence_operation_t operation,
-                                                   cancellation_token_t cancel) {
+                                                   cancellation_token_t cancel,
+                                                   std::uint64_t reservation_bytes) {
     persistence_ticket_t ticket;
     if (!operation) {
         ticket.completion = ready_failure(queue_error(workspace_error_code_t::invalid_argument,
@@ -272,6 +284,7 @@ persistence_ticket_t persistence_queue_t::enqueue(std::string label,
     queued->label = std::move(label);
     queued->operation = std::move(operation);
     queued->cancel = std::move(cancel);
+    queued->reservation_bytes = reservation_bytes;
     ticket.completion = queued->promise.get_future().share();
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
@@ -289,10 +302,22 @@ persistence_ticket_t persistence_queue_t::enqueue(std::string label,
                             "persistence queue capacity exceeded", "persistence_queue")));
             return ticket;
         }
+        if (reservation_bytes > state_->limits.max_pending_bytes ||
+            state_->pending_bytes > state_->limits.max_pending_bytes - reservation_bytes ||
+            state_->active_bytes > state_->limits.max_pending_bytes -
+                (state_->pending_bytes + reservation_bytes)) {
+            ++state_->rejected;
+            queued->promise.set_value(workspace_result_t<void>::failure(
+                queue_error(workspace_error_code_t::limit_exceeded,
+                            "persistence queue byte reservation exceeded",
+                            "persistence_queue")));
+            return ticket;
+        }
         queued->sequence = state_->next_sequence++;
         ticket.sequence = queued->sequence;
         ticket.accepted = true;
         ++state_->submitted;
+        state_->pending_bytes += reservation_bytes;
         state_->pending.push_back(queued);
     }
     schedule_drain(state_);
@@ -309,6 +334,8 @@ persistence_queue_snapshot_t persistence_queue_t::snapshot() const {
     result.cancelled = state_->cancelled;
     result.drain_tasks = state_->drain_tasks;
     result.pending = state_->pending.size();
+    result.pending_bytes = state_->pending_bytes;
+    result.active_bytes = state_->active_bytes;
     result.accepting = state_->accepting;
     result.drain_active = state_->drain_active || state_->drain_scheduled;
     return result;
@@ -333,6 +360,7 @@ void persistence_queue_t::request_cancel() noexcept {
         cancelled.assign(std::make_move_iterator(state_->pending.begin()),
                          std::make_move_iterator(state_->pending.end()));
         state_->pending.clear();
+        state_->pending_bytes = 0;
         state_->cancelled += cancelled.size();
         active_drain_cancel = state_->active_drain_cancel;
         active_drain_handle = state_->active_drain_handle;

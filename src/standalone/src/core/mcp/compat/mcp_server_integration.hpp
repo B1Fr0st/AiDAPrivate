@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mcp_standalone.hpp"
+#include "../registry/tool_registry.hpp"
 #include "../protocol/mcp_result.hpp"
 #include "../protocol/mcp_tool_contract.hpp"
 #include "../protocol/schema_runtime.hpp"
@@ -89,7 +89,7 @@ class mcp_server_integration_t final
     : public std::enable_shared_from_this<mcp_server_integration_t> {
 public:
     static std::shared_ptr<mcp_server_integration_t>
-        create(mcp_standalone::server_t& server,
+        create(mcp_standalone::tool_registry_t& registry,
                server_integration_config_t config = {});
 
     ~mcp_server_integration_t();

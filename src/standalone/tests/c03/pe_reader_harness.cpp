@@ -1,4 +1,5 @@
 #include "pe_reader_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/readers/pe_coff_reader.hpp"
 
@@ -24,13 +25,16 @@ constexpr std::uint32_t k_section_characteristics_code = 0x60000020U;
 constexpr std::uint32_t k_cli_directory_index = 14U;
 
 void require(bool condition, std::string_view message) {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
 
 template <typename value_t>
 value_t require_value(workspace_result_t<value_t> result, std::string_view message) {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	assertion_telemetry::record_assertion(accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ":" + result.error().stable_code());
     return result.take_value();
 }

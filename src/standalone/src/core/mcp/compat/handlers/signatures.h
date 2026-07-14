@@ -25,11 +25,43 @@ enum class signature_architecture_t : std::uint8_t {
     dalvik,
 };
 
+enum class signature_mode_t : std::uint8_t {
+    unknown = 0,
+    x86_16,
+    x86_32,
+    x86_64,
+    arm_a32,
+    arm_thumb,
+    aarch64,
+    mips32,
+    mips64,
+    ppc32,
+    ppc64,
+    riscv32,
+    riscv64,
+    jvm,
+    dalvik,
+};
+
+enum class signature_endian_t : std::uint8_t {
+    little = 0,
+    big,
+};
+
+struct signature_dynamic_range_t final {
+    std::uint8_t offset = 0;
+    std::uint8_t size = 0;
+};
+
 struct signature_instruction_t final {
     std::uint64_t address = 0;
     signature_architecture_t architecture = signature_architecture_t::unknown;
+    signature_mode_t mode = signature_mode_t::unknown;
+    signature_endian_t endian = signature_endian_t::little;
     std::vector<std::uint8_t> bytes;
     std::vector<std::uint8_t> stable_mask;
+    std::vector<signature_dynamic_range_t> relocation_ranges;
+    bool stable_mask_authoritative = false;
 };
 
 struct signature_function_t final {

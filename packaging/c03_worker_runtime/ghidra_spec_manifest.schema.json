@@ -1,0 +1,60 @@
+{
+  "$id": "aida.c03.ghidra-spec-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "source_contract_sha256", "producer", "specifications"],
+  "properties": {
+    "schema": { "const": "aida.c03.ghidra-spec-manifest" },
+    "schema_version": { "const": 1 },
+    "source_contract_sha256": { "$ref": "#/$defs/sha256" },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "executable_sha256", "approved_input_root", "approved_generator_root"],
+      "properties": {
+        "id": { "const": "ghidra_sleigh_compiler" },
+        "executable_sha256": { "$ref": "#/$defs/sha256" },
+        "approved_input_root": { "const": true },
+        "approved_generator_root": { "const": true }
+      }
+    },
+    "specifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_count", "mirrors", "exact_inventory", "generation_id", "canonical_inventory_sha256", "files"],
+      "properties": {
+        "file_count": { "const": 51 },
+        "mirrors": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "prefixItems": [{ "const": "ghidra_specs" }, { "const": "deps/ghidra_specs" }],
+          "items": false
+        },
+        "exact_inventory": { "const": true },
+        "generation_id": { "$ref": "#/$defs/sha256" },
+        "canonical_inventory_sha256": { "$ref": "#/$defs/sha256" },
+        "files": {
+          "type": "array",
+          "minItems": 51,
+          "maxItems": 51,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "kind", "size_bytes", "sha256"],
+            "properties": {
+              "name": { "type": "string", "minLength": 5, "maxLength": 128, "pattern": "^[A-Za-z0-9_.-]+\\.(?:sla|pspec|cspec|ldefs)$" },
+              "kind": { "enum": ["sla", "pspec", "cspec", "ldefs"] },
+              "size_bytes": { "type": "integer", "minimum": 1, "maximum": 536870912 },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

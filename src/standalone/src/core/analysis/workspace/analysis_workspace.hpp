@@ -28,6 +28,8 @@ class search_index_t;
 class analysis_workspace_t;
 class workspace_registry_t;
 struct workspace_publication_state_t;
+struct projection_invalidation_set_t;
+struct managed_artifact_publication_t;
 
 class workspace_analysis_run_t final {
 public:
@@ -80,10 +82,13 @@ struct analysis_publication_t final {
     analysis_publication_t(std::shared_ptr<const analysis_snapshot_t> snapshot_value,
                            std::shared_ptr<const byte_provider_t> provider_value,
                            std::shared_ptr<search_index_t> search_index_value,
-                           workspace_readiness_t readiness_value) noexcept
+                           workspace_readiness_t readiness_value,
+                           std::shared_ptr<const managed_artifact_publication_t>
+                               managed_artifacts_value = {}) noexcept
         : snapshot(std::move(snapshot_value)),
           provider(std::move(provider_value)),
           search_index(std::move(search_index_value)),
+          managed_artifacts(std::move(managed_artifacts_value)),
           binary_id(snapshot ? snapshot->binary_id : binary_id_t{}),
           load_profile_hash(snapshot ? snapshot->load_profile_hash : sha256_digest_t{}),
           generation(snapshot ? snapshot->generation : 0),
@@ -96,6 +101,7 @@ struct analysis_publication_t final {
     const std::shared_ptr<const analysis_snapshot_t> snapshot;
     const std::shared_ptr<const byte_provider_t> provider;
     const std::shared_ptr<search_index_t> search_index;
+    const std::shared_ptr<const managed_artifact_publication_t> managed_artifacts;
     const binary_id_t binary_id;
     const sha256_digest_t load_profile_hash;
     const std::uint64_t generation;
@@ -194,14 +200,21 @@ public:
         std::shared_ptr<search_index_t> search_index,
         bool require_complete_coverage,
         std::function<workspace_result_t<void>()> finalizer = {});
+    workspace_result_t<void> publish_managed_artifacts(
+        std::uint64_t expected_generation,
+        std::uint64_t expected_analysis_revision,
+        std::shared_ptr<const managed_artifact_publication_t> managed_artifacts,
+        bool advance_empty_analysis_revision);
     workspace_result_t<std::size_t> publish_projected_generation(
         std::uint64_t expected_generation,
         std::uint64_t expected_analysis_revision,
         std::uint64_t target_generation,
         std::uint64_t target_overlay_revision,
         std::shared_ptr<const byte_provider_t> projected_provider,
-        bool preserve_analysis,
-        std::function<workspace_result_t<void>()> finalizer);
+        const projection_invalidation_set_t& invalidation,
+        std::function<workspace_result_t<void>(
+            const std::shared_ptr<const analysis_snapshot_t>&,
+            const std::shared_ptr<search_index_t>&)> finalizer);
 
     std::uint64_t generation() const noexcept;
     std::uint64_t analysis_revision() const noexcept;
@@ -212,7 +225,13 @@ public:
     workspace_result_t<std::uint64_t> advance_overlay_revision(std::uint64_t expected_revision);
     workspace_result_t<std::uint64_t> restore_overlay_revision(
         std::uint64_t expected_current, std::uint64_t persisted_revision,
+        std::uint64_t persisted_generation,
         std::shared_ptr<const byte_provider_t> projected_provider = {});
+    workspace_result_t<void> restore_projected_provider(
+        std::uint64_t expected_generation,
+        std::uint64_t expected_analysis_revision,
+        std::uint64_t expected_overlay_revision,
+        std::shared_ptr<const byte_provider_t> projected_provider);
 
     cancellation_token_t cancellation_token() const;
     void request_cancel() noexcept;

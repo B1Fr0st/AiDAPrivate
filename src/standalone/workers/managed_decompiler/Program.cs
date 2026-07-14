@@ -1,87 +1,94 @@
+using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
 
 namespace Aida.ManagedDecompiler;
 
 internal static class Program
 {
-    private const int MaximumWireBytes = 16 * 1024 * 1024;
-    private static readonly object ActiveGate = new();
-    private static readonly SemaphoreSlim OutputGate = new(1, 1);
-    private static ActiveJob? activeJob;
+    private const string TransportSchema = "aida.c03.managed-cli.transport";
+    private const string WorkerBuildId = "aida-managed-decompiler-worker-v3";
+    private const string WorkerBuildHashMaterial = "aida-managed-decompiler-worker-build-v3|snapshot-bound-contract=4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6|tfm=net10.0|runtime=Microsoft.NETCore.App/10.0.9";
 
     private static async Task<int> Main(string[] arguments)
     {
-        if (arguments.Length != 4 || !string.Equals(arguments[0], "--offline-package-root", StringComparison.Ordinal) ||
-            !string.Equals(arguments[2], "--module-handle", StringComparison.Ordinal))
-            return 2;
+        ActiveJob? activeJob = null;
         try
         {
-            OfflinePackageLock.EstablishStartupGate(arguments[1]);
-            MetadataAnalysis.EstablishModuleHandle(arguments[3]);
+            var options = WorkerStartupOptions.Parse(arguments);
+            RuntimeIdentity.Establish(options.RuntimeManifestHash);
+            var moduleBytes = AuthenticatedTransport.ReadModuleMapping(options.ModuleHandle, options.ModuleSize);
+            MetadataAnalysis.EstablishModuleSnapshot(moduleBytes);
+            var workerBinaryHash = AuthenticatedTransport.HashIdentityHandle(options.IdentityHandle);
+            using var transport = AuthenticatedTransport.Establish(options);
+            await SendHelloAsync(transport, workerBinaryHash).ConfigureAwait(false);
+
+            var requestPayload = await transport.ReceivePayloadAsync(1, CancellationToken.None).ConfigureAwait(false);
+            if (Encoding.UTF8.GetByteCount(requestPayload) > AuthenticatedTransport.MaximumPayloadBytes)
+                throw new InvalidDataException("managed worker request exceeds the frame limit");
+            var request = WorkerProtocol.Deserialize<WorkerRequest>(requestPayload);
+            MetadataAnalysis.ValidateRequest(request);
+            if (request.Sequence != 1)
+                throw new InvalidDataException("managed worker request sequence does not match its authenticated frame");
+
+            activeJob = new ActiveJob(request);
+            var execution = RunJobAsync(activeJob);
+            var cancellation = ReceiveCancellationAsync(transport, activeJob);
+            var completed = await Task.WhenAny(execution, cancellation).ConfigureAwait(false);
+            if (ReferenceEquals(completed, cancellation))
+                await cancellation.ConfigureAwait(false);
+            var responsePayload = await execution.ConfigureAwait(false);
+            await transport.SendPayloadAsync(2, responsePayload, CancellationToken.None).ConfigureAwait(false);
+            return 0;
         }
-        catch (Exception)
+        catch
         {
+            activeJob?.Cancellation.Cancel();
             return 1;
         }
-
-        var jobs = new List<Task>();
-        string? line;
-        while ((line = await Console.In.ReadLineAsync().ConfigureAwait(false)) is not null)
+        finally
         {
-            if (line.Length == 0 || Encoding.UTF8.GetByteCount(line) > MaximumWireBytes)
-            {
-                await WriteLineAsync(WorkerProtocol.Serialize(Failure(0, string.Empty, string.Empty, 0, "invalid_contract", "managed_cli.message_size", 100, false))).ConfigureAwait(false);
-                continue;
-            }
-
-            try
-            {
-                using var document = JsonDocument.Parse(line);
-                if (!document.RootElement.TryGetProperty("kind", out var kindElement) || kindElement.ValueKind != JsonValueKind.String)
-                    throw new InvalidDataException("worker message kind is absent");
-                var kind = kindElement.GetString();
-                if (string.Equals(kind, "decompile", StringComparison.Ordinal))
-                {
-                    var request = WorkerProtocol.Deserialize<WorkerRequest>(line);
-                    MetadataAnalysis.ValidateRequest(request);
-                    var job = new ActiveJob(request);
-                    lock (ActiveGate)
-                    {
-                        if (activeJob is not null)
-                            throw new InvalidOperationException("managed decompiler worker accepts one active job");
-                        activeJob = job;
-                    }
-                    jobs.Add(RunJobAsync(job));
-                }
-                else if (string.Equals(kind, "cancel", StringComparison.Ordinal))
-                {
-                    var cancellation = WorkerProtocol.Deserialize<WorkerCancellation>(line);
-                    ValidateCancellation(cancellation);
-                    ActiveJob? job;
-                    lock (ActiveGate)
-                        job = activeJob;
-                    if (job is not null && string.Equals(job.Request.RequestId, cancellation.RequestId, StringComparison.Ordinal))
-                        job.Cancellation.Cancel();
-                }
-                else
-                {
-                    throw new InvalidDataException("worker message kind is unsupported");
-                }
-            }
-            catch (Exception)
-            {
-                await WriteLineAsync(WorkerProtocol.Serialize(Failure(0, string.Empty, string.Empty, 0, "invalid_contract", "managed_cli.request_rejected", 100, false))).ConfigureAwait(false);
-            }
+            activeJob?.Cancellation.Dispose();
+            MetadataAnalysis.ReleaseModuleSnapshot();
         }
-
-        await Task.WhenAll(jobs).ConfigureAwait(false);
-        return 0;
     }
 
-    private static async Task RunJobAsync(ActiveJob job)
+    private static async Task SendHelloAsync(AuthenticatedTransport transport, string workerBinaryHash)
     {
-        WorkerResult? result = null;
+        var buildHashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(WorkerBuildHashMaterial));
+        string buildHash;
+        try
+        {
+            buildHash = Convert.ToHexString(buildHashBytes).ToLowerInvariant();
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(buildHashBytes);
+        }
+        var hello = new WorkerTransportHello(
+            TransportSchema,
+            3,
+            "hello",
+            1,
+            Convert.ToHexString(transport.Session.NonceHash).ToLowerInvariant(),
+            Convert.ToHexString(transport.Session.ManifestHash).ToLowerInvariant(),
+            RuntimeIdentity.ManifestHashHex,
+            workerBinaryHash,
+            RuntimeIdentity.DecompilerAssemblySha256,
+            WorkerBuildId,
+            buildHash);
+        await transport.SendPayloadAsync(1, WorkerProtocol.Serialize(hello), CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private static async Task ReceiveCancellationAsync(AuthenticatedTransport transport, ActiveJob job)
+    {
+        var payload = await transport.ReceivePayloadAsync(2, CancellationToken.None).ConfigureAwait(false);
+        var cancellation = WorkerProtocol.Deserialize<WorkerCancellation>(payload);
+        ValidateCancellation(cancellation, job.Request);
+        job.Cancellation.Cancel();
+    }
+
+    private static async Task<string> RunJobAsync(ActiveJob job)
+    {
         WorkerFailure? failure = null;
         string? payload = null;
         ResourceBudgetGuard? resources = null;
@@ -95,130 +102,101 @@ internal static class Program
             using var bounded = CancellationTokenSource.CreateLinkedTokenSource(linked.Token, resources.LimitToken);
             var candidate = await Task.Run(() => MetadataAnalysis.Analyze(job.Request, resources, bounded.Token), bounded.Token).ConfigureAwait(false);
             var candidatePayload = WorkerProtocol.Serialize(candidate);
-            if (Encoding.UTF8.GetByteCount(candidatePayload) > MaximumWireBytes)
+            if (Encoding.UTF8.GetByteCount(candidatePayload) > AuthenticatedTransport.MaximumPayloadBytes)
                 throw new ResourceLimitException(ResourceLimitKind.Memory);
             resources.Checkpoint(bounded.Token);
             await resources.CompleteAsync().ConfigureAwait(false);
-            result = candidate;
             payload = candidatePayload;
         }
         catch (OperationCanceledException)
         {
             if (resources?.LimitExceeded == true)
             {
-                failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                    "resource_limit", "managed_cli.resource_limit", 100, false);
+                failure = Failure(job.Request, "resource_limit", "managed_cli.resource_limit", false);
             }
             else
             {
                 var deadlineExceeded = deadline.IsCancellationRequested && !job.Cancellation.IsCancellationRequested;
-                failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
+                failure = Failure(job.Request,
                     deadlineExceeded ? "deadline_exceeded" : "cancelled",
-                    deadlineExceeded ? "managed_cli.deadline_exceeded" : "managed_cli.cancelled", 100, false);
+                    deadlineExceeded ? "managed_cli.deadline_exceeded" : "managed_cli.cancelled", false);
             }
         }
         catch (ResourceLimitException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "resource_limit", "managed_cli.resource_limit", 100, false);
+            failure = Failure(job.Request, "resource_limit", "managed_cli.resource_limit", false);
         }
         catch (OutOfMemoryException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "resource_limit", "managed_cli.resource_limit", 100, false);
+            failure = Failure(job.Request, "resource_limit", "managed_cli.resource_limit", false);
         }
-        catch (OfflineIntegrityException)
+        catch (RuntimeIntegrityException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "worker_integrity_failure", "managed_cli.offline_integrity", 100, false);
+            failure = Failure(job.Request, "worker_integrity_failure", "managed_cli.runtime_integrity", false);
         }
         catch (BadImageFormatException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "malformed_metadata", "managed_cli.malformed_metadata", 100, false);
+            failure = Failure(job.Request, "malformed_metadata", "managed_cli.malformed_metadata", false);
         }
         catch (InvalidDataException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "malformed_metadata", "managed_cli.malformed_metadata", 100, false);
+            failure = Failure(job.Request, "malformed_metadata", "managed_cli.malformed_metadata", false);
         }
         catch (FileNotFoundException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "unresolved_reference", "managed_cli.unresolved_reference", 100, false);
+            failure = Failure(job.Request, "unresolved_reference", "managed_cli.unresolved_reference", false);
         }
         catch (UnauthorizedAccessException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "provider_failure", "managed_cli.access_denied", 100, false);
+            failure = Failure(job.Request, "provider_failure", "managed_cli.access_denied", false);
         }
         catch (IOException)
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "provider_failure", "managed_cli.io_failure", 100, true);
+            failure = Failure(job.Request, "provider_failure", "managed_cli.io_failure", true);
         }
-        catch (Exception)
+        catch
         {
-            failure = Failure(job.Request.Sequence, job.Request.RequestId, job.Request.ModuleHash, job.Request.MetadataToken,
-                "provider_failure", "managed_cli.provider_failure", 100, false);
+            failure = Failure(job.Request, "provider_failure", "managed_cli.provider_failure", false);
         }
         finally
         {
             if (resources is not null)
                 await resources.DisposeAsync().ConfigureAwait(false);
-            lock (ActiveGate)
-            {
-                if (ReferenceEquals(activeJob, job))
-                    activeJob = null;
-            }
         }
 
-        await WriteLineAsync(payload ?? WorkerProtocol.Serialize(result ?? failure!)).ConfigureAwait(false);
+        return payload ?? WorkerProtocol.Serialize(failure!);
     }
 
-    private static void ValidateCancellation(WorkerCancellation cancellation)
+    private static void ValidateCancellation(WorkerCancellation cancellation, WorkerRequest request)
     {
         if (!string.Equals(cancellation.Schema, WorkerProtocol.Schema, StringComparison.Ordinal) || cancellation.SchemaVersion != WorkerProtocol.Version ||
-            !string.Equals(cancellation.Kind, "cancel", StringComparison.Ordinal) || cancellation.Sequence == 0 ||
-            string.IsNullOrWhiteSpace(cancellation.RequestId) || cancellation.RequestId.Length > 128 || cancellation.RequestId.Contains('\0') ||
+            !string.Equals(cancellation.Kind, "cancel", StringComparison.Ordinal) || cancellation.Sequence != request.Sequence + 1 ||
+            !string.Equals(cancellation.RequestId, request.RequestId, StringComparison.Ordinal) ||
+            !string.Equals(cancellation.RequestBindingHash, request.RequestBindingHash, StringComparison.Ordinal) ||
             string.IsNullOrWhiteSpace(cancellation.StableReason) || cancellation.StableReason.Length > 256 || cancellation.StableReason.Contains('\0'))
-            throw new InvalidDataException("worker cancellation violates the offline contract");
+            throw new InvalidDataException("managed worker cancellation violates the authenticated request contract");
     }
 
-    private static WorkerFailure Failure(
-        ulong sequence,
-        string requestId,
-        string moduleHash,
-        uint metadataToken,
-        string code,
-        string key,
-        byte confidence,
-        bool retryable)
+    private static WorkerFailure Failure(WorkerRequest request, string code, string key, bool retryable)
     {
         return new WorkerFailure(
             WorkerProtocol.Schema,
             WorkerProtocol.Version,
             "failure",
-            sequence,
-            requestId,
-            moduleHash,
-            metadataToken,
-            OfflinePackageLock.ManifestHashHex,
-            new[] { new WorkerDiagnostic("error", code, key, Array.Empty<string>(), null, confidence, retryable, 1) });
-    }
-
-    private static async Task WriteLineAsync(string value)
-    {
-        await OutputGate.WaitAsync().ConfigureAwait(false);
-        try
-        {
-            await Console.Out.WriteLineAsync(value).ConfigureAwait(false);
-            await Console.Out.FlushAsync().ConfigureAwait(false);
-        }
-        finally
-        {
-            OutputGate.Release();
-        }
+            request.Sequence,
+            request.RequestId,
+            request.ModuleSource,
+            request.EntityHash,
+            request.MetadataToken,
+            request.WorkspaceGeneration,
+            request.TypeGraphRevision,
+            request.Budget,
+            RuntimeIdentity.ManifestHashHex,
+            request.ContractHash,
+            request.CacheIdentity,
+            request.RequestBindingHash,
+            request.Provider,
+            new[] { new WorkerDiagnostic("error", code, key, Array.Empty<string>(), null, 100, retryable, 1) });
     }
 
     private sealed class ActiveJob

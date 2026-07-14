@@ -1,20 +1,31 @@
 {
-  "schema": "aida.c03.malformed-cases",
-  "schema_version": 1,
-  "source": {
-    "path": "src/standalone/tests/c03/fixtures/corpus_generator_recipes.json",
-    "sha256": "1ab887cc868b81e3cbc30c3fd840d287d8c68dc67b4047682d69d1dc5e4053d5"
-  },
-  "license": {
-    "spdx": "CC0-1.0",
-    "redistribution": true
-  },
-  "cases": [
-    {"id":"pe32-x86-truncated","source_fixture_id":"pe32-x86","kind":"truncated","mutation":"truncate_after_dos_header","expected_error_codes":["pe_truncated_header"],"max_wall_ms":250,"max_private_bytes":67108864},
-    {"id":"zip64-bomb","source_fixture_id":"zip64-x64","kind":"zip_bomb","mutation":"inflate_ratio_exceeds_contract","expected_error_codes":["container_resource_limit"],"max_wall_ms":500,"max_private_bytes":134217728},
-    {"id":"dex-overflow","source_fixture_id":"dex-dalvik","kind":"integer_overflow","mutation":"string_data_offset_plus_size_overflow","expected_error_codes":["dex_offset_overflow"],"max_wall_ms":250,"max_private_bytes":67108864},
-    {"id":"cli-invalid-signature","source_fixture_id":"cli-x64","kind":"invalid_signature","mutation":"clear_cli_metadata_signature","expected_error_codes":["cli_invalid_metadata_signature"],"max_wall_ms":250,"max_private_bytes":67108864},
-    {"id":"macho-fat-invalid-offset","source_fixture_id":"macho-fat-x64-arm64","kind":"invalid_offset","mutation":"fat_arch_offset_out_of_range","expected_error_codes":["macho_offset_out_of_range"],"max_wall_ms":250,"max_private_bytes":67108864},
-    {"id":"apk-invalid-length","source_fixture_id":"apk-multidex","kind":"invalid_length","mutation":"zip_member_length_exceeds_container","expected_error_codes":["container_member_length_invalid"],"max_wall_ms":500,"max_private_bytes":134217728}
+  "schema":"aida.c03.malformed-cases",
+  "schema_version":1,
+  "source":{"path":"src/standalone/tests/c03/fixtures/corpus_generator_recipes.json","sha256":"e7e851b4fd853c35eced6cd060f73b82ee79fcdb8e5866c5cab0793785f24fa4"},
+  "license":{"spdx":"CC0-1.0","redistribution":true},
+  "target_execution_forbidden":true,
+  "cases":[
+    {"id":"pe32-truncated","source_fixture_id":"pe32-x86","kind":"truncated","mutation":"pe32_truncate_optional_header","expected_error_codes":["pe_truncated_header"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"pe64-overlap","source_fixture_id":"pe32plus-x64","kind":"overlapping_range","mutation":"pe64_overlap_section_ranges","expected_error_codes":["pe_section_overlap"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"coff-count-overflow","source_fixture_id":"coff-x64","kind":"integer_overflow","mutation":"coff_symbol_count_overflow","expected_error_codes":["coff_count_overflow"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"static-library-recursive","source_fixture_id":"static-library-x64","kind":"recursive_collection","mutation":"static_archive_recursive_member","expected_error_codes":["collection_depth_limit"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"import-library-bad-member","source_fixture_id":"import-library-x64","kind":"invalid_length","mutation":"import_archive_member_length_out_of_range","expected_error_codes":["archive_member_length_invalid"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"cli-signature","source_fixture_id":"cli-x64","kind":"invalid_signature","mutation":"cli_clear_metadata_signature","expected_error_codes":["cli_invalid_metadata_signature"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"readytorun-count","source_fixture_id":"readytorun-x64","kind":"invalid_count","mutation":"readytorun_section_count_exceeds_directory","expected_error_codes":["readytorun_section_count_invalid"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"elf32-endian","source_fixture_id":"elf32-x86-le","kind":"endian_mismatch","mutation":"elf32_flip_encoding_without_swapping","expected_error_codes":["elf_endian_header_invalid"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"elf64-offset","source_fixture_id":"elf64-x64-le","kind":"invalid_offset","mutation":"elf64_program_header_offset_out_of_range","expected_error_codes":["elf_offset_out_of_range"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"macho-thin-count","source_fixture_id":"macho64-arm64","kind":"invalid_count","mutation":"macho_load_command_count_exceeds_size","expected_error_codes":["macho_load_command_count_invalid"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"macho-fat-offset","source_fixture_id":"macho-fat-x64-arm64","kind":"invalid_offset","mutation":"macho_fat_slice_offset_out_of_range","expected_error_codes":["macho_offset_out_of_range"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"zip-length","source_fixture_id":"zip-x64","kind":"invalid_length","mutation":"zip_member_length_exceeds_container","expected_error_codes":["container_member_length_invalid"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"zip64-bomb","source_fixture_id":"zip64-x64","kind":"zip_bomb","mutation":"zip64_inflate_ratio_exceeds_contract","expected_error_codes":["container_resource_limit"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"apk-duplicate-dex","source_fixture_id":"apk-multidex","kind":"duplicate_identity","mutation":"apk_duplicate_classes_dex_identity","expected_error_codes":["collection_duplicate_member"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"aab-recursion","source_fixture_id":"aab-multidex","kind":"recursive_collection","mutation":"aab_module_archive_cycle","expected_error_codes":["collection_cycle"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"dex-overflow","source_fixture_id":"dex-dalvik","kind":"integer_overflow","mutation":"dex_string_offset_plus_size_overflow","expected_error_codes":["dex_offset_overflow"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"oat-version","source_fixture_id":"oat-arm64","kind":"invalid_signature","mutation":"oat_unknown_version_signature","expected_error_codes":["oat_version_unsupported"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"vdex-checksum","source_fixture_id":"vdex-arm64","kind":"invalid_checksum","mutation":"vdex_embedded_dex_checksum_mismatch","expected_error_codes":["vdex_checksum_mismatch"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"ipa-traversal","source_fixture_id":"ipa-objc-swift","kind":"invalid_encoding","mutation":"ipa_member_path_traversal_utf8","expected_error_codes":["container_member_path_invalid"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"jar-duplicate-class","source_fixture_id":"jar-jvm","kind":"duplicate_identity","mutation":"jar_duplicate_class_identity","expected_error_codes":["collection_duplicate_member"],"max_wall_ms":500,"max_private_bytes":134217728,"target_execution_forbidden":true},
+    {"id":"classfile-pool-count","source_fixture_id":"classfile-jvm","kind":"invalid_count","mutation":"class_constant_pool_count_overflow","expected_error_codes":["class_constant_pool_invalid"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true},
+    {"id":"raw-invalid-mode","source_fixture_id":"raw-thumb","kind":"invalid_architecture","mutation":"raw_thumb_odd_range_identity_mismatch","expected_error_codes":["architecture_mode_mismatch"],"max_wall_ms":250,"max_private_bytes":67108864,"target_execution_forbidden":true}
   ]
 }

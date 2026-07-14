@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace aida {
@@ -212,10 +213,22 @@ public:
         std::optional<std::uint64_t> address,
         workbench_shell_workspace_context_t& output);
 
+    workbench_error_t activate_entity_document(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_kind_t kind,
+        std::string_view canonical_provider_key,
+        workbench_shell_workspace_context_t& output);
+
     workbench_error_t close_document(
         const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
         document_kind_t kind,
         std::optional<std::uint64_t> address,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t close_entity_document(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_kind_t kind,
+        std::string_view canonical_provider_key,
         workbench_shell_workspace_context_t& output);
 
     workbench_error_t navigate_document(
@@ -225,6 +238,23 @@ public:
         const selection_context_t& selection,
         const document_local_cursor_t& cursor,
         workbench_shell_workspace_context_t& output);
+
+    workbench_error_t navigate_entity_document(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_kind_t kind,
+        std::string_view canonical_provider_key,
+        const selection_context_t& selection,
+        const document_local_cursor_t& cursor,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t dispatch_host_command(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        document_host::document_host_dispatch_t dispatch,
+        workbench_command_result_t& result,
+        workbench_shell_workspace_context_t& output);
+
+    std::vector<std::shared_ptr<analysis::analysis_workspace_t>>
+        analysis_workspaces() const;
 
     workbench_error_t close_analysis_workspace(
         const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace);

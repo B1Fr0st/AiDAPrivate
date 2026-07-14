@@ -1,4 +1,5 @@
 #include "../../src/core/analysis/workspace/c03_analysis_contracts.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include <array>
 #include <cstddef>
@@ -42,6 +43,8 @@ static_assert(static_cast<std::uint16_t>(contract_error_code_t::invalid_decompil
 
 void require(bool condition, std::string_view message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -49,7 +52,10 @@ void require(bool condition, std::string_view message)
 template <typename value_t>
 value_t require_value(contract_result_t<value_t> result, std::string_view message)
 {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ":" + std::string(result.error().stable_code));
     return std::move(result).take_value();
 }
@@ -1189,6 +1195,7 @@ int main()
         std::cout << "analysis contracts harness passed\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << "analysis contracts harness failed: " << error.what() << '\n';
         return 1;
     }

@@ -1,0 +1,37 @@
+{
+  "schema": "aida.c03.native-worker-manifest-source",
+  "schema_version": 2,
+  "artifact": {
+    "format": "aida.native-worker-manifest",
+    "magic": "NWMF",
+    "byte_order": "little-endian",
+    "schema_version": 2,
+    "relative_path": "deps/AiDA_NativeDecompilerWorker.manifest.bin",
+    "digest_relative_path": "deps/AiDA_NativeDecompilerWorker.manifest.sha256",
+    "digest_format": "lowercase-hex-newline"
+  },
+  "worker": {
+    "relative_path": "deps/AiDA_NativeDecompilerWorker.exe",
+    "provider": {
+      "id": 1,
+      "name": "aida-native-decompiler",
+      "version": "2",
+      "worker_build_id": "aida-native-decompiler-worker-v3",
+      "worker_build_hash_material": "aida-native-decompiler-worker-build-v3|bounded-printc-evidence"
+    },
+    "protocol": {
+      "version": 3,
+      "hash_material": "aida.isolated-decompiler.worker.frame.v3|bootstrap.v1|hmac-sha256|strict-sequence|readonly-provider-input|attested-provider-artifacts|bounded-native-printc-evidence|control-frame-8m|result-frame-80m|provider-artifacts-48m|printc-8m"
+    },
+    "capabilities": ["decompile"],
+    "startup_arguments": []
+  },
+  "materialization": {
+    "worker_binary_hash": "",
+    "provider_binary_hash": "",
+    "manifest_digest": "",
+    "worker_lock": "deny-write-and-delete-while-hashing",
+    "atomic_write": true,
+    "verify_after_write": true
+  }
+}

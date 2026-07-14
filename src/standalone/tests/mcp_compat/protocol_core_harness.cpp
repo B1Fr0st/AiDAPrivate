@@ -1,4 +1,5 @@
 #include "protocol_core_harness.hpp"
+#include "../c03/assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/mcp/protocol/mcp_tool_contract.hpp"
 
@@ -53,14 +54,18 @@ tool_contract_t make_contract() {
 }
 
 bool has_error_code(const mcp_result_t& result, std::string_view code) {
-    return result.is_error() && result.error_code() == code &&
+    const bool accepted = result.is_error() && result.error_code() == code &&
            result.envelope()["structuredContent"]["error"]["code"] == std::string(code);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, code, __FILE__, __LINE__);
+	return accepted;
 }
 
 }
 
 bool run_protocol_core_harness(std::string& failure) {
     const auto reject = [&failure](std::string_view message) {
+		aida::analysis::c03_test::assertion_telemetry::record_assertion(false, message, __FILE__, __LINE__);
         failure.assign(message.data(), message.size());
         return false;
     };
@@ -204,6 +209,8 @@ bool run_protocol_core_harness(std::string& failure) {
     }
 
     failure.clear();
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		true, "MCP protocol core contract satisfied", __FILE__, __LINE__);
     return true;
 }
 

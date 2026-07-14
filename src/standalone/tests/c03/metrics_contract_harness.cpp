@@ -1,4 +1,5 @@
 #include "metrics_contract_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/analysis_resource_metrics.hpp"
 
@@ -153,6 +154,7 @@ static_assert(has_contiguous_ordinals(expected_sla_validities),
 
 void require(bool condition, std::string_view message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -576,6 +578,7 @@ int run_metrics_contract_harness()
         std::cout << "metrics contract harness passed\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << "metrics contract harness failed: " << error.what() << '\n';
         return 1;
     }

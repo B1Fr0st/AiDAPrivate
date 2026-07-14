@@ -19,9 +19,9 @@
 namespace aida::analysis::native_worker::runtime {
 
 inline constexpr char k_provider_name[] = "aida-native-decompiler";
-inline constexpr char k_provider_version[] = "1";
-inline constexpr char k_worker_build_id[] = "aida-native-decompiler-worker-v1";
-inline constexpr char k_worker_build_hash_material[] = "aida-native-decompiler-worker-build-v1";
+inline constexpr char k_provider_version[] = "2";
+inline constexpr char k_worker_build_id[] = "aida-native-decompiler-worker-v3";
+inline constexpr char k_worker_build_hash_material[] = "aida-native-decompiler-worker-build-v3|bounded-printc-evidence";
 
 struct startup_t {
     HANDLE read_handle = nullptr;
@@ -229,7 +229,23 @@ inline bool send_failures(startup_t& startup, std::uint64_t job_id,
     for (std::uint32_t index = 0; index < diagnostics.size(); ++index)
         diagnostics[index].ordinal = index + 1U;
     failure.diagnostics = std::move(diagnostics);
-    return send_message(startup, decompiler_worker_message_t{std::move(failure)}, 8U * 1024U * 1024U);
+    bool bounded = false;
+    try {
+        const auto payload = serialize_decompiler_worker_message(
+            decompiler_worker_message_t{failure});
+        bounded = !payload.empty() &&
+            payload.size() <= k_decompiler_worker_control_frame_max_bytes;
+    } catch (...) {
+        bounded = false;
+    }
+    if (!bounded) {
+        failure.diagnostics.clear();
+        failure.diagnostics.push_back(failure_diagnostic(
+            decompiler_diagnostic_code_t::resource_limit,
+            "decompiler.isolated_worker.failure_frame_limit"));
+    }
+    return send_message(startup, decompiler_worker_message_t{std::move(failure)},
+        k_decompiler_worker_control_frame_max_bytes);
 }
 
 inline bool send_failure(startup_t& startup, std::uint64_t job_id, decompiler_diagnostic_code_t code,
@@ -240,8 +256,54 @@ inline bool send_failure(startup_t& startup, std::uint64_t job_id, decompiler_di
     return send_failures(startup, job_id, std::move(diagnostics));
 }
 
-inline bool send_document(startup_t& startup, std::uint64_t job_id,
-                          std::string provider_artifacts, decompiler_document_t document)
+enum class document_send_status_t : std::uint8_t {
+    sent,
+    resource_limit,
+    invalid_contract,
+    transport_failure
+};
+
+inline document_send_status_t classify_document_payload_size(const std::size_t size) noexcept
+{
+    return size != 0 && size <= k_decompiler_worker_result_frame_max_bytes
+        ? document_send_status_t::sent
+        : document_send_status_t::resource_limit;
+}
+
+struct prepared_document_payload_t final {
+    document_send_status_t status = document_send_status_t::invalid_contract;
+    std::string payload;
+};
+
+inline prepared_document_payload_t prepare_document_payload(
+    const decompiler_worker_document_message_t& message) noexcept
+{
+    prepared_document_payload_t prepared;
+    if (message.provider_artifacts.empty() ||
+        message.provider_artifacts.size() > k_decompiler_worker_provider_artifacts_max_bytes ||
+        (message.printc_evidence &&
+            (message.printc_evidence->empty() ||
+             message.printc_evidence->size() > k_decompiler_worker_printc_evidence_max_bytes))) {
+        prepared.status = document_send_status_t::resource_limit;
+        return prepared;
+    }
+    try {
+        prepared.payload = serialize_decompiler_worker_message(
+            decompiler_worker_message_t{message});
+    } catch (...) {
+        prepared.status = document_send_status_t::invalid_contract;
+        return prepared;
+    }
+    prepared.status = classify_document_payload_size(prepared.payload.size());
+    if (prepared.status != document_send_status_t::sent)
+        prepared.payload.clear();
+    return prepared;
+}
+
+inline document_send_status_t send_document(startup_t& startup, std::uint64_t job_id,
+                                             std::string provider_artifacts,
+                                             decompiler_document_t document,
+                                             std::optional<std::string> printc_evidence = {})
 {
     decompiler_worker_document_message_t result;
     result.envelope.kind = decompiler_worker_message_kind_t::document;
@@ -250,8 +312,21 @@ inline bool send_document(startup_t& startup, std::uint64_t job_id,
     result.job_id = job_id;
     result.provider_artifacts_hash = stable_serialization_hash(provider_artifacts);
     result.provider_artifacts = std::move(provider_artifacts);
+    if (printc_evidence) {
+        result.printc_evidence_hash = stable_serialization_hash(*printc_evidence);
+        result.printc_evidence = std::move(printc_evidence);
+    }
     result.document = std::move(document);
-    return send_message(startup, decompiler_worker_message_t{std::move(result)}, 64U * 1024U * 1024U);
+    const auto prepared = prepare_document_payload(result);
+    if (prepared.status != document_send_status_t::sent)
+        return prepared.status;
+    DWORD error = ERROR_SUCCESS;
+    if (!wire::send_frame(startup.write_handle, startup.session,
+        wire::frame_kind_t::decompiler_contract, startup.next_worker_sequence++,
+        reinterpret_cast<const std::uint8_t*>(prepared.payload.data()),
+        prepared.payload.size(), k_decompiler_worker_result_frame_max_bytes, error))
+        return document_send_status_t::transport_failure;
+    return document_send_status_t::sent;
 }
 
 inline bool send_hello(startup_t& startup, const decompiler_provider_identity_t& provider, const sha256_digest_t& manifest_hash)
@@ -262,7 +337,8 @@ inline bool send_hello(startup_t& startup, const decompiler_provider_identity_t&
     hello.envelope.sequence = startup.next_worker_sequence;
     hello.provider = provider;
     hello.manifest_hash = manifest_hash;
-    return send_message(startup, decompiler_worker_message_t{std::move(hello)}, 8U * 1024U * 1024U);
+    return send_message(startup, decompiler_worker_message_t{std::move(hello)},
+        k_decompiler_worker_control_frame_max_bytes);
 }
 
 inline std::optional<decompiler_worker_job_request_t> receive_job(startup_t& startup, std::chrono::milliseconds timeout)
@@ -272,7 +348,7 @@ inline std::optional<decompiler_worker_job_request_t> receive_job(startup_t& sta
         wire::frame_t frame;
         DWORD error = ERROR_SUCCESS;
         const auto state = startup.reader.poll(startup.read_handle, startup.session, startup.next_host_sequence,
-            8U * 1024U * 1024U, frame, error);
+            k_decompiler_worker_control_frame_max_bytes, frame, error);
         if (state == wire::read_state_t::failure)
             return std::nullopt;
         if (state == wire::read_state_t::complete) {
@@ -312,7 +388,7 @@ inline std::optional<decompiler_worker_cancel_request_t> receive_cancel(startup_
         wire::frame_t frame;
         DWORD error = ERROR_SUCCESS;
         const auto state = startup.reader.poll(startup.read_handle, startup.session, startup.next_host_sequence,
-            8U * 1024U * 1024U, frame, error);
+            k_decompiler_worker_control_frame_max_bytes, frame, error);
         if (state == wire::read_state_t::failure)
             return std::nullopt;
         if (state == wire::read_state_t::complete) {

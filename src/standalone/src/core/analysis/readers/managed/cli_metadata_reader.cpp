@@ -19,6 +19,20 @@ workspace_error_t cli_error(workspace_error_code_t code, std::string message,
     return error;
 }
 
+workspace_error_t cli_stop_error(
+    const cancellation_token_t& cancel,
+    std::string message,
+    std::string phase) {
+    auto error = cli_error(
+        cancel.deadline_exceeded()
+            ? workspace_error_code_t::deadline_exceeded
+            : workspace_error_code_t::cancelled,
+        std::move(message), std::move(phase));
+    error.deadline = cancel.deadline_exceeded();
+    error.cancellation = !error.deadline;
+    return error;
+}
+
 bool span_within(std::uint64_t offset, std::uint64_t size, std::uint64_t limit) noexcept {
     return offset <= limit && size <= limit - offset;
 }
@@ -376,10 +390,8 @@ private:
         if (!cancel_.stop_requested())
             return true;
         if (!failed_) {
-            error_ = cli_error(cancel_.deadline_exceeded()
-                                   ? workspace_error_code_t::deadline_exceeded
-                                   : workspace_error_code_t::cancelled,
-                               "CLI metadata parsing cancelled", phase);
+            error_ = cli_stop_error(
+                cancel_, "CLI metadata parsing cancelled", phase);
             failed_ = true;
         }
         return false;
@@ -1230,7 +1242,7 @@ parse_cli_metadata(const byte_provider_t& provider,
                    const cancellation_token_t& cancel) {
     if (cancel.stop_requested())
         return workspace_result_t<cli_metadata_t>::failure(
-            cli_error(workspace_error_code_t::cancelled, "CLI metadata parsing cancelled", "cli.init"));
+            cli_stop_error(cancel, "CLI metadata parsing cancelled", "cli.init"));
     auto pe_result = parse_pe_image(provider, {}, cancel);
     if (!pe_result)
         return workspace_result_t<cli_metadata_t>::failure(std::move(pe_result.error()));
@@ -1315,15 +1327,16 @@ build_cli_artifact(const cli_metadata_t& metadata,
     artifact.module_identity.runtime_major = metadata.header.major_version;
     artifact.module_identity.runtime_minor = metadata.header.minor_version;
     auto hash_result = provider.compute_content_sha256(cancel);
-    if (hash_result)
-        artifact.module_identity.artifact_hash = hash_result.value();
+    if (!hash_result)
+        return workspace_result_t<managed_artifact_t>::failure(hash_result.error());
+    artifact.module_identity.artifact_hash = hash_result.take_value();
 
     std::vector<managed_type_identity_t> type_identities;
     type_identities.reserve(metadata.type_defs.size());
     for (std::uint32_t row = 0; row < static_cast<std::uint32_t>(metadata.type_defs.size()); ++row) {
         if (cancel.stop_requested())
             return workspace_result_t<managed_artifact_t>::failure(
-                cli_error(workspace_error_code_t::cancelled, "CLI artifact building cancelled", "cli.build"));
+                cli_stop_error(cancel, "CLI artifact building cancelled", "cli.build"));
         const auto& td = metadata.type_defs[row];
         managed_type_identity_t type;
         type.namespace_name = td.type_namespace;
@@ -1372,7 +1385,7 @@ build_cli_artifact(const cli_metadata_t& metadata,
     for (std::uint32_t row = 0; row < static_cast<std::uint32_t>(metadata.method_defs.size()); ++row) {
         if (cancel.stop_requested())
             return workspace_result_t<managed_artifact_t>::failure(
-                cli_error(workspace_error_code_t::cancelled, "CLI artifact building cancelled", "cli.build"));
+                cli_stop_error(cancel, "CLI artifact building cancelled", "cli.build"));
         const auto& md = metadata.method_defs[row];
         managed_method_identity_t method;
         method.method_name = md.name;
@@ -1435,7 +1448,7 @@ build_cli_artifact(const cli_metadata_t& metadata,
     for (std::uint32_t row = 0; row < static_cast<std::uint32_t>(metadata.fields.size()); ++row) {
         if (cancel.stop_requested())
             return workspace_result_t<managed_artifact_t>::failure(
-                cli_error(workspace_error_code_t::cancelled, "CLI artifact building cancelled", "cli.build"));
+                cli_stop_error(cancel, "CLI artifact building cancelled", "cli.build"));
         const auto& fd = metadata.fields[row];
         managed_field_identity_t field;
         field.field_name = fd.name;
@@ -1586,12 +1599,13 @@ build_cli_artifact(const cli_metadata_t& metadata,
     }
 
     if (metadata.pe_image) {
-        artifact.normalized.format = format_id_t::pe32_plus;
+        artifact.normalized.format = metadata.pe_image->format();
         artifact.normalized.architecture = metadata.pe_image->architecture();
         artifact.normalized.architecture_mode = metadata.pe_image->architecture_mode();
         artifact.normalized.abi = metadata.pe_image->abi();
         artifact.normalized.endian = metadata.pe_image->endian();
-        artifact.normalized.address_width_bits = 64;
+        artifact.normalized.address_width_bits =
+            metadata.pe_image->format() == format_id_t::pe32 ? 32 : 64;
         artifact.normalized.image_base = metadata.pe_image->image_base();
         artifact.normalized.image_size = metadata.pe_image->image_size();
         artifact.normalized.header_size = metadata.pe_image->headers_size();

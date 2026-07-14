@@ -1,0 +1,29 @@
+{
+  "schema": "aida.c03.external-sla-qualification-policy",
+  "schema_version": 1,
+  "artifact": {
+    "minimum_bytes": 300000000,
+    "maximum_bytes": 500000000,
+    "minimum_file_backed_executable_bytes": 67108864,
+    "minimum_code_density": 0.1,
+    "maximum_zero_ratio": 0.8,
+    "allowed_code_images": ["pe32", "pe32plus", "elf32", "elf64", "macho32", "macho64"],
+    "forbidden_substitutes": ["pdb", "static_library", "installer_only", "archive_only", "zero_padded", "fabricated", "synthetic_only"]
+  },
+  "provenance": {
+    "required_fields": ["path", "size_bytes", "format", "architecture", "architecture_mode", "endian", "production_identity", "version", "sha256", "license_spdx", "redistribution"],
+    "artifact_bytes_must_be_local": true,
+    "download_forbidden": true,
+    "target_execution_forbidden": true
+  },
+  "measurement": {
+    "minimum_samples": 5,
+    "required_cache_states": ["cold", "warm"],
+    "required_evidence": ["hardware", "storage", "cache", "phase_timing", "memory", "mapped_windows", "spill", "query", "cancellation", "concurrent_fairness", "heartbeats", "warm_reopen"],
+    "receipt_validation_required": true
+  },
+  "license": {
+    "allowed_spdx": ["CC0-1.0", "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib"],
+    "redistribution_required": true
+  }
+}

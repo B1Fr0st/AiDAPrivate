@@ -1,0 +1,118 @@
+{
+  "$id": "aida.c03.distribution-manifest-spec.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "generator", "distribution", "artifacts", "inventory_sources", "workers", "dependencies", "customer_sidecars"],
+  "properties": {
+    "schema": { "const": "aida.c03.distribution-manifest-spec" },
+    "schema_version": { "const": 2 },
+    "generator": {
+      "const": { "preset": "ninja-msvc-release", "no_network_fetch": true, "offline_only": true, "manifest_digest_algorithm": "sha256" }
+    },
+    "distribution": {
+      "const": { "disk_backed": true, "protected": true, "arc_license_gates_required": true, "acl_restricted_ipc": true, "raw_standalone_download_forbidden": true, "fileless_launch_forbidden": true, "exact_inventory": true, "package_layout": "self-contained" }
+    },
+    "artifacts": { "type": "array", "minItems": 1, "maxItems": 4096, "items": { "$ref": "#/$defs/artifact" } },
+    "inventory_sources": { "type": "array", "minItems": 5, "maxItems": 32, "items": { "type": "object" } },
+    "workers": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/worker" } },
+    "dependencies": { "type": "array", "minItems": 30, "maxItems": 30, "items": { "$ref": "#/$defs/dependency" } },
+    "customer_sidecars": { "$ref": "#/$defs/customer_sidecars" }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9_.-]+$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "relative_path": { "type": "string", "minLength": 1, "maxLength": 32768, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*:)[^\\u0000]+$" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "relative_path", "owner", "license_ids"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "kind": { "enum": ["application", "application_runtime", "worker_executable", "worker_runtime", "worker_manifest", "resource_manifest", "manifest_digest", "acl_receipt", "build_receipt", "protector_receipt", "signature_receipt", "browser", "reverse_mcp", "license", "notice", "dependency", "resource"] },
+        "relative_path": { "$ref": "#/$defs/relative_path" },
+        "owner": { "$ref": "#/$defs/identifier" },
+        "license_ids": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "hash_material_sha256", "worker_manifest_schema_version"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "version": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "hash_material_sha256": { "$ref": "#/$defs/sha256" },
+        "worker_manifest_schema_version": { "type": "integer", "minimum": 1, "maximum": 3 }
+      }
+    },
+    "containment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_object", "kill_on_parent_close", "restricted_token", "network_denied", "child_process_denied", "unrelated_handles_denied", "process_mitigations", "acl_restricted_ipc", "authenticated_ipc", "monotonic_sequence", "cpu_quota_ms", "memory_quota_bytes", "deadline_ms", "cancellation_replaces_worker"],
+      "properties": {
+        "job_object": { "const": true },
+        "kill_on_parent_close": { "const": true },
+        "restricted_token": { "const": true },
+        "network_denied": { "const": true },
+        "child_process_denied": { "const": true },
+        "unrelated_handles_denied": { "const": true },
+        "process_mitigations": { "const": true },
+        "acl_restricted_ipc": { "const": true },
+        "authenticated_ipc": { "const": true },
+        "monotonic_sequence": { "const": true },
+        "cpu_quota_ms": { "type": "integer", "minimum": 1, "maximum": 600000 },
+        "memory_quota_bytes": { "type": "integer", "minimum": 67108864, "maximum": 8589934592 },
+        "deadline_ms": { "type": "integer", "minimum": 1, "maximum": 600000 },
+        "cancellation_replaces_worker": { "const": true }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "executable_artifact", "worker_manifest_artifact", "worker_manifest_digest_artifact", "acl_receipt_artifact", "protector_receipt_artifact", "signature_receipt_artifact", "protocol", "containment", "target_execution_forbidden", "dependency_ids"],
+      "properties": {
+        "id": { "enum": ["native_decompiler", "managed_cli_decompiler", "analysis_python"] },
+        "executable_artifact": { "$ref": "#/$defs/identifier" },
+        "worker_manifest_artifact": { "$ref": "#/$defs/identifier" },
+        "worker_manifest_digest_artifact": { "$ref": "#/$defs/identifier" },
+        "acl_receipt_artifact": { "$ref": "#/$defs/identifier" },
+        "protector_receipt_artifact": { "$ref": "#/$defs/identifier" },
+        "signature_receipt_artifact": { "$ref": "#/$defs/identifier" },
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "containment": { "$ref": "#/$defs/containment" },
+        "target_execution_forbidden": { "const": true },
+        "dependency_ids": { "type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "usage", "license", "artifact_ids", "notice_artifact_ids", "dependencies"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "usage": { "enum": ["production", "build_only", "evidence_only", "non_use"] },
+        "license": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "artifact_ids": { "type": "array", "maxItems": 4096, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
+        "notice_artifact_ids": { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
+        "dependencies": { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } }
+      }
+    },
+    "customer_sidecars": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["only_supported_browser", "browser_artifact", "reverse_mcp_artifact", "developer_source_shipped", "loose_python_shipped", "stock_browser_fallback", "environment"],
+      "properties": {
+        "only_supported_browser": { "const": "camoufox" },
+        "browser_artifact": { "const": "camoufox-executable" },
+        "reverse_mcp_artifact": { "const": "camoufox-reverse-mcp" },
+        "developer_source_shipped": { "const": false },
+        "loose_python_shipped": { "const": false },
+        "stock_browser_fallback": { "const": false },
+        "environment": {
+          "const": { "AIDA_CAMOUFOX_EXECUTABLE": "verified-browser", "AIDA_CAMOUFOX_MCP_EXECUTABLE": "verified-frozen-sidecar", "AIDA_CAMOUFOX_PYTHON": "unset-unless-verified-sidecar-runtime" }
+        }
+      }
+    }
+  }
+}

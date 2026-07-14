@@ -1,4 +1,5 @@
 #include "overlay_journal_v9_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/overlay_apply_engine.hpp"
 
@@ -18,6 +19,7 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -501,6 +503,7 @@ int main()
         std::cout << "overlay_journal_v9_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         std::cerr << exception.what() << '\n';
         return 1;
     }

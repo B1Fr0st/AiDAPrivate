@@ -1,5 +1,7 @@
 #include "decompiler_contracts_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 #include "../../src/core/analysis/decompiler/decompiler_contracts.hpp"
+#include "../../workers/native_decompiler/native_worker_runtime.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -11,6 +13,7 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -503,7 +506,13 @@ void verify_worker_variants(
     job.cache_key = cache;
     job.profile = cache.profile;
     job.snapshot_hash = digest("snapshot");
+    job.request_printc_evidence = true;
     verify_worker_round_trip(decompiler_worker_message_t{job}, "worker job decode failed");
+
+    auto wrong_printc_provider = job;
+    wrong_printc_provider.cache_key.provider.provider = decompiler_provider_id_t::ilspy_cli;
+    require(!validate_decompiler_worker_message(decompiler_worker_message_t{wrong_printc_provider}).valid(),
+        "worker job accepted PrintC evidence for a managed provider");
 
     auto profile_mismatch = job;
     profile_mismatch.profile = profile(decompiler_profile_id_t::fast);
@@ -529,8 +538,90 @@ void verify_worker_variants(
     decompiler_worker_document_message_t document_message;
     document_message.envelope = worker_envelope(decompiler_worker_message_kind_t::document, 4);
     document_message.job_id = 17;
+    document_message.provider_artifacts = "authenticated-provider-artifacts";
+    document_message.provider_artifacts_hash = stable_serialization_hash(document_message.provider_artifacts);
+    document_message.printc_evidence = "int fixture(void) { return 7; }";
+    document_message.printc_evidence_hash = stable_serialization_hash(*document_message.printc_evidence);
     document_message.document = document_value;
     verify_worker_round_trip(decompiler_worker_message_t{document_message}, "worker document decode failed");
+    const auto prepared_document = native_worker::runtime::prepare_document_payload(
+        document_message);
+    require(prepared_document.status == native_worker::runtime::document_send_status_t::sent &&
+        !prepared_document.payload.empty() &&
+        prepared_document.payload.size() <= k_decompiler_worker_result_frame_max_bytes,
+        "worker pre-send path rejected a valid combined document payload");
+
+    auto boundary_provider_artifacts = document_message;
+    boundary_provider_artifacts.provider_artifacts.assign(
+        k_decompiler_worker_provider_artifacts_max_bytes, 'p');
+    boundary_provider_artifacts.provider_artifacts_hash =
+        stable_serialization_hash(boundary_provider_artifacts.provider_artifacts);
+    require(validate_decompiler_worker_message(
+        decompiler_worker_message_t{boundary_provider_artifacts}).valid(),
+        "worker document rejected provider artifacts at the exact bound");
+
+    auto oversized_provider_artifacts = boundary_provider_artifacts;
+    oversized_provider_artifacts.provider_artifacts.push_back('p');
+    oversized_provider_artifacts.provider_artifacts_hash =
+        stable_serialization_hash(oversized_provider_artifacts.provider_artifacts);
+    require(!validate_decompiler_worker_message(
+        decompiler_worker_message_t{oversized_provider_artifacts}).valid(),
+        "worker document accepted provider artifacts one byte above the bound");
+
+    auto boundary_printc = document_message;
+    boundary_printc.printc_evidence = std::string(
+        k_decompiler_worker_printc_evidence_max_bytes, 'c');
+    boundary_printc.printc_evidence_hash =
+        stable_serialization_hash(*boundary_printc.printc_evidence);
+    require(validate_decompiler_worker_message(
+        decompiler_worker_message_t{boundary_printc}).valid(),
+        "worker document rejected PrintC evidence at the exact bound");
+
+    auto combined_boundary = boundary_provider_artifacts;
+    combined_boundary.printc_evidence = std::string(
+        k_decompiler_worker_printc_evidence_max_bytes, 'c');
+    combined_boundary.printc_evidence_hash =
+        stable_serialization_hash(*combined_boundary.printc_evidence);
+    const auto prepared_boundary = native_worker::runtime::prepare_document_payload(
+        combined_boundary);
+    require(prepared_boundary.status == native_worker::runtime::document_send_status_t::sent &&
+        !prepared_boundary.payload.empty() &&
+        prepared_boundary.payload.size() <= k_decompiler_worker_result_frame_max_bytes,
+        "worker pre-send path rejected accepted provider-artifact and PrintC boundaries");
+
+    const auto prepared_provider_over = native_worker::runtime::prepare_document_payload(
+        oversized_provider_artifacts);
+    require(prepared_provider_over.status ==
+        native_worker::runtime::document_send_status_t::resource_limit &&
+        prepared_provider_over.payload.empty(),
+        "worker pre-send path did not reject one-byte-over provider artifacts");
+
+    auto oversized_printc_preflight = boundary_printc;
+    oversized_printc_preflight.printc_evidence->push_back('c');
+    oversized_printc_preflight.printc_evidence_hash =
+        stable_serialization_hash(*oversized_printc_preflight.printc_evidence);
+    const auto prepared_printc_over = native_worker::runtime::prepare_document_payload(
+        oversized_printc_preflight);
+    require(prepared_printc_over.status ==
+        native_worker::runtime::document_send_status_t::resource_limit &&
+        prepared_printc_over.payload.empty(),
+        "worker pre-send path did not reject one-byte-over PrintC evidence");
+
+    auto tampered_printc = document_message;
+    tampered_printc.printc_evidence->append("tampered");
+    require(!validate_decompiler_worker_message(decompiler_worker_message_t{tampered_printc}).valid(),
+        "worker document accepted tampered PrintC evidence");
+
+    auto orphaned_printc_hash = document_message;
+    orphaned_printc_hash.printc_evidence.reset();
+    require(!validate_decompiler_worker_message(decompiler_worker_message_t{orphaned_printc_hash}).valid(),
+        "worker document accepted a PrintC hash without evidence");
+
+    auto oversized_printc = document_message;
+    oversized_printc.printc_evidence = std::string(k_decompiler_worker_printc_evidence_max_bytes + 1U, 'x');
+    oversized_printc.printc_evidence_hash = stable_serialization_hash(*oversized_printc.printc_evidence);
+    require(!validate_decompiler_worker_message(decompiler_worker_message_t{oversized_printc}).valid(),
+        "worker document accepted oversized PrintC evidence");
 
     decompiler_worker_failure_message_t failure;
     failure.envelope = worker_envelope(decompiler_worker_message_kind_t::failure, 5);
@@ -626,6 +717,7 @@ int main()
         std::cout << "decompiler_contracts_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

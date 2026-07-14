@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -33,5 +34,8 @@ namespace aida::analysis::c03
     contract_validation_result_t validate_corpus_manifest(const json& manifest);
     contract_validation_result_t validate_malformed_case_manifest(const json& manifest,
         const json& malformed_cases);
+    contract_validation_result_t validate_decompiler_provider_results(const json& evidence);
     contract_validation_result_t validate_decompiler_quality_receipt(const json& receipt);
+    contract_validation_result_t validate_decompiler_quality_receipt_files(const json& receipt,
+        const std::filesystem::path& repository_root);
 }

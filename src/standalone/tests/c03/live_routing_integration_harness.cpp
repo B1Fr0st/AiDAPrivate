@@ -1,5 +1,7 @@
 #include "live_routing_integration_harness.hpp"
 
+#include "assertion_telemetry/assertion_telemetry.hpp"
+
 #include "../../src/core/mcp/compat/live_routing_integration.hpp"
 #include "../../src/core/mcp/compat/debugger_lane.hpp"
 #include "../../src/core/mcp/compat/effect_policy.hpp"
@@ -26,6 +28,8 @@ namespace {
 using namespace aida::standalone::mcp::compat;
 
 void require(bool condition, std::string_view message) {
+    aida::analysis::c03_test::assertion_telemetry::record_assertion(
+        condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -141,7 +145,31 @@ void verify_bounded_snapshot_enforcement() {
 
     live_routing_limits_t limits;
     limits.maximum_snapshot_bytes = 4096U;
-    live_routing_integration_t routing(resolver, lock_manager, lane, limits);
+    std::atomic_uint32_t snapshot_calls{0};
+    live_snapshot_handler_t snapshot_reader = [&snapshot_calls](
+        const adapter_call_context_t& context,
+        const bounded_live_snapshot_request_t& request) {
+        snapshot_calls.fetch_add(1, std::memory_order_relaxed);
+        if (!context.target) {
+            return adapter_result_t<bounded_live_snapshot_t>::failure({
+                adapter_error_code_t::target_resolution_failed,
+                "fixture_target_resolution_missing",
+                1,
+                0,
+            });
+        }
+        const auto& target = context.target->target();
+        bounded_live_snapshot_t result;
+        result.bytes.resize(static_cast<std::size_t>(request.size));
+        for (std::size_t index = 0; index < result.bytes.size(); ++index)
+            result.bytes[index] = static_cast<std::uint8_t>((request.address + index) & 0xffU);
+        result.process_creation_identity = target.process_creation_identity;
+        result.attach_generation = target.attach_generation;
+        result.generation = target.generation;
+        return adapter_result_t<bounded_live_snapshot_t>::success(std::move(result));
+    };
+    live_routing_integration_t routing(
+        resolver, lock_manager, lane, limits, std::move(snapshot_reader));
 
     target_selector_t selector;
     selector.pid = 4242U;
@@ -155,6 +183,8 @@ void verify_bounded_snapshot_enforcement() {
     require(snap.has_value(), "bounded snapshot within limits was rejected");
     require(snap.value().bytes.size() == 4096U, "snapshot bytes size mismatch");
     require(!snap.value().truncated, "within-limit snapshot was truncated");
+    require(snapshot_calls.load(std::memory_order_relaxed) == 1U,
+            "fake snapshot backend invocation count mismatch");
 
     req.size = 8192U;
     auto oversize = routing.capture_bounded_snapshot(req);
@@ -163,6 +193,8 @@ void verify_bounded_snapshot_enforcement() {
             "oversized snapshot did not return budget_exceeded");
     require(oversize.error().expected == 4096U, "oversized snapshot expected limit mismatch");
     require(oversize.error().actual == 8192U, "oversized snapshot actual mismatch");
+    require(snapshot_calls.load(std::memory_order_relaxed) == 1U,
+            "oversized snapshot reached the fake backend");
 
     req.size = 4096U;
     req.address = 0x0000000140000000ULL + 0x8000U;
@@ -170,6 +202,67 @@ void verify_bounded_snapshot_enforcement() {
     require(!oob.has_value(), "out-of-bounds snapshot was accepted");
     require(oob.error().code == live_routing_error_code_t::module_identity_mismatch,
             "out-of-bounds snapshot did not return module_identity_mismatch");
+    require(snapshot_calls.load(std::memory_order_relaxed) == 1U,
+            "out-of-bounds snapshot reached the fake backend");
+
+    req.address = 0x0000000140000000ULL;
+    req.cancellation = protocol::cancellation_token_t::create(true);
+    const auto cancelled = routing.capture_bounded_snapshot(req);
+    require(!cancelled.has_value() &&
+            cancelled.error().code == live_routing_error_code_t::snapshot_cancelled,
+            "cancelled snapshot request was not rejected");
+    require(snapshot_calls.load(std::memory_order_relaxed) == 1U,
+            "cancelled snapshot request reached the fake backend");
+
+    req.cancellation = protocol::cancellation_token_t::create(false);
+    req.deadline = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    const auto expired = routing.capture_bounded_snapshot(req);
+    require(!expired.has_value() &&
+            expired.error().code == live_routing_error_code_t::snapshot_deadline_exceeded,
+            "expired snapshot request was not rejected");
+    require(snapshot_calls.load(std::memory_order_relaxed) == 1U,
+            "expired snapshot request reached the fake backend");
+
+    req.deadline.reset();
+    req.expected_generation = 999U;
+    const auto stale = routing.capture_bounded_snapshot(req);
+    require(!stale.has_value() &&
+            stale.error().code == live_routing_error_code_t::target_not_resolved,
+            "stale snapshot generation was accepted");
+    require(snapshot_calls.load(std::memory_order_relaxed) == 1U,
+            "stale snapshot generation reached the fake backend");
+
+    std::atomic_uint32_t mismatch_mode{0};
+    std::atomic_uint32_t mismatch_calls{0};
+    live_snapshot_handler_t mismatched_reader = [&mismatch_mode, &mismatch_calls](
+        const adapter_call_context_t& context,
+        const bounded_live_snapshot_request_t& request) {
+        mismatch_calls.fetch_add(1, std::memory_order_relaxed);
+        const auto& target = context.target->target();
+        bounded_live_snapshot_t result;
+        result.bytes.assign(static_cast<std::size_t>(request.size), 0x5aU);
+        result.process_creation_identity = target.process_creation_identity;
+        result.attach_generation = target.attach_generation;
+        result.generation = target.generation;
+        const auto mode = mismatch_mode.load(std::memory_order_relaxed);
+        if (mode == 0U) ++result.process_creation_identity;
+        else if (mode == 1U) ++result.attach_generation;
+        else ++result.generation;
+        return adapter_result_t<bounded_live_snapshot_t>::success(std::move(result));
+    };
+    live_routing_integration_t mismatched_routing(
+        resolver, lock_manager, lane, limits, std::move(mismatched_reader));
+    req.expected_generation = 1U;
+    for (std::uint32_t mode = 0; mode < 3U; ++mode) {
+        mismatch_mode.store(mode, std::memory_order_relaxed);
+        const auto mismatch = mismatched_routing.capture_bounded_snapshot(req);
+        require(!mismatch.has_value() &&
+                mismatch.error().code == live_routing_error_code_t::process_identity_mismatch,
+                "mismatched fake snapshot identity was accepted");
+    }
+    require(mismatch_calls.load(std::memory_order_relaxed) == 3U &&
+            mismatched_routing.completed_snapshot_requests() == 0U,
+            "mismatched fake snapshots were counted as completed");
 }
 
 void verify_debugger_lane_serialization() {
@@ -316,6 +409,7 @@ int main() {
         std::cout << "live_routing_integration_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

@@ -1,9 +1,17 @@
 {
-  "schema": "aida.c03.authority-surface-ledger.v1",
+  "schema": "aida.c03.authority-surface-ledger.v2",
   "authority": {
     "c02_completion_receipt": {
       "path": "plans/ida_clone_receipts/receipt_c02_multi_format_arch.json",
       "sha256": "C6485B5AA9ECBB9092D0885D32E05053C82CD6A533C788F7E5552386AA759B07"
+    },
+    "c03_activation_prompt": {
+      "path": "C:/Users/ruar1337/Desktop/prompts/ida-clone-c03-prompt.md",
+      "sha256": "5325BC81B26A57D2DA31714B766DCC406F135E5EC4819EEF9988258A5B2A3C2E"
+    },
+    "c03_draft": {
+      "path": "plans/ida_clone_draft_c03_final_completion_campaign.md",
+      "sha256": "F2A992F992B8CFCEC891F947F653C5CD872A84FB901542E827F7C9BC50BC15F5"
     },
     "pinned_ida_pro_mcp_archive": {
       "path": "C:/Users/ruar1337/ida-pro-mcp.zip",
@@ -11,6 +19,46 @@
       "license": "MIT",
       "sha256": "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7",
       "inspection_mode": "zip_data_only_no_archive_code_execution"
+    }
+  },
+  "contract_generation": {
+    "generator": {
+      "path": "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py",
+      "sha256": "5B334BC8B951F0FBE3FA121E5EE0C9EC15CDDC12F00ADBD5CDB65F35812149A0"
+    },
+    "reproduction_policy": "pinned_zip_data_only_byte_exact_offline",
+    "artifacts": [
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json",
+      "src/standalone/src/core/mcp/compat/ida_contracts_generated.hpp",
+      "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
+    ],
+    "descriptor_artifact_sha256": {
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json": "D5F458C90435E24ACF12AD0279D8987410A96698F66DE9820445E8FA00654BF7",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json": "A2495751CCC29407E8F7A1E4FEF6C1813DCA81B8D78431D60E4BCEDC3F31210C",
+      "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json": "BDA8DE668975D4233802A83FDD8877263EDE1EEB618798C0FCC8AED9ED5BC969"
+    }
+  },
+  "current_surface_reproduction": {
+    "generator": {
+      "path": "src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1",
+      "sha256": "66E888C875CD42B91A87F4082B570934325225A6D6B8E83AB2151242EBBA9671"
+    },
+    "verifier": {
+      "path": "tools/c03_authority/verify_authority_surface_ledger.py",
+      "sha256": "0CB2803831B221C810C6063921A68C45FAF6F293356AB2C20FD4AE89CC50812F"
+    },
+    "baseline": {
+      "path": "src/standalone/tests/analysis_workspace/standalone_surface_baseline.json",
+      "sha256": "F6D23ACA7E5E0B0177E5D7F1D474D1A1598F534532A7C8EB11BF6B22F232DAC2"
+    },
+    "checked_in_path": "src/standalone/tests/analysis_workspace/standalone_surface_final.json",
+    "policy": "byte_exact_current_source_reproduction_and_strict_additive_baseline",
+    "interpreter_policy": {
+      "python": "validated_absolute_sys_executable_from_cmake_python3_executable",
+      "powershell": "required_absolute_non_reparse_regular_system_windows_powershell_derived_by_getsystemdirectoryw",
+      "identity": "sha256_and_file_identity_checked_before_and_after_reproduction_for_interpreters_generators_verifier_and_archive"
     }
   },
   "mcp_compatibility": {
@@ -26,6 +74,193 @@
     ],
     "preserved_aida_extensions": ["analyze_funcs", "find_insns", "calculator", "calculate"],
     "compatibility_extension_union_count": 92
+  },
+  "current_surface_contract": {
+    "mcp": {
+      "legacy_resolved_count": 331,
+      "generated_registration_count": 92,
+      "generated_overlap_count": 42,
+      "generated_only_count": 50,
+      "effective_registration_count": 381,
+      "archive_backed_count": 87,
+      "proxy_local_count": 1,
+      "extension_count": 4,
+      "unresolved_registration_count": 0,
+      "resolved_helper_template_count": 2,
+      "resolved_helper_registration_count": 110,
+      "resolved_helpers": {
+        "register_direct_alias": 101,
+        "register_dispatch_alias": 9
+      },
+      "registration_source": "src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp",
+      "server_integration_source": "src/standalone/src/core/mcp/compat/mcp_server_integration.cpp",
+      "production_entry_source": "src/standalone/src/core/mcp/mcp_standalone_tools.cpp",
+      "production_entry_markers": [
+        "register_c03_compatibility_tools(srv);",
+        "integration->register_generated_tools();",
+        "integration->register_extension_tools();",
+        "names.size() != wave_c_compat::k_union_tool_count",
+        "unique_names.find(\"list_instances\") == unique_names.end()",
+        "unique_names.find(\"py_eval\") != unique_names.end()",
+        "protocol::validate_tool_contract",
+        "const auto input_validation = impl_->state.schemas.validate(",
+        "const auto output_validation = impl_->state.schemas.validate("
+      ],
+      "domains": {
+        "analysis": {
+          "names": ["decompile", "disasm", "func_profile", "analyze_batch", "xrefs_to", "xref_query", "xrefs_to_field", "callees", "find_bytes", "basic_blocks", "find", "insn_query", "export_funcs", "callgraph"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/analysis.cpp",
+          "handler_marker": "analysis_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/analysis_handlers_harness.cpp",
+          "fixture_marker": "run_analysis_handlers_harness"
+        },
+        "composite": {
+          "names": ["analyze_function", "analyze_component", "diff_before_after", "trace_data_flow"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/composite.cpp",
+          "handler_marker": "composite_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/composite_handlers_harness.cpp",
+          "fixture_marker": "run_composite_handlers_harness"
+        },
+        "core": {
+          "names": ["server_health", "lookup_funcs", "int_convert", "list_funcs", "func_query", "list_globals", "entity_query", "imports", "imports_query", "idb_save", "find_regex", "search_text"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/core.cpp",
+          "handler_marker": "core_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/core_handlers_harness.cpp",
+          "fixture_marker": "run_core_handlers_harness"
+        },
+        "debugger": {
+          "names": ["dbg_start", "dbg_status", "dbg_exit", "dbg_continue", "dbg_run_to", "dbg_step_into", "dbg_step_over", "dbg_bps", "dbg_add_bp", "dbg_delete_bp", "dbg_toggle_bp", "dbg_set_bp_condition", "dbg_regs_all", "dbg_regs_remote", "dbg_regs", "dbg_gpregs_remote", "dbg_gpregs", "dbg_regs_named_remote", "dbg_regs_named", "dbg_stacktrace", "dbg_read", "dbg_write"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/debugger.cpp",
+          "handler_marker": "debugger_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/debugger_handlers_harness.cpp",
+          "fixture_marker": "run_debugger_handlers_harness"
+        },
+        "memory": {
+          "names": ["get_bytes", "get_int", "get_string", "get_global_value", "patch", "put_int"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/memory.cpp",
+          "handler_marker": "memory_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/memory_handlers_harness.cpp",
+          "fixture_marker": "run_memory_handlers_harness"
+        },
+        "modify": {
+          "names": ["add_bookmark", "set_comments", "append_comments", "patch_asm", "rename", "define_func", "define_code", "undefine", "force_recompile", "set_op_type", "make_data"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/modify.cpp",
+          "handler_marker": "modify_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/modify_handlers_harness.cpp",
+          "fixture_marker": "run_modify_handlers_harness"
+        },
+        "python": {
+          "names": ["py_exec_file"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/python.cpp",
+          "handler_marker": "python_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/python_handler_harness.cpp",
+          "fixture_marker": "run_python_handler_harness"
+        },
+        "signatures": {
+          "names": ["make_signature", "make_signature_for_function", "make_signature_for_range", "find_xref_signatures"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/signatures.cpp",
+          "handler_marker": "is_signature_tool_name",
+          "fixture": "src/standalone/tests/mcp_compat/signature_handlers_harness.cpp",
+          "fixture_marker": "run_signature_handlers_harness"
+        },
+        "stack": {
+          "names": ["stack_frame", "declare_stack", "delete_stack"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/stack.cpp",
+          "handler_marker": "stack_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/stack_handlers_harness.cpp",
+          "fixture_marker": "run_stack_handlers_harness"
+        },
+        "survey": {
+          "names": ["survey_binary"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/survey.cpp",
+          "handler_marker": "survey_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/survey_handler_harness.cpp",
+          "fixture_marker": "run_survey_handler_harness"
+        },
+        "types": {
+          "names": ["declare_type", "enum_upsert", "read_struct", "search_structs", "type_query", "type_inspect", "set_type", "type_apply_batch", "infer_types"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/types.cpp",
+          "handler_marker": "types_handlers_t::invoke",
+          "fixture": "src/standalone/tests/mcp_compat/type_handlers_harness.cpp",
+          "fixture_marker": "run_type_handlers_harness"
+        },
+        "routing_extensions": {
+          "names": ["list_instances", "analyze_funcs", "find_insns", "calculator", "calculate"],
+          "handler": "src/standalone/src/core/mcp/compat/handlers/routing_extensions.cpp",
+          "handler_marker": "routing_extension_tool_names",
+          "fixture": "src/standalone/tests/mcp_compat/routing_extensions_harness.cpp",
+          "fixture_marker": "run_routing_extensions_harness"
+        }
+      }
+    },
+    "commands": {
+      "builtin_count": 34,
+      "dynamic_producers": ["skills", "mcp_prompts", "mcp_tools", "agents"]
+    },
+    "test_lab": {
+      "minimum_feature_count": 68,
+      "required_additive_features": ["c03-safe-headless:C03 Safe Headless"]
+    },
+    "workbench": {
+      "analysis_document_kinds": ["disassembly", "hex", "pseudocode", "graph", "diff"],
+      "default_analysis_document": "disassembly",
+      "per_workspace_persistence": true
+    },
+    "overlay": {
+      "legacy_ordinal_min": 0,
+      "legacy_ordinal_max": 13,
+      "appended_ordinal_min": 14,
+      "appended_ordinal_max": 17,
+      "operations": ["comment", "name", "bookmark", "type_declaration", "define_function", "define_code", "define_data", "undefine", "stack_variable", "delete_stack_variable", "type_application", "byte_patch", "assembly_patch", "integer_patch", "comment_update", "type_update", "enum_definition", "reanalysis"]
+    },
+    "dead_paths": {
+      "absent": [
+        "src/standalone/tests/c03/driver_bridge_stub.cpp",
+        "src/standalone/tests/c03/driver_bridge_stub.hpp",
+        "src/standalone/tests/analysis_workspace/workspace_mcp_harness.cpp",
+        "src/standalone/tests/c03/decompiler_provider_matrix/main.cpp",
+        "src/standalone/tests/c03/decompiler_quality_scorer_harness_main.cpp",
+        "cmake/c03_safe_headless/materialize_quality_selftest.py"
+      ],
+      "replacements": [
+        "cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp",
+        "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.cpp",
+        "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.hpp",
+        "src/standalone/tests/c03/decompiler_quality_scorer_harness.cpp",
+        "src/standalone/tests/c03/decompiler_quality_scorer_harness.hpp",
+        "src/standalone/tests/c03/mcp_production_core/main.cpp",
+        "src/standalone/tests/c03/mcp_production_core/mcp_production_core_harness.cpp",
+        "src/standalone/tests/c03/mcp_production_core/mcp_production_core_harness.hpp"
+      ],
+      "responsibilities": {
+        "production_mcp_registry_fixture": {
+          "retired": [
+            "src/standalone/tests/c03/driver_bridge_stub.cpp",
+            "src/standalone/tests/c03/driver_bridge_stub.hpp",
+            "src/standalone/tests/analysis_workspace/workspace_mcp_harness.cpp"
+          ],
+          "replacements": [
+            "src/standalone/tests/c03/mcp_production_core/main.cpp",
+            "src/standalone/tests/c03/mcp_production_core/mcp_production_core_harness.cpp",
+            "src/standalone/tests/c03/mcp_production_core/mcp_production_core_harness.hpp"
+          ]
+        },
+        "combined_decompiler_quality_pipeline": {
+          "retired": [
+            "src/standalone/tests/c03/decompiler_provider_matrix/main.cpp",
+            "src/standalone/tests/c03/decompiler_quality_scorer_harness_main.cpp",
+            "cmake/c03_safe_headless/materialize_quality_selftest.py"
+          ],
+          "replacements": [
+            "cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp",
+            "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.cpp",
+            "src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.hpp",
+            "src/standalone/tests/c03/decompiler_quality_scorer_harness.cpp",
+            "src/standalone/tests/c03/decompiler_quality_scorer_harness.hpp"
+          ]
+        }
+      }
+    }
   },
   "explicit_exclusions": [
     {
@@ -51,14 +286,14 @@
   ],
   "preservation_baseline": {
     "source_manifest": {
-      "path": "src/standalone/tests/analysis_workspace/standalone_surface_final.json",
-      "sha256": "4028170F80D8B19B09BC879766D5AE032C2790D493F30EE763020B97AF5FB2C4",
-      "schema_version": 2
+      "path": "src/standalone/tests/analysis_workspace/standalone_surface_baseline.json",
+      "sha256": "F6D23ACA7E5E0B0177E5D7F1D474D1A1598F534532A7C8EB11BF6B22F232DAC2",
+      "schema_version": 1
     },
     "aida_mcp": {
-      "registration_count": 331,
-      "unique_name_count": 331,
-      "sorted_name_list_sha256": "B76BA1D9D4BF00D1612C61367D757E0067D2FAB7590F41E489767339EC19A473",
+      "registration_count": 289,
+      "unique_name_count": 289,
+      "sorted_name_list_sha256": "098DB8CDDE2CDF0B6EF97268075208007ED083485E875B1B2A19CAAF30346B2A",
       "resources": [
         { "uri": "standalone://loaded-file", "name": "Loaded File Info", "mime_type": "application/json" },
         { "uri": "standalone://driver-status", "name": "Driver Status", "mime_type": "application/json" }

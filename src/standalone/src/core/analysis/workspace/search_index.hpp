@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <functional>
 
 namespace aida::analysis {
 
@@ -154,6 +155,10 @@ private:
 
 class search_index_t final : public std::enable_shared_from_this<search_index_t> {
 public:
+    using serialized_sink_t = std::function<workspace_result_t<void>(
+        const std::uint8_t*, std::size_t)>;
+    static constexpr std::uint32_t serialized_version = 1;
+
     static workspace_result_t<std::shared_ptr<search_index_t>> build(
         std::shared_ptr<const analysis_snapshot_t> snapshot,
         std::vector<data_candidate_record_t> data_candidates,
@@ -161,6 +166,16 @@ public:
         std::vector<type_candidate_record_t> types,
         std::shared_ptr<analysis_metrics_t> metrics,
         const search_index_limits_t& limits,
+        const cancellation_token_t& cancel);
+
+    static workspace_result_t<std::shared_ptr<search_index_t>> restore(
+        std::shared_ptr<const analysis_snapshot_t> snapshot,
+        std::vector<data_candidate_record_t> data_candidates,
+        std::vector<switch_record_t> switches,
+        std::vector<type_candidate_record_t> types,
+        std::shared_ptr<analysis_metrics_t> metrics,
+        const search_index_limits_t& limits,
+        const std::vector<std::uint8_t>& serialized,
         const cancellation_token_t& cancel);
 
     ~search_index_t();
@@ -187,6 +202,11 @@ public:
     const std::vector<switch_record_t>& switches() const noexcept;
     const std::vector<type_candidate_record_t>& types() const noexcept;
     std::uint64_t memory_bytes() const noexcept;
+    workspace_result_t<std::uint64_t> serialized_size(
+        const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<void> serialize_to(
+        const serialized_sink_t& sink,
+        const cancellation_token_t& cancel = {}) const;
     search_index_size_t size_accounting() const noexcept;
     analysis_metrics_snapshot_t metrics() const noexcept;
     std::size_t record_count() const noexcept;

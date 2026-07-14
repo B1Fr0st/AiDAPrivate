@@ -513,12 +513,78 @@ workbench_error_t commit(workbench_snapshot_ptr_t& current,
     return {};
 }
 
+workbench_error_t validate_restore_baseline(
+    const workbench_workspace_snapshot_t& current,
+    const workbench_persistence_dto_t& baseline,
+    bool allow_equal_revision_adoption)
+{
+    if (baseline.workspace != current.workspace())
+        return error(workbench_error_code_t::workspace_mismatch,
+                     baseline.workspace.value);
+    if (baseline.revision.value < current.revision().value)
+        return error(workbench_error_code_t::revision_mismatch,
+                     baseline.revision.value);
+    if (baseline.revision == current.revision() &&
+        !allow_equal_revision_adoption &&
+        !persistence_dto_equal(current.persistence(), baseline))
+        return error(workbench_error_code_t::revision_mismatch,
+                     baseline.revision.value);
+    return {};
+}
+
+workbench_error_t commit_restored(workbench_snapshot_ptr_t& current,
+                                  const workbench_persistence_dto_t& baseline,
+                                  workbench_persistence_dto_t& working,
+                                  bool allow_equal_revision_adoption,
+                                  workbench_command_result_t& result)
+{
+    const auto normalized_result = normalize_model_state(working);
+    if (!normalized_result)
+        return normalized_result;
+    if (baseline.workspace != working.workspace)
+        return error(workbench_error_code_t::workspace_mismatch,
+                     baseline.workspace.value);
+    const auto baseline_result = validate_restore_baseline(
+        *current, baseline, allow_equal_revision_adoption);
+    if (!baseline_result)
+        return baseline_result;
+
+    if (!persistence_dto_equal(baseline, working)) {
+        workspace_revision_t next;
+        const auto revision_result = next_workspace_revision(baseline.revision, next);
+        if (!revision_result)
+            return revision_result;
+        working.revision = next;
+        update_panel_revisions(working, next);
+        const auto final_result = normalize_model_state(working);
+        if (!final_result)
+            return final_result;
+    }
+
+    if (persistence_dto_equal(current->persistence(), working)) {
+        result.snapshot = current;
+        return {};
+    }
+    if (working.revision.value < current->revision().value ||
+        (working.revision == current->revision() &&
+         !allow_equal_revision_adoption))
+        return error(workbench_error_code_t::revision_mismatch,
+                     working.revision.value);
+
+    current = std::shared_ptr<const workbench_workspace_snapshot_t>(
+        new workbench_workspace_snapshot_t(std::move(working)));
+    result.snapshot = current;
+    result.changed = true;
+    return {};
+}
+
 }
 
 struct workbench_model_t::implementation_t {
     struct workspace_entry_t {
         std::mutex mutex;
         workbench_snapshot_ptr_t snapshot;
+        bool persistence_baseline_adopted = false;
     };
 
     mutable std::mutex mutex;
@@ -805,6 +871,8 @@ workbench_command_result_t workbench_model_t::execute(const workbench_command_t&
         return result;
     }
     result.error = commit(entry->snapshot, working, result);
+    if (result.error.ok() && result.changed)
+        entry->persistence_baseline_adopted = true;
     return result;
 }
 
@@ -830,9 +898,11 @@ workbench_command_result_t workbench_model_t::restore_workspace(
     }
 
     workbench_snapshot_ptr_t base_snapshot;
+    bool base_persistence_baseline_adopted = false;
     {
         std::lock_guard<std::mutex> lock(entry->mutex);
         base_snapshot = entry->snapshot;
+        base_persistence_baseline_adopted = entry->persistence_baseline_adopted;
         result.snapshot = base_snapshot;
         if (!revision_matches(expected_revision, base_snapshot->revision())) {
             result.error = error(workbench_error_code_t::revision_mismatch,
@@ -841,12 +911,19 @@ workbench_command_result_t workbench_model_t::restore_workspace(
         }
     }
 
-    workbench_persistence_dto_t working = persisted;
-    const auto normalize_result = normalize_model_state(working);
+    workbench_persistence_dto_t baseline = persisted;
+    const auto normalize_result = normalize_model_state(baseline);
     if (!normalize_result) {
         result.error = normalize_result;
         return result;
     }
+    const auto baseline_result = validate_restore_baseline(
+        *base_snapshot, baseline, !base_persistence_baseline_adopted);
+    if (!baseline_result) {
+        result.error = baseline_result;
+        return result;
+    }
+    workbench_persistence_dto_t working = baseline;
     document_registry_t registry;
     const auto registry_result = make_registry(working, registry);
     if (!registry_result) {
@@ -882,13 +959,17 @@ workbench_command_result_t workbench_model_t::restore_workspace(
 
     std::lock_guard<std::mutex> lock(entry->mutex);
     if (entry->snapshot != base_snapshot ||
+        entry->persistence_baseline_adopted != base_persistence_baseline_adopted ||
         !revision_matches(expected_revision, entry->snapshot->revision())) {
         result.snapshot = entry->snapshot;
         result.error = error(workbench_error_code_t::revision_mismatch,
                              expected_revision.value);
         return result;
     }
-    result.error = commit(entry->snapshot, working, result);
+    result.error = commit_restored(entry->snapshot, baseline, working,
+                                   !base_persistence_baseline_adopted, result);
+    if (result.error.ok())
+        entry->persistence_baseline_adopted = true;
     return result;
 }
 

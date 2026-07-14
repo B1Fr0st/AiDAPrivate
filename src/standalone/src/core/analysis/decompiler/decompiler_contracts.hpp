@@ -19,7 +19,16 @@ constexpr std::uint32_t k_type_graph_schema_version = 1;
 constexpr std::uint32_t k_typed_pseudocode_ast_schema_version = 2;
 constexpr std::uint32_t k_decompiler_document_schema_version = 1;
 constexpr std::uint32_t k_decompiler_cache_key_schema_version = 2;
-constexpr std::uint32_t k_decompiler_worker_protocol_version = 2;
+constexpr std::uint32_t k_decompiler_worker_protocol_version = 3;
+constexpr std::size_t k_decompiler_worker_control_frame_max_bytes = 8U * 1024U * 1024U;
+constexpr std::size_t k_decompiler_worker_result_frame_max_bytes = 80U * 1024U * 1024U;
+constexpr std::size_t k_decompiler_worker_provider_artifacts_max_bytes = 48U * 1024U * 1024U;
+constexpr std::size_t k_decompiler_worker_printc_evidence_max_bytes = 8U * 1024U * 1024U;
+static_assert(k_decompiler_worker_control_frame_max_bytes <=
+    k_decompiler_worker_result_frame_max_bytes);
+static_assert(k_decompiler_worker_provider_artifacts_max_bytes +
+    k_decompiler_worker_printc_evidence_max_bytes <
+    k_decompiler_worker_result_frame_max_bytes);
 constexpr std::uint64_t k_decompiler_profile_max_cpu_ms = 60'000;
 constexpr std::uint64_t k_decompiler_profile_max_memory_bytes = 4ULL << 30;
 
@@ -618,6 +627,7 @@ struct decompiler_worker_job_request_t {
     decompiler_pipeline_cache_key_t cache_key;
     decompiler_profile_budget_t profile;
     sha256_digest_t snapshot_hash;
+    bool request_printc_evidence = false;
 };
 
 struct decompiler_worker_cancel_request_t {
@@ -631,6 +641,8 @@ struct decompiler_worker_document_message_t {
     std::uint64_t job_id = 0;
     std::string provider_artifacts;
     sha256_digest_t provider_artifacts_hash;
+    std::optional<std::string> printc_evidence;
+    sha256_digest_t printc_evidence_hash;
     decompiler_document_t document;
 };
 

@@ -39,9 +39,58 @@ bool change_requires_full_reanalysis(const overlay_change_v9_t& change) noexcept
            (after_kind && *after_kind == overlay_operation_kind_v9_t::reanalysis);
 }
 
-bool entity_address_in_bounds(const overlay_entity_key_v9_t& entity,
-                              std::uint64_t image_size) noexcept
+overlay_operation_kind_v9_t canonical_entity_domain(
+    overlay_operation_kind_v9_t kind) noexcept
 {
+    if (kind == overlay_operation_kind_v9_t::comment_update)
+        return overlay_operation_kind_v9_t::comment;
+    if (kind == overlay_operation_kind_v9_t::type_update)
+        return overlay_operation_kind_v9_t::type_application;
+    return kind;
+}
+
+bool managed_change_is_valid(const overlay_change_v9_t& change) noexcept
+{
+    if (change.entity.target_discriminator !=
+        overlay_target_discriminator_v9_t::managed_entity)
+        return true;
+    if (!managed_overlay_operation_kind_v9(change.operation_kind) ||
+        canonical_entity_domain(change.operation_kind) !=
+            change.entity.domain ||
+        (!change.before && !change.after))
+        return false;
+    const auto valid_side = [&](const std::optional<overlay_payload_v9_t>& payload,
+                                const std::optional<overlay_operation_kind_v9_t>&
+                                    kind) noexcept {
+        if (!payload)
+            return !kind;
+        const auto inferred = overlay_operation_kind_for_item_v9(
+            change.entity, *payload);
+        return inferred &&
+            (!kind ||
+             (managed_overlay_operation_kind_v9(*kind) &&
+              canonical_entity_domain(*kind) == change.entity.domain));
+    };
+    return valid_side(change.before, change.before_kind) &&
+        valid_side(change.after, change.after_kind);
+}
+
+bool entity_address_in_bounds(const overlay_entity_key_v9_t& entity,
+                              std::uint64_t image_size,
+                              std::uint64_t generation,
+                              const std::array<std::uint8_t, 32>&
+                                  provider_hash) noexcept
+{
+    if (entity.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity)
+        return entity.managed_locator && entity.managed_locator->valid() &&
+            entity.managed_locator->provider_hash == provider_hash &&
+            entity.managed_locator->generation <= generation &&
+            entity.range.offset == 0 && entity.range.size == 0;
+    if (entity.target_discriminator !=
+            overlay_target_discriminator_v9_t::native_address ||
+        entity.managed_locator)
+        return false;
     if (entity.domain == overlay_operation_kind_v9_t::type_declaration ||
         entity.domain == overlay_operation_kind_v9_t::enum_definition)
         return entity.range.offset == 0 && entity.range.size == 0;
@@ -129,6 +178,11 @@ reanalysis_result_t incremental_reanalysis_t::compute_scope(
         result.detail = "no changes to compute scope from";
         return result;
     }
+    if (!std::all_of(changes.begin(), changes.end(),
+                     managed_change_is_valid)) {
+        result.detail = "managed reanalysis change identity or payload is invalid";
+        return result;
+    }
 
     result.invalidation = overlay_projection_t::compute_invalidation(
         changes, state.target.image_size);
@@ -139,7 +193,8 @@ reanalysis_result_t incremental_reanalysis_t::compute_scope(
             result.invalidation.affected_entities.end(),
             [&](const auto& entity) {
                 return entity_address_in_bounds(
-                    entity.key, state.target.image_size);
+                    entity.key, state.target.image_size,
+                    state.target.generation, state.target.image_hash);
             })) {
         result.detail = "one or more reanalysis ranges or entities exceed image bounds";
         return result;
@@ -161,6 +216,8 @@ reanalysis_result_t incremental_reanalysis_t::compute_scope(
 reanalysis_scope_t incremental_reanalysis_t::minimal_invalidation(
     const overlay_change_v9_t& change)
 {
+    if (!managed_change_is_valid(change))
+        return {};
     const auto invalidation = overlay_projection_t::compute_invalidation({change});
     reanalysis_scope_t scope;
     scope.ranges = invalidation.affected_ranges;

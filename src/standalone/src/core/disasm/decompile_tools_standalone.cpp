@@ -3,15 +3,17 @@
 #include <windows.h>
 
 #include "standalone_compat.hpp"
-#include "../analysis/workspace/decompiler_service.hpp"
+#include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -97,6 +99,68 @@ static bool parse_address_param(const json& params, const char* key, uint64_t& o
     return false;
 }
 
+static std::string pipeline_status_code(
+    const aida::analysis::decompiler_pipeline_status_t status)
+{
+    using status_t = aida::analysis::decompiler_pipeline_status_t;
+    switch (status) {
+    case status_t::invalid_request: return "DECOMPILER_INVALID_REQUEST";
+    case status_t::explicit_request_required: return "DECOMPILER_EXPLICIT_REQUEST_REQUIRED";
+    case status_t::provider_unavailable: return "DECOMPILER_PROVIDER_UNAVAILABLE";
+    case status_t::provider_failed: return "DECOMPILER_PROVIDER_FAILED";
+    case status_t::provider_crashed: return "DECOMPILER_PROVIDER_CRASHED";
+    case status_t::deadline_exceeded: return "DECOMPILER_DEADLINE_EXCEEDED";
+    case status_t::cancelled: return "DECOMPILER_CANCELLED";
+    case status_t::resource_limit: return "DECOMPILER_RESOURCE_LIMIT";
+    case status_t::stale_generation: return "DECOMPILER_STALE_GENERATION";
+    case status_t::normalization_failed: return "DECOMPILER_NORMALIZATION_FAILED";
+    case status_t::rendering_failed: return "DECOMPILER_RENDERING_FAILED";
+    case status_t::cache_integrity_failure: return "DECOMPILER_CACHE_INTEGRITY_FAILURE";
+    case status_t::service_stopped: return "DECOMPILER_SERVICE_STOPPED";
+    case status_t::completed: return "DECOMPILER_COMPLETED";
+    }
+    return "DECOMPILER_FAILED";
+}
+
+static json collect_callees(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    const aida::analysis::decompiler_document_t& document)
+{
+    json callees = json::array();
+    const auto* identity = std::get_if<aida::analysis::native_decompiler_entity_identity_t>(
+        &document.entity.identity);
+    const auto publication = workspace ? workspace->analysis_publication() : nullptr;
+    if (!identity || !publication || !publication->snapshot)
+        return callees;
+    const auto& snapshot = *publication->snapshot;
+    for (const auto& edge : snapshot.call_graph.edges) {
+        if (edge.source_function_id != identity->function_id)
+            continue;
+        std::string name = "callee_" + std::to_string(edge.id);
+        if (edge.target_function_id) {
+            const auto target = std::find_if(snapshot.functions.begin(), snapshot.functions.end(),
+                [&](const auto& function) { return function.id == *edge.target_function_id; });
+            if (target != snapshot.functions.end() && target->symbol_id) {
+                const auto symbol = std::find_if(snapshot.symbols.begin(), snapshot.symbols.end(),
+                    [&](const auto& current) { return current.id == *target->symbol_id; });
+                if (symbol != snapshot.symbols.end() && !symbol->name.empty())
+                    name = symbol->name;
+            }
+        }
+        auto address = edge.target.value;
+        if (edge.target.space == aida::analysis::address_space_id_t::relative_virtual &&
+            snapshot.normalized_image &&
+            address <= (std::numeric_limits<std::uint64_t>::max)() -
+                snapshot.normalized_image->image_base)
+            address += snapshot.normalized_image->image_base;
+        callees.push_back(json{{"name", std::move(name)}, {"address", hex_u64(address)},
+            {"external", edge.external_target},
+            {"noreturn", edge.target_noreturn},
+            {"confidence", edge.quality.confidence}});
+    }
+    return callees;
+}
+
 static tool_result_t handle_decompile_function(
     const json& params,
     const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
@@ -123,25 +187,16 @@ static tool_result_t handle_decompile_function(
     }
     if (!workspace)
         return tool_result_t::error("Target workspace is unavailable", "TARGET_NOT_FOUND", json::object());
-    auto service = workspace->decompiler();
-    if (!service)
+    auto integration = aida::analysis::decompiler_ui_integration_t::production_for_workspace(
+        workspace);
+    if (!integration)
         return tool_result_t::error(
-            "The workspace decompiler service is unavailable",
+            integration.error().message.empty()
+                ? "The typed decompiler service is unavailable"
+                : integration.error().message,
             "DECOMPILER_UNAVAILABLE",
-            json{{"readiness", static_cast<unsigned>(workspace->progress().readiness)}});
-
-    aida::analysis::address_t address;
-    address.space = workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
-        ? aida::analysis::address_space_id_t::live_virtual
-        : aida::analysis::address_space_id_t::virtual_address;
-    address.value = raw_address;
-    address.architecture = workspace->identity().architecture();
-    if (const auto image = workspace->image()) {
-        address.mode = image->architecture_mode();
-        if (workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
-            raw_address < image->image_base() && raw_address < image->image_size())
-            address.value = image->image_base() + raw_address;
-    }
+            json{{"phase", integration.error().phase},
+                 {"readiness", static_cast<unsigned>(workspace->progress().readiness)}});
 
     aida::analysis::cancellation_source_t cancellation(
         std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec));
@@ -157,7 +212,12 @@ static tool_result_t handle_decompile_function(
             "CANCELLATION_BRIDGE_UNAVAILABLE",
             json{{"native_error", error.code().value()}});
     }
-    auto decompiled = service->decompile(address, {}, cancellation.token());
+    auto decompiled = integration.value()->decompile_native(
+        raw_address,
+        aida::analysis::decompiler_ui_invocation_source_t::mcp_request,
+        aida::analysis::decompiler_profile_id_t::balanced,
+        aida::analysis::decompiler_pipeline_cache_mode_t::read_write,
+        cancellation.token());
     if (!decompiled) {
         const auto& error = decompiled.error();
         return tool_result_t::error(
@@ -169,38 +229,69 @@ static tool_result_t handle_decompile_function(
     }
 
     const auto& result_value = decompiled.value();
-    if (result_value.pseudocode.find_first_not_of(" \t\r\n") == std::string::npos)
+    if (!result_value.succeeded()) {
+        json diagnostics = json::array();
+        for (const auto& diagnostic : result_value.diagnostics) {
+            diagnostics.push_back(json{
+                {"code", static_cast<unsigned>(diagnostic.code)},
+                {"key", diagnostic.localization_key},
+                {"message", diagnostic.message},
+                {"confidence", diagnostic.confidence},
+                {"retryable", diagnostic.retryable}});
+        }
+        return tool_result_t::error(
+            result_value.diagnostics.empty() || result_value.diagnostics.front().message.empty()
+                ? "Typed decompilation failed"
+                : result_value.diagnostics.front().message,
+            pipeline_status_code(result_value.status),
+            json{{"address", hex_u64(raw_address)}, {"diagnostics", std::move(diagnostics)}});
+    }
+    if (result_value.rendered_text.find_first_not_of(" \t\r\n") == std::string::npos)
         return tool_result_t::error(
             "Decompilation produced no pseudocode",
             "DECOMPILER_EMPTY_RESULT",
-            json{{"address", hex_u64(result_value.function_address.value)}});
+            json{{"address", hex_u64(raw_address)}});
 
     json result;
-    result["address"] = hex_u64(result_value.function_address.value);
-    result["function_name"] = result_value.function_name;
-    result["sleigh_id"] = result_value.sleigh_id;
+    result["address"] = hex_u64(raw_address);
+    result["function_name"] = result_value.function_symbol;
+    result["sleigh_id"] = result_value.language_id;
     result["complete"] = true;
     result["elapsed_ms"] = result_value.elapsed_ms;
-    result["pseudocode"] = result_value.pseudocode;
-    result["cache_hit"] = result_value.cache_hit;
-    result["persistent_cache_hit"] = result_value.persistent_cache_hit;
-    result["generation"] = result_value.generation;
+    result["pseudocode"] = result_value.rendered_text;
+    result["cache_hit"] = result_value.cache_hit_stage.has_value();
+    result["cache_stage"] = result_value.cache_hit_stage
+        ? static_cast<unsigned>(*result_value.cache_hit_stage) : 0U;
+    result["persistent_cache_hit"] = false;
+    result["generation"] = result_value.workspace_generation;
     result["analysis_revision"] = result_value.analysis_revision;
     result["overlay_revision"] = result_value.overlay_revision;
-    json callees = json::array();
-    for (const auto& callee : result_value.callees)
-        callees.push_back(json{{"name", callee.first}, {"address", hex_u64(callee.second)}});
-    result["callees"] = std::move(callees);
-    result["mapped_line_count"] = result_value.line_to_address.size();
+    if (result_value.provider) {
+        result["provider"] = json{{"id", result_value.provider->registration_id},
+            {"name", result_value.provider->identity.provider_name},
+            {"version", result_value.provider->identity.provider_version},
+            {"isolated", result_value.provider->isolated}};
+    }
+    result["callees"] = collect_callees(workspace, *result_value.document);
+    result["mapped_line_count"] = result_value.source_mappings.size();
     std::size_t line_count = 0;
-    for (char ch : result_value.pseudocode)
+    for (char ch : result_value.rendered_text)
         line_count += ch == '\n' ? 1U : 0U;
-    if (!result_value.pseudocode.empty() && result_value.pseudocode.back() != '\n')
+    if (!result_value.rendered_text.empty() && result_value.rendered_text.back() != '\n')
         ++line_count;
     result["pseudocode_line_count"] = line_count;
-    result["line_count"] = result_value.line_to_address.empty()
-        ? line_count
-        : result_value.line_to_address.size();
+    result["line_count"] = result_value.source_mappings.empty()
+        ? line_count : result_value.source_mappings.size();
+    if (result_value.readability) {
+        result["readability"] = json{
+            {"ast_nodes", result_value.readability->ast_node_count},
+            {"source_map_coverage", result_value.readability->source_map_coverage_ratio},
+            {"mean_confidence", result_value.readability->mean_confidence},
+            {"minimum_confidence", result_value.readability->minimum_confidence},
+            {"explicit_unknown_ratio", result_value.readability->explicit_unknown_ratio},
+            {"max_expression_depth", result_value.readability->metrics.max_expression_depth},
+            {"max_control_nesting", result_value.readability->metrics.max_control_nesting}};
+    }
     admission.release("completed");
     return tool_result_t::ok(result);
 }
@@ -209,7 +300,7 @@ void register_decompile_tools(mcp_standalone::server_t& srv)
 {
     srv.register_tool({
         "decompile_function",
-        "Decompile a function at the given address using the Ghidra-derived decompiler and return the pseudocode text plus callee list. Runs on a worker thread with a configurable timeout (default 30s).",
+        "Decompile a function through the isolated typed provider pipeline and return pseudocode, exact source mappings, readability evidence, and recovered callees. Runs with a configurable timeout (default 30s).",
         {{"address", "string", "Function entry address (hex string or integer)", true},
          {"timeout_sec", "number", "Maximum seconds to wait for decompilation (1-300, default 30)", false}},
         true,

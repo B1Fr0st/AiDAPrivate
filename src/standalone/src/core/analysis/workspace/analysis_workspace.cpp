@@ -1,8 +1,11 @@
 #include "analysis_workspace.hpp"
 
+#include "../decompiler/managed_entity_binding.hpp"
+
 #include "checked_range.hpp"
 #include "live_snapshot_provider.hpp"
 #include "search_index.hpp"
+#include "../overlay_projection.hpp"
 
 #include <algorithm>
 #include <array>
@@ -421,9 +424,40 @@ bool analysis_publication_t::coherent_with(
                                    generation, analysis_revision, overlay_revision))
             return false;
     }
+    if (managed_artifacts &&
+        !managed_artifacts->coherent_with(identity, *provider, generation,
+                                           analysis_revision, overlay_revision))
+        return false;
     if (readiness == workspace_readiness_t::baseline_ready)
         return snapshot->baseline_complete && search_index != nullptr;
     return !snapshot->baseline_complete;
+}
+
+namespace {
+
+workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>
+rebind_publication_managed_artifacts(
+    const std::shared_ptr<const managed_artifact_publication_t>& source,
+    const workspace_identity_t& identity,
+    const std::shared_ptr<const byte_provider_t>& provider,
+    const std::shared_ptr<const pe_image_t>& pe_image,
+    std::uint64_t generation,
+    std::uint64_t analysis_revision,
+    std::uint64_t overlay_revision,
+    const cancellation_token_t& cancel) {
+    if (!source)
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::success(
+            nullptr);
+    if (!provider)
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            make_workspace_error(workspace_error_code_t::provider_unavailable,
+                "managed publication provider is unavailable",
+                "workspace_managed_rebind"));
+    return rebind_managed_artifact_publication(
+        *source, identity, *provider, pe_image, generation,
+        analysis_revision, overlay_revision, cancel);
+}
+
 }
 
 workspace_result_t<workspace_provider_binding_t>
@@ -2082,7 +2116,8 @@ workspace_result_t<void> analysis_workspace_t::publish_normalized_image(
     updated->image = std::move(pe_adapter);
     const auto replacement = std::make_shared<const analysis_publication_t>(
         std::static_pointer_cast<const analysis_snapshot_t>(updated),
-        current_publication->provider, nullptr, workspace_readiness_t::parsed);
+        current_publication->provider, nullptr, workspace_readiness_t::parsed,
+        current_publication->managed_artifacts);
     std::string parsed_phase = "parsed";
     {
         std::lock_guard state_lock(state_mutex_);
@@ -2142,9 +2177,22 @@ workspace_result_t<void> analysis_workspace_t::publish_snapshot(
                                                  workspace_cancel);
     if (!validation)
         return validation;
+    const auto source_publication = analysis_publication();
+    if (!source_publication || !source_publication->snapshot)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "workspace publication is unavailable",
+                                 "workspace_publish"));
+    auto rebound_managed = rebind_publication_managed_artifacts(
+        source_publication->managed_artifacts, *identity_, publication_provider,
+        snapshot_value->image, snapshot_value->generation,
+        snapshot_value->analysis_revision, snapshot_value->overlay_revision,
+        workspace_cancel);
+    if (!rebound_managed)
+        return workspace_result_t<void>::failure(rebound_managed.error());
     const auto replacement = std::make_shared<const analysis_publication_t>(
         snapshot_value, publication_provider, nullptr,
-        workspace_readiness_t::partial);
+        workspace_readiness_t::partial, rebound_managed.take_value());
     if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<void>::failure(
             publication_finalizer_conflict("workspace_publish"));
@@ -2175,7 +2223,8 @@ workspace_result_t<void> analysis_workspace_t::publish_snapshot(
                                      "snapshot publication revision conflicts with workspace state",
                                      "workspace_publish"));
         const auto current_publication = analysis_publication();
-        if (!current_publication || !current_publication->snapshot ||
+        if (!current_publication || current_publication != source_publication ||
+            !current_publication->snapshot ||
             current_publication->provider != publication_provider ||
             snapshot_value->normalized_image !=
                 current_publication->snapshot->normalized_image)
@@ -2254,9 +2303,23 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
         *snapshot_value, "workspace_publish");
     if (!executable_bytes)
         return workspace_result_t<void>::failure(executable_bytes.error());
+    const auto source_publication = analysis_publication();
+    if (!source_publication || !source_publication->snapshot)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "workspace publication is unavailable",
+                                 "workspace_publish"));
+    auto rebound_managed = rebind_publication_managed_artifacts(
+        source_publication->managed_artifacts, *identity_, publication_provider,
+        snapshot_value->image, snapshot_value->generation,
+        snapshot_value->analysis_revision, snapshot_value->overlay_revision,
+        workspace_cancel);
+    if (!rebound_managed)
+        return workspace_result_t<void>::failure(rebound_managed.error());
     const auto readiness = publication_readiness(*snapshot_value);
     const auto replacement = std::make_shared<const analysis_publication_t>(
-        snapshot_value, publication_provider, search_index_value, readiness);
+        snapshot_value, publication_provider, search_index_value, readiness,
+        rebound_managed.take_value());
     auto replacement_progress = publication_progress(
         readiness, executable_bytes.value());
     if (publication_finalizer_active_.load(std::memory_order_acquire))
@@ -2281,7 +2344,8 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
                                      "analysis bundle generation is stale",
                                      "workspace_publish"));
         const auto current_publication = analysis_publication();
-        if (!current_publication || !current_publication->snapshot ||
+        if (!current_publication || current_publication != source_publication ||
+            !current_publication->snapshot ||
             current_publication->provider != publication_provider ||
             snapshot_value->normalized_image !=
                 current_publication->snapshot->normalized_image)
@@ -2327,6 +2391,943 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
     return workspace_result_t<void>::success();
 }
 
+workspace_result_t<void> analysis_workspace_t::publish_managed_artifacts(
+    std::uint64_t expected_generation,
+    std::uint64_t expected_analysis_revision,
+    std::shared_ptr<const managed_artifact_publication_t> managed_artifacts,
+    bool advance_empty_analysis_revision) {
+    if (!managed_artifacts || target_kind() != target_kind_t::static_file)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                "managed artifact publication requires a static workspace binding",
+                "workspace_managed_publish"));
+    if (closing() || closed() ||
+        publication_finalizer_active_.load(std::memory_order_acquire))
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                "workspace cannot accept managed artifact publication",
+                "workspace_managed_publish"));
+    const auto source = analysis_publication();
+    if (!source || !source->snapshot || !source->provider ||
+        source->generation != expected_generation ||
+        source->analysis_revision != expected_analysis_revision)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::stale_generation,
+                "workspace changed before managed artifact publication",
+                "workspace_managed_publish"));
+    const bool advance = advance_empty_analysis_revision &&
+        expected_analysis_revision == 0 && !source->search_index &&
+        !source->snapshot->baseline_complete &&
+        !snapshot_has_analysis_facts(*source->snapshot);
+    const auto target_revision = advance ? 1ULL : expected_analysis_revision;
+    if (!managed_artifacts->coherent_with(
+            *identity_, *source->provider, expected_generation,
+            target_revision, source->overlay_revision)) {
+        if (!advance || !managed_artifacts->coherent_with(
+                *identity_, *source->provider, expected_generation,
+                expected_analysis_revision, source->overlay_revision))
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                    "managed artifact publication does not match the workspace",
+                    "workspace_managed_publish"));
+        auto rebound = rebind_managed_artifact_publication(
+            *managed_artifacts, *identity_, *source->provider,
+            source->snapshot->image, expected_generation, target_revision,
+            source->overlay_revision, cancellation_token());
+        if (!rebound)
+            return workspace_result_t<void>::failure(rebound.error());
+        managed_artifacts = rebound.take_value();
+    }
+    std::shared_ptr<const analysis_snapshot_t> snapshot_value = source->snapshot;
+    workspace_readiness_t readiness = source->readiness;
+    try {
+        if (advance) {
+            auto revised = std::make_shared<analysis_snapshot_t>(*source->snapshot);
+            revised->analysis_revision = target_revision;
+            revised->baseline_complete = false;
+            snapshot_value = std::static_pointer_cast<const analysis_snapshot_t>(
+                std::move(revised));
+            readiness = workspace_readiness_t::partial;
+        }
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "managed artifact publication allocation failed",
+                "workspace_managed_publish"));
+    }
+    std::shared_ptr<const analysis_publication_t> replacement;
+    try {
+        replacement = std::make_shared<const analysis_publication_t>(
+            snapshot_value, source->provider, source->search_index, readiness,
+            std::move(managed_artifacts));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "managed artifact publication allocation failed",
+                "workspace_managed_publish"));
+    }
+    if (!replacement->coherent_with(*identity_))
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                "managed artifact publication is incoherent",
+                "workspace_managed_publish"));
+    std::unique_lock<std::shared_mutex> mutation_lock(
+        mutation_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> publication_lock(
+        publication_mutex_, std::defer_lock);
+    std::lock(mutation_lock, publication_lock);
+    std::lock_guard state_lock(state_mutex_);
+    if (closing() || closed() ||
+        active_analysis_generation_.load(std::memory_order_acquire) != 0)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::analysis_in_progress,
+                "managed artifact publication conflicts with workspace activity",
+                "workspace_managed_publish"));
+    if (analysis_publication() != source || generation() != expected_generation ||
+        analysis_revision() != expected_analysis_revision)
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::revision_conflict,
+                "workspace changed during managed artifact publication",
+                "workspace_managed_publish"));
+    progress_.readiness = readiness;
+    progress_.phase = advance ? "managed_metadata_ready" : progress_.phase;
+    progress_.error.reset();
+    std::atomic_store_explicit(
+        &publication_state_->publication, replacement, std::memory_order_release);
+    return workspace_result_t<void>::success();
+}
+
+namespace {
+
+std::optional<std::uint64_t> projected_rva(
+    const workspace_image_t& image, const address_t& address) noexcept {
+    if (address.space == address_space_id_t::relative_virtual)
+        return address.value;
+    if (address.space == address_space_id_t::virtual_address ||
+        address.space == address_space_id_t::live_virtual) {
+        if (address.value < image.image_base)
+            return std::nullopt;
+        return address.value - image.image_base;
+    }
+    if (address.space != address_space_id_t::file_offset)
+        return std::nullopt;
+    for (const auto& mapping : image.address_mappings) {
+        if (mapping.source_space != address_space_id_t::file_offset ||
+            mapping.target_space != address_space_id_t::relative_virtual ||
+            address.value < mapping.source_start ||
+            address.value >= mapping.source_start + mapping.size)
+            continue;
+        return mapping.target_start + address.value - mapping.source_start;
+    }
+    return std::nullopt;
+}
+
+bool projected_overlap(const workspace_image_t& image,
+                       const address_t& address, std::uint64_t size,
+                       const std::vector<projected_range_t>& ranges) noexcept {
+    const auto start = projected_rva(image, address);
+    if (!start || size == 0 ||
+        size > (std::numeric_limits<std::uint64_t>::max)() - *start)
+        return false;
+    const projected_range_t fact_range{*start, size, false,
+        overlay_operation_kind_v9_t::reanalysis};
+    return std::any_of(ranges.begin(), ranges.end(),
+        [&](const auto& range) { return fact_range.overlaps(range); });
+}
+
+bool projected_overlap(const workspace_image_t& image,
+                       const address_t& begin, const address_t& end,
+                       const std::vector<projected_range_t>& ranges) noexcept {
+    if (begin.space != end.space || begin.architecture != end.architecture ||
+        begin.mode != end.mode || end.value <= begin.value)
+        return false;
+    return projected_overlap(image, begin, end.value - begin.value, ranges);
+}
+
+struct projected_cancellation_t final {};
+
+void poll_projected_cancellation(const cancellation_token_t& cancel,
+                                 std::uint64_t& visits) {
+    if ((visits++ & 255U) == 0 && cancel.stop_requested())
+        throw projected_cancellation_t{};
+}
+
+template <typename T, typename Predicate>
+std::vector<T> retain_records(const std::vector<T>& source, Predicate retain,
+                              const cancellation_token_t& cancel) {
+    std::vector<T> result;
+    result.reserve(source.size());
+    std::uint64_t visits = 0;
+    for (const auto& record : source) {
+        poll_projected_cancellation(cancel, visits);
+        if (retain(record))
+            result.push_back(record);
+    }
+    return result;
+}
+
+template <typename T>
+void assign_projected_entity_ids(std::vector<T>& records,
+                                 std::uint8_t domain,
+                                 const cancellation_token_t& cancel) {
+    const auto tag = static_cast<std::uint64_t>(domain) << 56U;
+    std::uint64_t visits = 0;
+    for (std::size_t index = 0; index < records.size(); ++index) {
+        poll_projected_cancellation(cancel, visits);
+        records[index].id = tag | static_cast<std::uint64_t>(index + 1U);
+    }
+}
+
+std::vector<projected_range_t> merged_projected_ranges(
+    std::vector<projected_range_t> ranges) {
+    std::sort(ranges.begin(), ranges.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.offset, lhs.size) <
+                std::tie(rhs.offset, rhs.size);
+        });
+    std::vector<projected_range_t> merged;
+    merged.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        if (range.size == 0)
+            continue;
+        if (merged.empty()) {
+            merged.push_back(range);
+            merged.back().is_byte_patch = false;
+            merged.back().operation_kind =
+                overlay_operation_kind_v9_t::reanalysis;
+            continue;
+        }
+        auto& previous = merged.back();
+        const auto previous_end = previous.offset + previous.size;
+        const auto range_end = range.offset + range.size;
+        if (range.offset > previous_end) {
+            merged.push_back(range);
+            merged.back().is_byte_patch = false;
+            merged.back().operation_kind =
+                overlay_operation_kind_v9_t::reanalysis;
+            continue;
+        }
+        previous.size = (std::max)(previous_end, range_end) - previous.offset;
+    }
+    return merged;
+}
+
+call_graph_publication_t retain_projected_call_graph(
+    const analysis_snapshot_t& source,
+    const analysis_snapshot_t& projected,
+    const workspace_image_t& image,
+    const std::vector<projected_range_t>& ranges,
+    bool code_changed,
+    const cancellation_token_t& cancel) {
+    if (!code_changed) {
+        call_graph_publication_t result;
+        const auto retain_all = [](const auto&) { return true; };
+        result.nodes = retain_records(
+            source.call_graph.nodes, retain_all, cancel);
+        result.call_sites = retain_records(
+            source.call_graph.call_sites, retain_all, cancel);
+        result.candidates = retain_records(
+            source.call_graph.candidates, retain_all, cancel);
+        result.edges = retain_records(
+            source.call_graph.edges, retain_all, cancel);
+        result.conflicts = retain_records(
+            source.call_graph.conflicts, retain_all, cancel);
+        result.indirect_site_count = source.call_graph.indirect_site_count;
+        result.unresolved_site_count = source.call_graph.unresolved_site_count;
+        result.bounded = source.call_graph.bounded;
+        return result;
+    }
+    if (source.call_graph.nodes.empty() && source.call_graph.call_sites.empty() &&
+        source.call_graph.candidates.empty() && source.call_graph.edges.empty() &&
+        source.call_graph.conflicts.empty())
+        return {};
+
+    std::unordered_set<entity_id_t> functions;
+    std::unordered_set<entity_id_t> blocks;
+    std::unordered_set<entity_id_t> instructions;
+    functions.reserve(projected.functions.size());
+    blocks.reserve(projected.blocks.size());
+    instructions.reserve(projected.instructions.size());
+    std::uint64_t visits = 0;
+    for (const auto& record : projected.functions) {
+        poll_projected_cancellation(cancel, visits);
+        functions.insert(record.id);
+    }
+    for (const auto& record : projected.blocks) {
+        poll_projected_cancellation(cancel, visits);
+        blocks.insert(record.id);
+    }
+    for (const auto& record : projected.instructions) {
+        poll_projected_cancellation(cancel, visits);
+        instructions.insert(record.id);
+    }
+
+    std::unordered_map<entity_id_t,
+                       std::vector<const call_graph_edge_record_t*>> edges_by_site;
+    edges_by_site.reserve(source.call_graph.call_sites.size());
+    for (const auto& edge : source.call_graph.edges) {
+        poll_projected_cancellation(cancel, visits);
+        edges_by_site[edge.call_site_id].push_back(&edge);
+    }
+
+    call_graph_publication_t result;
+    std::unordered_set<entity_id_t> indirect_sites;
+    result.call_sites.reserve(source.call_graph.call_sites.size());
+    result.candidates.reserve(source.call_graph.candidates.size());
+    result.edges.reserve(source.call_graph.edges.size());
+    for (const auto& site : source.call_graph.call_sites) {
+        poll_projected_cancellation(cancel, visits);
+        if (functions.find(site.source_function_id) == functions.end() ||
+            blocks.find(site.source_block_id) == blocks.end() ||
+            instructions.find(site.instruction_id) == instructions.end() ||
+            projected_overlap(image, site.address, 1, ranges))
+            continue;
+        const auto candidate_end = static_cast<std::uint64_t>(
+            site.first_candidate) + site.candidate_count;
+        if (candidate_end > source.call_graph.candidates.size())
+            continue;
+        bool retain_site = true;
+        for (std::uint64_t index = site.first_candidate;
+             index < candidate_end; ++index) {
+            poll_projected_cancellation(cancel, visits);
+            const auto& candidate = source.call_graph.candidates[
+                static_cast<std::size_t>(index)];
+            if ((candidate.target_function_id &&
+                 functions.find(*candidate.target_function_id) == functions.end()) ||
+                projected_overlap(image, candidate.target, 1, ranges)) {
+                retain_site = false;
+                break;
+            }
+        }
+        const auto source_edges = edges_by_site.find(site.id);
+        if (!retain_site || source_edges == edges_by_site.end())
+            continue;
+        const auto expected_edge_count = site.unresolved
+            ? 1ULL : static_cast<std::uint64_t>(site.candidate_count);
+        if (source_edges->second.size() != expected_edge_count)
+            continue;
+
+        auto retained_site = site;
+        retained_site.id = call_site_entity_tag |
+            static_cast<std::uint64_t>(result.call_sites.size() + 1U);
+        retained_site.first_candidate = static_cast<std::uint32_t>(
+            result.candidates.size());
+        for (std::uint64_t index = site.first_candidate;
+             index < candidate_end; ++index) {
+            poll_projected_cancellation(cancel, visits);
+            auto candidate = source.call_graph.candidates[
+                static_cast<std::size_t>(index)];
+            candidate.id = call_candidate_entity_tag |
+                static_cast<std::uint64_t>(result.candidates.size() + 1U);
+            candidate.call_site_id = retained_site.id;
+            candidate.rank = static_cast<std::uint32_t>(
+                result.candidates.size() - retained_site.first_candidate);
+            result.candidates.push_back(std::move(candidate));
+        }
+        for (const auto* source_edge : source_edges->second) {
+            poll_projected_cancellation(cancel, visits);
+            auto edge = *source_edge;
+            edge.id = call_edge_entity_tag |
+                static_cast<std::uint64_t>(result.edges.size() + 1U);
+            edge.call_site_id = retained_site.id;
+            result.edges.push_back(std::move(edge));
+        }
+        result.indirect_site_count += retained_site.indirect ? 1U : 0U;
+        result.unresolved_site_count += retained_site.unresolved ? 1U : 0U;
+        if (retained_site.indirect)
+            indirect_sites.insert(retained_site.id);
+        result.call_sites.push_back(std::move(retained_site));
+    }
+
+    result.conflicts.reserve(source.call_graph.conflicts.size());
+    for (const auto& source_conflict : source.call_graph.conflicts) {
+        poll_projected_cancellation(cancel, visits);
+        if ((source_conflict.source_function_id != 0 &&
+             functions.find(source_conflict.source_function_id) == functions.end()) ||
+            (source_conflict.selected_target_function_id != 0 &&
+             functions.find(source_conflict.selected_target_function_id) ==
+                 functions.end()) ||
+            (source_conflict.competing_target_function_id != 0 &&
+             functions.find(source_conflict.competing_target_function_id) ==
+                 functions.end()) ||
+            (source_conflict.instruction_id != 0 &&
+             source_conflict.kind !=
+                 call_graph_conflict_kind_t::orphan_candidate &&
+             instructions.find(source_conflict.instruction_id) ==
+                 instructions.end()))
+            continue;
+        auto conflict = source_conflict;
+        conflict.id = call_conflict_entity_tag |
+            static_cast<std::uint64_t>(result.conflicts.size() + 1U);
+        result.conflicts.push_back(std::move(conflict));
+    }
+
+    result.nodes.reserve(projected.functions.size());
+    std::unordered_map<entity_id_t, std::size_t> node_indices;
+    node_indices.reserve(projected.functions.size());
+    for (const auto& function : projected.functions) {
+        poll_projected_cancellation(cancel, visits);
+        call_graph_node_record_t node;
+        node.function_id = function.id;
+        node.address = function.start;
+        node_indices.emplace(function.id, result.nodes.size());
+        result.nodes.push_back(std::move(node));
+    }
+    for (const auto& site : result.call_sites) {
+        poll_projected_cancellation(cancel, visits);
+        result.nodes[node_indices[site.source_function_id]].unresolved_sites +=
+            site.unresolved ? 1U : 0U;
+    }
+    for (const auto& edge : result.edges) {
+        poll_projected_cancellation(cancel, visits);
+        auto& source_node = result.nodes[node_indices[edge.source_function_id]];
+        ++source_node.outgoing_edges;
+        if (indirect_sites.find(edge.call_site_id) != indirect_sites.end())
+            ++source_node.indirect_edges;
+        if (edge.target_function_id)
+            ++result.nodes[node_indices[*edge.target_function_id]].incoming_edges;
+    }
+    result.bounded = !result.nodes.empty() || !result.call_sites.empty() ||
+            !result.candidates.empty() || !result.edges.empty() ||
+            !result.conflicts.empty()
+        ? source.call_graph.bounded : false;
+    return result;
+}
+
+workspace_result_t<std::shared_ptr<analysis_snapshot_t>>
+make_projected_analysis_candidate(
+    const analysis_snapshot_t& source,
+    std::shared_ptr<const workspace_image_t> projected_image,
+    std::uint64_t target_generation,
+    std::uint64_t target_overlay_revision,
+    const projection_invalidation_set_t& invalidation,
+    const cancellation_token_t& cancel,
+    std::vector<projected_range_t>& dependency_ranges) {
+    if (!projected_image)
+        return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "projected image is unavailable",
+                                 "workspace_overlay_candidate"));
+    std::shared_ptr<analysis_snapshot_t> next;
+    try {
+        next = std::make_shared<analysis_snapshot_t>();
+        next->binary_id = source.binary_id;
+        next->load_profile_hash = source.load_profile_hash;
+        next->generation = target_generation;
+        next->analysis_revision = source.analysis_revision;
+        next->overlay_revision = target_overlay_revision;
+        next->baseline_complete = source.baseline_complete;
+        next->normalized_image = std::move(projected_image);
+        next->image = source.image;
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "projected candidate allocation failed",
+                                 "workspace_overlay_candidate"));
+    }
+    const auto& image = *next->normalized_image;
+    const auto& ranges = invalidation.affected_ranges;
+    dependency_ranges = ranges;
+    const bool code_changed =
+        stage_test(invalidation.invalidated_stages,
+                   projection_stage_flag_t::disassembler) ||
+        stage_test(invalidation.invalidated_stages,
+                   projection_stage_flag_t::basic_block_table) ||
+        stage_test(invalidation.invalidated_stages,
+                   projection_stage_flag_t::function_table);
+    std::unordered_set<entity_id_t> removed_functions;
+    std::uint64_t candidate_visits = 0;
+    if (code_changed) {
+        for (const auto& function : source.functions) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            bool affected = projected_overlap(
+                image, function.start, function.end, ranges);
+            for (const auto& chunk : function.chunks)
+                affected = affected || std::any_of(
+                    ranges.begin(), ranges.end(), [&](const auto& range) {
+                        return projected_range_t{
+                            chunk.rva_start,
+                            chunk.rva_end > chunk.rva_start
+                                ? chunk.rva_end - chunk.rva_start : 0,
+                            false, overlay_operation_kind_v9_t::reanalysis}
+                            .overlaps(range);
+                    });
+            if (affected)
+                removed_functions.insert(function.id);
+        }
+        for (const auto& block : source.blocks) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            if (projected_overlap(image, block.start, block.end, ranges))
+                removed_functions.insert(block.function_id);
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& membership : source.function_block_memberships) {
+                poll_projected_cancellation(cancel, candidate_visits);
+                if (membership.block_index >= source.blocks.size())
+                    continue;
+                const auto owner = source.blocks[membership.block_index].function_id;
+                const bool member_removed =
+                    removed_functions.find(membership.function_id) !=
+                    removed_functions.end();
+                const bool owner_removed =
+                    removed_functions.find(owner) != removed_functions.end();
+                if (!member_removed && !owner_removed)
+                    continue;
+                if (removed_functions.insert(membership.function_id).second)
+                    changed = true;
+                if (removed_functions.insert(owner).second)
+                    changed = true;
+            }
+        }
+    }
+    if (code_changed) {
+        for (const auto& function : source.functions) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            if (removed_functions.find(function.id) == removed_functions.end())
+                continue;
+            if (!function.chunks.empty()) {
+                for (const auto& chunk : function.chunks) {
+                    poll_projected_cancellation(cancel, candidate_visits);
+                    if (chunk.rva_end <= chunk.rva_start)
+                        continue;
+                    dependency_ranges.push_back({
+                        chunk.rva_start, chunk.rva_end - chunk.rva_start,
+                        false, overlay_operation_kind_v9_t::reanalysis});
+                }
+                continue;
+            }
+            const auto start = projected_rva(image, function.start);
+            const auto end = projected_rva(image, function.end);
+            if (start && end && *end > *start)
+                dependency_ranges.push_back({
+                    *start, *end - *start, false,
+                    overlay_operation_kind_v9_t::reanalysis});
+        }
+    }
+    dependency_ranges = merged_projected_ranges(
+        std::move(dependency_ranges));
+
+    std::vector<std::int64_t> instruction_map(source.instructions.size(), -1);
+    std::vector<bool> remove_instruction(source.instructions.size(), false);
+    if (code_changed) {
+        for (std::size_t index = 0; index < source.instructions.size(); ++index) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            remove_instruction[index] = projected_overlap(
+                image, source.instructions[index].address,
+                source.instructions[index].length, ranges);
+        }
+        for (const auto& block : source.blocks) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            if (removed_functions.find(block.function_id) == removed_functions.end())
+                continue;
+            const auto end = static_cast<std::uint64_t>(block.first_instruction) +
+                block.instruction_count;
+            for (std::uint64_t index = block.first_instruction;
+                 index < end && index < remove_instruction.size(); ++index)
+                remove_instruction[static_cast<std::size_t>(index)] = true;
+        }
+        if (!source.delay_slot_counts.empty()) {
+            for (std::size_t index = 0; index < source.instructions.size(); ++index) {
+                poll_projected_cancellation(cancel, candidate_visits);
+                const auto count = source.delay_slot_counts[index];
+                if (count == 0 || index + count >= source.instructions.size())
+                    continue;
+                bool remove_group = false;
+                for (std::size_t offset = 0; offset <= count; ++offset)
+                    remove_group = remove_group || remove_instruction[index + offset];
+                if (remove_group)
+                    for (std::size_t offset = 0; offset <= count; ++offset)
+                        remove_instruction[index + offset] = true;
+            }
+        }
+    }
+    next->instructions.reserve(source.instructions.size());
+    next->operand_facts.reserve(source.operand_facts.size());
+    next->target_facts.reserve(source.target_facts.size());
+    if (!source.delay_slot_counts.empty())
+        next->delay_slot_counts.reserve(source.delay_slot_counts.size());
+    for (std::size_t index = 0; index < source.instructions.size(); ++index) {
+        if ((index & 1023U) == 0 && cancel.stop_requested())
+            return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+                workspace_stop_error(cancel, "workspace_overlay_candidate"));
+        if (remove_instruction[index])
+            continue;
+        auto instruction = source.instructions[index];
+        instruction_map[index] = static_cast<std::int64_t>(next->instructions.size());
+        const auto operand_begin = instruction.operand_fact_begin;
+        const auto operand_end = static_cast<std::uint64_t>(operand_begin) +
+            instruction.operand_fact_count;
+        const auto target_begin = instruction.target_fact_begin;
+        const auto target_end = static_cast<std::uint64_t>(target_begin) +
+            instruction.target_fact_count;
+        instruction.operand_fact_begin =
+            static_cast<std::uint32_t>(next->operand_facts.size());
+        instruction.target_fact_begin =
+            static_cast<std::uint32_t>(next->target_facts.size());
+        next->operand_facts.insert(next->operand_facts.end(),
+            source.operand_facts.begin() + operand_begin,
+            source.operand_facts.begin() + static_cast<std::ptrdiff_t>(operand_end));
+        next->target_facts.insert(next->target_facts.end(),
+            source.target_facts.begin() + target_begin,
+            source.target_facts.begin() + static_cast<std::ptrdiff_t>(target_end));
+        next->instructions.push_back(std::move(instruction));
+        if (!source.delay_slot_counts.empty())
+            next->delay_slot_counts.push_back(source.delay_slot_counts[index]);
+    }
+
+    std::vector<std::int64_t> block_map(source.blocks.size(), -1);
+    next->blocks.reserve(source.blocks.size());
+    for (std::size_t index = 0; index < source.blocks.size(); ++index) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        const auto& source_block = source.blocks[index];
+        if (removed_functions.find(source_block.function_id) !=
+            removed_functions.end())
+            continue;
+        const auto first = source_block.first_instruction;
+        const auto last = static_cast<std::uint64_t>(first) +
+            source_block.instruction_count - 1U;
+        if (last >= instruction_map.size() || instruction_map[first] < 0 ||
+            instruction_map[static_cast<std::size_t>(last)] < 0 ||
+            instruction_map[static_cast<std::size_t>(last)] -
+                    instruction_map[first] + 1 != source_block.instruction_count)
+            return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "retained block lost an instruction",
+                                     "workspace_overlay_candidate"));
+        auto block = source_block;
+        block.first_instruction = static_cast<std::uint32_t>(instruction_map[first]);
+        block_map[index] = static_cast<std::int64_t>(next->blocks.size());
+        next->blocks.push_back(std::move(block));
+    }
+
+    next->functions.reserve(source.functions.size());
+    next->function_chunks.reserve(source.function_chunks.size());
+    next->function_block_memberships.reserve(
+        source.function_block_memberships.size());
+    for (const auto& source_function : source.functions) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        if (removed_functions.find(source_function.id) != removed_functions.end())
+            continue;
+        auto function = source_function;
+        if (function.block_count != 0) {
+            if (function.first_block >= block_map.size() ||
+                block_map[function.first_block] < 0)
+                return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+                    make_workspace_error(workspace_error_code_t::integrity_failure,
+                                         "retained function lost its primary block",
+                                         "workspace_overlay_candidate"));
+            function.first_block = static_cast<std::uint32_t>(
+                block_map[function.first_block]);
+        }
+        if (function.chunk_count != 0) {
+            const auto source_chunk_begin = source_function.first_chunk;
+            const auto source_chunk_end = static_cast<std::uint64_t>(source_chunk_begin) +
+                source_function.chunk_count;
+            const auto source_membership_begin = source_function.first_block_membership;
+            const auto source_membership_end =
+                static_cast<std::uint64_t>(source_membership_begin) +
+                source_function.block_membership_count;
+            function.first_chunk = static_cast<std::uint32_t>(
+                next->function_chunks.size());
+            function.first_block_membership = static_cast<std::uint32_t>(
+                next->function_block_memberships.size());
+            for (std::uint64_t index = source_chunk_begin;
+                 index < source_chunk_end; ++index) {
+                poll_projected_cancellation(cancel, candidate_visits);
+                auto chunk = source.function_chunks[static_cast<std::size_t>(index)];
+                if (chunk.first_block >= block_map.size() ||
+                    block_map[chunk.first_block] < 0)
+                    return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+                        make_workspace_error(workspace_error_code_t::integrity_failure,
+                                             "retained chunk lost a block",
+                                             "workspace_overlay_candidate"));
+                chunk.first_block = static_cast<std::uint32_t>(
+                    block_map[chunk.first_block]);
+                next->function_chunks.push_back(std::move(chunk));
+            }
+            for (std::uint64_t index = source_membership_begin;
+                 index < source_membership_end; ++index) {
+                poll_projected_cancellation(cancel, candidate_visits);
+                auto membership = source.function_block_memberships[
+                    static_cast<std::size_t>(index)];
+                if (membership.block_index >= block_map.size() ||
+                    block_map[membership.block_index] < 0)
+                    return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::failure(
+                        make_workspace_error(workspace_error_code_t::integrity_failure,
+                                             "retained membership lost a block",
+                                             "workspace_overlay_candidate"));
+                membership.block_index = static_cast<std::uint32_t>(
+                    block_map[membership.block_index]);
+                membership.ordinal = static_cast<std::uint32_t>(
+                    next->function_block_memberships.size() -
+                    function.first_block_membership);
+                next->function_block_memberships.push_back(
+                    std::move(membership));
+            }
+        }
+        next->functions.push_back(std::move(function));
+    }
+
+    std::unordered_set<entity_id_t> graph_entities;
+    for (const auto& record : next->instructions) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        graph_entities.insert(record.id);
+    }
+    for (const auto& record : next->blocks) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        graph_entities.insert(record.id);
+    }
+    for (const auto& record : next->functions) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        graph_entities.insert(record.id);
+    }
+    next->edges = retain_records(source.edges, [&](const auto& edge) {
+        return graph_entities.find(edge.source_entity) != graph_entities.end() &&
+            (!edge.target_entity ||
+             graph_entities.find(*edge.target_entity) != graph_entities.end()) &&
+            (!code_changed ||
+             (!projected_overlap(
+                  image, edge.source, 1, dependency_ranges) &&
+              !projected_overlap(
+                  image, edge.target, 1, dependency_ranges)));
+    }, cancel);
+    next->call_graph = retain_projected_call_graph(
+        source, *next, image, dependency_ranges, code_changed, cancel);
+
+    next->xrefs = retain_records(source.xrefs, [&](const auto& xref) {
+        return !stage_test(invalidation.invalidated_stages,
+                           projection_stage_flag_t::xref_table) ||
+            (!projected_overlap(
+                 image, xref.source, 1, dependency_ranges) &&
+             !projected_overlap(
+                 image, xref.target, 1, dependency_ranges));
+    }, cancel);
+    next->strings = retain_records(source.strings, [&](const auto& string) {
+        return !stage_test(invalidation.invalidated_stages,
+                           projection_stage_flag_t::string_table) ||
+            !projected_overlap(
+                image, string.address, string.byte_length,
+                dependency_ranges);
+    }, cancel);
+    next->symbols = retain_records(source.symbols, [&](const auto& symbol) {
+        return !stage_test(invalidation.invalidated_stages,
+                           projection_stage_flag_t::symbol_table) ||
+            !projected_overlap(image, symbol.address, 1, ranges);
+    }, cancel);
+    std::unordered_set<entity_id_t> retained_symbols;
+    retained_symbols.reserve(next->symbols.size());
+    for (const auto& symbol : next->symbols) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        retained_symbols.insert(symbol.id);
+    }
+    for (auto& function : next->functions) {
+        poll_projected_cancellation(cancel, candidate_visits);
+        if (function.symbol_id &&
+            retained_symbols.find(*function.symbol_id) == retained_symbols.end())
+            function.symbol_id.reset();
+    }
+    if (!stage_test(invalidation.invalidated_stages,
+                    projection_stage_flag_t::type_table)) {
+        const auto retain_all = [](const auto&) { return true; };
+        next->rich_facts.data_candidates = retain_records(
+            source.rich_facts.data_candidates, retain_all, cancel);
+        next->rich_facts.data_pointer_facts = retain_records(
+            source.rich_facts.data_pointer_facts, retain_all, cancel);
+        next->rich_facts.data_conflicts = retain_records(
+            source.rich_facts.data_conflicts, retain_all, cancel);
+        next->rich_facts.type_candidates = retain_records(
+            source.rich_facts.type_candidates, retain_all, cancel);
+        next->rich_facts.type_references = retain_records(
+            source.rich_facts.type_references, retain_all, cancel);
+        next->rich_facts.metadata_conflicts = retain_records(
+            source.rich_facts.metadata_conflicts, retain_all, cancel);
+    } else {
+        if (ranges.empty()) {
+            const auto retain_all = [](const auto&) { return true; };
+            next->rich_facts.data_candidates = retain_records(
+                source.rich_facts.data_candidates, retain_all, cancel);
+            next->rich_facts.data_pointer_facts = retain_records(
+                source.rich_facts.data_pointer_facts, retain_all, cancel);
+            next->rich_facts.data_conflicts = retain_records(
+                source.rich_facts.data_conflicts, retain_all, cancel);
+        } else {
+            next->rich_facts.data_candidates = retain_records(
+                source.rich_facts.data_candidates, [&](const auto& record) {
+                    return !projected_overlap(
+                               image, record.address,
+                               (std::max)(record.size, std::uint64_t{1}),
+                               dependency_ranges) &&
+                        (!record.target ||
+                         !projected_overlap(
+                             image, *record.target, 1,
+                             dependency_ranges));
+                }, cancel);
+            next->rich_facts.data_pointer_facts = retain_records(
+                source.rich_facts.data_pointer_facts, [&](const auto& record) {
+                    return !projected_overlap(
+                               image, record.slot,
+                               (std::max<std::uint64_t>)(
+                                   record.width_bytes, std::uint64_t{1}),
+                               dependency_ranges) &&
+                        !projected_overlap(
+                            image, record.target, 1, dependency_ranges);
+                }, cancel);
+            next->rich_facts.data_conflicts = retain_records(
+                source.rich_facts.data_conflicts, [&](const auto& record) {
+                    return !projected_overlap(
+                               image, record.address, 1,
+                               dependency_ranges) &&
+                        (!record.selected_target ||
+                         !projected_overlap(
+                             image, *record.selected_target, 1,
+                             dependency_ranges)) &&
+                        (!record.rejected_target ||
+                         !projected_overlap(
+                             image, *record.rejected_target, 1,
+                             dependency_ranges));
+                }, cancel);
+            next->rich_facts.type_candidates = retain_records(
+                source.rich_facts.type_candidates, [&](const auto& record) {
+                    return (!record.address ||
+                            !projected_overlap(
+                                image, *record.address, 1,
+                                dependency_ranges)) &&
+                        (!record.related_address ||
+                         !projected_overlap(
+                             image, *record.related_address, 1,
+                             dependency_ranges));
+                }, cancel);
+        }
+        std::unordered_set<entity_id_t> retained_type_entities;
+        retained_type_entities.reserve(
+            next->rich_facts.type_candidates.size());
+        for (const auto& record : next->rich_facts.type_candidates) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            retained_type_entities.insert(record.id);
+        }
+        if (!ranges.empty()) {
+            next->rich_facts.type_references = retain_records(
+                source.rich_facts.type_references, [&](const auto& record) {
+                    return (!record.source ||
+                            !projected_overlap(
+                                image, *record.source, 1,
+                                dependency_ranges)) &&
+                        (!record.target ||
+                         !projected_overlap(
+                             image, *record.target, 1,
+                             dependency_ranges)) &&
+                        (record.source_entity == 0 ||
+                         retained_type_entities.find(record.source_entity) !=
+                             retained_type_entities.end()) &&
+                        (record.target_entity == 0 ||
+                         retained_type_entities.find(record.target_entity) !=
+                             retained_type_entities.end());
+                }, cancel);
+            next->rich_facts.metadata_conflicts = retain_records(
+                source.rich_facts.metadata_conflicts, [&](const auto& record) {
+                    return !record.address ||
+                        !projected_overlap(
+                            image, *record.address, 1,
+                            dependency_ranges);
+                }, cancel);
+        }
+        assign_projected_entity_ids(
+            next->rich_facts.data_candidates, 8, cancel);
+        assign_projected_entity_ids(
+            next->rich_facts.data_pointer_facts, 12, cancel);
+        assign_projected_entity_ids(
+            next->rich_facts.data_conflicts, 13, cancel);
+        std::unordered_map<entity_id_t, entity_id_t> type_id_map;
+        type_id_map.reserve(next->rich_facts.type_candidates.size());
+        for (std::size_t index = 0;
+             index < next->rich_facts.type_candidates.size(); ++index) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            const auto old_id = next->rich_facts.type_candidates[index].id;
+            const auto new_id = (10ULL << 56U) |
+                static_cast<std::uint64_t>(index + 1U);
+            type_id_map.emplace(old_id, new_id);
+            next->rich_facts.type_candidates[index].id = new_id;
+        }
+        for (auto& reference : next->rich_facts.type_references) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            if (reference.source_entity != 0)
+                reference.source_entity =
+                    type_id_map.at(reference.source_entity);
+            if (reference.target_entity != 0)
+                reference.target_entity =
+                    type_id_map.at(reference.target_entity);
+        }
+        assign_projected_entity_ids(
+            next->rich_facts.type_references, 9, cancel);
+        assign_projected_entity_ids(
+            next->rich_facts.metadata_conflicts, 14, cancel);
+    }
+
+    const auto& coverage_ranges = dependency_ranges;
+    if (!stage_test(invalidation.invalidated_stages,
+                    projection_stage_flag_t::coverage_table)) {
+        next->coverage = retain_records(
+            source.coverage, [](const auto&) { return true; }, cancel);
+    } else {
+        for (const auto& span : source.coverage) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            const auto rva = projected_rva(image, span.start);
+            if (!rva || span.size == 0)
+                continue;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces{{
+                *rva, *rva + span.size}};
+            for (const auto& range : coverage_ranges) {
+                poll_projected_cancellation(cancel, candidate_visits);
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> split;
+                for (const auto& piece : pieces) {
+                    const auto range_end = range.offset + range.size;
+                    if (range_end <= piece.first || range.offset >= piece.second) {
+                        split.push_back(piece);
+                        continue;
+                    }
+                    if (piece.first < range.offset)
+                        split.emplace_back(piece.first, range.offset);
+                    if (range_end < piece.second)
+                        split.emplace_back(range_end, piece.second);
+                }
+                pieces = std::move(split);
+            }
+            for (const auto& piece : pieces) {
+                auto retained = span;
+                retained.start.value += piece.first - *rva;
+                retained.size = piece.second - piece.first;
+                next->coverage.push_back(std::move(retained));
+            }
+        }
+        for (const auto& range : coverage_ranges) {
+            poll_projected_cancellation(cancel, candidate_visits);
+            if (range.size == 0)
+                continue;
+            coverage_span_t pending;
+            pending.start.space = address_space_id_t::relative_virtual;
+            pending.start.value = range.offset;
+            pending.start.architecture = image.architecture;
+            pending.start.mode = image.architecture_mode;
+            pending.size = range.size;
+            pending.reason = coverage_reason_t::pending;
+            next->coverage.push_back(std::move(pending));
+        }
+        std::sort(next->coverage.begin(), next->coverage.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return std::tie(lhs.start, lhs.size, lhs.reason) <
+                       std::tie(rhs.start, rhs.size, rhs.reason);
+            });
+    }
+    if (invalidation.invalidated_stages != projection_stage_flag_t::none)
+        next->baseline_complete = false;
+    return workspace_result_t<std::shared_ptr<analysis_snapshot_t>>::success(
+        std::move(next));
+}
+
+}
+
 workspace_result_t<std::size_t>
 analysis_workspace_t::publish_projected_generation(
     std::uint64_t expected_generation,
@@ -2334,8 +3335,10 @@ analysis_workspace_t::publish_projected_generation(
     std::uint64_t target_generation,
     std::uint64_t target_overlay_revision,
     std::shared_ptr<const byte_provider_t> projected_provider,
-    bool preserve_analysis,
-    std::function<workspace_result_t<void>()> finalizer) {
+    const projection_invalidation_set_t& invalidation,
+    std::function<workspace_result_t<void>(
+        const std::shared_ptr<const analysis_snapshot_t>&,
+        const std::shared_ptr<search_index_t>&)> finalizer) {
     if (!projected_provider || !finalizer ||
         expected_generation == (std::numeric_limits<std::uint64_t>::max)() ||
         target_generation != expected_generation + 1 ||
@@ -2364,7 +3367,7 @@ analysis_workspace_t::publish_projected_generation(
             make_workspace_error(workspace_error_code_t::workspace_closing,
                                  "workspace is closing",
                                  "workspace_overlay_publish"));
-    const auto workspace_cancel = cancellation_.token();
+    const auto workspace_cancel = cancellation_token();
     if (workspace_cancel.stop_requested())
         return workspace_result_t<std::size_t>::failure(
             workspace_stop_error(workspace_cancel, "workspace_overlay_publish"));
@@ -2378,9 +3381,20 @@ analysis_workspace_t::publish_projected_generation(
                                  "workspace publication changed before projected generation preparation",
                                  "workspace_overlay_publish"));
     }
+    const auto image_size = source->snapshot->normalized_image->image_size;
+    for (const auto& range : invalidation.affected_ranges) {
+        if (range.size == 0 || range.offset >= image_size ||
+            range.size > image_size - range.offset)
+            return workspace_result_t<std::size_t>::failure(
+                make_workspace_error(
+                    workspace_error_code_t::range_overflow,
+                    "projected invalidation range exceeds the normalized image",
+                    "workspace_overlay_publish"));
+    }
 
     std::shared_ptr<const analysis_snapshot_t> projected_snapshot;
     std::shared_ptr<search_index_t> projected_index;
+    std::vector<projected_range_t> dependency_ranges;
     std::size_t retired_index_entries = source->search_index
         ? source->search_index->record_count()
         : 0;
@@ -2390,34 +3404,93 @@ analysis_workspace_t::publish_projected_generation(
             *projected_identity.content_sha256, "workspace_overlay_publish");
         if (!rebound)
             return workspace_result_t<std::size_t>::failure(rebound.error());
-        auto next = preserve_analysis
-            ? std::make_shared<analysis_snapshot_t>(*source->snapshot)
-            : std::make_shared<analysis_snapshot_t>();
-        next->binary_id = source->binary_id;
-        next->load_profile_hash = source->load_profile_hash;
-        next->generation = target_generation;
-        next->overlay_revision = target_overlay_revision;
-        next->normalized_image = rebound.take_value();
-        next->image = source->snapshot->image;
-        if (!preserve_analysis) {
-            next->analysis_revision = 0;
-            next->baseline_complete = false;
-        }
+        auto next = make_projected_analysis_candidate(
+            *source->snapshot, rebound.take_value(), target_generation,
+            target_overlay_revision, invalidation, workspace_cancel,
+            dependency_ranges);
+        if (!next)
+            return workspace_result_t<std::size_t>::failure(next.error());
         projected_snapshot =
-            std::static_pointer_cast<const analysis_snapshot_t>(std::move(next));
-        if (preserve_analysis && source->search_index) {
+            std::static_pointer_cast<const analysis_snapshot_t>(next.take_value());
+        if (source->search_index) {
+            auto data_candidates = stage_test(
+                    invalidation.invalidated_stages,
+                    projection_stage_flag_t::type_table)
+                ? retain_records(
+                      projected_snapshot->rich_facts.data_candidates,
+                      [](const auto&) { return true; }, workspace_cancel)
+                : retain_records(
+                      source->search_index->data_candidates(),
+                      [](const auto&) { return true; }, workspace_cancel);
+            std::unordered_set<entity_id_t> retained_functions;
+            retained_functions.reserve(projected_snapshot->functions.size());
+            std::uint64_t function_visits = 0;
+            for (const auto& function : projected_snapshot->functions) {
+                poll_projected_cancellation(
+                    workspace_cancel, function_visits);
+                retained_functions.insert(function.id);
+            }
+            auto switches = retain_records(
+                source->search_index->switches(), [&](const auto& record) {
+                    if (!stage_test(invalidation.invalidated_stages,
+                                    projection_stage_flag_t::function_table))
+                        return true;
+                    if (retained_functions.find(record.function_id) ==
+                        retained_functions.end())
+                        return false;
+                    const auto table_size = (std::max)(
+                        static_cast<std::uint64_t>(record.entry_size) *
+                            static_cast<std::uint64_t>(
+                                record.case_targets.size()),
+                        std::uint64_t{1});
+                    if (projected_overlap(
+                            *projected_snapshot->normalized_image,
+                            record.dispatch, 1, dependency_ranges) ||
+                        projected_overlap(
+                            *projected_snapshot->normalized_image,
+                            record.table, table_size, dependency_ranges) ||
+                        (record.default_target &&
+                         projected_overlap(
+                             *projected_snapshot->normalized_image,
+                             *record.default_target, 1,
+                             dependency_ranges)))
+                        return false;
+                    return std::none_of(
+                        record.case_targets.begin(),
+                        record.case_targets.end(),
+                        [&](const auto& target) {
+                            return projected_overlap(
+                                *projected_snapshot->normalized_image,
+                                target, 1, dependency_ranges);
+                        });
+                }, workspace_cancel);
+            auto types = retain_records(
+                source->search_index->types(), [&](const auto& record) {
+                    return !stage_test(invalidation.invalidated_stages,
+                                       projection_stage_flag_t::type_table) ||
+                        (!invalidation.affected_ranges.empty() &&
+                         !projected_overlap(
+                             *projected_snapshot->normalized_image,
+                             record.address, 1,
+                             dependency_ranges));
+                }, workspace_cancel);
             auto metrics = std::make_shared<analysis_metrics_t>(target_generation);
             auto rebuilt = search_index_t::build(
                 projected_snapshot,
-                source->search_index->data_candidates(),
-                source->search_index->switches(),
-                source->search_index->types(),
+                std::move(data_candidates), std::move(switches), std::move(types),
                 std::move(metrics), source->search_index->limits(),
                 workspace_cancel);
             if (!rebuilt)
                 return workspace_result_t<std::size_t>::failure(rebuilt.error());
             projected_index = rebuilt.take_value();
+            const auto projected_records = projected_index->record_count();
+            retired_index_entries = retired_index_entries >= projected_records
+                ? retired_index_entries - projected_records : 0;
         }
+    } catch (const projected_cancellation_t&) {
+        return workspace_result_t<std::size_t>::failure(
+            workspace_stop_error(
+                workspace_cancel, "workspace_overlay_publish"));
     } catch (const std::bad_alloc&) {
         return workspace_result_t<std::size_t>::failure(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
@@ -2441,12 +3514,11 @@ analysis_workspace_t::publish_projected_generation(
                                  "projected search index does not match its generation",
                                  "workspace_overlay_publish"));
     }
-    if ((!preserve_analysis &&
-         (projected_snapshot->analysis_revision != 0 ||
-          projected_snapshot->baseline_complete || projected_index ||
-          snapshot_has_analysis_facts(*projected_snapshot))) ||
-        (preserve_analysis &&
-         projected_snapshot->analysis_revision != expected_analysis_revision)) {
+    const auto expected_projected_analysis_revision = expected_analysis_revision;
+    if (projected_snapshot->analysis_revision !=
+            expected_projected_analysis_revision ||
+        (source->search_index && !projected_index) ||
+        (!source->search_index && projected_index)) {
         return workspace_result_t<std::size_t>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                                  "projected snapshot preservation policy is inconsistent",
@@ -2457,11 +3529,20 @@ analysis_workspace_t::publish_projected_generation(
     if (!executable_bytes)
         return workspace_result_t<std::size_t>::failure(executable_bytes.error());
     const auto readiness = publication_readiness(*projected_snapshot);
+    auto projected_managed = rebind_publication_managed_artifacts(
+        source->managed_artifacts, *identity_, projected_provider,
+        projected_snapshot->image, target_generation,
+        projected_snapshot->analysis_revision, target_overlay_revision,
+        workspace_cancel);
+    if (!projected_managed)
+        return workspace_result_t<std::size_t>::failure(
+            projected_managed.error());
     std::shared_ptr<const analysis_publication_t> replacement;
     workspace_progress_t replacement_progress;
     try {
         replacement = std::make_shared<const analysis_publication_t>(
-            projected_snapshot, projected_provider, projected_index, readiness);
+            projected_snapshot, projected_provider, projected_index, readiness,
+            projected_managed.take_value());
         replacement_progress = publication_progress(
             readiness, executable_bytes.value());
     } catch (const std::bad_alloc&) {
@@ -2517,7 +3598,7 @@ analysis_workspace_t::publish_projected_generation(
     publication_finalizer_active_.store(true, std::memory_order_release);
     workspace_result_t<void> finalized = workspace_result_t<void>::success();
     try {
-        finalized = finalizer();
+        finalized = finalizer(projected_snapshot, projected_index);
     } catch (...) {
         finalized = workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::persistence_failure,
@@ -2569,6 +3650,7 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
             make_workspace_error(workspace_error_code_t::range_overflow,
                                  "workspace generation overflowed", "workspace_generation"));
     const std::uint64_t next = current + 1;
+    try {
     auto empty = std::make_shared<analysis_snapshot_t>();
     empty->binary_id = identity_->binary_id();
     empty->load_profile_hash = identity_->load_profile_hash();
@@ -2578,9 +3660,25 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
     empty->image = current_publication->snapshot->image;
     const auto readiness = empty->normalized_image ? workspace_readiness_t::parsed
                                         : workspace_readiness_t::provider_ready;
+    std::shared_ptr<const managed_artifact_publication_t> managed_artifacts;
+    if (current_publication->managed_artifacts) {
+        auto rebound = std::make_shared<managed_artifact_publication_t>(
+            *current_publication->managed_artifacts);
+        rebound->generation = next;
+        rebound->analysis_revision = 0;
+        rebound->overlay_revision = empty->overlay_revision;
+        managed_artifacts = std::static_pointer_cast<
+            const managed_artifact_publication_t>(std::move(rebound));
+    }
     const auto replacement = std::make_shared<const analysis_publication_t>(
         std::static_pointer_cast<const analysis_snapshot_t>(empty),
-        current_publication->provider, nullptr, readiness);
+        current_publication->provider, nullptr, readiness,
+        std::move(managed_artifacts));
+    if (!replacement->coherent_with(*identity_))
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                "new workspace generation publication is incoherent",
+                "workspace_generation"));
     cancellation_source_t replacement_cancellation;
     workspace_progress_t replacement_progress;
     replacement_progress.readiness = readiness;
@@ -2592,6 +3690,12 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
     std::atomic_store_explicit(
         &publication_state_->publication, replacement, std::memory_order_release);
     return workspace_result_t<std::uint64_t>::success(next);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "new workspace generation allocation failed",
+                "workspace_generation"));
+    }
 }
 
 workspace_result_t<std::uint64_t> analysis_workspace_t::advance_overlay_revision(
@@ -2605,6 +3709,7 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::advance_overlay_revision
 
 workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision(
     std::uint64_t expected_current, std::uint64_t persisted_revision,
+    std::uint64_t persisted_generation,
     std::shared_ptr<const byte_provider_t> projected_provider) {
     const auto source = analysis_publication();
     if (!source || !source->snapshot || !source->provider ||
@@ -2615,10 +3720,12 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
                                  "workspace_overlay_restore"));
     }
     if (persisted_revision == 0 || persisted_revision <= expected_current ||
-        persisted_revision == (std::numeric_limits<std::uint64_t>::max)())
+        persisted_revision == (std::numeric_limits<std::uint64_t>::max)() ||
+        persisted_generation <= source->generation ||
+        persisted_generation == (std::numeric_limits<std::uint64_t>::max)())
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::revision_conflict,
-                                 "persisted overlay revision is not a valid monotonic restoration",
+                                 "persisted overlay generation or revision is not a valid monotonic restoration",
                                  "workspace_overlay_restore"));
     auto publication_provider = projected_provider
         ? std::move(projected_provider)
@@ -2645,6 +3752,7 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
     std::shared_ptr<const analysis_snapshot_t> restored_snapshot;
     try {
         auto restored = std::make_shared<analysis_snapshot_t>(*source->snapshot);
+        restored->generation = persisted_generation;
         restored->overlay_revision = persisted_revision;
         if (publication_provider != source->provider && restored->normalized_image) {
             auto rebound = bind_publication_image(
@@ -2663,8 +3771,17 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
                                  "overlay restoration allocation failed",
                                  "workspace_overlay_restore"));
     }
+    auto restored_managed = rebind_publication_managed_artifacts(
+        source->managed_artifacts, *identity_, publication_provider,
+        restored_snapshot->image, persisted_generation,
+        restored_snapshot->analysis_revision, persisted_revision,
+        cancellation_token());
+    if (!restored_managed)
+        return workspace_result_t<std::uint64_t>::failure(
+            restored_managed.error());
     const auto replacement = std::make_shared<const analysis_publication_t>(
-        restored_snapshot, publication_provider, nullptr, source->readiness);
+        restored_snapshot, publication_provider, nullptr, source->readiness,
+        restored_managed.take_value());
     if (!replacement->coherent_with(*identity_))
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
@@ -2694,7 +3811,8 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
             make_workspace_error(workspace_error_code_t::revision_conflict,
                                  "overlay revision can only be restored before analysis publication",
                                  "workspace_overlay_restore"));
-    if (current_publication->overlay_revision != expected_current)
+    if (current_publication->overlay_revision != expected_current ||
+        current_publication->generation != source->generation)
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::revision_conflict,
                                  "overlay revision changed during restoration",
@@ -2702,6 +3820,121 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
     std::atomic_store_explicit(
         &publication_state_->publication, replacement, std::memory_order_release);
     return workspace_result_t<std::uint64_t>::success(persisted_revision);
+}
+
+workspace_result_t<void> analysis_workspace_t::restore_projected_provider(
+    std::uint64_t expected_generation,
+    std::uint64_t expected_analysis_revision,
+    std::uint64_t expected_overlay_revision,
+    std::shared_ptr<const byte_provider_t> projected_provider) {
+    if (!projected_provider || target_kind() != target_kind_t::static_file)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "projected provider restoration is invalid",
+            "workspace_overlay_provider_restore"));
+    const auto& provider_identity = projected_provider->identity();
+    if (!provider_identity.immutable_snapshot ||
+        !provider_identity.content_sha256 ||
+        provider_identity.content_sha256->empty() ||
+        provider_identity.normalized_source.empty() ||
+        provider_identity.size != projected_provider->size() ||
+        projected_provider->size() != source_provider_->size() ||
+        provider_identity.member != source_provider_->member_metadata())
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::provider_binding_mismatch,
+            "restored projected provider identity is invalid",
+            "workspace_overlay_provider_restore"));
+    const auto source = analysis_publication();
+    if (!source || !source->snapshot || !source->snapshot->normalized_image ||
+        source->generation != expected_generation ||
+        source->analysis_revision != expected_analysis_revision ||
+        source->overlay_revision != expected_overlay_revision)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::stale_generation,
+            "workspace publication changed before projected provider restoration",
+            "workspace_overlay_provider_restore"));
+    const auto restore_cancel = cancellation_token();
+    std::shared_ptr<const analysis_snapshot_t> restored_snapshot;
+    std::shared_ptr<search_index_t> restored_index;
+    try {
+        auto rebound = bind_publication_image(
+            source->snapshot->normalized_image, *identity_, *projected_provider,
+            *provider_identity.content_sha256,
+            "workspace_overlay_provider_restore");
+        if (!rebound)
+            return workspace_result_t<void>::failure(rebound.error());
+        auto restored = std::make_shared<analysis_snapshot_t>(*source->snapshot);
+        restored->normalized_image = rebound.take_value();
+        restored_snapshot =
+            std::static_pointer_cast<const analysis_snapshot_t>(std::move(restored));
+        if (source->search_index) {
+            auto metrics = std::make_shared<analysis_metrics_t>(expected_generation);
+            auto rebuilt = search_index_t::build(
+                restored_snapshot, source->search_index->data_candidates(),
+                source->search_index->switches(), source->search_index->types(),
+                std::move(metrics), source->search_index->limits(),
+                restore_cancel);
+            if (!rebuilt)
+                return workspace_result_t<void>::failure(rebuilt.error());
+            restored_index = rebuilt.take_value();
+        }
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "projected provider restoration allocation failed",
+            "workspace_overlay_provider_restore"));
+    }
+    auto validated = validate_analysis_snapshot(
+        *restored_snapshot, restored_snapshot->baseline_complete,
+        restore_cancel);
+    if (!validated)
+        return validated;
+    auto restored_managed = rebind_publication_managed_artifacts(
+        source->managed_artifacts, *identity_, projected_provider,
+        restored_snapshot->image, expected_generation,
+        expected_analysis_revision, expected_overlay_revision,
+        restore_cancel);
+    if (!restored_managed)
+        return workspace_result_t<void>::failure(restored_managed.error());
+    const auto replacement = std::make_shared<const analysis_publication_t>(
+        restored_snapshot, projected_provider, restored_index, source->readiness,
+        restored_managed.take_value());
+    if (!replacement->coherent_with(*identity_))
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "restored projected publication is incoherent",
+            "workspace_overlay_provider_restore"));
+    if (publication_finalizer_active_.load(std::memory_order_acquire))
+        return workspace_result_t<void>::failure(
+            publication_finalizer_conflict("workspace_overlay_provider_restore"));
+    std::unique_lock<std::shared_mutex> mutation_lock(
+        mutation_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> publication_lock(
+        publication_mutex_, std::defer_lock);
+    std::lock(mutation_lock, publication_lock);
+    std::lock_guard state_lock(state_mutex_);
+    if (closing() || closed())
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::workspace_closing,
+            "workspace is closing",
+            "workspace_overlay_provider_restore"));
+    if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::analysis_in_progress,
+            "projected provider cannot be restored during analysis",
+            "workspace_overlay_provider_restore"));
+    const auto current = analysis_publication();
+    if (current != source || current->generation != expected_generation ||
+        current->analysis_revision != expected_analysis_revision ||
+        current->overlay_revision != expected_overlay_revision)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "workspace revisions changed during projected provider restoration",
+            "workspace_overlay_provider_restore"));
+    std::atomic_store_explicit(
+        &publication_state_->publication, replacement,
+        std::memory_order_release);
+    return workspace_result_t<void>::success();
 }
 
 cancellation_token_t analysis_workspace_t::cancellation_token() const {
@@ -3074,7 +4307,7 @@ workspace_result_t<void> analysis_workspace_t::install_search_index(
                                  "workspace_service"));
     const auto replacement = std::make_shared<const analysis_publication_t>(
         current->snapshot, current->provider, std::move(index_value),
-        current->readiness);
+        current->readiness, current->managed_artifacts);
     std::atomic_store_explicit(&publication_state_->publication, replacement,
                                std::memory_order_release);
     return workspace_result_t<void>::success();

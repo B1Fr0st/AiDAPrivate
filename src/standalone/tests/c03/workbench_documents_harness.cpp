@@ -1,4 +1,5 @@
 #include "workbench_documents_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/workbench/adapters/disasm_document.hpp"
 #include "../../src/core/workbench/adapters/hex_document.hpp"
@@ -24,12 +25,14 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
 
 void require(bool condition, const std::string& message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -2758,6 +2761,7 @@ bool run_workbench_documents_harness(std::string& failure)
         failure.clear();
         return true;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         failure = exception.what();
         return false;
     }

@@ -22,6 +22,58 @@ function Get-Text([string]$Path) {
     return [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false, $true))
 }
 
+function Get-FileSha256([string]$Path) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (-join ($algorithm.ComputeHash([IO.File]::ReadAllBytes($Path)) |
+            ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Get-StringListSha256([string[]]$Values) {
+    $unique = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($value in $Values) { [void]$unique.Add($value) }
+    [string[]]$canonicalValues = @($unique)
+    [Array]::Sort($canonicalValues, [StringComparer]::Ordinal)
+    $canonical = ($canonicalValues -join "`n")
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (-join ($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical)) |
+            ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Get-OrderedStringListSha256([string[]]$Values) {
+    $canonical = ($Values -join "`n")
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (-join ($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical)) |
+            ForEach-Object { $_.ToString('x2') })).ToUpperInvariant()
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Read-JsonObject([string]$Path, [string]$Contract) {
+    try {
+        $value = (Get-Text $Path) | ConvertFrom-Json
+    } catch {
+        throw "$Contract is invalid JSON: $($_.Exception.Message)"
+    }
+    if ($null -eq $value -or $value -is [Array]) {
+        throw "$Contract root must be an object"
+    }
+    return $value
+}
+
+function Convert-CanonicalJson([object]$Value) {
+    return ConvertTo-Json -InputObject $Value -Depth 64 -Compress
+}
+
 function Get-Relative([string]$Path) {
     $root = $RepositoryRoot.TrimEnd('\') + '\'
     if (!$Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
@@ -71,6 +123,777 @@ function Get-MatchingIndex([string]$Text, [int]$Start, [char]$Open, [char]$Close
         }
     }
     throw "Unterminated balanced range at offset $Start"
+}
+
+function Get-CppCodeMask([string]$Source) {
+    $mask = $Source.ToCharArray()
+    $length = $Source.Length
+    $index = 0
+    while ($index -lt $length) {
+        $current = $Source[$index]
+        $next = if ($index + 1 -lt $length) { $Source[$index + 1] } else { [char]0 }
+        if ($current -eq '/' -and $next -eq '/') {
+            while ($index -lt $length -and $Source[$index] -ne "`r" -and $Source[$index] -ne "`n") {
+                $mask[$index] = ' '
+                ++$index
+            }
+            continue
+        }
+        if ($current -eq '/' -and $next -eq '*') {
+            $mask[$index] = ' '
+            $mask[$index + 1] = ' '
+            $index += 2
+            $closed = $false
+            while ($index -lt $length) {
+                if ($index + 1 -lt $length -and $Source[$index] -eq '*' -and
+                    $Source[$index + 1] -eq '/') {
+                    $mask[$index] = ' '
+                    $mask[$index + 1] = ' '
+                    $index += 2
+                    $closed = $true
+                    break
+                }
+                if ($Source[$index] -ne "`r" -and $Source[$index] -ne "`n") {
+                    $mask[$index] = ' '
+                }
+                ++$index
+            }
+            if (!$closed) { throw 'Unterminated C++ block comment' }
+            continue
+        }
+        if ($current -eq 'R' -and $next -eq '"') {
+            $delimiterStart = $index + 2
+            $opening = $Source.IndexOf('(', $delimiterStart)
+            if ($opening -ge $delimiterStart -and $opening - $delimiterStart -le 16) {
+                $delimiter = $Source.Substring($delimiterStart, $opening - $delimiterStart)
+                if ($delimiter -notmatch '[\s\\()]') {
+                    $terminator = ')' + $delimiter + '"'
+                    $closing = $Source.IndexOf($terminator, $opening + 1,
+                        [StringComparison]::Ordinal)
+                    if ($closing -lt 0) { throw 'Unterminated C++ raw string literal' }
+                    $end = $closing + $terminator.Length
+                    while ($index -lt $end) {
+                        if ($Source[$index] -ne "`r" -and $Source[$index] -ne "`n") {
+                            $mask[$index] = ' '
+                        }
+                        ++$index
+                    }
+                    continue
+                }
+            }
+        }
+        if ($current -eq [char]34 -or $current -eq [char]39) {
+            $quote = $current
+            $mask[$index] = ' '
+            ++$index
+            $closed = $false
+            while ($index -lt $length) {
+                $literal = $Source[$index]
+                if ($literal -eq '\') {
+                    $mask[$index] = ' '
+                    ++$index
+                    if ($index -lt $length) {
+                        if ($Source[$index] -ne "`r" -and $Source[$index] -ne "`n") {
+                            $mask[$index] = ' '
+                        }
+                        ++$index
+                    }
+                    continue
+                }
+                if ($literal -ne "`r" -and $literal -ne "`n") { $mask[$index] = ' ' }
+                ++$index
+                if ($literal -eq $quote) {
+                    $closed = $true
+                    break
+                }
+            }
+            if (!$closed) { throw 'Unterminated C++ quoted literal' }
+            continue
+        }
+        ++$index
+    }
+    return -join $mask
+}
+
+function Get-CppNamespaceRanges([string]$Source, [string]$Mask) {
+    $ranges = [Collections.Generic.List[object]]::new()
+    $matches = [regex]::Matches($Mask,
+        '\bnamespace\s*(?<name>[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)?\s*\{')
+    foreach ($match in $matches) {
+        $open = $Mask.IndexOf('{', $match.Index)
+        if ($open -lt 0) { continue }
+        $close = Get-MatchingIndex $Mask $open '{' '}'
+        $name = [string]$match.Groups['name'].Value
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            $name = '<anonymous@' + (Get-LineNumber $Source $match.Index) + '>'
+        }
+        $ranges.Add([ordered]@{ name = $name; open = $open; close = $close })
+    }
+    return $ranges.ToArray()
+}
+
+function Get-CppNamespaceAt([object[]]$Ranges, [int]$Index) {
+    $names = @($Ranges | Where-Object { $Index -gt $_.open -and $Index -lt $_.close } |
+        Sort-Object open | ForEach-Object { [string]$_.name })
+    return ($names -join '::')
+}
+
+function Get-CppRegistrarDefinitions([string]$Path, [string]$Source, [string]$Mask,
+                                     [bool]$RequireServerParameter = $true) {
+    $relative = Get-Relative $Path
+    $namespaces = @(Get-CppNamespaceRanges $Source $Mask)
+    $definitions = [Collections.Generic.List[object]]::new()
+    $matches = [regex]::Matches($Mask,
+        '(?<![A-Za-z0-9_])(?<name>(?:[A-Za-z_]\w*::)*register_[A-Za-z0-9_]+)\s*\(')
+    foreach ($match in $matches) {
+        $open = $Mask.IndexOf('(', $match.Index)
+        if ($open -lt 0) { continue }
+        $close = Get-MatchingIndex $Mask $open '(' ')'
+        $parameters = $Source.Substring($open + 1, $close - $open - 1)
+        if ($RequireServerParameter -and
+            $parameters -notmatch '(?:mcp_standalone::)?server_t\s*&') { continue }
+        $cursor = $close + 1
+        while ($cursor -lt $Mask.Length -and [char]::IsWhiteSpace($Mask[$cursor])) { ++$cursor }
+        if ($cursor + 8 -le $Mask.Length -and $Mask.Substring($cursor, 8) -eq 'noexcept') {
+            $cursor += 8
+            while ($cursor -lt $Mask.Length -and [char]::IsWhiteSpace($Mask[$cursor])) { ++$cursor }
+        }
+        if ($cursor -ge $Mask.Length -or $Mask[$cursor] -ne '{') { continue }
+        $bodyClose = Get-MatchingIndex $Mask $cursor '{' '}'
+        $declaredName = [string]$match.Groups['name'].Value
+        $namespace = Get-CppNamespaceAt $namespaces $match.Index
+        $symbol = if ([string]::IsNullOrWhiteSpace($namespace)) {
+            $declaredName
+        } elseif ($declaredName.StartsWith($namespace + '::', [StringComparison]::Ordinal)) {
+            $declaredName
+        } else {
+            $namespace + '::' + $declaredName
+        }
+        $line = Get-LineNumber $Source $match.Index
+        $parameterCount = if ([string]::IsNullOrWhiteSpace($parameters)) {
+            0
+        } else {
+            @(Split-TopLevel $parameters).Count
+        }
+        $definitions.Add([ordered]@{
+            id = $relative + ':' + $line + ':' + $symbol
+            symbol = $symbol
+            bare_name = ($declaredName -split '::')[-1]
+            namespace = $namespace
+            parameters = ($parameters -replace '\s+', ' ').Trim()
+            parameter_count = $parameterCount
+            file = $relative
+            line = $line
+            name_offset = $match.Index
+            body_start = $cursor
+            body_end = $bodyClose
+        })
+    }
+    return $definitions.ToArray()
+}
+
+function Resolve-CppRegistrarTarget([object]$Caller, [string]$Callee,
+                                    [object[]]$Definitions, [int]$ArgumentCount) {
+    $qualified = $Callee.Contains('::')
+    $prefixes = [Collections.Generic.List[string]]::new()
+    $namespace = [string]$Caller.namespace
+    while (![string]::IsNullOrWhiteSpace($namespace)) {
+        $prefixes.Add($namespace + '::' + $Callee)
+        $separator = $namespace.LastIndexOf('::', [StringComparison]::Ordinal)
+        $namespace = if ($separator -ge 0) { $namespace.Substring(0, $separator) } else { '' }
+    }
+    $prefixes.Add($Callee)
+    foreach ($candidateName in $prefixes) {
+        $matches = @($Definitions | Where-Object {
+            [string]$_.symbol -eq $candidateName -and
+            [int]$_.parameter_count -eq $ArgumentCount
+        })
+        if ($matches.Count -gt 1) {
+            throw "Ambiguous registrar definition for '$Callee' from $($Caller.id)"
+        }
+        if ($matches.Count -eq 1) { return $matches[0] }
+    }
+    $bare = ($Callee -split '::')[-1]
+    $fallback = if ($qualified) {
+        @($Definitions | Where-Object {
+            (([string]$_.symbol).EndsWith('::' + $Callee, [StringComparison]::Ordinal) -or
+            [string]$_.symbol -eq $Callee) -and [int]$_.parameter_count -eq $ArgumentCount
+        })
+    } else {
+        @($Definitions | Where-Object {
+            [string]$_.bare_name -eq $bare -and [int]$_.parameter_count -eq $ArgumentCount
+        })
+    }
+    if ($fallback.Count -ne 1) {
+        throw "Unresolved or ambiguous registrar edge '$Callee' from $($Caller.id) candidates=$($fallback.Count)"
+    }
+    return $fallback[0]
+}
+
+function Test-CppRegistrarDeclaration([string]$Mask, [int]$Start, [int]$Close) {
+    $after = $Close + 1
+    while ($after -lt $Mask.Length -and [char]::IsWhiteSpace($Mask[$after])) { ++$after }
+    if ($after -ge $Mask.Length -or $Mask[$after] -ne ';') { return $false }
+    $boundary = $Start - 1
+    while ($boundary -ge 0 -and $Mask[$boundary] -notin @(';', '{', '}', "`r", "`n")) {
+        --$boundary
+    }
+    $prefix = $Mask.Substring($boundary + 1, $Start - $boundary - 1).Trim()
+    if ([string]::IsNullOrWhiteSpace($prefix)) { return $false }
+    return $prefix -match '^(?:(?:extern|static|inline|constexpr|consteval|constinit|friend|virtual|explicit|typename|const|volatile)\s+)*(?:(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*(?:\s*<[^;{}()]*>)?(?:\s*[*&]+)?\s+)+$'
+}
+
+function Get-CppRegistrarCalls([object]$Definition, [string]$Source, [string]$Mask,
+                               [object[]]$Definitions,
+                               [Collections.Generic.HashSet[string]]$TerminalOffsets,
+                               [hashtable]$ExplicitEdges) {
+    $calls = [Collections.Generic.List[object]]::new()
+    $bodyStart = [int]$Definition.body_start + 1
+    $bodyLength = [int]$Definition.body_end - $bodyStart
+    if ($bodyLength -le 0) { return @() }
+    $bodyMask = $Mask.Substring($bodyStart, $bodyLength)
+    $matches = [regex]::Matches($bodyMask,
+        '(?<callee>(?:[A-Za-z_]\w*::)*register_[A-Za-z0-9_]+)\s*\(')
+    foreach ($match in $matches) {
+        $absolute = $bodyStart + $match.Index
+        $callee = [string]$match.Groups['callee'].Value
+        $bare = ($callee -split '::')[-1]
+        $terminalKey = ([string]$Definition.file) + ':' + $absolute
+        $terminalPreviousKey = ([string]$Definition.file) + ':' + ($absolute - 1)
+        if ($TerminalOffsets.Contains($terminalKey) -or
+            $TerminalOffsets.Contains($terminalPreviousKey)) { continue }
+        $previous = if ($absolute -gt 0) { $Mask[$absolute - 1] } else { [char]0 }
+        $open = $Mask.IndexOf('(', $absolute)
+        $close = Get-MatchingIndex $Mask $open '(' ')'
+        if (Test-CppRegistrarDeclaration $Mask $absolute $close) { continue }
+        if ($ExplicitEdges.ContainsKey($terminalKey)) {
+            $explicit = $ExplicitEdges[$terminalKey]
+            if ([string]$explicit.caller_id -ne [string]$Definition.id) {
+                throw "Explicit registrar edge has the wrong enclosing owner at $terminalKey"
+            }
+            $calls.Add([ordered]@{
+                caller_id = [string]$explicit.caller_id
+                callee_id = [string]$explicit.callee_id
+                callee_symbol = [string]$explicit.callee_symbol
+                file = [string]$Definition.file
+                line = Get-LineNumber $Source $absolute
+                character_offset = $absolute
+                expression = [string]$explicit.expression
+            })
+            continue
+        }
+        if ($previous -eq '.' -or $previous -eq '>') {
+            throw "Indirect registrar edge '$callee' is not source-resolvable from $($Definition.id)"
+        }
+        if ($previous -match '[A-Za-z0-9_]') { continue }
+        $argumentText = $Source.Substring($open + 1, $close - $open - 1)
+        $argumentCount = if ([string]::IsNullOrWhiteSpace($argumentText)) {
+            0
+        } else {
+            @(Split-TopLevel $argumentText).Count
+        }
+        $target = Resolve-CppRegistrarTarget $Definition $callee $Definitions $argumentCount
+        $expression = ($Source.Substring($absolute, $close - $absolute + 1) -replace '\s+', ' ').Trim()
+        $calls.Add([ordered]@{
+            caller_id = [string]$Definition.id
+            callee_id = [string]$target.id
+            callee_symbol = [string]$target.symbol
+            file = [string]$Definition.file
+            line = Get-LineNumber $Source $absolute
+            character_offset = $absolute
+            expression = $expression
+        })
+    }
+    return $calls.ToArray()
+}
+
+function Get-UniqueCodeCall([string]$Path, [string]$Pattern, [string]$Label) {
+    $source = Get-Text $Path
+    $mask = Get-CppCodeMask $source
+    $matches = [regex]::Matches($mask, $Pattern)
+    if ($matches.Count -ne 1) {
+        throw "$Label must have exactly one code occurrence, observed $($matches.Count)"
+    }
+    $match = $matches[0]
+    $open = $mask.IndexOf('(', $match.Index)
+    $close = Get-MatchingIndex $mask $open '(' ')'
+    return [ordered]@{
+        file = Get-Relative $Path
+        line = Get-LineNumber $source $match.Index
+        character_offset = $match.Index
+        expression = ($source.Substring($match.Index, $close - $match.Index + 1) `
+            -replace '\s+', ' ').Trim()
+    }
+}
+
+function Get-OwnedCodeCall([string]$Path, [string]$Pattern, [string]$Label,
+                           [object[]]$Definitions) {
+    $call = Get-UniqueCodeCall $Path $Pattern $Label
+    $owners = @($Definitions | Where-Object {
+        [string]$_.file -eq [string]$call.file -and
+        [int]$call.character_offset -gt [int]$_.body_start -and
+        [int]$call.character_offset -lt [int]$_.body_end
+    })
+    if ($owners.Count -ne 1) {
+        throw "$Label has $($owners.Count) enclosing function definitions"
+    }
+    $call.caller_id = [string]$owners[0].id
+    $call.caller_symbol = [string]$owners[0].symbol
+    $source = Get-Text $Path
+    $mask = Get-CppCodeMask $source
+    $registrarMatch = [regex]::Match($mask.Substring([int]$call.character_offset),
+        '\bregister_[A-Za-z0-9_]+\s*\(')
+    if (!$registrarMatch.Success) {
+        throw "$Label does not contain a registrar-like call"
+    }
+    $call.registrar_character_offset = [int]$call.character_offset + $registrarMatch.Index
+    return $call
+}
+
+function Select-UniqueCppDefinition([object[]]$Definitions, [string]$File,
+                                    [string]$BareName, [string]$ParameterPattern,
+                                    [string]$Label) {
+    $matches = @($Definitions | Where-Object {
+        [string]$_.file -eq $File -and [string]$_.bare_name -eq $BareName -and
+        [string]$_.parameters -match $ParameterPattern
+    })
+    if ($matches.Count -ne 1) {
+        throw "$Label definition count is $($matches.Count), expected one"
+    }
+    return $matches[0]
+}
+
+function Get-McpProductionReachability([object[]]$CppFiles, [object[]]$Registrations,
+                                       [object[]]$GeneratedRegistrations,
+                                       [string]$StandaloneChatPath,
+                                       [string]$StandaloneToolsPath,
+                                       [string]$McpServerPath,
+                                       [string]$C03RegistrationPath,
+                                       [string]$C03IntegrationPath) {
+    $sources = @{}
+    $masks = @{}
+    $definitions = [Collections.Generic.List[object]]::new()
+    foreach ($file in $CppFiles) {
+        $source = Get-Text $file.FullName
+        if ($source.IndexOf('register_', [StringComparison]::Ordinal) -lt 0) { continue }
+        $relative = Get-Relative $file.FullName
+        $mask = Get-CppCodeMask $source
+        $sources[$relative] = $source
+        $masks[$relative] = $mask
+        foreach ($definition in @(Get-CppRegistrarDefinitions $file.FullName $source $mask $false)) {
+            $definitions.Add($definition)
+        }
+    }
+    $definitionIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($definition in $definitions) {
+        if (!$definitionIds.Add([string]$definition.id)) {
+            throw "Duplicate registrar definition identity: $($definition.id)"
+        }
+    }
+    $rootDefinitions = @($definitions | Where-Object {
+        [string]$_.symbol -eq 'mcp_standalone::register_standalone_tools'
+    })
+    if ($rootDefinitions.Count -ne 1) {
+        throw "Production MCP root registrar definition count is $($rootDefinitions.Count), expected one"
+    }
+    $root = $rootDefinitions[0]
+    $entry = Get-UniqueCodeCall $StandaloneChatPath `
+        '\bmcp_standalone::register_standalone_tools\s*\(\s*s_mcp_server\s*\)' `
+        'standalone production MCP initialization call'
+    $entry.root_registrar_id = [string]$root.id
+    $entry.root_registrar_symbol = [string]$root.symbol
+
+    $reachable = @{}
+    $parents = @{}
+    $chains = @{}
+    $reachable[[string]$root.id] = $root
+    $chains[[string]$root.id] = @([string]$root.id)
+    $queue = [Collections.Generic.Queue[object]]::new()
+    $queue.Enqueue($root)
+    $edges = [Collections.Generic.List[object]]::new()
+    $registrationTerminalOffsets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($registration in $Registrations) {
+        $offset = [int]$registration.source.character_offset
+        if ($offset -ge 0) {
+            [void]$registrationTerminalOffsets.Add(
+                ([string]$registration.source.file) + ':' + $offset)
+        }
+    }
+    $productionRouteEntryCall = Get-OwnedCodeCall $StandaloneToolsPath `
+        '\bregister_c03_compatibility_tools\s*\(\s*srv\s*\)' `
+        'C03 compatibility root registrar edge' $definitions.ToArray()
+    if ([string]$productionRouteEntryCall.caller_id -ne [string]$root.id) {
+        throw 'C03 compatibility root registrar edge is outside the production root'
+    }
+    $directGraphTerminalOffsets = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($key in $registrationTerminalOffsets) {
+        [void]$directGraphTerminalOffsets.Add($key)
+    }
+    [void]$directGraphTerminalOffsets.Add(
+        ([string]$productionRouteEntryCall.file) + ':' +
+        [int]$productionRouteEntryCall.registrar_character_offset)
+    while ($queue.Count -gt 0) {
+        $caller = $queue.Dequeue()
+        $relative = [string]$caller.file
+        if (!$sources.ContainsKey($relative) -or !$masks.ContainsKey($relative)) {
+            throw "Registrar source cache is unavailable: $relative"
+        }
+        $calls = @(Get-CppRegistrarCalls $caller $sources[$relative] $masks[$relative] `
+            $definitions.ToArray() $directGraphTerminalOffsets @{})
+        $localTargets = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($edge in $calls) {
+            $targetId = [string]$edge.callee_id
+            if (!$localTargets.Add($targetId)) {
+                throw "Registrar is invoked more than once from one parent: $targetId"
+            }
+            if ($targetId -eq [string]$root.id -or $parents.ContainsKey($targetId)) {
+                throw "Registrar has a cycle or multiple production parents: $targetId"
+            }
+            $targetMatches = @($definitions | Where-Object { [string]$_.id -eq $targetId })
+            if ($targetMatches.Count -ne 1) {
+                throw "Resolved registrar target identity is invalid: $targetId"
+            }
+            $target = $targetMatches[0]
+            $parents[$targetId] = [string]$caller.id
+            $chains[$targetId] = @($chains[[string]$caller.id]) + @($targetId)
+            $reachable[$targetId] = $target
+            $edges.Add($edge)
+            $queue.Enqueue($target)
+        }
+    }
+
+    $standaloneToolsRelative = Get-Relative $StandaloneToolsPath
+    $mcpServerRelative = Get-Relative $McpServerPath
+    $c03RegistrationRelative = Get-Relative $C03RegistrationPath
+    $c03IntegrationRelative = Get-Relative $C03IntegrationPath
+    $serverBridge = Select-UniqueCppDefinition $definitions.ToArray() $mcpServerRelative `
+        'register_c03_compatibility_tools' 'server_t\s*&' 'C03 server bridge'
+    $configBridge = Select-UniqueCppDefinition $definitions.ToArray() $c03RegistrationRelative `
+        'register_c03_compatibility_tools' 'tool_registry_t\s*&.*c03_compatibility_runtime_config_t' `
+        'C03 runtime-config bridge'
+    $waveRegistrar = Select-UniqueCppDefinition $definitions.ToArray() $c03RegistrationRelative `
+        'register_wave_c_compatibility_tools' 'tool_registry_t\s*&.*c03_compatibility_runtime_config_t' `
+        'C03 Wave C registrar'
+    $generatedRegistrar = Select-UniqueCppDefinition $definitions.ToArray() $c03IntegrationRelative `
+        'register_generated_tools' '^$' 'C03 generated registrar'
+    $extensionRegistrar = Select-UniqueCppDefinition $definitions.ToArray() $c03IntegrationRelative `
+        'register_extension_tools' '^$' 'C03 extension registrar'
+    $entryRegistrar = Select-UniqueCppDefinition $definitions.ToArray() $c03IntegrationRelative `
+        'register_entry' 'shared_ptr<mcp_server_integration_t>.*std::string\s*&' `
+        'C03 per-name registrar'
+
+    $routeSpecifications = @(
+        [ordered]@{
+            call = $productionRouteEntryCall
+            caller = $root
+            callee = $serverBridge
+        },
+        [ordered]@{
+            call = Get-OwnedCodeCall $McpServerPath `
+                '\bregister_c03_compatibility_tools\s*\(\s*server\.registry\s*\(\s*\)\s*,\s*make_application_c03_compatibility_runtime_config\s*\(\s*\)\s*\)' `
+                'C03 compatibility server bridge edge' $definitions.ToArray()
+            caller = $serverBridge
+            callee = $configBridge
+        },
+        [ordered]@{
+            call = Get-OwnedCodeCall $C03RegistrationPath `
+                '\bregister_wave_c_compatibility_tools\s*\(\s*registry\s*,\s*std::move\s*\(\s*config\s*\)\s*\)' `
+                'C03 compatibility wave registrar edge' $definitions.ToArray()
+            caller = $configBridge
+            callee = $waveRegistrar
+        },
+        [ordered]@{
+            call = Get-OwnedCodeCall $C03RegistrationPath `
+                '\bintegration\s*->\s*register_generated_tools\s*\(\s*\)' `
+                'C03 generated compatibility registrar edge' $definitions.ToArray()
+            caller = $waveRegistrar
+            callee = $generatedRegistrar
+        },
+        [ordered]@{
+            call = Get-OwnedCodeCall $C03RegistrationPath `
+                '\bintegration\s*->\s*register_extension_tools\s*\(\s*\)' `
+                'C03 extension registrar edge' $definitions.ToArray()
+            caller = $waveRegistrar
+            callee = $extensionRegistrar
+        },
+        [ordered]@{
+            call = Get-OwnedCodeCall $C03IntegrationPath `
+                '\bimpl_\s*->\s*register_entry\s*\(\s*owner\s*,\s*name\s*\)' `
+                'C03 generated per-name registrar edge' $definitions.ToArray()
+            caller = $generatedRegistrar
+            callee = $entryRegistrar
+        },
+        [ordered]@{
+            call = Get-OwnedCodeCall $C03IntegrationPath `
+                '\bimpl_\s*->\s*register_entry\s*\(\s*owner\s*,\s*std::string\s*\(\s*name\s*\)\s*\)' `
+                'C03 extension per-name registrar edge' $definitions.ToArray()
+            caller = $extensionRegistrar
+            callee = $entryRegistrar
+        }
+    )
+    $generatedRouteEdges = [Collections.Generic.List[object]]::new()
+    foreach ($specification in $routeSpecifications) {
+        if ([string]$specification.call.caller_id -ne [string]$specification.caller.id) {
+            throw "C03 route call has the wrong enclosing owner: $($specification.call.expression)"
+        }
+        $generatedRouteEdges.Add([ordered]@{
+            caller_id = [string]$specification.caller.id
+            caller_symbol = [string]$specification.caller.symbol
+            callee_id = [string]$specification.callee.id
+            callee_symbol = [string]$specification.callee.symbol
+            file = [string]$specification.call.file
+            line = [int]$specification.call.line
+            character_offset = [int]$specification.call.registrar_character_offset
+            expression = [string]$specification.call.expression
+        })
+    }
+    $terminalOperationCalls = @(
+        Get-OwnedCodeCall $C03IntegrationPath `
+            '\bstate\.registry\s*->\s*replace_tool\s*\(\s*std::move\s*\(\s*tool\s*\)\s*\)' `
+            'C03 replacement terminal registration' $definitions.ToArray()
+        Get-OwnedCodeCall $C03IntegrationPath `
+            '\bstate\.registry\s*->\s*register_tool\s*\(\s*std::move\s*\(\s*tool\s*\)\s*\)' `
+            'C03 insertion terminal registration' $definitions.ToArray()
+    )
+    $terminalOperations = [Collections.Generic.List[object]]::new()
+    foreach ($operation in $terminalOperationCalls) {
+        if ([string]$operation.caller_id -ne [string]$entryRegistrar.id) {
+            throw "C03 terminal registration is outside the per-name registrar"
+        }
+        $terminalOperations.Add([ordered]@{
+            file = [string]$operation.file
+            line = [int]$operation.line
+            character_offset = [int]$operation.registrar_character_offset
+            expression = [string]$operation.expression
+            caller_id = [string]$operation.caller_id
+            caller_symbol = [string]$operation.caller_symbol
+        })
+    }
+    $explicitRouteEdges = @{}
+    foreach ($edge in $generatedRouteEdges) {
+        $key = ([string]$edge.file) + ':' + [int]$edge.character_offset
+        if ($explicitRouteEdges.ContainsKey($key)) {
+            throw "C03 explicit registrar route offset is duplicated: $key"
+        }
+        $explicitRouteEdges[$key] = $edge
+    }
+    $routeTerminalOffsets = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($key in $registrationTerminalOffsets) {
+        [void]$routeTerminalOffsets.Add($key)
+    }
+    foreach ($operation in $terminalOperations) {
+        [void]$routeTerminalOffsets.Add(
+            ([string]$operation.file) + ':' + [int]$operation.character_offset)
+    }
+    $routeDefinitions = @($root, $serverBridge, $configBridge, $waveRegistrar,
+        $generatedRegistrar, $extensionRegistrar, $entryRegistrar)
+    foreach ($definition in $routeDefinitions) {
+        $relative = [string]$definition.file
+        $observed = @(Get-CppRegistrarCalls $definition $sources[$relative] $masks[$relative] `
+            $definitions.ToArray() $routeTerminalOffsets $explicitRouteEdges)
+        $expected = @($generatedRouteEdges | Where-Object {
+            [string]$_.caller_id -eq [string]$definition.id
+        })
+        if ([string]$definition.id -eq [string]$root.id) {
+            $expected += @($edges | Where-Object {
+                [string]$_.caller_id -eq [string]$definition.id
+            })
+        }
+        $observedLines = @($observed | ForEach-Object {
+            ([string]$_.caller_id) + "`t" + ([string]$_.callee_id) + "`t" +
+            ([string]$_.file) + "`t" + [int]$_.character_offset
+        } | Sort-Object)
+        $expectedLines = @($expected | ForEach-Object {
+            ([string]$_.caller_id) + "`t" + ([string]$_.callee_id) + "`t" +
+            ([string]$_.file) + "`t" + [int]$_.character_offset
+        } | Sort-Object)
+        if (($observedLines -join "`n") -ne ($expectedLines -join "`n")) {
+            throw "C03 registrar body has an unclassified or missing edge: $($definition.id)"
+        }
+    }
+    $generatedRouteNodes = $routeDefinitions | ForEach-Object {
+        [ordered]@{
+            id = [string]$_.id
+            symbol = [string]$_.symbol
+            file = [string]$_.file
+            line = [int]$_.line
+            body_start = [int]$_.body_start
+            body_end = [int]$_.body_end
+            parameters = [string]$_.parameters
+        }
+    }
+    $generatedBaseChain = @([string]$root.id, [string]$serverBridge.id,
+        [string]$configBridge.id, [string]$waveRegistrar.id)
+    $generatedCompatibilityChain = $generatedBaseChain + @(
+        [string]$generatedRegistrar.id, [string]$entryRegistrar.id)
+    $generatedExtensionChain = $generatedBaseChain + @(
+        [string]$extensionRegistrar.id, [string]$entryRegistrar.id)
+    $generatedBindings = [Collections.Generic.List[object]]::new()
+    $generatedBindingByName = @{}
+    foreach ($registration in $GeneratedRegistrations) {
+        $name = [string]$registration.name
+        if ($generatedBindingByName.ContainsKey($name)) {
+            throw "C03 generated reachability binding is duplicated: $name"
+        }
+        $extension = ([string]$registration.descriptor_source).Contains(
+            '#wave_c_extension_binding', [StringComparison]::Ordinal)
+        $chain = if ($extension) { $generatedExtensionChain } `
+            else { $generatedCompatibilityChain }
+        $binding = [ordered]@{
+            name = $name
+            branch = if ($extension) { 'extension' } else { 'generated_compatibility' }
+            registrar_id = [string]$entryRegistrar.id
+            registrar_symbol = [string]$entryRegistrar.symbol
+            chain = $chain
+            chain_sha256 = Get-OrderedStringListSha256 $chain
+        }
+        $registration.production_reachability = $binding
+        $generatedBindingByName[$name] = $binding
+        $generatedBindings.Add($binding)
+    }
+    if ($generatedBindings.Count -ne 92 -or
+        @($generatedBindings | Where-Object { $_.branch -eq 'generated_compatibility' }).Count -ne 88 -or
+        @($generatedBindings | Where-Object { $_.branch -eq 'extension' }).Count -ne 4) {
+        throw 'C03 generated per-name reachability partition is invalid'
+    }
+    $generatedRouteLines = [Collections.Generic.List[string]]::new()
+    foreach ($node in $generatedRouteNodes) {
+        $generatedRouteLines.Add('R' + "`t" + $node.id + "`t" + $node.symbol + "`t" +
+            $node.file + "`t" + $node.line)
+    }
+    foreach ($edge in $generatedRouteEdges) {
+        $generatedRouteLines.Add('E' + "`t" + $edge.caller_id + "`t" + $edge.callee_id +
+            "`t" + $edge.file + "`t" + $edge.line + "`t" + $edge.character_offset +
+            "`t" + $edge.expression)
+    }
+    foreach ($operation in $terminalOperations) {
+        $generatedRouteLines.Add('T' + "`t" + $operation.caller_id + "`t" + $operation.file +
+            "`t" + $operation.line + "`t" + $operation.character_offset + "`t" +
+            $operation.expression)
+    }
+    $generatedBindingLines = @($generatedBindings | Sort-Object name | ForEach-Object {
+        ([string]$_.name) + "`t" + ([string]$_.branch) + "`t" +
+        ([string]$_.registrar_id) + "`t" + ([string]$_.chain_sha256)
+    })
+    $generatedRouteHash = Get-StringListSha256 $generatedRouteLines.ToArray()
+    $generatedBindingHash = Get-StringListSha256 $generatedBindingLines
+
+    $directCount = 0
+    $projectionCount = 0
+    $rowLines = [Collections.Generic.List[string]]::new()
+    foreach ($registration in $Registrations) {
+        $offset = [int]$registration.source.character_offset
+        if ($offset -ge 0) {
+            $file = [string]$registration.source.file
+            $enclosing = @($definitions | Where-Object {
+                [string]$_.file -eq $file -and $offset -gt [int]$_.body_start -and
+                $offset -lt [int]$_.body_end
+            })
+            if ($enclosing.Count -ne 1) {
+                throw "MCP registration '$($registration.name)' has $($enclosing.Count) enclosing registrars"
+            }
+            $registrar = $enclosing[0]
+            $registrarId = [string]$registrar.id
+            if (!$reachable.ContainsKey($registrarId)) {
+                throw "MCP registration '$($registration.name)' is in an unreachable registrar: $registrarId"
+            }
+            $chain = @($chains[$registrarId])
+            $chainHash = Get-OrderedStringListSha256 $chain
+            $registration.production_reachability = [ordered]@{
+                mode = 'direct_registration'
+                registrar_id = $registrarId
+                registrar_symbol = [string]$registrar.symbol
+                chain = $chain
+                chain_sha256 = $chainHash
+            }
+            ++$directCount
+        } else {
+            $name = [string]$registration.name
+            if (!$generatedBindingByName.ContainsKey($name)) {
+                throw "Legacy MCP projection lacks generated production reachability: $name"
+            }
+            $generatedBinding = $generatedBindingByName[$name]
+            $chain = @($generatedBinding.chain)
+            $chainHash = [string]$generatedBinding.chain_sha256
+            $registration.production_reachability = [ordered]@{
+                mode = 'generated_compatibility_projection'
+                generated_branch = [string]$generatedBinding.branch
+                registrar_id = [string]$generatedBinding.registrar_id
+                registrar_symbol = [string]$generatedBinding.registrar_symbol
+                chain = $chain
+                chain_sha256 = $chainHash
+            }
+            ++$projectionCount
+        }
+        $rowLines.Add(([string]$registration.name) + "`t" +
+            ([string]$registration.production_reachability.mode) + "`t" +
+            ([string]$registration.production_reachability.registrar_id) + "`t" +
+            ([string]$registration.production_reachability.chain_sha256))
+    }
+    if ($Registrations.Count -ne 331 -or $directCount + $projectionCount -ne 331) {
+        throw "Production MCP reachability requires exactly 331 bound registrations"
+    }
+
+    $registrarRows = @($reachable.Values | Sort-Object id | ForEach-Object {
+        [ordered]@{
+            id = [string]$_.id
+            symbol = [string]$_.symbol
+            file = [string]$_.file
+            line = [int]$_.line
+            body_start = [int]$_.body_start
+            body_end = [int]$_.body_end
+            parent_id = if ([string]$_.id -eq [string]$root.id) { $null } `
+                else { [string]$parents[[string]$_.id] }
+            chain = @($chains[[string]$_.id])
+        }
+    })
+    $edgeRows = @($edges | Sort-Object caller_id, callee_id, file, line)
+    $graphLines = [Collections.Generic.List[string]]::new()
+    foreach ($registrar in $registrarRows) {
+        $graphLines.Add('R' + "`t" + $registrar.id + "`t" + $registrar.symbol + "`t" +
+            $registrar.file + "`t" + $registrar.line + "`t" + [string]$registrar.parent_id)
+    }
+    foreach ($edge in $edgeRows) {
+        $graphLines.Add('E' + "`t" + $edge.caller_id + "`t" + $edge.callee_id + "`t" +
+            $edge.file + "`t" + $edge.line + "`t" + $edge.character_offset + "`t" +
+            $edge.expression)
+    }
+    $sourceFilePaths = @($registrarRows | ForEach-Object { [string]$_.file }) + @(
+        Get-Relative $StandaloneChatPath
+        Get-Relative $McpServerPath
+        Get-Relative $C03RegistrationPath
+        Get-Relative $C03IntegrationPath
+    )
+    return [ordered]@{
+        schema_version = 1
+        production_entry = $entry
+        concrete_registration_count = $Registrations.Count
+        direct_registration_count = $directCount
+        generated_projection_count = $projectionCount
+        reachable_registrar_count = $registrarRows.Count
+        registrar_edge_count = $edgeRows.Count
+        row_binding_sha256 = Get-StringListSha256 @($rowLines | Sort-Object)
+        registrar_graph_sha256 = Get-StringListSha256 $graphLines.ToArray()
+        registrars = $registrarRows
+        edges = $edgeRows
+        generated_route = [ordered]@{
+            node_count = $generatedRouteNodes.Count
+            edge_count = $generatedRouteEdges.Count
+            terminal_operation_count = $terminalOperations.Count
+            binding_count = $generatedBindings.Count
+            generated_compatibility_count = 88
+            extension_count = 4
+            nodes = $generatedRouteNodes
+            edges = $generatedRouteEdges.ToArray()
+            terminal_operations = $terminalOperations.ToArray()
+            bindings = @($generatedBindings | Sort-Object name)
+            route_sha256 = $generatedRouteHash
+            binding_sha256 = $generatedBindingHash
+        }
+        source_files = @($sourceFilePaths | Sort-Object -Unique)
+    }
 }
 
 function Get-SourceBlock([string]$Source, [string]$Marker, [string]$Contract) {
@@ -420,6 +1243,318 @@ function Get-SchemaParameters([object]$Schema) {
     return $parameters.ToArray()
 }
 
+function Get-C03CompatibilitySurface([string]$ContractsPath, [string]$EffectLedgerPath,
+                                     [string]$ArchiveManifestPath,
+                                     [string]$RegistrationPath,
+                                     [string]$ServerIntegrationPath,
+                                     [string]$ToolRegistrationPath,
+                                     [string]$HandlerRoot,
+                                     [string]$FixtureRoot) {
+    $contractsDocument = Read-JsonObject $ContractsPath 'generated MCP contract ledger'
+    $effectDocument = Read-JsonObject $EffectLedgerPath 'generated MCP effect ledger'
+    $archiveManifest = Read-JsonObject $ArchiveManifestPath 'generated MCP archive manifest'
+    if ([int]$contractsDocument.schema_version -ne 1 -or
+        [int]$effectDocument.schema_version -ne 1 -or
+        [int]$archiveManifest.schema_version -ne 1) {
+        throw 'Generated MCP descriptor schema version is invalid'
+    }
+    $compatibilityNames = @($contractsDocument.compatibility_names | ForEach-Object { [string]$_ })
+    $contractNames = @($contractsDocument.contracts | ForEach-Object { [string]$_.name })
+    $effectNames = @($effectDocument.contracts | ForEach-Object { [string]$_.name })
+    $manifestCompatibility = @($archiveManifest.compatibility_names | ForEach-Object { [string]$_ })
+    $extensionNames = @($archiveManifest.aida_extensions | ForEach-Object { [string]$_ })
+    $unionNames = @($archiveManifest.union_names | ForEach-Object { [string]$_ })
+    Assert-StringSetEqual $compatibilityNames $contractNames 'generated MCP compatibility contracts'
+    Assert-StringSetEqual $compatibilityNames $effectNames 'generated MCP effect contracts'
+    Assert-StringSetEqual $compatibilityNames $manifestCompatibility 'generated MCP archive compatibility names'
+    Assert-StringSetEqual (@($compatibilityNames + $extensionNames)) $unionNames 'generated MCP compatibility-extension union'
+    if ($compatibilityNames.Count -ne 88 -or $extensionNames.Count -ne 4 -or
+        $unionNames.Count -ne 92 -or [int]$archiveManifest.archive_tool_count -ne 88 -or
+        [int]$archiveManifest.compatibility_tool_count -ne 88 -or
+        [int]$archiveManifest.aida_extension_count -ne 4 -or
+        [int]$archiveManifest.union_tool_count -ne 92) {
+        throw 'Generated MCP compatibility cardinality is invalid'
+    }
+    if (@($contractsDocument.excluded_tools).Count -ne 1 -or
+        [string]$contractsDocument.excluded_tools[0] -ne 'py_eval' -or
+        @($archiveManifest.excluded_tools).Count -ne 1 -or
+        [string]$archiveManifest.excluded_tools[0] -ne 'py_eval' -or
+        $unionNames -contains 'py_eval' -or $unionNames -notcontains 'list_instances') {
+        throw 'Generated MCP exclusion and proxy-local policy is invalid'
+    }
+    $expectedExtensions = @('analyze_funcs', 'find_insns', 'calculator', 'calculate')
+    if (($extensionNames -join "`n") -ne ($expectedExtensions -join "`n")) {
+        throw 'Generated MCP extension order is invalid'
+    }
+
+    $domains = [ordered]@{
+        analysis = [ordered]@{
+            names = @('decompile', 'disasm', 'func_profile', 'analyze_batch', 'xrefs_to',
+                'xref_query', 'xrefs_to_field', 'callees', 'find_bytes', 'basic_blocks',
+                'find', 'insn_query', 'export_funcs', 'callgraph')
+            handler = 'analysis.cpp'
+            handler_marker = 'analysis_handlers_t::invoke'
+            fixture = 'analysis_handlers_harness.cpp'
+            fixture_marker = 'run_analysis_handlers_harness'
+        }
+        composite = [ordered]@{
+            names = @('analyze_function', 'analyze_component', 'diff_before_after', 'trace_data_flow')
+            handler = 'composite.cpp'
+            handler_marker = 'composite_handlers_t::invoke'
+            fixture = 'composite_handlers_harness.cpp'
+            fixture_marker = 'run_composite_handlers_harness'
+        }
+        core = [ordered]@{
+            names = @('server_health', 'lookup_funcs', 'int_convert', 'list_funcs', 'func_query',
+                'list_globals', 'entity_query', 'imports', 'imports_query', 'idb_save',
+                'find_regex', 'search_text')
+            handler = 'core.cpp'
+            handler_marker = 'core_handlers_t::invoke'
+            fixture = 'core_handlers_harness.cpp'
+            fixture_marker = 'run_core_handlers_harness'
+        }
+        debugger = [ordered]@{
+            names = @('dbg_start', 'dbg_status', 'dbg_exit', 'dbg_continue', 'dbg_run_to',
+                'dbg_step_into', 'dbg_step_over', 'dbg_bps', 'dbg_add_bp', 'dbg_delete_bp',
+                'dbg_toggle_bp', 'dbg_set_bp_condition', 'dbg_regs_all', 'dbg_regs_remote',
+                'dbg_regs', 'dbg_gpregs_remote', 'dbg_gpregs', 'dbg_regs_named_remote',
+                'dbg_regs_named', 'dbg_stacktrace', 'dbg_read', 'dbg_write')
+            handler = 'debugger.cpp'
+            handler_marker = 'debugger_handlers_t::invoke'
+            fixture = 'debugger_handlers_harness.cpp'
+            fixture_marker = 'run_debugger_handlers_harness'
+        }
+        memory = [ordered]@{
+            names = @('get_bytes', 'get_int', 'get_string', 'get_global_value', 'patch', 'put_int')
+            handler = 'memory.cpp'
+            handler_marker = 'memory_handlers_t::invoke'
+            fixture = 'memory_handlers_harness.cpp'
+            fixture_marker = 'run_memory_handlers_harness'
+        }
+        modify = [ordered]@{
+            names = @('add_bookmark', 'set_comments', 'append_comments', 'patch_asm', 'rename',
+                'define_func', 'define_code', 'undefine', 'force_recompile', 'set_op_type', 'make_data')
+            handler = 'modify.cpp'
+            handler_marker = 'modify_handlers_t::invoke'
+            fixture = 'modify_handlers_harness.cpp'
+            fixture_marker = 'run_modify_handlers_harness'
+        }
+        python = [ordered]@{
+            names = @('py_exec_file')
+            handler = 'python.cpp'
+            handler_marker = 'python_handlers_t::invoke'
+            fixture = 'python_handler_harness.cpp'
+            fixture_marker = 'run_python_handler_harness'
+        }
+        signatures = [ordered]@{
+            names = @('make_signature', 'make_signature_for_function', 'make_signature_for_range',
+                'find_xref_signatures')
+            handler = 'signatures.cpp'
+            handler_marker = 'is_signature_tool_name'
+            fixture = 'signature_handlers_harness.cpp'
+            fixture_marker = 'run_signature_handlers_harness'
+        }
+        stack = [ordered]@{
+            names = @('stack_frame', 'declare_stack', 'delete_stack')
+            handler = 'stack.cpp'
+            handler_marker = 'stack_handlers_t::invoke'
+            fixture = 'stack_handlers_harness.cpp'
+            fixture_marker = 'run_stack_handlers_harness'
+        }
+        survey = [ordered]@{
+            names = @('survey_binary')
+            handler = 'survey.cpp'
+            handler_marker = 'survey_handlers_t::invoke'
+            fixture = 'survey_handler_harness.cpp'
+            fixture_marker = 'run_survey_handler_harness'
+        }
+        types = [ordered]@{
+            names = @('declare_type', 'enum_upsert', 'read_struct', 'search_structs', 'type_query',
+                'type_inspect', 'set_type', 'type_apply_batch', 'infer_types')
+            handler = 'types.cpp'
+            handler_marker = 'types_handlers_t::invoke'
+            fixture = 'type_handlers_harness.cpp'
+            fixture_marker = 'run_type_handlers_harness'
+        }
+        routing_extensions = [ordered]@{
+            names = @('list_instances', 'analyze_funcs', 'find_insns', 'calculator', 'calculate')
+            handler = 'routing_extensions.cpp'
+            handler_marker = 'routing_extension_tool_names'
+            fixture = 'routing_extensions_harness.cpp'
+            fixture_marker = 'run_routing_extensions_harness'
+        }
+    }
+
+    $partitionNames = [Collections.Generic.List[string]]::new()
+    $domainRecords = [Collections.Generic.List[object]]::new()
+    $domainByName = @{}
+    foreach ($domainName in $domains.Keys) {
+        $domain = $domains[$domainName]
+        $handlerPath = Join-Path $HandlerRoot $domain.handler
+        $fixturePath = Join-Path $FixtureRoot $domain.fixture
+        if (!(Test-Path -LiteralPath $handlerPath -PathType Leaf) -or
+            !(Test-Path -LiteralPath $fixturePath -PathType Leaf)) {
+            throw "MCP domain source is unavailable: $domainName"
+        }
+        $handlerSource = Get-Text $handlerPath
+        $fixtureSource = Get-Text $fixturePath
+        Assert-SourceContains $handlerSource @([string]$domain.handler_marker) "MCP $domainName production handler"
+        Assert-SourceContains $fixtureSource @([string]$domain.fixture_marker) "MCP $domainName functional fixture"
+        foreach ($name in @($domain.names)) {
+            if ($domainByName.ContainsKey($name)) {
+                throw "MCP compatibility domain partition contains duplicate '$name'"
+            }
+            $quoted = '"' + $name + '"'
+            Assert-SourceContains $handlerSource @($quoted) "MCP $name production handler"
+            Assert-SourceContains $fixtureSource @($quoted) "MCP $name functional fixture"
+            $domainByName[$name] = $domainName
+            $partitionNames.Add($name)
+        }
+        $domainRecords.Add([ordered]@{
+            domain = $domainName
+            names = @($domain.names)
+            production_handler = Get-Relative $handlerPath
+            handler_marker = [string]$domain.handler_marker
+            functional_fixture = Get-Relative $fixturePath
+            fixture_marker = [string]$domain.fixture_marker
+        })
+    }
+    Assert-StringSetEqual $unionNames $partitionNames.ToArray() 'MCP production-handler fixture partition'
+
+    $contractByName = @{}
+    $archiveBackedNames = [Collections.Generic.List[string]]::new()
+    foreach ($contract in @($contractsDocument.contracts)) {
+        $name = [string]$contract.name
+        if ($contractByName.ContainsKey($name)) { throw "Duplicate generated MCP contract '$name'" }
+        $contractByName[$name] = $contract
+        if ([bool]$contract.archive_backed) { $archiveBackedNames.Add($name) }
+    }
+    $proxyLocalNames = @($compatibilityNames | Where-Object { $_ -notin $archiveBackedNames })
+    if ($archiveBackedNames.Count -ne 87 -or $proxyLocalNames.Count -ne 1 -or
+        $proxyLocalNames[0] -ne 'list_instances') {
+        throw 'Generated MCP archive-backed and proxy-local partition is invalid'
+    }
+    $effectByName = @{}
+    foreach ($effect in @($effectDocument.contracts)) {
+        $name = [string]$effect.name
+        if ($effectByName.ContainsKey($name)) { throw "Duplicate generated MCP effect '$name'" }
+        $effectByName[$name] = $effect
+    }
+    $registrationRecords = [Collections.Generic.List[object]]::new()
+    foreach ($name in $compatibilityNames) {
+        $contract = $contractByName[$name]
+        $effect = $effectByName[$name]
+        if ($null -eq $contract.input_schema -or $null -eq $contract.output_schema -or
+            $null -eq $contract.annotations -or
+            !([string]$contract.adapter_symbol).StartsWith(
+                'aida::standalone::mcp::compat::adapters::', [StringComparison]::Ordinal)) {
+            throw "Generated MCP contract is incomplete: $name"
+        }
+        foreach ($field in @('adapter_symbol', 'effect', 'lock', 'read_only', 'unsafe')) {
+            if ((Convert-CanonicalJson $contract.$field) -ne (Convert-CanonicalJson $effect.$field)) {
+                throw "Generated MCP contract/effect mismatch for $name field $field"
+            }
+        }
+        if ([bool]$contract.routing.target_dependent -ne [bool]$effect.target_dependent) {
+            throw "Generated MCP routing/effect mismatch for $name"
+        }
+        $routingFields = @($contract.routing.fields | ForEach-Object { [string]$_.name })
+        Assert-StringSetEqual $routingFields @($effect.routing_fields | ForEach-Object { [string]$_ }) "Generated MCP routing fields for $name"
+        $acceptsPid = $routingFields -contains 'pid'
+        $acceptsBinName = $routingFields -contains 'bin_name'
+        if ([bool]$contract.routing.target_dependent -and (!$acceptsPid -or !$acceptsBinName)) {
+            throw "Target-dependent generated MCP contract lacks additive selectors: $name"
+        }
+        $domain = [string]$domainByName[$name]
+        $domainRecord = $domains[$domain]
+        $registrationRecords.Add([ordered]@{
+            name = $name
+            descriptor_source = Get-Relative $ContractsPath
+            adapter_symbol = [string]$contract.adapter_symbol
+            effect = [string]$contract.effect
+            lock = [string]$contract.lock
+            target_dependent = [bool]$contract.routing.target_dependent
+            accepts_pid = $acceptsPid
+            accepts_bin_name = $acceptsBinName
+            read_only = [bool]$contract.read_only
+            unsafe = [bool]$contract.unsafe
+            production_handler = Get-Relative (Join-Path $HandlerRoot $domainRecord.handler)
+            functional_fixture = Get-Relative (Join-Path $FixtureRoot $domainRecord.fixture)
+            domain = $domain
+        })
+    }
+    $extensionPolicies = [ordered]@{
+        analyze_funcs = @('workspace_overlay_mutation', 'workspace_overlay_transaction', $true, $true, $false)
+        find_insns = @('workspace_read', 'workspace_shared', $true, $true, $true)
+        calculator = @('registry_read', 'registry_read', $false, $false, $true)
+        calculate = @('registry_read', 'registry_read', $false, $false, $true)
+    }
+    foreach ($name in $extensionNames) {
+        $policy = $extensionPolicies[$name]
+        $domain = [string]$domainByName[$name]
+        $domainRecord = $domains[$domain]
+        $registrationRecords.Add([ordered]@{
+            name = $name
+            descriptor_source = (Get-Relative $RegistrationPath) + '#wave_c_extension_binding'
+            adapter_symbol = 'aida::standalone::mcp::compat::adapters::' + $name
+            effect = [string]$policy[0]
+            lock = [string]$policy[1]
+            target_dependent = [bool]$policy[2]
+            accepts_pid = [bool]$policy[3]
+            accepts_bin_name = [bool]$policy[3]
+            read_only = [bool]$policy[4]
+            unsafe = $false
+            production_handler = Get-Relative (Join-Path $HandlerRoot $domainRecord.handler)
+            functional_fixture = Get-Relative (Join-Path $FixtureRoot $domainRecord.fixture)
+            domain = $domain
+        })
+    }
+
+    $registrationSource = Get-Text $RegistrationPath
+    $integrationSource = Get-Text $ServerIntegrationPath
+    $toolRegistrationSource = Get-Text $ToolRegistrationPath
+    Assert-SourceContains $toolRegistrationSource @('register_c03_compatibility_tools(srv);') 'C03 MCP production entry'
+    Assert-SourceExcludes $toolRegistrationSource @('register_ida_compatibility_tools(srv)') 'C03 MCP production entry'
+    Assert-SourceContains $registrationSource @(
+        'integration->register_generated_tools();',
+        'integration->register_extension_tools();',
+        'names.size() != wave_c_compat::k_union_tool_count',
+        'integration->registered_tool_count() != wave_c_compat::k_union_tool_count',
+        'unique_names.find("list_instances") == unique_names.end()',
+        'unique_names.find("py_eval") != unique_names.end()'
+    ) 'C03 MCP generated registration'
+    Assert-SourceContains $integrationSource @(
+        'void mcp_server_integration_t::register_generated_tools()',
+        'void mcp_server_integration_t::register_extension_tools()',
+        'protocol::validate_tool_contract',
+        'const auto input_validation = impl_->state.schemas.validate(',
+        'const auto output_validation = impl_->state.schemas.validate('
+    ) 'C03 MCP server integration'
+
+    return [ordered]@{
+        registration_count = $registrationRecords.Count
+        archive_backed_count = $archiveBackedNames.Count
+        proxy_local_count = $proxyLocalNames.Count
+        extension_count = $extensionNames.Count
+        union_names = @($unionNames)
+        registrations = @($registrationRecords | Sort-Object name)
+        domains = $domainRecords.ToArray()
+        descriptor_artifacts = [ordered]@{
+            contracts = [ordered]@{ path = Get-Relative $ContractsPath; sha256 = Get-FileSha256 $ContractsPath }
+            effects = [ordered]@{ path = Get-Relative $EffectLedgerPath; sha256 = Get-FileSha256 $EffectLedgerPath }
+            archive_manifest = [ordered]@{ path = Get-Relative $ArchiveManifestPath; sha256 = Get-FileSha256 $ArchiveManifestPath }
+        }
+        registration_source = Get-Relative $RegistrationPath
+        server_integration_source = Get-Relative $ServerIntegrationPath
+        source_files = @($RegistrationPath, $ServerIntegrationPath, $ToolRegistrationPath,
+            $ContractsPath, $EffectLedgerPath, $ArchiveManifestPath) +
+            @($domainRecords | ForEach-Object {
+                Join-Path $RepositoryRoot $_.production_handler
+                Join-Path $RepositoryRoot $_.functional_fixture
+            })
+    }
+}
+
 function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
                                        [string]$MutationPath, [string]$RegistrationPath,
                                        [string]$SessionRegistrationPath) {
@@ -438,12 +1573,12 @@ function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
     Assert-StringSetEqual $targetNames (@($readEntries.name | Where-Object { $_ -ne 'int_convert' }) + @($mutationEntries.name)) 'IDA-compatible target-dependent registration set'
 
     Assert-SourceContains $registrationSource @(
-        'install_ida_compat_schema_validation();',
-        'for (const auto& definition : ida_compat::get_read_tool_defs())',
-        'for (const auto& definition : ida_compat::get_mutation_tool_defs())',
-        'for (const char* name : {"calculator", "calculate"})',
-        'if (!register_ida_compatibility_tools(srv))'
-    ) 'IDA-compatible production registration'
+        'register_c03_compatibility_tools(srv);'
+    ) 'C03 compatibility production registration'
+    Assert-SourceExcludes $registrationSource @(
+        'register_ida_compatibility_tools(srv)',
+        'install_ida_compat_schema_validation();'
+    ) 'removed legacy IDA-compatible production registration'
     Assert-SourceContains $schemaSource @(
         's["calculator"] = s["calculate"];',
         'const json selector_bin_name = {',
@@ -635,7 +1770,8 @@ function Get-IdaCompatibilityInventory([string]$SchemaPath, [string]$ReadPath,
 function New-Registration([string]$Name, [string]$Description, [object[]]$Parameters,
                           [bool]$ReadOnly, [string]$Visibility, [string]$File,
                           [int]$Line, [string]$Evidence, [string]$ParameterExpression,
-                          [bool]$WorkspaceAware, [object]$InputSchema = $null) {
+                          [bool]$WorkspaceAware, [int]$CharacterOffset = -1,
+                          [object]$InputSchema = $null) {
     $registration = [ordered]@{
         name = $Name
         description = $Description
@@ -643,7 +1779,12 @@ function New-Registration([string]$Name, [string]$Description, [object[]]$Parame
         read_only = $ReadOnly
         visibility_declared = $Visibility
         visibility_effective = $Visibility
-        source = [ordered]@{ file = $File; line = $Line; evidence = $Evidence }
+        source = [ordered]@{
+            file = $File
+            line = $Line
+            character_offset = $CharacterOffset
+            evidence = $Evidence
+        }
         parameter_expression = ($ParameterExpression -replace '\s+', ' ').Trim()
         workspace_aware = $WorkspaceAware
     }
@@ -651,6 +1792,261 @@ function New-Registration([string]$Name, [string]$Description, [object[]]$Parame
         $registration.input_schema = $InputSchema
     }
     return $registration
+}
+
+function Get-RegistrationHelperName([string]$Source, [int]$Index) {
+    foreach ($name in @('register_direct_alias', 'register_dispatch_alias')) {
+        try {
+            $block = Get-SourceBlock $Source ("void $name(") "MCP registration helper $name"
+        } catch {
+            continue
+        }
+        $end = $block.block_index + $block.text.Length
+        if ($Index -ge $block.marker_index -and $Index -lt $end) {
+            return $name
+        }
+    }
+    return $null
+}
+
+function Get-CommandSurface([string]$Path) {
+    $source = Get-Text $Path
+    $builtins = Get-SourceBlock $source 'void register_builtins_locked(' 'built-in command registry'
+    $names = [Collections.Generic.List[string]]::new()
+    foreach ($match in [regex]::Matches($builtins.text, 'c\.name\s*=\s*"([^"]+)"\s*;')) {
+        $names.Add($match.Groups[1].Value)
+    }
+    foreach ($match in [regex]::Matches($builtins.text,
+        '\{\s*"([^"]+)"\s*,\s*"[^"]+"\s*,\s*center_view_t::[A-Za-z0-9_]+\s*\}')) {
+        $names.Add($match.Groups[1].Value)
+    }
+    $unique = @($names | Sort-Object -Unique)
+    if ($names.Count -ne 34 -or $unique.Count -ne 34) {
+        throw 'Built-in command surface cardinality is invalid'
+    }
+    $rebuild = Get-SourceBlock $source 'void rebuild_locked()' 'command registry rebuild'
+    Assert-SourceOrdered $rebuild.text @(
+        'register_builtins_locked(dst);',
+        'register_skills_locked(dst, taken_names);',
+        'register_mcp_prompts_locked(dst, taken_names);',
+        'register_mcp_tools_locked(dst, taken_names);',
+        'register_agents_locked(dst, taken_names);'
+    ) 'command registry producer order'
+    return [ordered]@{
+        builtin_count = $unique.Count
+        builtin_names = $unique
+        dynamic_producers = @('skills', 'mcp_prompts', 'mcp_tools', 'agents')
+        source = Get-Relative $Path
+        source_files = @($Path)
+    }
+}
+
+function Get-TestLabSurface([string]$Root) {
+    $records = [Collections.Generic.List[object]]::new()
+    $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $sourceFiles = [Collections.Generic.List[string]]::new()
+    $macroCount = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $Root -File -Filter 'test_lab_features*.cpp' |
+        Sort-Object FullName)) {
+        $source = Get-Text $file.FullName
+        $matches = [regex]::Matches($source,
+            '(?s)TESTLAB_REGISTER\s*\(\s*[^,]+,\s*"([^"]+)"\s*,\s*[^,]+,\s*"([^"]+)"')
+        $allMacros = [regex]::Matches($source, 'TESTLAB_REGISTER\s*\(').Count
+        if ($matches.Count -ne $allMacros) {
+            throw "Unresolved Test Lab registration in $($file.FullName)"
+        }
+        if ($matches.Count -eq 0) { continue }
+        $sourceFiles.Add($file.FullName)
+        $macroCount += $matches.Count
+        foreach ($match in $matches) {
+            $category = $match.Groups[1].Value
+            $name = $match.Groups[2].Value
+            $key = $category + "`n" + $name
+            if (!$keys.Add($key)) {
+                throw "Duplicate Test Lab public feature '$category/$name'"
+            }
+            $records.Add([ordered]@{
+                category = $category
+                name = $name
+                source = [ordered]@{
+                    file = Get-Relative $file.FullName
+                    line = Get-LineNumber $source $match.Index
+                }
+            })
+        }
+    }
+    if ($macroCount -lt 68 -or $records.Count -ne $macroCount) {
+        throw 'Test Lab public feature surface regressed below the historical baseline'
+    }
+    return [ordered]@{
+        feature_count = $records.Count
+        features = @($records | Sort-Object category, name)
+        source_files = $sourceFiles.ToArray()
+    }
+}
+
+function Get-WorkbenchSurface([string]$ContractsPath, [string]$ShellPath,
+                              [string]$PersistencePath) {
+    $contracts = Get-Text $ContractsPath
+    $shell = Get-Text $ShellPath
+    $persistence = Get-Text $PersistencePath
+    $analysisKinds = @('disassembly', 'hex', 'pseudocode', 'graph', 'diff')
+    foreach ($kind in $analysisKinds) {
+        Assert-SourceContains $contracts @($kind + ' =') "workbench document kind $kind"
+        Assert-SourceContains $shell @('document_kind_t::' + $kind) "workbench production document $kind"
+    }
+    Assert-SourceContains $shell @(
+        'workbench_persistence_dto_t build_default_persistence(',
+        'default_doc.identity.kind = document_kind_t::disassembly;',
+        'workbench_shell_integration_t::make_default_for_analysis(',
+        'workbench_shell_runtime_t::attach_analysis_workspace(',
+        'output.disassembly_document = lifetime->documents->disassembly();',
+        'output.hex_document = lifetime->documents->hex();',
+        'output.pseudocode_document = lifetime->documents->pseudocode();',
+        'output.graph_document = lifetime->documents->graph();',
+        'output.diff_document = lifetime->documents->diff();',
+        'persist_runtime_binding(binding);'
+    ) 'workbench production shell integration'
+    Assert-SourceContains $persistence @(
+        '{"schema_version", std::to_string(dto.schema_version)}',
+        '{"revision", std::to_string(dto.revision.value)}',
+        '{"active_document", std::to_string(dto.active_document.value)}',
+        '{"split_tree", split_tree_json(dto.split_tree)}',
+        '{"panels", std::move(panels)}',
+        'navigation_event_json(event)'
+    ) 'workbench persistence codec'
+    return [ordered]@{
+        analysis_document_count = $analysisKinds.Count
+        analysis_document_kinds = $analysisKinds
+        default_analysis_document = 'disassembly'
+        per_workspace_persistence = $true
+        contracts_source = Get-Relative $ContractsPath
+        shell_source = Get-Relative $ShellPath
+        persistence_source = Get-Relative $PersistencePath
+        source_files = @($ContractsPath, $ShellPath, $PersistencePath)
+    }
+}
+
+function Get-OverlaySurface([string]$Path) {
+    $source = Get-Text $Path
+    $block = Get-SourceBlock $source 'enum class overlay_operation_kind_v9_t' 'overlay operation ordinals'
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($match in [regex]::Matches($block.text, '(?m)^\s*([A-Za-z_]\w*)\s*=\s*(\d+)\s*,?\s*$')) {
+        $records.Add([ordered]@{
+            name = $match.Groups[1].Value
+            ordinal = [int]$match.Groups[2].Value
+        })
+    }
+    if ($records.Count -ne 18) { throw 'Overlay operation cardinality is invalid' }
+    for ($index = 0; $index -lt $records.Count; ++$index) {
+        if ([int]$records[$index].ordinal -ne $index) {
+            throw "Overlay operation ordinal is not contiguous at index $index"
+        }
+        Assert-SourceContains $source @(
+            'static_assert(static_cast<std::uint8_t>(overlay_operation_kind_v9_t::' +
+            [string]$records[$index].name + ') == ' + $index + ');'
+        ) "overlay ordinal static assertion $index"
+    }
+    Assert-SourceContains $source @(
+        'return ordinal <= static_cast<std::uint8_t>(overlay_operation_kind_v9_t::integer_patch);'
+    ) 'legacy overlay ordinal preservation'
+    return [ordered]@{
+        operation_count = $records.Count
+        legacy_ordinal_min = 0
+        legacy_ordinal_max = 13
+        appended_ordinal_min = 14
+        appended_ordinal_max = 17
+        operations = $records.ToArray()
+        source = Get-Relative $Path
+        source_files = @($Path)
+    }
+}
+
+function Get-DeadPathSurface([string]$Root) {
+    $retirements = @(
+        [ordered]@{
+            responsibility = 'production_mcp_registry_fixture'
+            retired_paths = @(
+                'src/standalone/tests/c03/driver_bridge_stub.cpp',
+                'src/standalone/tests/c03/driver_bridge_stub.hpp',
+                'src/standalone/tests/analysis_workspace/workspace_mcp_harness.cpp'
+            )
+            replacement_paths = @(
+                'src/standalone/tests/c03/mcp_production_core/main.cpp',
+                'src/standalone/tests/c03/mcp_production_core/mcp_production_core_harness.cpp',
+                'src/standalone/tests/c03/mcp_production_core/mcp_production_core_harness.hpp'
+            )
+            cmake_markers = @(
+                'TARGET aida_c03_mcp_production_core_harness PACKAGE D03 TIMEOUT 300',
+                '${AIDA_C03_TEST_ROOT}/mcp_production_core/main.cpp',
+                '${AIDA_C03_TEST_ROOT}/mcp_production_core/mcp_production_core_harness.cpp'
+            )
+        },
+        [ordered]@{
+            responsibility = 'combined_decompiler_quality_pipeline'
+            retired_paths = @(
+                'src/standalone/tests/c03/decompiler_provider_matrix/main.cpp',
+                'src/standalone/tests/c03/decompiler_quality_scorer_harness_main.cpp',
+                'cmake/c03_safe_headless/materialize_quality_selftest.py'
+            )
+            replacement_paths = @(
+                'cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp',
+                'src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.cpp',
+                'src/standalone/tests/c03/decompiler_provider_matrix/provider_matrix.hpp',
+                'src/standalone/tests/c03/decompiler_quality_scorer_harness.cpp',
+                'src/standalone/tests/c03/decompiler_quality_scorer_harness.hpp'
+            )
+            cmake_markers = @(
+                'TARGET aida_c03_a06_decompiler_quality_scorer_harness PACKAGE A06 ARGS_ENTRY',
+                '${AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT}/c03_safe_headless/decompiler_quality_pipeline_main.cpp',
+                '${AIDA_C03_TEST_ROOT}/decompiler_provider_matrix/provider_matrix.cpp',
+                '${AIDA_C03_TEST_ROOT}/decompiler_quality_scorer_harness.cpp'
+            )
+        }
+    )
+    $removed = @($retirements | ForEach-Object { @($_.retired_paths) } | Sort-Object -Unique)
+    foreach ($path in $removed) {
+        if (Test-Path -LiteralPath (Join-Path $Root $path)) {
+            throw "Removed C03 path was restored: $path"
+        }
+    }
+    $replacements = @($retirements | ForEach-Object { @($_.replacement_paths) } | Sort-Object -Unique)
+    $replacementEvidence = [Collections.Generic.List[object]]::new()
+    foreach ($path in $replacements) {
+        $absolute = Join-Path $Root $path
+        if (!(Test-Path -LiteralPath $absolute -PathType Leaf)) {
+            throw "Required C03 replacement path is unavailable: $path"
+        }
+        $responsibilities = @($retirements | Where-Object { $_.replacement_paths -contains $path } |
+            ForEach-Object { [string]$_.responsibility } | Sort-Object -Unique)
+        $replacementEvidence.Add([ordered]@{
+            path = $path
+            sha256 = Get-FileSha256 $absolute
+            responsibilities = $responsibilities
+        })
+    }
+    $cmakePath = Join-Path $Root 'cmake\aida_c03_safe_headless_manifest.cmake'
+    $cmakeSource = Get-Text $cmakePath
+    $allCmakeMarkers = [Collections.Generic.List[string]]::new()
+    foreach ($retirement in $retirements) {
+        Assert-SourceContains $cmakeSource @($retirement.cmake_markers) `
+            "C03 replacement graph $($retirement.responsibility)"
+        foreach ($marker in @($retirement.cmake_markers)) {
+            $allCmakeMarkers.Add([string]$marker)
+        }
+    }
+    return [ordered]@{
+        absent_paths = $removed
+        replacement_paths = $replacements
+        retirements = $retirements
+        replacement_evidence = $replacementEvidence.ToArray()
+        cmake_graph = [ordered]@{
+            path = Get-Relative $cmakePath
+            marker_count = @($allCmakeMarkers | Sort-Object -Unique).Count
+            marker_sha256 = Get-StringListSha256 $allCmakeMarkers.ToArray()
+        }
+        source_files = @($replacements | ForEach-Object { Join-Path $Root $_ })
+    }
 }
 
 $core = Join-Path $RepositoryRoot 'src\standalone\src\core'
@@ -662,33 +2058,44 @@ $idaMutationPath = Join-Path $core 'mcp\ida_compat_mut.cpp'
 $calculatorToolPath = Join-Path $core 'mcp\calculator_tool.cpp'
 $decompilerServicePath = Join-Path $core 'analysis\workspace\decompiler_service.cpp'
 $sessionToolsPath = Join-Path $core 'tools\session_tools_standalone.cpp'
+$c03RegistrationPath = Join-Path $core 'mcp\compat\c03_compatibility_registration.cpp'
+$c03ServerIntegrationPath = Join-Path $core 'mcp\compat\mcp_server_integration.cpp'
+$standaloneChatPath = Join-Path $core 'ai\standalone_chat.cpp'
+$c03HandlerRoot = Join-Path $core 'mcp\compat\handlers'
+$c03FixtureRoot = Join-Path $RepositoryRoot 'src\standalone\tests\mcp_compat'
+$c03DescriptorRoot = Join-Path $RepositoryRoot 'src\standalone\src\resources\mcp\ida_pro_mcp_2_0_0'
+$c03ContractsPath = Join-Path $c03DescriptorRoot 'contracts.json'
+$c03EffectLedgerPath = Join-Path $c03DescriptorRoot 'effect_ledger.json'
+$c03ArchiveManifestPath = Join-Path $c03DescriptorRoot 'archive_manifest.json'
 $mcpSource = Get-Text $mcpPath
 $internalNames = @(Get-NameSet $mcpSource 'is_standalone_internal_only_tool_name')
 $chatNames = @(Get-NameSet $mcpSource 'is_standalone_ide_chat_only_tool_name')
 $browserNames = @(Get-NameSet $mcpSource 'is_camoufox_reverse_tool_name')
 $registrations = [Collections.Generic.List[object]]::new()
-$dynamicEvidence = [Collections.Generic.List[object]]::new()
+$resolvedHelperEvidence = [Collections.Generic.List[object]]::new()
+$unresolvedRegistrationEvidence = [Collections.Generic.List[object]]::new()
 $sourceFiles = [Collections.Generic.List[string]]::new()
 
 $files = @(Get-ChildItem $core -Recurse -File -Filter '*.cpp' | Sort-Object FullName)
 foreach ($file in $files) {
     $source = Get-Text $file.FullName
+    $codeMask = Get-CppCodeMask $source
     $relative = Get-Relative $file.FullName
     $fileContributed = $false
     $cursor = 0
     while ($cursor -lt $source.Length) {
-        $match = [regex]::Match($source, '\.register_tool\s*\(', [Text.RegularExpressions.RegexOptions]::None,
+        $match = [regex]::Match($codeMask, '\.register_tool\s*\(', [Text.RegularExpressions.RegexOptions]::None,
             [TimeSpan]::FromSeconds(2))
         if (!$match.Success) { break }
         $absolute = $cursor + $match.Index
         if ($cursor -gt 0) {
-            $remaining = $source.Substring($cursor)
+            $remaining = $codeMask.Substring($cursor)
             $match = [regex]::Match($remaining, '\.register_tool\s*\(')
             if (!$match.Success) { break }
             $absolute = $cursor + $match.Index
         }
-        $open = $source.IndexOf('(', $absolute)
-        $close = Get-MatchingIndex $source $open '(' ')'
+        $open = $codeMask.IndexOf('(', $absolute)
+        $close = Get-MatchingIndex $codeMask $open '(' ')'
         $argumentText = $source.Substring($open + 1, $close - $open - 1).Trim()
         $line = Get-LineNumber $source $absolute
         if ($argumentText.StartsWith('{')) {
@@ -712,29 +2119,48 @@ foreach ($file in $files) {
                         Name = $name; Description = $description; Parameters = $parameters
                         ReadOnly = $readOnly; Visibility = $visibility; File = $relative
                         Line = $line; Evidence = 'direct_initializer'; ParameterExpression = $fields[2]
-                        WorkspaceAware = $workspaceAware
+                        WorkspaceAware = $workspaceAware; CharacterOffset = $absolute
                     }
                     $registrations.Add((New-Registration @registrationArgs))
                     $fileContributed = $true
                 } else {
-                    $dynamicEvidence.Add([ordered]@{ file = $relative; line = $line; expression = ($fields[0] -replace '\s+', ' ').Trim() })
+                    $expression = ($fields[0] -replace '\s+', ' ').Trim()
+                    $helperName = Get-RegistrationHelperName $codeMask $absolute
+                    $record = [ordered]@{
+                        file = $relative
+                        line = $line
+                        expression = $expression
+                    }
+                    if ($null -ne $helperName) {
+                        $record.helper = $helperName
+                        $resolvedHelperEvidence.Add($record)
+                    } else {
+                        $unresolvedRegistrationEvidence.Add($record)
+                    }
                 }
             }
         } elseif ($argumentText -match '^std::move\s*\(\s*([A-Za-z_]\w*)\s*\)') {
             $variable = $Matches[1]
             $prefix = $source.Substring(0, $absolute)
-            $declarationMatches = [regex]::Matches($prefix, "(?:tool_def_t|mcp_standalone::tool_def_t)\s+$([regex]::Escape($variable))\b")
+            $prefixMask = $codeMask.Substring(0, $absolute)
+            $declarationMatches = [regex]::Matches($prefixMask, "(?:tool_def_t|mcp_standalone::tool_def_t)\s+$([regex]::Escape($variable))\b")
             if ($declarationMatches.Count -gt 0) {
                 $segmentStart = $declarationMatches[$declarationMatches.Count - 1].Index
                 $segment = $prefix.Substring($segmentStart)
-                $nameMatches = [regex]::Matches($segment, "$([regex]::Escape($variable))\.name\s*=\s*([^;]+);")
-                $descriptionMatches = [regex]::Matches($segment, "$([regex]::Escape($variable))\.description\s*=\s*([^;]+);")
-                $paramsMatches = [regex]::Matches($segment, "$([regex]::Escape($variable))\.params\s*=\s*([^;]+);")
-                $readOnlyMatches = [regex]::Matches($segment, "$([regex]::Escape($variable))\.read_only\s*=\s*(true|false)\s*;")
+                $segmentMask = $prefixMask.Substring($segmentStart)
+                $nameMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.name\s*=\s*([^;]+);")
+                $descriptionMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.description\s*=\s*([^;]+);")
+                $paramsMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.params\s*=\s*([^;]+);")
+                $readOnlyMatches = [regex]::Matches($segmentMask, "$([regex]::Escape($variable))\.read_only\s*=\s*(true|false)\s*;")
                 if ($nameMatches.Count -gt 0 -and $descriptionMatches.Count -gt 0 -and $readOnlyMatches.Count -gt 0) {
-                    $name = Convert-CppStrings $nameMatches[$nameMatches.Count - 1].Groups[1].Value
-                    $description = Convert-CppStrings $descriptionMatches[$descriptionMatches.Count - 1].Groups[1].Value
-                    $parameterExpression = if ($paramsMatches.Count -gt 0) { $paramsMatches[$paramsMatches.Count - 1].Groups[1].Value } else { '{}' }
+                    $nameGroup = $nameMatches[$nameMatches.Count - 1].Groups[1]
+                    $descriptionGroup = $descriptionMatches[$descriptionMatches.Count - 1].Groups[1]
+                    $name = Convert-CppStrings $segment.Substring($nameGroup.Index, $nameGroup.Length)
+                    $description = Convert-CppStrings $segment.Substring($descriptionGroup.Index, $descriptionGroup.Length)
+                    $parameterExpression = if ($paramsMatches.Count -gt 0) {
+                        $group = $paramsMatches[$paramsMatches.Count - 1].Groups[1]
+                        $segment.Substring($group.Index, $group.Length)
+                    } else { '{}' }
                     if ($null -ne $name -and $null -ne $description) {
                         $parameters = @(Resolve-ParameterExpression $parameterExpression $source)
                         $readOnly = $readOnlyMatches[$readOnlyMatches.Count - 1].Groups[1].Value -eq 'true'
@@ -743,7 +2169,7 @@ foreach ($file in $files) {
                             ReadOnly = $readOnly; Visibility = 'external_visible'; File = $relative
                             Line = $line; Evidence = 'assigned_tool_definition'
                             ParameterExpression = $parameterExpression
-                            WorkspaceAware = $false
+                            WorkspaceAware = $false; CharacterOffset = $absolute
                         }
                         $registrations.Add((New-Registration @registrationArgs))
                         $fileContributed = $true
@@ -755,13 +2181,13 @@ foreach ($file in $files) {
     }
 
     foreach ($wrapper in @('register_tool', 'register_direct_alias', 'register_dispatch_alias')) {
-        $matches = [regex]::Matches($source, "(?<![.A-Za-z0-9_])$wrapper\s*\(")
+        $matches = [regex]::Matches($codeMask, "(?<![.A-Za-z0-9_])$wrapper\s*\(")
         foreach ($match in $matches) {
-            $open = $source.IndexOf('(', $match.Index)
-            $close = Get-MatchingIndex $source $open '(' ')'
+            $open = $codeMask.IndexOf('(', $match.Index)
+            $close = Get-MatchingIndex $codeMask $open '(' ')'
             $after = $close + 1
-            while ($after -lt $source.Length -and [char]::IsWhiteSpace($source[$after])) { ++$after }
-            if ($after -lt $source.Length -and $source[$after] -eq '{') { continue }
+            while ($after -lt $codeMask.Length -and [char]::IsWhiteSpace($codeMask[$after])) { ++$after }
+            if ($after -lt $codeMask.Length -and $codeMask[$after] -eq '{') { continue }
             $arguments = Split-TopLevel $source.Substring($open + 1, $close - $open - 1)
             if ($arguments.Count -lt 3) { continue }
             $nameIndex = 1
@@ -789,7 +2215,7 @@ foreach ($file in $files) {
                 Visibility = 'external_visible'; File = $relative
                 Line = (Get-LineNumber $source $match.Index); Evidence = "wrapper_$wrapper"
                 ParameterExpression = $parameterExpression
-                WorkspaceAware = $false
+                WorkspaceAware = $false; CharacterOffset = $match.Index
             }
             $registrations.Add((New-Registration @registrationArgs))
             $fileContributed = $true
@@ -799,6 +2225,9 @@ foreach ($file in $files) {
 }
 
 $idaCompatibility = Get-IdaCompatibilityInventory $idaSchemaPath $idaReadPath $idaMutationPath $mcpToolsPath $sessionToolsPath
+$c03Compatibility = Get-C03CompatibilitySurface $c03ContractsPath $c03EffectLedgerPath `
+    $c03ArchiveManifestPath $c03RegistrationPath $c03ServerIntegrationPath `
+    $mcpToolsPath $c03HandlerRoot $c03FixtureRoot
 $registeredNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($registration in $registrations) {
     if (!$registeredNames.Add([string]$registration.name)) {
@@ -892,6 +2321,53 @@ $registrations = @($registrations | Sort-Object @{Expression='name';Ascending=$t
 $duplicateNames = @($registrations | Group-Object -Property { $_.name } |
     Where-Object Count -gt 1 |
     ForEach-Object { [ordered]@{ name = $_.Name; registrations = $_.Count } } | Sort-Object name)
+$resolvedHelperRecords = [Collections.Generic.List[object]]::new()
+foreach ($helper in $resolvedHelperEvidence) {
+    $evidenceName = 'wrapper_' + [string]$helper.helper
+    $concrete = @($registrations | Where-Object {
+        [string]$_.source.file -eq [string]$helper.file -and
+        [string]$_.source.evidence -eq $evidenceName
+    } | Sort-Object name)
+    if ([string]$helper.expression -ne 'alias' -or $concrete.Count -eq 0) {
+        throw "MCP registration helper has no concrete source-resolved registrations: $($helper.helper)"
+    }
+    $resolvedHelperRecords.Add([ordered]@{
+        helper = [string]$helper.helper
+        file = [string]$helper.file
+        line = [int]$helper.line
+        expression = [string]$helper.expression
+        concrete_registration_count = $concrete.Count
+        concrete_registration_names = @($concrete.name)
+    })
+}
+if ($unresolvedRegistrationEvidence.Count -ne 0) {
+    $detail = @($unresolvedRegistrationEvidence | ForEach-Object {
+        "$($_.file):$($_.line):$($_.expression)"
+    }) -join ', '
+    throw "Unresolved public MCP registrations remain: $detail"
+}
+$resolvedHelperNames = @($resolvedHelperRecords.helper | Sort-Object)
+$resolvedHelperRegistrationCount = [int](($resolvedHelperRecords | ForEach-Object {
+    [int]$_.concrete_registration_count
+} | Measure-Object -Sum).Sum)
+$expectedResolvedHelperNames = @('register_direct_alias', 'register_dispatch_alias') | Sort-Object
+if (($resolvedHelperNames -join "`n") -ne ($expectedResolvedHelperNames -join "`n") -or
+    $resolvedHelperRegistrationCount -ne 110) {
+    throw 'MCP registration helper provenance cardinality is invalid'
+}
+$resolvedRegistrationNames = @($registrations.name | Sort-Object -Unique)
+$c03UnionNames = @($c03Compatibility.union_names | Sort-Object -Unique)
+$c03OverlapNames = @($c03UnionNames | Where-Object { $_ -in $resolvedRegistrationNames } | Sort-Object)
+$c03GeneratedOnlyNames = @($c03UnionNames | Where-Object { $_ -notin $resolvedRegistrationNames } | Sort-Object)
+$effectiveRegistrationNames = @($resolvedRegistrationNames + $c03UnionNames | Sort-Object -Unique)
+if ($resolvedRegistrationNames.Count -ne $registrations.Count -or
+    $c03UnionNames.Count -ne 92 -or $c03OverlapNames.Count -ne 42 -or
+    $c03GeneratedOnlyNames.Count -ne 50 -or $effectiveRegistrationNames.Count -ne 381) {
+    throw 'MCP resolved/generated/effective registration cardinality is invalid'
+}
+$mcpProductionReachability = Get-McpProductionReachability $files $registrations `
+    $c03Compatibility.registrations $standaloneChatPath $mcpToolsPath $mcpPath $c03RegistrationPath `
+    $c03ServerIntegrationPath
 
 $resourceMatches = [regex]::Matches($mcpSource, '\{"uri",\s*"([^"]+)"\}\s*,\s*\r?\n?\s*\{"name",\s*"([^"]+)"\}\s*,\s*\r?\n?\s*\{"description",\s*"([^"]+)"\}\s*,\s*\r?\n?\s*\{"mimeType",\s*"([^"]+)"\}')
 $resources = [Collections.Generic.List[object]]::new()
@@ -919,6 +2395,12 @@ $hexHeaderPath = Join-Path $core 'editor\hex_view.hpp'
 $hexSourcePath = Join-Path $core 'editor\hex_view.cpp'
 $fileBrowserPath = Join-Path $RepositoryRoot 'src\standalone\src\helpers\file_browser.cpp'
 $mainPath = Join-Path $RepositoryRoot 'src\standalone\src\main.cpp'
+$commandRegistryPath = Join-Path $core 'ai\command_registry.cpp'
+$testLabRoot = Join-Path $core 'testlab'
+$workbenchContractsPath = Join-Path $core 'workbench\workbench_contracts.h'
+$workbenchShellPath = Join-Path $core 'workbench\workbench_shell_integration.cpp'
+$workbenchPersistencePath = Join-Path $core 'workbench\workbench_persistence.cpp'
+$overlayApplyHeaderPath = Join-Path $core 'analysis\overlay_apply_engine.hpp'
 $globalsSource = Get-Text $globalsPath
 $helpersSource = Get-Text $helpersPath
 $sessionHeader = Get-Text $sessionHeaderPath
@@ -930,6 +2412,12 @@ $hexHeaderSource = Get-Text $hexHeaderPath
 $hexSource = Get-Text $hexSourcePath
 $fileBrowserSource = Get-Text $fileBrowserPath
 $mainSource = Get-Text $mainPath
+$commandSurface = Get-CommandSurface $commandRegistryPath
+$testLabSurface = Get-TestLabSurface $testLabRoot
+$workbenchSurface = Get-WorkbenchSurface $workbenchContractsPath $workbenchShellPath `
+    $workbenchPersistencePath
+$overlaySurface = Get-OverlaySurface $overlayApplyHeaderPath
+$deadPathSurface = Get-DeadPathSurface $RepositoryRoot
 
 $centerMatch = [regex]::Match($globalsSource, '(?s)enum\s+class\s+center_view_t[^\{]*\{([^}]+)\}')
 $centerViews = @()
@@ -1272,15 +2760,71 @@ $sourceContractManifest = [ordered]@{
         files = $hexCallInventory.files
     }
     ida_compatibility = [ordered]@{
-        registration_count = $idaCompatibility.records.Count
-        read_only_names = $idaCompatibility.read_only_names
-        mutation_names = $idaCompatibility.mutation_names
-        target_dependent_names = $idaCompatibility.target_dependent_names
-        schema_source = Get-Relative $idaSchemaPath
+        registration_count = $c03Compatibility.registration_count
+        archive_backed_count = $c03Compatibility.archive_backed_count
+        proxy_local_count = $c03Compatibility.proxy_local_count
+        extension_count = $c03Compatibility.extension_count
+        union_names = $c03Compatibility.union_names
+        registrations = $c03Compatibility.registrations
+        domains = $c03Compatibility.domains
+        descriptor_artifacts = $c03Compatibility.descriptor_artifacts
+        registration_source = $c03Compatibility.registration_source
+        server_integration_source = $c03Compatibility.server_integration_source
+        legacy_schema_projection = [ordered]@{
+            registration_count = $idaCompatibility.records.Count
+            read_only_names = $idaCompatibility.read_only_names
+            mutation_names = $idaCompatibility.mutation_names
+            target_dependent_names = $idaCompatibility.target_dependent_names
+            schema_source = Get-Relative $idaSchemaPath
+        }
+    }
+}
+
+$publicSurfaceManifest = [ordered]@{
+    commands = [ordered]@{
+        builtin_count = $commandSurface.builtin_count
+        builtin_names = $commandSurface.builtin_names
+        dynamic_producers = $commandSurface.dynamic_producers
+        source = $commandSurface.source
+    }
+    test_lab = [ordered]@{
+        feature_count = $testLabSurface.feature_count
+        features = $testLabSurface.features
+    }
+    workbench = [ordered]@{
+        analysis_document_count = $workbenchSurface.analysis_document_count
+        analysis_document_kinds = $workbenchSurface.analysis_document_kinds
+        default_analysis_document = $workbenchSurface.default_analysis_document
+        per_workspace_persistence = $workbenchSurface.per_workspace_persistence
+        contracts_source = $workbenchSurface.contracts_source
+        shell_source = $workbenchSurface.shell_source
+        persistence_source = $workbenchSurface.persistence_source
+    }
+    overlay = [ordered]@{
+        operation_count = $overlaySurface.operation_count
+        legacy_ordinal_min = $overlaySurface.legacy_ordinal_min
+        legacy_ordinal_max = $overlaySurface.legacy_ordinal_max
+        appended_ordinal_min = $overlaySurface.appended_ordinal_min
+        appended_ordinal_max = $overlaySurface.appended_ordinal_max
+        operations = $overlaySurface.operations
+        source = $overlaySurface.source
+    }
+    dead_paths = [ordered]@{
+        absent_paths = $deadPathSurface.absent_paths
+        replacement_paths = $deadPathSurface.replacement_paths
+        retirements = $deadPathSurface.retirements
+        replacement_evidence = $deadPathSurface.replacement_evidence
+        cmake_graph = $deadPathSurface.cmake_graph
     }
 }
 
 $allEvidenceFiles = @($sourceFiles + $idaCompatibility.evidence_files +
+    $c03Compatibility.source_files + $commandSurface.source_files +
+    $testLabSurface.source_files + $workbenchSurface.source_files +
+    $overlaySurface.source_files + $deadPathSurface.source_files +
+    @($mcpProductionReachability.source_files | ForEach-Object {
+        Join-Path $RepositoryRoot ([string]$_).Replace('/', '\')
+    }) +
     $hexCallInventory.absolute_files + @($mcpPath, $globalsPath, $helpersPath,
     $sessionHeaderPath, $sessionSourcePath, $workspaceRegistryPath,
     $driverIdentityPath, $driverSourcePath, $hexHeaderPath, $hexSourcePath,
@@ -1308,10 +2852,6 @@ function Get-ObjectField([object]$Object, [string]$Name) {
     if (!(Test-ObjectField $Object $Name)) { return $null }
     if ($Object -is [Collections.IDictionary]) { return $Object[$Name] }
     return $Object.PSObject.Properties[$Name].Value
-}
-
-function Convert-CanonicalJson([object]$Value) {
-    return ConvertTo-Json -InputObject $Value -Depth 64 -Compress
 }
 
 function Get-NamedSurfaceIndex([object[]]$Values, [string]$Field, [string]$Contract) {
@@ -1396,6 +2936,33 @@ function Assert-SurfaceCompatibility([object]$Reference, [object]$Candidate,
         @((Get-ObjectField $candidateMcp 'duplicate_names')).Count -ne 0) {
         throw 'Generated MCP registration count or duplicate-name contract is inconsistent'
     }
+    if (Test-ObjectField $referenceMcp 'generated_union_names') {
+        foreach ($field in @('generated_registration_count', 'generated_overlap_count',
+            'generated_only_count', 'effective_registration_count', 'generated_union_names',
+            'generated_overlap_names', 'generated_only_names', 'effective_registration_names')) {
+            if (!(Test-ObjectField $candidateMcp $field)) {
+                throw "Generated MCP inventory lost field '$field' relative to $ReferenceLabel"
+            }
+        }
+        $candidateGenerated = @((Get-ObjectField $candidateMcp 'generated_union_names'))
+        $candidateOverlap = @((Get-ObjectField $candidateMcp 'generated_overlap_names'))
+        $candidateGeneratedOnly = @((Get-ObjectField $candidateMcp 'generated_only_names'))
+        $candidateEffective = @((Get-ObjectField $candidateMcp 'effective_registration_names'))
+        if ([int](Get-ObjectField $candidateMcp 'generated_registration_count') -ne
+                $candidateGenerated.Count -or
+            [int](Get-ObjectField $candidateMcp 'generated_overlap_count') -ne
+                $candidateOverlap.Count -or
+            [int](Get-ObjectField $candidateMcp 'generated_only_count') -ne
+                $candidateGeneratedOnly.Count -or
+            [int](Get-ObjectField $candidateMcp 'effective_registration_count') -ne
+                $candidateEffective.Count) {
+            throw 'Generated MCP additive inventory count is inconsistent'
+        }
+        Assert-StringSetEqual @((Get-ObjectField $referenceMcp 'generated_union_names')) `
+            $candidateGenerated 'pinned C03 generated MCP union'
+        Assert-StringSurfaceSubset @((Get-ObjectField $referenceMcp 'effective_registration_names')) `
+            $candidateEffective 'effective MCP registration'
+    }
     foreach ($name in $referenceTools.Keys) {
         if (!$candidateTools.ContainsKey($name)) {
             throw "Removed or renamed MCP registration '$name' relative to $ReferenceLabel"
@@ -1445,13 +3012,69 @@ function Assert-SurfaceCompatibility([object]$Reference, [object]$Candidate,
     }
     $referenceDynamic = @((Get-ObjectField $referenceMcp 'dynamic_registration_templates'))
     $candidateDynamic = @((Get-ObjectField $candidateMcp 'dynamic_registration_templates'))
+    $candidateResolvedHelpers = @((Get-ObjectField $candidateMcp 'resolved_registration_helpers'))
     foreach ($entry in $referenceDynamic) {
         $matched = @($candidateDynamic | Where-Object {
             [string](Get-ObjectField $_ 'file') -eq [string](Get-ObjectField $entry 'file') -and
             [string](Get-ObjectField $_ 'expression') -eq [string](Get-ObjectField $entry 'expression')
         }).Count -ne 0
         if (!$matched) {
-            throw "Removed unresolved dynamic registration template relative to $ReferenceLabel"
+            $matched = @($candidateResolvedHelpers | Where-Object {
+                [string](Get-ObjectField $_ 'file') -eq [string](Get-ObjectField $entry 'file') -and
+                [string](Get-ObjectField $_ 'expression') -eq [string](Get-ObjectField $entry 'expression')
+            }).Count -ne 0
+        }
+        if (!$matched) {
+            throw "Removed dynamic registration provenance relative to $ReferenceLabel"
+        }
+    }
+    if (Test-ObjectField $referenceMcp 'unresolved_registration_count') {
+        if ([int](Get-ObjectField $candidateMcp 'unresolved_registration_count') -ne 0 -or
+            @((Get-ObjectField $candidateMcp 'dynamic_registration_templates')).Count -ne 0) {
+            throw "Unresolved MCP registrations were introduced relative to $ReferenceLabel"
+        }
+        $referenceHelpers = Get-NamedSurfaceIndex @((Get-ObjectField $referenceMcp 'resolved_registration_helpers')) `
+            'helper' "$ReferenceLabel resolved MCP registration helpers"
+        $candidateHelpers = Get-NamedSurfaceIndex $candidateResolvedHelpers 'helper' `
+            'generated resolved MCP registration helpers'
+        foreach ($name in $referenceHelpers.Keys) {
+            if (!$candidateHelpers.ContainsKey($name) -or
+                (Convert-CanonicalJson (Get-ObjectField $referenceHelpers[$name] 'concrete_registration_names')) -ne
+                (Convert-CanonicalJson (Get-ObjectField $candidateHelpers[$name] 'concrete_registration_names'))) {
+                throw "Resolved MCP registration helper '$name' regressed relative to $ReferenceLabel"
+            }
+        }
+    }
+    if (Test-ObjectField $referenceMcp 'production_reachability') {
+        if (!(Test-ObjectField $candidateMcp 'production_reachability')) {
+            throw "Generated MCP inventory lost production reachability relative to $ReferenceLabel"
+        }
+        $beforeReachability = Get-ObjectField $referenceMcp 'production_reachability'
+        $afterReachability = Get-ObjectField $candidateMcp 'production_reachability'
+        foreach ($field in @('schema_version', 'concrete_registration_count',
+            'direct_registration_count', 'generated_projection_count',
+            'reachable_registrar_count', 'registrar_edge_count',
+            'row_binding_sha256', 'registrar_graph_sha256')) {
+            if ((Convert-CanonicalJson (Get-ObjectField $beforeReachability $field)) -ne
+                (Convert-CanonicalJson (Get-ObjectField $afterReachability $field))) {
+                throw "MCP production reachability field '$field' regressed relative to $ReferenceLabel"
+            }
+        }
+        $beforeGeneratedRoute = Get-ObjectField $beforeReachability 'generated_route'
+        $afterGeneratedRoute = Get-ObjectField $afterReachability 'generated_route'
+        foreach ($field in @('node_count', 'edge_count', 'terminal_operation_count',
+            'binding_count', 'generated_compatibility_count', 'extension_count',
+            'route_sha256', 'binding_sha256')) {
+            if ((Convert-CanonicalJson (Get-ObjectField $beforeGeneratedRoute $field)) -ne
+                (Convert-CanonicalJson (Get-ObjectField $afterGeneratedRoute $field))) {
+                throw "MCP generated production route field '$field' regressed relative to $ReferenceLabel"
+            }
+        }
+        foreach ($name in $referenceTools.Keys) {
+            if ((Convert-CanonicalJson (Get-ObjectField $referenceTools[$name] 'production_reachability')) -ne
+                (Convert-CanonicalJson (Get-ObjectField $candidateTools[$name] 'production_reachability'))) {
+                throw "MCP production reachability row '$name' regressed relative to $ReferenceLabel"
+            }
         }
     }
 
@@ -1505,6 +3128,64 @@ function Assert-SurfaceCompatibility([object]$Reference, [object]$Candidate,
         if ((Convert-CanonicalJson $referenceHexCalls) -ne (Convert-CanonicalJson $candidateHexCalls)) {
             throw "Hex context source schema regressed relative to $ReferenceLabel"
         }
+        $referenceCompatibility = Get-ObjectField (Get-ObjectField $Reference 'source_contracts') 'ida_compatibility'
+        if (Test-ObjectField $referenceCompatibility 'union_names') {
+            $candidateCompatibility = Get-ObjectField (Get-ObjectField $Candidate 'source_contracts') 'ida_compatibility'
+            Assert-StringSetEqual @((Get-ObjectField $referenceCompatibility 'union_names')) `
+                @((Get-ObjectField $candidateCompatibility 'union_names')) `
+                'C03 generated MCP compatibility union'
+            $referenceGenerated = Get-NamedSurfaceIndex @((Get-ObjectField $referenceCompatibility 'registrations')) `
+                'name' "$ReferenceLabel generated MCP compatibility registrations"
+            $candidateGenerated = Get-NamedSurfaceIndex @((Get-ObjectField $candidateCompatibility 'registrations')) `
+                'name' 'generated MCP compatibility registrations'
+            foreach ($name in $referenceGenerated.Keys) {
+                if (!$candidateGenerated.ContainsKey($name)) {
+                    throw "Removed C03 generated MCP registration '$name' relative to $ReferenceLabel"
+                }
+                foreach ($field in @('descriptor_source', 'adapter_symbol', 'effect', 'lock',
+                    'target_dependent', 'accepts_pid', 'accepts_bin_name', 'read_only', 'unsafe',
+                    'production_handler', 'functional_fixture', 'domain')) {
+                    if ((Convert-CanonicalJson (Get-ObjectField $referenceGenerated[$name] $field)) -ne
+                        (Convert-CanonicalJson (Get-ObjectField $candidateGenerated[$name] $field))) {
+                        throw "C03 generated MCP registration '$name' changed field '$field' relative to $ReferenceLabel"
+                    }
+                }
+                if (Test-ObjectField $referenceGenerated[$name] 'production_reachability') {
+                    if ((Convert-CanonicalJson (Get-ObjectField $referenceGenerated[$name] 'production_reachability')) -ne
+                        (Convert-CanonicalJson (Get-ObjectField $candidateGenerated[$name] 'production_reachability'))) {
+                        throw "C03 generated MCP registration '$name' changed production reachability relative to $ReferenceLabel"
+                    }
+                }
+            }
+        }
+    }
+    if (Test-ObjectField $Reference 'public_surfaces') {
+        if (!(Test-ObjectField $Candidate 'public_surfaces')) {
+            throw "Public surface inventory was removed relative to $ReferenceLabel"
+        }
+        $referencePublic = Get-ObjectField $Reference 'public_surfaces'
+        $candidatePublic = Get-ObjectField $Candidate 'public_surfaces'
+        Assert-StringSurfaceSubset @((Get-ObjectField (Get-ObjectField $referencePublic 'commands') 'builtin_names')) `
+            @((Get-ObjectField (Get-ObjectField $candidatePublic 'commands') 'builtin_names')) `
+            'built-in command'
+        $referenceFeatures = @((Get-ObjectField (Get-ObjectField $referencePublic 'test_lab') 'features') |
+            ForEach-Object { [string]$_.category + "`n" + [string]$_.name })
+        $candidateFeatures = @((Get-ObjectField (Get-ObjectField $candidatePublic 'test_lab') 'features') |
+            ForEach-Object { [string]$_.category + "`n" + [string]$_.name })
+        Assert-StringSurfaceSubset $referenceFeatures $candidateFeatures 'Test Lab feature'
+        Assert-StringSetEqual @((Get-ObjectField (Get-ObjectField $referencePublic 'workbench') 'analysis_document_kinds')) `
+            @((Get-ObjectField (Get-ObjectField $candidatePublic 'workbench') 'analysis_document_kinds')) `
+            'workbench analysis document kinds'
+        if ((Convert-CanonicalJson (Get-ObjectField $referencePublic 'overlay')) -ne
+            (Convert-CanonicalJson (Get-ObjectField $candidatePublic 'overlay'))) {
+            throw "Overlay ordinal surface changed relative to $ReferenceLabel"
+        }
+        $referenceDead = Get-ObjectField $referencePublic 'dead_paths'
+        $candidateDead = Get-ObjectField $candidatePublic 'dead_paths'
+        Assert-StringSetEqual @((Get-ObjectField $referenceDead 'absent_paths')) `
+            @((Get-ObjectField $candidateDead 'absent_paths')) 'removed C03 paths'
+        Assert-StringSetEqual @((Get-ObjectField $referenceDead 'replacement_paths')) `
+            @((Get-ObjectField $candidateDead 'replacement_paths')) 'C03 replacement paths'
     }
 }
 
@@ -1535,7 +3216,8 @@ $manifest = [ordered]@{
         policy = 'strict_additive_v1'
         baseline = Get-Relative $BaselinePath
         protected_mcp_fields = @('name', 'description', 'parameters', 'input_schema',
-            'read_only', 'visibility_declared', 'visibility_effective', 'workspace_aware')
+            'read_only', 'visibility_declared', 'visibility_effective', 'workspace_aware',
+            'production_reachability')
         protected_resource_fields = @('uri', 'name', 'description', 'mime_type', 'result_fields')
         protected_ui_fields = @('center_views', 'actions', 'shortcuts')
         protected_session_fields = @('public_method_names')
@@ -1543,9 +3225,22 @@ $manifest = [ordered]@{
     mcp = [ordered]@{
         registration_count = $registrations.Count
         unique_name_count = @($registrations.name | Sort-Object -Unique).Count
+        generated_registration_count = $c03UnionNames.Count
+        generated_overlap_count = $c03OverlapNames.Count
+        generated_only_count = $c03GeneratedOnlyNames.Count
+        effective_registration_count = $effectiveRegistrationNames.Count
+        generated_union_names = $c03UnionNames
+        generated_overlap_names = $c03OverlapNames
+        generated_only_names = $c03GeneratedOnlyNames
+        effective_registration_names = $effectiveRegistrationNames
         registrations = $registrations
         duplicate_names = $duplicateNames
-        dynamic_registration_templates = @($dynamicEvidence | Sort-Object file, line)
+        unresolved_registration_count = $unresolvedRegistrationEvidence.Count
+        resolved_helper_template_count = $resolvedHelperRecords.Count
+        resolved_helper_registration_count = $resolvedHelperRegistrationCount
+        dynamic_registration_templates = @($unresolvedRegistrationEvidence | Sort-Object file, line)
+        resolved_registration_helpers = @($resolvedHelperRecords | Sort-Object helper)
+        production_reachability = $mcpProductionReachability
         visibility_policy = [ordered]@{
             internal_only = $internalNames
             ide_chat_only = $chatNames
@@ -1563,6 +3258,7 @@ $manifest = [ordered]@{
         header = Get-Relative $sessionHeaderPath
         implementation = Get-Relative $sessionSourcePath
     }
+    public_surfaces = $publicSurfaceManifest
     source_contracts = $sourceContractManifest
     evidence_source_hashes = @($sourceHashes | Sort-Object file)
 }
@@ -1598,10 +3294,22 @@ finally { $hasher.Dispose() }
     sha256 = $outputHash
     registration_count = $registrations.Count
     unique_name_count = @($registrations.name | Sort-Object -Unique).Count
-    resolved_dynamic_templates = $dynamicEvidence.Count
-    unresolved_dynamic_templates = $dynamicEvidence.Count
+    resolved_dynamic_templates = $resolvedHelperRecords.Count
+    resolved_helper_registrations = $resolvedHelperRegistrationCount
+    unresolved_dynamic_templates = $unresolvedRegistrationEvidence.Count
     ida_compatibility_registrations = $idaCompatibility.records.Count
+    c03_compatibility_registrations = $c03Compatibility.registration_count
+    effective_mcp_registrations = $effectiveRegistrationNames.Count
+    reachable_mcp_registrations = $mcpProductionReachability.concrete_registration_count
+    reachable_mcp_registrars = $mcpProductionReachability.reachable_registrar_count
+    reachable_mcp_registrar_edges = $mcpProductionReachability.registrar_edge_count
+    mcp_reachability_row_sha256 = $mcpProductionReachability.row_binding_sha256
+    mcp_reachability_graph_sha256 = $mcpProductionReachability.registrar_graph_sha256
     resources = $resources.Count
     center_views = $centerViews.Count
+    builtin_commands = $commandSurface.builtin_count
+    test_lab_features = $testLabSurface.feature_count
+    workbench_analysis_documents = $workbenchSurface.analysis_document_count
+    overlay_operations = $overlaySurface.operation_count
     source_contracts = $sourceContracts.Count
 } | ConvertTo-Json -Compress

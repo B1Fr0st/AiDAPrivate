@@ -14,7 +14,7 @@
 namespace aida::analysis::readers::managed {
 
 struct classfile_parse_limits_t {
-    classfile_parse_limits_t parser_limits;
+    ::aida::analysis::classfile_parse_limits_t parser_limits;
     std::uint32_t max_types = 65535;
     std::uint32_t max_methods = 65535;
     std::uint32_t max_fields = 65535;

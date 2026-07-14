@@ -30,6 +30,7 @@
 #include "../analysis/workspace/search_index.hpp"
 #include "../analysis/workspace/workspace_database.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
+#include "../analysis/decompiler/managed_entity_binding.hpp"
 #include "../infra/executor.hpp"
 #include "../runtime/standalone_driver.hpp"
 #include "../runtime/standalone_driver_identity.hpp"
@@ -341,6 +342,39 @@ workspace_result_t<bool> reopen_persisted_analysis(
     if (!loaded.value())
         return workspace_result_t<bool>::success(false);
     const auto& snapshot = loaded.value();
+    const auto current_publication = workspace->analysis_publication();
+    if (!current_publication || !current_publication->provider)
+        return workspace_result_t<bool>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "Workspace provider is unavailable during managed reopen",
+            "analysis_session.reopen"));
+    auto managed = database->load_managed_publication(
+        current_publication->provider, snapshot->generation,
+        snapshot->analysis_revision, snapshot->overlay_revision, cancel);
+    if (!managed)
+        return workspace_result_t<bool>::failure(managed.error());
+    auto managed_publication = managed.take_value();
+    if (workspace->analysis_revision() >
+        (std::numeric_limits<std::uint64_t>::max)() - 2ULL)
+        return workspace_result_t<bool>::failure(make_workspace_error(
+            workspace_error_code_t::range_overflow,
+            "Workspace analysis revision cannot advance during reopen",
+            "analysis_session.reopen"));
+    if (managed_publication &&
+        snapshot->analysis_revision == workspace->analysis_revision() + 2ULL) {
+        auto admission = aida::analysis::rebind_managed_artifact_publication(
+            *managed_publication, workspace->identity(),
+            *current_publication->provider, snapshot->image,
+            snapshot->generation, workspace->analysis_revision() + 1ULL,
+            snapshot->overlay_revision, cancel);
+        if (!admission)
+            return workspace_result_t<bool>::failure(admission.error());
+        auto admitted = workspace->publish_managed_artifacts(
+            workspace->generation(), workspace->analysis_revision(),
+            admission.take_value(), true);
+        if (!admitted)
+            return workspace_result_t<bool>::failure(admitted.error());
+    }
     if (snapshot->generation != workspace->generation() ||
         snapshot->analysis_revision != workspace->analysis_revision() + 1 ||
         snapshot->overlay_revision != workspace->overlay_revision()) {
@@ -354,10 +388,15 @@ workspace_result_t<bool> reopen_persisted_analysis(
     if (!products)
         return workspace_result_t<bool>::failure(products.error());
     auto metrics = std::make_shared<analysis_metrics_t>(snapshot->generation);
-    auto index = search_index_t::build(snapshot,
-        std::move(products.value().data_candidates),
-        std::move(products.value().switches),
-        std::move(products.value().types), metrics, {}, cancel);
+    auto persisted_products = products.take_value();
+    workspace_result_t<std::shared_ptr<search_index_t>> index =
+        persisted_products.search_index_blob.empty()
+            ? search_index_t::build(
+                  snapshot, std::move(persisted_products.data_candidates),
+                  std::move(persisted_products.switches),
+                  std::move(persisted_products.types), metrics, {}, cancel)
+            : restore_persisted_search_index(
+                  snapshot, std::move(persisted_products), metrics, {}, cancel);
     if (!index)
         return workspace_result_t<bool>::failure(index.error());
     if (cancel.stop_requested()) {
@@ -371,6 +410,25 @@ workspace_result_t<bool> reopen_persisted_analysis(
         snapshot->baseline_complete);
     if (!published)
         return workspace_result_t<bool>::failure(published.error());
+    if (managed_publication) {
+        const auto reopened = workspace->analysis_publication();
+        if (!reopened || !reopened->managed_artifacts) {
+            auto managed_published = workspace->publish_managed_artifacts(
+                snapshot->generation, snapshot->analysis_revision,
+                managed_publication, false);
+            if (!managed_published)
+                return workspace_result_t<bool>::failure(
+                    managed_published.error());
+        } else if (!reopened->managed_artifacts->coherent_with(
+                       workspace->identity(), *reopened->provider,
+                       snapshot->generation, snapshot->analysis_revision,
+                       snapshot->overlay_revision)) {
+            return workspace_result_t<bool>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "Managed publication is incoherent after warm reopen",
+                "analysis_session.reopen"));
+        }
+    }
     return workspace_result_t<bool>::success(true);
 }
 

@@ -1,6 +1,7 @@
 #include "test_lab_view.hpp"
 #include "test_lab.hpp"
 #include "test_lab_format.hpp"
+#include "test_lab_features_c03_safe_headless.hpp"
 #include "test_all_features.hpp"
 
 #include "imgui/imgui.h"
@@ -43,6 +44,7 @@ namespace test_lab_view {
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return "WHO";
 				case test_lab::driver_e::sentinel: return "SEN";
+				case test_lab::driver_e::driverless: return "SAFE";
 			}
 			return "?";
 		}
@@ -52,44 +54,70 @@ namespace test_lab_view {
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return aida::ui::with_alpha(t.accent_u32, alpha);
 				case test_lab::driver_e::sentinel: return aida::ui::with_alpha(t.warning, alpha);
+				case test_lab::driver_e::driverless: return aida::ui::with_alpha(t.success, alpha);
 			}
 			return aida::ui::with_alpha(t.text_dim, alpha);
 		}
 
-		ImU32 status_dot_color(test_lab::run_state_e s, bool ok, bool skipped, float alpha) {
+		ImU32 status_dot_color(test_lab::run_state_e s, test_lab::outcome_e outcome, float alpha) {
 			const auto& t = aida::ui::resolved();
 			switch (s) {
 				case test_lab::run_state_e::idle:     return aida::ui::with_alpha(t.text_dim, alpha);
 				case test_lab::run_state_e::running:  return aida::ui::with_alpha(t.accent_u32, alpha);
-				case test_lab::run_state_e::complete: return aida::ui::with_alpha(skipped ? t.warning : (ok ? t.success : t.error), alpha);
+				case test_lab::run_state_e::complete:
+					return aida::ui::with_alpha(outcome == test_lab::outcome_e::passed ? t.success :
+						((outcome == test_lab::outcome_e::not_run || outcome == test_lab::outcome_e::cancelled) ? t.warning : t.error), alpha);
 			}
 			return aida::ui::with_alpha(t.text_dim, alpha);
 		}
 
-		const char* result_state_label(test_lab::run_state_e s, bool ok, bool skipped) {
+		const char* result_state_label(test_lab::run_state_e s, test_lab::outcome_e outcome) {
 			switch (s) {
 				case test_lab::run_state_e::idle: return "Idle";
 				case test_lab::run_state_e::running: return "Running";
-				case test_lab::run_state_e::complete: return skipped ? "Skipped" : (ok ? "Pass" : "Fail");
+				case test_lab::run_state_e::complete:
+					switch (outcome) {
+						case test_lab::outcome_e::not_run: return "Not run";
+						case test_lab::outcome_e::missing: return "Missing";
+						case test_lab::outcome_e::passed: return "Passed";
+						case test_lab::outcome_e::failed: return "Failed";
+						case test_lab::outcome_e::timed_out: return "Timed out";
+						case test_lab::outcome_e::crashed: return "Crashed";
+						case test_lab::outcome_e::cancelled: return "Cancelled";
+						case test_lab::outcome_e::malformed_result: return "Malformed result";
+						case test_lab::outcome_e::integrity_failure: return "Integrity failure";
+					}
 			}
 			return "Idle";
 		}
 
-		const char* result_state_badge(test_lab::run_state_e s, bool ok, bool skipped) {
+		const char* result_state_badge(test_lab::run_state_e s, test_lab::outcome_e outcome) {
 			switch (s) {
 				case test_lab::run_state_e::idle: return "IDLE";
 				case test_lab::run_state_e::running: return "RUN";
-				case test_lab::run_state_e::complete: return skipped ? "SKIP" : (ok ? "PASS" : "FAIL");
+				case test_lab::run_state_e::complete:
+					switch (outcome) {
+						case test_lab::outcome_e::not_run: return "N/R";
+						case test_lab::outcome_e::missing: return "MISS";
+						case test_lab::outcome_e::passed: return "PASS";
+						case test_lab::outcome_e::failed: return "FAIL";
+						case test_lab::outcome_e::timed_out: return "TIME";
+						case test_lab::outcome_e::crashed: return "CRASH";
+						case test_lab::outcome_e::cancelled: return "CANCEL";
+						case test_lab::outcome_e::malformed_result: return "BAD";
+						case test_lab::outcome_e::integrity_failure: return "INTEG";
+					}
 			}
 			return "IDLE";
 		}
 
-		ImU32 result_state_color(test_lab::run_state_e s, bool ok, bool skipped) {
+		ImU32 result_state_color(test_lab::run_state_e s, test_lab::outcome_e outcome) {
 			const auto& t = aida::ui::resolved();
 			switch (s) {
 				case test_lab::run_state_e::idle: return t.text_dim;
 				case test_lab::run_state_e::running: return t.accent_u32;
-				case test_lab::run_state_e::complete: return skipped ? t.warning : (ok ? t.success : t.error);
+				case test_lab::run_state_e::complete: return outcome == test_lab::outcome_e::passed ? t.success :
+					((outcome == test_lab::outcome_e::not_run || outcome == test_lab::outcome_e::cancelled) ? t.warning : t.error);
 			}
 			return t.text_dim;
 		}
@@ -184,7 +212,8 @@ namespace test_lab_view {
 			out.append(driver_label(f.driver));
 			out.append("\n");
 			out.append("status: ");
-			out.append(result_state_label(r.state.load(std::memory_order_acquire), r.ok, r.skipped));
+			out.append(result_state_label(r.state.load(std::memory_order_acquire),
+				test_lab::effective_outcome(r, f.driver == test_lab::driver_e::driverless)));
 			out.append("\n");
 			char buf[128];
 			std::snprintf(buf, sizeof(buf), "ntstatus: %s (0x%08X)\n",
@@ -244,6 +273,7 @@ namespace test_lab_view {
 
 		struct feature_run_summary_t {
 			test_lab::run_state_e state = test_lab::run_state_e::idle;
+			test_lab::outcome_e outcome = test_lab::outcome_e::not_run;
 			bool ok = false;
 			bool skipped = false;
 			std::int32_t ntstatus = 0;
@@ -287,6 +317,7 @@ namespace test_lab_view {
 			if (feature_index >= g_feature_summaries.size()) return;
 			feature_run_summary_t& s = g_feature_summaries[feature_index];
 			s.state = test_lab::run_state_e::running;
+			s.outcome = test_lab::outcome_e::not_run;
 			s.ok = false;
 			s.skipped = false;
 			s.ntstatus = 0;
@@ -306,6 +337,7 @@ namespace test_lab_view {
 			feature_run_summary_t& s = g_feature_summaries[feature_index];
 			if (s.started_ms == 0) s.started_ms = now_ms();
 			s.state = test_lab::run_state_e::complete;
+			s.outcome = test_lab::outcome_e::not_run;
 			s.ok = false;
 			s.skipped = true;
 			s.ntstatus = 0;
@@ -324,6 +356,7 @@ namespace test_lab_view {
 			feature_run_summary_t& s = g_feature_summaries[feature_index];
 			if (s.started_ms == 0) s.started_ms = now_ms();
 			s.state = test_lab::run_state_e::complete;
+			s.outcome = r.outcome;
 			s.ok = r.ok;
 			s.skipped = r.skipped;
 			s.ntstatus = r.ntstatus;
@@ -403,11 +436,13 @@ namespace test_lab_view {
 			}
 		}
 
-		bool try_copy_result_summary(const char* site, test_lab::run_state_e& state, bool& ok, bool& skipped) {
+		bool try_copy_result_summary(const char* site, test_lab::run_state_e& state,
+			test_lab::outcome_e& outcome, bool& ok, bool& skipped) {
 			std::unique_lock<std::mutex> lk(g_result_mtx, std::try_to_lock);
 			if (!lk.owns_lock()) {
 				log_render_lock_busy(site, "g_result_mtx");
 				state = test_lab::run_state_e::idle;
+				outcome = test_lab::outcome_e::not_run;
 				ok = false;
 				skipped = false;
 				return false;
@@ -415,11 +450,13 @@ namespace test_lab_view {
 			std::shared_ptr<test_lab::result_t> snap = g_result;
 			if (!snap) {
 				state = test_lab::run_state_e::idle;
+				outcome = test_lab::outcome_e::not_run;
 				ok = false;
 				skipped = false;
 				return true;
 			}
 			state = snap->state.load(std::memory_order_acquire);
+			outcome = snap->outcome;
 			ok = snap->ok;
 			skipped = snap->skipped;
 			return true;
@@ -430,6 +467,7 @@ namespace test_lab_view {
 			if (!lk.owns_lock()) {
 				log_render_lock_busy(site, "g_result_mtx");
 				out.state.store(test_lab::run_state_e::idle, std::memory_order_release);
+				out.outcome = test_lab::outcome_e::not_run;
 				out.ok = false;
 				out.skipped = false;
 				out.ntstatus = 0;
@@ -443,6 +481,7 @@ namespace test_lab_view {
 			std::shared_ptr<test_lab::result_t> snap = g_result;
 			if (!snap) {
 				out.state.store(test_lab::run_state_e::idle, std::memory_order_release);
+				out.outcome = test_lab::outcome_e::not_run;
 				out.ok = false;
 				out.skipped = false;
 				out.ntstatus = 0;
@@ -454,6 +493,7 @@ namespace test_lab_view {
 				return true;
 			}
 			out.state.store(snap->state.load(std::memory_order_acquire), std::memory_order_release);
+			out.outcome = snap->outcome;
 			out.ok = snap->ok;
 			out.skipped = snap->skipped;
 			out.ntstatus = snap->ntstatus;
@@ -542,6 +582,7 @@ namespace test_lab_view {
 			switch (d) {
 				case test_lab::driver_e::whoswho:  return "whoswho";
 				case test_lab::driver_e::sentinel: return "sentinel";
+				case test_lab::driver_e::driverless: return "driverless";
 			}
 			return "unknown";
 		}
@@ -624,7 +665,8 @@ namespace test_lab_view {
 			line.append("[").append(ts).append("] [").append(driver_name(f.driver)).append("] ");
 			line.append(f.category != nullptr ? f.category : "?").append("/");
 			line.append(f.name != nullptr ? f.name : "?");
-			line.append(r.skipped ? " -- SKIPPED" : (r.ok ? " -- OK" : " -- FAIL"));
+			line.append(" -- ").append(test_lab_format::testlab_outcome_name(
+				test_lab::effective_outcome(r, f.driver == test_lab::driver_e::driverless)));
 			char tmp[64];
 			std::snprintf(tmp, sizeof(tmp), " ntstatus=%s bytes=%u elapsed_us=%llu\n",
 				test_lab_format::ntstatus_to_string(r.ntstatus),
@@ -937,6 +979,7 @@ namespace test_lab_view {
 					test_lab_format::testlab_diag_log_entry(f, s);
 					auto t0 = std::chrono::steady_clock::now();
 					f.run(s, r);
+					if (f.driver != test_lab::driver_e::driverless) test_lab::normalize_legacy_result(r);
 					auto t1 = std::chrono::steady_clock::now();
 					std::uint64_t elapsed_us = static_cast<std::uint64_t>(
 						std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
@@ -1159,6 +1202,7 @@ namespace test_lab_view {
 				float dot_r = 4.f;
 				ImVec2 dot_p(row_start.x + 10.f, row_start.y + row_h * 0.5f);
 				test_lab::run_state_e rs = test_lab::run_state_e::idle;
+				test_lab::outcome_e routcome = test_lab::outcome_e::not_run;
 				bool rok = false;
 				bool rskipped = false;
 				feature_run_summary_t row_summary;
@@ -1167,13 +1211,15 @@ namespace test_lab_view {
 					rs = row_summary.state;
 					rok = row_summary.ok;
 					rskipped = row_summary.skipped;
+					routcome = row_summary.outcome;
 				} else if (is_selected) {
-					try_copy_result_summary("left_pane_selected_row", rs, rok, rskipped);
+					try_copy_result_summary("left_pane_selected_row", rs, routcome, rok, rskipped);
 					row_summary.state = rs;
 					row_summary.ok = rok;
 					row_summary.skipped = rskipped;
+					row_summary.outcome = routcome;
 				}
-				rdl->AddCircleFilled(dot_p, dot_r, status_dot_color(rs, rok, rskipped, ent));
+				rdl->AddCircleFilled(dot_p, dot_r, status_dot_color(rs, routcome, ent));
 
 				float badge_w = 34.f;
 				float badge_h = 16.f;
@@ -1189,8 +1235,8 @@ namespace test_lab_view {
 
 				ImU32 name_col = aida::ui::with_alpha(
 					is_selected ? t.text_primary : t.text_secondary, ent);
-				const char* state_badge = result_state_badge(rs, rok, rskipped);
-				ImU32 state_col = result_state_color(rs, rok, rskipped);
+				const char* state_badge = result_state_badge(rs, routcome);
+				ImU32 state_col = result_state_color(rs, routcome);
 				float state_badge_w = 44.f;
 				float state_badge_h = 16.f;
 				ImVec2 sa(row_start.x + pane_w - 24.f - state_badge_w - 8.f,
@@ -1218,7 +1264,7 @@ namespace test_lab_view {
 					ImGui::Text("%s/%s",
 						f.category != nullptr ? f.category : "?",
 						f.name != nullptr ? f.name : "?");
-					ImGui::Text("Status: %s", result_state_label(rs, rok, rskipped));
+					ImGui::Text("Status: %s", result_state_label(rs, routcome));
 					if (rs == test_lab::run_state_e::complete) {
 						ImGui::Text("NTSTATUS: %s", test_lab_format::ntstatus_to_string(row_summary.ntstatus));
 						ImGui::Text("Bytes: %u  Elapsed: %s",
@@ -1287,6 +1333,7 @@ namespace test_lab_view {
 			new_result->state.store(test_lab::run_state_e::running, std::memory_order_release);
 			if (!try_replace_result("single_feature_start", new_result)) {
 				new_result->ok = false;
+				new_result->outcome = test_lab::outcome_e::failed;
 				new_result->error = "result lock busy";
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
 				if (feature_idx >= 0)
@@ -1308,6 +1355,7 @@ namespace test_lab_view {
 				full_test_scope_t full_test_scope("test_lab_view_single_feature");
 				if (feature_copy.run == nullptr) {
 					new_result->ok = false;
+					new_result->outcome = test_lab::outcome_e::failed;
 					new_result->error = "no run function";
 					test_lab_format::testlab_diag_log_skip(feature_copy, "no run function");
 					new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
@@ -1320,6 +1368,7 @@ namespace test_lab_view {
 				test_lab::result_t local;
 				local.state.store(test_lab::run_state_e::running, std::memory_order_release);
 				feature_copy.run(snapshot, local);
+				if (feature_copy.driver != test_lab::driver_e::driverless) test_lab::normalize_legacy_result(local);
 				auto t1 = std::chrono::steady_clock::now();
 				std::uint64_t elapsed_us = static_cast<std::uint64_t>(
 					std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
@@ -1328,6 +1377,7 @@ namespace test_lab_view {
 				{
 					std::lock_guard<std::mutex> lk(g_result_mtx);
 					new_result->ok = local.ok;
+					new_result->outcome = local.outcome;
 					new_result->skipped = local.skipped;
 					new_result->ntstatus = local.ntstatus;
 					new_result->bytes_returned = local.bytes_returned;
@@ -1342,6 +1392,7 @@ namespace test_lab_view {
 			};
 			if (!aida::infra::executor::submit(std::move(submission)).submitted) {
 				new_result->ok = false;
+				new_result->outcome = test_lab::outcome_e::failed;
 				new_result->error = "executor unavailable";
 				new_result->state.store(test_lab::run_state_e::complete, std::memory_order_release);
 				if (feature_idx >= 0)
@@ -1372,6 +1423,7 @@ namespace test_lab_view {
 					if (cached.state != test_lab::run_state_e::idle) {
 						local_copy.state.store(cached.state, std::memory_order_release);
 						local_copy.ok = cached.ok;
+						local_copy.outcome = cached.outcome;
 						local_copy.skipped = cached.skipped;
 						local_copy.ntstatus = cached.ntstatus;
 						local_copy.bytes_returned = cached.bytes_returned;
@@ -1394,7 +1446,9 @@ namespace test_lab_view {
 				return;
 			}
 
-			ImU32 status_col = result_state_color(rs, local_copy.ok, local_copy.skipped);
+			const auto displayed_outcome = test_lab::effective_outcome(local_copy,
+				f.driver == test_lab::driver_e::driverless);
+			ImU32 status_col = result_state_color(rs, displayed_outcome);
 			char ntbuf[96];
 			std::snprintf(ntbuf, sizeof(ntbuf), "%s / 0x%08X",
 				test_lab_format::ntstatus_to_string(local_copy.ntstatus),
@@ -1403,7 +1457,7 @@ namespace test_lab_view {
 			std::snprintf(bytesbuf, sizeof(bytesbuf), "%u", static_cast<unsigned>(local_copy.bytes_returned));
 			std::string elapsed = format_elapsed(local_copy.elapsed_us);
 
-			render_chip(result_state_label(rs, local_copy.ok, local_copy.skipped), status_col, 74.f);
+			render_chip(result_state_label(rs, displayed_outcome), status_col, 104.f);
 			if (ImGui::GetContentRegionAvail().x > 172.f) ImGui::SameLine();
 			render_metric_chip("NTSTATUS", ntbuf, status_col, 168.f);
 			if (ImGui::GetContentRegionAvail().x > 100.f) ImGui::SameLine();

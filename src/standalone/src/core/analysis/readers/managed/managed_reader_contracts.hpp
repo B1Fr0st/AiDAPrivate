@@ -6,6 +6,7 @@
 #include "../../decompiler/decompiler_contracts.hpp"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -14,7 +15,7 @@
 
 namespace aida::analysis::readers::managed {
 
-inline constexpr std::uint32_t managed_reader_schema_version = 1;
+inline constexpr std::uint32_t managed_reader_schema_version = 2;
 
 enum class managed_artifact_kind_t : std::uint8_t {
     cli_metadata = 0,
@@ -82,13 +83,15 @@ struct managed_module_identity_t {
     managed_artifact_kind_t kind = managed_artifact_kind_t::cli_metadata;
     std::uint64_t artifact_offset = 0;
     std::uint64_t artifact_size = 0;
+    std::uint32_t artifact_ordinal = 0;
     std::optional<std::uint32_t> runtime_major;
     std::optional<std::uint32_t> runtime_minor;
     std::optional<std::uint32_t> assembly_flags;
     std::optional<std::uint32_t> entry_point_token;
 
     bool valid() const noexcept {
-        return !assembly_name.empty() && artifact_size != 0;
+        return (!assembly_name.empty() || !module_name.empty()) &&
+            !artifact_hash.empty() && artifact_size != 0;
     }
 };
 
@@ -245,6 +248,14 @@ struct managed_reader_limits_t {
     std::uint32_t max_constant_pool_entries = 65535;
     std::uint32_t max_table_rows = 1U << 24;
     std::uint32_t max_generic_params = 1U << 20;
+
+    bool valid() const noexcept {
+        return max_metadata_bytes != 0 && max_types != 0 && max_methods != 0 &&
+            max_fields != 0 && max_member_references != 0 && max_annotations != 0 &&
+            max_resources != 0 && max_exception_regions != 0 && max_code_ranges != 0 &&
+            max_code_bytes != 0 && max_string_bytes != 0 && max_dex_files != 0 &&
+            max_constant_pool_entries != 0 && max_table_rows != 0 && max_generic_params != 0;
+    }
 };
 
 struct managed_duplicate_identity_t {
@@ -285,7 +296,23 @@ struct managed_multidex_t {
     std::vector<std::uint64_t> embedded_offsets;
 
     bool valid() const noexcept {
-        return !artifacts.empty();
+        if (artifacts.empty() || embedded_offsets.size() != artifacts.size())
+            return false;
+        for (std::size_t index = 0; index < artifacts.size(); ++index) {
+            const auto& artifact = artifacts[index];
+            if (!artifact.valid() ||
+                artifact.module_identity.artifact_ordinal != index ||
+                artifact.module_identity.artifact_offset != embedded_offsets[index])
+                return false;
+            if ((container_kind == managed_artifact_kind_t::dex &&
+                    artifact.kind != managed_artifact_kind_t::dex) ||
+                (container_kind == managed_artifact_kind_t::oat &&
+                    artifact.kind != managed_artifact_kind_t::oat) ||
+                (container_kind == managed_artifact_kind_t::vdex &&
+                    artifact.kind != managed_artifact_kind_t::vdex))
+                return false;
+        }
+        return true;
     }
 };
 

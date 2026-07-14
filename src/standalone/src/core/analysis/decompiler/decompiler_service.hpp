@@ -2,7 +2,9 @@
 
 #include "decompiler_cache_v9.hpp"
 #include "decompiler_provider_registry.hpp"
+#include "pseudocode_readability.hpp"
 #include "pseudocode_renderer_v2.hpp"
+#include "type_graph_builder.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -85,6 +87,7 @@ struct decompiler_pipeline_request_t {
     decompiler_pipeline_cache_identity_t cache_identity;
     std::shared_ptr<const decompiler_provider_context_t> provider_context;
     decompiler_provider_context_factory_t provider_context_factory;
+    std::vector<type_graph::type_seed_batch_t> type_evidence;
     std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
@@ -95,6 +98,7 @@ struct decompiler_pipeline_result_t {
     std::shared_ptr<const decompiler_provider_ir_cache_value_t> provider_stage;
     std::shared_ptr<const decompiler_normalized_cache_value_t> normalized_stage;
     std::shared_ptr<const decompiler_rendered_cache_value_t> rendered_stage;
+    std::optional<pseudocode_readability_report_t> readability;
     std::optional<decompiler_cache_stage_t> cache_hit_stage;
     std::vector<decompiler_diagnostic_t> diagnostics;
     std::uint64_t elapsed_wall_clock_ms = 0;
@@ -111,6 +115,7 @@ struct decompiler_pipeline_service_config_t {
     pseudocode_renderer_v2_limits_t renderer_limits;
     decompiler_profile_policy_t profiles = default_decompiler_profile_policy();
     std::shared_ptr<decompiler_isolated_provider_host_t> isolated_provider_host;
+    pseudocode_readability_limits_t readability_limits;
     bool require_complete_source_map = true;
 };
 

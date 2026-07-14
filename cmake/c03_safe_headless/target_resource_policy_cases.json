@@ -1,0 +1,86 @@
+{
+  "schema": "aida.c03.safe-headless.target-resource-policy-cases.v1",
+  "version": 1,
+  "cases": [
+    {
+      "id": "ordinary-default",
+      "entry_id": "fixture.authority",
+      "source_target": "aida_c03_fixture_authority",
+      "max_active_processes": 1,
+      "max_wall_ms": 120000,
+      "accepted": true
+    },
+    {
+      "id": "quality-approved",
+      "entry_id": "decompiler.quality_scorer",
+      "source_target": "aida_c03_a06_decompiler_quality_scorer_harness",
+      "max_active_processes": 4,
+      "max_wall_ms": 1800000,
+      "accepted": true
+    },
+    {
+      "id": "zero-process",
+      "entry_id": "fixture.authority",
+      "source_target": "aida_c03_fixture_authority",
+      "max_active_processes": 0,
+      "max_wall_ms": 120000,
+      "accepted": false
+    },
+    {
+      "id": "over-process",
+      "entry_id": "decompiler.quality_scorer",
+      "source_target": "aida_c03_a06_decompiler_quality_scorer_harness",
+      "max_active_processes": 5,
+      "max_wall_ms": 1800000,
+      "accepted": false
+    },
+    {
+      "id": "unauthorized-multi-process",
+      "entry_id": "fixture.authority",
+      "source_target": "aida_c03_fixture_authority",
+      "max_active_processes": 4,
+      "max_wall_ms": 120000,
+      "accepted": false
+    },
+    {
+      "id": "unauthorized-wall-override",
+      "entry_id": "fixture.authority",
+      "source_target": "aida_c03_fixture_authority",
+      "max_active_processes": 1,
+      "max_wall_ms": 1800000,
+      "accepted": false
+    },
+    {
+      "id": "quality-noncanonical-process",
+      "entry_id": "decompiler.quality_scorer",
+      "source_target": "aida_c03_a06_decompiler_quality_scorer_harness",
+      "max_active_processes": 3,
+      "max_wall_ms": 1800000,
+      "accepted": false
+    },
+    {
+      "id": "quality-noncanonical-wall",
+      "entry_id": "decompiler.quality_scorer",
+      "source_target": "aida_c03_a06_decompiler_quality_scorer_harness",
+      "max_active_processes": 4,
+      "max_wall_ms": 120000,
+      "accepted": false
+    },
+    {
+      "id": "under-wall-bound",
+      "entry_id": "fixture.authority",
+      "source_target": "aida_c03_fixture_authority",
+      "max_active_processes": 1,
+      "max_wall_ms": 99,
+      "accepted": false
+    },
+    {
+      "id": "over-wall-bound",
+      "entry_id": "decompiler.quality_scorer",
+      "source_target": "aida_c03_a06_decompiler_quality_scorer_harness",
+      "max_active_processes": 4,
+      "max_wall_ms": 1800001,
+      "accepted": false
+    }
+  ]
+}

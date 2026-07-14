@@ -1,4 +1,5 @@
 #include "workbench_navigator_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/workbench/navigator/workbench_navigator.hpp"
 
@@ -40,6 +41,7 @@ static_assert(static_cast<std::uint16_t>(navigator_error_code_t::stale_snapshot)
 
 void require(bool condition, std::string_view message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -743,6 +745,7 @@ bool run_workbench_navigator_harness(std::string& failure)
         failure.clear();
         return true;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         failure = exception.what();
         return false;
     }

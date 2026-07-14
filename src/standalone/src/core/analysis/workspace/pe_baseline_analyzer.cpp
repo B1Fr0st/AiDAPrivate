@@ -1,9 +1,9 @@
 #include "pe_baseline_analyzer.hpp"
 
 #include "checked_range.hpp"
-#include "packed_page_codec.hpp"
 #include "persistence_queue.hpp"
 #include "workspace_database.hpp"
+#include "../decompiler/managed_entity_binding.hpp"
 #include <algorithm>
 #include <future>
 #include <limits>
@@ -2028,31 +2028,32 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_phase(
     products.generation = impl_->final_snapshot->generation;
     products.analysis_revision = impl_->final_snapshot->analysis_revision;
     products.overlay_revision = impl_->final_snapshot->overlay_revision;
-    products.data_candidates = impl_->search->data_candidates();
-    products.switches = impl_->search->switches();
-    products.types = impl_->search->types();
+    products.live_index = impl_->search;
     const auto cancel = impl_->cancellation.token();
-    auto domains = encode_packed_baseline_domains(
-        *impl_->final_snapshot, products, cancel);
-    if (!domains)
-        return workspace_result_t<void>::failure(domains.error());
-    packed_page_encode_options_t encode_options;
-    encode_options.generation = impl_->final_snapshot->generation;
-    encode_options.analysis_revision = impl_->final_snapshot->analysis_revision;
-    encode_options.overlay_revision = impl_->final_snapshot->overlay_revision;
-    auto batch = packed_page_codec_t::encode_multi_domain_batch(
-        domains.value(), encode_options,
-        [&] {
-            if (runtime_cancel.load(std::memory_order_acquire))
-                impl_->cancellation.request_cancel();
-            return impl_->cancellation.token().stop_requested();
-        });
-    if (!batch)
-        return workspace_result_t<void>::failure(batch.error());
     active = impl_->ensure_active(runtime_cancel, "persistence");
     if (!active)
         return active;
-    impl_->persistence_ticket = database->persist_snapshot(impl_->final_snapshot, std::move(products),
+    std::shared_ptr<const managed_artifact_publication_t> managed_publication;
+    const auto current_publication = impl_->workspace->analysis_publication();
+    if (!current_publication || !current_publication->provider) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "workspace publication is unavailable before persistence",
+            "persistence"));
+    }
+    if (current_publication->managed_artifacts) {
+        auto rebound = rebind_managed_artifact_publication(
+            *current_publication->managed_artifacts,
+            impl_->workspace->identity(), *current_publication->provider,
+            impl_->final_snapshot->image, impl_->final_snapshot->generation,
+            impl_->final_snapshot->analysis_revision,
+            impl_->final_snapshot->overlay_revision, cancel);
+        if (!rebound)
+            return workspace_result_t<void>::failure(rebound.error());
+        managed_publication = rebound.take_value();
+    }
+    impl_->persistence_ticket = database->persist_snapshot(
+        impl_->final_snapshot, std::move(products), std::move(managed_publication),
         impl_->settings.canonical_json(), impl_->metrics->snapshot().to_json(), cancel);
     if (!impl_->persistence_ticket.accepted || !impl_->persistence_ticket.completion.valid() ||
         !impl_->persistence_ticket.snapshot_candidate) {
@@ -2077,62 +2078,12 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_phase(
         return workspace_result_t<void>::failure(completed.error());
     }
     const auto snapshot_metrics = impl_->persistence_ticket.commit_metrics;
-    if (!snapshot_metrics) {
-        impl_->discard_persistence_candidate();
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "snapshot persistence omitted commit-local metrics", "persistence"));
-    }
-
     const auto candidate = impl_->persistence_ticket.snapshot_candidate;
-    auto manifest = encode_packed_baseline_manifest(
-        *impl_->final_snapshot, candidate->token(), cancel);
-    if (!manifest) {
-        impl_->discard_persistence_candidate();
-        return workspace_result_t<void>::failure(manifest.error());
-    }
-    auto publication = packed_page_codec_t::build_publication(
-        batch.value(), manifest.take_value(),
-        [&] {
-            if (runtime_cancel.load(std::memory_order_acquire))
-                impl_->cancellation.request_cancel();
-            return impl_->cancellation.token().stop_requested();
-        });
-    if (!publication) {
-        impl_->discard_persistence_candidate();
-        return workspace_result_t<void>::failure(publication.error());
-    }
-    auto packed_ticket = database->publish_packed_generation(
-        publication.take_value(), candidate, cancel);
-    if (!packed_ticket.accepted || !packed_ticket.completion.valid()) {
-        impl_->discard_persistence_candidate();
-        return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::persistence_failure,
-            "workspace persistence queue rejected the packed baseline generation",
-            "persistence"));
-    }
-    for (;;) {
-        if (packed_ticket.completion.wait_for(std::chrono::milliseconds(2)) ==
-            std::future_status::ready) {
-            break;
-        }
-        active = impl_->ensure_active(runtime_cancel, "persistence");
-        if (!active) {
-            impl_->discard_persistence_candidate();
-            return active;
-        }
-    }
-    const auto& packed_completed = packed_ticket.completion.get();
-    if (!packed_completed) {
-        impl_->discard_persistence_candidate();
-        return workspace_result_t<void>::failure(packed_completed.error());
-    }
-    const auto packed_metrics = packed_ticket.commit_metrics;
-    if (!packed_metrics || !candidate->packed_generation_required()) {
+    if (!snapshot_metrics || !candidate->packed_generation_required()) {
         impl_->discard_persistence_candidate();
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
-            "packed baseline persistence omitted candidate or commit metrics",
+            "packed snapshot persistence omitted candidate or commit metrics",
             "persistence"));
     }
 
@@ -2144,13 +2095,10 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_phase(
     std::uint64_t elapsed_us = 0;
     std::uint64_t elapsed = 0;
     if (!checked_add_u64(database_state.database_bytes, database_state.wal_bytes, footprint) ||
-        !checked_add_u64(snapshot_metrics->logical_bytes,
-                         packed_metrics->logical_bytes, logical_bytes) ||
-        !checked_add_u64(snapshot_metrics->page_write_bytes,
-                         packed_metrics->page_write_bytes, page_write_bytes) ||
-        !checked_add_u64(snapshot_metrics->rows, packed_metrics->rows, rows) ||
-        !checked_add_u64(snapshot_metrics->elapsed_us,
-                         packed_metrics->elapsed_us, elapsed_us) ||
+        !checked_add_u64(0, snapshot_metrics->logical_bytes, logical_bytes) ||
+        !checked_add_u64(0, snapshot_metrics->page_write_bytes, page_write_bytes) ||
+        !checked_add_u64(0, snapshot_metrics->rows, rows) ||
+        !checked_add_u64(0, snapshot_metrics->elapsed_us, elapsed_us) ||
         !checked_mul_u64(elapsed_us, 1000ULL, elapsed)) {
         impl_->discard_persistence_candidate();
         return workspace_result_t<void>::failure(make_workspace_error(
@@ -2162,7 +2110,7 @@ workspace_result_t<void> pe_baseline_analyzer_t::persistence_phase(
     impl_->metrics->add(analysis_metric_t::database_logical_bytes, logical_bytes);
     impl_->metrics->add(analysis_metric_t::database_rows, rows);
     impl_->metrics->add(analysis_metric_t::database_commit_elapsed_ns, elapsed);
-    impl_->metrics->add(analysis_metric_t::persistence_batches, 2);
+    impl_->metrics->add(analysis_metric_t::persistence_batches, 1);
     impl_->metrics->end_phase(measurement, logical_bytes, page_write_bytes,
         rows, 1, false);
     return impl_->update_progress("persistence", 1, 1, footprint, footprint);

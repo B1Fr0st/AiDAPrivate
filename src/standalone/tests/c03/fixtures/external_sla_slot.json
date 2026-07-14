@@ -9,8 +9,8 @@
     "status": "approved"
   },
   "generator_source": {
-    "path": "src/standalone/tests/c03/fixtures/corpus_generator_recipes.json",
-    "sha256": "1ab887cc868b81e3cbc30c3fd840d287d8c68dc67b4047682d69d1dc5e4053d5"
+    "path": "src/standalone/tests/c03/fixtures/external_sla_qualification_policy.json",
+    "sha256": "72670c1cf56cc13252aa63dff99337e0bf1fd7c7c60ca286c1468941092e306b"
   },
   "license": {
     "policy_id": "aida.c03.license-clean-redistributable.v1",

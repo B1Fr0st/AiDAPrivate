@@ -6,7 +6,7 @@ namespace Aida.ManagedDecompiler;
 internal static class WorkerProtocol
 {
     internal const string Schema = "aida.c03.managed-cli.worker";
-    internal const int Version = 2;
+    internal const int Version = 3;
     internal static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -25,19 +25,42 @@ internal static class WorkerProtocol
     internal static string Serialize<T>(T value) => JsonSerializer.Serialize(value, JsonOptions);
 }
 
+internal sealed record WorkerTransportHello(
+    string Schema,
+    int SchemaVersion,
+    string Kind,
+    ulong Sequence,
+    string SessionNonceHash,
+    string ManifestHash,
+    string RuntimeManifestHash,
+    string WorkerBinaryHash,
+    string ProviderBinaryHash,
+    string WorkerBuildId,
+    string WorkerBuildHash);
+
 internal sealed record WorkerRequest(
     string Schema,
     int SchemaVersion,
     string Kind,
     ulong Sequence,
     string RequestId,
-    string ModulePath,
-    string ModuleHash,
+    WorkerModuleSource ModuleSource,
+    string EntityHash,
     uint MetadataToken,
     ulong WorkspaceGeneration,
-    string OfflineLockHash,
+    ulong TypeGraphRevision,
+    string RuntimeManifestHash,
+    string ContractHash,
+    string CacheIdentity,
+    string RequestBindingHash,
     WorkerBudget Budget,
     WorkerProviderExpectation Provider);
+
+internal sealed record WorkerModuleSource(
+    string Kind,
+    string LogicalIdentity,
+    string ModuleHash,
+    ulong ModuleSize);
 
 internal sealed record WorkerCancellation(
     string Schema,
@@ -45,6 +68,7 @@ internal sealed record WorkerCancellation(
     string Kind,
     ulong Sequence,
     string RequestId,
+    string RequestBindingHash,
     string StableReason);
 
 internal sealed record WorkerBudget(
@@ -52,7 +76,11 @@ internal sealed record WorkerBudget(
     ulong MaxWallClockMs,
     ulong MaxCpuMs,
     ulong MaxMemoryBytes,
-    ulong MaxProviderIrNodes);
+    ulong MaxProviderIrNodes,
+    ulong MaxHirNodes,
+    ulong MaxAstNodes,
+    ulong MaxSemanticQueries,
+    bool SemanticProofsEnabled);
 
 internal static class WorkerBudgetLimits
 {
@@ -61,7 +89,12 @@ internal static class WorkerBudgetLimits
 
     internal static bool IsSane(WorkerBudget? budget) =>
         budget is not null && budget.MaxCpuMs != 0 && budget.MaxCpuMs <= MaximumCpuMs &&
-        budget.MaxMemoryBytes != 0 && budget.MaxMemoryBytes <= MaximumMemoryBytes;
+        budget.MaxMemoryBytes != 0 && budget.MaxMemoryBytes <= MaximumMemoryBytes &&
+        budget.MaxProviderIrNodes != 0 && budget.MaxHirNodes != 0 &&
+        budget.MaxAstNodes != 0 &&
+        (budget.Profile == "thorough"
+            ? budget.SemanticProofsEnabled && budget.MaxSemanticQueries != 0
+            : !budget.SemanticProofsEnabled && budget.MaxSemanticQueries == 0);
 }
 
 internal sealed record WorkerProviderExpectation(
@@ -127,8 +160,6 @@ internal sealed record WorkerUnknown(string Reason, string StableToken, int IlOf
 
 internal sealed record WorkerDiagnostic(string Severity, string Code, string Key, IReadOnlyList<string> Args, int? IlOffset, byte Confidence, bool Retryable, uint Ordinal);
 
-internal sealed record WorkerProvider(string Version, string DecompilerAssemblyHash);
-
 internal sealed record WorkerTokenMap(
     uint Token,
     string StableIdentity,
@@ -146,10 +177,17 @@ internal sealed record WorkerResult(
     string Kind,
     ulong Sequence,
     string RequestId,
-    string ModuleHash,
+    WorkerModuleSource ModuleSource,
+    string EntityHash,
     uint MetadataToken,
-    string OfflineLockHash,
-    WorkerProvider Provider,
+    ulong WorkspaceGeneration,
+    ulong TypeGraphRevision,
+    WorkerBudget Budget,
+    string RuntimeManifestHash,
+    string ContractHash,
+    string CacheIdentity,
+    string RequestBindingHash,
+    WorkerProviderExpectation Provider,
     WorkerIdentity Identity,
     WorkerSource Source,
     IReadOnlyList<WorkerTokenMap> TokenMap,
@@ -165,7 +203,15 @@ internal sealed record WorkerFailure(
     string Kind,
     ulong Sequence,
     string RequestId,
-    string ModuleHash,
+    WorkerModuleSource ModuleSource,
+    string EntityHash,
     uint MetadataToken,
-    string OfflineLockHash,
+    ulong WorkspaceGeneration,
+    ulong TypeGraphRevision,
+    WorkerBudget Budget,
+    string RuntimeManifestHash,
+    string ContractHash,
+    string CacheIdentity,
+    string RequestBindingHash,
+    WorkerProviderExpectation Provider,
     IReadOnlyList<WorkerDiagnostic> Diagnostics);

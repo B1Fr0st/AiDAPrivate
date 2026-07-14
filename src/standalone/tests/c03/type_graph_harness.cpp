@@ -1,4 +1,5 @@
 #include "type_graph_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 #include "../../src/core/analysis/decompiler/type_graph_builder.hpp"
 #include "../../src/core/analysis/decompiler/decompiler_contracts.hpp"
 
@@ -14,6 +15,7 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -724,6 +726,7 @@ int main()
         std::cout << "type_graph_harness: all fixtures satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << "type_graph_harness FAILED: " << error.what() << '\n';
         return 1;
     }

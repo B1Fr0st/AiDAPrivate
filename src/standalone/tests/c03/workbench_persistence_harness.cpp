@@ -1,8 +1,10 @@
 #include "workbench_persistence_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/workspace/workspace_database.hpp"
 #include "../../src/core/analysis/workspace/workspace_identity.hpp"
 #include "../../src/core/infra/taskflow_runtime.hpp"
+#include "../../src/core/workbench/workbench_model.h"
 #include "../../src/core/workbench/workbench_persistence.hpp"
 
 #include <nlohmann/json.hpp>
@@ -15,6 +17,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
@@ -33,6 +36,7 @@ using json = nlohmann::json;
 
 void require(bool condition, const char* message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -195,6 +199,33 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
     dto.history.forward.push_back(std::move(forward));
     return dto;
 }
+
+class persistence_catalog_t final : public document_catalog_adapter_t {
+public:
+    explicit persistence_catalog_t(const workbench_persistence_dto_t& persistence)
+        : persistence_(persistence)
+    {
+    }
+
+    workbench_error_t describe(const document_identity_t& identity,
+                               document_descriptor_t& output) const override
+    {
+        const auto found = std::find_if(
+            persistence_.documents.begin(), persistence_.documents.end(),
+            [&identity](const auto& document) {
+                return document_identity_equal(document.identity, identity);
+            });
+        if (found == persistence_.documents.end())
+            return {workbench_error_code_t::invalid_document, identity.object_id};
+        output.identity = found->identity;
+        output.title = found->title;
+        output.can_open = true;
+        return {};
+    }
+
+private:
+    const workbench_persistence_dto_t& persistence_;
+};
 
 std::filesystem::path unique_fixture_path(const char* suffix)
 {
@@ -1168,6 +1199,64 @@ void verify_database_adapter_queue_and_close()
     require(stale_result.code == workbench_error_code_t::revision_mismatch,
             "adapter: stale queued revision must be rejected");
 
+    workspace_revision_t expected_revision = second.revision;
+    for (std::uint64_t cycle = 0; cycle < 3; ++cycle) {
+        workbench_persistence_dto_t persisted;
+        require(adapter.load(workspace, persisted).ok() &&
+                    persisted.revision == expected_revision,
+                "adapter: reopen cycle must load the exact committed revision");
+        persistence_catalog_t catalog(persisted);
+        workbench_model_t model;
+        workbench_snapshot_ptr_t initial;
+        require(model.create_workspace(make_workspace(workspace), initial).ok(),
+                "adapter: reopen cycle model must initialize");
+        const auto restored = model.restore_workspace(
+            workspace, initial->revision(), adapter, catalog,
+            missing_document_policy_t::reject);
+        require(restored.error.ok() && restored.changed && restored.snapshot &&
+                    restored.snapshot->revision() == expected_revision &&
+                    persistence_dto_equal(restored.snapshot->persistence(), persisted),
+                "adapter: restored model must adopt the committed revision baseline");
+
+        const auto no_op = model.restore_workspace(
+            workspace, restored.snapshot->revision(), persisted, catalog,
+            missing_document_policy_t::reject);
+        require(no_op.error.ok() && !no_op.changed &&
+                    no_op.snapshot == restored.snapshot,
+                "adapter: exact repeated restore must be a snapshot-preserving no-op");
+
+        workbench_command_t focus;
+        focus.kind = workbench_command_kind_t::focus_view;
+        focus.workspace = workspace;
+        focus.expected_revision = restored.snapshot->revision();
+        focus.view = cycle % 2U == 0 ? view_id_t{12} : view_id_t{11};
+        const auto mutated = model.execute(focus);
+        require(mutated.error.ok() && mutated.changed && mutated.snapshot &&
+                    mutated.snapshot->revision().value == expected_revision.value + 1U &&
+                    restored.snapshot->revision() == expected_revision,
+                "adapter: post-reopen mutation must advance exactly one revision");
+        require(adapter.store(mutated.snapshot->persistence()).ok(),
+                "adapter: strict database must accept the next restored-model revision");
+        const auto stale_cycle_store = adapter.store(persisted);
+        require(stale_cycle_store.code == workbench_error_code_t::revision_mismatch,
+                "adapter: prior reopen generation must become stale after commit");
+        expected_revision = mutated.snapshot->revision();
+    }
+
+    std::vector<std::future<bool>> concurrent_reads;
+    concurrent_reads.reserve(12);
+    for (std::size_t index = 0; index < 12; ++index) {
+        concurrent_reads.push_back(std::async(
+            std::launch::async, [&adapter, workspace, expected_revision] {
+                workbench_persistence_dto_t loaded;
+                return adapter.load(workspace, loaded).ok() &&
+                    loaded.revision == expected_revision;
+            }));
+    }
+    for (auto& read : concurrent_reads)
+        require(read.get(),
+                "adapter: concurrent reads must observe the same committed revision");
+
     workbench_persistence_dto_t wrong_workspace;
     auto isolation_result = adapter.load({5101}, wrong_workspace);
     require(isolation_result.code == workbench_error_code_t::workspace_mismatch,
@@ -1199,6 +1288,7 @@ bool run_workbench_persistence_harness(std::string& failure)
         failure.clear();
         return true;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         failure = exception.what();
         return false;
     }

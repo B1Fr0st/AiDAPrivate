@@ -1,0 +1,109 @@
+{
+  "$id": "aida.c03.managed-worker-manifest-source.schema.json",
+  "title": "AiDA C03 Managed Decompiler Worker Manifest Source",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "artifact", "worker", "materialization"],
+  "properties": {
+    "schema": { "const": "aida.c03.managed-worker-manifest-source" },
+    "schema_version": { "const": 3 },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "magic", "byte_order", "schema_version", "relative_path", "digest_relative_path", "digest_format"],
+      "properties": {
+        "format": { "const": "aida.native-worker-manifest" },
+        "magic": { "const": "NWMF" },
+        "byte_order": { "const": "little-endian" },
+        "schema_version": { "const": 3 },
+        "relative_path": { "const": "deps/AiDA_ManagedDecompilerWorker.manifest.bin" },
+        "digest_relative_path": { "const": "deps/AiDA_ManagedDecompilerWorker.manifest.sha256" },
+        "digest_format": { "const": "lowercase-hex-newline" }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "provider", "protocol", "capabilities", "startup_arguments", "runtime"],
+      "properties": {
+        "relative_path": { "const": "deps/AiDA_ManagedDecompilerWorker.exe" },
+        "provider": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "name", "version", "binary_relative_path", "binary_sha256", "worker_build_id", "worker_build_hash_material"],
+          "properties": {
+            "id": { "const": 2 },
+            "name": { "const": "ICSharpCode.Decompiler" },
+            "version": { "const": "10.1.0.8386" },
+            "binary_relative_path": { "const": "deps/ICSharpCode.Decompiler.dll" },
+            "binary_sha256": { "const": "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345" },
+            "worker_build_id": { "const": "aida-managed-decompiler-worker-v3" },
+            "worker_build_hash_material": { "const": "aida-managed-decompiler-worker-build-v3|snapshot-bound-contract=4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6|tfm=net10.0|runtime=Microsoft.NETCore.App/10.0.9" }
+          }
+        },
+        "protocol": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "hash_material", "contract_hash_material"],
+          "properties": {
+            "version": { "const": 3 },
+            "hash_material": { "const": "aida.isolated-decompiler.worker.frame.v3|bootstrap.v1|hmac-sha256|strict-sequence|readonly-provider-input|attested-provider-artifacts|bounded-native-printc-evidence|control-frame-8m|result-frame-80m|provider-artifacts-48m|printc-8m" },
+            "contract_hash_material": { "const": "aida.c03.managed-cli.contract.v3|readonly-inherited-mapping.v1|source-kind|logical-identity|module-sha256|module-size|entity|generation|type-revision|profile|runtime-manifest|provider|cache|request-binding|exact-response" }
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "prefixItems": [{ "const": "decompile" }],
+          "items": false
+        },
+        "startup_arguments": { "type": "array", "maxItems": 0 },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["target_framework", "framework", "framework_version", "runtime_identifier", "manifest_relative_path", "manifest_digest_relative_path", "dotnet_root_relative_path", "machine_runtime_fallback"],
+          "properties": {
+            "target_framework": { "const": "net10.0" },
+            "framework": { "const": "Microsoft.NETCore.App" },
+            "framework_version": { "const": "10.0.9" },
+            "runtime_identifier": { "const": "win-x64" },
+            "manifest_relative_path": { "const": "deps/AiDA_ManagedRuntime.manifest.json" },
+            "manifest_digest_relative_path": { "const": "deps/AiDA_ManagedRuntime.manifest.sha256" },
+            "dotnet_root_relative_path": { "const": "deps/dotnet" },
+            "machine_runtime_fallback": { "const": false }
+          }
+        }
+      }
+    },
+    "materialization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_binary_hash", "provider_binary_hash", "runtime_manifest_hash", "manifest_digest", "input_lock", "atomic_write", "verify_after_write"],
+      "properties": {
+        "worker_binary_hash": {
+          "oneOf": [
+            { "const": "" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        },
+        "provider_binary_hash": { "const": "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345" },
+        "runtime_manifest_hash": {
+          "oneOf": [
+            { "const": "" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        },
+        "manifest_digest": {
+          "oneOf": [
+            { "const": "" },
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          ]
+        },
+        "input_lock": { "const": "deny-write-and-delete-while-hashing" },
+        "atomic_write": { "const": true },
+        "verify_after_write": { "const": true }
+      }
+    }
+  }
+}

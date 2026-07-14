@@ -3,11 +3,11 @@
 
 #include "ida_compat_read.hpp"
 
+#include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../analysis/workspace/analysis_workspace.hpp"
 #include "../analysis/workspace/compact_ir.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../analysis/workspace/search_index.hpp"
-#include "../analysis/workspace/decompiler_service.hpp"
 #include "../analysis/workspace/pe_image.hpp"
 #include "../analysis/workspace/byte_provider.hpp"
 #include "../analysis/workspace/arch_decoder.hpp"
@@ -29,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -226,22 +227,27 @@ namespace mcp_standalone::ida_compat
         };
 
         struct ws_state {
+            std::shared_ptr<analysis_workspace_t> workspace;
+            std::shared_ptr<const analysis_publication_t> publication;
             std::shared_ptr<const analysis_snapshot_t> snapshot;
             std::shared_ptr<search_index_t> search_index;
             std::shared_ptr<const pe_image_t> image;
             std::shared_ptr<const workspace_image_t> normalized_image;
             std::shared_ptr<overlay_journal_t> overlay;
-            std::shared_ptr<decompiler_service_t> decompiler;
             const byte_provider_t* provider = nullptr;
             target_kind_t kind = target_kind_t::static_file;
             overlay_names_t ov_names;
             explicit ws_state(const workspace_request_context_t& ctx) : ov_names(nullptr) {
                 if (!ctx.workspace) return;
-                auto pub = ctx.workspace->analysis_publication();
-                if (pub) { snapshot = pub->snapshot; search_index = pub->search_index; }
+                workspace = ctx.workspace;
+                publication = workspace->analysis_publication();
+                if (publication) {
+                    snapshot = publication->snapshot;
+                    search_index = publication->search_index;
+                }
                 image = ctx.workspace->image(); normalized_image = ctx.workspace->normalized_image();
                 overlay = ctx.workspace->overlay();
-                decompiler = ctx.workspace->decompiler(); provider = &ctx.workspace->provider();
+                provider = &ctx.workspace->provider();
                 kind = ctx.kind;
                 ov_names = overlay_names_t(overlay.get());
             }
@@ -324,6 +330,74 @@ namespace mcp_standalone::ida_compat
             }
             return source;
         }
+
+        class request_cancellation_bridge_t final {
+        public:
+            request_cancellation_bridge_t(
+                const workspace_request_context_t& context,
+                cancellation_source_t& source)
+                : context_(context), source_(source) {
+                if (!context_.cancellation) {
+                    ready_ = true;
+                    return;
+                }
+                auto& active = active_bridges();
+                auto observed = active.load(std::memory_order_acquire);
+                while (observed < k_max_active_bridges &&
+                       !active.compare_exchange_weak(
+                           observed, observed + 1U,
+                           std::memory_order_acq_rel,
+                           std::memory_order_acquire)) {
+                }
+                if (observed >= k_max_active_bridges)
+                    return;
+                owns_slot_ = true;
+                try {
+                    worker_ = std::thread([this] {
+                        while (!stopping_.load(std::memory_order_acquire)) {
+                            if (context_.cancellation_requested()) {
+                                source_.request_cancel();
+                                return;
+                            }
+                            ::Sleep(2);
+                        }
+                    });
+                    ready_ = true;
+                } catch (...) {
+                    owns_slot_ = false;
+                    active.fetch_sub(1U, std::memory_order_acq_rel);
+                }
+            }
+
+            ~request_cancellation_bridge_t() {
+                stopping_.store(true, std::memory_order_release);
+                if (worker_.joinable()) worker_.join();
+                if (owns_slot_)
+                    active_bridges().fetch_sub(1U, std::memory_order_acq_rel);
+            }
+
+            request_cancellation_bridge_t(
+                const request_cancellation_bridge_t&) = delete;
+            request_cancellation_bridge_t& operator=(
+                const request_cancellation_bridge_t&) = delete;
+
+            bool ready() const noexcept { return ready_; }
+
+        private:
+            static constexpr std::uint32_t k_max_active_bridges = 16;
+
+            static std::atomic<std::uint32_t>& active_bridges() noexcept {
+                static std::atomic<std::uint32_t> active{0};
+                return active;
+            }
+
+            const workspace_request_context_t& context_;
+            cancellation_source_t& source_;
+            std::atomic<bool> stopping_{false};
+            std::thread worker_;
+            bool owns_slot_ = false;
+            bool ready_ = false;
+        };
 
         json formatter_error_json(const workspace_error_t& error,
                                   const workspace_image_t& image,
@@ -998,6 +1072,215 @@ namespace mcp_standalone::ida_compat
             return resolved_address_t{address, provider_offset_for(*ws.normalized_image, address)};
         }
 
+        std::optional<std::uint32_t> managed_token_value(std::string_view text) {
+            if (text.empty()) return std::nullopt;
+            const auto parsed = parse_addr(json(std::string(text)));
+            if (!parsed || *parsed > (std::numeric_limits<std::uint32_t>::max)())
+                return std::nullopt;
+            return static_cast<std::uint32_t>(*parsed);
+        }
+
+        std::optional<decompiler_entity_locator_t> decompiler_locator(
+            const ws_state& ws, const json& input) {
+            if (input.is_string()) {
+                std::string text = input.get<std::string>();
+                while (!text.empty() && std::isspace(
+                           static_cast<unsigned char>(text.front())))
+                    text.erase(text.begin());
+                while (!text.empty() && std::isspace(
+                           static_cast<unsigned char>(text.back())))
+                    text.pop_back();
+                const auto separator = text.find(':');
+                if (separator != std::string::npos) {
+                    std::string prefix = text.substr(0, separator);
+                    std::transform(prefix.begin(), prefix.end(), prefix.begin(),
+                        [](unsigned char value) {
+                            return static_cast<char>(std::tolower(value));
+                        });
+                    const bool token_locator = prefix == "token" ||
+                        prefix == "cli" || prefix == "jvm" ||
+                        prefix == "dalvik";
+                    if (token_locator) {
+                        std::string value = text.substr(separator + 1);
+                        std::optional<std::uint32_t> artifact;
+                        const auto artifact_separator = value.find('@');
+                        if (artifact_separator != std::string::npos) {
+                            artifact = managed_token_value(
+                                value.substr(artifact_separator + 1));
+                            value.resize(artifact_separator);
+                            if (!artifact) return std::nullopt;
+                        }
+                        const auto token = managed_token_value(value);
+                        if (!token) return std::nullopt;
+                        decompiler_entity_locator_t locator;
+                        locator.token = *token;
+                        locator.artifact_ordinal = artifact;
+                        if (prefix == "cli")
+                            locator.expected_kind =
+                                decompiler_entity_kind_t::cli_method;
+                        else if (prefix == "jvm")
+                            locator.expected_kind =
+                                decompiler_entity_kind_t::jvm_method;
+                        else if (prefix == "dalvik")
+                            locator.expected_kind =
+                                decompiler_entity_kind_t::dalvik_method;
+                        return locator;
+                    }
+                }
+            }
+            if (const auto resolved = resolve_address(ws, input)) {
+                decompiler_entity_locator_t locator;
+                locator.address = resolved->address.space ==
+                        address_space_id_t::file_offset &&
+                        resolved->provider_offset
+                    ? *resolved->provider_offset
+                    : resolved->address.value;
+                return locator;
+            }
+            if (!input.is_string() || !ws.snapshot)
+                return std::nullopt;
+            const auto requested = input.get<std::string>();
+            const function_record_t* match = nullptr;
+            for (const auto& function : ws.snapshot->functions) {
+                if (func_name(*ws.snapshot, ws.ov_names, function) != requested)
+                    continue;
+                if (match) return std::nullopt;
+                match = &function;
+            }
+            if (!match) return std::nullopt;
+            decompiler_entity_locator_t locator;
+            locator.address = match->start.value;
+            locator.expected_kind = decompiler_entity_kind_t::native_function;
+            return locator;
+        }
+
+        std::string decompiler_entity_name(const decompiler_entity_key_t& entity) {
+            if (const auto* native = std::get_if<
+                    native_decompiler_entity_identity_t>(&entity.identity))
+                return native->canonical_symbol;
+            if (const auto* cli = std::get_if<
+                    cli_decompiler_entity_identity_t>(&entity.identity))
+                return cli->declaring_type + "::" + cli->method_name;
+            if (const auto* jvm = std::get_if<
+                    jvm_decompiler_entity_identity_t>(&entity.identity))
+                return jvm->class_internal_name + "." + jvm->method_name;
+            if (const auto* dalvik = std::get_if<
+                    dalvik_decompiler_entity_identity_t>(&entity.identity))
+                return dalvik->class_descriptor + "->" + dalvik->method_name;
+            return {};
+        }
+
+        std::optional<std::string> decompiler_entity_prototype(
+            const decompiler_entity_key_t& entity) {
+            if (const auto* cli = std::get_if<
+                    cli_decompiler_entity_identity_t>(&entity.identity))
+                return cli->method_signature.empty()
+                    ? std::nullopt
+                    : std::optional<std::string>(cli->method_signature);
+            if (const auto* jvm = std::get_if<
+                    jvm_decompiler_entity_identity_t>(&entity.identity))
+                return jvm->method_descriptor.empty()
+                    ? std::nullopt
+                    : std::optional<std::string>(jvm->method_descriptor);
+            if (const auto* dalvik = std::get_if<
+                    dalvik_decompiler_entity_identity_t>(&entity.identity))
+                return dalvik->prototype.empty()
+                    ? std::nullopt
+                    : std::optional<std::string>(dalvik->prototype);
+            return std::nullopt;
+        }
+
+        std::optional<std::string> decompiler_entity_locator_text(
+            const ws_state& ws,
+            const generation_bound_decompiler_entity_t& binding) {
+            if (const auto* native = std::get_if<
+                    native_decompiler_entity_identity_t>(&binding.entity.identity))
+                return hex_str(native->entry.value);
+            if (!binding.artifact_index || !ws.publication ||
+                !ws.publication->managed_artifacts ||
+                *binding.artifact_index >=
+                    ws.publication->managed_artifacts->artifacts().size())
+                return std::nullopt;
+            const auto artifact = ws.publication->managed_artifacts->artifacts()
+                [*binding.artifact_index].artifact_ordinal;
+            std::string prefix;
+            std::uint32_t token = 0;
+            if (const auto* cli = std::get_if<
+                    cli_decompiler_entity_identity_t>(&binding.entity.identity)) {
+                prefix = "cli";
+                token = cli->metadata_token;
+            } else if (const auto* jvm = std::get_if<
+                           jvm_decompiler_entity_identity_t>(&binding.entity.identity)) {
+                prefix = "jvm";
+                token = jvm->method_index;
+            } else if (const auto* dalvik = std::get_if<
+                           dalvik_decompiler_entity_identity_t>(&binding.entity.identity)) {
+                prefix = "dalvik";
+                token = dalvik->method_id;
+            } else {
+                return std::nullopt;
+            }
+            return prefix + ":" + std::to_string(token) + "@" +
+                std::to_string(artifact);
+        }
+
+        std::uint64_t decompiler_entity_size(
+            const ws_state& ws,
+            const generation_bound_decompiler_entity_t& binding) noexcept {
+            if (const auto* native = std::get_if<
+                    native_decompiler_entity_identity_t>(&binding.entity.identity))
+                return native->end.value >= native->entry.value
+                    ? native->end.value - native->entry.value : 0;
+            if (!binding.method_index || !ws.publication ||
+                !ws.publication->managed_artifacts)
+                return 0;
+            for (const auto& method :
+                 ws.publication->managed_artifacts->methods())
+                if (method.method_index == *binding.method_index &&
+                    method.entity == binding.entity)
+                    return method.code_size;
+            return 0;
+        }
+
+        json decompiler_source_mappings(
+            const decompiler_ui_result_t& result,
+            std::size_t maximum_bytes,
+            bool& truncated) {
+            truncated = false;
+            json mappings = json::array();
+            std::size_t serialized_bytes = 2;
+            for (const auto& mapping : result.source_mappings) {
+                if (mapping.token_begin >= mapping.token_end ||
+                    mapping.token_end > result.rendered_text.size())
+                    continue;
+                json item{{"begin", mapping.token_begin},
+                          {"end", mapping.token_end}};
+                auto address_range = mapping.address_range;
+                if (!address_range && mapping.coordinate)
+                    address_range = mapping.coordinate->address_range;
+                if (address_range) {
+                    item["address"] = hex_str(address_range->begin.value);
+                    item["address_begin"] = hex_str(
+                        address_range->begin.value);
+                    item["address_end"] = hex_str(
+                        address_range->end.value);
+                }
+                const auto item_bytes = item.dump().size() + 1U;
+                if (item_bytes > maximum_bytes -
+                        (std::min)(maximum_bytes, serialized_bytes)) {
+                    truncated = true;
+                    break;
+                }
+                serialized_bytes += item_bytes;
+                mappings.push_back(std::move(item));
+                if (mappings.size() >= kMaxPageItems) {
+                    truncated = result.source_mappings.size() > mappings.size();
+                    break;
+                }
+            }
+            return mappings;
+        }
+
         std::optional<std::uint64_t> snapshot_address_value(const ws_state& ws,
                                                             const resolved_address_t& address) {
             if (!ws.normalized_image) return std::nullopt;
@@ -1260,39 +1543,183 @@ namespace mcp_standalone::ida_compat
 
     tool_result_t tool_decompile(const json& params, const workspace_request_context_t& ctx) {
         ws_state ws(ctx);
-        if (!ws.decompiler) return adapter_error(ctx, "decompiler service not available", "NO_DECOMPILER");
-        if (!ws.has_image()) return adapter_error(ctx, "normalized image unavailable", "NO_IMAGE");
-        auto address = resolve_address(ws, params.value("address", json()));
-        if (!address) return adapter_error(ctx, "valid address required", "MISSING_PARAM");
+        if (!ws.workspace)
+            return adapter_error(ctx, "workspace is unavailable", "NO_WORKSPACE");
+        const auto locator = decompiler_locator(
+            ws, params.value("address", json()));
+        if (!locator)
+            return adapter_error(ctx,
+                "address, function name, or managed token locator is required",
+                "MISSING_PARAM",
+                json{{"managed_locator", "cli|jvm|dalvik|token:<value>[@artifact]"}});
         if (auto stopped = stop_result(ctx)) return std::move(*stopped);
-        decompiler_request_t req;
-        req.use_memory_cache = params.value("use_cache", true);
-        if (ctx.deadline_ms != 0) {
-            const auto now = static_cast<std::uint64_t>(GetTickCount64());
-            if (now >= ctx.deadline_ms) return adapter_error(ctx, "request deadline exceeded", "DEADLINE_EXCEEDED");
-            req.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ctx.deadline_ms - now);
+        auto producer = decompiler_ui_integration_t::production_for_workspace(
+            ws.workspace);
+        if (!producer)
+            return adapter_error(ctx, producer.error().message,
+                "NO_DECOMPILER",
+                json{{"phase", producer.error().phase},
+                     {"stable_code", producer.error().stable_code()}});
+        auto cancellation = request_cancellation_source(ctx);
+        request_cancellation_bridge_t bridge(ctx, cancellation);
+        if (!bridge.ready())
+            return adapter_error(ctx,
+                "decompiler cancellation bridge capacity is exhausted",
+                "RESOURCE_EXHAUSTED",
+                json{{"resource", "decompiler_cancellation_bridge"},
+                     {"capacity", 16}});
+        auto resolved = producer.value()->resolve_entity_at(
+            *locator, cancellation.token());
+        if (!resolved) {
+            const auto& error = resolved.error();
+            const std::string code = error.deadline ? "DEADLINE_EXCEEDED" :
+                error.cancellation ? "CANCELLED" :
+                error.code == workspace_error_code_t::target_ambiguous
+                    ? "AMBIGUOUS_ENTITY" :
+                error.code == workspace_error_code_t::target_not_found
+                    ? "ENTITY_NOT_FOUND" : "ENTITY_RESOLUTION_FAILED";
+            return adapter_error(ctx, error.message, code,
+                json{{"phase", error.phase},
+                     {"stable_code", error.stable_code()}});
         }
-        auto r = ws.decompiler->decompile(address->address, req);
-        if (!r.has_value()) {
-            const auto& error = r.error();
+        const auto binding = resolved.take_value();
+        ws.publication = ws.workspace->analysis_publication();
+        if (!ws.publication ||
+            ws.publication->generation != binding.generation ||
+            ws.publication->analysis_revision != binding.analysis_revision ||
+            ws.publication->overlay_revision != binding.overlay_revision ||
+            ws.workspace->overlay_revision() != binding.overlay_revision ||
+            (ctx.analysis_revision != 0 &&
+             ctx.analysis_revision != binding.analysis_revision) ||
+            ctx.overlay_revision != binding.overlay_revision)
+            return adapter_error(ctx, "decompiler entity revision changed",
+                "STALE_ENTITY",
+                json{{"generation", binding.generation},
+                     {"analysis_revision", binding.analysis_revision},
+                     {"overlay_revision", binding.overlay_revision}});
+        auto result = producer.value()->decompile_entity(
+            binding, decompiler_ui_invocation_source_t::mcp_request,
+            decompiler_profile_id_t::balanced,
+            params.value("use_cache", true)
+                ? decompiler_pipeline_cache_mode_t::read_write
+                : decompiler_pipeline_cache_mode_t::bypass,
+            cancellation.token());
+        if (!result) {
+            const auto& error = result.error();
             const std::string code = error.deadline ? "DEADLINE_EXCEEDED" :
                 error.cancellation ? "CANCELLED" : "DECOMPILE_FAILED";
-            return adapter_error(ctx, error.message, code, json{{"phase", error.phase}});
+            return adapter_error(ctx, error.message, code,
+                json{{"phase", error.phase},
+                     {"stable_code", error.stable_code()}});
         }
         if (auto stopped = stop_result(ctx)) return std::move(*stopped);
-        auto& d = r.value();
-        constexpr std::size_t kMaxPseudocodeBytes = 512 * 1024;
-        const bool pseudocode_truncated = d.pseudocode.size() > kMaxPseudocodeBytes;
-        json j = {{"address", hex_str(d.function_address.value)}, {"name", d.function_name},
-            {"pseudocode", pseudocode_truncated ? d.pseudocode.substr(0, kMaxPseudocodeBytes) : d.pseudocode},
-            {"pseudocode_truncated", pseudocode_truncated}, {"cache_hit", d.cache_hit},
-            {"persistent_cache_hit", d.persistent_cache_hit}, {"elapsed_ms", d.elapsed_ms}};
-        json callees = json::array();
-        for (const auto& [name, ca] : d.callees) {
-            if (callees.size() >= kMaxPageItems) break;
-            callees.push_back({{"name", name}, {"address", hex_str(ca)}});
+        const auto& d = result.value();
+        if (!d.succeeded() || d.workspace_generation != binding.generation ||
+            d.analysis_revision != binding.analysis_revision ||
+            d.overlay_revision != binding.overlay_revision ||
+            d.document->entity != binding.entity) {
+            json diagnostics = json::array();
+            for (const auto& diagnostic : d.diagnostics) {
+                diagnostics.push_back({
+                    {"code", static_cast<std::uint32_t>(diagnostic.code)},
+                    {"localization_key", diagnostic.localization_key},
+                    {"message", diagnostic.message},
+                    {"retryable", diagnostic.retryable},
+                });
+            }
+            return adapter_error(ctx,
+                "typed decompiler pipeline did not produce a valid document",
+                d.status == decompiler_pipeline_status_t::deadline_exceeded
+                    ? "DEADLINE_EXCEEDED" :
+                d.status == decompiler_pipeline_status_t::cancelled
+                    ? "CANCELLED" : "DECOMPILE_FAILED",
+                json{{"status", static_cast<std::uint32_t>(d.status)},
+                     {"diagnostics", std::move(diagnostics)}});
         }
-        j["callees"] = callees;
+        constexpr std::size_t kMaxPseudocodeBytes = 512 * 1024;
+        const bool pseudocode_truncated =
+            d.rendered_text.size() > kMaxPseudocodeBytes;
+        const auto entity_locator = decompiler_entity_locator_text(ws, binding);
+        if (!entity_locator)
+            return adapter_error(ctx,
+                "decompiler entity could not be represented by a stable locator",
+                "ENTITY_LOCATOR_UNAVAILABLE",
+                json{{"entity_kind", static_cast<std::uint32_t>(
+                    binding.entity.kind)}});
+        constexpr std::size_t kMaxSourceMappingBytes = 192 * 1024;
+        bool source_mappings_truncated = false;
+        auto source_mappings = decompiler_source_mappings(
+            d, kMaxSourceMappingBytes, source_mappings_truncated);
+        json j = {{"address", *entity_locator},
+            {"name", decompiler_entity_name(binding.entity)},
+            {"size", std::to_string(decompiler_entity_size(ws, binding))},
+            {"pseudocode", pseudocode_truncated
+                ? d.rendered_text.substr(0, kMaxPseudocodeBytes)
+                : d.rendered_text},
+            {"pseudocode_truncated", pseudocode_truncated},
+            {"cache_hit", d.cache_hit_stage.has_value()},
+            {"persistent_cache_hit", false}, {"elapsed_ms", d.elapsed_ms},
+            {"entity_kind", static_cast<std::uint32_t>(binding.entity.kind)},
+            {"generation", binding.generation},
+            {"analysis_revision", binding.analysis_revision},
+            {"overlay_revision", binding.overlay_revision},
+            {"source_mappings", std::move(source_mappings)},
+            {"source_mappings_truncated", source_mappings_truncated}};
+        if (const auto prototype = decompiler_entity_prototype(binding.entity))
+            j["prototype"] = *prototype;
+        else
+            j["prototype"] = nullptr;
+        if (d.provider) {
+            j["provider"] = {
+                {"registration_id", d.provider->registration_id},
+                {"provider_id", static_cast<std::uint32_t>(
+                    d.provider->identity.provider)},
+                {"provider_name", d.provider->identity.provider_name},
+                {"provider_version", d.provider->identity.provider_version},
+                {"worker_build_id", d.provider->identity.worker_build_id},
+            };
+        }
+        json callees = json::array();
+        std::size_t callee_bytes = 2;
+        bool callees_truncated = false;
+        if (const auto* native = std::get_if<
+                native_decompiler_entity_identity_t>(&binding.entity.identity);
+            native && ws.snapshot) {
+            const auto function = std::find_if(
+                ws.snapshot->functions.begin(), ws.snapshot->functions.end(),
+                [native](const function_record_t& candidate) {
+                    return candidate.id == native->function_id;
+                });
+            if (function != ws.snapshot->functions.end()) {
+                for (const auto& edge : ws.snapshot->edges) {
+                    if (edge.source.value < function->start.value ||
+                        edge.source.value >= function->end.value ||
+                        (edge.kind != edge_kind_t::call &&
+                         edge.kind != edge_kind_t::tail_call &&
+                         edge.kind != edge_kind_t::indirect))
+                        continue;
+                    json callee{{"address", hex_str(edge.target.value)}};
+                    if (const auto* target = find_func_at(
+                            *ws.snapshot, edge.target.value))
+                        callee["name"] = func_name(
+                            *ws.snapshot, ws.ov_names, *target);
+                    const auto serialized = callee.dump().size() + 1U;
+                    if (serialized > 64U * 1024U -
+                            (std::min)(64U * 1024U, callee_bytes)) {
+                        callees_truncated = true;
+                        break;
+                    }
+                    callee_bytes += serialized;
+                    callees.push_back(std::move(callee));
+                    if (callees.size() >= kMaxPageItems) {
+                        callees_truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        j["callees"] = std::move(callees);
+        j["callees_truncated"] = callees_truncated;
         return adapter_ok(ctx, j);
     }
 

@@ -1,77 +1,371 @@
 {
-  "$id": "aida.c03.worker-manifest.schema.json",
-  "title": "AiDA C03 Protected Worker Manifest",
+  "$id": "aida.c03.worker-manifest-lock.schema.json",
+  "title": "AiDA C03 Offline Worker And Dependency Authority",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "schema_version", "distribution", "workers", "camoufox", "notices"],
+  "required": ["schema", "schema_version", "no_network_fetch", "source_inventory", "dependencies", "production_link_denylist", "offline_managed_restore", "analysis_python_worker", "notice_artifacts", "dependency_decisions", "customer_sidecars"],
   "properties": {
-    "schema": { "const": "aida.c03.worker-manifest" },
-    "schema_version": { "const": 1 },
-    "distribution": {
+    "schema": { "const": "aida.c03.worker-manifest-lock" },
+    "schema_version": { "const": 2 },
+    "no_network_fetch": { "const": true },
+    "source_inventory": {
+      "type": "array",
+      "minItems": 58,
+      "maxItems": 58,
+      "items": { "$ref": "#/$defs/source" }
+    },
+    "dependencies": {
+      "type": "array",
+      "minItems": 30,
+      "maxItems": 30,
+      "items": { "$ref": "#/$defs/dependency" }
+    },
+    "production_link_denylist": {
+      "const": ["lmdb", "unicorn", "remill"]
+    },
+    "offline_managed_restore": { "$ref": "#/$defs/managed_restore" },
+    "analysis_python_worker": { "$ref": "#/$defs/analysis_python_worker" },
+    "notice_artifacts": { "$ref": "#/$defs/notice_artifacts" },
+    "dependency_decisions": { "$ref": "#/$defs/dependency_decisions" },
+    "customer_sidecars": { "$ref": "#/$defs/customer_sidecars" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "optional_sha256": { "type": "string", "pattern": "^(?:|[0-9a-f]{64})$" },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32768,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*:)[^\\u0000]+$"
+    },
+    "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["disk_backed", "protected", "arc_license_gates_required", "raw_standalone_download_forbidden", "fileless_launch_forbidden"],
+      "required": ["path", "size_bytes", "sha256", "component", "usage", "license"],
       "properties": {
-        "disk_backed": { "const": true },
-        "protected": { "const": true },
-        "arc_license_gates_required": { "const": true },
-        "raw_standalone_download_forbidden": { "const": true },
-        "fileless_launch_forbidden": { "const": true }
+        "path": { "$ref": "#/$defs/relative_path" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 8589934592 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "component": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "usage": { "enum": ["production", "build_only", "evidence_only"] },
+        "license": { "type": "string", "minLength": 1, "maxLength": 256 }
       }
     },
-    "workers": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "relative_path", "sha256", "signature", "pipe", "containment", "target_execution_forbidden"],
-        "properties": {
-          "id": { "enum": ["native_decompiler", "managed_cli_decompiler", "analysis_python"] },
-          "relative_path": { "type": "string", "pattern": "^deps/[A-Za-z0-9_.-]+\\.exe$" },
-          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-          "signature": { "type": "object", "additionalProperties": false, "required": ["verified", "manifest_bound"], "properties": { "verified": { "const": true }, "manifest_bound": { "const": true } } },
-          "pipe": { "type": "object", "additionalProperties": false, "required": ["acl_restricted", "session_nonce", "monotonic_sequence"], "properties": { "acl_restricted": { "const": true }, "session_nonce": { "const": true }, "monotonic_sequence": { "const": true } } },
-          "containment": { "type": "object", "additionalProperties": false, "required": ["job_object", "kill_on_parent_close", "restricted_token", "network_denied", "child_process_denied", "unrelated_handles_denied", "process_mitigations", "cpu_quota", "memory_quota", "deadline_ms", "cancellation_replaces_worker"], "properties": { "job_object": { "const": true }, "kill_on_parent_close": { "const": true }, "restricted_token": { "const": true }, "network_denied": { "const": true }, "child_process_denied": { "const": true }, "unrelated_handles_denied": { "const": true }, "process_mitigations": { "const": true }, "cpu_quota": { "type": "integer", "minimum": 1 }, "memory_quota": { "type": "integer", "minimum": 1 }, "deadline_ms": { "type": "integer", "minimum": 1 }, "cancellation_replaces_worker": { "const": true } } },
-          "target_execution_forbidden": { "const": true }
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "usage", "license", "components", "source_paths", "ships_to_customer"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_.-]+$" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "usage": { "enum": ["production", "build_only", "evidence_only", "non_use"] },
+        "license": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "components": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "source_paths": { "type": "array", "maxItems": 128, "uniqueItems": true, "items": { "$ref": "#/$defs/relative_path" } },
+        "ships_to_customer": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "usage": { "const": "production" } } },
+          "then": {
+            "properties": {
+              "components": { "minItems": 1 },
+              "source_paths": { "minItems": 1 },
+              "ships_to_customer": { "const": true }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "usage": { "enum": ["build_only", "evidence_only"] } } },
+          "then": {
+            "properties": {
+              "components": { "minItems": 1 },
+              "source_paths": { "minItems": 1 },
+              "ships_to_customer": { "const": false }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "usage": { "const": "non_use" } } },
+          "then": {
+            "properties": {
+              "components": { "maxItems": 0 },
+              "source_paths": { "maxItems": 0 },
+              "ships_to_customer": { "const": false }
+            }
+          }
+        }
+      ]
+    },
+    "managed_package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "path", "sha256", "license"],
+      "properties": {
+        "id": { "enum": ["ICSharpCode.Decompiler", "System.Collections.Immutable", "System.Reflection.Metadata"] },
+        "version": { "type": "string", "minLength": 1 },
+        "path": { "$ref": "#/$defs/relative_path" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "license": { "const": "MIT" }
+      }
+    },
+    "managed_restore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locked_mode_required", "network_sources_forbidden", "local_source", "sdk", "packages"],
+      "properties": {
+        "locked_mode_required": { "const": true },
+        "network_sources_forbidden": { "const": true },
+        "local_source": { "const": ".deps/nuget-offline" },
+        "sdk": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256", "shipped"],
+          "properties": {
+            "path": { "const": ".deps/dotnet-sdk-10.0.301-win-x64/dotnet.exe" },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "shipped": { "const": false }
+          }
+        },
+        "packages": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/managed_package" }
         }
       }
     },
-    "camoufox": {
+    "containment": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["only_supported_browser", "browser_relative_path", "browser_sha256", "reverse_mcp_relative_path", "reverse_mcp_sha256", "developer_source_shipped", "loose_python_shipped", "stock_browser_fallback", "environment"],
+      "required": ["job_object", "kill_on_parent_close", "restricted_token", "network_denied", "child_process_denied", "unrelated_handles_denied", "process_mitigations", "acl_restricted_ipc", "authenticated_ipc", "monotonic_sequence", "cancellation_replaces_worker", "cpu_quota_ms", "memory_quota_bytes", "deadline_ms"],
       "properties": {
-        "only_supported_browser": { "const": "camoufox" },
-        "browser_relative_path": { "const": "deps/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe" },
-        "browser_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-        "reverse_mcp_relative_path": { "const": "deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe" },
-        "reverse_mcp_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-        "developer_source_shipped": { "const": false },
-        "loose_python_shipped": { "const": false },
-        "stock_browser_fallback": { "const": false },
-        "environment": { "type": "object", "additionalProperties": false, "required": ["AIDA_CAMOUFOX_EXECUTABLE", "AIDA_CAMOUFOX_MCP_EXECUTABLE", "AIDA_CAMOUFOX_PYTHON"], "properties": { "AIDA_CAMOUFOX_EXECUTABLE": { "const": "verified-browser" }, "AIDA_CAMOUFOX_MCP_EXECUTABLE": { "const": "verified-frozen-sidecar" }, "AIDA_CAMOUFOX_PYTHON": { "const": "unset-unless-verified-sidecar-runtime" } } }
+        "job_object": { "const": true },
+        "kill_on_parent_close": { "const": true },
+        "restricted_token": { "const": true },
+        "network_denied": { "const": true },
+        "child_process_denied": { "const": true },
+        "unrelated_handles_denied": { "const": true },
+        "process_mitigations": { "const": true },
+        "acl_restricted_ipc": { "const": true },
+        "authenticated_ipc": { "const": true },
+        "monotonic_sequence": { "const": true },
+        "cancellation_replaces_worker": { "const": true },
+        "cpu_quota_ms": { "type": "integer", "minimum": 1 },
+        "memory_quota_bytes": { "type": "integer", "minimum": 1 },
+        "deadline_ms": { "type": "integer", "minimum": 1 }
       }
     },
-    "notices": {
+    "analysis_python_worker": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["ledger_relative_path", "managed_package_notices"],
+      "required": ["id", "network_fetch_forbidden", "pinned_freezer_required", "source", "build_script", "manifest", "protocol", "containment", "runtime_coupling", "prebuilt_artifact"],
       "properties": {
-        "ledger_relative_path": { "const": "notices/THIRD_PARTY_NOTICES.md" },
-        "managed_package_notices": {
-          "type": "array",
-          "minItems": 2,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["id", "license_relative_path", "license_sha256", "third_party_notices_relative_path", "third_party_notices_sha256"],
+        "id": { "const": "analysis_python" },
+        "network_fetch_forbidden": { "const": true },
+        "pinned_freezer_required": { "const": true },
+        "source": { "$ref": "#/$defs/locked_path" },
+        "build_script": { "$ref": "#/$defs/locked_path" },
+        "manifest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["magic", "schema_version", "digest_algorithm", "capability"],
+          "properties": {
+            "magic": { "const": "APWM" },
+            "schema_version": { "const": 1 },
+            "digest_algorithm": { "const": "sha256" },
+            "capability": { "const": "execute-approved-file" }
+          }
+        },
+        "protocol": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "hash_material"],
+          "properties": {
+            "version": { "const": 1 },
+            "hash_material": { "const": "aida.analysis-python.worker.frame.v1|bootstrap.v1|hmac-sha256|strict-sequence|approved-workspace-api" }
+          }
+        },
+        "containment": { "$ref": "#/$defs/containment" },
+        "runtime_coupling": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["camoufox_forbidden", "browser_runtime_forbidden", "target_execution_forbidden"],
+          "properties": {
+            "camoufox_forbidden": { "const": true },
+            "browser_runtime_forbidden": { "const": true },
+            "target_execution_forbidden": { "const": true }
+          }
+        },
+        "prebuilt_artifact": { "$ref": "#/$defs/prebuilt" }
+      }
+    },
+    "locked_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relative_path" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "prebuilt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_directory", "source_path", "package_relative_path", "manifest_relative_path", "manifest_digest_relative_path", "frozen_contents_path", "build_receipt_path", "protector_receipt_path", "signature_receipt_path", "identity_state", "expected_sha256", "expected_size_bytes", "expected_signer_thumbprint_sha256", "expected_protector_tool_sha256", "expected_protector_verifier_sha256", "expected_signature_verifier_sha256", "freezer", "protector_flags", "required_for_staging"],
+      "properties": {
+        "source_directory": { "const": ".deps/AiDA_AnalysisPythonWorker" },
+        "source_path": { "const": ".deps/AiDA_AnalysisPythonWorker/AiDA_AnalysisPythonWorker.exe" },
+        "package_relative_path": { "const": "deps/AiDA_AnalysisPythonWorker.exe" },
+        "manifest_relative_path": { "const": "deps/AiDA_AnalysisPythonWorker.manifest.bin" },
+        "manifest_digest_relative_path": { "const": "deps/AiDA_AnalysisPythonWorker.manifest.sha256" },
+        "frozen_contents_path": { "const": ".deps/AiDA_AnalysisPythonWorker/AiDA_AnalysisPythonWorker.frozen_contents.json" },
+        "build_receipt_path": { "const": ".deps/AiDA_AnalysisPythonWorker/AiDA_AnalysisPythonWorker.build_receipt.json" },
+        "protector_receipt_path": { "const": ".deps/AiDA_AnalysisPythonWorker/AiDA_AnalysisPythonWorker.protector_receipt.json" },
+        "signature_receipt_path": { "const": ".deps/AiDA_AnalysisPythonWorker/AiDA_AnalysisPythonWorker.signature_receipt.json" },
+        "identity_state": { "enum": ["external_fixture_required", "locked"] },
+        "expected_sha256": { "$ref": "#/$defs/optional_sha256" },
+        "expected_size_bytes": { "type": "integer", "minimum": 0, "maximum": 2147483648 },
+        "expected_signer_thumbprint_sha256": { "$ref": "#/$defs/optional_sha256" },
+        "expected_protector_tool_sha256": { "$ref": "#/$defs/optional_sha256" },
+        "expected_protector_verifier_sha256": { "$ref": "#/$defs/optional_sha256" },
+        "expected_signature_verifier_sha256": { "$ref": "#/$defs/optional_sha256" },
+        "freezer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "environment_lock_sha256"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "version": { "type": "string", "minLength": 1 },
+            "environment_lock_sha256": { "$ref": "#/$defs/optional_sha256" }
+          }
+        },
+        "protector_flags": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "required_for_staging": { "const": true }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "identity_state": { "const": "external_fixture_required" } } },
+          "then": {
             "properties": {
-              "id": { "enum": ["System.Collections.Immutable", "System.Reflection.Metadata"] },
-              "license_relative_path": { "type": "string", "pattern": "^notices/managed/[A-Za-z0-9_.-]+/LICENSE\\.TXT$" },
-              "license_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-              "third_party_notices_relative_path": { "type": "string", "pattern": "^notices/managed/[A-Za-z0-9_.-]+/THIRD-PARTY-NOTICES\\.TXT$" },
-              "third_party_notices_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+              "expected_sha256": { "const": "" },
+              "expected_size_bytes": { "const": 0 },
+              "expected_signer_thumbprint_sha256": { "const": "" },
+              "expected_protector_tool_sha256": { "const": "" },
+              "expected_protector_verifier_sha256": { "const": "" },
+              "expected_signature_verifier_sha256": { "const": "" },
+              "freezer": {
+                "properties": {
+                  "version": { "const": "external-fixture-required" },
+                  "environment_lock_sha256": { "const": "" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "identity_state": { "const": "locked" } } },
+          "then": {
+            "properties": {
+              "expected_sha256": { "$ref": "#/$defs/sha256" },
+              "expected_size_bytes": { "minimum": 1 },
+              "expected_signer_thumbprint_sha256": { "$ref": "#/$defs/sha256" },
+              "expected_protector_tool_sha256": { "$ref": "#/$defs/sha256" },
+              "expected_protector_verifier_sha256": { "$ref": "#/$defs/sha256" },
+              "expected_signature_verifier_sha256": { "$ref": "#/$defs/sha256" },
+              "freezer": {
+                "properties": {
+                  "environment_lock_sha256": { "$ref": "#/$defs/sha256" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "managed_notice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "archive", "license_entry", "license_relative_path", "license_sha256", "third_party_notices_entry", "third_party_notices_relative_path", "third_party_notices_sha256"],
+      "properties": {
+        "id": { "enum": ["System.Collections.Immutable", "System.Reflection.Metadata"] },
+        "archive": { "$ref": "#/$defs/relative_path" },
+        "license_entry": { "const": "LICENSE.TXT" },
+        "license_relative_path": { "$ref": "#/$defs/relative_path" },
+        "license_sha256": { "$ref": "#/$defs/sha256" },
+        "third_party_notices_entry": { "const": "THIRD-PARTY-NOTICES.TXT" },
+        "third_party_notices_relative_path": { "$ref": "#/$defs/relative_path" },
+        "third_party_notices_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "source_notice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "license_source", "license_sha256"],
+      "properties": {
+        "id": { "enum": ["pyinstaller", "lief", "remill"] },
+        "license_source": { "$ref": "#/$defs/relative_path" },
+        "license_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "notice_artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ledger_source_path", "customer_ledger_relative_path", "managed_package_notices", "build_only_notices", "evidence_only_notices"],
+      "properties": {
+        "ledger_source_path": { "const": "licenses/c03/THIRD_PARTY_NOTICES.md" },
+        "customer_ledger_relative_path": { "const": "notices/THIRD_PARTY_NOTICES.md" },
+        "managed_package_notices": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "$ref": "#/$defs/managed_notice" } },
+        "build_only_notices": { "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/source_notice" } },
+        "evidence_only_notices": { "type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": { "$ref": "#/$defs/source_notice" } }
+      }
+    },
+    "dependency_decisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["production", "build_only", "evidence_only", "non_use", "llvm_component_allowlist", "production_link_denylist"],
+      "properties": {
+        "production": { "const": ["zydis", "zycore", "capstone", "taskflow", "ghidra_worker", "triton_thorough_only", "z3_thorough_only", "sqlite", "imgui", "zlib", "zstd", "liblzma_minimal", "minizip_ng_read_only", "pcre2_8bit_no_jit", "nlohmann_json", "json_schema_validator", "llvm_demangle_support", "dotnet_runtime", "managed_worker_packages", "analysis_python_worker"] },
+        "build_only": { "const": ["dotnet_sdk", "pyinstaller"] },
+        "evidence_only": { "const": ["lief", "remill"] },
+        "non_use": { "const": ["lmdb", "unicorn"] },
+        "llvm_component_allowlist": { "const": ["Demangle", "Support"] },
+        "production_link_denylist": { "const": ["lmdb", "unicorn", "remill"] }
+      }
+    },
+    "customer_sidecars": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["distribution", "raw_standalone_download_forbidden", "fileless_launch_forbidden", "camoufox"],
+      "properties": {
+        "distribution": { "const": "protected-disk-backed" },
+        "raw_standalone_download_forbidden": { "const": true },
+        "fileless_launch_forbidden": { "const": true },
+        "camoufox": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["only_supported_browser", "browser_source_path", "browser_relative_path", "browser_sha256", "reverse_mcp_source_path", "reverse_mcp_relative_path", "reverse_mcp_sha256", "offline_build_lock", "developer_source_shipped", "loose_python_shipped", "stock_browser_fallback", "environment"],
+          "properties": {
+            "only_supported_browser": { "const": "camoufox" },
+            "browser_source_path": { "const": "camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe" },
+            "browser_relative_path": { "const": "deps/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe" },
+            "browser_sha256": { "$ref": "#/$defs/sha256" },
+            "reverse_mcp_source_path": { "const": ".deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe" },
+            "reverse_mcp_relative_path": { "const": "deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe" },
+            "reverse_mcp_sha256": { "$ref": "#/$defs/sha256" },
+            "offline_build_lock": { "const": "packaging/c03_camoufox_reverse_mcp_build.lock.json" },
+            "developer_source_shipped": { "const": false },
+            "loose_python_shipped": { "const": false },
+            "stock_browser_fallback": { "const": false },
+            "environment": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["AIDA_CAMOUFOX_EXECUTABLE", "AIDA_CAMOUFOX_MCP_EXECUTABLE", "AIDA_CAMOUFOX_PYTHON"],
+              "properties": {
+                "AIDA_CAMOUFOX_EXECUTABLE": { "const": "verified-browser" },
+                "AIDA_CAMOUFOX_MCP_EXECUTABLE": { "const": "verified-frozen-sidecar" },
+                "AIDA_CAMOUFOX_PYTHON": { "const": "unset-unless-verified-sidecar-runtime" }
+              }
             }
           }
         }

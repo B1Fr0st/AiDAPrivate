@@ -1,4 +1,5 @@
 #include "function_cfg_callgraph_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 #include "analysis_memory_provider.hpp"
 
 #include "../../src/core/analysis/call_graph_builder.hpp"
@@ -22,6 +23,8 @@ namespace {
 
 void require(bool condition, std::string_view message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -29,7 +32,10 @@ void require(bool condition, std::string_view message)
 template <typename T>
 T require_value(workspace_result_t<T> result, std::string_view message)
 {
-    if (!result)
+    const bool accepted = static_cast<bool>(result);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ": " + result.error().message);
     return result.take_value();
 }
@@ -1111,6 +1117,7 @@ bool run_function_cfg_callgraph_harness(std::string& failure)
         test_snapshot_and_call_graph_publication();
         return true;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure = error.what();
         return false;
     }

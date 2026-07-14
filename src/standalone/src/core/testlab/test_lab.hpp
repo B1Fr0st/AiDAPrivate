@@ -11,12 +11,25 @@ namespace test_lab {
 	enum class driver_e : int {
 		whoswho = 0,
 		sentinel = 1,
+		driverless = 2,
 	};
 
 	enum class run_state_e : int {
 		idle = 0,
 		running = 1,
 		complete = 2,
+	};
+
+	enum class outcome_e : int {
+		not_run = 0,
+		missing = 1,
+		passed = 2,
+		failed = 3,
+		timed_out = 4,
+		crashed = 5,
+		cancelled = 6,
+		malformed_result = 7,
+		integrity_failure = 8,
 	};
 
 	struct state_t {
@@ -40,6 +53,7 @@ namespace test_lab {
 
 	struct result_t {
 		std::atomic<run_state_e>     state{ run_state_e::idle };
+		outcome_e                    outcome = outcome_e::not_run;
 		bool                         ok = false;
 		bool                         skipped = false;
 		std::int32_t                 ntstatus = 0;
@@ -49,6 +63,20 @@ namespace test_lab {
 		std::vector<std::uint8_t>    raw;
 		std::vector<parsed_field_t>  parsed;
 	};
+
+	inline outcome_e effective_outcome(const result_t& result, bool explicit_outcome = false) noexcept {
+		if (explicit_outcome || result.outcome != outcome_e::not_run) return result.outcome;
+		if (result.ok) return outcome_e::passed;
+		if (result.skipped) return outcome_e::not_run;
+		if (result.state.load(std::memory_order_acquire) != run_state_e::idle || !result.error.empty() ||
+			result.ntstatus != 0) return outcome_e::failed;
+		return outcome_e::not_run;
+	}
+
+	inline void normalize_legacy_result(result_t& result) noexcept {
+		if (result.outcome != outcome_e::not_run) return;
+		result.outcome = result.ok ? outcome_e::passed : (result.skipped ? outcome_e::not_run : outcome_e::failed);
+	}
 
 	using render_inputs_fn = void(*)(state_t&);
 	using run_fn = void(*)(state_t&, result_t&);

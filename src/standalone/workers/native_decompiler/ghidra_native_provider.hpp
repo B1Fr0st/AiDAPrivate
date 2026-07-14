@@ -11,6 +11,7 @@ namespace aida::analysis::native_worker::ghidra_native_provider {
 struct result_t {
     std::optional<decompiler_document_t> document;
     std::string provider_artifacts;
+    std::optional<std::string> printc_evidence;
     std::vector<decompiler_diagnostic_t> diagnostics;
 };
 

@@ -131,6 +131,9 @@ projected_range_t range_from_change(const overlay_change_v9_t& change)
 {
     projected_range_t range;
     range.source_kind = effective_kind_of(change);
+    if (change.entity.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity)
+        return range;
     const auto before_kind = before_kind_of(change);
     const auto after_kind = after_kind_of(change);
     range.is_byte_patch =
@@ -143,7 +146,10 @@ projected_range_t range_from_change(const overlay_change_v9_t& change)
     } else if (is_structural_kind(range.source_kind) ||
                range.source_kind == overlay_operation_kind_v9_t::reanalysis) {
         range.size = change.entity.range.size;
-    } else if (range.source_kind == overlay_operation_kind_v9_t::name) {
+    } else if (change.entity.domain !=
+                   overlay_operation_kind_v9_t::type_declaration &&
+               change.entity.domain !=
+                   overlay_operation_kind_v9_t::enum_definition) {
         range.size = change.entity.range.size > 0 ? change.entity.range.size : 1;
     }
     return range;
@@ -152,6 +158,9 @@ projected_range_t range_from_change(const overlay_change_v9_t& change)
 std::optional<projected_range_t> active_range_from_change(
     const overlay_change_v9_t& change) noexcept
 {
+    if (change.entity.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity)
+        return std::nullopt;
     const auto kind = after_kind_of(change);
     if (!kind)
         return std::nullopt;
@@ -180,6 +189,15 @@ projected_entity_t entity_from_change(const overlay_change_v9_t& change)
         flags = flags | overlay_projection_t::stage_flags_for_domain(*entity.before_kind);
     if (entity.after_kind)
         flags = flags | overlay_projection_t::stage_flags_for_domain(*entity.after_kind);
+    if (change.entity.target_discriminator ==
+            overlay_target_discriminator_v9_t::managed_entity &&
+        ((entity.before_kind &&
+          (*entity.before_kind == overlay_operation_kind_v9_t::comment ||
+           *entity.before_kind == overlay_operation_kind_v9_t::name)) ||
+         (entity.after_kind &&
+          (*entity.after_kind == overlay_operation_kind_v9_t::comment ||
+           *entity.after_kind == overlay_operation_kind_v9_t::name))))
+        flags = flags | projection_stage_flag_t::decompiler;
     entity.invalidated = flags != projection_stage_flag_t::none;
     entity.is_new = !change.before && change.after.has_value();
     return entity;
@@ -281,8 +299,29 @@ void sort_active_ranges(std::vector<indexed_active_range_t>& ranges)
 
 bool persisted_entity_in_bounds(const overlay_entity_key_v9_t& entity,
                                 const overlay_payload_v9_t& payload,
-                                std::uint64_t image_size) noexcept
+                                std::uint64_t image_size,
+                                std::uint64_t generation,
+                                const std::array<std::uint8_t, 32>&
+                                    provider_hash) noexcept
 {
+    if (entity.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity) {
+        return entity.managed_locator && entity.managed_locator->valid() &&
+            entity.managed_locator->provider_hash == provider_hash &&
+            entity.managed_locator->generation != 0 &&
+            entity.managed_locator->generation <= generation &&
+            entity.range.offset == 0 && entity.range.size == 0 &&
+            (entity.domain == overlay_operation_kind_v9_t::comment ||
+             entity.domain == overlay_operation_kind_v9_t::name ||
+             entity.domain == overlay_operation_kind_v9_t::type_application) &&
+            payload.bytes.empty() && payload.assembly.empty() &&
+            payload.integer_type.empty() && payload.integer_value.empty() &&
+            payload.reanalysis_flags == 0 && payload.stack_offset == 0;
+    }
+    if (entity.target_discriminator !=
+            overlay_target_discriminator_v9_t::native_address ||
+        entity.managed_locator)
+        return false;
     if (entity.domain == overlay_operation_kind_v9_t::type_declaration ||
         entity.domain == overlay_operation_kind_v9_t::enum_definition)
         return entity.range.offset == 0 && entity.range.size == 0;
@@ -306,7 +345,8 @@ bool persisted_state_in_bounds(const overlay_static_state_v9_t& state) noexcept
         state.items.begin(), state.items.end(),
         [&](const auto& item) {
             return persisted_entity_in_bounds(
-                item.first, item.second, state.target.image_size);
+                item.first, item.second, state.target.image_size,
+                state.target.generation, state.target.image_hash);
         });
 }
 
@@ -553,17 +593,15 @@ projection_stage_flag_t overlay_projection_t::stage_flags_for_domain(
 {
     switch (domain) {
     case overlay_operation_kind_v9_t::byte_patch:
-        return projection_stage_flag_t::disassembler |
-               projection_stage_flag_t::decompiler |
-               projection_stage_flag_t::string_table |
-               projection_stage_flag_t::xref_table |
-               projection_stage_flag_t::coverage_table |
-               projection_stage_flag_t::basic_block_table;
     case overlay_operation_kind_v9_t::assembly_patch:
     case overlay_operation_kind_v9_t::integer_patch:
         return projection_stage_flag_t::disassembler |
                projection_stage_flag_t::decompiler |
+               projection_stage_flag_t::string_table |
                projection_stage_flag_t::xref_table |
+               projection_stage_flag_t::function_table |
+               projection_stage_flag_t::type_table |
+               projection_stage_flag_t::coverage_table |
                projection_stage_flag_t::basic_block_table;
     case overlay_operation_kind_v9_t::define_function:
         return projection_stage_flag_t::function_table |
@@ -574,12 +612,21 @@ projection_stage_flag_t overlay_projection_t::stage_flags_for_domain(
     case overlay_operation_kind_v9_t::define_data:
         return projection_stage_flag_t::disassembler |
                projection_stage_flag_t::decompiler |
+               projection_stage_flag_t::string_table |
+               projection_stage_flag_t::xref_table |
+               projection_stage_flag_t::function_table |
+               projection_stage_flag_t::type_table |
+               projection_stage_flag_t::coverage_table |
                projection_stage_flag_t::basic_block_table;
     case overlay_operation_kind_v9_t::undefine:
         return projection_stage_flag_t::disassembler |
                projection_stage_flag_t::decompiler |
                projection_stage_flag_t::basic_block_table |
-               projection_stage_flag_t::xref_table;
+               projection_stage_flag_t::xref_table |
+               projection_stage_flag_t::function_table |
+               projection_stage_flag_t::string_table |
+               projection_stage_flag_t::type_table |
+               projection_stage_flag_t::coverage_table;
     case overlay_operation_kind_v9_t::name:
         return projection_stage_flag_t::symbol_table;
     case overlay_operation_kind_v9_t::bookmark:
@@ -613,6 +660,15 @@ projection_stage_flag_t overlay_projection_t::derive_invalidated_stages(
             flags = flags | stage_flags_for_domain(*after_kind);
         if (!before_kind && !after_kind)
             flags = flags | stage_flags_for_domain(change.operation_kind);
+        if (change.entity.target_discriminator ==
+                overlay_target_discriminator_v9_t::managed_entity &&
+            ((before_kind &&
+              (*before_kind == overlay_operation_kind_v9_t::comment ||
+               *before_kind == overlay_operation_kind_v9_t::name)) ||
+             (after_kind &&
+              (*after_kind == overlay_operation_kind_v9_t::comment ||
+               *after_kind == overlay_operation_kind_v9_t::name))))
+            flags = flags | projection_stage_flag_t::decompiler;
     }
     return flags;
 }
@@ -780,9 +836,18 @@ projection_invalidation_set_t overlay_projection_t::compute_invalidation(
                    projection_stage_flag_t::decompiler)) {
         invalidation.decompiler_cache.invalidated_stages =
             decompiler_cache_invalidation_flag_t::all_stages;
+        const bool precise_managed_entities =
+            !invalidation.affected_entities.empty() && std::all_of(
+                invalidation.affected_entities.begin(),
+                invalidation.affected_entities.end(), [](const auto& entity) {
+                    return entity.key.target_discriminator ==
+                        overlay_target_discriminator_v9_t::managed_entity;
+                });
         invalidation.decompiler_cache.invalidate_workspace =
             full_reanalysis ||
-            invalidation.invalidated_stages == projection_stage_flag_t::all_stages;
+            invalidation.invalidated_stages == projection_stage_flag_t::all_stages ||
+            (invalidation.affected_ranges.empty() &&
+             !precise_managed_entities);
     }
     return invalidation;
 }
@@ -834,6 +899,32 @@ projection_result_t overlay_projection_t::project(
     std::string_view immutable_bytes,
     std::uint64_t current_generation)
 {
+    auto result = prepare(state, current_generation);
+    if (!result)
+        return result;
+    if (immutable_bytes.size() < result.projected_size) {
+        result.code = projection_code_t::range_out_of_bounds;
+        result.detail = "immutable_bytes smaller than image_size";
+        result.projected_state.reset();
+        result.changes.clear();
+        return result;
+    }
+    try {
+        result.projected_bytes = apply_patches(immutable_bytes, state);
+        return result;
+    } catch (...) {
+        result.code = projection_code_t::publication_failed;
+        result.detail = "projection byte materialization failed";
+        result.projected_state.reset();
+        result.changes.clear();
+        return result;
+    }
+}
+
+projection_result_t overlay_projection_t::prepare(
+    const overlay_static_state_v9_t& state,
+    std::uint64_t current_generation)
+{
     projection_result_t result;
     result.source_state = capture_state_version(state);
     result.source_generation = state.target.generation;
@@ -847,11 +938,6 @@ projection_result_t overlay_projection_t::project(
         if (current_generation != state.target.generation) {
             result.code = projection_code_t::stale_generation;
             result.detail = "current_generation does not match state.target.generation";
-            return result;
-        }
-        if (immutable_bytes.size() < state.target.image_size) {
-            result.code = projection_code_t::range_out_of_bounds;
-            result.detail = "immutable_bytes smaller than image_size";
             return result;
         }
         if (!persisted_state_in_bounds(state)) {
@@ -879,9 +965,9 @@ projection_result_t overlay_projection_t::project(
             result.detail = "one or more projected ranges exceed image bounds";
             return result;
         }
-        result.projected_bytes = apply_patches(immutable_bytes, state);
         result.changes = std::move(*changes);
         result.projected_state = state;
+        result.projected_size = state.target.image_size;
         result.new_generation = current_generation;
         result.revision = state.revision;
         result.code = projection_code_t::ok;
@@ -897,6 +983,38 @@ projection_result_t overlay_projection_t::project_transaction(
     const overlay_static_state_v9_t& state,
     const overlay_transaction_v9_t& transaction,
     std::string_view immutable_bytes,
+    std::uint64_t current_generation,
+    const overlay_apply_limits_v9_t& limits)
+{
+    auto result = prepare_transaction(
+        state, transaction, current_generation, limits);
+    if (!result)
+        return result;
+    if (immutable_bytes.size() < result.projected_size) {
+        result.code = projection_code_t::range_out_of_bounds;
+        result.detail = "immutable_bytes smaller than image_size";
+        result.projected_state.reset();
+        result.changes.clear();
+        result.publication_ready = false;
+        return result;
+    }
+    try {
+        result.projected_bytes = apply_patches(
+            immutable_bytes, *result.projected_state);
+        return result;
+    } catch (...) {
+        result.code = projection_code_t::publication_failed;
+        result.detail = "transaction projection byte materialization failed";
+        result.projected_state.reset();
+        result.changes.clear();
+        result.publication_ready = false;
+        return result;
+    }
+}
+
+projection_result_t overlay_projection_t::prepare_transaction(
+    const overlay_static_state_v9_t& state,
+    const overlay_transaction_v9_t& transaction,
     std::uint64_t current_generation,
     const overlay_apply_limits_v9_t& limits)
 {
@@ -925,17 +1043,13 @@ projection_result_t overlay_projection_t::project_transaction(
             result.detail = "transaction has no operations";
             return result;
         }
-        if (immutable_bytes.size() < state.target.image_size) {
-            result.code = projection_code_t::range_out_of_bounds;
-            result.detail = "immutable_bytes smaller than image_size";
-            return result;
-        }
         if (!persisted_state_in_bounds(state)) {
             result.code = projection_code_t::range_out_of_bounds;
             result.detail = "projected state contains an out-of-bounds entity";
             return result;
         }
-        if (current_generation == (std::numeric_limits<std::uint64_t>::max)()) {
+        if (current_generation >=
+            (std::numeric_limits<std::uint64_t>::max)() - 1U) {
             result.code = projection_code_t::publication_failed;
             result.detail = "generation is exhausted";
             return result;
@@ -1007,9 +1121,9 @@ projection_result_t overlay_projection_t::project_transaction(
             result.detail = "one or more affected ranges exceed image bounds";
             return result;
         }
-        result.projected_bytes = apply_patches(immutable_bytes, projected_state);
         rebase_state_generation(projected_state, result.new_generation);
         result.projected_state = std::move(projected_state);
+        result.projected_size = state.target.image_size;
         result.revision = apply_result.revision;
         result.publication_ready = true;
         result.code = projection_code_t::ok;
@@ -1080,8 +1194,7 @@ projection_finalize_result_t overlay_projection_t::finalize_publication(
                                       prepared.new_generation);
         const auto active_changes = changes_from_state(next_state);
         if (!publication_state_coherent(next_state, prepared) ||
-            next_state.target.image_size >
-                static_cast<std::uint64_t>(prepared.projected_bytes.size()) ||
+            prepared.projected_size != next_state.target.image_size ||
             !transition_matches_candidate(state, next_state, prepared.changes) ||
             !history_matches_candidate(state, next_state) ||
             !invalidation_equal(expected_invalidation, prepared.invalidation) ||
@@ -1095,6 +1208,7 @@ projection_finalize_result_t overlay_projection_t::finalize_publication(
             prepared.projected_bytes,
             prepared.invalidation,
             prepared.changes,
+            prepared.projected_size,
             prepared.source_generation,
             prepared.new_generation,
             prepared.source_revision,

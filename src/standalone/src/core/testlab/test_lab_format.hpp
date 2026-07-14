@@ -15,8 +15,24 @@ namespace test_lab_format {
 		switch (d) {
 			case test_lab::driver_e::whoswho:  return "whoswho";
 			case test_lab::driver_e::sentinel: return "sentinel";
+			case test_lab::driver_e::driverless: return "driverless";
 		}
 		return "unknown";
+	}
+
+	inline const char* testlab_outcome_name(test_lab::outcome_e outcome) {
+		switch (outcome) {
+			case test_lab::outcome_e::not_run: return "not_run";
+			case test_lab::outcome_e::missing: return "missing";
+			case test_lab::outcome_e::passed: return "passed";
+			case test_lab::outcome_e::failed: return "failed";
+			case test_lab::outcome_e::timed_out: return "timed_out";
+			case test_lab::outcome_e::crashed: return "crashed";
+			case test_lab::outcome_e::cancelled: return "cancelled";
+			case test_lab::outcome_e::malformed_result: return "malformed_result";
+			case test_lab::outcome_e::integrity_failure: return "integrity_failure";
+		}
+		return "not_run";
 	}
 
 	inline void testlab_diag_log_entry(const test_lab::feature_t& f, const test_lab::state_t& s) {
@@ -42,9 +58,10 @@ namespace test_lab_format {
 	{
 		std::uint32_t last_err = GetLastError();
 		diag::log_tagged_fmt("testlab",
-			"%s/%s: exit ok=%d skipped=%d ntstatus=0x%08X bytes=%u elapsed_us=%llu last_err=%lu parsed_fields=%zu raw_size=%zu error=\"%.256s\"",
+			"%s/%s: exit outcome=%s ok=%d skipped=%d ntstatus=0x%08X bytes=%u elapsed_us=%llu last_err=%lu parsed_fields=%zu raw_size=%zu error=\"%.256s\"",
 			testlab_driver_name(f.driver),
 			(f.name != nullptr ? f.name : "?"),
+			testlab_outcome_name(test_lab::effective_outcome(r, f.driver == test_lab::driver_e::driverless)),
 			r.ok ? 1 : 0,
 			r.skipped ? 1 : 0,
 			static_cast<unsigned>(static_cast<std::uint32_t>(r.ntstatus)),

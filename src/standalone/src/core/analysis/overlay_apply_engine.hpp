@@ -13,6 +13,7 @@
 namespace aida::analysis {
 
 inline constexpr std::uint32_t k_overlay_journal_v9_schema = 9;
+inline constexpr std::size_t k_overlay_managed_entity_serialization_limit = 16U << 10;
 
 enum class overlay_target_kind_v9_t : std::uint8_t {
     invalid = 0,
@@ -31,6 +32,11 @@ enum class overlay_architecture_v9_t : std::uint8_t {
     riscv = 7,
     jvm = 8,
     dalvik = 9
+};
+
+enum class overlay_target_discriminator_v9_t : std::uint8_t {
+    native_address = 0,
+    managed_entity = 1
 };
 
 enum class overlay_operation_kind_v9_t : std::uint8_t {
@@ -80,6 +86,8 @@ constexpr bool is_legacy_overlay_operation_ordinal(std::uint8_t ordinal) noexcep
 
 std::optional<overlay_operation_kind_v9_t>
     overlay_operation_kind_from_ordinal(std::uint8_t ordinal) noexcept;
+bool managed_overlay_operation_kind_v9(
+    overlay_operation_kind_v9_t kind) noexcept;
 
 struct overlay_target_identity_v9_t final {
     std::array<std::uint8_t, 32> image_hash{};
@@ -109,6 +117,24 @@ struct overlay_static_range_v9_t final {
     bool operator!=(const overlay_static_range_v9_t& other) const noexcept;
 };
 
+struct overlay_managed_entity_locator_v9_t final {
+    std::array<std::uint8_t, 32> workspace_id{};
+    std::array<std::uint8_t, 32> provider_hash{};
+    std::array<std::uint8_t, 32> artifact_hash{};
+    std::array<std::uint8_t, 32> entity_hash{};
+    std::uint64_t provider_size = 0;
+    std::uint64_t generation = 0;
+    std::string serialized_entity;
+
+    bool valid() const noexcept;
+    bool stable_identity_equal(
+        const overlay_managed_entity_locator_v9_t& other) const noexcept;
+    bool stable_identity_less(
+        const overlay_managed_entity_locator_v9_t& other) const noexcept;
+    bool operator==(const overlay_managed_entity_locator_v9_t& other) const noexcept;
+    bool operator!=(const overlay_managed_entity_locator_v9_t& other) const noexcept;
+};
+
 struct overlay_payload_v9_t final {
     std::string name;
     std::string text;
@@ -128,7 +154,10 @@ struct overlay_payload_v9_t final {
 
 struct overlay_operation_v9_t final {
     overlay_operation_kind_v9_t kind = overlay_operation_kind_v9_t::comment;
+    overlay_target_discriminator_v9_t target_discriminator =
+        overlay_target_discriminator_v9_t::native_address;
     overlay_static_range_v9_t range;
+    std::optional<overlay_managed_entity_locator_v9_t> managed_locator;
     overlay_payload_v9_t payload;
     bool remove = false;
 
@@ -146,7 +175,10 @@ struct overlay_operation_record_v9_t final {
 
 struct overlay_entity_key_v9_t final {
     overlay_operation_kind_v9_t domain = overlay_operation_kind_v9_t::comment;
+    overlay_target_discriminator_v9_t target_discriminator =
+        overlay_target_discriminator_v9_t::native_address;
     overlay_static_range_v9_t range;
+    std::optional<overlay_managed_entity_locator_v9_t> managed_locator;
     std::int64_t stack_offset = 0;
     std::string qualifier;
 
@@ -211,6 +243,8 @@ struct overlay_apply_limits_v9_t final {
     std::size_t max_patch_bytes_per_operation = 1U << 20;
     std::size_t max_patch_bytes_per_transaction = 16U << 20;
     std::size_t max_transaction_payload_bytes = 32U << 20;
+    std::size_t max_managed_entity_bytes =
+        k_overlay_managed_entity_serialization_limit;
 };
 
 enum class overlay_apply_code_v9_t : std::uint8_t {

@@ -1,4 +1,5 @@
 #include "document_host_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/workbench/document_host/document_host.hpp"
 
@@ -27,6 +28,7 @@ static_assert(static_cast<std::uint8_t>(document_host_presentation_kind_t::empty
 
 void require(bool condition, const char* message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -520,6 +522,7 @@ bool run_document_host_harness(std::string& failure)
         failure.clear();
         return true;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         failure = exception.what();
         return false;
     }

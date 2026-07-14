@@ -1,4 +1,5 @@
 #include "decompiler_service_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/decompiler_service.hpp"
 #include "../../src/core/analysis/decompiler/legacy_document_adapter.hpp"
@@ -19,6 +20,7 @@ namespace {
 
 void require(const bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -389,6 +391,7 @@ public:
             return result;
         }
         result.attested_document = std::move(*rendered.document);
+        result.authenticated_artifacts = true;
         if (mode == mode_t::mismatch)
             result.attested_document->renderer.style_id = "c03-attestation-mismatch";
         return result;
@@ -759,6 +762,7 @@ int main()
         std::cout << "decompiler_service_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

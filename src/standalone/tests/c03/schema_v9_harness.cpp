@@ -1,13 +1,17 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
 #include "schema_v9_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
+#include "managed_publication_persistence/managed_publication_persistence_harness.hpp"
 
 #include "workspace_schema_v9.hpp"
 #include "packed_page_codec.hpp"
 #include "workspace_database.hpp"
 #include "workspace_identity.hpp"
 #include "../../src/core/infra/taskflow_runtime.hpp"
+#include "../analysis_workspace/workspace_fixture_builder.hpp"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include <windows.h>
 
 #include <sqlite3.h>
@@ -26,6 +30,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
@@ -512,7 +517,7 @@ PRAGMA user_version=9;
         options.overlay_revision = 7;
         options.page_size = packed_page_default_size;
         auto batch = packed_page_codec_t::encode_batch(
-            packed_page_type_t::symbol_type_candidates,
+            packed_page_type_t::managed_publication,
             std::vector<std::uint8_t>(fixed_width_address_size, 0x5AU),
             options);
         if (!batch) {
@@ -529,7 +534,7 @@ PRAGMA user_version=9;
         if (!loaded || !loaded.value() || loaded.value()->pages.size() != 1 ||
             loaded.value()->pages.front().page_type !=
                 static_cast<std::uint32_t>(
-                    packed_page_type_t::symbol_type_candidates)) {
+                    packed_page_type_t::managed_publication)) {
             result.message = "repaired v9 packed domain did not round-trip";
             return;
         }
@@ -1426,6 +1431,7 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
         snapshot->generation = 5001;
         snapshot->analysis_revision = 71;
         snapshot->overlay_revision = 12;
+        snapshot->baseline_complete = true;
         snapshot->normalized_image = normalized;
         const address_t instruction_address{address_space_id_t::relative_virtual,
             4096, architecture_id_t::x86_64, architecture_mode_t::x86_64};
@@ -1577,25 +1583,16 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
         search_products.generation = snapshot->generation;
         search_products.analysis_revision = snapshot->analysis_revision;
         search_products.overlay_revision = snapshot->overlay_revision;
-        search_products.data_candidates.push_back(data_candidate);
-        auto baseline_domains = encode_packed_baseline_domains(
-            *snapshot, search_products);
-        if (!baseline_domains) {
-            result.message = std::string("failed to encode packed baseline domains: ") +
-                baseline_domains.error().message;
+        auto search_index = search_index_t::build(
+            std::shared_ptr<const analysis_snapshot_t>(snapshot),
+            std::vector<data_candidate_record_t>{data_candidate}, {}, {},
+            std::make_shared<analysis_metrics_t>(snapshot->generation), {}, {});
+        if (!search_index) {
+            result.message = std::string("failed to build packed search fixture: ") +
+                search_index.error().message;
             return;
         }
-        packed_page_encode_options_t baseline_options;
-        baseline_options.generation = snapshot->generation;
-        baseline_options.analysis_revision = snapshot->analysis_revision;
-        baseline_options.overlay_revision = snapshot->overlay_revision;
-        auto baseline_batch = packed_page_codec_t::encode_multi_domain_batch(
-            baseline_domains.value(), baseline_options);
-        if (!baseline_batch) {
-            result.message = std::string("failed to encode packed baseline batch: ") +
-                baseline_batch.error().message;
-            return;
-        }
+        search_products.live_index = search_index.take_value();
 
         auto snapshot_ticket = database->persist_snapshot(
             snapshot, std::move(search_products), "{}", "{}");
@@ -1621,51 +1618,12 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
                 exception.what();
             return;
         }
-        auto baseline_manifest = encode_packed_baseline_manifest(
-            *snapshot, snapshot_ticket.snapshot_candidate->token());
-        if (!baseline_manifest) {
-            result.message = std::string("failed to encode candidate-bound manifest: ") +
-                baseline_manifest.error().message;
-            return;
-        }
-        auto baseline_publication = packed_page_codec_t::build_publication(
-            baseline_batch.value(), baseline_manifest.take_value());
-        if (!baseline_publication) {
-            result.message = std::string("failed to build packed baseline publication: ") +
-                baseline_publication.error().message;
-            return;
-        }
-        auto baseline_ticket = database->publish_packed_generation(
-            baseline_publication.take_value(),
-            snapshot_ticket.snapshot_candidate);
-        if (!baseline_ticket.accepted || !baseline_ticket.completion.valid()) {
-            result.message = "workspace queue rejected candidate-bound packed baseline";
-            return;
-        }
-        if (baseline_ticket.completion.wait_for(std::chrono::seconds(10)) !=
-            std::future_status::ready) {
-            result.message = "candidate-bound packed baseline did not complete";
-            return;
-        }
-        try {
-            const auto& completion = baseline_ticket.completion.get();
-            if (!completion) {
-                result.message = std::string("candidate-bound packed baseline failed: ") +
-                    completion.error().message;
-                return;
-            }
-        } catch (const std::exception& exception) {
-            result.message = std::string("candidate-bound packed future failed: ") +
-                exception.what();
-            return;
-        }
         if (!snapshot_ticket.snapshot_candidate->packed_generation_required()) {
             result.message = "packed baseline did not bind to the snapshot candidate";
             return;
         }
-        auto hidden_generation = database->load_packed_generation(
-            snapshot->generation);
-        if (!hidden_generation || hidden_generation.value()) {
+        auto hidden_snapshot = database->load_snapshot(normalized, {});
+        if (!hidden_snapshot || hidden_snapshot.value()) {
             result.message = "unpromoted packed baseline became visible";
             return;
         }
@@ -1673,25 +1631,6 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
         if (!finalized) {
             result.message = std::string("rich snapshot promotion failed: ") +
                 finalized.error().message;
-            return;
-        }
-        auto committed_baseline = database->load_packed_generation(
-            snapshot->generation);
-        if (!committed_baseline || !committed_baseline.value() ||
-            !committed_baseline.value()->generation.committed ||
-            committed_baseline.value()->generation.shard_count !=
-                static_cast<std::uint16_t>(packed_page_last_data_type) ||
-            committed_baseline.value()->pages.empty() ||
-            committed_baseline.value()->index.size() !=
-                committed_baseline.value()->pages.size()) {
-            result.message = "candidate promotion did not expose one complete packed baseline";
-            return;
-        }
-        auto restored_baseline = packed_page_codec_t::restore_publication(
-            *committed_baseline.value());
-        if (!restored_baseline) {
-            result.message = std::string("persisted warm-open index failed validation: ") +
-                restored_baseline.error().message;
             return;
         }
         auto reopened_snapshot = database->load_snapshot(normalized, {});
@@ -1715,74 +1654,25 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
             snapshot->generation, snapshot->analysis_revision,
             snapshot->overlay_revision);
         if (!reopened_search || reopened_search.value().data_candidates.size() != 1 ||
-            reopened_search.value().data_candidates.front().id != data_candidate.id) {
+            reopened_search.value().data_candidates.front().id != data_candidate.id ||
+            reopened_search.value().search_index_blob_version !=
+                search_index_t::serialized_version ||
+            reopened_search.value().search_index_blob.empty()) {
             result.message = "packed search-product reopen lost candidate data";
             return;
         }
-
-        constexpr std::size_t payload_capacity =
-            packed_page_default_size - packed_page_header_size;
-        std::vector<std::uint8_t> bytes(payload_capacity * 2U, 0xA5U);
-        for (std::size_t page = 0; page < 2; ++page) {
-            const auto offset = page * payload_capacity;
-            const std::uint64_t first_address = 0x1000U + page * 0x1000U;
-            const std::uint64_t last_address = first_address + 0xFF0U;
-            std::memcpy(bytes.data() + offset, &first_address,
-                        sizeof(first_address));
-            std::memcpy(bytes.data() + offset + payload_capacity -
-                            sizeof(last_address),
-                        &last_address, sizeof(last_address));
-        }
-        packed_page_encode_options_t encode_options;
-        encode_options.page_size = packed_page_default_size;
-        encode_options.generation = 7001;
-        encode_options.analysis_revision = 81;
-        encode_options.overlay_revision = 13;
-        auto batch = packed_page_codec_t::encode_batch(
-            packed_page_type_t::instructions, bytes, encode_options);
-        if (!batch) {
-            result.message = "failed to encode queued publication fixture";
-            return;
-        }
-        auto publication = publication_from_batch(batch.value());
-        if (!publication) {
-            result.message = "failed to construct queued publication fixture";
+        auto restored_search = restore_persisted_search_index(
+            reopened_snapshot.value(), reopened_search.take_value(),
+            std::make_shared<analysis_metrics_t>(snapshot->generation));
+        if (!restored_search ||
+            !restored_search.value()->matches(reopened_snapshot.value()) ||
+            restored_search.value()->data_candidates().size() != 1 ||
+            restored_search.value()->data_candidates().front().id !=
+                data_candidate.id) {
+            result.message = "packed warm reopen did not restore the persisted search index";
             return;
         }
 
-        auto ticket = database->publish_packed_generation(
-            publication.take_value());
-        if (!ticket.accepted || !ticket.completion.valid()) {
-            result.message = "workspace queue rejected packed publication";
-            return;
-        }
-        if (ticket.completion.wait_for(std::chrono::seconds(10)) !=
-            std::future_status::ready) {
-            result.message = "queued packed publication did not complete";
-            return;
-        }
-        try {
-            const auto& completion = ticket.completion.get();
-            if (!completion) {
-                result.message = std::string("queued packed publication failed: ") +
-                    completion.error().message;
-                return;
-            }
-        } catch (const std::exception& exception) {
-            result.message = std::string("queued publication future failed: ") +
-                exception.what();
-            return;
-        }
-
-        auto loaded = database->load_packed_generation(7001);
-        if (!loaded || !loaded.value() ||
-            loaded.value()->generation.generation != 7001 ||
-            !loaded.value()->generation.committed ||
-            loaded.value()->pages.size() != 2 ||
-            loaded.value()->index.size() != 2) {
-            result.message = "queued publication was not read as one committed generation";
-            return;
-        }
         std::ifstream source_after(source_path, std::ios::binary);
         const std::string observed_source(
             std::istreambuf_iterator<char>(source_after),
@@ -1793,10 +1683,10 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
         }
 
         database->request_cancel();
-        auto closed_read = database->load_packed_generation(7001);
+        auto closed_read = database->load_snapshot(normalized, {});
         if (closed_read ||
             closed_read.error().code != workspace_error_code_t::workspace_closing) {
-            result.message = "closed database accepted a new packed-generation read";
+            result.message = "closed database accepted a new packed snapshot read";
             return;
         }
         auto drained = database->drain(
@@ -1819,8 +1709,8 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
             return;
         }
         database = reopened_database.take_value();
-        auto invalidated_generation = database->load_packed_generation(7001);
-        if (!invalidated_generation || invalidated_generation.value()) {
+        auto invalidated_snapshot = database->load_snapshot(normalized, {});
+        if (!invalidated_snapshot || invalidated_snapshot.value()) {
             result.message = "derived-data invalidation retained a packed generation";
             return;
         }
@@ -1841,6 +1731,132 @@ schema_v9_fixture_result_t run_database_open_queue_path() {
     return result;
 }
 
+schema_v9_fixture_result_t run_baseline_persistence_entry_path() {
+    schema_v9_fixture_result_t result;
+    result.name = "baseline_persistence_entry_path";
+    const auto started = std::chrono::steady_clock::now();
+    using namespace test_fixture;
+    fixture_root_t root("c03_baseline_persistence");
+    std::shared_ptr<analysis_workspace_t> workspace;
+    std::string database_path;
+    try {
+        const auto source_path = write_bytes_fixture(
+            root.path() / "baseline" / "persisted.exe", minimal_pe64(0xC5));
+        workspace = open_workspace(source_path, "persisted.exe");
+        install_services(workspace);
+        analyze_workspace(workspace, 2);
+        const auto published = workspace->snapshot();
+        const auto normalized = workspace->normalized_image();
+        const auto image = workspace->image();
+        const auto database = workspace->database();
+        if (!published || !published->baseline_complete || !normalized || !database) {
+            throw fixture_error_t(
+                "production baseline service did not publish a complete persisted generation");
+        }
+        database_path = database->path();
+        const auto expected_binary = published->binary_id;
+        const auto expected_profile = published->load_profile_hash;
+        const auto expected_generation = published->generation;
+        const auto expected_analysis_revision = published->analysis_revision;
+        const auto expected_overlay_revision = published->overlay_revision;
+        auto loaded = database->load_snapshot(normalized, image,
+            workspace->cancellation_token());
+        if (!loaded || !loaded.value() || !loaded.value()->baseline_complete ||
+            loaded.value()->binary_id != expected_binary ||
+            loaded.value()->load_profile_hash != expected_profile ||
+            loaded.value()->generation != expected_generation ||
+            loaded.value()->analysis_revision != expected_analysis_revision ||
+            loaded.value()->overlay_revision != expected_overlay_revision) {
+            throw fixture_error_t(loaded
+                ? "production baseline persistence did not reopen its exact generation"
+                : loaded.error().stable_code() + ":" + loaded.error().message);
+        }
+        auto products = database->load_search_products(expected_generation,
+            expected_analysis_revision, expected_overlay_revision,
+            workspace->cancellation_token());
+        if (!products || products.value().search_index_blob_version !=
+                search_index_t::serialized_version ||
+            products.value().search_index_blob.empty()) {
+            throw fixture_error_t(products
+                ? "production baseline persistence omitted its packed search index"
+                : products.error().stable_code() + ":" + products.error().message);
+        }
+        auto restored = restore_persisted_search_index(
+            loaded.value(), products.take_value(),
+            std::make_shared<analysis_metrics_t>(expected_generation), {},
+            workspace->cancellation_token());
+        if (!restored || !restored.value()->matches(loaded.value())) {
+            throw fixture_error_t(restored
+                ? "production baseline search generation identity diverged after restore"
+                : restored.error().stable_code() + ":" + restored.error().message);
+        }
+
+        close_workspace(workspace);
+        workspace.reset();
+        workspace = open_workspace(source_path, "persisted.exe");
+        install_services(workspace);
+        const auto cold_snapshot = workspace->snapshot();
+        if (!workspace->database() || workspace->database()->path() != database_path ||
+            !cold_snapshot || cold_snapshot->baseline_complete ||
+            cold_snapshot->analysis_revision != 0) {
+            throw fixture_error_t(
+                "reopened workspace did not bind the original durable generation store");
+        }
+        auto warm_snapshot = workspace->database()->load_snapshot(
+            workspace->normalized_image(), workspace->image(),
+            workspace->cancellation_token());
+        if (!warm_snapshot || !warm_snapshot.value() ||
+            warm_snapshot.value()->generation != expected_generation ||
+            warm_snapshot.value()->binary_id != expected_binary ||
+            warm_snapshot.value()->load_profile_hash != expected_profile) {
+            throw fixture_error_t(warm_snapshot
+                ? "warm workspace reopen did not recover the exact packed generation"
+                : warm_snapshot.error().stable_code() + ":" +
+                    warm_snapshot.error().message);
+        }
+        auto warm_products = workspace->database()->load_search_products(
+            expected_generation, expected_analysis_revision,
+            expected_overlay_revision, workspace->cancellation_token());
+        if (!warm_products) {
+            throw fixture_error_t(warm_products.error().stable_code() + ":" +
+                warm_products.error().message);
+        }
+        auto warm_index = restore_persisted_search_index(
+            warm_snapshot.value(), warm_products.take_value(),
+            std::make_shared<analysis_metrics_t>(expected_generation), {},
+            workspace->cancellation_token());
+        if (!warm_index || !warm_index.value()->matches(warm_snapshot.value())) {
+            throw fixture_error_t(warm_index
+                ? "warm packed search generation identity diverged"
+                : warm_index.error().stable_code() + ":" + warm_index.error().message);
+        }
+        close_workspace(workspace, true);
+        workspace.reset();
+        database_path.clear();
+        result.passed = true;
+        result.message =
+            "production baseline entry persisted and warm-restored one packed generation";
+    } catch (const std::exception& error) {
+        result.message = error.what();
+        if (workspace && !workspace->closed()) {
+            try {
+                close_workspace(workspace);
+            } catch (...) {
+            }
+        }
+        if (!database_path.empty()) {
+            try {
+                remove_database_artifacts(database_path);
+            } catch (...) {
+            }
+        }
+    }
+    result.elapsed_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
+    return result;
+}
+
 schema_v9_harness_summary_t run_all_schema_v9_fixtures() {
     schema_v9_harness_summary_t summary;
     std::vector<schema_v9_fixture_result_t> results;
@@ -1855,8 +1871,13 @@ schema_v9_harness_summary_t run_all_schema_v9_fixtures() {
     results.push_back(run_workbench_round_trip());
     results.push_back(run_generation_atomicity());
     results.push_back(run_database_open_queue_path());
+    results.push_back(run_baseline_persistence_entry_path());
+    results.push_back(run_managed_publication_persistence());
     summary.total = results.size();
     for (const auto& r : results) {
+		c03_test::assertion_telemetry::record_assertion(r.passed,
+			r.passed ? std::string_view(r.name) : std::string_view(r.message),
+			__FILE__, __LINE__);
         if (r.passed)
             ++summary.passed;
         else

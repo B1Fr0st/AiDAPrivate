@@ -8,10 +8,9 @@
 #include <array>
 #include <cctype>
 #include <limits>
-#include <set>
+#include <new>
 #include <stdexcept>
 #include <string_view>
-#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -21,20 +20,11 @@ namespace {
 using json = nlohmann::json;
 
 constexpr std::string_view k_schema = "aida.c03.managed-cli.worker";
-constexpr std::string_view k_decompiler_package_id = "ICSharpCode.Decompiler";
+constexpr std::string_view k_contract_material = "aida.c03.managed-cli.contract.v3|readonly-inherited-mapping.v1|source-kind|logical-identity|module-sha256|module-size|entity|generation|type-revision|profile|runtime-manifest|provider|cache|request-binding|exact-response";
 constexpr std::string_view k_decompiler_package_version = "10.1.0.8386";
-constexpr std::string_view k_decompiler_package_file = "ICSharpCode.Decompiler.10.1.0.8386.nupkg";
-constexpr std::string_view k_decompiler_package_hash = "a6fb2e9be86c1b73e54231e20640d4d566c52f21cba9ad99c3e9100d67e8f5af";
-constexpr std::string_view k_immutable_package_id = "System.Collections.Immutable";
-constexpr std::string_view k_immutable_package_version = "9.0.0";
-constexpr std::string_view k_immutable_package_file = "System.Collections.Immutable.9.0.0.nupkg";
-constexpr std::string_view k_immutable_package_hash = "fbaab954c7a87396e6e1616ca15ea705703d755e696bf3b8c96fa039d8bcc9a7";
-constexpr std::string_view k_metadata_package_id = "System.Reflection.Metadata";
-constexpr std::string_view k_metadata_package_version = "9.0.0";
-constexpr std::string_view k_metadata_package_file = "System.Reflection.Metadata.9.0.0.nupkg";
-constexpr std::string_view k_metadata_package_hash = "6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634";
-constexpr std::string_view k_sdk_hash = "a5ccdc3a41d5e5c6014ff64509aed176db39f4f14caffff3dd1997f8907e94d7";
 constexpr std::string_view k_decompiler_assembly_hash = "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345";
+constexpr std::string_view k_worker_build_id = "aida-managed-decompiler-worker-v3";
+constexpr std::string_view k_worker_build_material = "aida-managed-decompiler-worker-build-v3|snapshot-bound-contract=4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6|tfm=net10.0|runtime=Microsoft.NETCore.App/10.0.9";
 constexpr std::size_t k_max_wire_bytes = 16U << 20;
 constexpr std::size_t k_max_source_bytes = 8U << 20;
 constexpr std::size_t k_max_token_entries = 1U << 20;
@@ -58,14 +48,6 @@ workspace_result_t<T> failure(workspace_error_code_t code, std::string message, 
     return workspace_result_t<T>::failure(error(code, std::move(message), std::move(phase)));
 }
 
-bool is_simple_file_name(const std::string& value)
-{
-    return !value.empty() && value.size() <= 255 && value.find_first_of("\\/:") == std::string::npos &&
-        value.find("..") == std::string::npos && std::all_of(value.begin(), value.end(), [](unsigned char character) {
-            return std::isalnum(character) != 0 || character == '.' || character == '-' || character == '_';
-        });
-}
-
 sha256_digest_t digest_from_hex(std::string_view value)
 {
     if (value.size() != 64 || !std::all_of(value.begin(), value.end(), [](unsigned char character) {
@@ -86,37 +68,6 @@ std::string digest_hex(const sha256_digest_t& value)
 bool same_digest(const sha256_digest_t& left, const sha256_digest_t& right)
 {
     return left.constant_time_equal(right);
-}
-
-std::string canonical_lock_text()
-{
-    return std::string(k_decompiler_package_id) + "|" + std::string(k_decompiler_package_version) + "|" + std::string(k_decompiler_package_hash) + "\n" +
-        std::string(k_immutable_package_id) + "|" + std::string(k_immutable_package_version) + "|" + std::string(k_immutable_package_hash) + "\n" +
-        std::string(k_metadata_package_id) + "|" + std::string(k_metadata_package_version) + "|" + std::string(k_metadata_package_hash);
-}
-
-sha256_digest_t expected_lock_hash()
-{
-    return stable_serialization_hash(canonical_lock_text());
-}
-
-bool matches_locked_packages(const std::vector<offline_package_t>& packages)
-{
-    const std::array<std::tuple<std::string_view, std::string_view, std::string_view, std::string_view>, 3> expected = {{
-        {k_decompiler_package_id, k_decompiler_package_version, k_decompiler_package_file, k_decompiler_package_hash},
-        {k_immutable_package_id, k_immutable_package_version, k_immutable_package_file, k_immutable_package_hash},
-        {k_metadata_package_id, k_metadata_package_version, k_metadata_package_file, k_metadata_package_hash}
-    }};
-    if (packages.size() != expected.size())
-        return false;
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-        const auto& package = packages[index];
-        const auto& expected_package = expected[index];
-        if (std::string_view(package.id) != std::get<0>(expected_package) || std::string_view(package.version) != std::get<1>(expected_package) ||
-            std::string_view(package.file_name) != std::get<2>(expected_package) || std::string_view(package.content_hash.to_hex()) != std::get<3>(expected_package))
-            return false;
-    }
-    return true;
 }
 
 workspace_result_t<sha256_digest_t> hash_file(const std::string& path, const cancellation_token_t& cancel)
@@ -227,6 +178,92 @@ std::string profile_name(decompiler_profile_id_t value)
         return "thorough";
     }
     throw std::invalid_argument("decompiler profile is invalid");
+}
+
+std::string source_kind_name(module_source_kind_t value)
+{
+    switch (value) {
+    case module_source_kind_t::regular_file:
+        return "regular_file";
+    case module_source_kind_t::embedded_member:
+        return "embedded_member";
+    }
+    throw std::invalid_argument("managed CLI module source kind is invalid");
+}
+
+bool valid_logical_identity(const module_source_kind_t kind, const std::string& value)
+{
+    if (value.empty() || value.size() > 32768 || value.find('\0') != std::string::npos ||
+        std::any_of(value.begin(), value.end(), [](const unsigned char character) {
+            return character < 0x20U || character == 0x7fU;
+        }))
+        return false;
+    if (kind == module_source_kind_t::regular_file)
+        return true;
+    const auto marker = value.find("#member:");
+    if (marker == std::string::npos || marker == 0 || marker + 8 >= value.size())
+        return false;
+    std::string member = value.substr(marker + 8);
+    std::replace(member.begin(), member.end(), '\\', '/');
+    if (member.front() == '/' || member.back() == '/')
+        return false;
+    std::size_t offset = 0;
+    while (offset < member.size()) {
+        const auto end = member.find('/', offset);
+        const auto count = (end == std::string::npos ? member.size() : end) - offset;
+        const std::string_view component(member.data() + offset, count);
+        if (component.empty() || component == "." || component == "..")
+            return false;
+        if (end == std::string::npos)
+            break;
+        offset = end + 1;
+    }
+    return true;
+}
+
+sha256_digest_t cache_identity(const request_t& request)
+{
+    json value;
+    value["contractHash"] = request.contract_hash.to_hex();
+    value["entityHash"] = request.entity_hash.to_hex();
+    value["moduleSource"] = {
+        {"kind", source_kind_name(request.module_source.kind)},
+        {"logicalIdentity", request.module_source.logical_identity},
+        {"moduleHash", request.module_source.module_hash.to_hex()},
+        {"moduleSize", request.module_source.module_size}
+    };
+    value["workspaceGeneration"] = request.workspace_generation;
+    value["typeGraphRevision"] = request.type_graph_revision;
+    value["profile"] = {
+        {"name", profile_name(request.profile.profile)},
+        {"maxWallClockMs", request.profile.max_wall_clock_ms},
+        {"maxCpuMs", request.profile.max_cpu_ms},
+        {"maxMemoryBytes", request.profile.max_memory_bytes},
+        {"maxProviderIrNodes", request.profile.max_provider_ir_nodes},
+        {"maxHirNodes", request.profile.max_hir_nodes},
+        {"maxAstNodes", request.profile.max_ast_nodes},
+        {"maxSemanticQueries", request.profile.max_semantic_queries},
+        {"semanticProofsEnabled", request.profile.semantic_proofs_enabled}
+    };
+    value["runtimeManifestHash"] = request.worker.runtime_manifest_hash.to_hex();
+    value["provider"] = {
+        {"version", request.worker.provider_version},
+        {"decompilerAssemblyHash", request.worker.decompiler_assembly_hash.to_hex()},
+        {"workerBuildId", request.worker.worker_build_id},
+        {"workerBuildHash", request.worker.worker_build_hash.to_hex()}
+    };
+    return stable_serialization_hash(value.dump());
+}
+
+sha256_digest_t request_binding(const request_t& request)
+{
+    json value;
+    value["schema"] = std::string(k_schema);
+    value["schemaVersion"] = k_managed_cli_worker_protocol_version;
+    value["sequence"] = request.sequence;
+    value["requestId"] = request.request_id;
+    value["cacheIdentity"] = request.cache_identity.to_hex();
+    return stable_serialization_hash(value.dump());
 }
 
 std::string type_kind_name(decompiler_type_kind_t value)
@@ -421,44 +458,198 @@ std::vector<decompiler_diagnostic_t> parse_diagnostics(const json& values, const
     return result;
 }
 
+workspace_result_t<request_t> make_request_core(
+    std::uint64_t sequence,
+    std::string request_id,
+    module_source_t source,
+    decompiler_entity_key_t entity,
+    std::uint64_t workspace_generation,
+    std::uint64_t type_graph_revision,
+    decompiler_profile_budget_t profile,
+    worker_identity_t worker,
+    const cancellation_token_t& cancel)
+{
+    if (sequence != 1 || request_id.empty() || request_id.size() > 128 ||
+        request_id.find('\0') != std::string::npos || workspace_generation == 0 ||
+        type_graph_revision == 0 ||
+        std::string_view(worker.provider_version) != k_decompiler_package_version ||
+        std::string_view(worker.worker_build_id) != k_worker_build_id ||
+        !same_digest(worker.worker_build_hash,
+            stable_serialization_hash(std::string(k_worker_build_material))) ||
+        !valid_logical_identity(source.kind, source.logical_identity))
+        return failure<request_t>(workspace_error_code_t::invalid_argument,
+            "managed CLI request identity is invalid", "managed_cli.request");
+    if (source.kind == module_source_kind_t::regular_file) {
+        if (source.filesystem_path.empty() ||
+            source.filesystem_path != source.logical_identity)
+            return failure<request_t>(workspace_error_code_t::invalid_argument,
+                "managed CLI regular module source is invalid", "managed_cli.request.source");
+        const auto normalized_module = normalize_utf8_path(source.filesystem_path, false);
+        if (!normalized_module)
+            return workspace_result_t<request_t>::failure(normalized_module.error());
+        source.filesystem_path = normalized_module.value();
+        source.logical_identity = normalized_module.value();
+    } else if (source.kind == module_source_kind_t::embedded_member) {
+        if (!source.filesystem_path.empty())
+            return failure<request_t>(workspace_error_code_t::invalid_argument,
+                "managed CLI embedded module cannot carry a filesystem path",
+                "managed_cli.request.source");
+    } else {
+        return failure<request_t>(workspace_error_code_t::invalid_argument,
+            "managed CLI module source kind is invalid", "managed_cli.request.source");
+    }
+    if (source.module_size > k_managed_cli_maximum_module_bytes)
+        return failure<request_t>(workspace_error_code_t::limit_exceeded,
+            "managed CLI module exceeds the snapshot limit", "managed_cli.request.source");
+    if (!same_digest(worker.decompiler_assembly_hash,
+            digest_from_hex(k_decompiler_assembly_hash)) ||
+        worker.runtime_manifest_hash.empty())
+        return failure<request_t>(workspace_error_code_t::integrity_failure,
+            "managed CLI decompiler hash is not locked", "managed_cli.request");
+    const auto entity_validation = validate_decompiler_entity_key(entity);
+    if (!entity_validation.valid() || entity.kind != decompiler_entity_kind_t::cli_method ||
+        !std::holds_alternative<cli_decompiler_entity_identity_t>(entity.identity))
+        return failure<request_t>(workspace_error_code_t::invalid_argument,
+            "managed CLI entity is invalid", "managed_cli.request");
+    const auto& cli = std::get<cli_decompiler_entity_identity_t>(entity.identity);
+    if ((cli.metadata_token >> 24) != 0x06 ||
+        (cli.metadata_token & 0x00ffffffU) == 0 || cli.assembly_identity.empty() ||
+        cli.module_name.empty() || cli.declaring_type.empty() ||
+        cli.method_name.empty() || cli.method_signature.empty())
+        return failure<request_t>(workspace_error_code_t::invalid_argument,
+            "managed CLI method token is invalid", "managed_cli.request");
+    if (!source.module_hash.empty() &&
+        !same_digest(source.module_hash, cli.module_hash))
+        return failure<request_t>(workspace_error_code_t::integrity_failure,
+            "managed CLI source hash conflicts with the entity",
+            "managed_cli.request.source");
+    if (!validate_decompiler_profile(profile).valid())
+        return failure<request_t>(workspace_error_code_t::invalid_argument,
+            "managed CLI profile is invalid", "managed_cli.request");
+    source.module_hash = cli.module_hash;
+    request_t result;
+    result.sequence = sequence;
+    result.request_id = std::move(request_id);
+    result.module_source = std::move(source);
+    result.entity = std::move(entity);
+    result.entity_hash = stable_serialization_hash(result.entity);
+    result.workspace_generation = workspace_generation;
+    result.type_graph_revision = type_graph_revision;
+    result.profile = std::move(profile);
+    result.worker = std::move(worker);
+    result.contract_hash = stable_serialization_hash(std::string(k_contract_material));
+    return workspace_result_t<request_t>::success(std::move(result));
+}
+
+workspace_result_t<request_t> bind_snapshot_core(
+    const request_t& request,
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes,
+    const cancellation_token_t& cancel)
+{
+    if (!bytes || bytes->empty() || bytes->size() > k_managed_cli_maximum_module_bytes ||
+        bytes->size() > request.profile.max_memory_bytes / 2U)
+        return failure<request_t>(workspace_error_code_t::limit_exceeded,
+            "managed CLI snapshot violates the module budget",
+            "managed_cli.request.snapshot");
+    if (cancel.stop_requested())
+        return failure<request_t>(cancel.deadline_exceeded()
+                ? workspace_error_code_t::deadline_exceeded
+                : workspace_error_code_t::cancelled,
+            "managed CLI snapshot binding was cancelled",
+            "managed_cli.request.snapshot");
+    auto source = request.module_source;
+    const auto supplied_size = source.module_size;
+    source.module_size = bytes->size();
+    auto canonical = make_request_core(request.sequence, request.request_id,
+        std::move(source), request.entity, request.workspace_generation,
+        request.type_graph_revision, request.profile, request.worker, cancel);
+    if (!canonical)
+        return canonical;
+    auto module_hash = sha256_bytes(bytes->data(), bytes->size(), cancel);
+    if (!module_hash)
+        return workspace_result_t<request_t>::failure(module_hash.error());
+    const auto& cli = std::get<cli_decompiler_entity_identity_t>(
+        canonical.value().entity.identity);
+    if (!same_digest(module_hash.value(), cli.module_hash) ||
+        (supplied_size != 0 && supplied_size != bytes->size()) ||
+        (!request.entity_hash.empty() &&
+            !same_digest(request.entity_hash, canonical.value().entity_hash)) ||
+        (!request.contract_hash.empty() &&
+            !same_digest(request.contract_hash, canonical.value().contract_hash)))
+        return failure<request_t>(workspace_error_code_t::integrity_failure,
+            "managed CLI snapshot does not match its immutable request",
+            "managed_cli.request.snapshot");
+    canonical.value().module_snapshot = std::move(bytes);
+    canonical.value().cache_identity = cache_identity(canonical.value());
+    canonical.value().request_binding_hash = request_binding(canonical.value());
+    if ((!request.cache_identity.empty() &&
+            !same_digest(request.cache_identity, canonical.value().cache_identity)) ||
+        (!request.request_binding_hash.empty() &&
+            !same_digest(request.request_binding_hash,
+                canonical.value().request_binding_hash)))
+        return failure<request_t>(workspace_error_code_t::integrity_failure,
+            "managed CLI request binding is stale or malformed",
+            "managed_cli.request.binding");
+    return canonical;
+}
+
 void validate_response_header(const json& value, const request_t& request, const char* kind)
 {
-    if (std::string_view(require_string(value, "schema", 128)) != k_schema || require_u32(value, "schemaVersion") != k_managed_cli_worker_protocol_version ||
-        require_string(value, "kind", 32) != kind || require_u64(value, "sequence") != request.sequence ||
-        require_string(value, "requestId", 128) != request.request_id || require_string(value, "moduleHash", 64) != digest_hex(std::get<cli_decompiler_entity_identity_t>(request.entity.identity).module_hash) ||
-        require_u32(value, "metadataToken") != std::get<cli_decompiler_entity_identity_t>(request.entity.identity).metadata_token ||
-        !same_digest(digest_from_hex(require_string(value, "offlineLockHash", 64)), request.offline_lock_hash))
+    const auto& source = require_member(value, "moduleSource");
+    require_exact_fields(source,
+        {"kind", "logicalIdentity", "moduleHash", "moduleSize"});
+    const auto& budget = require_member(value, "budget");
+    require_exact_fields(budget,
+        {"profile", "maxWallClockMs", "maxCpuMs", "maxMemoryBytes",
+         "maxProviderIrNodes", "maxHirNodes", "maxAstNodes",
+         "maxSemanticQueries", "semanticProofsEnabled"});
+    const auto& provider = require_member(value, "provider");
+    require_exact_fields(provider,
+        {"version", "decompilerAssemblyHash", "workerBuildId",
+         "workerBuildHash"});
+    if (std::string_view(require_string(value, "schema", 128)) != k_schema ||
+        require_u32(value, "schemaVersion") != k_managed_cli_worker_protocol_version ||
+        require_string(value, "kind", 32) != kind ||
+        require_u64(value, "sequence") != request.sequence ||
+        require_string(value, "requestId", 128) != request.request_id ||
+        require_string(source, "kind", 32) != source_kind_name(request.module_source.kind) ||
+        require_string(source, "logicalIdentity", 32768) !=
+            request.module_source.logical_identity ||
+        !same_digest(digest_from_hex(require_string(source, "moduleHash", 64)),
+            request.module_source.module_hash) ||
+        require_u64(source, "moduleSize") != request.module_source.module_size ||
+        !same_digest(digest_from_hex(require_string(value, "entityHash", 64)),
+            request.entity_hash) ||
+        require_u32(value, "metadataToken") !=
+            std::get<cli_decompiler_entity_identity_t>(request.entity.identity).metadata_token ||
+        require_u64(value, "workspaceGeneration") != request.workspace_generation ||
+        require_u64(value, "typeGraphRevision") != request.type_graph_revision ||
+        require_string(budget, "profile", 32) != profile_name(request.profile.profile) ||
+        require_u64(budget, "maxWallClockMs") != request.profile.max_wall_clock_ms ||
+        require_u64(budget, "maxCpuMs") != request.profile.max_cpu_ms ||
+        require_u64(budget, "maxMemoryBytes") != request.profile.max_memory_bytes ||
+        require_u64(budget, "maxProviderIrNodes") != request.profile.max_provider_ir_nodes ||
+        require_u64(budget, "maxHirNodes") != request.profile.max_hir_nodes ||
+        require_u64(budget, "maxAstNodes") != request.profile.max_ast_nodes ||
+        require_u64(budget, "maxSemanticQueries") != request.profile.max_semantic_queries ||
+        require_bool(budget, "semanticProofsEnabled") != request.profile.semantic_proofs_enabled ||
+        !same_digest(digest_from_hex(require_string(value, "runtimeManifestHash", 64)),
+            request.worker.runtime_manifest_hash) ||
+        !same_digest(digest_from_hex(require_string(value, "contractHash", 64)),
+            request.contract_hash) ||
+        !same_digest(digest_from_hex(require_string(value, "cacheIdentity", 64)),
+            request.cache_identity) ||
+        !same_digest(digest_from_hex(require_string(value, "requestBindingHash", 64)),
+            request.request_binding_hash) ||
+        require_string(provider, "version", 64) != request.worker.provider_version ||
+        !same_digest(digest_from_hex(require_string(provider,
+            "decompilerAssemblyHash", 64)), request.worker.decompiler_assembly_hash) ||
+        require_string(provider, "workerBuildId", 256) != request.worker.worker_build_id ||
+        !same_digest(digest_from_hex(require_string(provider, "workerBuildHash", 64)),
+            request.worker.worker_build_hash))
         throw decode_error_t("worker response header does not match its request");
 }
 
-}
-
-workspace_result_t<sha256_digest_t> verify_offline_lock(const offline_lock_t& lock, const cancellation_token_t& cancel)
-{
-    if (lock.package_root.empty() || lock.sdk_path.empty() || !matches_locked_packages(lock.packages) ||
-        std::string_view(lock.sdk_hash.to_hex()) != k_sdk_hash)
-        return failure<sha256_digest_t>(workspace_error_code_t::integrity_failure, "managed CLI offline lock is invalid", "managed_cli.lock");
-    const auto root = normalize_utf8_path(lock.package_root, true);
-    if (!root)
-        return workspace_result_t<sha256_digest_t>::failure(root.error());
-    const auto sdk = hash_file(lock.sdk_path, cancel);
-    if (!sdk)
-        return sdk;
-    if (!same_digest(sdk.value(), lock.sdk_hash))
-        return failure<sha256_digest_t>(workspace_error_code_t::integrity_failure, "managed CLI SDK hash mismatch", "managed_cli.lock");
-    for (const auto& package : lock.packages) {
-        if (!is_simple_file_name(package.file_name))
-            return failure<sha256_digest_t>(workspace_error_code_t::integrity_failure, "managed CLI package name is invalid", "managed_cli.lock");
-        const auto path = normalize_utf8_path(root.value() + "\\" + package.file_name, true);
-        if (!path)
-            return workspace_result_t<sha256_digest_t>::failure(path.error());
-        const auto actual = hash_file(path.value(), cancel);
-        if (!actual)
-            return actual;
-        if (!same_digest(actual.value(), package.content_hash))
-            return failure<sha256_digest_t>(workspace_error_code_t::integrity_failure, "managed CLI package hash mismatch", "managed_cli.lock");
-    }
-    return workspace_result_t<sha256_digest_t>::success(expected_lock_hash());
 }
 
 workspace_result_t<request_t> make_request(
@@ -467,71 +658,125 @@ workspace_result_t<request_t> make_request(
     std::string module_path,
     decompiler_entity_key_t entity,
     std::uint64_t workspace_generation,
+    std::uint64_t type_graph_revision,
     decompiler_profile_budget_t profile,
     worker_identity_t worker,
-    offline_lock_t offline_lock,
     const cancellation_token_t& cancel)
 {
-    if (sequence == 0 || request_id.empty() || request_id.size() > 128 || request_id.find('\0') != std::string::npos ||
-        module_path.empty() || module_path.size() > 32768 || module_path.find('\0') != std::string::npos ||
-        workspace_generation == 0 || std::string_view(worker.provider_version) != k_decompiler_package_version ||
-        worker.worker_build_id.empty() || worker.worker_build_id.size() > 256 || worker.worker_build_id.find('\0') != std::string::npos ||
-        worker.worker_build_hash.empty())
-        return failure<request_t>(workspace_error_code_t::invalid_argument, "managed CLI request identity is invalid", "managed_cli.request");
-    const auto verified_lock = verify_offline_lock(offline_lock, cancel);
-    if (!verified_lock)
-        return workspace_result_t<request_t>::failure(verified_lock.error());
-    if (!same_digest(worker.decompiler_assembly_hash, digest_from_hex(k_decompiler_assembly_hash)))
-        return failure<request_t>(workspace_error_code_t::integrity_failure, "managed CLI decompiler hash is not locked", "managed_cli.request");
-    const auto entity_validation = validate_decompiler_entity_key(entity);
-    if (!entity_validation.valid() || entity.kind != decompiler_entity_kind_t::cli_method || !std::holds_alternative<cli_decompiler_entity_identity_t>(entity.identity))
-        return failure<request_t>(workspace_error_code_t::invalid_argument, "managed CLI entity is invalid", "managed_cli.request");
-    const auto& cli = std::get<cli_decompiler_entity_identity_t>(entity.identity);
-    if ((cli.metadata_token >> 24) != 0x06 || (cli.metadata_token & 0x00ffffffU) == 0 || cli.assembly_identity.empty() ||
-        cli.module_name.empty() || cli.declaring_type.empty() || cli.method_name.empty() || cli.method_signature.empty())
-        return failure<request_t>(workspace_error_code_t::invalid_argument, "managed CLI method token is invalid", "managed_cli.request");
-    if (!validate_decompiler_profile(profile).valid())
-        return failure<request_t>(workspace_error_code_t::invalid_argument, "managed CLI profile is invalid", "managed_cli.request");
-    const auto normalized_module = normalize_utf8_path(module_path, false);
-    if (!normalized_module)
-        return workspace_result_t<request_t>::failure(normalized_module.error());
-    const auto normalized_root = normalize_utf8_path(offline_lock.package_root, true);
-    if (!normalized_root)
-        return workspace_result_t<request_t>::failure(normalized_root.error());
-    const auto normalized_sdk = normalize_utf8_path(offline_lock.sdk_path, true);
-    if (!normalized_sdk)
-        return workspace_result_t<request_t>::failure(normalized_sdk.error());
-    offline_lock.package_root = normalized_root.value();
-    offline_lock.sdk_path = normalized_sdk.value();
-    request_t result;
-    result.sequence = sequence;
-    result.request_id = std::move(request_id);
-    result.module_path = normalized_module.value();
-    result.entity = std::move(entity);
-    result.workspace_generation = workspace_generation;
-    result.profile = std::move(profile);
-    result.worker = std::move(worker);
-    result.offline_lock = std::move(offline_lock);
-    result.offline_lock_hash = verified_lock.value();
-    return workspace_result_t<request_t>::success(std::move(result));
+    module_source_t source;
+    source.kind = module_source_kind_t::regular_file;
+    source.logical_identity = module_path;
+    source.filesystem_path = std::move(module_path);
+    return make_request_core(sequence, std::move(request_id), std::move(source),
+        std::move(entity), workspace_generation, type_graph_revision,
+        std::move(profile), std::move(worker), cancel);
 }
 
-workspace_result_t<std::vector<std::string>> make_worker_startup_arguments(
-    const request_t& request,
+workspace_result_t<request_t> make_embedded_request(
+    std::uint64_t sequence,
+    std::string request_id,
+    std::string logical_identity,
+    std::vector<std::uint8_t> module_bytes,
+    decompiler_entity_key_t entity,
+    std::uint64_t workspace_generation,
+    std::uint64_t type_graph_revision,
+    decompiler_profile_budget_t profile,
+    worker_identity_t worker,
     const cancellation_token_t& cancel)
 {
-    const auto checked = make_request(request.sequence, request.request_id, request.module_path, request.entity,
-        request.workspace_generation, request.profile, request.worker, request.offline_lock, cancel);
-    if (!checked)
-        return workspace_result_t<std::vector<std::string>>::failure(checked.error());
-    return workspace_result_t<std::vector<std::string>>::success(
-        std::vector<std::string>{"--offline-package-root", checked.value().offline_lock.package_root});
+    auto snapshot = make_immutable_module_snapshot(std::move(module_bytes), cancel);
+    if (!snapshot)
+        return workspace_result_t<request_t>::failure(snapshot.error());
+    return make_embedded_request(sequence, std::move(request_id),
+        std::move(logical_identity), snapshot.take_value(), std::move(entity),
+        workspace_generation, type_graph_revision, std::move(profile),
+        std::move(worker), cancel);
+}
+
+workspace_result_t<request_t> make_embedded_request(
+    std::uint64_t sequence,
+    std::string request_id,
+    std::string logical_identity,
+    immutable_module_snapshot_t module_snapshot,
+    decompiler_entity_key_t entity,
+    std::uint64_t workspace_generation,
+    std::uint64_t type_graph_revision,
+    decompiler_profile_budget_t profile,
+    worker_identity_t worker,
+    const cancellation_token_t& cancel)
+{
+    if (!module_snapshot.valid())
+        return failure<request_t>(workspace_error_code_t::invalid_argument,
+            "managed CLI immutable module snapshot is invalid",
+            "managed_cli.request.snapshot");
+    module_source_t source;
+    source.kind = module_source_kind_t::embedded_member;
+    source.logical_identity = std::move(logical_identity);
+    auto request = make_request_core(sequence, std::move(request_id),
+        std::move(source), std::move(entity), workspace_generation,
+        type_graph_revision, std::move(profile), std::move(worker),
+        cancel);
+    if (!request)
+        return request;
+    const auto& cli = std::get<cli_decompiler_entity_identity_t>(
+        request.value().entity.identity);
+    if (!same_digest(cli.module_hash, module_snapshot.hash))
+        return failure<request_t>(workspace_error_code_t::integrity_failure,
+            "managed CLI immutable module snapshot does not match its entity",
+            "managed_cli.request.snapshot");
+    return bind_snapshot_core(request.value(), std::move(module_snapshot.bytes), cancel);
+}
+
+workspace_result_t<immutable_module_snapshot_t> make_immutable_module_snapshot(
+    std::vector<std::uint8_t> module_bytes,
+    const cancellation_token_t& cancel)
+{
+    if (module_bytes.empty() ||
+        module_bytes.size() > k_managed_cli_maximum_module_bytes)
+        return failure<immutable_module_snapshot_t>(workspace_error_code_t::limit_exceeded,
+            "managed CLI immutable module snapshot violates the size limit",
+            "managed_cli.request.snapshot");
+    if (cancel.stop_requested())
+        return failure<immutable_module_snapshot_t>(cancel.deadline_exceeded()
+                ? workspace_error_code_t::deadline_exceeded
+                : workspace_error_code_t::cancelled,
+            "managed CLI immutable module snapshot was cancelled",
+            "managed_cli.request.snapshot");
+    immutable_module_snapshot_t result;
+    try {
+        result.bytes = std::make_shared<const std::vector<std::uint8_t>>(
+            std::move(module_bytes));
+    } catch (...) {
+        return failure<immutable_module_snapshot_t>(workspace_error_code_t::limit_exceeded,
+            "managed CLI snapshot ownership could not be established",
+            "managed_cli.request.snapshot");
+    }
+    auto hash = sha256_bytes(result.bytes->data(), result.bytes->size(), cancel);
+    if (!hash)
+        return workspace_result_t<immutable_module_snapshot_t>::failure(hash.error());
+    result.hash = hash.value();
+    return workspace_result_t<immutable_module_snapshot_t>::success(std::move(result));
+}
+
+workspace_result_t<request_t> bind_module_snapshot(
+    const request_t& request,
+    std::vector<std::uint8_t> module_bytes,
+    const cancellation_token_t& cancel)
+{
+    auto snapshot = make_immutable_module_snapshot(std::move(module_bytes), cancel);
+    if (!snapshot)
+        return workspace_result_t<request_t>::failure(snapshot.error());
+    return bind_snapshot_core(request, std::move(snapshot.value().bytes), cancel);
+}
+
+sha256_digest_t managed_cli_contract_hash()
+{
+    return stable_serialization_hash(std::string(k_contract_material));
 }
 
 workspace_result_t<std::string> serialize_request(const request_t& request)
 {
-    const auto checked = make_request(request.sequence, request.request_id, request.module_path, request.entity,
-        request.workspace_generation, request.profile, request.worker, request.offline_lock);
+    const auto checked = bind_snapshot_core(request, request.module_snapshot, {});
     if (!checked)
         return workspace_result_t<std::string>::failure(checked.error());
     const auto& canonical = checked.value();
@@ -542,15 +787,28 @@ workspace_result_t<std::string> serialize_request(const request_t& request)
     result["kind"] = "decompile";
     result["sequence"] = canonical.sequence;
     result["requestId"] = canonical.request_id;
-    result["modulePath"] = canonical.module_path;
-    result["moduleHash"] = digest_hex(cli.module_hash);
+    result["moduleSource"] = {
+        {"kind", source_kind_name(canonical.module_source.kind)},
+        {"logicalIdentity", canonical.module_source.logical_identity},
+        {"moduleHash", digest_hex(canonical.module_source.module_hash)},
+        {"moduleSize", canonical.module_source.module_size}
+    };
+    result["entityHash"] = digest_hex(canonical.entity_hash);
     result["metadataToken"] = cli.metadata_token;
     result["workspaceGeneration"] = canonical.workspace_generation;
-    result["offlineLockHash"] = digest_hex(canonical.offline_lock_hash);
+    result["typeGraphRevision"] = canonical.type_graph_revision;
+    result["runtimeManifestHash"] = digest_hex(canonical.worker.runtime_manifest_hash);
+    result["contractHash"] = digest_hex(canonical.contract_hash);
+    result["cacheIdentity"] = digest_hex(canonical.cache_identity);
+    result["requestBindingHash"] = digest_hex(canonical.request_binding_hash);
     result["budget"] = {
         {"profile", profile_name(canonical.profile.profile)}, {"maxWallClockMs", canonical.profile.max_wall_clock_ms},
         {"maxCpuMs", canonical.profile.max_cpu_ms}, {"maxMemoryBytes", canonical.profile.max_memory_bytes},
-        {"maxProviderIrNodes", canonical.profile.max_provider_ir_nodes}
+        {"maxProviderIrNodes", canonical.profile.max_provider_ir_nodes},
+        {"maxHirNodes", canonical.profile.max_hir_nodes},
+        {"maxAstNodes", canonical.profile.max_ast_nodes},
+        {"maxSemanticQueries", canonical.profile.max_semantic_queries},
+        {"semanticProofsEnabled", canonical.profile.semantic_proofs_enabled}
     };
     result["provider"] = {
         {"version", canonical.worker.provider_version}, {"decompilerAssemblyHash", digest_hex(canonical.worker.decompiler_assembly_hash)},
@@ -561,7 +819,7 @@ workspace_result_t<std::string> serialize_request(const request_t& request)
 
 workspace_result_t<std::string> serialize_cancellation(const request_t& request, std::uint64_t sequence, std::string stable_reason)
 {
-    if (sequence == 0 || stable_reason.empty() || stable_reason.size() > 256 || stable_reason.find('\0') != std::string::npos)
+    if (sequence != request.sequence + 1 || stable_reason.empty() || stable_reason.size() > 256 || stable_reason.find('\0') != std::string::npos)
         return failure<std::string>(workspace_error_code_t::invalid_argument, "managed CLI cancellation is invalid", "managed_cli.cancel");
     const auto checked = serialize_request(request);
     if (!checked)
@@ -572,14 +830,14 @@ workspace_result_t<std::string> serialize_cancellation(const request_t& request,
     result["kind"] = "cancel";
     result["sequence"] = sequence;
     result["requestId"] = request.request_id;
+    result["requestBindingHash"] = request.request_binding_hash.to_hex();
     result["stableReason"] = std::move(stable_reason);
     return workspace_result_t<std::string>::success(result.dump());
 }
 
 workspace_result_t<response_t> deserialize_response(const request_t& request, const std::string& payload, const cancellation_token_t& cancel)
 {
-    const auto checked = make_request(request.sequence, request.request_id, request.module_path, request.entity,
-        request.workspace_generation, request.profile, request.worker, request.offline_lock, cancel);
+    const auto checked = bind_snapshot_core(request, request.module_snapshot, cancel);
     if (!checked)
         return workspace_result_t<response_t>::failure(checked.error());
     if (cancel.stop_requested())
@@ -591,7 +849,11 @@ workspace_result_t<response_t> deserialize_response(const request_t& request, co
         const auto envelope = json::parse(payload, nullptr, true, true);
         const auto kind = require_string(envelope, "kind", 32);
         if (kind == "failure") {
-            require_exact_fields(envelope, {"schema", "schemaVersion", "kind", "sequence", "requestId", "moduleHash", "metadataToken", "offlineLockHash", "diagnostics"});
+            require_exact_fields(envelope, {"schema", "schemaVersion", "kind",
+                "sequence", "requestId", "moduleSource", "entityHash",
+                "metadataToken", "workspaceGeneration", "typeGraphRevision",
+                "budget", "runtimeManifestHash", "contractHash", "cacheIdentity",
+                "requestBindingHash", "provider", "diagnostics"});
             validate_response_header(envelope, request, "failure");
             response_t result;
             result.failure = failure_t{parse_diagnostics(require_array(envelope, "diagnostics", k_max_ir_nodes), request)};
@@ -601,15 +863,14 @@ workspace_result_t<response_t> deserialize_response(const request_t& request, co
         }
         if (kind != "result")
             throw decode_error_t("worker response kind is invalid");
-        require_exact_fields(envelope, {"schema", "schemaVersion", "kind", "sequence", "requestId", "moduleHash", "metadataToken", "offlineLockHash", "provider", "identity", "source", "tokenMap", "typeGraph", "returnTypeId", "ir", "unknowns", "diagnostics"});
+        require_exact_fields(envelope, {"schema", "schemaVersion", "kind",
+            "sequence", "requestId", "moduleSource", "entityHash",
+            "metadataToken", "workspaceGeneration", "typeGraphRevision",
+            "budget", "runtimeManifestHash", "contractHash", "cacheIdentity",
+            "requestBindingHash", "provider", "identity", "source", "tokenMap",
+            "typeGraph", "returnTypeId", "ir", "unknowns", "diagnostics"});
         validate_response_header(envelope, request, "result");
         const auto& cli = std::get<cli_decompiler_entity_identity_t>(request.entity.identity);
-
-        const auto& provider = require_member(envelope, "provider");
-        require_exact_fields(provider, {"version", "decompilerAssemblyHash"});
-        if (require_string(provider, "version", 64) != request.worker.provider_version ||
-            !same_digest(digest_from_hex(require_string(provider, "decompilerAssemblyHash", 64)), request.worker.decompiler_assembly_hash))
-            throw decode_error_t("worker provider identity does not match its request");
 
         const auto& identity = require_member(envelope, "identity");
         require_exact_fields(identity, {"assemblyIdentity", "moduleName", "declaringType", "methodName", "methodSignature", "genericArity"});
@@ -820,10 +1081,38 @@ workspace_result_t<response_t> deserialize_response(const request_t& request, co
             source_text, source_hash, std::move(token_map), std::move(diagnostics)};
         return workspace_result_t<response_t>::success(std::move(result));
     } catch (const decode_error_t& exception) {
+        if (cancel.stop_requested())
+            return failure<response_t>(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "managed CLI response parsing was cancelled",
+                "managed_cli.response");
         return failure<response_t>(workspace_error_code_t::decode_failure, exception.what(), "managed_cli.response");
     } catch (const json::exception& exception) {
+        if (cancel.stop_requested())
+            return failure<response_t>(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "managed CLI response parsing was cancelled",
+                "managed_cli.response");
         return failure<response_t>(workspace_error_code_t::decode_failure, exception.what(), "managed_cli.response");
+    } catch (const std::bad_alloc&) {
+        if (cancel.stop_requested())
+            return failure<response_t>(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "managed CLI response parsing was cancelled",
+                "managed_cli.response");
+        return failure<response_t>(workspace_error_code_t::limit_exceeded,
+            "managed CLI response allocation exceeded its resource limit",
+            "managed_cli.response");
     } catch (const std::exception& exception) {
+        if (cancel.stop_requested())
+            return failure<response_t>(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "managed CLI response parsing was cancelled",
+                "managed_cli.response");
         return failure<response_t>(workspace_error_code_t::decode_failure, exception.what(), "managed_cli.response");
     }
 }

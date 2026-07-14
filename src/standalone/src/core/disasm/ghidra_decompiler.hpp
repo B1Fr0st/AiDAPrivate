@@ -1001,10 +1001,13 @@ struct prepared_arch_t {
 	                const DisasmFile* file_fallback,
 	                std::atomic<bool>* cancel,
 	                const std::string& sleigh_id,
-	                std::vector<aida_ghidra::region_t> extra_regions = {})
+	                std::vector<aida_ghidra::region_t> extra_regions = {},
+	                uint64_t total_image_size = 0)
 	{
 		auto loader = std::make_unique<aida_ghidra::load_image_t>(
 			data, size, base, file_fallback, cancel);
+		if (total_image_size != 0)
+			loader->set_image_size(total_image_size);
 		for (auto& reg : extra_regions) {
 			loader->add_region(reg.start_va, std::move(reg.data));
 		}
@@ -1560,6 +1563,96 @@ inline ghidra_result_t decompile_isolated_buffer(
 	} catch (...) {
 		result.is_error = true;
 		result.error_text = "isolated decompilation failed";
+	}
+	if (!result.is_error && !result.typed_artifacts) {
+		result.is_error = true;
+		result.complete = false;
+		result.error_text = "isolated decompilation completed without typed provider artifacts";
+	} else if (!result.is_error && !detail::decompile_result_within_limits(result, result_limits)) {
+		result.is_error = true;
+		result.complete = false;
+		result.error_text = "isolated decompilation result exceeds configured limits";
+	}
+	return result;
+}
+
+inline ghidra_result_t decompile_isolated_regions(
+	std::vector<aida_ghidra::region_t> regions,
+	uint64_t image_base,
+	uint64_t image_size,
+	uint64_t entry_addr,
+	const std::string& sleigh_id,
+	std::atomic<bool>* cancel,
+	std::optional<std::chrono::steady_clock::time_point> deadline,
+	const ghidra_decompile_result_limits_t& result_limits,
+	const aida::analysis::ghidra_ir_adapter::capture_request_t& typed_request)
+{
+	active_decompile_guard_t active_guard(cancel);
+	ghidra_result_t result;
+	result.function_addr = entry_addr;
+	if (active_guard.was_shutting_down) {
+		result.is_error = true;
+		result.error_text = "decompiler is shutting down";
+		return result;
+	}
+	if (regions.empty() || image_size == 0 ||
+		entry_addr < image_base || entry_addr - image_base >= image_size ||
+		sleigh_id.empty() || !valid_decompile_result_limits(result_limits) ||
+		!aida::analysis::validate_decompiler_entity_key(typed_request.entity).valid()) {
+		result.is_error = true;
+		result.error_text = "isolated region decompiler input violates the typed provider contract";
+		return result;
+	}
+	std::sort(regions.begin(), regions.end(), [](const auto& left, const auto& right) {
+		return left.start_va < right.start_va;
+	});
+	std::size_t entry_region = regions.size();
+	uint64_t prior_end = image_base;
+	for (std::size_t index = 0; index < regions.size(); ++index) {
+		const auto& region = regions[index];
+		if (region.data.empty() || region.start_va < image_base ||
+			region.start_va < prior_end || region.start_va - image_base >= image_size ||
+			region.data.size() > image_size - (region.start_va - image_base)) {
+			result.is_error = true;
+			result.error_text = "isolated decompiler regions are malformed or overlap";
+			return result;
+		}
+		prior_end = region.start_va + region.data.size();
+		if (entry_addr >= region.start_va && entry_addr - region.start_va < region.data.size())
+			entry_region = index;
+	}
+	if (entry_region == regions.size()) {
+		result.is_error = true;
+		result.error_text = "isolated decompiler entry is not captured";
+		return result;
+	}
+	if (!g_state.initialized.load(std::memory_order_acquire) && !init()) {
+		result.is_error = true;
+		result.error_text = "dependency_blocked: ghidra decompiler not initialized; " + init_diagnostics();
+		return result;
+	}
+	if ((cancel && cancel->load(std::memory_order_acquire)) ||
+		(deadline && std::chrono::steady_clock::now() >= *deadline)) {
+		result.is_error = true;
+		result.error_text = "cancelled";
+		return result;
+	}
+	try {
+		auto primary = std::move(regions[entry_region]);
+		regions.erase(regions.begin() + static_cast<std::ptrdiff_t>(entry_region));
+		detail::prepared_arch_t prepared(primary.data.data(), primary.data.size(),
+			primary.start_va, nullptr, cancel, sleigh_id, std::move(regions), image_size);
+		result = detail::do_decompile(prepared.arch.get(), entry_addr, cancel, deadline,
+			result_limits, &typed_request);
+	} catch (ghidra::LowlevelError& error) {
+		result.is_error = true;
+		result.error_text = error.explain;
+	} catch (ghidra::DecoderError& error) {
+		result.is_error = true;
+		result.error_text = error.explain;
+	} catch (...) {
+		result.is_error = true;
+		result.error_text = "isolated region decompilation failed";
 	}
 	if (!result.is_error && !result.typed_artifacts) {
 		result.is_error = true;

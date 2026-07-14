@@ -23,7 +23,7 @@ struct registered_contract_t final {
 };
 
 struct integration_state_t final {
-    mcp_standalone::server_t* server = nullptr;
+    mcp_standalone::tool_registry_t* registry = nullptr;
     server_integration_config_t config;
     protocol::schema_runtime_t schemas;
     compat::effect_lock_manager_t lock_manager;
@@ -35,9 +35,9 @@ struct integration_state_t final {
     bool generated_indexed = false;
     bool extensions_indexed = false;
 
-    integration_state_t(mcp_standalone::server_t& srv,
+    integration_state_t(mcp_standalone::tool_registry_t& target_registry,
                         server_integration_config_t cfg)
-        : server(&srv), config(std::move(cfg)),
+        : registry(&target_registry), config(std::move(cfg)),
           schemas(config.schema_cache_capacity) {}
 };
 
@@ -224,12 +224,9 @@ mcp_standalone::tool_result_t to_standalone_result(
     return standalone;
 }
 
-bool server_has_tool(const mcp_standalone::server_t& server,
-                     std::string_view name) {
-    const auto& tools = server.get_tools();
-    return std::any_of(tools.begin(), tools.end(), [name](const auto& tool) {
-        return tool.name == name;
-    });
+bool registry_has_tool(const mcp_standalone::tool_registry_t& registry,
+                       std::string_view name) {
+    return registry.find_tool(std::string(name), false).has_value();
 }
 
 std::uint64_t workspace_target_id(
@@ -259,9 +256,9 @@ tool_provenance_metadata_t extension_provenance(
 struct mcp_server_integration_t::impl_t {
     integration_state_t state;
 
-    explicit impl_t(mcp_standalone::server_t& srv,
+    explicit impl_t(mcp_standalone::tool_registry_t& registry,
                     server_integration_config_t cfg)
-        : state(srv, std::move(cfg)) {}
+        : state(registry, std::move(cfg)) {}
 
     void increment_metric(
         std::uint64_t server_integration_metrics_t::*field,
@@ -344,7 +341,9 @@ struct mcp_server_integration_t::impl_t {
         if (found == state.contracts.end() || found->second.registered)
             return;
         auto& entry = found->second;
-        if (server_has_tool(*state.server, name))
+        const bool replace_existing = registry_has_tool(*state.registry, name);
+        if (replace_existing &&
+            !state.config.replace_hand_drifted_registration)
             throw std::runtime_error("MCP tool registration collision: " + name);
 
         auto tool = contract_to_tool_def(entry.contract);
@@ -367,7 +366,10 @@ struct mcp_server_integration_t::impl_t {
                     name, arguments, cancellation, nullptr));
             };
         }
-        if (!state.server->register_tool(std::move(tool)))
+        const bool installed = replace_existing
+            ? state.registry->replace_tool(std::move(tool))
+            : state.registry->register_tool(std::move(tool));
+        if (!installed)
             throw std::runtime_error("MCP tool registration failed: " + name);
         entry.registered = true;
         ++state.registered_count;
@@ -396,7 +398,7 @@ mcp_server_integration_t::~mcp_server_integration_t() = default;
 
 std::shared_ptr<mcp_server_integration_t>
 mcp_server_integration_t::create(
-    mcp_standalone::server_t& server,
+    mcp_standalone::tool_registry_t& registry,
     server_integration_config_t config) {
     if (!config.enforce_input_validation || !config.enforce_output_validation ||
         !config.move_provenance_to_top_level ||
@@ -407,7 +409,7 @@ mcp_server_integration_t::create(
         throw std::invalid_argument(
             "MCP server integration requires strict generated validation and a real adapter dispatcher");
     }
-    auto impl = std::make_unique<impl_t>(server, std::move(config));
+    auto impl = std::make_unique<impl_t>(registry, std::move(config));
     return std::shared_ptr<mcp_server_integration_t>(
         new mcp_server_integration_t(std::move(impl)));
 }
@@ -626,6 +628,7 @@ mcp_server_integration_t::contract_to_tool_def(
     tool.annotations = contract.annotations;
     tool.target_independent = contract.target_policy.requirement ==
         protocol::target_requirement_t::independent;
+    tool.production_registry_dispatch = true;
     return tool;
 }
 

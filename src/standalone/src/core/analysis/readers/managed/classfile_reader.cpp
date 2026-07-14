@@ -13,6 +13,20 @@ workspace_error_t classfile_managed_error(workspace_error_code_t code, std::stri
     return make_workspace_error(code, std::move(message), std::move(phase));
 }
 
+workspace_error_t classfile_managed_stop_error(
+    const cancellation_token_t& cancel,
+    std::string message,
+    std::string phase) {
+    auto error = classfile_managed_error(
+        cancel.deadline_exceeded()
+            ? workspace_error_code_t::deadline_exceeded
+            : workspace_error_code_t::cancelled,
+        std::move(message), std::move(phase));
+    error.deadline = cancel.deadline_exceeded();
+    error.cancellation = !error.deadline;
+    return error;
+}
+
 std::string jvm_internal_name_from_class_ref(const classfile_image_t& image, std::uint16_t index) {
     if (index == 0 || index >= image.constant_pool.size())
         return {};
@@ -255,8 +269,9 @@ build_classfile_artifact(const classfile_metadata_t& metadata,
     artifact.module_identity.artifact_offset = 0;
 
     auto hash_result = provider.compute_content_sha256(cancel);
-    if (hash_result)
-        artifact.module_identity.artifact_hash = hash_result.value();
+    if (!hash_result)
+        return workspace_result_t<managed_artifact_t>::failure(hash_result.error());
+    artifact.module_identity.artifact_hash = hash_result.take_value();
 
     managed_type_identity_t type;
     type.type_name = metadata.image.this_class_name;
@@ -283,8 +298,8 @@ build_classfile_artifact(const classfile_metadata_t& metadata,
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(metadata.image.methods.size()); ++i) {
         if (cancel.stop_requested())
             return workspace_result_t<managed_artifact_t>::failure(
-                classfile_managed_error(workspace_error_code_t::cancelled,
-                                        "Classfile artifact building cancelled", "classfile.build"));
+                classfile_managed_stop_error(cancel,
+                    "Classfile artifact building cancelled", "classfile.build"));
         if (artifact.methods.size() >= limits.max_methods)
             return workspace_result_t<managed_artifact_t>::failure(
                 classfile_managed_error(workspace_error_code_t::limit_exceeded,
@@ -322,8 +337,8 @@ build_classfile_artifact(const classfile_metadata_t& metadata,
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(metadata.image.fields.size()); ++i) {
         if (cancel.stop_requested())
             return workspace_result_t<managed_artifact_t>::failure(
-                classfile_managed_error(workspace_error_code_t::cancelled,
-                                        "Classfile artifact building cancelled", "classfile.build"));
+                classfile_managed_stop_error(cancel,
+                    "Classfile artifact building cancelled", "classfile.build"));
         if (artifact.fields.size() >= limits.max_fields)
             return workspace_result_t<managed_artifact_t>::failure(
                 classfile_managed_error(workspace_error_code_t::limit_exceeded,

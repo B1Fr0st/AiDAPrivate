@@ -81,6 +81,18 @@ workspace_result_t<std::uint32_t> crc32c_cancellable(
 
 class packed_page_codec_t final {
 public:
+    static workspace_result_t<void> seal_page(
+        packed_page_t& page,
+        const packed_stop_predicate_t& stop_requested = {});
+
+    static workspace_result_t<packed_record_page_prefix_t> record_prefix(
+        const packed_page_t& page,
+        const packed_stop_predicate_t& stop_requested = {});
+
+    static workspace_result_t<std::vector<std::uint8_t>> record_payload(
+        const packed_page_t& page,
+        const packed_stop_predicate_t& stop_requested = {});
+
     static workspace_result_t<packed_page_batch_t> encode_batch(
         packed_page_type_t page_type,
         const std::vector<std::uint8_t>& data,

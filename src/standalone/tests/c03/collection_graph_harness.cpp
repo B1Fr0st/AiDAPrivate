@@ -1,4 +1,5 @@
 #include "collection_graph_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/collection/artifact_collection.hpp"
 #include "../../src/core/analysis/collection/member_graph.hpp"
@@ -42,12 +43,17 @@ struct deflate_ender_t final {
 
 template <typename value_t>
 value_t require_value(workspace_result_t<value_t> result, const char* message) {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ": " + result.error().stable_code());
     return result.take_value();
 }
 
 void require(bool condition, const char* message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -55,7 +61,10 @@ void require(bool condition, const char* message) {
 template <typename value_t>
 void require_error(workspace_result_t<value_t> result, workspace_error_code_t code,
                    const char* message) {
-    if (result || result.error().code != code)
+	const bool accepted = !result && result.error().code == code;
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(message);
 }
 
@@ -915,6 +924,7 @@ int main() {
         std::cout << "collection_graph_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::filesystem::remove_all(root, ignored);
         std::cerr << error.what() << '\n';
         return 1;

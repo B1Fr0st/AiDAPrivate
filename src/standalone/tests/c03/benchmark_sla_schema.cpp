@@ -1,4 +1,5 @@
 #include "benchmark_sla_schema.hpp"
+#include "evidence_hash.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6,6 +7,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <set>
 #include <string_view>
 #include <vector>
@@ -197,6 +199,52 @@ bool add_without_overflow(std::uint64_t& aggregate, std::uint64_t value)
     return true;
 }
 
+void validate_evidence_bindings(contract_validation_result_t& result, const json& bindings,
+    std::map<std::string, std::string, std::less<>>& binding_hashes)
+{
+    if (!bindings.is_array()) {
+        result.reject("/provenance/evidence_bindings", "array_required", "expected an array");
+        return;
+    }
+    if (bindings.empty())
+        result.reject("/provenance/evidence_bindings", "min_items", "benchmark file evidence bindings are required");
+    for (std::size_t index = 0; index < bindings.size(); ++index) {
+        const auto& binding = bindings[index];
+        const std::string path = "/provenance/evidence_bindings/" + std::to_string(index);
+        require_closed_object(result, binding, path, {"id", "kind", "path", "sha256", "max_bytes"});
+        const bool id_valid = require_string(result, binding, path, "id");
+        require_string(result, binding, path, "kind");
+        if (require_string(result, binding, path, "path")) {
+            const auto value = binding.at("path").get<std::string>();
+            if (value.find("..") != std::string::npos || (!value.empty() && (value.front() == '/' || value.front() == '\\')) ||
+                value.find(':') != std::string::npos)
+                result.reject(path + "/path", "path_scope", "evidence binding path must be repository-relative");
+        }
+        const bool hash_valid = require_sha256(result, binding, path, "sha256");
+        const json* max_bytes = require_field(result, binding, path, "max_bytes");
+        if (max_bytes && (!is_nonnegative_integer(*max_bytes) || max_bytes->get<std::uint64_t>() == 0 ||
+            max_bytes->get<std::uint64_t>() > 4ULL * 1024ULL * 1024ULL * 1024ULL))
+            result.reject(path + "/max_bytes", "bounded_positive_integer_required", "evidence byte limit is invalid");
+        if (id_valid && hash_valid && !binding_hashes.emplace(binding.at("id").get<std::string>(),
+            binding.at("sha256").get<std::string>()).second)
+            result.reject(path + "/id", "duplicate_binding", "evidence binding identifier is duplicated");
+    }
+}
+
+void validate_bound_hash(contract_validation_result_t& result,
+    const std::map<std::string, std::string, std::less<>>& bindings,
+    const json& object, std::string_view path, std::string_view binding_name, std::string_view hash_name)
+{
+    const bool binding_valid = require_string(result, object, path, binding_name);
+    const bool hash_valid = require_sha256(result, object, path, hash_name);
+    if (!binding_valid || !hash_valid)
+        return;
+    const auto binding = bindings.find(object.at(std::string(binding_name)).get<std::string>());
+    if (binding == bindings.end() || binding->second != object.at(std::string(hash_name)).get<std::string>())
+        result.reject(std::string(path) + "/" + std::string(binding_name), "binding_hash_mismatch",
+            "declared digest does not match its file evidence binding");
+}
+
 void validate_matrix(contract_validation_result_t& result, const json& matrix, std::string_view path)
 {
     require_closed_object(result, matrix, path,
@@ -290,8 +338,8 @@ const json& approved_external_sla_slot()
             {"approval_id", "aida.c03.release-sla.external-slot.2026-07-12.v1"},
             {"policy_version", 1}, {"status", "approved"}}},
         {"generator_source", {
-            {"path", "src/standalone/tests/c03/fixtures/corpus_generator_recipes.json"},
-            {"sha256", "1ab887cc868b81e3cbc30c3fd840d287d8c68dc67b4047682d69d1dc5e4053d5"}}},
+            {"path", "src/standalone/tests/c03/fixtures/external_sla_qualification_policy.json"},
+            {"sha256", "72670c1cf56cc13252aa63dff99337e0bf1fd7c7c60ca286c1468941092e306b"}}},
         {"license", {
             {"policy_id", "aida.c03.license-clean-redistributable.v1"},
             {"policy_version", 1},
@@ -309,17 +357,16 @@ const json& approved_external_sla_slot()
 const json& benchmark_sla_receipt_schema()
 {
     static const json schema = json::parse(R"schema({
-        "$schema":"https://json-schema.org/draft-07/schema#",
         "$id":"aida.c03.benchmark-sla-receipt.v2",
         "type":"object",
-        "required":["schema","schema_version","receipt_id","mode","claim_status","provenance","corpus","matrix","hardware","cache","resource_quotas","sample_policy","samples","aggregate","thresholds","receipt_sha256"],
+        "required":["schema","schema_version","receipt_id","mode","claim_status","provenance","thresholds","receipt_sha256"],
         "additionalProperties":false,
         "properties":{
             "schema":{"const":"aida.c03.benchmark-sla-receipt"},
             "schema_version":{"const":2},
             "receipt_id":{"type":"string","minLength":1},
             "mode":{"enum":["deterministic_component","release_sla"]},
-            "claim_status":{"enum":["development_only","measured"]},
+            "claim_status":{"enum":["development_only","measured","NOT RUN - NO QUALIFYING LOCAL FIXTURE"]},
             "provenance":{"type":"object"},
             "corpus":{"type":"object"},
             "matrix":{"type":"object"},
@@ -330,8 +377,23 @@ const json& benchmark_sla_receipt_schema()
             "samples":{"type":"array","minItems":1},
             "aggregate":{"type":"object"},
             "thresholds":{"type":"object"},
+            "external_slot":{"type":"object"},
+            "not_run":{"type":"object"},
             "receipt_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}
-        }
+        },
+        "oneOf":[
+            {"required":["corpus","matrix","hardware","cache","resource_quotas","sample_policy","samples","aggregate"],
+             "not":{"anyOf":[{"required":["external_slot"]},{"required":["not_run"]}]},
+             "anyOf":[
+                 {"properties":{"mode":{"const":"deterministic_component"},"claim_status":{"const":"development_only"}}},
+                 {"properties":{"mode":{"const":"release_sla"},"claim_status":{"const":"measured"}}}
+             ]},
+            {"required":["external_slot","not_run"],
+             "properties":{"mode":{"const":"release_sla"},"claim_status":{"const":"NOT RUN - NO QUALIFYING LOCAL FIXTURE"}},
+             "not":{"anyOf":[{"required":["corpus"]},{"required":["matrix"]},{"required":["hardware"]},
+                 {"required":["cache"]},{"required":["resource_quotas"]},{"required":["sample_policy"]},
+                 {"required":["samples"]},{"required":["aggregate"]}]}}
+        ]
     })schema");
     return schema;
 }
@@ -423,7 +485,8 @@ contract_validation_result_t validate_benchmark_sla_receipt(const json& receipt,
     contract_validation_result_t result;
     require_closed_object(result, receipt, "",
         {"schema", "schema_version", "receipt_id", "mode", "claim_status", "provenance", "corpus", "matrix",
-         "hardware", "cache", "resource_quotas", "sample_policy", "samples", "aggregate", "thresholds", "receipt_sha256"});
+         "hardware", "cache", "resource_quotas", "sample_policy", "samples", "aggregate", "thresholds",
+         "external_slot", "not_run", "receipt_sha256"});
     if (require_string(result, receipt, "", "schema") && receipt.at("schema") != "aida.c03.benchmark-sla-receipt")
         result.reject("/schema", "schema_id", "unexpected benchmark SLA receipt schema identifier");
     const json* version = require_field(result, receipt, "", "schema_version");
@@ -433,6 +496,7 @@ contract_validation_result_t validate_benchmark_sla_receipt(const json& receipt,
     require_sha256(result, receipt, "", "receipt_sha256");
 
     bool release_sla = false;
+    bool not_run = false;
     bool approved_slot_valid = true;
     if (require_string(result, receipt, "", "mode")) {
         const auto mode = receipt.at("mode").get<std::string>();
@@ -448,28 +512,109 @@ contract_validation_result_t validate_benchmark_sla_receipt(const json& receipt,
     }
     if (require_string(result, receipt, "", "claim_status")) {
         const auto claim_status = receipt.at("claim_status").get<std::string>();
-        if ((release_sla && claim_status != "measured") || (!release_sla && claim_status != "development_only"))
+        not_run = release_sla && claim_status == "NOT RUN - NO QUALIFYING LOCAL FIXTURE";
+        if ((release_sla && claim_status != "measured" && !not_run) || (!release_sla && claim_status != "development_only"))
             result.reject("/claim_status", "claim_status", "claim status does not match benchmark mode");
     }
 
+    if (not_run) {
+        require_closed_object(result, receipt, "",
+            {"schema", "schema_version", "receipt_id", "mode", "claim_status", "provenance", "external_slot",
+             "not_run", "thresholds", "receipt_sha256"});
+        const json* provenance = require_field(result, receipt, "", "provenance");
+        std::map<std::string, std::string, std::less<>> binding_hashes;
+        if (provenance) {
+            require_closed_object(result, *provenance, "/provenance",
+                {"authorization_id", "harness_build_sha256", "runtime_build_sha256", "manifest_sha256",
+                 "policy_sha256", "harness_binding_id", "runtime_binding_id", "manifest_binding_id",
+                 "policy_binding_id", "evidence_bindings"});
+            require_string(result, *provenance, "/provenance", "authorization_id");
+            const json* bindings = require_field(result, *provenance, "/provenance", "evidence_bindings");
+            if (bindings)
+                validate_evidence_bindings(result, *bindings, binding_hashes);
+            validate_bound_hash(result, binding_hashes, *provenance, "/provenance",
+                "harness_binding_id", "harness_build_sha256");
+            validate_bound_hash(result, binding_hashes, *provenance, "/provenance",
+                "runtime_binding_id", "runtime_build_sha256");
+            validate_bound_hash(result, binding_hashes, *provenance, "/provenance",
+                "manifest_binding_id", "manifest_sha256");
+            validate_bound_hash(result, binding_hashes, *provenance, "/provenance",
+                "policy_binding_id", "policy_sha256");
+            if (provenance->contains("policy_sha256") && is_sha256(provenance->at("policy_sha256")) &&
+                provenance->at("policy_sha256") != approved_external_sla_slot().at("generator_source").at("sha256"))
+                result.reject("/provenance/policy_sha256", "source_provenance_mismatch",
+                    "not-run evidence does not bind the approved qualification policy");
+        }
+        const json* slot = require_field(result, receipt, "", "external_slot");
+        if (slot) {
+            const auto slot_result = validate_external_sla_slot(*slot);
+            for (const auto& violation : slot_result.violations)
+                result.reject("/external_slot" + violation.path, violation.code, violation.message);
+        }
+        const json* reason = require_field(result, receipt, "", "not_run");
+        if (reason) {
+            require_closed_object(result, *reason, "/not_run",
+                {"reason", "searched_roots", "candidate_count", "rejection_evidence", "target_execution_forbidden"});
+            if (require_string(result, *reason, "/not_run", "reason") &&
+                reason->at("reason") != "NO QUALIFYING LOCAL FIXTURE")
+                result.reject("/not_run/reason", "not_run_reason", "not-run reason must be exact and truthful");
+            const json* roots = require_field(result, *reason, "/not_run", "searched_roots");
+            if (!roots || !roots->is_array() || roots->empty())
+                result.reject("/not_run/searched_roots", "min_items", "searched local roots are required");
+            require_nonnegative_integer(result, *reason, "/not_run", "candidate_count");
+            const json* rejections = require_field(result, *reason, "/not_run", "rejection_evidence");
+            if (!rejections || !rejections->is_array())
+                result.reject("/not_run/rejection_evidence", "array_required", "candidate rejection evidence is required");
+            else if (reason->contains("candidate_count") && is_nonnegative_integer(reason->at("candidate_count")) &&
+                reason->at("candidate_count").get<std::uint64_t>() != rejections->size())
+                result.reject("/not_run/candidate_count", "candidate_count_mismatch",
+                    "candidate count must equal the rejection evidence cardinality");
+            require_bool(result, *reason, "/not_run", "target_execution_forbidden", true);
+        }
+        const json* thresholds = require_field(result, receipt, "", "thresholds");
+        if (thresholds && !has_exact_thresholds(*thresholds))
+            result.reject("/thresholds", "threshold_drift", "receipt thresholds must equal the C03 SLA contract");
+        std::string receipt_hash_error;
+        if (!verify_canonical_receipt_hash(receipt, "receipt_sha256", receipt_hash_error))
+            result.reject("/receipt_sha256", "receipt_hash", receipt_hash_error);
+        return result;
+    }
+
     const json* provenance = require_field(result, receipt, "", "provenance");
+    std::map<std::string, std::string, std::less<>> binding_hashes;
     if (provenance) {
         require_closed_object(result, *provenance, "/provenance",
-            {"authorization_id", "harness_build_sha256", "runtime_build_sha256", "manifest_sha256"});
+            {"authorization_id", "harness_build_sha256", "runtime_build_sha256", "manifest_sha256",
+             "harness_binding_id", "runtime_binding_id", "manifest_binding_id", "evidence_bindings"});
         require_string(result, *provenance, "/provenance", "authorization_id");
-        for (const std::string_view field : {"harness_build_sha256", "runtime_build_sha256", "manifest_sha256"})
-            require_sha256(result, *provenance, "/provenance", field);
+        const json* bindings = require_field(result, *provenance, "/provenance", "evidence_bindings");
+        if (bindings)
+            validate_evidence_bindings(result, *bindings, binding_hashes);
+        validate_bound_hash(result, binding_hashes, *provenance, "/provenance",
+            "harness_binding_id", "harness_build_sha256");
+        validate_bound_hash(result, binding_hashes, *provenance, "/provenance",
+            "runtime_binding_id", "runtime_build_sha256");
+        validate_bound_hash(result, binding_hashes, *provenance, "/provenance",
+            "manifest_binding_id", "manifest_sha256");
     }
 
     const json* corpus = require_field(result, receipt, "", "corpus");
     if (corpus) {
         require_closed_object(result, *corpus, "/corpus",
-            {"external_slot_id", "slot_approval_id", "license_policy_id", "license_policy_version", "artifact", "license", "source_provenance_sha256"});
+            {"external_slot_id", "slot_approval_id", "license_policy_id", "license_policy_version", "artifact", "license",
+             "source_provenance_sha256", "source_binding_id"});
         const bool slot_id_valid = require_string(result, *corpus, "/corpus", "external_slot_id");
         const bool approval_id_valid = require_string(result, *corpus, "/corpus", "slot_approval_id");
         const bool license_policy_id_valid = require_string(result, *corpus, "/corpus", "license_policy_id");
         const bool license_policy_version_valid = require_positive_integer(result, *corpus, "/corpus", "license_policy_version");
         const bool source_provenance_valid = require_sha256(result, *corpus, "/corpus", "source_provenance_sha256");
+        const bool source_binding_valid = require_string(result, *corpus, "/corpus", "source_binding_id");
+        if (source_binding_valid && source_provenance_valid) {
+            const auto binding = binding_hashes.find(corpus->at("source_binding_id").get<std::string>());
+            if (binding == binding_hashes.end() || binding->second != corpus->at("source_provenance_sha256").get<std::string>())
+                result.reject("/corpus/source_binding_id", "binding_hash_mismatch",
+                    "corpus provenance does not match its file evidence binding");
+        }
         if (release_sla && approved_slot_valid && slot_id_valid && corpus->at("external_slot_id") != approved_external_slot.at("slot_id"))
             result.reject("/corpus/external_slot_id", "unapproved_external_slot", "receipt does not bind the approved external slot");
         if (release_sla && approved_slot_valid && approval_id_valid &&
@@ -488,12 +633,53 @@ contract_validation_result_t validate_benchmark_sla_receipt(const json& receipt,
         const json* artifact = require_field(result, *corpus, "/corpus", "artifact");
         if (artifact) {
             require_closed_object(result, *artifact, "/corpus/artifact",
-                {"sha256", "size_bytes", "format", "architecture", "mode", "endian", "external"});
+                {"sha256", "size_bytes", "format", "architecture", "mode", "endian", "external", "binding_id", "qualification"});
             require_sha256(result, *artifact, "/corpus/artifact", "sha256");
             require_positive_integer(result, *artifact, "/corpus/artifact", "size_bytes");
             for (const std::string_view field : {"format", "architecture", "mode", "endian"})
                 require_string(result, *artifact, "/corpus/artifact", field);
             require_bool(result, *artifact, "/corpus/artifact", "external", release_sla);
+            const bool artifact_binding_valid = require_string(result, *artifact, "/corpus/artifact", "binding_id");
+            if (artifact_binding_valid && artifact->contains("sha256") && is_sha256(artifact->at("sha256"))) {
+                const auto binding = binding_hashes.find(artifact->at("binding_id").get<std::string>());
+                if (binding == binding_hashes.end() || binding->second != artifact->at("sha256").get<std::string>())
+                    result.reject("/corpus/artifact/binding_id", "binding_hash_mismatch",
+                        "artifact digest does not match its file evidence binding");
+            }
+            const json* qualification = require_field(result, *artifact, "/corpus/artifact", "qualification");
+            if (qualification) {
+                require_closed_object(result, *qualification, "/corpus/artifact/qualification",
+                    {"classification", "production_identity", "version", "executable_bytes", "zero_bytes",
+                     "code_density", "zero_ratio", "pdb", "static_library", "installer_only", "fabricated",
+                     "code_image", "target_execution_forbidden"});
+                for (const std::string_view field : {"classification", "production_identity", "version"})
+                    require_string(result, *qualification, "/corpus/artifact/qualification", field);
+                for (const std::string_view field : {"executable_bytes", "zero_bytes"})
+                    require_nonnegative_integer(result, *qualification, "/corpus/artifact/qualification", field);
+                for (const std::string_view field : {"code_density", "zero_ratio"}) {
+                    const json* ratio = require_field(result, *qualification, "/corpus/artifact/qualification", field);
+                    if (ratio && (!is_nonnegative_number(*ratio) || ratio->get<double>() > 1.0))
+                        result.reject("/corpus/artifact/qualification/" + std::string(field), "ratio_required", "expected a finite ratio");
+                }
+                for (const std::string_view field : {"pdb", "static_library", "installer_only", "fabricated"})
+                    require_bool(result, *qualification, "/corpus/artifact/qualification", field, false);
+                require_bool(result, *qualification, "/corpus/artifact/qualification", "code_image", true);
+                require_bool(result, *qualification, "/corpus/artifact/qualification", "target_execution_forbidden", true);
+                if (release_sla) {
+                    if (qualification->value("classification", std::string{}) != "production_code_image")
+                        result.reject("/corpus/artifact/qualification/classification", "release_fixture_classification",
+                            "release SLA requires a production code image");
+                    if (qualification->value("executable_bytes", 0ULL) < 64ULL * 1024ULL * 1024ULL)
+                        result.reject("/corpus/artifact/qualification/executable_bytes", "release_executable_volume",
+                            "release SLA requires at least 64 MiB of executable bytes");
+                    if (qualification->value("code_density", 0.0) < 0.10)
+                        result.reject("/corpus/artifact/qualification/code_density", "release_code_density",
+                            "release SLA fixture code density is too low");
+                    if (qualification->value("zero_ratio", 1.0) > 0.80)
+                        result.reject("/corpus/artifact/qualification/zero_ratio", "release_zero_padding",
+                            "release SLA fixture is dominated by zero padding");
+                }
+            }
             if (release_sla && artifact->contains("size_bytes") && is_nonnegative_integer(artifact->at("size_bytes"))) {
                 const auto size = artifact->at("size_bytes").get<std::uint64_t>();
                 const auto minimum = benchmark_sla_thresholds().at("release_min_artifact_bytes").get<std::uint64_t>();
@@ -815,6 +1001,36 @@ contract_validation_result_t validate_benchmark_sla_receipt(const json& receipt,
         fail_if_peak_exceeds("spill_peak_bytes", "spill_bytes_max");
         fail_if_peak_exceeds("spill_written_total_bytes", "spill_written_total_bytes_max");
         fail_if_peak_exceeds("spill_read_total_bytes", "spill_read_total_bytes_max");
+    }
+    std::string receipt_hash_error;
+    if (!verify_canonical_receipt_hash(receipt, "receipt_sha256", receipt_hash_error))
+        result.reject("/receipt_sha256", "receipt_hash", receipt_hash_error);
+    return result;
+}
+
+contract_validation_result_t validate_benchmark_sla_receipt_files(const json& receipt,
+    const json& approved_external_slot, const std::filesystem::path& evidence_root)
+{
+    auto result = validate_benchmark_sla_receipt(receipt, approved_external_slot);
+    if (!receipt.is_object() || !receipt.contains("provenance") || !receipt.at("provenance").is_object() ||
+        !receipt.at("provenance").contains("evidence_bindings") ||
+        !receipt.at("provenance").at("evidence_bindings").is_array())
+        return result;
+    const auto& bindings = receipt.at("provenance").at("evidence_bindings");
+    for (std::size_t index = 0; index < bindings.size(); ++index) {
+        const auto& binding = bindings[index];
+        if (!binding.is_object() || !binding.contains("path") || !binding.at("path").is_string() ||
+            !binding.contains("sha256") || !binding.at("sha256").is_string() ||
+            !binding.contains("max_bytes") || !is_nonnegative_integer(binding.at("max_bytes")))
+            continue;
+        const auto observed = sha256_repository_evidence_file(evidence_root,
+            binding.at("path").get<std::string>(), binding.at("max_bytes").get<std::uint64_t>());
+        if (!observed.ok)
+            result.reject("/provenance/evidence_bindings/" + std::to_string(index) + "/path",
+                "evidence_read", observed.error);
+        else if (observed.sha256 != binding.at("sha256").get<std::string>())
+            result.reject("/provenance/evidence_bindings/" + std::to_string(index) + "/sha256",
+                "evidence_hash_mismatch", "evidence file hash differs from the receipt binding");
     }
     return result;
 }

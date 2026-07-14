@@ -1,4 +1,5 @@
 #include "image_layout_index_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/image_layout_index.hpp"
 
@@ -19,6 +20,7 @@ namespace c03_test {
 namespace {
 
 void require(bool condition, const char* message) {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -466,6 +468,7 @@ int main() {
         std::cout << "image_layout_index_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

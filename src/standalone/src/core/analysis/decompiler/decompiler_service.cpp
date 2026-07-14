@@ -1,6 +1,7 @@
 #include "decompiler_service.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
@@ -158,10 +159,18 @@ bool valid_config(const decompiler_pipeline_service_config_t& value) noexcept
            value.max_diagnostics <= std::numeric_limits<std::uint32_t>::max() &&
            value.max_provider_payload_bytes != 0 && value.max_normalized_payload_bytes != 0 &&
            value.ast_limits.max_hir_values != 0 && value.ast_limits.max_ast_nodes >= 3 &&
-           value.ast_limits.max_expression_nesting != 0 && value.renderer_limits.max_ast_nodes != 0 &&
-           value.renderer_limits.max_output_bytes != 0 && value.renderer_limits.max_tokens != 0 &&
-           value.renderer_limits.max_source_maps != 0 && value.renderer_limits.max_nesting != 0 &&
-           valid_profile_policy(value.profiles);
+            value.ast_limits.max_expression_nesting != 0 && value.renderer_limits.max_ast_nodes != 0 &&
+            value.renderer_limits.max_output_bytes != 0 && value.renderer_limits.max_tokens != 0 &&
+            value.renderer_limits.max_source_maps != 0 && value.renderer_limits.max_nesting != 0 &&
+            value.readability_limits.max_ast_nodes != 0 &&
+            value.readability_limits.max_traversal_edges != 0 &&
+            value.readability_limits.max_nesting != 0 &&
+            value.readability_limits.max_document_bytes != 0 &&
+            value.readability_limits.max_tokens != 0 &&
+            value.readability_limits.max_source_maps != 0 &&
+            value.readability_limits.max_diagnostics != 0 &&
+            value.readability_limits.max_unknowns != 0 &&
+            valid_profile_policy(value.profiles);
 }
 
 std::chrono::steady_clock::time_point minimum_deadline(
@@ -330,6 +339,79 @@ bool equivalent_attested_document(
     canonical_rendered.diagnostics.clear();
     return serialize_decompiler_document(canonical_attested) ==
            serialize_decompiler_document(canonical_rendered);
+}
+
+std::vector<semantic_refinement_query_t> produce_semantic_queries(
+    const hir_function_t& hir,
+    const std::uint32_t maximum)
+{
+    std::vector<semantic_refinement_query_t> result;
+    if (maximum == 0)
+        return result;
+    result.reserve((std::min<std::size_t>)(maximum, 256));
+    for (const auto& block : hir.blocks) {
+        for (const auto& value : block.values) {
+            if (result.size() >= maximum)
+                return result;
+            if (value.kind != hir_node_kind_t::literal || value.stable_value.empty() ||
+                value.coordinate.layer != decompiler_coordinate_layer_t::hir)
+                continue;
+            std::uint64_t literal = 0;
+            auto begin = value.stable_value.data();
+            auto end = begin + value.stable_value.size();
+            int base = 10;
+            if (value.stable_value.size() > 2 && value.stable_value[0] == '0' &&
+                (value.stable_value[1] == 'x' || value.stable_value[1] == 'X')) {
+                begin += 2;
+                base = 16;
+            }
+            const auto parsed = std::from_chars(begin, end, literal, base);
+            if (parsed.ec != std::errc{} || parsed.ptr != end)
+                continue;
+            semantic_refinement_query_t query;
+            query.ordinal = static_cast<std::uint64_t>(result.size() + 1);
+            query.stable_id = "literal_" + std::to_string(value.id);
+            query.coordinate = value.coordinate;
+            query.refinement_key = "literal_constant_" + std::to_string(value.id);
+            query.static_ir.domain = triton_z3_semantic_domain_t::constant;
+            triton_z3_ir_node_t observed;
+            observed.id = 1;
+            observed.opcode = triton_z3_ir_opcode_t::bitvector_constant;
+            observed.bit_width = 64;
+            observed.literal = literal;
+            triton_z3_ir_node_t expected = observed;
+            expected.id = 2;
+            triton_z3_ir_node_t equality;
+            equality.id = 3;
+            equality.opcode = triton_z3_ir_opcode_t::equal;
+            equality.bit_width = 1;
+            equality.lhs_id = observed.id;
+            equality.rhs_id = expected.id;
+            query.static_ir.nodes = {observed, expected, equality};
+            query.static_ir.root_node_id = equality.id;
+            if (valid_triton_z3_static_ir(query.static_ir))
+                result.push_back(std::move(query));
+        }
+    }
+    return result;
+}
+
+workspace_result_t<pseudocode_readability_report_t> readability_report(
+    const decompiler_document_t& document,
+    const decompiler_pipeline_service_config_t& config)
+{
+    pseudocode_readability_request_t request;
+    request.limits = config.readability_limits;
+    request.require_complete_source_map = config.require_complete_source_map;
+    auto analyzed = analyze_pseudocode_readability(document.ast, document, request);
+    if (!analyzed.succeeded() || !analyzed.report) {
+        return workspace_result_t<pseudocode_readability_report_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "rendered pseudocode failed the readability contract",
+            "decompiler.pipeline.readability"));
+    }
+    return workspace_result_t<pseudocode_readability_report_t>::success(
+        std::move(*analyzed.report));
 }
 
 bool equal_language(
@@ -953,6 +1035,16 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             result.rendered_stage = rendered_lookup.value().value;
             result.cache_hit_stage = decompiler_cache_stage_t::rendered_document;
             result.diagnostics = result.rendered_stage->diagnostics;
+            auto readability = readability_report(
+                result.rendered_stage->document, state_->config);
+            if (!readability) {
+                result.diagnostics.push_back(pipeline_diagnostic(
+                    decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::malformed_document,
+                    "decompiler.pipeline.readability.rejected"));
+                return finish(decompiler_pipeline_status_t::rendering_failed);
+            }
+            result.readability = readability.take_value();
             {
                 std::lock_guard lock(state_->metrics_mutex);
                 ++state_->metrics.rendered_cache_hits;
@@ -1093,11 +1185,11 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             }
             return finish(provider_failure_status(provider_result.status, operation_cancel));
         }
-        if (route.value().descriptor.isolated && !provider_result.attested_document) {
+        if (route.value().descriptor.isolated && !provider_result.authenticated_artifacts) {
             result.diagnostics.push_back(pipeline_diagnostic(
                 decompiler_diagnostic_severity_t::error,
                 decompiler_diagnostic_code_t::worker_protocol_failure,
-                "decompiler.pipeline.provider.attested_document_required"));
+                "decompiler.pipeline.provider.authenticated_artifacts_required"));
             return finish(decompiler_pipeline_status_t::provider_failed);
         }
         deferred_intermediate_cache_writes = provider_result.attested_document.has_value();
@@ -1137,6 +1229,22 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
             : static_cast<std::uint64_t>(measured_provider_ms);
         provider_stage.provider_cpu_ms = provider_result.elapsed_cpu_ms;
         provider_stage.provider_peak_memory_bytes = provider_result.peak_memory_bytes;
+
+        if (!request.type_evidence.empty()) {
+            auto merged_types = type_graph::merge_type_evidence(
+                std::move(provider_stage.provider_type_graph), request.type_evidence);
+            if (!merged_types) {
+                provider_stage.diagnostics.push_back(pipeline_diagnostic(
+                    decompiler_diagnostic_severity_t::error,
+                    decompiler_diagnostic_code_t::malformed_type_graph,
+                    "decompiler.pipeline.type_evidence.rejected"));
+                result.diagnostics = std::move(provider_stage.diagnostics);
+                return finish(merged_types.error().code == workspace_error_code_t::limit_exceeded
+                    ? decompiler_pipeline_status_t::resource_limit
+                    : decompiler_pipeline_status_t::normalization_failed);
+            }
+            provider_stage.provider_type_graph = merged_types.take_value();
+        }
 
         if (!validate_provider_ir(provider_stage.provider_ir).valid() ||
             !validate_type_graph(provider_stage.provider_type_graph).valid() ||
@@ -1213,12 +1321,16 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
                 : decompiler_pipeline_status_t::normalization_failed);
         }
 
+        auto semantic_queries = result.provider_stage->semantic_queries;
         if (budget->profile == decompiler_profile_id_t::thorough &&
-            !result.provider_stage->semantic_queries.empty()) {
+            budget->semantic_proofs_enabled && semantic_queries.empty())
+            semantic_queries = produce_semantic_queries(hir, budget->max_semantic_queries);
+        if (budget->profile == decompiler_profile_id_t::thorough &&
+            budget->semantic_proofs_enabled && !semantic_queries.empty()) {
             semantic_refinement_request_t refinement_request;
             refinement_request.profile = *budget;
             refinement_request.function = hir;
-            refinement_request.queries = result.provider_stage->semantic_queries;
+            refinement_request.queries = std::move(semantic_queries);
             const auto refinement = state_->semantic_refiner->refine(refinement_request, operation_cancel);
             append_diagnostics(diagnostics, refinement.diagnostics);
             if (refinement.status == semantic_refinement_status_t::cancelled) {
@@ -1333,7 +1445,18 @@ decompiler_pipeline_result_t decompiler_pipeline_service_t::decompile(
         result.diagnostics = std::move(diagnostics);
         return finish(decompiler_pipeline_status_t::rendering_failed);
     }
-    if (attested_document &&
+    auto readability = readability_report(*rendering.document, state_->config);
+    if (!readability) {
+        diagnostics.push_back(pipeline_diagnostic(
+            decompiler_diagnostic_severity_t::error,
+            decompiler_diagnostic_code_t::malformed_document,
+            "decompiler.pipeline.readability.rejected"));
+        result.diagnostics = std::move(diagnostics);
+        return finish(decompiler_pipeline_status_t::rendering_failed);
+    }
+    result.readability = readability.take_value();
+    if (attested_document && request.type_evidence.empty() &&
+        result.normalized_stage->semantic_facts.empty() &&
         !equivalent_attested_document(*attested_document, *rendering.document)) {
         diagnostics.push_back(pipeline_diagnostic(
             decompiler_diagnostic_severity_t::error,

@@ -1,5 +1,7 @@
 ﻿#include "tile_decode_orchestrator_harness.hpp"
 
+#include "assertion_telemetry/assertion_telemetry.hpp"
+
 #include "../../src/core/analysis/image_layout_index.hpp"
 #include "../../src/core/analysis/packed_analysis_store.hpp"
 #include "../../src/core/analysis/provider_snapshot.hpp"
@@ -29,6 +31,7 @@ namespace {
 
 void require(bool condition, std::string_view message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -1652,6 +1655,7 @@ bool run_tile_decode_orchestrator_harness(std::string& failure)
         test_randomized_scheduling_byte_identical();
         return true;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure = error.what();
         return false;
     }

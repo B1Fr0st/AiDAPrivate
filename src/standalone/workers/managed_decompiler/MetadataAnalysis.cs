@@ -5,7 +5,6 @@ using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text;
-using Microsoft.Win32.SafeHandles;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.Metadata;
@@ -37,42 +36,53 @@ internal sealed record ModuleSnapshot(byte[] Bytes, string Sha256);
 
 internal static class MetadataAnalysis
 {
-    private const long MaximumModuleBytes = int.MaxValue;
+    private const long MaximumModuleBytes = 256L * 1024L * 1024L;
     private const int MaximumSourceBytes = 8 * 1024 * 1024;
     private const int MaximumMetadataEntries = 1_048_576;
-    private static readonly object ModuleHandleGate = new();
-    private static nint moduleHandle;
+    private const string ManagedContractHash = "4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6";
+    private const string ManagedWorkerBuildId = "aida-managed-decompiler-worker-v3";
+    private const string ManagedWorkerBuildHash = "4dd8c0d095629437387a4b631fd9ac3c3cb8e840f6b7af277ccc2ad49d4bc3b7";
+    private static readonly object ModuleSnapshotGate = new();
+    private static ModuleSnapshot? moduleSnapshot;
 
-    internal static void EstablishModuleHandle(string value)
+    internal static void EstablishModuleSnapshot(byte[] bytes)
     {
-        if (!ulong.TryParse(value, out var raw) || raw == 0 || raw > (ulong)nint.MaxValue)
-            throw new InvalidDataException("module handle is invalid");
-        var rawHandle = (nint)raw;
-        var candidate = new SafeFileHandle(rawHandle, ownsHandle: false);
-        if (candidate.IsInvalid || candidate.IsClosed)
-            throw new InvalidDataException("module handle is unavailable");
-        using (var stream = new FileStream(candidate, FileAccess.Read, 1, isAsync: false))
+        ArgumentNullException.ThrowIfNull(bytes);
+        if (bytes.Length == 0 || bytes.LongLength > MaximumModuleBytes)
+            throw new InvalidDataException("module snapshot length is invalid");
+        var hash = SHA256.HashData(bytes);
+        var snapshot = new ModuleSnapshot(bytes, Convert.ToHexString(hash).ToLowerInvariant());
+        CryptographicOperations.ZeroMemory(hash);
+        lock (ModuleSnapshotGate)
         {
-            if (stream.Length <= 0 || stream.Length > MaximumModuleBytes)
-                throw new InvalidDataException("module handle length is invalid");
+            if (moduleSnapshot is not null)
+                throw new InvalidDataException("module snapshot was already established");
+            moduleSnapshot = snapshot;
         }
-        lock (ModuleHandleGate)
+    }
+
+    internal static void ReleaseModuleSnapshot()
+    {
+        ModuleSnapshot? snapshot;
+        lock (ModuleSnapshotGate)
         {
-            if (moduleHandle != 0)
-                throw new InvalidDataException("module handle was already established");
-            moduleHandle = rawHandle;
+            snapshot = moduleSnapshot;
+            moduleSnapshot = null;
         }
+        if (snapshot is not null)
+            CryptographicOperations.ZeroMemory(snapshot.Bytes);
     }
 
     internal static WorkerResult Analyze(WorkerRequest request, ResourceBudgetGuard resourceBudget, CancellationToken cancellationToken)
     {
         ValidateRequest(request);
-        OfflinePackageLock.RequireRuntimeGate(request.OfflineLockHash, resourceBudget, cancellationToken);
+        RuntimeIdentity.RequireRuntimeGate(request.RuntimeManifestHash, resourceBudget, cancellationToken);
         resourceBudget.Checkpoint(cancellationToken);
 
         var snapshot = ReadVerifiedSnapshot(request, resourceBudget, cancellationToken);
         using var stream = new MemoryStream(snapshot.Bytes, writable: false);
-        using var module = new PEFile(request.ModulePath, stream, PEStreamOptions.LeaveOpen, MetadataReaderOptions.None);
+        using var module = new PEFile(request.ModuleSource.LogicalIdentity, stream,
+            PEStreamOptions.LeaveOpen, MetadataReaderOptions.None);
         var peReader = module.Reader;
         if (!peReader.HasMetadata)
             throw new BadImageFormatException("target does not contain CLI metadata");
@@ -90,6 +100,7 @@ internal static class MetadataAnalysis
             throw new ResourceLimitException(ResourceLimitKind.Memory);
         resourceBudget.EnsureAllocationFits(checked((ulong)sourceByteCount), cancellationToken);
         var sourceHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(source))).ToLowerInvariant();
+        RevalidateSnapshot(snapshot, request, resourceBudget, cancellationToken);
 
         return new WorkerResult(
             WorkerProtocol.Schema,
@@ -97,10 +108,17 @@ internal static class MetadataAnalysis
             "result",
             request.Sequence,
             request.RequestId,
-            snapshot.Sha256,
+            request.ModuleSource,
+            request.EntityHash,
             request.MetadataToken,
-            OfflinePackageLock.ManifestHashHex,
-            new WorkerProvider(request.Provider.Version, OfflinePackageLock.DecompilerAssemblySha256),
+            request.WorkspaceGeneration,
+            request.TypeGraphRevision,
+            request.Budget,
+            RuntimeIdentity.ManifestHashHex,
+            request.ContractHash,
+            request.CacheIdentity,
+            request.RequestBindingHash,
+            request.Provider,
             parsed.Identity,
             new WorkerSource(source, sourceHash),
             parsed.TokenMap,
@@ -115,20 +133,23 @@ internal static class MetadataAnalysis
     {
         if (!string.Equals(request.Schema, WorkerProtocol.Schema, StringComparison.Ordinal) || request.SchemaVersion != WorkerProtocol.Version ||
             !string.Equals(request.Kind, "decompile", StringComparison.Ordinal) || request.Sequence == 0 || string.IsNullOrWhiteSpace(request.RequestId) ||
-            request.RequestId.Length > 128 || request.RequestId.Contains('\0') || string.IsNullOrWhiteSpace(request.ModulePath) ||
-            request.ModulePath.Length > 32768 || request.ModulePath.Contains('\0') ||
-            !Path.IsPathFullyQualified(request.ModulePath) || request.WorkspaceGeneration == 0 || request.MetadataToken == 0 ||
-            request.Budget is null || request.Provider is null || !IsLowerHexDigest(request.ModuleHash) ||
-            !FixedTimeHexEquals(request.OfflineLockHash, OfflinePackageLock.ManifestHashHex) ||
+            request.RequestId.Length > 128 || request.RequestId.Contains('\0') || request.ModuleSource is null ||
+            !ValidModuleSource(request.ModuleSource) || request.WorkspaceGeneration == 0 ||
+            (request.MetadataToken >> 24) != 0x06 || (request.MetadataToken & 0x00ffffffU) == 0 ||
+            request.TypeGraphRevision == 0 || request.Budget is null || request.Provider is null ||
+            !IsLowerHexDigest(request.EntityHash) || request.EntityHash.All(character => character == '0') ||
+            !FixedTimeHexEquals(request.RuntimeManifestHash, RuntimeIdentity.ManifestHashHex) ||
+            !FixedTimeHexEquals(request.ContractHash, ManagedContractHash) ||
+            !IsLowerHexDigest(request.CacheIdentity) || request.CacheIdentity.All(character => character == '0') ||
+            !IsLowerHexDigest(request.RequestBindingHash) || request.RequestBindingHash.All(character => character == '0') ||
             request.Budget.MaxWallClockMs == 0 || !WorkerBudgetLimits.IsSane(request.Budget) ||
+            request.ModuleSource.ModuleSize > request.Budget.MaxMemoryBytes / 2 ||
             request.Budget.MaxProviderIrNodes == 0 || request.Budget.Profile is not ("fast" or "balanced" or "thorough") ||
             !string.Equals(request.Provider.Version, "10.1.0.8386", StringComparison.Ordinal) ||
-            !FixedTimeHexEquals(request.Provider.DecompilerAssemblyHash, OfflinePackageLock.DecompilerAssemblySha256) ||
-            string.IsNullOrWhiteSpace(request.Provider.WorkerBuildId) || request.Provider.WorkerBuildId.Length > 256 ||
-            request.Provider.WorkerBuildId.Contains('\0') ||
-            !IsLowerHexDigest(request.Provider.WorkerBuildHash) ||
-            request.Provider.WorkerBuildHash.All(character => character == '0'))
-            throw new InvalidDataException("managed decompiler request violates the offline contract");
+            !FixedTimeHexEquals(request.Provider.DecompilerAssemblyHash, RuntimeIdentity.DecompilerAssemblySha256) ||
+            !string.Equals(request.Provider.WorkerBuildId, ManagedWorkerBuildId, StringComparison.Ordinal) ||
+            !FixedTimeHexEquals(request.Provider.WorkerBuildHash, ManagedWorkerBuildHash))
+            throw new InvalidDataException("managed decompiler request violates the app-local runtime contract");
 
     }
 
@@ -137,45 +158,63 @@ internal static class MetadataAnalysis
         ResourceBudgetGuard resourceBudget,
         CancellationToken cancellationToken)
     {
-        nint rawHandle;
-        lock (ModuleHandleGate)
-            rawHandle = moduleHandle;
-        if (rawHandle == 0)
-            throw new InvalidDataException("module handle is unavailable");
-        var handle = new SafeFileHandle(rawHandle, ownsHandle: false);
-        using var stream = new FileStream(handle, FileAccess.Read, 1024 * 1024, isAsync: false);
-        stream.Position = 0;
-        var length = stream.Length;
+        ModuleSnapshot snapshot;
+        lock (ModuleSnapshotGate)
+            snapshot = moduleSnapshot ?? throw new InvalidDataException("module snapshot is unavailable");
+        var length = snapshot.Bytes.LongLength;
         if (length <= 0 || length > MaximumModuleBytes)
             throw new ResourceLimitException(ResourceLimitKind.Memory);
         resourceBudget.EnsureAllocationFits(checked((ulong)length), cancellationToken);
-        byte[] bytes;
-        try
-        {
-            bytes = GC.AllocateUninitializedArray<byte>(checked((int)length));
-        }
-        catch (OutOfMemoryException)
-        {
-            throw new ResourceLimitException(ResourceLimitKind.Memory);
-        }
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var offset = 0;
-        while (offset < bytes.Length)
-        {
-            resourceBudget.Checkpoint(cancellationToken);
-            var read = stream.Read(bytes, offset, Math.Min(1024 * 1024, bytes.Length - offset));
-            if (read == 0)
-                throw new InvalidDataException("module changed while creating the verified snapshot");
-            hash.AppendData(bytes, offset, read);
-            offset += read;
-        }
-        if (stream.ReadByte() != -1 || stream.Length != length)
-            throw new InvalidDataException("module changed while creating the verified snapshot");
-        var actualHash = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
-        if (!FixedTimeHexEquals(actualHash, request.ModuleHash))
+        if ((ulong)length != request.ModuleSource.ModuleSize ||
+            !FixedTimeHexEquals(snapshot.Sha256, request.ModuleSource.ModuleHash))
             throw new InvalidDataException("module hash does not match the verified snapshot");
         resourceBudget.Checkpoint(cancellationToken);
-        return new ModuleSnapshot(bytes, actualHash);
+        return snapshot;
+    }
+
+    private static void RevalidateSnapshot(
+        ModuleSnapshot snapshot,
+        WorkerRequest request,
+        ResourceBudgetGuard resourceBudget,
+        CancellationToken cancellationToken)
+    {
+        resourceBudget.Checkpoint(cancellationToken);
+        var hash = SHA256.HashData(snapshot.Bytes);
+        try
+        {
+            var actual = Convert.ToHexString(hash).ToLowerInvariant();
+            if (!FixedTimeHexEquals(actual, snapshot.Sha256) ||
+                !FixedTimeHexEquals(actual, request.ModuleSource.ModuleHash))
+                throw new InvalidDataException("module snapshot changed during managed analysis");
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(hash);
+        }
+        resourceBudget.Checkpoint(cancellationToken);
+    }
+
+    private static bool ValidModuleSource(WorkerModuleSource source)
+    {
+        if (source.ModuleSize == 0 || source.ModuleSize > (ulong)MaximumModuleBytes ||
+            !IsLowerHexDigest(source.ModuleHash) || source.ModuleHash.All(character => character == '0') ||
+            string.IsNullOrWhiteSpace(source.LogicalIdentity) ||
+            source.LogicalIdentity.Length > 32768 || source.LogicalIdentity.Contains('\0') ||
+            source.LogicalIdentity.Any(character => character < 0x20 || character == 0x7f))
+            return false;
+        if (string.Equals(source.Kind, "regular_file", StringComparison.Ordinal))
+            return Path.IsPathFullyQualified(source.LogicalIdentity);
+        if (!string.Equals(source.Kind, "embedded_member", StringComparison.Ordinal))
+            return false;
+        var marker = source.LogicalIdentity.IndexOf("#member:", StringComparison.Ordinal);
+        if (marker <= 0 || marker + 8 >= source.LogicalIdentity.Length)
+            return false;
+        var member = source.LogicalIdentity[(marker + 8)..].Replace('\\', '/');
+        if (member.StartsWith("/", StringComparison.Ordinal) ||
+            member.EndsWith("/", StringComparison.Ordinal))
+            return false;
+        return member.Split('/', StringSplitOptions.None)
+            .All(component => component.Length != 0 && component is not "." and not "..");
     }
 
     private static MethodDefinitionHandle RequireMethodHandle(uint token, MetadataReader reader)
@@ -237,7 +276,7 @@ internal static class MetadataAnalysis
         if (instructions.Count > request.Budget.MaxProviderIrNodes)
             throw new ResourceLimitException(ResourceLimitKind.ProviderIrNodes);
 
-        var typeGraph = BuildTypeGraph(typeNames);
+        var typeGraph = BuildTypeGraph(typeNames, request.TypeGraphRevision);
         var typeIds = typeGraph.Nodes.ToDictionary(node => node.CanonicalName, node => node.Id, StringComparer.Ordinal);
         var blocks = BuildBlocks(instructions, peReader, method.RelativeVirtualAddress, typeIds, signature.ReturnType, unknowns, resourceBudget, cancellationToken);
         if (blocks.Count == 0)
@@ -338,7 +377,7 @@ internal static class MetadataAnalysis
         };
     }
 
-    private static WorkerTypeGraph BuildTypeGraph(IEnumerable<string> names)
+    private static WorkerTypeGraph BuildTypeGraph(IEnumerable<string> names, ulong revision)
     {
         var ordered = names.Where(name => !string.IsNullOrWhiteSpace(name))
             .Distinct(StringComparer.Ordinal)
@@ -352,7 +391,7 @@ internal static class MetadataAnalysis
             nodes.Add(new WorkerTypeNode((ulong)index + 1, TypeKind(name), name, name, PrimitiveByteSize(name), 0,
                 IsSignedInteger(name), name == "System.Object" ? (byte)0 : (byte)100));
         }
-        return new WorkerTypeGraph(1, nodes, Array.Empty<WorkerTypeEdge>());
+        return new WorkerTypeGraph(revision, nodes, Array.Empty<WorkerTypeEdge>());
     }
 
     private static List<WorkerIrBlock> BuildBlocks(
@@ -578,7 +617,7 @@ internal static class MetadataAnalysis
             {
                 var count = ReadInt32(bytes, ref offset);
                 if (count < 0 || count > 1_048_576)
-                    throw new BadImageFormatException("switch target count exceeds the offline limit");
+                    throw new BadImageFormatException("switch target count exceeds the bounded metadata limit");
                 var deltas = new int[count];
                 for (var index = 0; index < deltas.Length; index++)
                     deltas[index] = ReadInt32(bytes, ref offset);

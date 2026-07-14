@@ -1,4 +1,5 @@
 #include "workspace_adapter_harness.hpp"
+#include "../c03/assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/mcp/compat/workspace_adapter.hpp"
 
@@ -17,6 +18,7 @@ namespace {
 using namespace aida::standalone::mcp::compat;
 
 void require(bool condition, std::string_view message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(std::string(message));
     }
@@ -339,6 +341,7 @@ bool run_workspace_adapter_harness(std::string& failure) {
         verify_workspace_adapter();
         verify_live_snapshot_bounds();
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure.assign(error.what());
         return false;
     }

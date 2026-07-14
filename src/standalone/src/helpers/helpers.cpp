@@ -9,7 +9,9 @@
 #include <dwmapi.h>
 #include <fstream>
 #include <filesystem>
+#include <array>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
 #include <iostream>
@@ -335,6 +337,7 @@ namespace {
 			case center_view_t::graph_view: return "graph_view";
 			case center_view_t::image_view: return "image_view";
 			case center_view_t::test_lab: return "test_lab";
+			case center_view_t::workbench: return "workbench";
 		}
 		return "unknown";
 	}
@@ -353,25 +356,6 @@ namespace {
 				return aida::workbench::document_kind_t::graph;
 			case center_view_t::snapshot_diff:
 				return aida::workbench::document_kind_t::diff;
-			default:
-				return std::nullopt;
-		}
-	}
-
-	std::optional<center_view_t> center_view_for_workbench_document(
-		aida::workbench::document_kind_t kind)
-	{
-		switch (kind) {
-			case aida::workbench::document_kind_t::disassembly:
-				return center_view_t::disassembly;
-			case aida::workbench::document_kind_t::hex:
-				return center_view_t::hex_view;
-			case aida::workbench::document_kind_t::pseudocode:
-				return center_view_t::pseudocode;
-			case aida::workbench::document_kind_t::graph:
-				return center_view_t::graph_view;
-			case aida::workbench::document_kind_t::diff:
-				return center_view_t::snapshot_diff;
 			default:
 				return std::nullopt;
 		}
@@ -407,17 +391,867 @@ namespace {
 			return;
 		}
 		restored_workspace = workspace;
-		const auto active = std::find_if(
-			context.persistence.documents.begin(),
-			context.persistence.documents.end(),
-			[&context](const aida::workbench::document_persistence_dto_t& document) {
-				return document.id == context.persistence.active_document;
-			});
-		if (active == context.persistence.documents.end())
+		if (workspace->identity().target_kind() ==
+			aida::analysis::target_kind_t::static_file)
+			globals::ui::active_center_view = center_view_t::workbench;
+	}
+
+	class workbench_frame_cancellation_t final
+		: public aida::workbench::disasm_document::disasm_cancellation_t,
+		  public aida::workbench::hex_document::hex_cancellation_t,
+		  public aida::workbench::graph_document::graph_layout_cancellation_t,
+		  public aida::workbench::diff_document::diff_cancellation_t,
+		  public aida::workbench::navigator::navigator_cancellation_t
+	{
+	public:
+		explicit workbench_frame_cancellation_t(std::uint32_t budget_ms)
+			: deadline_(std::chrono::steady_clock::now() +
+				std::chrono::milliseconds(budget_ms)) {}
+
+		bool cancelled() const noexcept override
+		{
+			return std::chrono::steady_clock::now() >= deadline_;
+		}
+
+	private:
+		std::chrono::steady_clock::time_point deadline_;
+	};
+
+	struct workbench_ui_state_t final {
+		aida::workbench::navigator::navigator_domain_t navigator_domain =
+			aida::workbench::navigator::navigator_domain_t::functions;
+		std::uint64_t disassembly_offset = 0;
+		std::uint64_t hex_offset = 0;
+		std::uint64_t diff_offset = 0;
+		std::uint64_t diff_total = 0;
+		std::uint64_t last_address = 0;
+		std::string last_entity_locator;
+		std::string pseudocode_identity;
+		std::optional<aida::workbench::pseudocode_document::
+			pseudocode_request_t> pseudocode_request;
+		aida::workbench::graph_document::graph_kind_t graph_kind =
+			aida::workbench::graph_document::graph_kind_t::cfg;
+		aida::workbench::graph_document::graph_layout_t graph_layout;
+		std::uint64_t graph_layout_function_address = 0;
+		aida::workbench::diff_document::diff_kind_t diff_kind =
+			aida::workbench::diff_document::diff_kind_t::generation;
+		aida::analysis::decompiler_profile_id_t pseudocode_profile =
+			aida::analysis::decompiler_profile_id_t::balanced;
+		std::uint64_t observed_generation = 0;
+		std::uint64_t last_touch = 0;
+		std::string status;
+	};
+
+	workbench_ui_state_t& workbench_ui_state(
+		aida::workbench::workspace_id_t workspace)
+	{
+		static std::map<std::uint64_t, workbench_ui_state_t> states;
+		static std::uint64_t touch = 0;
+		if (++touch == 0)
+			touch = 1;
+		auto found = states.find(workspace.value);
+		if (found == states.end()) {
+			if (states.size() >= 64) {
+				const auto oldest = std::min_element(
+					states.begin(), states.end(), [](const auto& lhs, const auto& rhs) {
+						return lhs.second.last_touch < rhs.second.last_touch;
+					});
+				if (oldest != states.end())
+					states.erase(oldest);
+			}
+			found = states.try_emplace(workspace.value).first;
+		}
+		found->second.last_touch = touch;
+		return found->second;
+	}
+
+	const aida::workbench::document_persistence_dto_t*
+	workbench_document(const aida::workbench::workbench_persistence_dto_t& state,
+		aida::workbench::document_id_t document)
+	{
+		const auto found = std::find_if(state.documents.begin(), state.documents.end(),
+			[document](const auto& candidate) { return candidate.id == document; });
+		return found == state.documents.end() ? nullptr : &*found;
+	}
+
+	void render_workbench_disassembly(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		aida::workbench::workbench_shell_workspace_context_t& context,
+		workbench_ui_state_t& state)
+	{
+		if (!context.disassembly_document) {
+			ImGui::TextDisabled("Disassembly provider unavailable");
 			return;
-		const auto center = center_view_for_workbench_document(active->identity.kind);
-		if (center)
-			globals::ui::active_center_view = *center;
+		}
+		const auto total_rows = context.disassembly_document->total_rows();
+		if (ImGui::SmallButton("Previous##wb_disasm"))
+			state.disassembly_offset = state.disassembly_offset > 256
+				? state.disassembly_offset - 256 : 0;
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Next##wb_disasm"))
+			state.disassembly_offset = total_rows > 256U
+				? (std::min)(state.disassembly_offset + 256U,
+					total_rows - 256U) : 0;
+		ImGui::SameLine();
+		ImGui::TextDisabled("generation %llu", static_cast<unsigned long long>(
+			context.analysis_generation));
+		aida::workbench::disasm_document::disasm_page_t page;
+		workbench_frame_cancellation_t cancellation(20);
+		const auto error = context.disassembly_document->page(
+			{state.disassembly_offset, 256}, &cancellation, page);
+		if (!error) {
+			ImGui::TextDisabled("Disassembly unavailable (%u)",
+				static_cast<unsigned>(error.code));
+			return;
+		}
+		if (page.offset != state.disassembly_offset)
+			state.disassembly_offset = page.offset;
+		for (const auto& row : page.rows) {
+			char label[1024];
+			_snprintf_s(label, sizeof(label), _TRUNCATE,
+				"%016llX  %-10s %s%s%s##wb_disasm_%llu",
+				static_cast<unsigned long long>(row.address), row.mnemonic.c_str(),
+				row.operands.c_str(), row.overlay ? "  ; " : "",
+				row.overlay ? row.overlay->text.c_str() : "",
+				static_cast<unsigned long long>(row.id.value));
+			const bool selected = state.last_address == row.address;
+			if (!ImGui::Selectable(label, selected))
+				continue;
+			state.last_address = row.address;
+			state.last_entity_locator.clear();
+			aida::workbench::selection_context_t selection;
+			selection.kind = aida::workbench::selection_kind_t::address;
+			selection.has_address = true;
+			selection.address = row.address;
+			selection.extent = row.byte_size;
+			aida::workbench::document_local_cursor_t cursor;
+			cursor.has_position = true;
+			cursor.position = row.address;
+			static_cast<void>(
+				aida::workbench::workbench_shell_runtime_t::instance()
+					.navigate_document(workspace,
+						aida::workbench::document_kind_t::disassembly,
+						std::nullopt, selection, cursor, context));
+		}
+	}
+
+	void render_workbench_hex(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		aida::workbench::workbench_shell_workspace_context_t& context,
+		workbench_ui_state_t& state)
+	{
+		if (!context.hex_document) {
+			ImGui::TextDisabled("Hex provider unavailable");
+			return;
+		}
+		const auto total_rows = context.hex_document->total_rows();
+		if (ImGui::SmallButton("Previous##wb_hex"))
+			state.hex_offset = state.hex_offset > 256 ? state.hex_offset - 256 : 0;
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Next##wb_hex"))
+			state.hex_offset = total_rows > 256U
+				? (std::min)(state.hex_offset + 256U, total_rows - 256U) : 0;
+		aida::workbench::hex_document::hex_page_t page;
+		workbench_frame_cancellation_t cancellation(20);
+		const auto error = context.hex_document->page(
+			{state.hex_offset, 256}, &cancellation, page);
+		if (!error) {
+			ImGui::TextDisabled("Hex unavailable (%u)",
+				static_cast<unsigned>(error.code));
+			return;
+		}
+		if (page.offset != state.hex_offset)
+			state.hex_offset = page.offset;
+		for (const auto& row : page.rows) {
+			char label[2048];
+			_snprintf_s(label, sizeof(label), _TRUNCATE,
+				"%016llX  %-48s  %s##wb_hex_%llu",
+				static_cast<unsigned long long>(row.address), row.hex_text.c_str(),
+				row.ascii_text.c_str(),
+				static_cast<unsigned long long>(row.id.value));
+			if (!ImGui::Selectable(label, state.last_address == row.address))
+				continue;
+			state.last_address = row.address;
+			state.last_entity_locator.clear();
+			aida::workbench::selection_context_t selection;
+			selection.kind = aida::workbench::selection_kind_t::range;
+			selection.has_address = true;
+			selection.address = row.address;
+			selection.extent = row.byte_count;
+			aida::workbench::document_local_cursor_t cursor;
+			cursor.has_position = true;
+			cursor.position = row.address;
+			static_cast<void>(
+				aida::workbench::workbench_shell_runtime_t::instance()
+					.navigate_document(workspace,
+						aida::workbench::document_kind_t::hex,
+						std::nullopt, selection, cursor, context));
+		}
+	}
+
+	void render_workbench_pseudocode(
+		aida::workbench::workbench_shell_workspace_context_t& context,
+		workbench_ui_state_t& state)
+	{
+		auto* model = context.pseudocode_document;
+		if (!model) {
+			ImGui::TextDisabled("Typed pseudocode provider unavailable");
+			return;
+		}
+		if (ImGui::SmallButton("Fast##wb_psv"))
+			state.pseudocode_profile = aida::analysis::decompiler_profile_id_t::fast;
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Balanced##wb_psv"))
+			state.pseudocode_profile = aida::analysis::decompiler_profile_id_t::balanced;
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Thorough##wb_psv"))
+			state.pseudocode_profile = aida::analysis::decompiler_profile_id_t::thorough;
+		ImGui::SameLine();
+		const bool can_request =
+			(state.last_address != 0 || !state.last_entity_locator.empty()) &&
+			!model->has_pending_requests();
+		ImGui::BeginDisabled(!can_request);
+		if (ImGui::SmallButton("Decompile (F5)##wb_psv")) {
+			aida::workbench::pseudocode_document::pseudocode_request_t request;
+			aida::workbench::pseudocode_document::pseudocode_error_t resolved;
+			if (!state.last_entity_locator.empty()) {
+				const auto locator =
+					aida::workbench::pseudocode_document::
+						parse_pseudocode_entity_locator(
+							state.last_entity_locator);
+				resolved = locator
+					? model->resolve_request(*locator, state.pseudocode_profile,
+						aida::workbench::pseudocode_document::
+							k_pseudocode_document_default_timeout_ms, request)
+					: aida::workbench::pseudocode_document::pseudocode_error_t{
+						aida::workbench::pseudocode_document::
+							pseudocode_error_code_t::invalid_argument, 0};
+			} else {
+				resolved = model->resolve_request(
+					state.last_address, state.pseudocode_profile,
+					aida::workbench::pseudocode_document::
+						k_pseudocode_document_default_timeout_ms, request);
+			}
+			const auto requested = resolved ? model->request(request) : resolved;
+			if (requested || requested.code ==
+				aida::workbench::pseudocode_document::
+					pseudocode_error_code_t::request_in_progress)
+				state.pseudocode_request = request;
+			else
+				state.status = "Decompiler request rejected (" +
+					std::to_string(static_cast<unsigned>(requested.code)) + ")";
+		}
+		ImGui::EndDisabled();
+		const auto* cached = state.pseudocode_request
+			? model->cached_document(*state.pseudocode_request)
+			: model->cached_document();
+		if (cached && cached->state ==
+			aida::workbench::pseudocode_document::pseudocode_cache_state_t::requesting) {
+			static_cast<void>(model->poll(cached->job_id));
+			cached = state.pseudocode_request
+				? model->cached_document(*state.pseudocode_request)
+				: model->cached_document();
+		}
+		if (model->has_pending_requests() && cached) {
+			ImGui::SameLine();
+			if (ImGui::SmallButton("Cancel##wb_psv"))
+				static_cast<void>(model->cancel(cached->job_id));
+		}
+		if (!state.status.empty())
+			ImGui::TextDisabled("%s", state.status.c_str());
+		aida::workbench::pseudocode_document::pseudocode_page_t page;
+		const auto error = model->page({0, 1024}, page);
+		if (!error) {
+			const auto diagnostics = model->diagnostics();
+			for (const auto& diagnostic : diagnostics)
+				ImGui::TextWrapped("%s", diagnostic.message.c_str());
+			if (diagnostics.empty())
+				ImGui::TextDisabled("Select an address and request decompilation explicitly.");
+			return;
+		}
+		for (const auto& line : page.lines) {
+			char id[64];
+			_snprintf_s(id, sizeof(id), _TRUNCATE, "##wb_psv_%u", line.line_number);
+			ImGui::Selectable((line.text + id).c_str(), false);
+		}
+	}
+
+	void render_workbench_graph(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		aida::workbench::workbench_shell_workspace_context_t& context,
+		workbench_ui_state_t& state, float width, float height)
+	{
+		auto* model = context.graph_document;
+		if (!model) {
+			ImGui::TextDisabled("Graph provider unavailable");
+			return;
+		}
+		if (ImGui::SmallButton("CFG##wb_graph")) {
+			state.graph_kind = aida::workbench::graph_document::graph_kind_t::cfg;
+			state.graph_layout = {};
+		}
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Call graph##wb_graph")) {
+			state.graph_kind = aida::workbench::graph_document::graph_kind_t::call_graph;
+			state.graph_layout = {};
+		}
+		ImGui::SameLine();
+		const bool reusable_layout_scope = state.graph_layout.complete &&
+			state.graph_layout.snapshot_generation == context.analysis_generation &&
+			state.graph_layout.graph_kind == state.graph_kind;
+		const auto graph_function_address = state.graph_kind ==
+			aida::workbench::graph_document::graph_kind_t::cfg
+			? (reusable_layout_scope
+				? state.graph_layout_function_address : state.last_address)
+			: 0;
+		if (ImGui::SmallButton("Layout##wb_graph")) {
+			aida::workbench::graph_document::graph_layout_request_t request;
+			request.expected_generation = context.analysis_generation;
+			request.graph_kind = state.graph_kind;
+			request.function_address = graph_function_address;
+			request.max_nodes =
+				aida::workbench::graph_document::k_graph_document_max_page_size;
+			request.max_edges = 8192;
+			request.max_iterations = 256;
+			request.canvas_width = (std::max)(width, 320.0f);
+			request.canvas_height = (std::max)(height - 48.0f, 200.0f);
+			workbench_frame_cancellation_t cancellation(40);
+			aida::workbench::graph_document::graph_layout_t layout;
+			const auto error = model->compute_layout(
+				request, &cancellation, layout);
+			if (!error) {
+				state.graph_layout = {};
+				state.status = "Graph layout deferred (" +
+					std::to_string(static_cast<unsigned>(error.code)) + ")";
+			} else {
+				state.graph_layout = std::move(layout);
+				state.graph_layout_function_address = graph_function_address;
+				state.status.clear();
+			}
+		}
+		const bool layout_current = state.graph_layout.complete &&
+			state.graph_layout.snapshot_generation == context.analysis_generation &&
+			state.graph_layout.graph_kind == state.graph_kind &&
+			state.graph_layout_function_address == graph_function_address;
+		aida::workbench::graph_document::graph_page_request_t request;
+		request.limit = layout_current
+			? aida::workbench::graph_document::k_graph_document_max_page_size
+			: 256;
+		request.graph_kind = state.graph_kind;
+		request.function_address = graph_function_address;
+		workbench_frame_cancellation_t cancellation(25);
+		aida::workbench::graph_document::graph_page_t page;
+		const auto error = model->page(request, &cancellation, page);
+		if (!error) {
+			ImGui::TextDisabled("Graph materialization deferred (%u)",
+				static_cast<unsigned>(error.code));
+			return;
+		}
+		auto navigate = [&](const aida::workbench::graph_document::graph_node_view_t& node) {
+			state.last_address = node.address;
+			state.last_entity_locator.clear();
+			aida::workbench::selection_context_t selection;
+			selection.kind = aida::workbench::selection_kind_t::address;
+			selection.has_address = true;
+			selection.address = node.address;
+			selection.entity_key = std::to_string(node.id.value);
+			aida::workbench::document_local_cursor_t cursor;
+			cursor.has_position = true;
+			cursor.position = node.address;
+			static_cast<void>(
+				aida::workbench::workbench_shell_runtime_t::instance()
+					.navigate_document(workspace,
+						aida::workbench::document_kind_t::graph,
+						std::nullopt, selection, cursor, context));
+		};
+		if (layout_current && page.total_items <=
+			aida::workbench::graph_document::k_graph_document_max_page_size) {
+			std::unordered_map<std::uint64_t,
+				const aida::workbench::graph_document::graph_node_view_t*> nodes;
+			nodes.reserve(page.nodes.size());
+			for (const auto& node : page.nodes)
+				nodes.emplace(node.id.value, &node);
+			std::unordered_map<std::uint64_t,
+				const aida::workbench::graph_document::graph_layout_node_t*> positions;
+			positions.reserve(state.graph_layout.nodes.size());
+			for (const auto& node : state.graph_layout.nodes)
+				positions.emplace(node.id.value, &node);
+			const auto available = ImGui::GetContentRegionAvail();
+			const ImVec2 canvas_size(
+				(std::max)(available.x, 1.0f),
+				(std::max)(available.y, 1.0f));
+			const auto origin = ImGui::GetCursorScreenPos();
+			ImGui::InvisibleButton("##wb_graph_canvas", canvas_size);
+			auto* draw = ImGui::GetWindowDrawList();
+			const auto edge_color = ImGui::GetColorU32(ImGuiCol_Separator);
+			for (const auto& edge : state.graph_layout.edges) {
+				const auto source = positions.find(edge.source.value);
+				const auto target = positions.find(edge.target.value);
+				if (source == positions.end() || target == positions.end())
+					continue;
+				ImVec2 previous(
+					origin.x + source->second->x + source->second->width * 0.5f,
+					origin.y + source->second->y + source->second->height * 0.5f);
+				const auto bends = (std::min)(edge.bend_x.size(), edge.bend_y.size());
+				for (std::size_t index = 0; index < bends; ++index) {
+					const ImVec2 bend(origin.x + edge.bend_x[index],
+						origin.y + edge.bend_y[index]);
+					draw->AddLine(previous, bend, edge_color, 1.5f);
+					previous = bend;
+				}
+				const ImVec2 endpoint(
+					origin.x + target->second->x + target->second->width * 0.5f,
+					origin.y + target->second->y + target->second->height * 0.5f);
+				draw->AddLine(previous, endpoint, edge_color, 1.5f);
+			}
+			const auto mouse = ImGui::GetMousePos();
+			const bool clicked = ImGui::IsItemHovered() &&
+				ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+			const auto normal_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
+			const auto selected_color = ImGui::GetColorU32(ImGuiCol_HeaderActive);
+			const auto border_color = ImGui::GetColorU32(ImGuiCol_Border);
+			const auto text_color = ImGui::GetColorU32(ImGuiCol_Text);
+			const aida::workbench::graph_document::graph_node_view_t* clicked_node = nullptr;
+			for (const auto& layout_node : state.graph_layout.nodes) {
+				const auto view = nodes.find(layout_node.id.value);
+				if (view == nodes.end())
+					continue;
+				const ImVec2 minimum(origin.x + layout_node.x,
+					origin.y + layout_node.y);
+				const ImVec2 maximum(minimum.x + layout_node.width,
+					minimum.y + layout_node.height);
+				draw->AddRectFilled(minimum, maximum,
+					state.last_address == view->second->address
+						? selected_color : normal_color, 4.0f);
+				draw->AddRect(minimum, maximum, border_color, 4.0f);
+				auto label = view->second->label;
+				if (label.size() > 24)
+					label.resize(24);
+				draw->AddText(ImVec2(minimum.x + 6.0f, minimum.y + 6.0f),
+					text_color, label.c_str());
+				if (clicked && mouse.x >= minimum.x && mouse.x < maximum.x &&
+					mouse.y >= minimum.y && mouse.y < maximum.y)
+					clicked_node = view->second;
+			}
+			if (clicked_node)
+				navigate(*clicked_node);
+			return;
+		}
+		for (const auto& node : page.nodes) {
+			char label[1024];
+			_snprintf_s(label, sizeof(label), _TRUNCATE,
+				"%016llX  %s  in:%u out:%u##wb_graph_%llu",
+				static_cast<unsigned long long>(node.address), node.label.c_str(),
+				node.in_degree, node.out_degree,
+				static_cast<unsigned long long>(node.id.value));
+			if (!ImGui::Selectable(label, state.last_address == node.address))
+				continue;
+			navigate(node);
+		}
+	}
+
+	bool workbench_diff_scope(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		const aida::workbench::workbench_shell_workspace_context_t& context,
+		aida::workbench::diff_document::diff_kind_t kind,
+		aida::workbench::diff_document::diff_scope_t& scope)
+	{
+		scope = {};
+		scope.kind = kind;
+		scope.before.workspace_id = context.workspace.value;
+		scope.after.workspace_id = context.workspace.value;
+		scope.before.generation = context.analysis_generation;
+		scope.after.generation = context.analysis_generation;
+		if (kind == aida::workbench::diff_document::diff_kind_t::generation) {
+			if (context.analysis_generation < 2)
+				return false;
+			scope.before.generation = context.analysis_generation - 1U;
+			return true;
+		}
+		if (kind == aida::workbench::diff_document::diff_kind_t::overlay) {
+			if (context.overlay_revision == 0)
+				return false;
+			scope.before.overlay_revision = context.overlay_revision - 1U;
+			scope.after.overlay_revision = context.overlay_revision;
+			return true;
+		}
+		const auto workspaces =
+			aida::workbench::workbench_shell_runtime_t::instance()
+				.analysis_workspaces();
+		for (const auto& other : workspaces) {
+			if (!other || other == workspace)
+				continue;
+			aida::workbench::workbench_shell_workspace_context_t other_context;
+			const auto loaded =
+				aida::workbench::workbench_shell_runtime_t::instance()
+					.workspace_context(other, other_context);
+			if (!loaded)
+				continue;
+			scope.after.workspace_id = other_context.workspace.value;
+			scope.after.generation = other_context.analysis_generation;
+			return true;
+		}
+		return false;
+	}
+
+	void render_workbench_diff(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		aida::workbench::workbench_shell_workspace_context_t& context,
+		workbench_ui_state_t& state)
+	{
+		auto* model = context.diff_document;
+		if (!model) {
+			ImGui::TextDisabled("Diff provider unavailable");
+			return;
+		}
+		if (ImGui::SmallButton("Generation##wb_diff"))
+			state.diff_kind = aida::workbench::diff_document::diff_kind_t::generation;
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Overlay##wb_diff"))
+			state.diff_kind = aida::workbench::diff_document::diff_kind_t::overlay;
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Workspace##wb_diff"))
+			state.diff_kind = aida::workbench::diff_document::diff_kind_t::workspace;
+		aida::workbench::diff_document::diff_scope_t scope;
+		if (!workbench_diff_scope(workspace, context, state.diff_kind, scope)) {
+			ImGui::TextDisabled("The selected diff requires another retained generation, overlay revision, or workspace.");
+			return;
+		}
+		if (ImGui::SmallButton("Previous##wb_diff"))
+			state.diff_offset = state.diff_offset > 256 ? state.diff_offset - 256 : 0;
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Next##wb_diff"))
+			state.diff_offset = state.diff_total > 256U
+				? (std::min)(state.diff_offset + 256U,
+					state.diff_total - 256U) : 0;
+		aida::workbench::diff_document::diff_page_t page;
+		workbench_frame_cancellation_t cancellation(30);
+		const auto error = model->page({state.diff_offset, 256,
+			static_cast<aida::workbench::diff_document::diff_domain_t>(0xFF)},
+			context.analysis_generation, scope, &cancellation, page);
+		if (!error) {
+			ImGui::TextDisabled("Diff materialization deferred (%u)",
+				static_cast<unsigned>(error.code));
+			return;
+		}
+		state.diff_total = page.total_entries;
+		for (std::size_t index = 0; index < page.entries.size(); ++index) {
+			const auto& entry = page.entries[index];
+			char label[2048];
+			_snprintf_s(label, sizeof(label), _TRUNCATE,
+				"%016llX  %s  %s -> %s##wb_diff_%llu",
+				static_cast<unsigned long long>(entry.address),
+				entry.entity_key.c_str(), entry.old_value.c_str(),
+				entry.new_value.c_str(),
+				static_cast<unsigned long long>(page.offset + index));
+			if (!ImGui::Selectable(label, state.last_address == entry.address))
+				continue;
+			state.last_address = entry.address;
+			state.last_entity_locator.clear();
+			if (entry.address == 0)
+				continue;
+			aida::workbench::selection_context_t selection;
+			selection.kind = aida::workbench::selection_kind_t::address;
+			selection.has_address = true;
+			selection.address = entry.address;
+			selection.entity_key = entry.entity_key;
+			aida::workbench::document_local_cursor_t cursor;
+			cursor.has_position = true;
+			cursor.position = page.offset + index;
+			static_cast<void>(
+				aida::workbench::workbench_shell_runtime_t::instance()
+					.navigate_document(workspace,
+						aida::workbench::document_kind_t::diff,
+						std::nullopt, selection, cursor, context));
+		}
+	}
+
+	void render_workbench_document(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		aida::workbench::workbench_shell_workspace_context_t& context,
+		const aida::workbench::document_persistence_dto_t& document,
+		workbench_ui_state_t& state, float width, float height)
+	{
+		if (document.local_state.selection.has_address) {
+			state.last_address = document.local_state.selection.address;
+			state.last_entity_locator.clear();
+		} else if (document.identity.kind ==
+				aida::workbench::document_kind_t::pseudocode &&
+			document.identity.has_address) {
+			state.last_address = document.identity.address;
+			state.last_entity_locator.clear();
+		} else if (document.identity.kind ==
+				aida::workbench::document_kind_t::pseudocode) {
+			const auto& encoded = document.identity.provider_key != "analysis"
+				? document.identity.provider_key
+				: document.local_state.selection.entity_key;
+			const auto locator =
+				aida::workbench::pseudocode_document::
+					parse_pseudocode_entity_locator(encoded);
+			const auto canonical = locator
+				? aida::workbench::pseudocode_document::
+					canonical_pseudocode_entity_locator(*locator)
+				: std::nullopt;
+			if (canonical && *canonical == encoded) {
+				state.last_address = 0;
+				state.last_entity_locator = *canonical;
+			}
+		}
+		if (document.identity.kind ==
+				aida::workbench::document_kind_t::pseudocode) {
+			const std::string identity = !state.last_entity_locator.empty()
+				? state.last_entity_locator
+				: "native:" + std::to_string(state.last_address);
+			if (state.pseudocode_identity != identity) {
+				state.pseudocode_identity = identity;
+				state.pseudocode_request.reset();
+			}
+		}
+		switch (document.identity.kind) {
+		case aida::workbench::document_kind_t::disassembly:
+			render_workbench_disassembly(workspace, context, state);
+			break;
+		case aida::workbench::document_kind_t::hex:
+			render_workbench_hex(workspace, context, state);
+			break;
+		case aida::workbench::document_kind_t::pseudocode:
+			render_workbench_pseudocode(context, state);
+			break;
+		case aida::workbench::document_kind_t::graph:
+			render_workbench_graph(workspace, context, state, width, height);
+			break;
+		case aida::workbench::document_kind_t::diff:
+			render_workbench_diff(workspace, context, state);
+			break;
+		default:
+			ImGui::TextDisabled("Document provider is not available for this kind.");
+			break;
+		}
+	}
+
+	void render_workbench_navigator(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		aida::workbench::workbench_shell_workspace_context_t& context,
+		workbench_ui_state_t& state)
+	{
+		using domain_t = aida::workbench::navigator::navigator_domain_t;
+		const std::array<std::pair<const char*, domain_t>, 6> domains{{
+			{"Functions", domain_t::functions}, {"Imports", domain_t::imports},
+			{"Exports", domain_t::exports}, {"Strings", domain_t::strings},
+			{"Symbols", domain_t::symbols}, {"Types", domain_t::types}}};
+		for (std::size_t index = 0; index < domains.size(); ++index) {
+			if (index != 0)
+				ImGui::SameLine();
+			if (ImGui::SmallButton((std::string(domains[index].first) +
+				"##wb_nav_domain").c_str()))
+				state.navigator_domain = domains[index].second;
+		}
+		if (!context.navigator_tree) {
+			ImGui::TextDisabled("Navigator provider unavailable");
+			return;
+		}
+		aida::workbench::navigator::navigator_tree_request_t request;
+		request.domain = state.navigator_domain;
+		request.page.limit = 256;
+		workbench_frame_cancellation_t cancellation(20);
+		aida::workbench::navigator::navigator_tree_page_t page;
+		const auto error = context.navigator_tree->page(request, &cancellation, page);
+		if (!error) {
+			ImGui::TextDisabled("Navigator deferred (%u)",
+				static_cast<unsigned>(error.code));
+			return;
+		}
+		for (const auto& row : page.rows) {
+			const auto label = std::string(row.label) + "##wb_nav_" +
+				std::to_string(row.id.value);
+			if (!ImGui::Selectable(label.c_str(),
+				row.has_address && state.last_address == row.address))
+				continue;
+			if (!row.has_address)
+				continue;
+			state.last_address = row.address;
+			state.last_entity_locator.clear();
+			aida::workbench::selection_context_t selection;
+			selection.kind = aida::workbench::selection_kind_t::address;
+			selection.has_address = true;
+			selection.address = row.address;
+			selection.entity_key = std::to_string(row.id.value);
+			aida::workbench::document_local_cursor_t cursor;
+			cursor.has_position = true;
+			cursor.position = row.address;
+			static_cast<void>(
+				aida::workbench::workbench_shell_runtime_t::instance()
+					.navigate_document(workspace,
+						aida::workbench::document_kind_t::disassembly,
+						std::nullopt, selection, cursor, context));
+		}
+	}
+
+	void render_workbench_inspector(
+		const aida::workbench::workbench_shell_workspace_context_t& context)
+	{
+		ImGui::TextUnformatted("Inspector");
+		ImGui::Separator();
+		ImGui::Text("Generation: %llu", static_cast<unsigned long long>(
+			context.analysis_generation));
+		ImGui::Text("Analysis revision: %llu", static_cast<unsigned long long>(
+			context.analysis_revision));
+		ImGui::Text("Overlay revision: %llu", static_cast<unsigned long long>(
+			context.overlay_revision));
+		const auto* active = context.inspector_session
+			? context.inspector_session->active_context() : nullptr;
+		if (!active) {
+			ImGui::TextDisabled("No synchronized selection");
+			return;
+		}
+		ImGui::Separator();
+		ImGui::Text("Document kind: %u", static_cast<unsigned>(
+			active->document.kind));
+		if (active->selection.has_address)
+			ImGui::Text("Address: 0x%llX", static_cast<unsigned long long>(
+				active->selection.address));
+		if (!active->selection.entity_key.empty())
+			ImGui::TextWrapped("Entity: %s", active->selection.entity_key.c_str());
+		static const char* panels[] = {"Identity", "Bytes", "Operands", "Xrefs",
+			"Calls", "Stack/locals", "Types", "Overlays", "Diagnostics",
+			"Source provenance"};
+		ImGui::Separator();
+		for (const auto* panel : panels)
+			ImGui::BulletText("%s", panel);
+	}
+
+	void render_analysis_workbench(
+		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+		float width, float height)
+	{
+		if (!workspace) {
+			ImGui::TextDisabled("No analysis workspace is active");
+			return;
+		}
+		aida::workbench::workbench_shell_workspace_context_t context;
+		const auto loaded =
+			aida::workbench::workbench_shell_runtime_t::instance()
+				.workspace_context(workspace, context);
+		if (!loaded || !context.document_host) {
+			ImGui::TextDisabled("Workbench unavailable (%u)",
+				static_cast<unsigned>(loaded.code));
+			return;
+		}
+		auto& state = workbench_ui_state(context.workspace);
+		if (state.observed_generation != context.analysis_generation) {
+			state.disassembly_offset = 0;
+			state.hex_offset = 0;
+			state.diff_offset = 0;
+			state.diff_total = 0;
+			state.graph_layout = {};
+			state.graph_layout_function_address = 0;
+			state.status.clear();
+			state.observed_generation = context.analysis_generation;
+		}
+		aida::workbench::document_host::document_host_layout_request_t request;
+		request.client_extent.width_pixels = static_cast<std::uint32_t>(
+			(std::max)(1.0f, width));
+		request.client_extent.height_pixels = static_cast<std::uint32_t>(
+			(std::max)(1.0f, height));
+		request.dpi = static_cast<std::uint32_t>((std::clamp)(
+			96.0f * ImGui::GetIO().DisplayFramebufferScale.x, 48.0f, 768.0f));
+		request.average_character_width_pixels = static_cast<std::uint32_t>(
+			(std::clamp)(ImGui::CalcTextSize("M").x, 4.0f, 64.0f));
+		aida::workbench::document_host::document_host_chrome_t chrome;
+		const auto composed = context.document_host->compose(
+			context.workspace, request, chrome);
+		if (!composed) {
+			ImGui::TextDisabled("Workbench layout rejected (%u)",
+				static_cast<unsigned>(composed.code));
+			return;
+		}
+		ImGui::PushID(static_cast<int>(context.workspace.value & 0x7FFFFFFFU));
+		auto begin_region = [](const char* id,
+			const aida::workbench::document_host::document_host_rect_t& bounds) {
+			ImGui::SetCursorPos(ImVec2(static_cast<float>(bounds.x),
+				static_cast<float>(bounds.y)));
+			return ImGui::BeginChild(id,
+				ImVec2(static_cast<float>(bounds.width),
+					static_cast<float>(bounds.height)), false,
+				ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
+		};
+		if (chrome.navigator_visible && chrome.navigator_bounds.width != 0 &&
+			chrome.navigator_bounds.height != 0) {
+			if (begin_region("##wb_navigator", chrome.navigator_bounds))
+				render_workbench_navigator(workspace, context, state);
+			ImGui::EndChild();
+		}
+		for (const auto& tab : chrome.tabs) {
+			if (!tab.visible)
+				continue;
+			ImGui::SetCursorPos(ImVec2(static_cast<float>(tab.bounds.x),
+				static_cast<float>(tab.bounds.y)));
+			if (ImGui::Selectable((tab.label + "##wb_tab_" +
+				std::to_string(tab.document.value)).c_str(), tab.selected, 0,
+				ImVec2(static_cast<float>(tab.bounds.width),
+					static_cast<float>(tab.bounds.height)))) {
+				aida::workbench::document_host::document_host_dispatch_t dispatch;
+				dispatch.kind = aida::workbench::document_host::
+					document_host_dispatch_kind_t::select_document;
+				dispatch.document = tab.document;
+				aida::workbench::workbench_command_result_t result;
+				static_cast<void>(
+					aida::workbench::workbench_shell_runtime_t::instance()
+						.dispatch_host_command(workspace, dispatch, result, context));
+			}
+		}
+		for (const auto& item : chrome.toolbar) {
+			if (!item.visible)
+				continue;
+			ImGui::SetCursorPos(ImVec2(static_cast<float>(item.bounds.x),
+				static_cast<float>(item.bounds.y)));
+			ImGui::BeginDisabled(!item.enabled);
+			const char* label = ">";
+			switch (item.action) {
+			case aida::workbench::document_host::document_host_toolbar_action_t::previous_view: label = "<"; break;
+			case aida::workbench::document_host::document_host_toolbar_action_t::next_view: label = ">"; break;
+			case aida::workbench::document_host::document_host_toolbar_action_t::split_horizontal: label = "H"; break;
+			case aida::workbench::document_host::document_host_toolbar_action_t::split_vertical: label = "V"; break;
+			case aida::workbench::document_host::document_host_toolbar_action_t::history_back: label = "B"; break;
+			case aida::workbench::document_host::document_host_toolbar_action_t::history_forward: label = "F"; break;
+			case aida::workbench::document_host::document_host_toolbar_action_t::close_document: label = "X"; break;
+			}
+			if (ImGui::Button((std::string(label) + "##wb_toolbar_" +
+				std::to_string(static_cast<unsigned>(item.action))).c_str(),
+				ImVec2(static_cast<float>(item.bounds.width),
+					static_cast<float>(item.bounds.height)))) {
+				aida::workbench::document_host::document_host_dispatch_t dispatch;
+				dispatch.kind = aida::workbench::document_host::
+					document_host_dispatch_kind_t::toolbar;
+				dispatch.toolbar_action = item.action;
+				aida::workbench::workbench_command_result_t result;
+				static_cast<void>(
+					aida::workbench::workbench_shell_runtime_t::instance()
+						.dispatch_host_command(workspace, dispatch, result, context));
+			}
+			ImGui::EndDisabled();
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("%s", item.tooltip.c_str());
+		}
+		for (const auto& leaf : chrome.leaves) {
+			const auto* document = workbench_document(
+				context.persistence, leaf.document);
+			if (!document || leaf.bounds.width == 0 || leaf.bounds.height == 0)
+				continue;
+			const auto id = "##wb_leaf_" + std::to_string(leaf.view.value);
+			if (begin_region(id.c_str(), leaf.bounds))
+				render_workbench_document(workspace, context, *document, state,
+					static_cast<float>(leaf.bounds.width),
+					static_cast<float>(leaf.bounds.height));
+			ImGui::EndChild();
+		}
+		if (chrome.inspector_visible && chrome.inspector_bounds.width != 0 &&
+			chrome.inspector_bounds.height != 0) {
+			if (begin_region("##wb_inspector", chrome.inspector_bounds))
+				render_workbench_inspector(context);
+			ImGui::EndChild();
+		}
+		ImGui::PopID();
 	}
 
 	void mark_center_render_section(const char* section, center_view_t view, bool overlay_blocking, float vw, float vh)
@@ -1843,8 +2677,12 @@ static void render_session_tabs(float x, float y, float width, float height, flo
 			"session_switch idx=%zu name=%s ok=%d", sw_idx, sw_name, ok ? 1 : 0);
 		anti_tamper::webhook::write_log("chrome", sw_buf);
 		if (ok) {
-			if (analysis_session::active_workspace()) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+			if (const auto workspace = analysis_session::active_workspace()) {
+				globals::ui::active_center_view =
+					workspace->identity().target_kind() ==
+						aida::analysis::target_kind_t::static_file
+					? center_view_t::workbench
+					: center_view_t::disassembly;
 			}
 		}
 	} else if (reattach_intent >= 0) {
@@ -2191,7 +3029,98 @@ void helpers::render_title()
 		}
 
 		if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
-			if (pseudocode_view::has_active_tab(active_workspace_context)) {
+			if (active_workspace_handle &&
+				active_workspace_handle->identity().target_kind() ==
+					aida::analysis::target_kind_t::static_file &&
+				globals::ui::active_center_view == center_view_t::workbench) {
+				aida::workbench::workbench_shell_workspace_context_t context;
+				const auto loaded =
+					aida::workbench::workbench_shell_runtime_t::instance()
+						.workspace_context(active_workspace_handle, context);
+				const auto* active = loaded
+					? workbench_document(context.persistence,
+						context.persistence.active_document) : nullptr;
+				const auto address = active &&
+					active->local_state.selection.has_address
+					? active->local_state.selection.address
+					: active && active->identity.kind ==
+							aida::workbench::document_kind_t::pseudocode &&
+						active->identity.has_address
+						? active->identity.address : 0;
+				std::optional<aida::analysis::decompiler_entity_locator_t>
+					managed_locator;
+				std::string managed_identity;
+				if (active) {
+					const auto& encoded = active->identity.provider_key != "analysis"
+						? active->identity.provider_key
+						: active->local_state.selection.entity_key;
+					const auto parsed =
+						aida::workbench::pseudocode_document::
+							parse_pseudocode_entity_locator(encoded);
+					const auto canonical = parsed
+						? aida::workbench::pseudocode_document::
+							canonical_pseudocode_entity_locator(*parsed)
+						: std::nullopt;
+					if (canonical && *canonical == encoded) {
+						managed_locator = *parsed;
+						managed_identity = *canonical;
+					}
+				}
+				if ((address != 0 || managed_locator) &&
+					context.pseudocode_document) {
+					aida::workbench::workbench_shell_workspace_context_t activated;
+					aida::workbench::workbench_error_t opened;
+					if (managed_locator) {
+						opened = aida::workbench::workbench_shell_runtime_t::instance()
+							.activate_entity_document(active_workspace_handle,
+								aida::workbench::document_kind_t::pseudocode,
+								managed_identity, activated);
+					} else {
+						const auto document_address = active &&
+							active->identity.kind ==
+								aida::workbench::document_kind_t::pseudocode &&
+							active->identity.has_address
+							? active->identity.address : address;
+						opened = aida::workbench::workbench_shell_runtime_t::instance()
+							.activate_document(active_workspace_handle,
+								aida::workbench::document_kind_t::pseudocode,
+								document_address, activated);
+					}
+					if (opened && activated.pseudocode_document) {
+						aida::workbench::pseudocode_document::pseudocode_request_t request;
+						aida::workbench::pseudocode_document::pseudocode_error_t
+							resolved;
+						if (managed_locator) {
+							resolved = activated.pseudocode_document->resolve_request(
+								*managed_locator,
+								aida::analysis::decompiler_profile_id_t::balanced,
+								aida::workbench::pseudocode_document::
+									k_pseudocode_document_default_timeout_ms,
+								request);
+						} else {
+							resolved = activated.pseudocode_document->resolve_request(
+								address,
+								aida::analysis::decompiler_profile_id_t::balanced,
+								aida::workbench::pseudocode_document::
+									k_pseudocode_document_default_timeout_ms,
+								request);
+						}
+						const auto requested = resolved
+							? activated.pseudocode_document->request(request) : resolved;
+						if (requested || requested.code ==
+							aida::workbench::pseudocode_document::
+								pseudocode_error_code_t::request_in_progress)
+							static_cast<void>(
+								activated.pseudocode_document->activate(request));
+						diag::log_tagged_fmt("ui",
+							"workbench_f5 address=0x%llX managed=%d ok=%d code=%u",
+							static_cast<unsigned long long>(address),
+							managed_locator ? 1 : 0,
+							requested ? 1 : 0,
+							static_cast<unsigned>(requested.code));
+					}
+				}
+			} else if (pseudocode_view::has_active_tab(active_workspace_context)) {
 				globals::ui::active_center_view = center_view_t::pseudocode;
 				diag::log_tagged("ui", "view_switch to=pseudocode hotkey=F5");
 			}
@@ -3670,6 +4599,7 @@ void helpers::render_title()
 				case center_view_t::binary_map:  segs.push_back("Binary Map"); break;
 				case center_view_t::debugger_view:segs.push_back("Debugger"); break;
 				case center_view_t::graph_view:  segs.push_back("Graph"); break;
+				case center_view_t::workbench:   segs.push_back("Workbench"); break;
 				case center_view_t::welcome:
 				default: break;
 			}
@@ -4520,6 +5450,7 @@ void helpers::render_title()
 						}
 						menu_sep();
 						if (menu_item("Editor", "")) globals::ui::active_center_view = center_view_t::code_editor;
+						if (menu_item("Workbench", "")) globals::ui::active_center_view = center_view_t::workbench;
 						if (menu_item("Disassembly", "")) globals::ui::active_center_view = center_view_t::disassembly;
 						if (menu_item("Hex", "")) globals::ui::active_center_view = center_view_t::hex_view;
 						if (menu_item("Pseudocode", "")) globals::ui::active_center_view = center_view_t::pseudocode;
@@ -4652,13 +5583,18 @@ void helpers::render_title()
 
 	{
 		ImVec2 wp = ImGui::GetWindowPos();
-		float  sp_w = metrics.splitter_w;
+		const float splitter_visible = aida::ui::scale_px(
+			aida::ui::metrics::splitter::visible, metrics.scale);
+		const float splitter_hit = (std::max)(metrics.splitter_w,
+			aida::ui::scale_px(aida::ui::metrics::splitter::thickness +
+				aida::ui::metrics::splitter::hit_padding * 2.0f, metrics.scale));
+		const float splitter_half_hit = splitter_hit * 0.5f;
 
 
 		float ab_offset = g_sa_settings.activity_bar_visible ? metrics.activity_bar_w : 0.f;
 		float ls_x = wp.x + pad + ab_offset + left_w;
-		ImVec2 ls_min(ls_x - sp_w * 0.5f, wp.y + content_top);
-		ImVec2 ls_max(ls_x + sp_w * 0.5f + gap, wp.y + content_top + total_h);
+		ImVec2 ls_min(ls_x - splitter_half_hit, wp.y + content_top);
+		ImVec2 ls_max(ls_x + splitter_half_hit + gap, wp.y + content_top + total_h);
 
 		bool ls_hov = globals::ui::panel_left_visible && !ui_input_gate::splitter_input_blocked() && ImGui::IsMouseHoveringRect(ls_min, ls_max);
 		if (ls_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -4681,7 +5617,8 @@ void helpers::render_title()
 			ImVec2 mpos = ImGui::GetIO().MousePos;
 			float rs_y0 = wp.y + content_top;
 			float rs_y1 = wp.y + content_top + right_total_h;
-			bool rs_in_rect = mpos.x >= (rs_x - 8.f) && mpos.x <= (rs_x + 8.f)
+			bool rs_in_rect = mpos.x >= (rs_x - splitter_half_hit) &&
+				mpos.x <= (rs_x + splitter_half_hit)
 			               && mpos.y >= rs_y0 && mpos.y <= rs_y1;
 			bool rs_hov = globals::ui::panel_right_visible && rs_in_rect
 			           && !globals::ui::dragging_left_splitter && !globals::ui::dragging_bottom_splitter
@@ -4703,8 +5640,8 @@ void helpers::render_title()
 		if (bottom_h > 1.f) {
 			float right_gap_bs = (right_w > 1.f) ? (right_w + gap) : 0.f;
 			float bs_y = wp.y + content_top + total_h;
-			ImVec2 bs_min(wp.x + pad, bs_y - sp_w * 0.5f);
-			ImVec2 bs_max(wp.x + ww - pad - right_gap_bs, bs_y + sp_w * 0.5f + gap);
+			ImVec2 bs_min(wp.x + pad, bs_y - splitter_half_hit);
+			ImVec2 bs_max(wp.x + ww - pad - right_gap_bs, bs_y + splitter_half_hit + gap);
 			bool bs_hov = !ui_input_gate::splitter_input_blocked() && ImGui::IsMouseHoveringRect(bs_min, bs_max);
 			if (bs_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 				globals::ui::dragging_bottom_splitter = true;
@@ -4738,27 +5675,38 @@ void helpers::render_title()
 		{
 			ImDrawList* fdl = ImGui::GetForegroundDrawList();
 			const auto& th_sp = aida::ui::resolved();
-			float ax_sp = globals::ui::accent.x, ay_sp = globals::ui::accent.y, az_sp = globals::ui::accent.z;
-			ImU32 accent_line = IM_COL32((int)(ax_sp*255),(int)(ay_sp*255),(int)(az_sp*255),(int)(220 * a));
-			ImU32 idle_line   = aida::ui::with_alpha(th_sp.border_strong, 0.55f * a);
+			ImU32 accent_line = aida::ui::with_alpha(th_sp.accent_u32, 0.88f * a);
+			ImU32 idle_line = aida::ui::with_alpha(th_sp.border_subtle, 0.82f * a);
 			float ab_off_line = g_sa_settings.activity_bar_visible ? metrics.activity_bar_w : 0.f;
 			if (globals::ui::panel_left_visible && left_w > 1.f) {
 				float lsx = wp.x + pad + ab_off_line + left_w + gap * 0.5f;
 				bool active = globals::ui::dragging_left_splitter ||
-					ImGui::IsMouseHoveringRect(ImVec2(lsx - 4.f, wp.y + content_top),
-					                           ImVec2(lsx + 4.f, wp.y + content_top + total_h));
+					ImGui::IsMouseHoveringRect(ImVec2(lsx - splitter_half_hit, wp.y + content_top),
+					                           ImVec2(lsx + splitter_half_hit, wp.y + content_top + total_h));
 				ImU32 col = active ? accent_line : idle_line;
 				fdl->AddLine(ImVec2(lsx, wp.y + content_top + 2.f),
-					ImVec2(lsx, wp.y + content_top + total_h - 2.f), col, active ? 1.6f : 1.f);
+					ImVec2(lsx, wp.y + content_top + total_h - 2.f), col,
+					active ? 2.0f : splitter_visible);
+				if (active) {
+					const float cy = wp.y + content_top + total_h * 0.5f;
+					fdl->AddRectFilled(ImVec2(lsx - 2.0f, cy - 16.0f),
+						ImVec2(lsx + 2.0f, cy + 16.0f), accent_line, 2.0f);
+				}
 			}
 			if (globals::ui::panel_right_visible && right_w > 1.f) {
 				float rsx = wp.x + ww - pad - right_w - gap * 0.5f;
 				bool active = globals::ui::dragging_right_splitter ||
-					ImGui::IsMouseHoveringRect(ImVec2(rsx - 4.f, wp.y + content_top),
-					                           ImVec2(rsx + 4.f, wp.y + content_top + right_total_h));
+					ImGui::IsMouseHoveringRect(ImVec2(rsx - splitter_half_hit, wp.y + content_top),
+					                           ImVec2(rsx + splitter_half_hit, wp.y + content_top + right_total_h));
 				ImU32 col = active ? accent_line : idle_line;
 				fdl->AddLine(ImVec2(rsx, wp.y + content_top + 2.f),
-					ImVec2(rsx, wp.y + content_top + right_total_h - 2.f), col, active ? 1.6f : 1.f);
+					ImVec2(rsx, wp.y + content_top + right_total_h - 2.f), col,
+					active ? 2.0f : splitter_visible);
+				if (active) {
+					const float cy = wp.y + content_top + right_total_h * 0.5f;
+					fdl->AddRectFilled(ImVec2(rsx - 2.0f, cy - 16.0f),
+						ImVec2(rsx + 2.0f, cy + 16.0f), accent_line, 2.0f);
+				}
 			}
 			if (globals::ui::panel_bottom_visible && bottom_h > 1.f) {
 				float right_gap_line = (right_w > 1.f) ? (right_w + gap) : 0.f;
@@ -4766,23 +5714,29 @@ void helpers::render_title()
 				float bx0 = wp.x + pad + ab_off_line;
 				float bx1 = wp.x + ww - pad - right_gap_line;
 				bool active = globals::ui::dragging_bottom_splitter ||
-					ImGui::IsMouseHoveringRect(ImVec2(bx0, bsy - 4.f), ImVec2(bx1, bsy + 4.f));
+					ImGui::IsMouseHoveringRect(ImVec2(bx0, bsy - splitter_half_hit),
+						ImVec2(bx1, bsy + splitter_half_hit));
 				ImU32 col = active ? accent_line : idle_line;
-				fdl->AddLine(ImVec2(bx0 + 2.f, bsy), ImVec2(bx1 - 2.f, bsy), col, active ? 1.6f : 1.f);
+				fdl->AddLine(ImVec2(bx0 + 2.f, bsy), ImVec2(bx1 - 2.f, bsy), col,
+					active ? 2.0f : splitter_visible);
+				if (active) {
+					const float cx = bx0 + (bx1 - bx0) * 0.5f;
+					fdl->AddRectFilled(ImVec2(cx - 16.0f, bsy - 2.0f),
+						ImVec2(cx + 16.0f, bsy + 2.0f), accent_line, 2.0f);
+				}
 			}
 		}
 	}
 
-	float ax3 = globals::ui::accent.x, ay3 = globals::ui::accent.y, az3 = globals::ui::accent.z;
-	ImU32 ac_full = IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(255*a));
-	ImU32 ac_dim  = IM_COL32((int)(ax3*255),(int)(ay3*255),(int)(az3*255),(int)(35*a));
 	const auto& th_lp = aida::ui::resolved();
+	float ax3 = globals::ui::accent.x, ay3 = globals::ui::accent.y, az3 = globals::ui::accent.z;
+	ImU32 ac_full = aida::ui::with_alpha(th_lp.accent_u32, a);
+	ImU32 ac_dim = aida::ui::with_alpha(th_lp.accent_dim, 0.42f * a);
 
-
-	const float hdr_pad  = 10.f;
-	const float row_h    = 22.f;
-	const float row_gap  = 1.f;
-	const float tb_vpad  = 8.f;
+	const float hdr_pad = aida::ui::scale_px(aida::ui::metrics::spacing::md, metrics.scale);
+	const float row_h = aida::ui::scale_px(aida::ui::metrics::row::compact, metrics.scale);
+	const float row_gap = aida::ui::scale_px(aida::ui::metrics::spacing::xxs, metrics.scale);
+	const float tb_vpad = aida::ui::scale_px(aida::ui::metrics::spacing::sm, metrics.scale);
 	const float hdr_h    = tb_vpad * 2.f + row_h * 2.f + row_gap;
 
 	ImDrawList* wdl  = ImGui::GetWindowDrawList();
@@ -7191,10 +8145,22 @@ void helpers::render_title()
 	if (overlay_blocking) {
 		cv = center_view_t::welcome;
 	}
+	if (cv == center_view_t::workbench &&
+		(!active_workspace_handle ||
+		 active_workspace_handle->identity().target_kind() !=
+			aida::analysis::target_kind_t::static_file)) {
+		cv = active_workspace_context
+			? center_view_t::disassembly : center_view_t::welcome;
+		globals::ui::active_center_view = cv;
+	}
 
 	if (cv == center_view_t::welcome && !overlay_blocking) {
 		if (code_editor::active && !code_editor::buffer.empty())
 			cv = center_view_t::code_editor;
+		else if (active_workspace_handle &&
+			active_workspace_handle->identity().target_kind() ==
+				aida::analysis::target_kind_t::static_file)
+			cv = center_view_t::workbench;
 		else if (active_workspace_context)
 			cv = center_view_t::disassembly;
 		else if (hex_view::active(active_workspace_context))
@@ -7243,7 +8209,16 @@ void helpers::render_title()
 		}
 	};
 
-	if (cv == center_view_t::code_editor && code_editor::active && !code_editor::buffer.empty())
+	if (cv == center_view_t::workbench && active_workspace_handle &&
+		active_workspace_handle->identity().target_kind() ==
+			aida::analysis::target_kind_t::static_file)
+	{
+		mark_center_render_section("center_view_workbench", cv, overlay_blocking, vw, vh);
+		render_analysis_workbench(active_workspace_handle, vw, vh);
+		log_center_dispatch_exit("center_view_workbench");
+	}
+
+	else if (cv == center_view_t::code_editor && code_editor::active && !code_editor::buffer.empty())
 	{
 		mark_center_render_section("center_view_code_editor", cv, overlay_blocking, vw, vh);
 		ImGui::SetCursorPos(ImVec2(0.f, 0.f));

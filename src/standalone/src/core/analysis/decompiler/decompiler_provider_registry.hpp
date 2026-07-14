@@ -111,6 +111,7 @@ struct decompiler_provider_result_t {
     decompiler_provider_execution_status_t status = decompiler_provider_execution_status_t::failed;
     std::optional<decompiler_provider_artifacts_t> artifacts;
     std::optional<decompiler_document_t> attested_document;
+    bool authenticated_artifacts = false;
     std::vector<decompiler_diagnostic_t> diagnostics;
     std::uint64_t elapsed_wall_clock_ms = 0;
     std::uint64_t elapsed_cpu_ms = 0;

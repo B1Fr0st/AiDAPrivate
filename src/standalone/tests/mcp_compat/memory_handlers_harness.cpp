@@ -1,4 +1,5 @@
 #include "memory_handlers_harness.hpp"
+#include "../c03/assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/mcp/compat/handlers/memory.h"
 #include "../../src/core/mcp/compat/workspace_adapter.hpp"
@@ -40,6 +41,7 @@ constexpr std::array<std::string_view, k_memory_tool_count> k_memory_names{{
 }};
 
 void require(bool condition, std::string_view message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(std::string(message));
     }
@@ -47,6 +49,7 @@ void require(bool condition, std::string_view message) {
 
 void require_fixture(bool condition, std::string_view fixture,
                      std::string_view detail) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, detail, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(
             std::string(fixture) + " fixture: " + std::string(detail));
@@ -839,6 +842,7 @@ bool run_memory_handlers_harness(std::string& failure) {
     try {
         verify_memory_handlers();
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure.assign(error.what());
         return false;
     }

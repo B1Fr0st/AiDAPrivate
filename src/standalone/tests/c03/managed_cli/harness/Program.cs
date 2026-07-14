@@ -1,11 +1,14 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Aida.ManagedDecompiler;
+using Microsoft.Win32.SafeHandles;
 
 namespace Aida.C03.ManagedCliHarness;
 
@@ -13,38 +16,52 @@ internal static class Program
 {
     private const string FixtureAssemblyFileName = "ManagedCliFixtures.dll";
     private const string FixtureManifestRelativePath = "src/standalone/tests/c03/managed_cli/fixture_manifest.json";
-    private const string OfflinePackageRelativePath = ".deps/nuget-offline";
-    private static readonly WorkerBudget StandardBudget = new("balanced", 30_000, 30_000, 1UL << 30, 1_000_000);
+    private const string ManagedContractHash = "4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6";
+    private const string ManagedWorkerBuildMaterial = "aida-managed-decompiler-worker-build-v3|snapshot-bound-contract=4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6|tfm=net10.0|runtime=Microsoft.NETCore.App/10.0.9";
+    private static string runtimeManifestHash = string.Empty;
+    private static readonly WorkerBudget StandardBudget = new(
+        "balanced", 30_000, 30_000, 1UL << 30, 1_000_000,
+        1_000_000, 1_000_000, 0, false);
     private static readonly WorkerProviderExpectation ProviderExpectation = new(
         "10.1.0.8386",
-        OfflinePackageLock.DecompilerAssemblySha256,
-        "managed-cli-worker-harness",
-        HashText("managed-cli-worker-harness"));
+        RuntimeIdentity.DecompilerAssemblySha256,
+        "aida-managed-decompiler-worker-v3",
+        HashText(ManagedWorkerBuildMaterial));
 
     private static async Task<int> Main()
     {
+        byte[]? moduleBytes = null;
         try
         {
             var repositoryRoot = FindRepositoryRoot();
+            var packageRoot = ResolveManagedPackageRoot();
+            runtimeManifestHash = ReadRuntimeManifestHash(packageRoot);
+            ValidateStartupArgumentContract();
             var manifest = LoadManifest(Path.Combine(repositoryRoot, FixtureManifestRelativePath));
             var fixturePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, FixtureAssemblyFileName));
             Require(File.Exists(fixturePath), "managed CLI fixture assembly is unavailable");
-            var moduleHash = HashFile(fixturePath);
+            moduleBytes = File.ReadAllBytes(fixturePath);
+            Require(moduleBytes.Length != 0, "managed CLI fixture assembly is empty");
+            var moduleHash = HashBytes(moduleBytes);
             var inventory = ReadMethodInventory(fixturePath);
             ValidateManifestInventory(manifest, inventory);
 
             var firstCase = manifest.Methods[0];
             var firstMethod = inventory.Methods[firstCase.Symbol];
-            var firstRequest = CreateRequest(1, fixturePath, moduleHash, firstMethod, StandardBudget);
-            await ValidateMandatoryOfflineGateAsync(firstRequest).ConfigureAwait(false);
-
-            OfflinePackageLock.EstablishStartupGate(Path.Combine(repositoryRoot, OfflinePackageRelativePath));
-            await ValidateManifestMethodsAsync(repositoryRoot, manifest, inventory, fixturePath, moduleHash).ConfigureAwait(false);
-            await ValidateCancellationAsync(firstRequest).ConfigureAwait(false);
+            var firstRequest = CreateRequest(1, "regular_file", fixturePath,
+                moduleHash, checked((ulong)moduleBytes.LongLength), firstMethod,
+                StandardBudget, 1, 1);
+            await ValidateMandatoryRuntimeGateAsync(firstRequest).ConfigureAwait(false);
+            await ValidateManifestMethodsAsync(manifest, inventory,
+                fixturePath, moduleHash, checked((ulong)moduleBytes.LongLength)).ConfigureAwait(false);
             await ValidateResourceLimitsAsync().ConfigureAwait(false);
             await ValidateResourceBudgetBoundsAsync(firstRequest).ConfigureAwait(false);
-            await ValidateSnapshotBindingAsync(firstRequest, fixturePath).ConfigureAwait(false);
-            await ValidateMalformedCasesAsync(manifest, firstMethod, fixturePath).ConfigureAwait(false);
+            await ValidateSnapshotBindingAsync(firstRequest,
+                fixturePath, moduleBytes).ConfigureAwait(false);
+            await ValidateMalformedCasesAsync(manifest, firstMethod,
+                fixturePath).ConfigureAwait(false);
+            await ValidateConcurrentWorkspaceIsolationAsync(fixturePath,
+                moduleHash, checked((ulong)moduleBytes.LongLength), firstMethod).ConfigureAwait(false);
             Console.Out.WriteLine("managed CLI worker harness satisfied");
             return 0;
         }
@@ -53,37 +70,94 @@ internal static class Program
             Console.Error.WriteLine(exception.Message);
             return 1;
         }
+        finally
+        {
+            if (moduleBytes is not null)
+                CryptographicOperations.ZeroMemory(moduleBytes);
+        }
     }
 
-    private static async Task ValidateMandatoryOfflineGateAsync(WorkerRequest request)
+    private static async Task ValidateMandatoryRuntimeGateAsync(WorkerRequest request)
     {
         await using var guard = new ResourceBudgetGuard(request.Budget);
         try
         {
             _ = MetadataAnalysis.Analyze(request, guard, CancellationToken.None);
-            throw new InvalidOperationException("managed CLI analysis bypassed the offline startup gate");
+            throw new InvalidOperationException("managed CLI analysis bypassed the app-local runtime gate");
         }
-        catch (OfflineIntegrityException)
+        catch (RuntimeIntegrityException)
         {
         }
     }
 
+    private static void ValidateStartupArgumentContract()
+    {
+        var valid = new[]
+        {
+            "--aida-managed-decompiler-worker",
+            "--provider=2",
+            "--read-handle=1",
+            "--write-handle=2",
+            "--module-handle=3",
+            "--module-size=1",
+            "--identity-handle=4",
+            "--runtime-manifest-hash=" + runtimeManifestHash
+        };
+        var parsed = WorkerStartupOptions.Parse(valid);
+        Require(parsed.ModuleSize == 1 && parsed.ReadHandle != parsed.WriteHandle &&
+            parsed.ModuleHandle != parsed.IdentityHandle,
+            "managed CLI worker startup contract rejected its exact handle allowlist");
+
+        void RequireRejected(string[] arguments, string message)
+        {
+            try
+            {
+                _ = WorkerStartupOptions.Parse(arguments);
+                throw new InvalidOperationException(message);
+            }
+            catch (InvalidDataException)
+            {
+            }
+        }
+
+        var oversized = valid.ToArray();
+        oversized[5] = "--module-size=268435457";
+        RequireRejected(oversized, "managed CLI worker accepted an oversized module mapping");
+        var duplicate = valid.ToArray();
+        duplicate[4] = "--module-handle=2";
+        RequireRejected(duplicate, "managed CLI worker accepted overlapping handle capabilities");
+        var nonCanonical = valid.ToArray();
+        nonCanonical[2] = "--read-handle=+1";
+        RequireRejected(nonCanonical, "managed CLI worker accepted a non-canonical handle value");
+        var missingRuntime = valid[..^1];
+        RequireRejected(missingRuntime, "managed CLI worker accepted a missing runtime identity");
+        var uppercaseRuntime = valid.ToArray();
+        uppercaseRuntime[^1] = "--runtime-manifest-hash=A" + runtimeManifestHash[1..];
+        RequireRejected(uppercaseRuntime, "managed CLI worker accepted a non-canonical runtime identity");
+        var emptyRuntimeIdentity = valid.ToArray();
+        emptyRuntimeIdentity[^1] = "--runtime-manifest-hash=" + new string('0', 64);
+        RequireRejected(emptyRuntimeIdentity, "managed CLI worker accepted an empty runtime identity");
+        var repositoryRuntime = valid.Append("--package-root=.deps").ToArray();
+        RequireRejected(repositoryRuntime, "managed CLI worker accepted a repository package override");
+    }
+
     private static async Task ValidateManifestMethodsAsync(
-        string repositoryRoot,
         FixtureManifest manifest,
         MethodInventory inventory,
         string fixturePath,
-        string moduleHash)
+        string moduleHash,
+        ulong moduleSize)
     {
-        await using var worker = ManagedWorkerProcess.Start(repositoryRoot);
         ulong sequence = 10;
         foreach (var fixtureCase in manifest.Methods)
         {
             var method = inventory.Methods[fixtureCase.Symbol];
-            var request = CreateRequest(sequence++, fixturePath, moduleHash, method, StandardBudget);
+            var request = CreateRequest(sequence++, "regular_file", fixturePath,
+                moduleHash, moduleSize, method, StandardBudget, 7, 9);
             string? baseline = null;
             for (var run = 0; run < manifest.Validation.DeterministicRuns; run++)
             {
+                await using var worker = await ManagedWorkerProcess.StartAsync(fixturePath).ConfigureAwait(false);
                 var result = await worker.DecompileAsync(request).ConfigureAwait(false);
                 ValidateMethodResult(fixtureCase, method, request, result);
                 var serialized = WorkerProtocol.Serialize(result);
@@ -93,30 +167,39 @@ internal static class Program
             }
         }
         var firstMethod = inventory.Methods[manifest.Methods[0].Symbol];
-        var cancellationRequest = CreateRequest(sequence++, fixturePath, moduleHash, firstMethod, StandardBudget);
-        var cancelled = await worker.DecompileAndCancelAsync(cancellationRequest).ConfigureAwait(false);
+        var cancellationRequest = CreateRequest(sequence++, "regular_file", fixturePath,
+            moduleHash, moduleSize, firstMethod, StandardBudget, 7, 9);
+        await using var cancellationWorker = await ManagedWorkerProcess.StartAsync(fixturePath).ConfigureAwait(false);
+        var cancelled = await cancellationWorker.DecompileAndCancelAsync(cancellationRequest).ConfigureAwait(false);
         Require(cancelled.Diagnostics.Count == 1 && string.Equals(cancelled.Diagnostics[0].Code, "cancelled", StringComparison.Ordinal),
             "managed CLI worker cancellation response is invalid");
-        var memoryRequest = CreateRequest(sequence, fixturePath, moduleHash, firstMethod,
-            new WorkerBudget("balanced", 5_000, 5_000, 1, 1_000_000));
-        var limited = await worker.DecompileFailureAsync(memoryRequest).ConfigureAwait(false);
+        var memoryRequest = CreateRequest(sequence++, "regular_file", fixturePath,
+            moduleHash, moduleSize, firstMethod,
+            new WorkerBudget("balanced", 5_000, 5_000, moduleSize * 2, 1_000_000,
+                1_000_000, 1_000_000, 0, false), 7, 9);
+        await using var memoryWorker = await ManagedWorkerProcess.StartAsync(fixturePath).ConfigureAwait(false);
+        var limited = await memoryWorker.DecompileFailureAsync(memoryRequest).ConfigureAwait(false);
         Require(limited.Diagnostics.Count == 1 && string.Equals(limited.Diagnostics[0].Code, "resource_limit", StringComparison.Ordinal),
             "managed CLI worker resource response is invalid");
-    }
 
-    private static async Task<WorkerResult> AnalyzeAsync(WorkerRequest request, CancellationToken cancellationToken)
-    {
-        await using var guard = new ResourceBudgetGuard(request.Budget);
-        using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(request.Budget.MaxWallClockMs));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token, guard.LimitToken);
-        var result = await Task.Run(() => MetadataAnalysis.Analyze(request, guard, linked.Token), linked.Token).ConfigureAwait(false);
-        await guard.CompleteAsync().ConfigureAwait(false);
-        return result;
+        var deadlineRequest = CreateRequest(sequence, "regular_file", fixturePath,
+            moduleHash, moduleSize, firstMethod,
+            new WorkerBudget("balanced", 1, 30_000, 1UL << 30, 1_000_000,
+                1_000_000, 1_000_000, 0, false), 7, 9);
+        await using var deadlineWorker = await ManagedWorkerProcess.StartAsync(
+            fixturePath).ConfigureAwait(false);
+        var deadline = await deadlineWorker.DecompileFailureAsync(deadlineRequest).ConfigureAwait(false);
+        Require(deadline.Diagnostics.Count == 1 &&
+            string.Equals(deadline.Diagnostics[0].Code, "deadline_exceeded", StringComparison.Ordinal),
+            "managed CLI worker deadline response is invalid");
     }
 
     private static void ValidateMethodResult(FixtureCase fixtureCase, MethodDescriptor method, WorkerRequest request, WorkerResult result)
     {
-        Require(string.Equals(result.ModuleHash, request.ModuleHash, StringComparison.Ordinal), $"module hash drifted for {fixtureCase.Symbol}");
+        ValidateTerminalBinding(request, result.ModuleSource, result.EntityHash,
+            result.MetadataToken, result.WorkspaceGeneration, result.TypeGraphRevision,
+            result.Budget, result.RuntimeManifestHash, result.ContractHash,
+            result.CacheIdentity, result.RequestBindingHash, result.Provider);
         Require(result.MetadataToken == method.Token && result.Identity.GenericArity == fixtureCase.MethodGenericArity,
             $"metadata identity drifted for {fixtureCase.Symbol}");
         Require(string.Equals(result.Identity.DeclaringType + "." + result.Identity.MethodName, fixtureCase.Symbol, StringComparison.Ordinal),
@@ -145,24 +228,46 @@ internal static class Program
             $"token map ordering drifted for {fixtureCase.Symbol}");
     }
 
-    private static async Task ValidateCancellationAsync(WorkerRequest request)
+    private static void ValidateTerminalBinding(
+        WorkerRequest request,
+        WorkerModuleSource moduleSource,
+        string entityHash,
+        uint metadataToken,
+        ulong workspaceGeneration,
+        ulong typeGraphRevision,
+        WorkerBudget budget,
+        string responseRuntimeManifestHash,
+        string contractHash,
+        string cacheIdentity,
+        string requestBindingHash,
+        WorkerProviderExpectation provider)
     {
-        Require(request.Budget.MaxWallClockMs != 0, "cancellation fixture budget is invalid");
-        using var cancellation = new CancellationTokenSource();
-        cancellation.Cancel();
-        try
-        {
-            _ = await AnalyzeAsync(request, cancellation.Token).ConfigureAwait(false);
-            throw new InvalidOperationException("managed CLI analysis ignored cancellation");
-        }
-        catch (OperationCanceledException)
-        {
-        }
+        Require(string.Equals(moduleSource.Kind, request.ModuleSource.Kind, StringComparison.Ordinal) &&
+            string.Equals(moduleSource.LogicalIdentity, request.ModuleSource.LogicalIdentity, StringComparison.Ordinal) &&
+            FixedTimeHexEquals(moduleSource.ModuleHash, request.ModuleSource.ModuleHash) &&
+            moduleSource.ModuleSize == request.ModuleSource.ModuleSize &&
+            FixedTimeHexEquals(entityHash, request.EntityHash) && metadataToken == request.MetadataToken &&
+            workspaceGeneration == request.WorkspaceGeneration && typeGraphRevision == request.TypeGraphRevision &&
+            budget == request.Budget && FixedTimeHexEquals(responseRuntimeManifestHash, request.RuntimeManifestHash) &&
+            FixedTimeHexEquals(contractHash, request.ContractHash) &&
+            FixedTimeHexEquals(cacheIdentity, request.CacheIdentity) &&
+            FixedTimeHexEquals(requestBindingHash, request.RequestBindingHash) &&
+            provider == request.Provider,
+            "managed CLI terminal response is not exactly bound to its request");
+    }
+
+    private static void ValidateFailureBinding(WorkerRequest request, WorkerFailure failure)
+    {
+        ValidateTerminalBinding(request, failure.ModuleSource, failure.EntityHash,
+            failure.MetadataToken, failure.WorkspaceGeneration, failure.TypeGraphRevision,
+            failure.Budget, failure.RuntimeManifestHash, failure.ContractHash,
+            failure.CacheIdentity, failure.RequestBindingHash, failure.Provider);
     }
 
     private static async Task ValidateResourceLimitsAsync()
     {
-        await using (var memoryGuard = new ResourceBudgetGuard(new WorkerBudget("balanced", 5_000, 5_000, 1, 1_000)))
+        await using (var memoryGuard = new ResourceBudgetGuard(new WorkerBudget(
+            "balanced", 5_000, 5_000, 1, 1_000, 1_000, 1_000, 0, false)))
         {
             try
             {
@@ -175,7 +280,9 @@ internal static class Program
             }
         }
 
-        await using var cpuGuard = new ResourceBudgetGuard(new WorkerBudget("balanced", 5_000, 1, WorkerBudgetLimits.MaximumMemoryBytes, 1_000));
+        await using var cpuGuard = new ResourceBudgetGuard(new WorkerBudget(
+            "balanced", 5_000, 1, WorkerBudgetLimits.MaximumMemoryBytes,
+            1_000, 1_000, 1_000, 0, false));
         var elapsed = Stopwatch.StartNew();
         while (elapsed.Elapsed < TimeSpan.FromSeconds(5))
         {
@@ -195,17 +302,27 @@ internal static class Program
 
     private static async Task ValidateResourceBudgetBoundsAsync(WorkerRequest request)
     {
-        var tiny = new WorkerBudget("balanced", 1, 1, 1, 1);
-        MetadataAnalysis.ValidateRequest(request with { Budget = tiny });
+        var tiny = new WorkerBudget("balanced", 1, 1,
+            request.ModuleSource.ModuleSize * 2, 1, 1, 1, 0, false);
+        MetadataAnalysis.ValidateRequest(RebindRequest(request with { Budget = tiny }));
 
-        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, ulong.MaxValue, 1, 1),
+        await RequireBudgetRejectedAsync(request, new WorkerBudget(
+                "balanced", 1, ulong.MaxValue, 1, 1, 1, 1, 0, false),
             "managed CLI accepted UINT64_MAX CPU budget").ConfigureAwait(false);
-        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, WorkerBudgetLimits.MaximumCpuMs + 1, 1, 1),
+        await RequireBudgetRejectedAsync(request, new WorkerBudget(
+                "balanced", 1, WorkerBudgetLimits.MaximumCpuMs + 1, 1, 1, 1, 1, 0, false),
             "managed CLI accepted oversized CPU budget").ConfigureAwait(false);
-        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, 1, ulong.MaxValue, 1),
+        await RequireBudgetRejectedAsync(request, new WorkerBudget(
+                "balanced", 1, 1, ulong.MaxValue, 1, 1, 1, 0, false),
             "managed CLI accepted UINT64_MAX memory budget").ConfigureAwait(false);
-        await RequireBudgetRejectedAsync(request, new WorkerBudget("balanced", 1, 1, WorkerBudgetLimits.MaximumMemoryBytes + 1, 1),
+        await RequireBudgetRejectedAsync(request, new WorkerBudget(
+                "balanced", 1, 1, WorkerBudgetLimits.MaximumMemoryBytes + 1,
+                1, 1, 1, 0, false),
             "managed CLI accepted oversized memory budget").ConfigureAwait(false);
+        await RequireBudgetRejectedAsync(request, new WorkerBudget(
+                "balanced", 1, 1, request.ModuleSource.ModuleSize * 2,
+                1, 1, 1, 1, false),
+            "managed CLI accepted semantic queries in the balanced profile").ConfigureAwait(false);
     }
 
     private static async Task RequireBudgetRejectedAsync(WorkerRequest request, WorkerBudget budget, string message)
@@ -229,24 +346,57 @@ internal static class Program
         }
     }
 
-    private static async Task ValidateSnapshotBindingAsync(WorkerRequest request, string fixturePath)
+    private static async Task ValidateSnapshotBindingAsync(
+        WorkerRequest request,
+        string fixturePath,
+        byte[] fixtureBytes)
     {
         var temporaryPath = Path.Combine(Path.GetTempPath(), $"aida-managed-cli-snapshot-{Guid.NewGuid():N}.dll");
         try
         {
-            File.Copy(fixturePath, temporaryPath, overwrite: false);
-            var bound = request with { ModulePath = temporaryPath, ModuleHash = HashFile(temporaryPath), Sequence = request.Sequence + 10_000 };
+            File.WriteAllBytes(temporaryPath, fixtureBytes);
+            var source = new WorkerModuleSource("embedded_member",
+                Path.GetFullPath(fixturePath) + "#member:nested/ManagedCliFixtures.dll",
+                HashBytes(fixtureBytes), checked((ulong)fixtureBytes.LongLength));
+            var bound = RebindRequest(request with
+            {
+                RequestId = request.RequestId + "-snapshot",
+                ModuleSource = source,
+                EntityHash = HashText(request.EntityHash + "|" + source.ModuleHash),
+                WorkspaceGeneration = request.WorkspaceGeneration + 1
+            });
+            await using var worker = await ManagedWorkerProcess.StartAsync(temporaryPath).ConfigureAwait(false);
             var bytes = File.ReadAllBytes(temporaryPath);
             bytes[^1] ^= 0x5a;
             File.WriteAllBytes(temporaryPath, bytes);
+            var result = await worker.DecompileAsync(bound).ConfigureAwait(false);
+            ValidateTerminalBinding(bound, result.ModuleSource, result.EntityHash,
+                result.MetadataToken, result.WorkspaceGeneration, result.TypeGraphRevision,
+                result.Budget, result.RuntimeManifestHash, result.ContractHash,
+                result.CacheIdentity, result.RequestBindingHash, result.Provider);
+            Require(FixedTimeHexEquals(result.ModuleSource.ModuleHash,
+                    bound.ModuleSource.ModuleHash),
+                "managed CLI immutable module snapshot changed after launch binding");
+
+            await using var staleWorker = await ManagedWorkerProcess.StartAsync(
+                temporaryPath).ConfigureAwait(false);
+            var stale = await staleWorker.DecompileFailureAsync(bound).ConfigureAwait(false);
+            Require(stale.Diagnostics.Count == 1 &&
+                string.Equals(stale.Diagnostics[0].Code, "malformed_metadata", StringComparison.Ordinal),
+                "managed CLI stale snapshot binding was not rejected");
+
             try
             {
-                _ = await AnalyzeAsync(bound, CancellationToken.None).ConfigureAwait(false);
-                throw new InvalidOperationException("managed CLI accepted a module changed after hash binding");
+                MetadataAnalysis.ValidateRequest(RebindRequest(bound with
+                {
+                    ModuleSource = source with { LogicalIdentity = fixturePath }
+                }));
+                throw new InvalidOperationException("managed CLI embedded source without member identity was accepted");
             }
             catch (InvalidDataException)
             {
             }
+            CryptographicOperations.ZeroMemory(bytes);
         }
         finally
         {
@@ -288,18 +438,31 @@ internal static class Program
                         throw new InvalidDataException($"unsupported malformed fixture mutation: {malformed.Mutation}");
                 }
                 File.WriteAllBytes(temporaryPath, bytes);
-                var request = CreateRequest(20_000 + checked((ulong)malformedIndex), temporaryPath, HashBytes(bytes), method, StandardBudget) with
+                var request = CreateRequest(20_000 + checked((ulong)malformedIndex),
+                    "regular_file", temporaryPath, HashBytes(bytes),
+                    checked((ulong)bytes.LongLength), method, StandardBudget, 41, 17);
+                request = RebindRequest(request with { MetadataToken = token });
+                if (string.Equals(malformed.Mutation, "non_method_token", StringComparison.Ordinal))
                 {
-                    MetadataToken = token
-                };
-                try
-                {
-                    _ = await AnalyzeAsync(request, CancellationToken.None).ConfigureAwait(false);
-                    throw new InvalidOperationException($"managed CLI accepted malformed fixture {malformed.Id}");
+                    try
+                    {
+                        MetadataAnalysis.ValidateRequest(request);
+                        throw new InvalidOperationException(
+                            "managed CLI non-method token request was accepted");
+                    }
+                    catch (InvalidDataException)
+                    {
+                    }
+                    CryptographicOperations.ZeroMemory(bytes);
+                    continue;
                 }
-                catch (Exception exception) when (exception is BadImageFormatException or InvalidDataException)
-                {
-                }
+                await using var worker = await ManagedWorkerProcess.StartAsync(temporaryPath).ConfigureAwait(false);
+                var failure = await worker.DecompileFailureAsync(request).ConfigureAwait(false);
+                Require(failure.Diagnostics.Count == 1 &&
+                    string.Equals(failure.Diagnostics[0].Code, malformed.ExpectedCode, StringComparison.Ordinal) &&
+                    string.Equals(failure.Diagnostics[0].Key, malformed.ExpectedKey, StringComparison.Ordinal),
+                    $"managed CLI malformed fixture diagnostic drifted for {malformed.Id}");
+                CryptographicOperations.ZeroMemory(bytes);
             }
             finally
             {
@@ -309,26 +472,104 @@ internal static class Program
         }
     }
 
+    private static async Task ValidateConcurrentWorkspaceIsolationAsync(
+        string fixturePath,
+        string moduleHash,
+        ulong moduleSize,
+        MethodDescriptor method)
+    {
+        var leftRequest = CreateRequest(30_001, "regular_file", fixturePath,
+            moduleHash, moduleSize, method, StandardBudget, 101, 23);
+        var rightRequest = CreateRequest(30_002, "regular_file", fixturePath,
+            moduleHash, moduleSize, method, StandardBudget, 202, 29);
+        Require(!FixedTimeHexEquals(leftRequest.CacheIdentity, rightRequest.CacheIdentity) &&
+            !FixedTimeHexEquals(leftRequest.RequestBindingHash, rightRequest.RequestBindingHash),
+            "managed CLI cross-workspace request identities collided");
+        await using var leftWorker = await ManagedWorkerProcess.StartAsync(
+            fixturePath).ConfigureAwait(false);
+        await using var rightWorker = await ManagedWorkerProcess.StartAsync(
+            fixturePath).ConfigureAwait(false);
+        var results = await Task.WhenAll(
+            leftWorker.DecompileAsync(leftRequest),
+            rightWorker.DecompileAsync(rightRequest)).ConfigureAwait(false);
+        Require(results[0].WorkspaceGeneration == leftRequest.WorkspaceGeneration &&
+            results[1].WorkspaceGeneration == rightRequest.WorkspaceGeneration &&
+            results[0].WorkspaceGeneration != results[1].WorkspaceGeneration &&
+            FixedTimeHexEquals(results[0].ModuleSource.ModuleHash,
+                results[1].ModuleSource.ModuleHash),
+            "managed CLI concurrent workspace responses crossed request boundaries");
+    }
+
     private static WorkerRequest CreateRequest(
         ulong sequence,
-        string modulePath,
+        string sourceKind,
+        string logicalIdentity,
         string moduleHash,
+        ulong moduleSize,
         MethodDescriptor method,
-        WorkerBudget budget)
+        WorkerBudget budget,
+        ulong workspaceGeneration,
+        ulong typeGraphRevision)
     {
-        return new WorkerRequest(
+        var source = new WorkerModuleSource(sourceKind,
+            string.Equals(sourceKind, "regular_file", StringComparison.Ordinal)
+                ? Path.GetFullPath(logicalIdentity) : logicalIdentity,
+            moduleHash, moduleSize);
+        var entityHash = HashText(WorkerProtocol.Serialize(new
+        {
+            Source = source,
+            method.Token,
+            method.DeclaringType,
+            method.Name,
+            method.Signature,
+            method.GenericArity
+        }));
+        var request = new WorkerRequest(
             WorkerProtocol.Schema,
             WorkerProtocol.Version,
             "decompile",
-            sequence,
-            $"managed-cli-fixture-{sequence}",
-            Path.GetFullPath(modulePath),
-            moduleHash,
-            method.Token,
             1,
-            OfflinePackageLock.ManifestHashHex,
+            $"managed-cli-fixture-{sequence}",
+            source,
+            entityHash,
+            method.Token,
+            workspaceGeneration,
+            typeGraphRevision,
+            runtimeManifestHash,
+            ManagedContractHash,
+            string.Empty,
+            string.Empty,
             budget,
             ProviderExpectation);
+        return RebindRequest(request);
+    }
+
+    private static WorkerRequest RebindRequest(WorkerRequest request)
+    {
+        var cacheIdentity = HashText(WorkerProtocol.Serialize(new
+        {
+            request.ContractHash,
+            request.EntityHash,
+            request.ModuleSource,
+            request.WorkspaceGeneration,
+            request.TypeGraphRevision,
+            request.Budget,
+            request.RuntimeManifestHash,
+            request.Provider
+        }));
+        var requestBindingHash = HashText(WorkerProtocol.Serialize(new
+        {
+            request.Schema,
+            request.SchemaVersion,
+            request.Sequence,
+            request.RequestId,
+            CacheIdentity = cacheIdentity
+        }));
+        return request with
+        {
+            CacheIdentity = cacheIdentity,
+            RequestBindingHash = requestBindingHash
+        };
     }
 
     private static MethodInventory ReadMethodInventory(string path)
@@ -372,7 +613,7 @@ internal static class Program
             "managed CLI fixture manifest schema is invalid");
         Require(string.Equals(manifest.Assembly, "ManagedCliFixtures", StringComparison.Ordinal) && manifest.Methods.Count >= 6,
             "managed CLI fixture manifest inventory is incomplete");
-        Require(manifest.Validation.DeterministicRuns >= 2 && manifest.Validation.Cancellation && manifest.Validation.OfflineStartupGate &&
+        Require(manifest.Validation.DeterministicRuns >= 2 && manifest.Validation.Cancellation && manifest.Validation.RuntimeGate &&
             manifest.Validation.SnapshotBinding && manifest.Validation.ResourceLimits.OrderBy(value => value, StringComparer.Ordinal)
                 .SequenceEqual(new[] { "maxCpuMs", "maxMemoryBytes" }.OrderBy(value => value, StringComparer.Ordinal), StringComparer.Ordinal),
             "managed CLI fixture validation contract is incomplete");
@@ -410,7 +651,7 @@ internal static class Program
             validationValue.GetProperty("deterministic_runs").GetInt32(),
             validationValue.GetProperty("cancellation").GetBoolean(),
             validationValue.GetProperty("resource_limits").EnumerateArray().Select(value => value.GetString() ?? throw new InvalidDataException("resource limit is empty")).ToArray(),
-            validationValue.GetProperty("offline_startup_gate").GetBoolean(),
+            validationValue.GetProperty("runtime_identity_gate").GetBoolean(),
             validationValue.GetProperty("snapshot_binding").GetBoolean());
         return new FixtureManifest(
             root.GetProperty("schema").GetString() ?? throw new InvalidDataException("fixture schema is empty"),
@@ -434,6 +675,29 @@ internal static class Program
             }
         }
         throw new DirectoryNotFoundException("AiDA repository root is unavailable");
+    }
+
+    private static string ResolveManagedPackageRoot()
+    {
+        var configured = Environment.GetEnvironmentVariable("AIDA_C03_MANAGED_PACKAGE_ROOT");
+        if (string.IsNullOrWhiteSpace(configured))
+            throw new DirectoryNotFoundException("managed CLI app-local package root is not configured");
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(configured));
+        if (!Directory.Exists(root) || root.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries)
+                .Any(component => string.Equals(component, ".deps", StringComparison.OrdinalIgnoreCase)))
+            throw new DirectoryNotFoundException("managed CLI app-local package root is invalid");
+        return root;
+    }
+
+    private static string ReadRuntimeManifestHash(string packageRoot)
+    {
+        var manifest = Path.Combine(packageRoot, "deps", "AiDA_ManagedRuntime.manifest.json");
+        var digest = Path.Combine(packageRoot, "deps", "AiDA_ManagedRuntime.manifest.sha256");
+        Require(File.Exists(manifest) && File.Exists(digest), "managed CLI runtime manifest package is unavailable");
+        var actual = HashFile(manifest);
+        var text = File.ReadAllText(digest, Encoding.ASCII);
+        Require(string.Equals(text, actual + "\n", StringComparison.Ordinal), "managed CLI runtime manifest digest is invalid");
+        return actual;
     }
 
     private static int FindSequence(byte[] bytes, byte[] sequence)
@@ -460,7 +724,25 @@ internal static class Program
     {
         if (left.Length != 64 || right.Length != 64)
             return false;
-        return CryptographicOperations.FixedTimeEquals(Convert.FromHexString(left), Convert.FromHexString(right));
+        byte[]? leftBytes = null;
+        byte[]? rightBytes = null;
+        try
+        {
+            leftBytes = Convert.FromHexString(left);
+            rightBytes = Convert.FromHexString(right);
+            return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes);
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (leftBytes is not null)
+                CryptographicOperations.ZeroMemory(leftBytes);
+            if (rightBytes is not null)
+                CryptographicOperations.ZeroMemory(rightBytes);
+        }
     }
 
     private static void Require(bool condition, string message)
@@ -471,79 +753,96 @@ internal static class Program
 
     private sealed class ManagedWorkerProcess : IAsyncDisposable
     {
-        private readonly Process process;
+        private readonly SafeFileHandle process;
+        private readonly HarnessTransport transport;
+        private bool requestSent;
+        private bool terminalReceived;
 
-        private ManagedWorkerProcess(Process process)
+        private ManagedWorkerProcess(SafeFileHandle process, HarnessTransport transport)
         {
             this.process = process;
+            this.transport = transport;
         }
 
-        internal static ManagedWorkerProcess Start(string repositoryRoot)
+        internal static async Task<ManagedWorkerProcess> StartAsync(string modulePath)
         {
-            var sdkPath = Path.Combine(repositoryRoot, ".deps/dotnet-sdk-10.0.301-win-x64/dotnet.exe");
-            var workerPath = Path.Combine(AppContext.BaseDirectory, "ManagedDecompilerWorker.dll");
-            var runtimeConfigPath = Path.Combine(AppContext.BaseDirectory, "ManagedCliWorkerHarness.runtimeconfig.json");
-            var dependencyContextPath = Path.Combine(AppContext.BaseDirectory, "ManagedCliWorkerHarness.deps.json");
-            Require(File.Exists(sdkPath), "managed CLI locked SDK is unavailable");
-            Require(File.Exists(workerPath), "managed CLI worker assembly is unavailable");
-            Require(File.Exists(runtimeConfigPath) && File.Exists(dependencyContextPath), "managed CLI harness runtime contract is unavailable");
-            var start = new ProcessStartInfo
+            var launch = WorkerLaunch.Start(modulePath);
+            HarnessTransport? transport = null;
+            try
             {
-                FileName = sdkPath,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                WorkingDirectory = AppContext.BaseDirectory
-            };
-            start.ArgumentList.Add("exec");
-            start.ArgumentList.Add("--runtimeconfig");
-            start.ArgumentList.Add(runtimeConfigPath);
-            start.ArgumentList.Add("--depsfile");
-            start.ArgumentList.Add(dependencyContextPath);
-            start.ArgumentList.Add(workerPath);
-            start.ArgumentList.Add("--offline-package-root");
-            start.ArgumentList.Add(Path.Combine(repositoryRoot, OfflinePackageRelativePath));
-            var process = Process.Start(start) ?? throw new InvalidOperationException("managed CLI worker process could not start");
-            return new ManagedWorkerProcess(process);
+                transport = await HarnessTransport.EstablishAsync(launch.RequestStream, launch.ResponseStream).ConfigureAwait(false);
+                var helloPayload = await transport.ReceivePayloadAsync(1).ConfigureAwait(false);
+                var hello = WorkerProtocol.Deserialize<WorkerTransportHello>(helloPayload);
+                Require(string.Equals(hello.Schema, "aida.c03.managed-cli.transport", StringComparison.Ordinal) &&
+                    hello.SchemaVersion == 3 && string.Equals(hello.Kind, "hello", StringComparison.Ordinal) && hello.Sequence == 1 &&
+                    FixedTimeHexEquals(hello.SessionNonceHash, transport.SessionNonceHash) &&
+                    FixedTimeHexEquals(hello.ManifestHash, transport.ManifestHash) &&
+                    FixedTimeHexEquals(hello.RuntimeManifestHash, runtimeManifestHash) &&
+                    FixedTimeHexEquals(hello.WorkerBinaryHash, launch.WorkerHash) &&
+                    FixedTimeHexEquals(hello.ProviderBinaryHash, RuntimeIdentity.DecompilerAssemblySha256) &&
+                    string.Equals(hello.WorkerBuildId, ProviderExpectation.WorkerBuildId, StringComparison.Ordinal) &&
+                    FixedTimeHexEquals(hello.WorkerBuildHash, ProviderExpectation.WorkerBuildHash),
+                    "managed CLI worker authenticated hello is invalid");
+                launch.TransferOwnership();
+                return new ManagedWorkerProcess(launch.Process, transport);
+            }
+            catch
+            {
+                transport?.Dispose();
+                launch.Abort();
+                throw;
+            }
         }
 
         internal async Task<WorkerResult> DecompileAsync(WorkerRequest request)
         {
-            Require(!process.HasExited, "managed CLI worker exited before accepting a fixture");
-            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(request)).ConfigureAwait(false);
-            await process.StandardInput.FlushAsync().ConfigureAwait(false);
+            await SendRequestAsync(request).ConfigureAwait(false);
             var line = await ReadResponseAsync().ConfigureAwait(false);
             using var document = JsonDocument.Parse(line);
             var kind = document.RootElement.GetProperty("kind").GetString();
             if (!string.Equals(kind, "result", StringComparison.Ordinal))
                 throw new InvalidOperationException("managed CLI worker rejected a fixture: " + line);
-            return WorkerProtocol.Deserialize<WorkerResult>(line);
+            var result = WorkerProtocol.Deserialize<WorkerResult>(line);
+            ValidateTerminalBinding(request, result.ModuleSource, result.EntityHash,
+                result.MetadataToken, result.WorkspaceGeneration, result.TypeGraphRevision,
+                result.Budget, result.RuntimeManifestHash, result.ContractHash,
+                result.CacheIdentity, result.RequestBindingHash, result.Provider);
+            return result;
         }
 
         internal async Task<WorkerFailure> DecompileAndCancelAsync(WorkerRequest request)
         {
-            Require(!process.HasExited, "managed CLI worker exited before accepting cancellation");
+            await SendRequestAsync(request).ConfigureAwait(false);
             var cancellation = new WorkerCancellation(
                 WorkerProtocol.Schema,
                 WorkerProtocol.Version,
                 "cancel",
-                request.Sequence + 100_000,
+                request.Sequence + 1,
                 request.RequestId,
+                request.RequestBindingHash,
                 "managed_cli_fixture_cancel");
-            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(request)).ConfigureAwait(false);
-            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(cancellation)).ConfigureAwait(false);
-            await process.StandardInput.FlushAsync().ConfigureAwait(false);
-            return WorkerProtocol.Deserialize<WorkerFailure>(await ReadFailureResponseAsync().ConfigureAwait(false));
+            await transport.SendPayloadAsync(2, WorkerProtocol.Serialize(cancellation)).ConfigureAwait(false);
+            var failure = WorkerProtocol.Deserialize<WorkerFailure>(
+                await ReadFailureResponseAsync().ConfigureAwait(false));
+            ValidateFailureBinding(request, failure);
+            return failure;
         }
 
         internal async Task<WorkerFailure> DecompileFailureAsync(WorkerRequest request)
         {
-            Require(!process.HasExited, "managed CLI worker exited before accepting a limited fixture");
-            await process.StandardInput.WriteLineAsync(WorkerProtocol.Serialize(request)).ConfigureAwait(false);
-            await process.StandardInput.FlushAsync().ConfigureAwait(false);
-            return WorkerProtocol.Deserialize<WorkerFailure>(await ReadFailureResponseAsync().ConfigureAwait(false));
+            await SendRequestAsync(request).ConfigureAwait(false);
+            var failure = WorkerProtocol.Deserialize<WorkerFailure>(
+                await ReadFailureResponseAsync().ConfigureAwait(false));
+            ValidateFailureBinding(request, failure);
+            return failure;
+        }
+
+        private async Task SendRequestAsync(WorkerRequest request)
+        {
+            Require(!requestSent && !terminalReceived && request.Sequence == 1,
+                "managed CLI harness request lifecycle is invalid");
+            requestSent = true;
+            await transport.SendPayloadAsync(1, WorkerProtocol.Serialize(request)).ConfigureAwait(false);
         }
 
         private async Task<string> ReadFailureResponseAsync()
@@ -557,38 +856,527 @@ internal static class Program
 
         private async Task<string> ReadResponseAsync()
         {
-            var line = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(45)).ConfigureAwait(false);
-            if (line is not null)
-                return line;
-            var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
-            throw new InvalidOperationException("managed CLI worker returned no fixture response: " + error);
+            Require(requestSent && !terminalReceived, "managed CLI harness response lifecycle is invalid");
+            var payload = await transport.ReceivePayloadAsync(2).ConfigureAwait(false);
+            terminalReceived = true;
+            return payload;
         }
 
-        public async ValueTask DisposeAsync()
+        public ValueTask DisposeAsync()
         {
             var forced = false;
-            var exitCode = -1;
+            uint exitCode = uint.MaxValue;
             try
             {
-                process.StandardInput.Close();
-                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-                await process.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                forced = true;
-                if (!process.HasExited)
-                    process.Kill(entireProcessTree: true);
-                await process.WaitForExitAsync().ConfigureAwait(false);
+                var wait = WaitForSingleObject(process, terminalReceived ? 10_000U : 0U);
+                if (wait != WaitObject0)
+                {
+                    forced = true;
+                    TerminateProcess(process, 1);
+                    WaitForSingleObject(process, 10_000U);
+                }
+                GetExitCodeProcess(process, out exitCode);
             }
             finally
             {
-                if (process.HasExited)
-                    exitCode = process.ExitCode;
+                transport.Dispose();
                 process.Dispose();
             }
-            Require(!forced && exitCode == 0, "managed CLI worker did not shut down cleanly");
+            Require(terminalReceived && !forced && exitCode == 0, "managed CLI worker did not shut down cleanly");
+            return ValueTask.CompletedTask;
         }
+
+        private sealed class WorkerLaunch
+        {
+            private bool transferred;
+
+            private WorkerLaunch(SafeFileHandle process, FileStream requestStream, FileStream responseStream, string workerHash)
+            {
+                Process = process;
+                RequestStream = requestStream;
+                ResponseStream = responseStream;
+                WorkerHash = workerHash;
+            }
+
+            internal SafeFileHandle Process { get; }
+            internal FileStream RequestStream { get; }
+            internal FileStream ResponseStream { get; }
+            internal string WorkerHash { get; }
+
+            internal static WorkerLaunch Start(string modulePath)
+            {
+                var packageRoot = ResolveManagedPackageRoot();
+                var workerPath = Path.GetFullPath(Path.Combine(packageRoot, "deps", "AiDA_ManagedDecompilerWorker.exe"));
+                var dotnetRoot = Path.GetFullPath(Path.Combine(packageRoot, "deps", "dotnet"));
+                modulePath = Path.GetFullPath(modulePath);
+                Require(File.Exists(workerPath), "managed CLI app-local worker apphost is unavailable");
+                Require(File.Exists(Path.Combine(dotnetRoot, "host", "fxr", "10.0.9", "hostfxr.dll")),
+                    "managed CLI app-local hostfxr is unavailable");
+                Require(FixedTimeHexEquals(ReadRuntimeManifestHash(packageRoot), runtimeManifestHash),
+                    "managed CLI runtime manifest changed before worker launch");
+                var moduleBytes = File.ReadAllBytes(modulePath);
+                Require(moduleBytes.Length != 0, "managed CLI module snapshot is empty");
+
+                SafeFileHandle? childRead = null;
+                SafeFileHandle? parentWrite = null;
+                SafeFileHandle? parentRead = null;
+                SafeFileHandle? childWrite = null;
+                SafeFileHandle? mapping = null;
+                SafeFileHandle? childMapping = null;
+                SafeFileHandle? identity = null;
+                SafeFileHandle? childIdentity = null;
+                SafeFileHandle? process = null;
+                FileStream? requestStream = null;
+                FileStream? responseStream = null;
+                nint attributeList = 0;
+                nint handleList = 0;
+                nint environmentBlock = 0;
+                try
+                {
+                    var security = new SecurityAttributes
+                    {
+                        Length = checked((uint)Marshal.SizeOf<SecurityAttributes>()),
+                        InheritHandle = 1
+                    };
+                    Require(CreatePipe(out childRead, out parentWrite, ref security, 0) &&
+                        CreatePipe(out parentRead, out childWrite, ref security, 0),
+                        "managed CLI harness pipes could not be created");
+                    Require(SetHandleInformation(parentWrite!, HandleFlagInherit, 0) &&
+                        SetHandleInformation(parentRead!, HandleFlagInherit, 0),
+                        "managed CLI harness parent pipe inheritance could not be removed");
+
+                    mapping = CreateFileMapping(new nint(-1), 0, PageReadWrite, 0, checked((uint)moduleBytes.Length), null);
+                    Require(!mapping.IsInvalid, "managed CLI harness module mapping could not be created");
+                    var view = MapViewOfFile(mapping!, FileMapWrite, 0, 0, checked((nuint)moduleBytes.Length));
+                    Require(view != 0, "managed CLI harness module mapping could not be opened");
+                    try
+                    {
+                        Marshal.Copy(moduleBytes, 0, view, moduleBytes.Length);
+                    }
+                    finally
+                    {
+                        Require(UnmapViewOfFile(view), "managed CLI harness module mapping could not be released");
+                        CryptographicOperations.ZeroMemory(moduleBytes);
+                    }
+                    var currentProcess = GetCurrentProcess();
+                    Require(DuplicateHandle(currentProcess, mapping!, currentProcess, out childMapping,
+                        FileMapRead, true, 0), "managed CLI harness read-only module handle could not be created");
+                    identity = File.OpenHandle(workerPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    Require(DuplicateHandle(currentProcess, identity, currentProcess, out childIdentity,
+                        0, true, DuplicateSameAccess), "managed CLI harness identity handle could not be created");
+
+                    nuint attributeBytes = 0;
+                    InitializeProcThreadAttributeList(0, 1, 0, ref attributeBytes);
+                    Require(attributeBytes != 0, "managed CLI harness attribute size is invalid");
+                    attributeList = Marshal.AllocHGlobal(checked((nint)attributeBytes));
+                    Require(InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeBytes),
+                        "managed CLI harness attribute list could not be initialized");
+                    var inherited = new[]
+                    {
+                        childRead!.DangerousGetHandle(),
+                        childWrite!.DangerousGetHandle(),
+                        childMapping!.DangerousGetHandle(),
+                        childIdentity!.DangerousGetHandle()
+                    };
+                    handleList = Marshal.AllocHGlobal(checked(inherited.Length * IntPtr.Size));
+                    for (var index = 0; index < inherited.Length; index++)
+                        Marshal.WriteIntPtr(handleList, index * IntPtr.Size, inherited[index]);
+                    Require(UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeHandleList,
+                        handleList, checked((nuint)(inherited.Length * IntPtr.Size)), 0, 0),
+                        "managed CLI harness inherited handle whitelist could not be installed");
+
+                    var startup = new StartupInfoEx();
+                    startup.StartupInfo.Size = checked((uint)Marshal.SizeOf<StartupInfoEx>());
+                    startup.AttributeList = attributeList;
+                    var commandLine = new StringBuilder();
+                    commandLine.Append(QuoteArgument(workerPath));
+                    commandLine.Append(" --aida-managed-decompiler-worker --provider=2");
+                    commandLine.Append(" --read-handle=").Append(childRead!.DangerousGetHandle().ToInt64());
+                    commandLine.Append(" --write-handle=").Append(childWrite!.DangerousGetHandle().ToInt64());
+                    commandLine.Append(" --module-handle=").Append(childMapping!.DangerousGetHandle().ToInt64());
+                    commandLine.Append(" --module-size=").Append(moduleBytes.Length);
+                    commandLine.Append(" --identity-handle=").Append(childIdentity!.DangerousGetHandle().ToInt64());
+                    commandLine.Append(" --runtime-manifest-hash=").Append(runtimeManifestHash);
+                    environmentBlock = CreateWorkerEnvironment(dotnetRoot);
+                    Require(CreateProcess(workerPath, commandLine, 0, 0, true,
+                        ExtendedStartupInfoPresent | CreateNoWindow | CreateUnicodeEnvironment,
+                        environmentBlock, packageRoot,
+                        ref startup, out var processInformation),
+                        "managed CLI worker process could not start");
+                    using var thread = new SafeFileHandle(processInformation.Thread, ownsHandle: true);
+                    process = new SafeFileHandle(processInformation.Process, ownsHandle: true);
+                    requestStream = new FileStream(parentWrite!, FileAccess.Write, 4096, isAsync: false);
+                    parentWrite = null;
+                    responseStream = new FileStream(parentRead!, FileAccess.Read, 4096, isAsync: false);
+                    parentRead = null;
+                    var result = new WorkerLaunch(process, requestStream, responseStream, HashFile(workerPath));
+                    process = null;
+                    requestStream = null;
+                    responseStream = null;
+                    return result;
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(moduleBytes);
+                    if (attributeList != 0)
+                    {
+                        DeleteProcThreadAttributeList(attributeList);
+                        Marshal.FreeHGlobal(attributeList);
+                    }
+                    if (handleList != 0)
+                        Marshal.FreeHGlobal(handleList);
+                    if (environmentBlock != 0)
+                        Marshal.FreeHGlobal(environmentBlock);
+                    requestStream?.Dispose();
+                    responseStream?.Dispose();
+                    process?.Dispose();
+                    childRead?.Dispose();
+                    parentWrite?.Dispose();
+                    parentRead?.Dispose();
+                    childWrite?.Dispose();
+                    mapping?.Dispose();
+                    childMapping?.Dispose();
+                    identity?.Dispose();
+                    childIdentity?.Dispose();
+                }
+            }
+
+            private static nint CreateWorkerEnvironment(string dotnetRoot)
+            {
+                var systemRoot = Environment.GetEnvironmentVariable("SystemRoot");
+                Require(!string.IsNullOrWhiteSpace(systemRoot), "managed CLI harness SystemRoot is unavailable");
+                var entries = new[]
+                {
+                    "COMPlus_EnableDiagnostics=0",
+                    "DOTNET_CLI_TELEMETRY_OPTOUT=1",
+                    "DOTNET_EnableDiagnostics=0",
+                    "DOTNET_MULTILEVEL_LOOKUP=0",
+                    "DOTNET_NOLOGO=1",
+                    "DOTNET_ROLL_FORWARD=Disable",
+                    "DOTNET_ROLL_FORWARD_TO_PRERELEASE=0",
+                    "DOTNET_ROOT=" + dotnetRoot,
+                    "DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1",
+                    "PATH=" + Path.Combine(systemRoot!, "System32"),
+                    "SystemRoot=" + systemRoot,
+                    "WINDIR=" + systemRoot
+                }.OrderBy(value => value, StringComparer.OrdinalIgnoreCase);
+                return Marshal.StringToHGlobalUni(string.Join('\0', entries) + "\0\0");
+            }
+
+            internal void TransferOwnership()
+            {
+                transferred = true;
+            }
+
+            internal void Abort()
+            {
+                if (transferred)
+                    return;
+                TerminateProcess(Process, 1);
+                WaitForSingleObject(Process, 10_000U);
+                RequestStream.Dispose();
+                ResponseStream.Dispose();
+                Process.Dispose();
+            }
+        }
+
+        private sealed class HarnessTransport : IDisposable
+        {
+            private const int MaximumPayloadBytes = 16 * 1024 * 1024;
+            private const uint BootstrapMagic = 0x42574e41;
+            private const uint FrameMagic = 0x46574e41;
+            private const ushort Version = 1;
+            private const ushort ContractKind = 1;
+            private const int DigestBytes = 32;
+            private const int BootstrapBytes = 104;
+            private const int AuthenticatedHeaderBytes = 52;
+            private const int HeaderBytes = 84;
+            private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+            private readonly FileStream requestStream;
+            private readonly FileStream responseStream;
+            private readonly byte[] key;
+            private readonly byte[] nonceHash;
+            private readonly byte[] manifestHash;
+            private bool disposed;
+
+            private HarnessTransport(FileStream requestStream, FileStream responseStream,
+                byte[] key, byte[] nonceHash, byte[] manifestHash)
+            {
+                this.requestStream = requestStream;
+                this.responseStream = responseStream;
+                this.key = key;
+                this.nonceHash = nonceHash;
+                this.manifestHash = manifestHash;
+            }
+
+            internal string SessionNonceHash => Convert.ToHexString(nonceHash).ToLowerInvariant();
+            internal string ManifestHash => Convert.ToHexString(manifestHash).ToLowerInvariant();
+
+            internal static async Task<HarnessTransport> EstablishAsync(FileStream requestStream, FileStream responseStream)
+            {
+                var nonce = RandomNumberGenerator.GetBytes(DigestBytes);
+                var key = RandomNumberGenerator.GetBytes(DigestBytes);
+                var nonceHash = SHA256.HashData(nonce);
+                var manifestHash = SHA256.HashData(Encoding.UTF8.GetBytes("aida.c03.managed-cli.harness-manifest-v2"));
+                var bootstrap = new byte[BootstrapBytes];
+                BinaryPrimitives.WriteUInt32LittleEndian(bootstrap, BootstrapMagic);
+                BinaryPrimitives.WriteUInt16LittleEndian(bootstrap.AsSpan(4), Version);
+                nonce.CopyTo(bootstrap.AsSpan(8));
+                key.CopyTo(bootstrap.AsSpan(8 + DigestBytes));
+                manifestHash.CopyTo(bootstrap.AsSpan(8 + DigestBytes * 2));
+                CryptographicOperations.ZeroMemory(nonce);
+                try
+                {
+                    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+                    await requestStream.WriteAsync(bootstrap, deadline.Token).ConfigureAwait(false);
+                    await requestStream.FlushAsync(deadline.Token).ConfigureAwait(false);
+                    return new HarnessTransport(requestStream, responseStream, key, nonceHash, manifestHash);
+                }
+                catch
+                {
+                    CryptographicOperations.ZeroMemory(key);
+                    CryptographicOperations.ZeroMemory(nonceHash);
+                    CryptographicOperations.ZeroMemory(manifestHash);
+                    throw;
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(bootstrap);
+                }
+            }
+
+            internal async Task SendPayloadAsync(ulong sequence, string payload)
+            {
+                Require(!disposed && sequence != 0 && !string.IsNullOrEmpty(payload),
+                    "managed CLI harness frame is invalid");
+                var payloadBytes = StrictUtf8.GetBytes(payload);
+                Require(payloadBytes.Length <= MaximumPayloadBytes, "managed CLI harness payload is oversized");
+                var header = new byte[HeaderBytes];
+                BinaryPrimitives.WriteUInt32LittleEndian(header, FrameMagic);
+                BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(4), Version);
+                BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(6), ContractKind);
+                BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(8), sequence);
+                BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(16), checked((uint)payloadBytes.Length));
+                nonceHash.CopyTo(header.AsSpan(20));
+                var authenticated = new byte[AuthenticatedHeaderBytes + payloadBytes.Length];
+                header.AsSpan(0, AuthenticatedHeaderBytes).CopyTo(authenticated);
+                payloadBytes.CopyTo(authenticated.AsSpan(AuthenticatedHeaderBytes));
+                var tag = HMACSHA256.HashData(key, authenticated);
+                tag.CopyTo(header.AsSpan(AuthenticatedHeaderBytes));
+                CryptographicOperations.ZeroMemory(authenticated);
+                CryptographicOperations.ZeroMemory(tag);
+                try
+                {
+                    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+                    await requestStream.WriteAsync(header, deadline.Token).ConfigureAwait(false);
+                    await requestStream.WriteAsync(payloadBytes, deadline.Token).ConfigureAwait(false);
+                    await requestStream.FlushAsync(deadline.Token).ConfigureAwait(false);
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(header);
+                    CryptographicOperations.ZeroMemory(payloadBytes);
+                }
+            }
+
+            internal async Task<string> ReceivePayloadAsync(ulong expectedSequence)
+            {
+                Require(!disposed && expectedSequence != 0, "managed CLI harness receive sequence is invalid");
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+                var header = new byte[HeaderBytes];
+                await responseStream.ReadExactlyAsync(header, deadline.Token).ConfigureAwait(false);
+                Require(BinaryPrimitives.ReadUInt32LittleEndian(header) == FrameMagic &&
+                    BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(4)) == Version &&
+                    BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(6)) == ContractKind &&
+                    BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(8)) == expectedSequence &&
+                    CryptographicOperations.FixedTimeEquals(header.AsSpan(20, DigestBytes), nonceHash),
+                    "managed CLI harness response header is invalid");
+                var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(16));
+                Require(payloadLength != 0 && payloadLength <= MaximumPayloadBytes,
+                    "managed CLI harness response size is invalid");
+                var payload = new byte[checked((int)payloadLength)];
+                await responseStream.ReadExactlyAsync(payload, deadline.Token).ConfigureAwait(false);
+                var authenticated = new byte[AuthenticatedHeaderBytes + payload.Length];
+                header.AsSpan(0, AuthenticatedHeaderBytes).CopyTo(authenticated);
+                payload.CopyTo(authenticated.AsSpan(AuthenticatedHeaderBytes));
+                var tag = HMACSHA256.HashData(key, authenticated);
+                var valid = CryptographicOperations.FixedTimeEquals(tag, header.AsSpan(AuthenticatedHeaderBytes, DigestBytes));
+                CryptographicOperations.ZeroMemory(authenticated);
+                CryptographicOperations.ZeroMemory(tag);
+                CryptographicOperations.ZeroMemory(header);
+                Require(valid, "managed CLI harness response authentication failed");
+                try
+                {
+                    return StrictUtf8.GetString(payload);
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(payload);
+                }
+            }
+
+            public void Dispose()
+            {
+                if (disposed)
+                    return;
+                disposed = true;
+                requestStream.Dispose();
+                responseStream.Dispose();
+                CryptographicOperations.ZeroMemory(key);
+                CryptographicOperations.ZeroMemory(nonceHash);
+                CryptographicOperations.ZeroMemory(manifestHash);
+            }
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            Require(!value.Contains('\0'), "managed CLI harness argument contains NUL");
+            if (value.Length != 0 && value.All(character => !char.IsWhiteSpace(character) && character != '"'))
+                return value;
+            var result = new StringBuilder(value.Length + 2);
+            result.Append('"');
+            var slashes = 0;
+            foreach (var character in value)
+            {
+                if (character == '\\')
+                {
+                    slashes++;
+                    continue;
+                }
+                if (character == '"')
+                {
+                    result.Append('\\', slashes * 2 + 1);
+                    result.Append('"');
+                    slashes = 0;
+                    continue;
+                }
+                result.Append('\\', slashes);
+                slashes = 0;
+                result.Append(character);
+            }
+            result.Append('\\', slashes * 2);
+            result.Append('"');
+            return result.ToString();
+        }
+
+        private const uint HandleFlagInherit = 1;
+        private const uint PageReadWrite = 0x04;
+        private const uint FileMapWrite = 0x0002;
+        private const uint FileMapRead = 0x0004;
+        private const uint DuplicateSameAccess = 0x00000002;
+        private const uint ExtendedStartupInfoPresent = 0x00080000;
+        private const uint CreateNoWindow = 0x08000000;
+        private const uint CreateUnicodeEnvironment = 0x00000400;
+        private static readonly nuint ProcThreadAttributeHandleList = 0x00020002;
+        private const uint WaitObject0 = 0;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes
+        {
+            internal uint Length;
+            internal nint SecurityDescriptor;
+            internal int InheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfo
+        {
+            internal uint Size;
+            internal nint Reserved;
+            internal nint Desktop;
+            internal nint Title;
+            internal uint X;
+            internal uint Y;
+            internal uint XSize;
+            internal uint YSize;
+            internal uint XCountChars;
+            internal uint YCountChars;
+            internal uint FillAttribute;
+            internal uint Flags;
+            internal ushort ShowWindow;
+            internal ushort ReservedBytes;
+            internal nint ReservedPointer;
+            internal nint StandardInput;
+            internal nint StandardOutput;
+            internal nint StandardError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfoEx
+        {
+            internal StartupInfo StartupInfo;
+            internal nint AttributeList;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation
+        {
+            internal nint Process;
+            internal nint Thread;
+            internal uint ProcessId;
+            internal uint ThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreatePipe(out SafeFileHandle readPipe, out SafeFileHandle writePipe,
+            ref SecurityAttributes pipeAttributes, uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetHandleInformation(SafeFileHandle handle, uint mask, uint flags);
+
+        [DllImport("kernel32.dll", EntryPoint = "CreateFileMappingW", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern SafeFileHandle CreateFileMapping(nint file, nint attributes, uint protection,
+            uint maximumSizeHigh, uint maximumSizeLow, string? name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern nint MapViewOfFile(SafeFileHandle mapping, uint access,
+            uint offsetHigh, uint offsetLow, nuint bytesToMap);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnmapViewOfFile(nint baseAddress);
+
+        [DllImport("kernel32.dll")]
+        private static extern nint GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DuplicateHandle(nint sourceProcess, SafeFileHandle sourceHandle,
+            nint targetProcess, out SafeFileHandle targetHandle, uint access,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint options);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool InitializeProcThreadAttributeList(nint attributeList,
+            int attributeCount, uint flags, ref nuint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UpdateProcThreadAttribute(nint attributeList, uint flags,
+            nuint attribute, nint value, nuint size, nint previousValue, nint returnSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern void DeleteProcThreadAttributeList(nint attributeList);
+
+        [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateProcess(string applicationName, StringBuilder commandLine,
+            nint processAttributes, nint threadAttributes, [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+            uint creationFlags, nint environment, string currentDirectory,
+            ref StartupInfoEx startupInfo, out ProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(SafeFileHandle handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetExitCodeProcess(SafeFileHandle process, out uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TerminateProcess(SafeFileHandle process, uint exitCode);
     }
 
     private sealed record FixtureManifest(
@@ -616,7 +1404,7 @@ internal static class Program
         int DeterministicRuns,
         bool Cancellation,
         IReadOnlyList<string> ResourceLimits,
-        bool OfflineStartupGate,
+        bool RuntimeGate,
         bool SnapshotBinding);
 
     private sealed record MethodDescriptor(

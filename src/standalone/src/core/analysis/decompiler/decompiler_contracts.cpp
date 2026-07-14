@@ -1676,16 +1676,26 @@ decompiler_contract_validation_t validate_decompiler_worker_message(const decomp
                 message.cache_key.profile.max_semantic_queries != message.profile.max_semantic_queries ||
                 message.cache_key.profile.semantic_proofs_enabled != message.profile.semantic_proofs_enabled)
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::worker_protocol_failure, "decompiler.worker.profile_binding"));
+            if (message.request_printc_evidence &&
+                message.cache_key.provider.provider != decompiler_provider_id_t::ghidra_native)
+                result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::worker_protocol_failure, "decompiler.worker.printc_request"));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_cancel_request_t>) {
             if (envelope.kind != decompiler_worker_message_kind_t::cancel_request || message.job_id == 0 || message.stable_reason.empty())
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::worker_protocol_failure, "decompiler.worker.cancel"));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_document_message_t>) {
             if (envelope.kind != decompiler_worker_message_kind_t::document || message.job_id == 0 ||
                 message.provider_artifacts.empty() ||
-                message.provider_artifacts.size() > 64U * 1024U * 1024U ||
+                message.provider_artifacts.size() > k_decompiler_worker_provider_artifacts_max_bytes ||
                 message.provider_artifacts_hash.empty() ||
                 stable_serialization_hash(message.provider_artifacts) != message.provider_artifacts_hash)
                 result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::worker_protocol_failure, "decompiler.worker.document"));
+            if ((message.printc_evidence.has_value() &&
+                    (message.printc_evidence->empty() ||
+                     message.printc_evidence->size() > k_decompiler_worker_printc_evidence_max_bytes ||
+                     message.printc_evidence_hash.empty() ||
+                     stable_serialization_hash(*message.printc_evidence) != message.printc_evidence_hash)) ||
+                (!message.printc_evidence.has_value() && !message.printc_evidence_hash.empty()))
+                result.diagnostics.push_back(contract_error(decompiler_diagnostic_code_t::worker_protocol_failure, "decompiler.worker.printc_evidence"));
             append(result, validate_decompiler_document(message.document));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_failure_message_t>) {
             if (envelope.kind != decompiler_worker_message_kind_t::failure || message.job_id == 0 || message.diagnostics.empty())
@@ -1847,6 +1857,7 @@ std::string serialize_decompiler_worker_message(const decompiler_worker_message_
             write_cache_key(writer, message.cache_key);
             write_profile(writer, message.profile);
             writer.digest(message.snapshot_hash);
+            writer.u8(message.request_printc_evidence ? 1U : 0U);
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_cancel_request_t>) {
             writer.u64(message.job_id);
             writer.string(message.stable_reason);
@@ -1854,6 +1865,11 @@ std::string serialize_decompiler_worker_message(const decompiler_worker_message_
             writer.u64(message.job_id);
             writer.string(message.provider_artifacts);
             writer.digest(message.provider_artifacts_hash);
+            writer.u8(message.printc_evidence.has_value() ? 1U : 0U);
+            if (message.printc_evidence) {
+                writer.string(*message.printc_evidence);
+                writer.digest(message.printc_evidence_hash);
+            }
             writer.string(serialize_decompiler_document(message.document));
         } else if constexpr (std::is_same_v<message_t, decompiler_worker_failure_message_t>) {
             writer.u64(message.job_id);
@@ -1967,10 +1983,13 @@ decompiler_contract_decode_result_t<decompiler_worker_message_t> deserialize_dec
         }
         case decompiler_worker_message_kind_t::job_request: {
             decompiler_worker_job_request_t message;
+            std::uint8_t request_printc_evidence = 0;
             message.envelope = envelope;
             if (!reader.u64(message.job_id) || !read_cache_key(reader, message.cache_key) ||
-                !read_profile(reader, message.profile) || !reader.digest(message.snapshot_hash))
+                !read_profile(reader, message.profile) || !reader.digest(message.snapshot_hash) ||
+                !reader.u8(request_printc_evidence) || request_printc_evidence > 1U)
                 return false;
+            message.request_printc_evidence = request_printc_evidence != 0;
             decoded = std::move(message);
             return true;
         }
@@ -1985,9 +2004,19 @@ decompiler_contract_decode_result_t<decompiler_worker_message_t> deserialize_dec
         case decompiler_worker_message_kind_t::document: {
             decompiler_worker_document_message_t message;
             std::string document_bytes;
+            std::uint8_t has_printc_evidence = 0;
             message.envelope = envelope;
             if (!reader.u64(message.job_id) || !reader.string(message.provider_artifacts) ||
-                !reader.digest(message.provider_artifacts_hash) || !reader.string(document_bytes))
+                !reader.digest(message.provider_artifacts_hash) || !reader.u8(has_printc_evidence) ||
+                has_printc_evidence > 1U)
+                return false;
+            if (has_printc_evidence != 0) {
+                std::string evidence;
+                if (!reader.string(evidence) || !reader.digest(message.printc_evidence_hash))
+                    return false;
+                message.printc_evidence = std::move(evidence);
+            }
+            if (!reader.string(document_bytes))
                 return false;
             auto document = deserialize_decompiler_document(document_bytes);
             if (!document.valid())

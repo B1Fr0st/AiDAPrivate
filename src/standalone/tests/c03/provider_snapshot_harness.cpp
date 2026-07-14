@@ -1,4 +1,5 @@
 #include "provider_snapshot_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/mapped_window_cache.hpp"
 #include "../../src/core/analysis/provider_snapshot.hpp"
@@ -23,19 +24,27 @@ namespace aida::analysis::c03::test {
 namespace {
 
 void require(bool condition, const char* message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
 
 template <typename value_t>
 value_t require_value(workspace_result_t<value_t> result, const char* message) {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ":" + result.error().stable_code());
     return result.take_value();
 }
 
 void require_success(workspace_result_t<void> result, const char* message) {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ":" + result.error().stable_code());
 }
 

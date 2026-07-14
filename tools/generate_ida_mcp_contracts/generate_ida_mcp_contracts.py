@@ -30,6 +30,14 @@ OVERLAY_MUTATION_TOOL_NAMES = (
     "diff_before_after", "declare_stack", "delete_stack", "declare_type", "enum_upsert", "set_type",
     "type_apply_batch",
 )
+MAX_ARCHIVE_MEMBERS = 4096
+MAX_ARCHIVE_COMPRESSED_BYTES = 128 * 1024 * 1024
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_SOURCE_MEMBER_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
+MAX_ARCHIVE_PATH_BYTES = 1024
 
 
 class ContractGenerationError(RuntimeError):
@@ -85,14 +93,38 @@ def sha256_file(path: Path) -> str:
 
 def validate_archive_members(archive: zipfile.ZipFile) -> None:
     names: set[str] = set()
-    for info in archive.infolist():
+    folded_names: set[str] = set()
+    compressed_total = 0
+    uncompressed_total = 0
+    infos = archive.infolist()
+    if not infos or len(infos) > MAX_ARCHIVE_MEMBERS:
+        raise ContractGenerationError("archive member count exceeds the bounded inspection policy")
+    for info in infos:
         name = info.filename
         path = PurePosixPath(name)
-        if name in names:
+        if not name or "\x00" in name or len(name.encode("utf-8")) > MAX_ARCHIVE_PATH_BYTES:
+            raise ContractGenerationError("archive contains an invalid or overlong member path")
+        if name in names or name.casefold() in folded_names:
             raise ContractGenerationError(f"archive contains duplicate member {name!r}")
         names.add(name)
-        if path.is_absolute() or ".." in path.parts or "\\" in name:
+        folded_names.add(name.casefold())
+        if path.is_absolute() or ".." in path.parts or "\\" in name or ":" in name:
             raise ContractGenerationError(f"archive contains unsafe member path {name!r}")
+        unix_mode = (info.external_attr >> 16) & 0xFFFF
+        if unix_mode & 0o170000 == 0o120000:
+            raise ContractGenerationError(f"archive contains symbolic link member {name!r}")
+        if info.flag_bits & 0x1:
+            raise ContractGenerationError(f"archive contains encrypted member {name!r}")
+        if info.file_size < 0 or info.compress_size < 0 or info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise ContractGenerationError(f"archive member exceeds the bounded size policy: {name!r}")
+        if info.file_size and info.compress_size == 0:
+            raise ContractGenerationError(f"archive member has an invalid zero compressed size: {name!r}")
+        if info.compress_size and info.file_size > info.compress_size * MAX_COMPRESSION_RATIO:
+            raise ContractGenerationError(f"archive member exceeds the compression-ratio policy: {name!r}")
+        compressed_total += info.compress_size
+        uncompressed_total += info.file_size
+        if compressed_total > MAX_ARCHIVE_COMPRESSED_BYTES or uncompressed_total > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise ContractGenerationError("archive exceeds the bounded aggregate size policy")
     if not any(name.startswith(ARCHIVE_ROOT) for name in names):
         raise ContractGenerationError(f"archive root {ARCHIVE_ROOT!r} is absent")
 
@@ -119,9 +151,15 @@ def read_archive_sources(archive_path: Path) -> tuple[dict[str, str], dict[str, 
             if "MIT License" not in license_text:
                 raise ContractGenerationError("archive license is not the expected MIT license")
             sources: dict[str, str] = {}
+            source_total = 0
             for info in archive.infolist():
                 if not info.filename.startswith(SOURCE_ROOT) or not info.filename.endswith(".py"):
                     continue
+                if info.file_size > MAX_SOURCE_MEMBER_BYTES:
+                    raise ContractGenerationError(f"{info.filename}: source member exceeds the bounded size policy")
+                source_total += info.file_size
+                if source_total > MAX_SOURCE_TOTAL_BYTES:
+                    raise ContractGenerationError("archive source set exceeds the bounded aggregate size policy")
                 try:
                     sources[info.filename] = archive.read(info).decode("utf-8")
                 except UnicodeDecodeError as exc:
@@ -137,6 +175,23 @@ def read_archive_sources(archive_path: Path) -> tuple[dict[str, str], dict[str, 
         "source_root": SOURCE_ROOT,
     }
     return sources, metadata
+
+
+def validate_schema_references(value: Any, path: str = "$") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key == "$ref":
+                if not isinstance(child, str) or not child.startswith("#/"):
+                    raise ContractGenerationError(f"{child_path}: remote, file, and network schema references are forbidden")
+            if key in {"$schema", "$id"} and isinstance(child, str):
+                lowered = child.strip().casefold()
+                if re.match(r"^[a-z][a-z0-9+.-]*:", lowered) or lowered.startswith(("//", "\\\\")):
+                    raise ContractGenerationError(f"{child_path}: external schema identifiers are forbidden")
+            validate_schema_references(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            validate_schema_references(child, f"{path}[{index}]")
 
 
 def module_name_for_path(path: str) -> str:
@@ -996,6 +1051,8 @@ def build_artifacts(archive_path: Path) -> dict[str, bytes]:
             "ui_activation": "forbidden",
         },
     }
+    validate_schema_references(contract_ledger)
+    validate_schema_references(effect_ledger)
     contract_bytes = canonical_json(contract_ledger).encode("ascii")
     effect_bytes = canonical_json(effect_ledger).encode("ascii")
     manifest = {
@@ -1013,6 +1070,7 @@ def build_artifacts(archive_path: Path) -> dict[str, bytes]:
         "contract_ledger_sha256": sha256_bytes(contract_bytes),
         "effect_ledger_sha256": sha256_bytes(effect_bytes),
     }
+    validate_schema_references(manifest)
     manifest_bytes = canonical_json(manifest).encode("ascii")
     header = render_header(manifest, sha256_bytes(manifest_bytes))
     source = render_source(contracts)

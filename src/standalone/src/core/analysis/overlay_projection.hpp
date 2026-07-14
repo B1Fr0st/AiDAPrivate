@@ -260,6 +260,7 @@ struct projection_result_t final {
     projection_invalidation_set_t invalidation;
     std::vector<overlay_change_v9_t> changes;
     std::vector<std::uint8_t> projected_bytes;
+    std::uint64_t projected_size = 0;
     std::optional<overlay_static_state_v9_t> projected_state;
     bool publication_ready = false;
     std::string detail;
@@ -296,6 +297,7 @@ struct projection_publication_view_t final {
     const std::vector<std::uint8_t>& projected_bytes;
     const projection_invalidation_set_t& invalidation;
     const std::vector<overlay_change_v9_t>& changes;
+    std::uint64_t projected_size = 0;
     std::uint64_t source_generation = 0;
     std::uint64_t target_generation = 0;
     std::uint64_t source_revision = 0;
@@ -330,10 +332,20 @@ struct projection_finalize_result_t final {
 
 class overlay_projection_t final {
 public:
+    static projection_result_t prepare(
+        const overlay_static_state_v9_t& state,
+        std::uint64_t current_generation);
+
     static projection_result_t project(
         const overlay_static_state_v9_t& state,
         std::string_view immutable_bytes,
         std::uint64_t current_generation);
+
+    static projection_result_t prepare_transaction(
+        const overlay_static_state_v9_t& state,
+        const overlay_transaction_v9_t& transaction,
+        std::uint64_t current_generation,
+        const overlay_apply_limits_v9_t& limits = {});
 
     static projection_result_t project_transaction(
         const overlay_static_state_v9_t& state,

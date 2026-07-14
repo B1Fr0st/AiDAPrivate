@@ -1,20 +1,25 @@
 #include "workspace_fixture_builder.hpp"
 
+#include "../c03/benchmark_sla_schema.hpp"
+#include "../c03/assertion_telemetry/assertion_telemetry.hpp"
+
 #include <winioctl.h>
 #include <psapi.h>
 
-#include "../../src/core/mcp/mcp_standalone.hpp"
-#include "../../src/core/tools/standalone_tools_fwd.hpp"
+#include "../../src/core/mcp/compat/c03_compatibility_registration.hpp"
+#include "../../src/core/mcp/registry/tool_registry.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <intrin.h>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -218,6 +223,27 @@ std::uint64_t executable_bytes(const std::shared_ptr<const workspace_image_t>& i
         }
     }
     return total;
+}
+
+std::uint64_t zero_bytes(const std::filesystem::path& path, std::uint64_t expected_size)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+        throw fixture_error_t("benchmark fixture cannot be opened for zero-padding qualification");
+    std::array<char, 1024 * 1024> buffer{};
+    std::uint64_t consumed = 0;
+    std::uint64_t zeros = 0;
+    while (stream) {
+        stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = stream.gcount();
+        if (count <= 0)
+            break;
+        consumed += static_cast<std::uint64_t>(count);
+        zeros += static_cast<std::uint64_t>(std::count(buffer.begin(), buffer.begin() + count, '\0'));
+    }
+    if (stream.bad() || consumed != expected_size)
+        throw fixture_error_t("benchmark fixture changed or failed during zero-padding qualification");
+    return zeros;
 }
 
 json process_memory_snapshot()
@@ -736,11 +762,8 @@ json decompiler_measurements(const std::shared_ptr<analysis_workspace_t>& worksp
 json mcp_measurement(const std::shared_ptr<analysis_workspace_t>& workspace,
                      analysis_metrics_t& interaction_metrics)
 {
-    mcp_standalone::server_t server;
-    analysis_tools::register_analysis_tools(server);
-    disasm_tools::register_disasm_tools(server);
-    decompile_tools::register_decompile_tools(server);
-    mcp_standalone::set_ide_lifecycle_ready(true);
+    mcp_standalone::tool_registry_t registry;
+    mcp_standalone::register_c03_compatibility_tools(registry);
     std::vector<std::uint64_t> latencies;
     json failures = json::array();
     std::size_t last_returned = 0;
@@ -748,24 +771,29 @@ json mcp_measurement(const std::shared_ptr<analysis_workspace_t>& workspace,
     for (std::size_t sample = 0; sample < 16; ++sample) {
         ++attempts;
         const auto begin = steady_clock_t::now();
-        const auto response = server.call_registered_tool("disasm_list_functions",
-            json{{"binary_id", workspace->identity().binary_id().to_hex()},
-                {"offset", sample * 16}, {"limit", 200}}, true);
+        const auto response = registry.call_registered_tool("list_funcs",
+            json{{"bin_name", workspace->identity().bin_name()},
+                {"queries", json{{"offset", sample * 16}, {"count", 200}}}});
         const auto latency = nanoseconds_since(begin);
         interaction_metrics.record_mcp_latency(latency);
         const bool valid = response.success && response.data.is_object() &&
-            response.data.contains("functions") && response.data["functions"].is_array() &&
-            response.data.contains("_meta") && response.data["_meta"].is_object() &&
-            response.data["_meta"].contains("aida") &&
-            response.data["_meta"]["aida"].is_object() &&
-            response.data["_meta"]["aida"].value("binary_id", std::string()) ==
-                workspace->identity().binary_id().to_hex();
+            response.data.contains("result") && response.data["result"].is_array() &&
+            response.data["result"].size() == 1 &&
+            response.data["result"][0].contains("data") &&
+            response.data["result"][0]["data"].is_array() &&
+            response.meta.is_object() && response.meta.contains("aida") &&
+            response.meta["aida"].is_object() &&
+            response.meta["aida"].value("contract_name", std::string()) ==
+                "list_funcs";
+        aida::analysis::c03_test::assertion_telemetry::record_assertion(
+            valid, "benchmark MCP registry response satisfies the exact generated contract",
+            __FILE__, __LINE__);
         if (!valid)
             failures.push_back(json{{"sample", sample}, {"error_code", response.error_code},
                 {"message", response.text}});
         else {
             latencies.push_back(latency);
-            last_returned = response.data.value("returned", std::size_t{0});
+            last_returned = response.data["result"][0]["data"].size();
         }
     }
     std::uint64_t total_latency = 0;
@@ -773,8 +801,8 @@ json mcp_measurement(const std::shared_ptr<analysis_workspace_t>& workspace,
     if (latencies.empty())
         throw fixture_error_t("MCP benchmark handler produced no identity-bound responses");
     return json{{"handler_calls_wired", true},
-        {"handler", "mcp_standalone::server_t::call_registered_tool"},
-        {"tool", "disasm_list_functions"}, {"latency_ns", latencies},
+        {"handler", "mcp_standalone::tool_registry_t::call_registered_tool"},
+        {"tool", "list_funcs"}, {"latency_ns", latencies},
         {"attempts", attempts}, {"successes", latencies.size()},
         {"failures_count", attempts - latencies.size()},
         {"total_success_latency_ns", total_latency},
@@ -931,19 +959,64 @@ json concurrent_measurement(const std::filesystem::path& path)
     }
 }
 
+int validate_receipt_command(const std::filesystem::path& root, const std::filesystem::path& relative)
+{
+    std::error_code error;
+    const auto canonical_root = std::filesystem::weakly_canonical(root, error);
+    if (error || !std::filesystem::is_directory(canonical_root))
+        throw fixture_error_t("benchmark receipt evidence root is invalid");
+    if (relative.is_absolute() || relative.has_root_name())
+        throw fixture_error_t("benchmark receipt path must be evidence-root relative");
+    for (const auto& part : relative) {
+        if (part == "..")
+            throw fixture_error_t("benchmark receipt path traversal is forbidden");
+    }
+    const auto receipt_path = std::filesystem::weakly_canonical(canonical_root / relative, error);
+    const auto within = std::filesystem::relative(receipt_path, canonical_root, error);
+    if (error || within.empty() || within.is_absolute() ||
+        (within.begin() != within.end() && *within.begin() == ".."))
+        throw fixture_error_t("benchmark receipt path escapes the evidence root");
+    std::ifstream stream(receipt_path, std::ios::binary);
+    if (!stream)
+        throw fixture_error_t("benchmark receipt is unavailable");
+    json receipt;
+    try {
+        stream >> receipt;
+    } catch (const json::exception& exception) {
+        throw fixture_error_t(std::string("benchmark receipt JSON is invalid: ") + exception.what());
+    }
+    const auto validation = aida::analysis::c03::validate_benchmark_sla_receipt_files(
+        receipt, aida::analysis::c03::approved_external_sla_slot(), canonical_root);
+    if (!validation.valid) {
+        std::string failure = "benchmark receipt failed the C03 SLA contract";
+        for (const auto& violation : validation.violations)
+            failure += "\n" + violation.path + ":" + violation.code + ":" + violation.message;
+        throw fixture_error_t(std::move(failure));
+    }
+    std::cout << receipt.dump(2) << '\n';
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv)
 {
     std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
     try {
-        if (argc != 2)
+        if (argc == 4 && std::string_view(argv[1]) == "--validate-receipt")
+            return validate_receipt_command(argv[2], std::filesystem::u8path(argv[3]));
+        if (argc != 3)
             throw aida::analysis::test_fixture::fixture_error_t(
-                "usage: analysis_benchmark_harness <code-bearing supported static fixture>");
-        const std::filesystem::path path = std::filesystem::absolute(argv[1]);
+                "usage: analysis_benchmark_harness <deterministic_component|release_sla> <code-bearing supported static fixture>");
+        const std::string benchmark_mode = argv[1];
+        if (benchmark_mode != "deterministic_component" && benchmark_mode != "release_sla")
+            throw aida::analysis::test_fixture::fixture_error_t("benchmark mode is unsupported");
+        const bool release_sla = benchmark_mode == "release_sla";
+        const std::filesystem::path path = std::filesystem::absolute(argv[2]);
         if (!std::filesystem::is_regular_file(path))
             throw aida::analysis::test_fixture::fixture_error_t("benchmark fixture does not exist");
         const auto fixture_size = std::filesystem::file_size(path);
+        const auto fixture_zero_bytes = zero_bytes(path, fixture_size);
         const auto host = host_identity(path);
         const auto runtime_before = aida::infra::taskflow_runtime::active_snapshot();
         const auto cold_memory_before = process_memory_snapshot();
@@ -957,6 +1030,17 @@ int main(int argc, char** argv)
         if (code_bytes == 0)
             throw aida::analysis::test_fixture::fixture_error_t(
                 "benchmark fixture has no normalized executable bytes");
+        if (release_sla) {
+            const auto& thresholds = aida::analysis::c03::benchmark_sla_thresholds();
+            const auto minimum = thresholds.at("release_min_artifact_bytes").get<std::uint64_t>();
+            const auto maximum = thresholds.at("release_max_artifact_bytes").get<std::uint64_t>();
+            const auto code_density = static_cast<double>(code_bytes) / static_cast<double>(fixture_size);
+            const auto zero_ratio = static_cast<double>(fixture_zero_bytes) / static_cast<double>(fixture_size);
+            if (fixture_size < minimum || fixture_size > maximum || code_bytes < 64ULL * 1024ULL * 1024ULL ||
+                code_density < 0.10 || zero_ratio > 0.80)
+                throw aida::analysis::test_fixture::fixture_error_t(
+                    "release SLA fixture fails size, executable-volume, density, or zero-padding qualification");
+        }
         const auto analysis_begin = steady_clock_t::now();
         analyze_workspace(workspace, 0);
         const auto analysis_ns = nanoseconds_since(analysis_begin);
@@ -986,6 +1070,9 @@ int main(int argc, char** argv)
             {"image_base", std::to_string(image->image_base)},
             {"image_size", image->image_size}, {"header_size", image->header_size},
             {"executable_code_bytes", code_bytes},
+            {"zero_bytes", fixture_zero_bytes},
+            {"code_density", static_cast<double>(code_bytes) / static_cast<double>(fixture_size)},
+            {"zero_ratio", static_cast<double>(fixture_zero_bytes) / static_cast<double>(fixture_size)},
             {"entry_points", image->entry_points.size()}, {"segments", image->segments.size()},
             {"sections", image->sections.size()}, {"image_symbols", image->symbols.size()},
             {"imports", image->imports.size()}, {"exports", image->exports.size()},
@@ -1067,10 +1154,16 @@ int main(int argc, char** argv)
         report["concurrent_fairness"] = concurrent_measurement(path);
         report["cancellation"] = cancellation_measurement(path);
         report["fixture"]["file_version"] = file_version_identity(path);
+        report["benchmark_contract"] = json{{"mode", benchmark_mode},
+            {"claim_status", release_sla ? "measurement_candidate" : "development_only"},
+            {"thresholds", aida::analysis::c03::benchmark_sla_thresholds()},
+            {"receipt_validation_required", true}, {"target_execution_forbidden", true}};
         report["runtime_claim"] = "measurement_only";
         std::cout << report.dump(2) << '\n';
         return 0;
     } catch (const std::exception& error) {
+        aida::analysis::c03_test::assertion_telemetry::record_exception(
+            error.what());
         if (workspace) {
             try { close_workspace(workspace, true); } catch (...) {}
         }

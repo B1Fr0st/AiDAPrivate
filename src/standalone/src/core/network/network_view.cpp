@@ -18,6 +18,7 @@
 #include "../ui/motion.hpp"
 #include "../ui/transition.hpp"
 #include "../ui/components.hpp"
+#include "../ui/metrics.hpp"
 #include "../ui/empty_state.hpp"
 #include "../ui/no_target_overlay.hpp"
 #include "../ui/responsive.hpp"
@@ -1366,21 +1367,14 @@ static void render_payload_box(const char* id, const char* title, const std::str
 }
 
 static float render_no_target_banner(float x, float y, float w, float alpha) {
-    const auto& th = aida::ui::resolved();
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImVec2 a(wp.x + x, wp.y + y);
-    ImVec2 b(wp.x + x + w, wp.y + y + 34.f);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(a, b, aida::ui::with_alpha(th.warning_soft, alpha * 2.4f), 6.f);
-    dl->AddRect(a, b, aida::ui::with_alpha(th.warning, alpha * 0.55f), 6.f, 0, 1.f);
-    dl->PushClipRect(a, b, true);
-    dl->AddText(ImVec2(a.x + 10.f, a.y + 8.f), aida::ui::with_alpha(th.warning, alpha), "No target attached");
+    (void)alpha;
     const char* msg = w < 620.f
-        ? "Driver capture disabled; web, proxy, API, protocol, and Camoufox prep remain available."
-        : "Driver capture and native process diagnostics are disabled; web, proxy, API, protocol, and Camoufox prep tools remain available.";
-    dl->AddText(ImVec2(a.x + 140.f, a.y + 8.f), aida::ui::with_alpha(th.text_secondary, alpha), msg);
-    dl->PopClipRect();
-    return 40.f;
+        ? "Driver capture is unavailable. Web, proxy, API, protocol, and Camoufox tools remain ready."
+        : "Driver capture and native process diagnostics are unavailable. Web, proxy, API, protocol, and Camoufox tools remain ready.";
+    ImGui::SetCursorPos(ImVec2(x, y));
+    aida::ui::components::inline_notice("network_no_target_notice", "No target attached", msg,
+        aida::ui::components::status_kind_t::warning);
+    return 60.f;
 }
 
 static float render_tab_bar(state_t& state, float x, float y, float w, float alpha,
@@ -1389,9 +1383,9 @@ static float render_tab_bar(state_t& state, float x, float y, float w, float alp
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetWindowPos();
 
-    const float primary_h = 32.f;
-    const float secondary_h = 30.f;
-    const float gap_h = 4.f;
+    const float primary_h = aida::ui::metrics::tab::primary_h;
+    const float secondary_h = aida::ui::metrics::tab::inner_h;
+    const float gap_h = aida::ui::metrics::spacing::xs;
     const float nav_h = primary_h + secondary_h + gap_h;
     const int group_count = nav_group_count();
     const int active_group_idx = nav_group_for_tab(state.active_tab);
@@ -1404,9 +1398,14 @@ static float render_tab_bar(state_t& state, float x, float y, float w, float alp
     float second_y0 = nav_y1 + gap_h;
     float second_y1 = second_y0 + secondary_h;
 
-    ui_anim::render_gradient_header(dl, nav_x0, nav_y0, w, primary_h, ar, ag, ab, alpha * 0.65f);
-    dl->AddRectFilled(ImVec2(nav_x0, nav_y0), ImVec2(nav_x1, nav_y1),
-                      aida::ui::with_alpha(th.panel_header, alpha * 0.55f));
+    (void)ar;
+    (void)ag;
+    (void)ab;
+    dl->AddRectFilled(ImVec2(nav_x0, nav_y0), ImVec2(nav_x1, second_y1),
+        aida::ui::with_alpha(th.bg_elevated, alpha), aida::ui::metrics::radius::md);
+    dl->AddRect(ImVec2(nav_x0, nav_y0), ImVec2(nav_x1, second_y1),
+        aida::ui::with_alpha(th.border_subtle, alpha), aida::ui::metrics::radius::md, 0,
+        aida::ui::metrics::panel::border);
 
     float primary_total = 0.f;
     float primary_full[16] = {};
@@ -1447,8 +1446,8 @@ static float render_tab_bar(state_t& state, float x, float y, float w, float alp
         float hv = s_group_hover[i].tick(hovered, dt, aida::motion::spring::balanced);
         float pv = s_group_press[i].tick(pressed, dt);
         if (active) {
-            dl->AddRectFilled(a, b, aida::ui::with_alpha(th.selection, alpha), 7.f);
-            dl->AddRect(a, b, aida::ui::with_alpha(th.accent_u32, alpha * 0.55f), 7.f, 0, 1.f);
+            dl->AddRectFilled(a, b, aida::ui::with_alpha(th.selection, alpha), aida::ui::metrics::radius::sm);
+            dl->AddRect(a, b, aida::ui::with_alpha(th.accent_u32, alpha * 0.55f), aida::ui::metrics::radius::sm, 0, 1.f);
         } else if (hv > 0.001f) {
             dl->AddRectFilled(a, b, aida::ui::with_alpha(th.hover_wash, alpha * hv), 7.f);
         }
@@ -1482,8 +1481,8 @@ static float render_tab_bar(state_t& state, float x, float y, float w, float alp
     dl->AddLine(ImVec2(nav_x0, nav_y1), ImVec2(nav_x1, nav_y1),
                 aida::ui::with_alpha(th.border_subtle, alpha));
 
-    dl->AddRectFilled(ImVec2(nav_x0, second_y0), ImVec2(nav_x1, second_y1),
-                      aida::ui::with_alpha(th.panel_bg, alpha * 0.55f));
+    dl->AddRectFilled(ImVec2(nav_x0 + 1.f, second_y0), ImVec2(nav_x1 - 1.f, second_y1 - 1.f),
+                      aida::ui::with_alpha(th.panel_bg, alpha * 0.62f));
 
     const int count = active_group.tab_count;
     float total_w = 0.f;
@@ -6973,6 +6972,64 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     ImGui::EndChild();
 }
 
+static aida::ui::components::status_kind_t network_header_status(const state_t& state,
+                                                                 bool has_target) {
+    if (!has_target)
+        return aida::ui::components::status_kind_t::warning;
+    if (state.cap_start_pending.load(std::memory_order_acquire) ||
+        state.cap_stop_pending.load(std::memory_order_acquire))
+        return aida::ui::components::status_kind_t::info;
+    if (state.cap_running.load(std::memory_order_acquire))
+        return aida::ui::components::status_kind_t::success;
+    return aida::ui::components::status_kind_t::neutral;
+}
+
+static void render_network_status_bar(state_t& state, ImVec2 pos, float width, bool has_target) {
+    ImGui::SetCursorPos(pos);
+    bool visible = aida::ui::components::begin_status_bar("##network_status_bar");
+    if (visible) {
+        uint32_t attached_pid = driver_bridge::attached_pid();
+        char pid_text[24] = {};
+        if (attached_pid != 0)
+            std::snprintf(pid_text, sizeof(pid_text), "%u", static_cast<unsigned>(attached_pid));
+        else
+            std::snprintf(pid_text, sizeof(pid_text), "none");
+
+        bool capture_running = state.cap_running.load(std::memory_order_acquire);
+        bool capture_pending = state.cap_start_pending.load(std::memory_order_acquire) ||
+                               state.cap_stop_pending.load(std::memory_order_acquire);
+        const char* capture_text = capture_pending ? "transitioning" : capture_running ? "running" : "idle";
+        aida::ui::components::status_kind_t capture_kind = capture_pending
+            ? aida::ui::components::status_kind_t::info
+            : capture_running ? aida::ui::components::status_kind_t::success
+                              : aida::ui::components::status_kind_t::neutral;
+
+        size_t packet_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(state.cap_mutex);
+            packet_count = state.captured_packets.size();
+        }
+        char packet_text[32] = {};
+        std::snprintf(packet_text, sizeof(packet_text), "%zu", packet_count);
+
+        aida::ui::components::status_item("target", "Target", pid_text,
+            has_target ? aida::ui::components::status_kind_t::success
+                       : aida::ui::components::status_kind_t::warning);
+        aida::ui::components::status_item("capture", "Capture", capture_text, capture_kind);
+        if (width >= 620.f)
+            aida::ui::components::status_item("packets", "Packets", packet_text,
+                packet_count > 0 ? aida::ui::components::status_kind_t::info
+                                 : aida::ui::components::status_kind_t::neutral);
+        if (width >= 820.f) {
+            int tab_index = std::clamp(static_cast<int>(state.active_tab), 0,
+                static_cast<int>(sub_tab_t::COUNT) - 1);
+            aida::ui::components::status_item("tool", "Tool", tab_names[tab_index],
+                aida::ui::components::status_kind_t::accent, false, false);
+        }
+    }
+    aida::ui::components::end_status_bar();
+}
+
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b) {
@@ -6981,43 +7038,98 @@ void render(float pos_x, float pos_y, float width, float height,
     const bool has_target = analysis_session::has_active_target();
     g_state.last_render_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
 
+    ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    bool root_visible = ImGui::BeginChild("##network_view_root", ImVec2(width, height), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    if (!root_visible) {
+        ImGui::EndChild();
+        return;
+    }
+
+    ImVec2 root_size = ImGui::GetWindowSize();
+    ImVec2 root_screen = ImGui::GetWindowPos();
+    ImGui::GetWindowDrawList()->AddRectFilled(root_screen,
+        ImVec2(root_screen.x + root_size.x, root_screen.y + root_size.y),
+        aida::ui::with_alpha(th.bg_base, alpha));
+
     const float kNetMinWidth = 320.f;
-    if (width < kNetMinWidth) {
+    const float kNetMinHeight = 260.f;
+    if (root_size.x < kNetMinWidth || root_size.y < kNetMinHeight) {
         static bool s_logged_net_clamp = false;
         if (!s_logged_net_clamp) {
             s_logged_net_clamp = true;
             ::diag::log_tagged_fmt("responsive",
-                "network_view clamp_overlay width=%.0f min=%.0f",
-                width, kNetMinWidth);
+                "network_view clamp_overlay width=%.0f height=%.0f min_width=%.0f min_height=%.0f",
+                root_size.x, root_size.y, kNetMinWidth, kNetMinHeight);
         }
-        ImVec2 wp = ImGui::GetWindowPos();
         aida::ui::responsive::draw_clamp_overlay(
-            ImVec2(wp.x + pos_x, wp.y + pos_y),
-            ImVec2(width, height),
-            "Widen the panel to view network tools");
+            root_screen, root_size,
+            "Widen or raise the panel to view network tools");
+        ImGui::EndChild();
         return;
     }
 
+    const float outer_pad = aida::ui::metrics::spacing::md;
+    const float inner_width = std::max(1.f, root_size.x - outer_pad * 2.f);
+    const bool capture_running = g_state.cap_running.load(std::memory_order_acquire);
+    const bool capture_busy = g_state.cap_start_pending.load(std::memory_order_acquire) ||
+                              g_state.cap_stop_pending.load(std::memory_order_acquire);
+    const int active_group_idx = nav_group_for_tab(g_state.active_tab);
+    const char* subtitle = root_size.x >= 620.f
+        ? k_nav_groups[active_group_idx].status
+        : tab_names[std::clamp(static_cast<int>(g_state.active_tab), 0,
+            static_cast<int>(sub_tab_t::COUNT) - 1)];
+    const char* primary_action = has_target && !capture_busy && root_size.x >= 680.f
+        ? (capture_running ? "Stop capture" : "Start capture")
+        : nullptr;
+    const char* secondary_action = root_size.x >= 840.f && g_state.active_tab != sub_tab_t::capture
+        ? "Open Capture"
+        : nullptr;
 
-    float tab_h = render_tab_bar(g_state, pos_x, pos_y, width, alpha, accent_r, accent_g, accent_b, dt);
+    ImGui::SetCursorPos(ImVec2(outer_pad, outer_pad));
+    aida::ui::components::view_header_result_t header = aida::ui::components::view_header(
+        "Network", subtitle, primary_action, secondary_action,
+        network_header_status(g_state, has_target));
+    if (header.primary_clicked) {
+        if (capture_running)
+            request_capture_stop(g_state);
+        else
+            request_capture_start(g_state);
+    }
+    if (header.secondary_clicked) {
+        g_state.prev_tab = g_state.active_tab;
+        g_state.active_tab = sub_tab_t::capture;
+        g_state.content_fade = 0.f;
+    }
+
+    const float nav_y = ImGui::GetCursorPosY();
+    const float status_h = aida::ui::metrics::status_bar::height;
+    const float status_y = root_size.y - outer_pad - status_h;
+    const float content_bottom = status_y - aida::ui::metrics::spacing::sm;
+
+    float tab_h = render_tab_bar(g_state, outer_pad, nav_y, inner_width, alpha,
+        accent_r, accent_g, accent_b, dt);
 
     g_state.content_fade = ui_anim::smooth_lerp(g_state.content_fade, 1.f, 14.f, dt);
     float ca = alpha * std::max(g_state.content_fade, 0.3f);
 
-    float content_y = pos_y + tab_h + 6.f;
-    float content_h = height - tab_h - 6.f;
+    float content_y = nav_y + tab_h + aida::ui::metrics::spacing::sm;
+    float content_h = std::max(0.f, content_bottom - content_y);
     if (!has_target && tab_requires_target(g_state.active_tab)) {
-        ImVec2 wp = ImGui::GetWindowPos();
         aida::ui::no_target_overlay::render(
-            ImVec2(wp.x + pos_x, wp.y + content_y),
-            ImVec2(width, content_h),
+            ImVec2(root_screen.x + outer_pad, root_screen.y + content_y),
+            ImVec2(inner_width, content_h),
             "No target attached",
             "This Network tool needs an attached process for driver-backed capture, PID filtering, TLS key capture, or PCAP export. Attach or launch a target to enable it.",
             alpha, aida::ui::empty_state::glyph_t::network);
+        render_network_status_bar(g_state, ImVec2(outer_pad, status_y), inner_width, has_target);
+        ImGui::EndChild();
         return;
     }
     if (!has_target) {
-        float banner_h = render_no_target_banner(pos_x, content_y, width, ca);
+        float banner_h = render_no_target_banner(outer_pad, content_y, inner_width, ca);
         content_y += banner_h;
         content_h = std::max(0.f, content_h - banner_h);
     }
@@ -7043,10 +7155,10 @@ void render(float pos_x, float pos_y, float width, float height,
 
     switch (g_state.active_tab) {
         case sub_tab_t::connections:
-            render_connections(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_connections(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::capture:
-            render_capture(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_capture(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::intercept:
             render_intercept(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);

@@ -1,4 +1,5 @@
 #include "analysis_scheduler_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 #include "../../src/core/analysis/analysis_scheduler.hpp"
 
 #include <array>
@@ -13,6 +14,7 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -415,6 +417,7 @@ bool run_analysis_scheduler_harness(std::string& failure)
         failure.clear();
         return true;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure = error.what();
         return false;
     }

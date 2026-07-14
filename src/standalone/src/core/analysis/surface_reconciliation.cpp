@@ -1,12 +1,20 @@
 #include "surface_reconciliation.hpp"
 
 #include <algorithm>
-#include <stdexcept>
+#include <initializer_list>
+#include <limits>
+#include <tuple>
 #include <utility>
 
 namespace aida::analysis::c03 {
 
 namespace {
+
+constexpr std::size_t k_default_maximum_entries = 100000;
+constexpr std::size_t k_default_maximum_findings = 10000;
+constexpr std::uint64_t k_default_maximum_severity = 1000;
+constexpr std::size_t k_default_maximum_identifier_bytes = 512;
+constexpr std::size_t k_default_maximum_text_bytes = 4096;
 
 struct stable_code_entry_t {
     surface_error_code_t code;
@@ -14,20 +22,27 @@ struct stable_code_entry_t {
 };
 
 constexpr stable_code_entry_t k_stable_codes[] = {
-    {surface_error_code_t::none,                              "none"},
-    {surface_error_code_t::dead_replaced_path_detected,       "dead_replaced_path_detected"},
-    {surface_error_code_t::duplicate_store_detected,          "duplicate_store_detected"},
-    {surface_error_code_t::stale_registration_detected,       "stale_registration_detected"},
-    {surface_error_code_t::old_schema_v8_writer_detected,     "old_schema_v8_writer_detected"},
-    {surface_error_code_t::legacy_invalid_ast_flow_detected,  "legacy_invalid_ast_flow_detected"},
-    {surface_error_code_t::unsupported_alias_detected,        "unsupported_alias_detected"},
-    {surface_error_code_t::security_regression_detected,      "security_regression_detected"},
-    {surface_error_code_t::unexplained_removal_detected,      "unexplained_removal_detected"},
-    {surface_error_code_t::baseline_mismatch,                 "baseline_mismatch"},
-    {surface_error_code_t::internal_error,                    "internal_error"},
+    {surface_error_code_t::none,                                      "none"},
+    {surface_error_code_t::dead_replaced_path_detected,               "dead_replaced_path_detected"},
+    {surface_error_code_t::duplicate_store_detected,                  "duplicate_store_detected"},
+    {surface_error_code_t::stale_registration_detected,               "stale_registration_detected"},
+    {surface_error_code_t::old_schema_v8_writer_detected,             "old_schema_v8_writer_detected"},
+    {surface_error_code_t::legacy_invalid_ast_flow_detected,          "legacy_invalid_ast_flow_detected"},
+    {surface_error_code_t::unsupported_alias_detected,                "unsupported_alias_detected"},
+    {surface_error_code_t::security_regression_detected,              "security_regression_detected"},
+    {surface_error_code_t::unexplained_removal_detected,              "unexplained_removal_detected"},
+    {surface_error_code_t::baseline_mismatch,                         "baseline_mismatch"},
+    {surface_error_code_t::internal_error,                            "internal_error"},
+    {surface_error_code_t::invalid_limit_contract,                    "invalid_limit_contract"},
+    {surface_error_code_t::baseline_entry_cap_exceeded,               "baseline_entry_cap_exceeded"},
+    {surface_error_code_t::actual_entry_cap_exceeded,                 "actual_entry_cap_exceeded"},
+    {surface_error_code_t::finding_cap_exceeded,                      "finding_cap_exceeded"},
+    {surface_error_code_t::duplicate_baseline_identifier_detected,    "duplicate_baseline_identifier_detected"},
+    {surface_error_code_t::duplicate_actual_identifier_detected,      "duplicate_actual_identifier_detected"},
+    {surface_error_code_t::invalid_surface_entry,                     "invalid_surface_entry"},
+    {surface_error_code_t::invalid_surface_marker,                    "invalid_surface_marker"},
+    {surface_error_code_t::auxiliary_marker_cap_exceeded,             "auxiliary_marker_cap_exceeded"},
 };
-
-constexpr std::size_t k_stable_code_count = sizeof(k_stable_codes) / sizeof(k_stable_codes[0]);
 
 struct entry_kind_name_t {
     surface_entry_kind_t kind;
@@ -47,24 +62,158 @@ constexpr entry_kind_name_t k_kind_names[] = {
     {surface_entry_kind_t::test_harness,           "test_harness"},
 };
 
-constexpr std::size_t k_kind_name_count = sizeof(k_kind_names) / sizeof(k_kind_names[0]);
+bool saturating_add(
+    std::uint64_t& value, std::uint64_t increment,
+    std::uint64_t maximum) noexcept {
+    if (value > maximum) {
+        value = maximum;
+        return true;
+    }
+    if (increment >= maximum - value) {
+        value = maximum;
+        return true;
+    }
+    value += increment;
+    return false;
+}
+
+bool saturating_atomic_add(
+    std::atomic_uint64_t& value, std::uint64_t increment,
+    std::uint64_t maximum) noexcept {
+    auto current = value.load(std::memory_order_acquire);
+    for (;;) {
+        const bool saturated =
+            current >= maximum ||
+            increment >= maximum - std::min(current, maximum);
+        const auto desired = saturated ? maximum : current + increment;
+        if (value.compare_exchange_weak(
+                current, desired, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return saturated;
+        }
+    }
+}
+
+void append_bounded(
+    std::string& destination, std::string_view value,
+    std::size_t maximum_bytes) {
+    if (destination.size() >= maximum_bytes || value.empty())
+        return;
+    const auto available = maximum_bytes - destination.size();
+    destination.append(value.data(), std::min(available, value.size()));
+}
+
+std::string bounded_concat(
+    std::size_t maximum_bytes,
+    std::initializer_list<std::string_view> components) {
+    std::string value;
+    value.reserve(std::min<std::size_t>(maximum_bytes, 256));
+    for (const auto component : components)
+        append_bounded(value, component, maximum_bytes);
+    return value;
+}
+
+std::string bounded_evidence(std::string_view value, std::size_t maximum_bytes) {
+    std::string evidence;
+    evidence.reserve(std::min(value.size(), maximum_bytes));
+    for (std::size_t index = 0;
+         index < value.size() && evidence.size() < maximum_bytes; ++index) {
+        const auto byte = static_cast<unsigned char>(value[index]);
+        if (byte == 0 || byte < 0x20 || byte == 0x7f)
+            evidence.push_back('?');
+        else
+            evidence.push_back(static_cast<char>(byte));
+    }
+    return evidence;
+}
+
+bool valid_kind(surface_entry_kind_t kind) noexcept {
+    return static_cast<std::uint8_t>(kind) <=
+           static_cast<std::uint8_t>(surface_entry_kind_t::test_harness);
+}
+
+std::vector<const surface_entry_t*> sorted_entries(
+    const std::vector<surface_entry_t>& entries) {
+    std::vector<const surface_entry_t*> ordered;
+    ordered.reserve(entries.size());
+    for (const auto& entry : entries)
+        ordered.push_back(&entry);
+    std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+        return std::tie(
+                   left->identifier, left->kind, left->canonical_path,
+                   left->schema_version, left->is_active, left->is_replaced,
+                   left->replaced_by, left->security_note) <
+               std::tie(
+                   right->identifier, right->kind, right->canonical_path,
+                   right->schema_version, right->is_active, right->is_replaced,
+                   right->replaced_by, right->security_note);
+    });
+    return ordered;
+}
+
+template <typename Map>
+std::vector<const typename Map::value_type*> sorted_map_entries(const Map& values) {
+    std::vector<const typename Map::value_type*> ordered;
+    ordered.reserve(values.size());
+    for (const auto& value : values)
+        ordered.push_back(&value);
+    std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+        return std::tie(left->first, left->second) <
+               std::tie(right->first, right->second);
+    });
+    return ordered;
+}
+
+template <typename Set>
+std::vector<const typename Set::value_type*> sorted_set_entries(const Set& values) {
+    std::vector<const typename Set::value_type*> ordered;
+    ordered.reserve(values.size());
+    for (const auto& value : values)
+        ordered.push_back(&value);
+    std::sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+        return *left < *right;
+    });
+    return ordered;
+}
+
+bool has_finding(
+    const surface_reconciliation_result_t& result,
+    surface_error_code_t code, std::string_view identifier) {
+    return std::any_of(
+        result.findings.begin(), result.findings.end(),
+        [code, identifier](const auto& finding) {
+            return finding.code == code && finding.identifier == identifier;
+        });
+}
 
 }
 
+struct surface_reconciliation_t::marker_target_proof_t final {
+    struct source_evidence_t final {
+        surface_entry_kind_t kind = surface_entry_kind_t::source_file;
+        std::string canonical_path;
+    };
+
+    std::unordered_map<std::string, source_evidence_t> valid_dead_replacements;
+    std::unordered_map<std::string, source_evidence_t> valid_alias_replacements;
+    std::unordered_map<std::string, source_evidence_t> valid_stale_registrations;
+    std::unordered_map<std::string, source_evidence_t> unique_active_actual;
+};
+
 std::string_view surface_reconciliation_t::stable_code_for(
     surface_error_code_t code) noexcept {
-    for (std::size_t i = 0; i < k_stable_code_count; ++i) {
-        if (k_stable_codes[i].code == code)
-            return k_stable_codes[i].name;
+    for (const auto& entry : k_stable_codes) {
+        if (entry.code == code)
+            return entry.name;
     }
     return "unknown";
 }
 
 std::string_view surface_reconciliation_t::entry_kind_name(
     surface_entry_kind_t kind) noexcept {
-    for (std::size_t i = 0; i < k_kind_name_count; ++i) {
-        if (k_kind_names[i].kind == kind)
-            return k_kind_names[i].name;
+    for (const auto& entry : k_kind_names) {
+        if (entry.kind == kind)
+            return entry.name;
     }
     return "unknown";
 }
@@ -72,350 +221,1403 @@ std::string_view surface_reconciliation_t::entry_kind_name(
 surface_finding_t surface_reconciliation_t::make_finding(
     surface_error_code_t code, std::string_view identifier,
     std::string detail, std::string canonical_path,
-    surface_entry_kind_t kind, std::uint64_t severity) {
+    surface_entry_kind_t kind, std::uint64_t severity) const {
     surface_finding_t finding;
     finding.code = code;
     finding.stable_code = stable_code_for(code);
-    finding.identifier = std::string(identifier);
-    finding.detail = std::move(detail);
-    finding.canonical_path = std::move(canonical_path);
-    finding.kind = kind;
-    finding.severity = severity;
+    finding.identifier = bounded_evidence(identifier, limits_.maximum_identifier_bytes);
+    finding.detail = bounded_evidence(detail, limits_.maximum_text_bytes);
+    finding.canonical_path = bounded_evidence(
+        canonical_path, limits_.maximum_text_bytes);
+    finding.kind = valid_kind(kind) ? kind : surface_entry_kind_t::source_file;
+    finding.severity = std::min(severity, limits_.maximum_severity);
     return finding;
 }
 
 surface_reconciliation_t::surface_reconciliation_t(
     surface_reconciliation_limits_t limits)
-    : limits_(limits) {}
-
-void surface_reconciliation_t::register_baseline_entry(const surface_entry_t& entry) {
-    if (baseline_.size() < limits_.maximum_entries)
-        baseline_.push_back(entry);
+    : limits_(limits) {
+    if (limits_.maximum_entries == 0 ||
+        limits_.maximum_entries > k_default_maximum_entries) {
+        limits_.maximum_entries = k_default_maximum_entries;
+        limit_contract_valid_ = false;
+    }
+    if (limits_.maximum_findings < 2 ||
+        limits_.maximum_findings > k_default_maximum_findings) {
+        limits_.maximum_findings = k_default_maximum_findings;
+        limit_contract_valid_ = false;
+    }
+    if (limits_.maximum_severity == 0 ||
+        limits_.maximum_severity > k_default_maximum_severity) {
+        limits_.maximum_severity = k_default_maximum_severity;
+        limit_contract_valid_ = false;
+    }
+    if (limits_.maximum_identifier_bytes == 0 ||
+        limits_.maximum_identifier_bytes > k_default_maximum_identifier_bytes) {
+        limits_.maximum_identifier_bytes = k_default_maximum_identifier_bytes;
+        limit_contract_valid_ = false;
+    }
+    if (limits_.maximum_text_bytes == 0 ||
+        limits_.maximum_text_bytes > k_default_maximum_text_bytes) {
+        limits_.maximum_text_bytes = k_default_maximum_text_bytes;
+        limit_contract_valid_ = false;
+    }
+    if (limits_.maximum_identifier_bytes > limits_.maximum_text_bytes) {
+        limits_.maximum_identifier_bytes = k_default_maximum_identifier_bytes;
+        limits_.maximum_text_bytes = k_default_maximum_text_bytes;
+        limit_contract_valid_ = false;
+    }
+    if (limits_.maximum_metric_value == 0) {
+        limits_.maximum_metric_value =
+            std::numeric_limits<std::uint64_t>::max();
+        limit_contract_valid_ = false;
+    }
 }
 
-void surface_reconciliation_t::register_actual_entry(const surface_entry_t& entry) {
-    if (actual_.size() < limits_.maximum_entries)
-        actual_.push_back(entry);
+bool surface_reconciliation_t::valid_identifier(std::string_view value) const noexcept {
+    if (value.empty() || value.size() > limits_.maximum_identifier_bytes)
+        return false;
+    for (const char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte < 0x21 || byte > 0x7e)
+            return false;
+    }
+    return true;
+}
+
+bool surface_reconciliation_t::valid_text(
+    std::string_view value, bool allow_empty) const noexcept {
+    if ((!allow_empty && value.empty()) || value.size() > limits_.maximum_text_bytes)
+        return false;
+    for (const char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte == 0 || byte < 0x20 || byte == 0x7f)
+            return false;
+    }
+    return true;
+}
+
+bool surface_reconciliation_t::valid_path(std::string_view value) const noexcept {
+    if (!valid_text(value, false) || value.front() == '/' ||
+        value.back() == '/' || value.find('\\') != std::string_view::npos ||
+        value.find(':') != std::string_view::npos) {
+        return false;
+    }
+    std::size_t start = 0;
+    while (start < value.size()) {
+        const auto end = value.find('/', start);
+        const auto length = (end == std::string_view::npos ? value.size() : end) - start;
+        const auto segment = value.substr(start, length);
+        if (segment.empty() || segment == "." || segment == "..")
+            return false;
+        if (end == std::string_view::npos)
+            break;
+        start = end + 1;
+    }
+    return true;
+}
+
+bool surface_reconciliation_t::valid_entry(
+    const surface_entry_t& entry, std::string_view& reason) const noexcept {
+    if (!valid_identifier(entry.identifier)) {
+        reason = "invalid_identifier";
+        return false;
+    }
+    if (!valid_path(entry.canonical_path)) {
+        reason = "invalid_canonical_path";
+        return false;
+    }
+    if (!valid_kind(entry.kind)) {
+        reason = "invalid_entry_kind";
+        return false;
+    }
+    if (entry.is_replaced) {
+        if (entry.is_active) {
+            reason = "active_replaced_entry";
+            return false;
+        }
+        if (!valid_identifier(entry.replaced_by)) {
+            reason = "invalid_replacement_identifier";
+            return false;
+        }
+        if (entry.replaced_by == entry.identifier) {
+            reason = "self_replacement";
+            return false;
+        }
+    } else if (!entry.replaced_by.empty()) {
+        reason = "replacement_without_replaced_state";
+        return false;
+    }
+    if (entry.kind == surface_entry_kind_t::schema_writer) {
+        if (entry.is_active && !valid_identifier(entry.schema_version)) {
+            reason = "active_schema_writer_without_valid_version";
+            return false;
+        }
+        if (!entry.schema_version.empty() &&
+            !valid_identifier(entry.schema_version)) {
+            reason = "invalid_schema_version";
+            return false;
+        }
+    } else if (!entry.schema_version.empty()) {
+        reason = "schema_version_on_non_writer";
+        return false;
+    }
+    if (entry.kind == surface_entry_kind_t::security_guard) {
+        if (!entry.security_note.empty() &&
+            !valid_text(entry.security_note, false)) {
+            reason = "invalid_security_note";
+            return false;
+        }
+        if (!entry.is_active && entry.security_note.empty()) {
+            reason = "inactive_security_guard_without_note";
+            return false;
+        }
+    } else if (!entry.security_note.empty()) {
+        reason = "security_note_on_non_guard";
+        return false;
+    }
+    reason = {};
+    return true;
+}
+
+void surface_reconciliation_t::record_invalid_entry(
+    bool baseline, const surface_entry_t& entry, std::string_view reason) {
+    auto& rejected = baseline ? rejected_baseline_entries_ : rejected_actual_entries_;
+    const bool rejected_saturated =
+        saturating_add(rejected, 1, limits_.maximum_metric_value);
+    const bool malformed_saturated =
+        saturating_add(malformed_entries_, 1, limits_.maximum_metric_value);
+    if (rejected_saturated || malformed_saturated)
+        metrics_saturated_.store(true, std::memory_order_release);
+    if (first_invalid_entry_reason_.empty()) {
+        first_invalid_entry_identifier_ = bounded_evidence(
+            entry.identifier, limits_.maximum_identifier_bytes);
+        if (first_invalid_entry_identifier_.empty())
+            first_invalid_entry_identifier_ = "<invalid>";
+        first_invalid_entry_reason_ = reason;
+        first_invalid_entry_is_baseline_ = baseline;
+    }
+}
+
+void surface_reconciliation_t::record_invalid_marker(
+    std::string_view collection, std::string_view identifier,
+    std::string_view reason) {
+    const bool rejected_saturated = saturating_add(
+        rejected_auxiliary_markers_, 1, limits_.maximum_metric_value);
+    const bool malformed_saturated = saturating_add(
+        malformed_markers_, 1, limits_.maximum_metric_value);
+    if (rejected_saturated || malformed_saturated) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (first_invalid_marker_reason_.empty()) {
+        first_invalid_marker_identifier_ = bounded_evidence(
+            identifier, limits_.maximum_identifier_bytes);
+        if (first_invalid_marker_identifier_.empty())
+            first_invalid_marker_identifier_ = "<invalid>";
+        first_invalid_marker_collection_ = collection;
+        first_invalid_marker_reason_ = reason;
+    }
+}
+
+bool surface_reconciliation_t::reserve_auxiliary_marker(
+    std::string_view collection) noexcept {
+    if (auxiliary_marker_count_ >= limits_.maximum_entries) {
+        auxiliary_cap_exceeded_ = true;
+        if (saturating_add(
+                rejected_auxiliary_markers_, 1,
+                limits_.maximum_metric_value)) {
+            metrics_saturated_.store(true, std::memory_order_release);
+        }
+        if (first_auxiliary_overflow_collection_.empty())
+            first_auxiliary_overflow_collection_ = collection;
+        return false;
+    }
+    ++auxiliary_marker_count_;
+    return true;
+}
+
+void surface_reconciliation_t::register_baseline_entry(
+    const surface_entry_t& entry) {
+    if (saturating_add(
+            attempted_baseline_entries_, 1, limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    std::string_view reason;
+    if (!valid_entry(entry, reason)) {
+        record_invalid_entry(true, entry, reason);
+        return;
+    }
+    if (baseline_.size() >= limits_.maximum_entries) {
+        baseline_cap_exceeded_ = true;
+        if (saturating_add(
+                rejected_baseline_entries_, 1,
+                limits_.maximum_metric_value)) {
+            metrics_saturated_.store(true, std::memory_order_release);
+        }
+        return;
+    }
+    baseline_.push_back(entry);
+}
+
+void surface_reconciliation_t::register_actual_entry(
+    const surface_entry_t& entry) {
+    if (saturating_add(
+            attempted_actual_entries_, 1, limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    std::string_view reason;
+    if (!valid_entry(entry, reason)) {
+        record_invalid_entry(false, entry, reason);
+        return;
+    }
+    if (actual_.size() >= limits_.maximum_entries) {
+        actual_cap_exceeded_ = true;
+        if (saturating_add(
+                rejected_actual_entries_, 1,
+                limits_.maximum_metric_value)) {
+            metrics_saturated_.store(true, std::memory_order_release);
+        }
+        return;
+    }
+    actual_.push_back(entry);
 }
 
 void surface_reconciliation_t::mark_dead_replaced_path(
     std::string_view identifier, std::string_view replaced_by) {
-    dead_replaced_paths_[std::string(identifier)] = std::string(replaced_by);
+    if (saturating_add(
+            attempted_auxiliary_markers_, 1,
+            limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (!valid_identifier(identifier) || !valid_identifier(replaced_by)) {
+        record_invalid_marker(
+            "dead_replaced_paths", identifier, "invalid_replacement_marker");
+        return;
+    }
+    if (identifier == replaced_by) {
+        record_invalid_marker(
+            "dead_replaced_paths", identifier, "self_replacement");
+        return;
+    }
+    const auto found = dead_replaced_paths_.find(std::string(identifier));
+    if (found != dead_replaced_paths_.end()) {
+        if (found->second != replaced_by)
+            record_invalid_marker(
+                "dead_replaced_paths", identifier, "conflicting_duplicate_marker");
+        return;
+    }
+    if (!reserve_auxiliary_marker("dead_replaced_paths"))
+        return;
+    dead_replaced_paths_.emplace(
+        std::string(identifier), std::string(replaced_by));
 }
 
 void surface_reconciliation_t::mark_duplicate_store(
     std::string_view identifier, std::string_view other_path) {
-    duplicate_stores_[std::string(identifier)] = std::string(other_path);
+    if (saturating_add(
+            attempted_auxiliary_markers_, 1,
+            limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (!valid_identifier(identifier) || !valid_path(other_path)) {
+        record_invalid_marker(
+            "duplicate_stores", identifier, "invalid_duplicate_store_marker");
+        return;
+    }
+    const auto found = duplicate_stores_.find(std::string(identifier));
+    if (found != duplicate_stores_.end()) {
+        if (found->second != other_path)
+            record_invalid_marker(
+                "duplicate_stores", identifier, "conflicting_duplicate_marker");
+        return;
+    }
+    if (!reserve_auxiliary_marker("duplicate_stores"))
+        return;
+    duplicate_stores_.emplace(
+        std::string(identifier), std::string(other_path));
 }
 
-void surface_reconciliation_t::mark_stale_registration(std::string_view identifier) {
-    stale_registrations_.insert(std::string(identifier));
+void surface_reconciliation_t::mark_stale_registration(
+    std::string_view identifier) {
+    if (saturating_add(
+            attempted_auxiliary_markers_, 1,
+            limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (!valid_identifier(identifier)) {
+        record_invalid_marker(
+            "stale_registrations", identifier, "invalid_identifier");
+        return;
+    }
+    if (stale_registrations_.find(std::string(identifier)) !=
+        stale_registrations_.end()) {
+        return;
+    }
+    if (!reserve_auxiliary_marker("stale_registrations"))
+        return;
+    stale_registrations_.emplace(std::string(identifier));
 }
 
 void surface_reconciliation_t::mark_old_schema_v8_writer(
     std::string_view identifier, std::string_view canonical_path) {
-    old_schema_v8_writers_[std::string(identifier)] = std::string(canonical_path);
+    if (saturating_add(
+            attempted_auxiliary_markers_, 1,
+            limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (!valid_identifier(identifier) || !valid_path(canonical_path)) {
+        record_invalid_marker(
+            "old_schema_v8_writers", identifier, "invalid_schema_marker");
+        return;
+    }
+    const auto found = old_schema_v8_writers_.find(std::string(identifier));
+    if (found != old_schema_v8_writers_.end()) {
+        if (found->second != canonical_path)
+            record_invalid_marker(
+                "old_schema_v8_writers", identifier,
+                "conflicting_duplicate_marker");
+        return;
+    }
+    if (!reserve_auxiliary_marker("old_schema_v8_writers"))
+        return;
+    old_schema_v8_writers_.emplace(
+        std::string(identifier), std::string(canonical_path));
 }
 
-void surface_reconciliation_t::mark_legacy_invalid_ast_flow(std::string_view identifier) {
-    legacy_ast_flows_.insert(std::string(identifier));
+void surface_reconciliation_t::mark_legacy_invalid_ast_flow(
+    std::string_view identifier) {
+    if (saturating_add(
+            attempted_auxiliary_markers_, 1,
+            limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (!valid_identifier(identifier)) {
+        record_invalid_marker("legacy_ast_flows", identifier, "invalid_identifier");
+        return;
+    }
+    if (legacy_ast_flows_.find(std::string(identifier)) != legacy_ast_flows_.end())
+        return;
+    if (!reserve_auxiliary_marker("legacy_ast_flows"))
+        return;
+    legacy_ast_flows_.emplace(std::string(identifier));
 }
 
 void surface_reconciliation_t::mark_unsupported_alias(
     std::string_view alias, std::string_view canonical_name) {
-    unsupported_aliases_[std::string(alias)] = std::string(canonical_name);
+    if (saturating_add(
+            attempted_auxiliary_markers_, 1,
+            limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (!valid_identifier(alias) || !valid_identifier(canonical_name)) {
+        record_invalid_marker(
+            "unsupported_aliases", alias, "invalid_alias_marker");
+        return;
+    }
+    if (alias == canonical_name) {
+        record_invalid_marker(
+            "unsupported_aliases", alias, "self_replacement");
+        return;
+    }
+    const auto found = unsupported_aliases_.find(std::string(alias));
+    if (found != unsupported_aliases_.end()) {
+        if (found->second != canonical_name)
+            record_invalid_marker(
+                "unsupported_aliases", alias, "conflicting_duplicate_marker");
+        return;
+    }
+    if (!reserve_auxiliary_marker("unsupported_aliases"))
+        return;
+    unsupported_aliases_.emplace(
+        std::string(alias), std::string(canonical_name));
 }
 
 void surface_reconciliation_t::mark_security_regression(
     std::string_view identifier, std::string_view detail) {
-    security_regressions_[std::string(identifier)] = std::string(detail);
+    if (saturating_add(
+            attempted_auxiliary_markers_, 1,
+            limits_.maximum_metric_value)) {
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (!valid_identifier(identifier) || !valid_text(detail, false)) {
+        record_invalid_marker(
+            "security_regressions", identifier, "invalid_security_marker");
+        return;
+    }
+    const auto found = security_regressions_.find(std::string(identifier));
+    if (found != security_regressions_.end()) {
+        if (found->second != detail)
+            record_invalid_marker(
+                "security_regressions", identifier,
+                "conflicting_duplicate_marker");
+        return;
+    }
+    if (!reserve_auxiliary_marker("security_regressions"))
+        return;
+    security_regressions_.emplace(
+        std::string(identifier), std::string(detail));
+}
+
+void surface_reconciliation_t::append_finding(
+    surface_reconciliation_result_t& result,
+    surface_finding_t finding) const {
+    if (saturating_add(
+            result.findings_produced, 1, limits_.maximum_metric_value)) {
+        result.metrics_saturated = true;
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (result.findings.size() < limits_.maximum_findings) {
+        result.findings.push_back(std::move(finding));
+        return;
+    }
+    result.finding_cap_exceeded = true;
+    if (saturating_add(
+            result.findings_discarded, 1, limits_.maximum_metric_value)) {
+        result.metrics_saturated = true;
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+}
+
+void surface_reconciliation_t::append_input_contract_findings(
+    surface_reconciliation_result_t& result) const {
+    if (!limit_contract_valid_) {
+        append_finding(result, make_finding(
+            surface_error_code_t::invalid_limit_contract,
+            "surface_reconciliation_limits",
+            "one or more caller limits were zero, below the diagnostic retention minimum, cross-inconsistent, or above the enforced maximum",
+            "", surface_entry_kind_t::contract_registration, 1000));
+    }
+    if (baseline_cap_exceeded_) {
+        append_finding(result, make_finding(
+            surface_error_code_t::baseline_entry_cap_exceeded,
+            "baseline_entries",
+            bounded_concat(limits_.maximum_text_bytes, {
+                "baseline entry capacity exceeded; attempted=",
+                std::to_string(attempted_baseline_entries_), ", rejected=",
+                std::to_string(rejected_baseline_entries_)}),
+            "", surface_entry_kind_t::source_file, 900));
+    }
+    if (actual_cap_exceeded_) {
+        append_finding(result, make_finding(
+            surface_error_code_t::actual_entry_cap_exceeded,
+            "actual_entries",
+            bounded_concat(limits_.maximum_text_bytes, {
+                "actual entry capacity exceeded; attempted=",
+                std::to_string(attempted_actual_entries_), ", rejected=",
+                std::to_string(rejected_actual_entries_)}),
+            "", surface_entry_kind_t::source_file, 900));
+    }
+    if (malformed_entries_ != 0) {
+        append_finding(result, make_finding(
+            surface_error_code_t::invalid_surface_entry,
+            first_invalid_entry_identifier_,
+            bounded_concat(limits_.maximum_text_bytes, {
+                first_invalid_entry_is_baseline_ ? "baseline" : "actual",
+                " surface entry rejected; reason=", first_invalid_entry_reason_,
+                ", malformed=", std::to_string(malformed_entries_)}),
+            "", surface_entry_kind_t::source_file, 950));
+    }
+    if (malformed_markers_ != 0) {
+        append_finding(result, make_finding(
+            surface_error_code_t::invalid_surface_marker,
+            first_invalid_marker_identifier_,
+            bounded_concat(limits_.maximum_text_bytes, {
+                "surface marker rejected; collection=",
+                first_invalid_marker_collection_, ", reason=",
+                first_invalid_marker_reason_, ", malformed=",
+                std::to_string(malformed_markers_)}),
+            "", surface_entry_kind_t::contract_registration, 950));
+    }
+    if (auxiliary_cap_exceeded_) {
+        append_finding(result, make_finding(
+            surface_error_code_t::auxiliary_marker_cap_exceeded,
+            first_auxiliary_overflow_collection_,
+            bounded_concat(limits_.maximum_text_bytes, {
+                "shared auxiliary marker capacity exceeded; attempted=",
+                std::to_string(attempted_auxiliary_markers_), ", rejected=",
+                std::to_string(rejected_auxiliary_markers_)}),
+            "", surface_entry_kind_t::contract_registration, 900));
+    }
+}
+
+void surface_reconciliation_t::append_metrics_saturation_finding(
+    surface_reconciliation_result_t& result) const {
+    if (has_finding(result, surface_error_code_t::internal_error, "metrics_saturated"))
+        return;
+    append_finding(result, make_finding(
+        surface_error_code_t::internal_error, "metrics_saturated",
+        bounded_concat(limits_.maximum_text_bytes, {
+            "one or more reconciliation metrics reached the configured ceiling of ",
+            std::to_string(limits_.maximum_metric_value)}),
+        "", surface_entry_kind_t::contract_registration, 1000));
+}
+
+void surface_reconciliation_t::finalize_finding_cap(
+    surface_reconciliation_result_t& result) const {
+    if (!result.finding_cap_exceeded)
+        return;
+    const auto is_metric_marker = [](const surface_finding_t& finding) {
+        return finding.code == surface_error_code_t::internal_error &&
+               finding.identifier == "metrics_saturated";
+    };
+    const auto is_mandatory = [&is_metric_marker](
+        const surface_finding_t& finding) {
+        return finding.code == surface_error_code_t::finding_cap_exceeded ||
+               is_metric_marker(finding);
+    };
+    const auto install = [this, &result, &is_mandatory](
+        surface_finding_t marker) {
+        auto found = std::find_if(
+            result.findings.begin(), result.findings.end(),
+            [&marker](const auto& finding) {
+                return finding.code == marker.code &&
+                       finding.identifier == marker.identifier;
+            });
+        if (found != result.findings.end())
+            return;
+        if (saturating_add(
+                result.findings_produced, 1,
+                limits_.maximum_metric_value)) {
+            result.metrics_saturated = true;
+            metrics_saturated_.store(true, std::memory_order_release);
+        }
+        if (result.findings.size() < limits_.maximum_findings) {
+            result.findings.push_back(std::move(marker));
+            return;
+        }
+        auto replace = std::find_if(
+            result.findings.rbegin(), result.findings.rend(),
+            [&is_mandatory](const auto& finding) {
+                return !is_mandatory(finding);
+            });
+        if (replace == result.findings.rend())
+            return;
+        if (saturating_add(
+                result.findings_discarded, 1,
+                limits_.maximum_metric_value)) {
+            result.metrics_saturated = true;
+            metrics_saturated_.store(true, std::memory_order_release);
+        }
+        *replace = std::move(marker);
+    };
+
+    install(make_finding(
+        surface_error_code_t::finding_cap_exceeded, "surface_findings", "",
+        "", surface_entry_kind_t::contract_registration, 1000));
+    if (result.metrics_saturated ||
+        metrics_saturated_.load(std::memory_order_acquire)) {
+        result.metrics_saturated = true;
+        install(make_finding(
+            surface_error_code_t::internal_error, "metrics_saturated",
+            bounded_concat(limits_.maximum_text_bytes, {
+                "one or more reconciliation metrics reached the configured ceiling of ",
+                std::to_string(limits_.maximum_metric_value)}),
+            "", surface_entry_kind_t::contract_registration, 1000));
+    }
+    auto cap_marker = std::find_if(
+        result.findings.begin(), result.findings.end(), [](const auto& finding) {
+            return finding.code == surface_error_code_t::finding_cap_exceeded;
+        });
+    if (cap_marker == result.findings.end())
+        return;
+    cap_marker->detail = bounded_concat(limits_.maximum_text_bytes, {
+        "finding capacity exceeded; produced=",
+        std::to_string(result.findings_produced), ", retained=",
+        std::to_string(result.findings.size()), ", discarded=",
+        std::to_string(result.findings_discarded)});
+}
+
+surface_reconciliation_t::marker_target_proof_t
+surface_reconciliation_t::validate_marker_targets(
+    surface_reconciliation_result_t& result) const {
+    marker_target_proof_t proof;
+    proof.valid_dead_replacements.reserve(dead_replaced_paths_.size());
+    proof.valid_alias_replacements.reserve(unsupported_aliases_.size());
+    proof.valid_stale_registrations.reserve(stale_registrations_.size());
+
+    const auto index_entries = [](const std::vector<surface_entry_t>& entries) {
+        std::unordered_map<std::string, std::vector<const surface_entry_t*>> index;
+        index.reserve(entries.size());
+        for (const auto& entry : entries)
+            index[entry.identifier].push_back(&entry);
+        return index;
+    };
+    const auto baseline_index = index_entries(baseline_);
+    const auto actual_index = index_entries(actual_);
+    proof.unique_active_actual.reserve(actual_index.size());
+    for (const auto& [identifier, entries] : actual_index) {
+        if (entries.size() != 1 || !entries.front()->is_active)
+            continue;
+        proof.unique_active_actual.emplace(
+            identifier,
+            marker_target_proof_t::source_evidence_t{
+                entries.front()->kind, entries.front()->canonical_path});
+    }
+
+    const auto cyclic_predecessors = [](const auto& markers) {
+        std::unordered_map<std::string, std::uint8_t> state;
+        std::unordered_set<std::string> invalid;
+        state.reserve(markers.size());
+        invalid.reserve(markers.size());
+        for (const auto* root : sorted_map_entries(markers)) {
+            const auto root_state = state.find(root->first);
+            if (root_state != state.end() && root_state->second == 2)
+                continue;
+            std::vector<const std::string*> path;
+            path.reserve(16);
+            std::string current = root->first;
+            bool inherits_cycle = false;
+            for (;;) {
+                const auto edge = markers.find(current);
+                if (edge == markers.end())
+                    break;
+                const auto known = state.find(edge->first);
+                const auto value = known == state.end() ? 0 : known->second;
+                if (value == 0) {
+                    state.emplace(edge->first, 1);
+                    path.push_back(&edge->first);
+                    current = edge->second;
+                    continue;
+                }
+                inherits_cycle =
+                    value == 1 || invalid.find(edge->first) != invalid.end();
+                break;
+            }
+            if (inherits_cycle) {
+                for (const auto* identifier : path)
+                    invalid.insert(*identifier);
+            }
+            for (const auto* identifier : path)
+                state[*identifier] = 2;
+        }
+        return invalid;
+    };
+
+    const auto dead_cycles = cyclic_predecessors(dead_replaced_paths_);
+    const auto alias_cycles = cyclic_predecessors(unsupported_aliases_);
+    const auto reject = [this, &result](
+        std::string_view collection, std::string_view identifier,
+        std::string_view target, std::string_view reason) {
+        const bool rejected_saturated = saturating_add(
+            result.rejected_auxiliary_markers, 1,
+            limits_.maximum_metric_value);
+        const bool malformed_saturated = saturating_add(
+            result.malformed_markers, 1, limits_.maximum_metric_value);
+        if (rejected_saturated || malformed_saturated) {
+            result.metrics_saturated = true;
+            metrics_saturated_.store(true, std::memory_order_release);
+        }
+        const auto detail = target.empty()
+            ? bounded_concat(limits_.maximum_text_bytes, {
+                  "surface marker rejected; collection=", collection,
+                  ", reason=", reason})
+            : bounded_concat(limits_.maximum_text_bytes, {
+                  "replacement marker rejected; collection=", collection,
+                  ", target=", target, ", reason=", reason});
+        append_finding(result, make_finding(
+            surface_error_code_t::invalid_surface_marker, identifier,
+            detail, "", surface_entry_kind_t::contract_registration, 950));
+    };
+
+    const auto validate = [&baseline_index, &actual_index, &reject](
+        const auto& markers, const auto& cycles, std::string_view collection,
+        bool alias, auto& valid) {
+        for (const auto* marker : sorted_map_entries(markers)) {
+            const auto& identifier = marker->first;
+            const auto& target = marker->second;
+            std::string_view reason;
+            if (identifier == target) {
+                reason = "self_replacement";
+            } else if (cycles.find(identifier) != cycles.end()) {
+                reason = "cyclic_replacement_graph";
+            }
+
+            const auto baseline_source = baseline_index.find(identifier);
+            const auto actual_source = actual_index.find(identifier);
+            const auto baseline_source_count =
+                baseline_source == baseline_index.end()
+                    ? 0
+                    : baseline_source->second.size();
+            const auto actual_source_count =
+                actual_source == actual_index.end()
+                    ? 0
+                    : actual_source->second.size();
+            if (reason.empty() && baseline_source_count == 0 &&
+                actual_source_count == 0) {
+                reason = "missing_source_identity";
+            } else if (reason.empty() &&
+                       (baseline_source_count > 1 || actual_source_count > 1)) {
+                reason = "ambiguous_source_identity";
+            }
+
+            surface_entry_kind_t source_kind = surface_entry_kind_t::source_file;
+            const surface_entry_t* source_entry = nullptr;
+            if (reason.empty()) {
+                if (actual_source_count == 1) {
+                    source_entry = actual_source->second.front();
+                    source_kind = source_entry->kind;
+                } else {
+                    source_entry = baseline_source->second.front();
+                    source_kind = baseline_source->second.front()->kind;
+                }
+                if (baseline_source_count == 1 && actual_source_count == 1 &&
+                    baseline_source->second.front()->kind !=
+                        actual_source->second.front()->kind) {
+                    reason = "conflicting_source_kind";
+                } else if (alias &&
+                           source_kind != surface_entry_kind_t::alias_mapping) {
+                    reason = "alias_marker_on_incompatible_source_kind";
+                } else if (!alias &&
+                           source_kind == surface_entry_kind_t::alias_mapping) {
+                    reason = "dead_path_marker_on_alias_source";
+                } else if (source_kind == surface_entry_kind_t::security_guard) {
+                    reason = "security_guard_replacement_forbidden";
+                }
+            }
+
+            const auto target_entries = actual_index.find(target);
+            const auto target_count =
+                target_entries == actual_index.end()
+                    ? 0
+                    : target_entries->second.size();
+            if (reason.empty() && target_count == 0) {
+                reason = "missing_actual_target";
+            } else if (reason.empty() && target_count > 1) {
+                reason = "ambiguous_actual_target";
+            } else if (reason.empty() &&
+                       !target_entries->second.front()->is_active) {
+                reason = "inactive_actual_target";
+            } else if (reason.empty()) {
+                const auto target_kind = target_entries->second.front()->kind;
+                const bool compatible = alias
+                    ? target_kind == surface_entry_kind_t::handler_registration ||
+                          target_kind == surface_entry_kind_t::tool_registration
+                    : target_kind == source_kind;
+                if (!compatible)
+                    reason = "incompatible_actual_target_kind";
+            }
+
+            if (!reason.empty()) {
+                reject(collection, identifier, target, reason);
+                continue;
+            }
+            valid.emplace(
+                identifier,
+                marker_target_proof_t::source_evidence_t{
+                    source_kind, source_entry->canonical_path});
+        }
+    };
+
+    validate(
+        dead_replaced_paths_, dead_cycles, "dead_replaced_paths", false,
+        proof.valid_dead_replacements);
+    validate(
+        unsupported_aliases_, alias_cycles, "unsupported_aliases", true,
+        proof.valid_alias_replacements);
+    for (const auto* identifier : sorted_set_entries(stale_registrations_)) {
+        std::string_view reason;
+        const auto baseline_source = baseline_index.find(*identifier);
+        const auto actual_source = actual_index.find(*identifier);
+        const auto baseline_source_count =
+            baseline_source == baseline_index.end()
+                ? 0
+                : baseline_source->second.size();
+        const auto actual_source_count =
+            actual_source == actual_index.end()
+                ? 0
+                : actual_source->second.size();
+        if (baseline_source_count == 0 && actual_source_count == 0) {
+            reason = "missing_source_identity";
+        } else if (baseline_source_count > 1 || actual_source_count > 1) {
+            reason = "ambiguous_source_identity";
+        }
+        surface_entry_kind_t source_kind = surface_entry_kind_t::source_file;
+        const surface_entry_t* source_entry = nullptr;
+        if (reason.empty()) {
+            if (actual_source_count == 1) {
+                source_entry = actual_source->second.front();
+                source_kind = source_entry->kind;
+            } else {
+                source_entry = baseline_source->second.front();
+                source_kind = baseline_source->second.front()->kind;
+            }
+            if (baseline_source_count == 1 && actual_source_count == 1 &&
+                baseline_source->second.front()->kind !=
+                    actual_source->second.front()->kind) {
+                reason = "conflicting_source_kind";
+            } else if (source_kind == surface_entry_kind_t::security_guard) {
+                reason = "security_guard_stale_forbidden";
+            } else if (source_kind != surface_entry_kind_t::handler_registration &&
+                       source_kind != surface_entry_kind_t::tool_registration) {
+                reason = "stale_marker_on_incompatible_source_kind";
+            }
+        }
+        if (!reason.empty()) {
+            reject("stale_registrations", *identifier, "", reason);
+            continue;
+        }
+        proof.valid_stale_registrations.emplace(
+            *identifier,
+            marker_target_proof_t::source_evidence_t{
+                source_kind, source_entry->canonical_path});
+    }
+    return proof;
+}
+
+void surface_reconciliation_t::check_duplicate_identifiers(
+    surface_reconciliation_result_t& result) const {
+    const auto check = [this, &result](
+        const std::vector<surface_entry_t>& entries, bool baseline) {
+        const auto ordered = sorted_entries(entries);
+        for (std::size_t begin = 0; begin < ordered.size();) {
+            std::size_t end = begin + 1;
+            while (end < ordered.size() &&
+                   ordered[end]->identifier == ordered[begin]->identifier) {
+                ++end;
+            }
+            const auto count = end - begin;
+            if (count > 1) {
+                const bool all_stores = std::all_of(
+                    ordered.begin() + static_cast<std::ptrdiff_t>(begin),
+                    ordered.begin() + static_cast<std::ptrdiff_t>(end),
+                    [](const auto* entry) {
+                        return entry->kind == surface_entry_kind_t::store_definition;
+                    });
+                if (baseline || !all_stores) {
+                    append_finding(result, make_finding(
+                        baseline
+                            ? surface_error_code_t::duplicate_baseline_identifier_detected
+                            : surface_error_code_t::duplicate_actual_identifier_detected,
+                        ordered[begin]->identifier,
+                        bounded_concat(limits_.maximum_text_bytes, {
+                            baseline ? "baseline" : "actual",
+                            " surface contains duplicate identifier entries; count=",
+                            std::to_string(count)}),
+                        ordered[begin]->canonical_path,
+                        ordered[begin]->kind, 650));
+                }
+            }
+            begin = end;
+        }
+    };
+    check(baseline_, true);
+    check(actual_, false);
+}
+
+void surface_reconciliation_t::check_baseline_mismatches(
+    surface_reconciliation_result_t& result,
+    const marker_target_proof_t& target_proof) const {
+    const auto baseline = sorted_entries(baseline_);
+    const auto actual = sorted_entries(actual_);
+    std::size_t baseline_index = 0;
+    std::size_t actual_index = 0;
+    while (baseline_index < baseline.size() && actual_index < actual.size()) {
+        if (baseline[baseline_index]->identifier < actual[actual_index]->identifier) {
+            ++baseline_index;
+            continue;
+        }
+        if (actual[actual_index]->identifier < baseline[baseline_index]->identifier) {
+            ++actual_index;
+            continue;
+        }
+        const auto identifier = baseline[baseline_index]->identifier;
+        auto baseline_end = baseline_index + 1;
+        while (baseline_end < baseline.size() &&
+               baseline[baseline_end]->identifier == identifier) {
+            ++baseline_end;
+        }
+        auto actual_end = actual_index + 1;
+        while (actual_end < actual.size() &&
+               actual[actual_end]->identifier == identifier) {
+            ++actual_end;
+        }
+        if (baseline_end - baseline_index == 1 &&
+            actual_end - actual_index == 1) {
+            const auto& expected = *baseline[baseline_index];
+            const auto& observed = *actual[actual_index];
+            const bool canonical_path_changed =
+                expected.canonical_path != observed.canonical_path;
+            const bool kind_changed = expected.kind != observed.kind;
+            const bool active_changed = expected.is_active != observed.is_active;
+            const bool replaced_changed = expected.is_replaced != observed.is_replaced;
+            const bool replacement_changed = expected.replaced_by != observed.replaced_by;
+            const bool schema_changed = expected.schema_version != observed.schema_version;
+            const bool security_note_changed =
+                expected.security_note != observed.security_note;
+            if (canonical_path_changed || kind_changed || active_changed ||
+                replaced_changed || replacement_changed || schema_changed ||
+                security_note_changed) {
+                const auto dead = dead_replaced_paths_.find(identifier);
+                const bool explained_replacement =
+                    dead != dead_replaced_paths_.end() && expected.is_active &&
+                    target_proof.valid_dead_replacements.find(identifier) !=
+                        target_proof.valid_dead_replacements.end() &&
+                    !expected.is_replaced && !observed.is_active &&
+                    observed.is_replaced && observed.replaced_by == dead->second &&
+                    expected.kind == observed.kind &&
+                    expected.canonical_path == observed.canonical_path &&
+                    expected.schema_version == observed.schema_version &&
+                    expected.security_note == observed.security_note;
+                const bool registration_kind =
+                    expected.kind == surface_entry_kind_t::handler_registration ||
+                    expected.kind == surface_entry_kind_t::tool_registration;
+                const bool explained_stale_registration =
+                    target_proof.valid_stale_registrations.find(identifier) !=
+                        target_proof.valid_stale_registrations.end() &&
+                    registration_kind && expected.kind == observed.kind &&
+                    expected.is_active && !observed.is_active &&
+                    expected.is_replaced == observed.is_replaced &&
+                    expected.replaced_by == observed.replaced_by &&
+                    expected.canonical_path == observed.canonical_path &&
+                    expected.schema_version == observed.schema_version &&
+                    expected.security_note == observed.security_note;
+                const auto alias = unsupported_aliases_.find(identifier);
+                const bool explained_alias_retirement =
+                    alias != unsupported_aliases_.end() &&
+                    target_proof.valid_alias_replacements.find(identifier) !=
+                        target_proof.valid_alias_replacements.end() &&
+                    expected.kind == surface_entry_kind_t::alias_mapping &&
+                    observed.kind == surface_entry_kind_t::alias_mapping &&
+                    expected.is_active && !expected.is_replaced &&
+                    !observed.is_active && observed.is_replaced &&
+                    observed.replaced_by == alias->second &&
+                    expected.canonical_path == observed.canonical_path &&
+                    expected.schema_version == observed.schema_version &&
+                    expected.security_note == observed.security_note;
+                const auto schema = old_schema_v8_writers_.find(identifier);
+                const bool explained_schema_migration =
+                    schema != old_schema_v8_writers_.end() &&
+                    expected.kind == surface_entry_kind_t::schema_writer &&
+                    observed.kind == surface_entry_kind_t::schema_writer &&
+                    expected.schema_version == "v8" &&
+                    observed.schema_version == "v9" &&
+                    schema->second == expected.canonical_path &&
+                    expected.canonical_path == observed.canonical_path &&
+                    expected.is_active && observed.is_active &&
+                    expected.is_replaced == observed.is_replaced &&
+                    expected.replaced_by == observed.replaced_by &&
+                    expected.security_note == observed.security_note;
+                const bool security_relevant =
+                    expected.kind == surface_entry_kind_t::security_guard ||
+                    observed.kind == surface_entry_kind_t::security_guard ||
+                    security_note_changed;
+                if (!security_relevant &&
+                    (explained_replacement || explained_stale_registration ||
+                     explained_alias_retirement || explained_schema_migration)) {
+                    baseline_index = baseline_end;
+                    actual_index = actual_end;
+                    continue;
+                }
+                std::string changed_fields;
+                const auto add_field = [this, &changed_fields](std::string_view field) {
+                    if (!changed_fields.empty())
+                        append_bounded(changed_fields, ",", limits_.maximum_text_bytes);
+                    append_bounded(changed_fields, field, limits_.maximum_text_bytes);
+                };
+                if (kind_changed)
+                    add_field("kind");
+                if (canonical_path_changed)
+                    add_field("canonical_path");
+                if (active_changed)
+                    add_field("is_active");
+                if (replaced_changed)
+                    add_field("is_replaced");
+                if (replacement_changed)
+                    add_field("replaced_by");
+                if (schema_changed)
+                    add_field("schema_version");
+                if (security_note_changed)
+                    add_field("security_note");
+                append_finding(result, make_finding(
+                    security_relevant
+                        ? surface_error_code_t::security_regression_detected
+                        : surface_error_code_t::baseline_mismatch,
+                    identifier,
+                    bounded_concat(limits_.maximum_text_bytes, {
+                        security_relevant
+                            ? "security-relevant baseline drift in fields: "
+                            : "baseline and actual surface differ in fields: ",
+                        changed_fields}),
+                    expected.canonical_path,
+                    security_relevant
+                        ? surface_entry_kind_t::security_guard
+                        : expected.kind,
+                    security_relevant ? 950 : 750));
+            }
+        }
+        baseline_index = baseline_end;
+        actual_index = actual_end;
+    }
 }
 
 void surface_reconciliation_t::check_dead_replaced_paths(
-    surface_reconciliation_result_t& result) const {
-    for (const auto& [identifier, replaced_by] : dead_replaced_paths_) {
-        bool found_in_actual = false;
-        for (const auto& entry : actual_) {
-            if (entry.identifier == identifier && entry.is_active) {
-                found_in_actual = true;
-                break;
-            }
+    surface_reconciliation_result_t& result,
+    const marker_target_proof_t& target_proof) const {
+    std::unordered_set<std::string> active_ids;
+    active_ids.reserve(actual_.size());
+    for (const auto& entry : actual_) {
+        if (entry.is_active)
+            active_ids.insert(entry.identifier);
+    }
+    for (const auto* marker : sorted_map_entries(dead_replaced_paths_)) {
+        const auto evidence =
+            target_proof.valid_dead_replacements.find(marker->first);
+        if (evidence == target_proof.valid_dead_replacements.end()) {
+            continue;
         }
-        if (found_in_actual) {
-            result.findings.push_back(make_finding(
-                surface_error_code_t::dead_replaced_path_detected,
-                identifier,
-                "path marked as replaced by " + replaced_by + " but still active in actual surface",
-                "",
-                surface_entry_kind_t::source_file,
-                500));
-        }
+        if (active_ids.find(marker->first) == active_ids.end())
+            continue;
+        append_finding(result, make_finding(
+            surface_error_code_t::dead_replaced_path_detected,
+            marker->first,
+            bounded_concat(limits_.maximum_text_bytes, {
+                "path marked as replaced by ", marker->second,
+                " but still active in actual surface"}),
+            evidence->second.canonical_path, evidence->second.kind, 500));
     }
 }
 
 void surface_reconciliation_t::check_duplicate_stores(
     surface_reconciliation_result_t& result) const {
-    std::unordered_map<std::string, std::vector<std::string>> store_paths;
-    for (const auto& entry : actual_) {
-        if (entry.kind == surface_entry_kind_t::store_definition) {
-            store_paths[entry.identifier].push_back(entry.canonical_path);
+    const auto actual = sorted_entries(actual_);
+    std::unordered_set<std::string> duplicate_actual_ids;
+    for (std::size_t begin = 0; begin < actual.size();) {
+        std::size_t end = begin + 1;
+        while (end < actual.size() &&
+               actual[end]->identifier == actual[begin]->identifier) {
+            ++end;
         }
-    }
-    for (const auto& [identifier, paths] : store_paths) {
-        if (paths.size() > 1) {
-            std::string detail = "store '" + identifier + "' defined in multiple paths: ";
-            for (std::size_t i = 0; i < paths.size(); ++i) {
-                if (i > 0) detail += ", ";
-                detail += paths[i];
+        if (end - begin > 1) {
+            duplicate_actual_ids.insert(actual[begin]->identifier);
+            const bool all_stores = std::all_of(
+                actual.begin() + static_cast<std::ptrdiff_t>(begin),
+                actual.begin() + static_cast<std::ptrdiff_t>(end),
+                [](const auto* entry) {
+                    return entry->kind == surface_entry_kind_t::store_definition;
+                });
+            if (all_stores) {
+                std::string detail = "store defined in multiple paths: ";
+                for (auto index = begin; index < end; ++index) {
+                    if (index != begin)
+                        append_bounded(detail, ", ", limits_.maximum_text_bytes);
+                    append_bounded(
+                        detail, actual[index]->canonical_path,
+                        limits_.maximum_text_bytes);
+                }
+                append_finding(result, make_finding(
+                    surface_error_code_t::duplicate_store_detected,
+                    actual[begin]->identifier, std::move(detail),
+                    actual[begin]->canonical_path,
+                    surface_entry_kind_t::store_definition, 600));
             }
-            result.findings.push_back(make_finding(
-                surface_error_code_t::duplicate_store_detected,
-                identifier,
-                std::move(detail),
-                paths.front(),
-                surface_entry_kind_t::store_definition,
-                600));
         }
+        begin = end;
     }
-    for (const auto& [identifier, other_path] : duplicate_stores_) {
-        result.findings.push_back(make_finding(
+    for (const auto* marker : sorted_map_entries(duplicate_stores_)) {
+        if (duplicate_actual_ids.find(marker->first) != duplicate_actual_ids.end())
+            continue;
+        append_finding(result, make_finding(
             surface_error_code_t::duplicate_store_detected,
-            identifier,
-            "duplicate store also at " + other_path,
-            other_path,
-            surface_entry_kind_t::store_definition,
-            550));
+            marker->first,
+            bounded_concat(limits_.maximum_text_bytes, {
+                "duplicate store also at ", marker->second}),
+            marker->second, surface_entry_kind_t::store_definition, 550));
     }
 }
 
 void surface_reconciliation_t::check_stale_registrations(
-    surface_reconciliation_result_t& result) const {
-    for (const auto& identifier : stale_registrations_) {
-        bool found_in_actual = false;
-        for (const auto& entry : actual_) {
-            if (entry.identifier == identifier && entry.is_active) {
-                found_in_actual = true;
-                break;
-            }
-        }
-        if (found_in_actual) {
-            result.findings.push_back(make_finding(
-                surface_error_code_t::stale_registration_detected,
-                identifier,
-                "registration is stale but still active in actual surface",
-                "",
-                surface_entry_kind_t::handler_registration,
-                400));
-        }
-    }
-
+    surface_reconciliation_result_t& result,
+    const marker_target_proof_t& target_proof) const {
+    std::unordered_set<std::string> active_ids;
     std::unordered_set<std::string> actual_ids;
+    active_ids.reserve(actual_.size());
+    actual_ids.reserve(actual_.size());
     for (const auto& entry : actual_) {
-        if (entry.kind == surface_entry_kind_t::handler_registration ||
-            entry.kind == surface_entry_kind_t::tool_registration) {
-            actual_ids.insert(entry.identifier);
-        }
+        actual_ids.insert(entry.identifier);
+        if (entry.is_active)
+            active_ids.insert(entry.identifier);
     }
-    for (const auto& entry : baseline_) {
-        if ((entry.kind == surface_entry_kind_t::handler_registration ||
-             entry.kind == surface_entry_kind_t::tool_registration) &&
-            entry.is_active) {
-            if (actual_ids.find(entry.identifier) == actual_ids.end()) {
-                result.findings.push_back(make_finding(
-                    surface_error_code_t::stale_registration_detected,
-                    entry.identifier,
-                    "baseline registration not found in actual surface",
-                    entry.canonical_path,
-                    entry.kind,
-                    350));
-            }
+    for (const auto* identifier : sorted_set_entries(stale_registrations_)) {
+        const auto evidence =
+            target_proof.valid_stale_registrations.find(*identifier);
+        if (evidence == target_proof.valid_stale_registrations.end()) {
+            continue;
         }
+        if (active_ids.find(*identifier) == active_ids.end())
+            continue;
+        append_finding(result, make_finding(
+            surface_error_code_t::stale_registration_detected,
+            *identifier,
+            "registration is stale but still active in actual surface",
+            evidence->second.canonical_path, evidence->second.kind, 400));
+    }
+    const auto baseline = sorted_entries(baseline_);
+    for (std::size_t begin = 0; begin < baseline.size();) {
+        std::size_t end = begin + 1;
+        while (end < baseline.size() &&
+               baseline[end]->identifier == baseline[begin]->identifier) {
+            ++end;
+        }
+        const auto& entry = *baseline[begin];
+        const bool registration =
+            entry.kind == surface_entry_kind_t::handler_registration ||
+            entry.kind == surface_entry_kind_t::tool_registration;
+        if (end - begin == 1 && registration && entry.is_active &&
+            actual_ids.find(entry.identifier) == actual_ids.end() &&
+            target_proof.valid_stale_registrations.find(entry.identifier) ==
+                target_proof.valid_stale_registrations.end()) {
+            append_finding(result, make_finding(
+                surface_error_code_t::stale_registration_detected,
+                entry.identifier,
+                "baseline registration not found in actual surface",
+                entry.canonical_path, entry.kind, 350));
+        }
+        begin = end;
     }
 }
 
 void surface_reconciliation_t::check_old_schema_v8_writers(
     surface_reconciliation_result_t& result) const {
-    for (const auto& entry : actual_) {
-        if (entry.kind == surface_entry_kind_t::schema_writer &&
-            entry.schema_version == "v8" && entry.is_active) {
-            result.findings.push_back(make_finding(
-                surface_error_code_t::old_schema_v8_writer_detected,
-                entry.identifier,
-                "active schema writer using deprecated v8 schema; must migrate to v9",
-                entry.canonical_path,
-                surface_entry_kind_t::schema_writer,
-                700));
+    const auto actual = sorted_entries(actual_);
+    std::unordered_set<std::string> emitted;
+    for (const auto* entry : actual) {
+        if (entry->kind != surface_entry_kind_t::schema_writer ||
+            entry->schema_version != "v8" || !entry->is_active ||
+            !emitted.insert(entry->identifier).second) {
+            continue;
         }
-    }
-    for (const auto& [identifier, canonical_path] : old_schema_v8_writers_) {
-        result.findings.push_back(make_finding(
+        append_finding(result, make_finding(
             surface_error_code_t::old_schema_v8_writer_detected,
-            identifier,
-            "schema v8 writer detected at " + canonical_path,
-            canonical_path,
-            surface_entry_kind_t::schema_writer,
-            700));
+            entry->identifier,
+            "active schema writer uses deprecated v8 schema; migration to v9 is required",
+            entry->canonical_path, surface_entry_kind_t::schema_writer, 700));
     }
 }
 
 void surface_reconciliation_t::check_legacy_invalid_ast_flows(
-    surface_reconciliation_result_t& result) const {
-    for (const auto& identifier : legacy_ast_flows_) {
-        bool found_in_actual = false;
-        for (const auto& entry : actual_) {
-            if (entry.identifier == identifier && entry.is_active &&
-                entry.kind == surface_entry_kind_t::ast_path) {
-                found_in_actual = true;
-                break;
-            }
+    surface_reconciliation_result_t& result,
+    const marker_target_proof_t& target_proof) const {
+    for (const auto* identifier : sorted_set_entries(legacy_ast_flows_)) {
+        const auto entry = target_proof.unique_active_actual.find(*identifier);
+        if (entry == target_proof.unique_active_actual.end() ||
+            entry->second.kind != surface_entry_kind_t::ast_path) {
+            continue;
         }
-        if (found_in_actual) {
-            result.findings.push_back(make_finding(
-                surface_error_code_t::legacy_invalid_ast_flow_detected,
-                identifier,
-                "legacy invalid AST flow is still active in actual surface",
-                "",
-                surface_entry_kind_t::ast_path,
-                650));
-        }
+        append_finding(result, make_finding(
+            surface_error_code_t::legacy_invalid_ast_flow_detected,
+            *identifier,
+            "legacy invalid AST flow is still active in actual surface",
+            entry->second.canonical_path, entry->second.kind, 650));
     }
 }
 
 void surface_reconciliation_t::check_unsupported_aliases(
-    surface_reconciliation_result_t& result) const {
-    for (const auto& [alias, canonical_name] : unsupported_aliases_) {
-        bool alias_active = false;
-        for (const auto& entry : actual_) {
-            if (entry.identifier == alias && entry.is_active &&
-                entry.kind == surface_entry_kind_t::alias_mapping) {
-                alias_active = true;
-                break;
-            }
+    surface_reconciliation_result_t& result,
+    const marker_target_proof_t& target_proof) const {
+    for (const auto* marker : sorted_map_entries(unsupported_aliases_)) {
+        const auto entry = target_proof.unique_active_actual.find(marker->first);
+        if (entry == target_proof.unique_active_actual.end() ||
+            entry->second.kind != surface_entry_kind_t::alias_mapping) {
+            continue;
         }
-        if (alias_active) {
-            result.findings.push_back(make_finding(
-                surface_error_code_t::unsupported_alias_detected,
-                alias,
-                "unsupported alias still active; canonical name is " + canonical_name,
-                "",
-                surface_entry_kind_t::alias_mapping,
-                300));
-        }
+        append_finding(result, make_finding(
+            surface_error_code_t::unsupported_alias_detected,
+            marker->first,
+            bounded_concat(limits_.maximum_text_bytes, {
+                "unsupported alias remains active; canonical name is ",
+                marker->second}),
+            entry->second.canonical_path, entry->second.kind, 300));
     }
 }
 
 void surface_reconciliation_t::check_security_regressions(
     surface_reconciliation_result_t& result) const {
-    for (const auto& entry : actual_) {
-        if (entry.kind == surface_entry_kind_t::security_guard && !entry.is_active) {
-            result.findings.push_back(make_finding(
-                surface_error_code_t::security_regression_detected,
-                entry.identifier,
-                "security guard is inactive in actual surface: " + entry.security_note,
-                entry.canonical_path,
-                surface_entry_kind_t::security_guard,
-                900));
-        }
+    std::unordered_set<std::string> emitted;
+    for (const auto& finding : result.findings) {
+        if (finding.code == surface_error_code_t::security_regression_detected)
+            emitted.insert(finding.identifier);
     }
-    for (const auto& [identifier, detail] : security_regressions_) {
-        result.findings.push_back(make_finding(
+    const auto actual = sorted_entries(actual_);
+    for (const auto* entry : actual) {
+        if (entry->kind != surface_entry_kind_t::security_guard || entry->is_active ||
+            !emitted.insert(entry->identifier).second) {
+            continue;
+        }
+        append_finding(result, make_finding(
             surface_error_code_t::security_regression_detected,
-            identifier,
-            "security regression: " + detail,
-            "",
-            surface_entry_kind_t::security_guard,
-            900));
+            entry->identifier,
+            bounded_concat(limits_.maximum_text_bytes, {
+                "security guard is inactive in actual surface: ",
+                entry->security_note}),
+            entry->canonical_path, surface_entry_kind_t::security_guard, 900));
     }
-
-    for (const auto& entry : baseline_) {
-        if (entry.kind == surface_entry_kind_t::security_guard && entry.is_active) {
-            bool found_in_actual = false;
-            for (const auto& actual_entry : actual_) {
-                if (actual_entry.identifier == entry.identifier &&
-                    actual_entry.kind == surface_entry_kind_t::security_guard &&
-                    actual_entry.is_active) {
-                    found_in_actual = true;
-                    break;
-                }
-            }
-            if (!found_in_actual) {
-                result.findings.push_back(make_finding(
-                    surface_error_code_t::security_regression_detected,
-                    entry.identifier,
-                    "baseline security guard missing from actual surface",
-                    entry.canonical_path,
-                    surface_entry_kind_t::security_guard,
-                    950));
-            }
+    for (const auto* marker : sorted_map_entries(security_regressions_)) {
+        if (!emitted.insert(marker->first).second) {
+            continue;
         }
+        append_finding(result, make_finding(
+            surface_error_code_t::security_regression_detected,
+            marker->first,
+            bounded_concat(limits_.maximum_text_bytes, {
+                "security regression: ", marker->second}),
+            "", surface_entry_kind_t::security_guard, 900));
+    }
+    const auto baseline = sorted_entries(baseline_);
+    std::unordered_set<std::string> active_actual_guards;
+    for (const auto& entry : actual_) {
+        if (entry.kind == surface_entry_kind_t::security_guard && entry.is_active)
+            active_actual_guards.insert(entry.identifier);
+    }
+    for (const auto* entry : baseline) {
+        if (entry->kind != surface_entry_kind_t::security_guard || !entry->is_active ||
+            active_actual_guards.find(entry->identifier) != active_actual_guards.end() ||
+            !emitted.insert(entry->identifier).second) {
+            continue;
+        }
+        append_finding(result, make_finding(
+            surface_error_code_t::security_regression_detected,
+            entry->identifier,
+            "baseline security guard is missing or inactive in actual surface",
+            entry->canonical_path, surface_entry_kind_t::security_guard, 950));
     }
 }
 
 void surface_reconciliation_t::check_unexplained_removals(
-    surface_reconciliation_result_t& result) const {
-
-    std::unordered_set<std::string> dead_replaced_ids;
-    for (const auto& [id, _] : dead_replaced_paths_) {
-        dead_replaced_ids.insert(id);
-    }
-    std::unordered_set<std::string> stale_ids;
-    for (const auto& id : stale_registrations_) {
-        stale_ids.insert(id);
-    }
-
+    surface_reconciliation_result_t& result,
+    const marker_target_proof_t& target_proof) const {
     std::unordered_set<std::string> actual_ids;
-    for (const auto& entry : actual_) {
+    actual_ids.reserve(actual_.size());
+    for (const auto& entry : actual_)
         actual_ids.insert(entry.identifier);
-    }
-
-    std::uint64_t removals = 0;
-    for (const auto& entry : baseline_) {
-        if (!entry.is_active)
-            continue;
-
-        if (actual_ids.find(entry.identifier) == actual_ids.end()) {
-            bool explained = dead_replaced_ids.count(entry.identifier) > 0 ||
-                             stale_ids.count(entry.identifier) > 0;
+    const auto baseline = sorted_entries(baseline_);
+    for (std::size_t begin = 0; begin < baseline.size();) {
+        std::size_t end = begin + 1;
+        while (end < baseline.size() &&
+               baseline[end]->identifier == baseline[begin]->identifier) {
+            ++end;
+        }
+        const auto& entry = *baseline[begin];
+        if (end - begin == 1 && entry.is_active &&
+            entry.kind != surface_entry_kind_t::security_guard &&
+            actual_ids.find(entry.identifier) == actual_ids.end()) {
+            const bool explained =
+                target_proof.valid_dead_replacements.find(entry.identifier) !=
+                    target_proof.valid_dead_replacements.end() ||
+                target_proof.valid_stale_registrations.find(entry.identifier) !=
+                    target_proof.valid_stale_registrations.end() ||
+                target_proof.valid_alias_replacements.find(entry.identifier) !=
+                    target_proof.valid_alias_replacements.end();
             if (!explained) {
-                ++removals;
-                result.findings.push_back(make_finding(
+                if (saturating_add(
+                        result.unexplained_removals, 1,
+                        limits_.maximum_metric_value)) {
+                    result.metrics_saturated = true;
+                    metrics_saturated_.store(true, std::memory_order_release);
+                }
+                append_finding(result, make_finding(
                     surface_error_code_t::unexplained_removal_detected,
                     entry.identifier,
-                    "baseline entry absent from actual surface with no explanation",
-                    entry.canonical_path,
-                    entry.kind,
-                    800));
+                    "baseline entry is absent from actual surface with no explicit explanation",
+                    entry.canonical_path, entry.kind, 800));
             }
         }
+        begin = end;
     }
-
-    result.unexplained_removals = removals;
 }
 
 surface_reconciliation_result_t surface_reconciliation_t::reconcile() const {
     surface_reconciliation_result_t result;
-    result.baseline_entry_count = static_cast<std::uint64_t>(baseline_.size());
-    result.actual_entry_count = static_cast<std::uint64_t>(actual_.size());
-    result.total_entries_checked = result.baseline_entry_count + result.actual_entry_count;
-
-    check_dead_replaced_paths(result);
-    check_duplicate_stores(result);
-    check_stale_registrations(result);
-    check_old_schema_v8_writers(result);
-    check_legacy_invalid_ast_flows(result);
-    check_unsupported_aliases(result);
-    check_security_regressions(result);
-    check_unexplained_removals(result);
-
-    if (result.findings.size() > limits_.maximum_findings) {
-        result.findings.resize(limits_.maximum_findings);
+    const auto capture_size_metric = [this, &result](std::size_t value) {
+        const auto converted = static_cast<std::uint64_t>(value);
+        if (converted < limits_.maximum_metric_value)
+            return converted;
+        result.metrics_saturated = true;
+        metrics_saturated_.store(true, std::memory_order_release);
+        return limits_.maximum_metric_value;
+    };
+    result.baseline_entry_count = capture_size_metric(baseline_.size());
+    result.actual_entry_count = capture_size_metric(actual_.size());
+    result.attempted_baseline_entries = attempted_baseline_entries_;
+    result.attempted_actual_entries = attempted_actual_entries_;
+    result.rejected_baseline_entries = rejected_baseline_entries_;
+    result.rejected_actual_entries = rejected_actual_entries_;
+    result.attempted_auxiliary_markers = attempted_auxiliary_markers_;
+    result.rejected_auxiliary_markers = rejected_auxiliary_markers_;
+    result.malformed_entries = malformed_entries_;
+    result.malformed_markers = malformed_markers_;
+    result.limits_invalid = !limit_contract_valid_;
+    result.baseline_cap_exceeded = baseline_cap_exceeded_;
+    result.actual_cap_exceeded = actual_cap_exceeded_;
+    result.auxiliary_cap_exceeded = auxiliary_cap_exceeded_;
+    result.metrics_saturated =
+        result.metrics_saturated ||
+        metrics_saturated_.load(std::memory_order_acquire);
+    result.total_entries_checked = result.attempted_baseline_entries;
+    if (saturating_add(
+            result.total_entries_checked, result.attempted_actual_entries,
+            limits_.maximum_metric_value)) {
+        result.metrics_saturated = true;
+        metrics_saturated_.store(true, std::memory_order_release);
     }
 
-    result.clean = result.findings.empty() && result.unexplained_removals == 0;
+    append_input_contract_findings(result);
+    const auto marker_target_proof = validate_marker_targets(result);
+    check_duplicate_identifiers(result);
+    check_baseline_mismatches(result, marker_target_proof);
+    check_dead_replaced_paths(result, marker_target_proof);
+    check_duplicate_stores(result);
+    check_stale_registrations(result, marker_target_proof);
+    check_old_schema_v8_writers(result);
+    check_legacy_invalid_ast_flows(result, marker_target_proof);
+    check_unsupported_aliases(result, marker_target_proof);
+    check_security_regressions(result);
+    check_unexplained_removals(result, marker_target_proof);
 
-    reconciliations_.fetch_add(1, std::memory_order_acq_rel);
-    total_findings_.fetch_add(result.findings.size(), std::memory_order_acq_rel);
+    if (saturating_atomic_add(
+            reconciliations_, 1, limits_.maximum_metric_value)) {
+        result.metrics_saturated = true;
+        metrics_saturated_.store(true, std::memory_order_release);
+    }
+    if (result.metrics_saturated ||
+        metrics_saturated_.load(std::memory_order_acquire)) {
+        result.metrics_saturated = true;
+        append_metrics_saturation_finding(result);
+    }
+    finalize_finding_cap(result);
 
+    const auto counted_findings = result.findings.size();
+    if (saturating_atomic_add(
+            total_findings_, static_cast<std::uint64_t>(counted_findings),
+            limits_.maximum_metric_value)) {
+        result.metrics_saturated = true;
+        metrics_saturated_.store(true, std::memory_order_release);
+        append_metrics_saturation_finding(result);
+        finalize_finding_cap(result);
+        if (result.findings.size() > counted_findings) {
+            saturating_atomic_add(
+                total_findings_, static_cast<std::uint64_t>(
+                    result.findings.size() - counted_findings),
+                limits_.maximum_metric_value);
+        }
+    }
+
+    result.metrics_saturated =
+        result.metrics_saturated ||
+        metrics_saturated_.load(std::memory_order_acquire);
+    result.clean = result.findings.empty() && result.unexplained_removals == 0 &&
+                   !result.limits_invalid && !result.baseline_cap_exceeded &&
+                   !result.actual_cap_exceeded && !result.auxiliary_cap_exceeded &&
+                   !result.finding_cap_exceeded && result.malformed_entries == 0 &&
+                   result.malformed_markers == 0 && !result.metrics_saturated;
+    std::sort(result.findings.begin(), result.findings.end(), [](const auto& left,
+                                                                 const auto& right) {
+        return std::tie(
+                   left.code, left.identifier, left.canonical_path, left.detail,
+                   left.kind, left.severity) <
+               std::tie(
+                   right.code, right.identifier, right.canonical_path, right.detail,
+                   right.kind, right.severity);
+    });
     return result;
 }
 

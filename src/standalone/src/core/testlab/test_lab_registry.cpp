@@ -1,6 +1,7 @@
 #include "test_lab.hpp"
 
 #include <mutex>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -34,7 +35,15 @@ namespace test_lab {
 			return false;
 		}
 		std::lock_guard<std::mutex> lk(registry_mutex());
+		for (const auto& existing : registry_storage()) {
+			if (std::strcmp(existing.category, f.category) == 0 &&
+				std::strcmp(existing.name, f.name) == 0) {
+				last_error_storage() = "register_feature: duplicate category/name";
+				return false;
+			}
+		}
 		registry_storage().push_back(f);
+		last_error_storage().clear();
 		return true;
 	}
 

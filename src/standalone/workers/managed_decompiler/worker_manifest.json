@@ -1,0 +1,51 @@
+{
+  "schema": "aida.c03.managed-worker-manifest-source",
+  "schema_version": 3,
+  "artifact": {
+    "format": "aida.native-worker-manifest",
+    "magic": "NWMF",
+    "byte_order": "little-endian",
+    "schema_version": 3,
+    "relative_path": "deps/AiDA_ManagedDecompilerWorker.manifest.bin",
+    "digest_relative_path": "deps/AiDA_ManagedDecompilerWorker.manifest.sha256",
+    "digest_format": "lowercase-hex-newline"
+  },
+  "worker": {
+    "relative_path": "deps/AiDA_ManagedDecompilerWorker.exe",
+    "provider": {
+      "id": 2,
+      "name": "ICSharpCode.Decompiler",
+      "version": "10.1.0.8386",
+      "binary_relative_path": "deps/ICSharpCode.Decompiler.dll",
+      "binary_sha256": "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345",
+      "worker_build_id": "aida-managed-decompiler-worker-v3",
+      "worker_build_hash_material": "aida-managed-decompiler-worker-build-v3|snapshot-bound-contract=4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6|tfm=net10.0|runtime=Microsoft.NETCore.App/10.0.9"
+    },
+    "protocol": {
+      "version": 3,
+      "hash_material": "aida.isolated-decompiler.worker.frame.v3|bootstrap.v1|hmac-sha256|strict-sequence|readonly-provider-input|attested-provider-artifacts|bounded-native-printc-evidence|control-frame-8m|result-frame-80m|provider-artifacts-48m|printc-8m",
+      "contract_hash_material": "aida.c03.managed-cli.contract.v3|readonly-inherited-mapping.v1|source-kind|logical-identity|module-sha256|module-size|entity|generation|type-revision|profile|runtime-manifest|provider|cache|request-binding|exact-response"
+    },
+    "capabilities": ["decompile"],
+    "startup_arguments": [],
+    "runtime": {
+      "target_framework": "net10.0",
+      "framework": "Microsoft.NETCore.App",
+      "framework_version": "10.0.9",
+      "runtime_identifier": "win-x64",
+      "manifest_relative_path": "deps/AiDA_ManagedRuntime.manifest.json",
+      "manifest_digest_relative_path": "deps/AiDA_ManagedRuntime.manifest.sha256",
+      "dotnet_root_relative_path": "deps/dotnet",
+      "machine_runtime_fallback": false
+    }
+  },
+  "materialization": {
+    "worker_binary_hash": "",
+    "provider_binary_hash": "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345",
+    "runtime_manifest_hash": "",
+    "manifest_digest": "",
+    "input_lock": "deny-write-and-delete-while-hashing",
+    "atomic_write": true,
+    "verify_after_write": true
+  }
+}

@@ -1,4 +1,5 @@
 #include "jvm_ssa_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/providers/jvm_ssa.hpp"
 
@@ -21,6 +22,7 @@ using jvm_ssa::deserialize_jvm_ssa_result;
 
 void require(bool condition, const std::string& message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -1180,6 +1182,7 @@ int main()
         std::cout << "jvm_ssa_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         std::cerr << exception.what() << '\n';
         return 1;
     }

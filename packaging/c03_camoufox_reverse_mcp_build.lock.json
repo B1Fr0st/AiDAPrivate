@@ -1,0 +1,51 @@
+{
+  "schema": "aida.c03.camoufox-reverse-mcp-offline-build-lock",
+  "schema_version": 2,
+  "network_fetch_forbidden": true,
+  "environment_root": ".deps/.camoufox-reverse-mcp-build-venv",
+  "interpreter": {
+    "relative_path": ".deps/.camoufox-reverse-mcp-build-venv/Scripts/python.exe",
+    "version": "3.12.10",
+    "size_bytes": 274424,
+    "sha256": "0b471133e110cfb53a061cad528ce8e517d7b9ac41a0a396c39ad795a487fc14"
+  },
+  "freezer": {
+    "backend": "pyinstaller",
+    "version": "6.21.0",
+    "metadata_relative_path": ".deps/.camoufox-reverse-mcp-build-venv/Lib/site-packages/pyinstaller-6.21.0.dist-info/METADATA",
+    "metadata_sha256": "5acfe668c0d37ca97f3234f3f025ed24962f662221fec20d20c9166d154548e2",
+    "record_relative_path": ".deps/.camoufox-reverse-mcp-build-venv/Lib/site-packages/pyinstaller-6.21.0.dist-info/RECORD",
+    "record_sha256": "493774422dc9e8c5e19eaba3c4b839555a4a31a87ce8eceeef27e5294a5e582d",
+    "license_relative_path": ".deps/.camoufox-reverse-mcp-build-venv/Lib/site-packages/pyinstaller-6.21.0.dist-info/licenses/COPYING.txt",
+    "license_sha256": "dcf75fdb959db1e3b41c0f8505069d2ece781b5ec6b3d0a4d30975cfc6580245"
+  },
+  "source": {
+    "root_relative_path": "camoufox-reverse-mcp",
+    "project_relative_path": "camoufox-reverse-mcp/pyproject.toml",
+    "project_sha256": "aa1eab416c99bb3c51e833372d0638540ecbac0ba1712172da8db81b81a86deb",
+    "package_marker_relative_path": "camoufox-reverse-mcp/src/camoufox_reverse_mcp/__init__.py",
+    "package_marker_sha256": "889d74efc4561f1c8d7b0eb5ee47e37f14a7461971d41bb06f51f2d9e3f73384",
+    "environment_binding_relative_path": ".deps/.camoufox-reverse-mcp-build-venv/Lib/site-packages/_editable_impl_camoufox_reverse_mcp.pth",
+    "environment_binding_sha256": "2f33942582b73427151513bffcb1feacf92065e2dee8ff119ddc1d390bf046f6"
+  },
+  "patched_camoufox": {
+    "package_relative_path": ".deps/camoufox-runtime/Lib/site-packages/camoufox",
+    "fingerprints_relative_path": ".deps/camoufox-runtime/Lib/site-packages/camoufox/fingerprints.py",
+    "fingerprints_sha256": "856e6dedd11dd2dd39eb9b1519a7bdb882e783b79432d8c30242855b773320d2",
+    "required_symbol": "generate_context_fingerprint"
+  },
+  "runtime_graph": {
+    "site_packages_relative_path": ".deps/.camoufox-reverse-mcp-build-venv/Lib/site-packages",
+    "distribution_count": 77,
+    "record_metadata_aggregate_sha256": "523ddb2c8d14f37c705d6a2f9e1f9d1cc11197c6f74a1f1927c5fe2ced5a00ae",
+    "verify_every_record_entry": true,
+    "unexpected_distributions_forbidden": true
+  },
+  "output": {
+    "relative_path": "AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe",
+    "flat_relative_path": "AiDA_CamoufoxReverseMcp.exe",
+    "onefile_required": true,
+    "source_files_forbidden": true,
+    "stock_browser_fallback_forbidden": true
+  }
+}

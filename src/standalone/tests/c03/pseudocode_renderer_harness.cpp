@@ -1,4 +1,5 @@
 #include "pseudocode_renderer_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/pseudocode_renderer_v2.hpp"
 #include "../../src/core/analysis/workspace/decompiler_service.hpp"
@@ -15,6 +16,7 @@ namespace {
 
 void require(const bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -772,6 +774,7 @@ int main()
         std::cout << "pseudocode_renderer_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

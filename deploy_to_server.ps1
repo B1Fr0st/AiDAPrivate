@@ -2,7 +2,6 @@
 param(
     [string]$BuildDir,
     [switch]$SkipArc,
-    [switch]$SkipStandalone,
     [switch]$SkipCamoufoxSidecar,
     [switch]$Camoufox,
     [switch]$Force,
@@ -26,8 +25,6 @@ foreach ($arg in @($ExtraArgs)) {
 if ($explicitCamoufox -and $SkipCamoufoxSidecar.IsPresent) {
     throw "Use either --camoufox/-Camoufox or -SkipCamoufoxSidecar, not both."
 }
-$SkipStandalone = [switch]::Present
-
 $RepoRoot = $PSScriptRoot
 $Server = "ruarr@23.88.62.199"
 $SshKey = Join-Path $env:USERPROFILE ".ssh\aida_server"
@@ -35,7 +32,6 @@ $RemoteRoot = "/home/ruarr/aida-server"
 $RemoteArcPath = "$RemoteRoot/arc/aida_core.bin"
 $RemoteArcShaPath = "$RemoteRoot/arc/aida_core.sha256"
 $RemoteArtifactDir = "$RemoteRoot/bootstrap_artifacts"
-$RemotePrivateStandalonePath = "$RemoteRoot/private/AiDAStandalone.base.exe"
 $SshOptions = @("-o", "StrictHostKeyChecking=yes", "-o", "IdentitiesOnly=yes", "-o", "PasswordAuthentication=no", "-i", $SshKey)
 
 function Write-Step([string]$Message) {
@@ -222,7 +218,7 @@ function Get-RemoteEnvMap {
 set -e
 cd /home/ruarr/aida-server
 if [ -f .env ]; then
-  awk -F= '/^AIDA_BOOTSTRAP_ARTIFACT_URL=|^AIDA_BOOTSTRAP_ARTIFACT_SHA256=|^AIDA_BOOTSTRAP_ARTIFACT_VERSION=|^AIDA_BOOTSTRAP_ARTIFACT_SIZE=|^AIDA_BOOTSTRAP_PACKAGE_SHA256=|^AIDA_BOOTSTRAP_PACKAGE_SIZE=|^AIDA_BOOTSTRAP_ARTIFACT_FORMAT=|^AIDA_CAMOUFOX_SIDECAR_URL=|^AIDA_CAMOUFOX_SIDECAR_SHA256=|^AIDA_CAMOUFOX_SIDECAR_VERSION=|^AIDA_CAMOUFOX_SIDECAR_SIZE=|^AIDA_CAMOUFOX_SIDECAR_EXE_REL=|^AIDA_CAMOUFOX_SIDECAR_PYTHON_REL=|^AIDA_CAMOUFOX_MCP_URL=|^AIDA_CAMOUFOX_MCP_SHA256=|^AIDA_CAMOUFOX_MCP_VERSION=|^AIDA_CAMOUFOX_MCP_SIZE=|^AIDA_CAMOUFOX_MCP_REL=/{print}' .env
+  awk -F= '/^AIDA_CAMOUFOX_SIDECAR_URL=|^AIDA_CAMOUFOX_SIDECAR_SHA256=|^AIDA_CAMOUFOX_SIDECAR_VERSION=|^AIDA_CAMOUFOX_SIDECAR_SIZE=|^AIDA_CAMOUFOX_SIDECAR_EXE_REL=|^AIDA_CAMOUFOX_SIDECAR_PYTHON_REL=|^AIDA_CAMOUFOX_MCP_URL=|^AIDA_CAMOUFOX_MCP_SHA256=|^AIDA_CAMOUFOX_MCP_VERSION=|^AIDA_CAMOUFOX_MCP_SIZE=|^AIDA_CAMOUFOX_MCP_REL=/{print}' .env
 fi
 '@
     $lines = Invoke-RemoteBash $script
@@ -263,12 +259,11 @@ function Find-FirstExistingPath([string[]]$Candidates, [switch]$Directory) {
 function Sync-RemoteDeployScripts {
     Write-Step "Syncing remote deploy helpers"
     if ($PlanOnly) {
-        Write-Ok "Plan only: would upload server/scripts/encrypt-arc.js and create_bootstrap_package.js"
+        Write-Ok "Plan only: would upload server/scripts/encrypt-arc.js"
         return
     }
     Invoke-Remote ("mkdir -p " + (ConvertTo-RemoteShellLiteral "$RemoteRoot/scripts") + " " + (ConvertTo-RemoteShellLiteral $RemoteArtifactDir) + " " + (ConvertTo-RemoteShellLiteral "$RemoteRoot/arc"))
     Copy-ToRemote (Join-Path $RepoRoot "server\scripts\encrypt-arc.js") "$RemoteRoot/scripts/encrypt-arc.js"
-    Copy-ToRemote (Join-Path $RepoRoot "server\scripts\create_bootstrap_package.js") "$RemoteRoot/scripts/create_bootstrap_package.js"
     Write-Ok "Remote helper scripts synced"
 }
 
@@ -328,165 +323,6 @@ stat -c 'arc_size=%s' '/home/ruarr/aida-server/arc/aida_core.bin'
     }
     Write-Ok "ARC published sha256=$localSha"
     return $true
-}
-
-function Publish-StandalonePackage([string]$StandalonePath, [string]$DeployId, [hashtable]$RemoteEnv) {
-    if ($SkipStandalone) {
-        Write-Warn "Skipping standalone package publish because bootstrap delivery is Camoufox-only"
-        return [pscustomobject]@{ Changed = $false; Url = ""; PackageName = ""; PlainSha = ""; PackageSha = ""; PlainSize = 0; PackageSize = 0; Version = "" }
-    }
-    if (-not (Test-Path -LiteralPath $StandalonePath -PathType Leaf)) {
-        Stop-Deploy "AiDAStandalone.exe not found: $StandalonePath"
-    }
-
-    $plainSha = Get-FileSha256Lower $StandalonePath
-    $plainSize = (Get-Item -LiteralPath $StandalonePath).Length
-    $currentSha = if ($RemoteEnv.ContainsKey("AIDA_BOOTSTRAP_ARTIFACT_SHA256")) { ([string]$RemoteEnv["AIDA_BOOTSTRAP_ARTIFACT_SHA256"]).ToLowerInvariant() } else { "" }
-    $currentSize = if ($RemoteEnv.ContainsKey("AIDA_BOOTSTRAP_ARTIFACT_SIZE")) { [string]$RemoteEnv["AIDA_BOOTSTRAP_ARTIFACT_SIZE"] } else { "" }
-    if (-not $Force -and $currentSha -eq $plainSha -and $currentSize -eq [string]$plainSize) {
-        $currentUrl = if ($RemoteEnv.ContainsKey("AIDA_BOOTSTRAP_ARTIFACT_URL")) { [string]$RemoteEnv["AIDA_BOOTSTRAP_ARTIFACT_URL"] } else { "" }
-        $artifactLive = $false
-        if ($currentUrl) {
-            $urlLit = ConvertTo-RemoteShellLiteral $currentUrl
-            $probe = Invoke-RemoteSoft "curl -s -r 0-0 -o /dev/null -w '%{http_code}' $urlLit || echo 000"
-            $status = if ($probe.Output) { ([string]($probe.Output | Select-Object -First 1)).Trim() } else { "" }
-            $artifactLive = $probe.ExitCode -eq 0 -and ($status -eq "200" -or $status -eq "206")
-        }
-        if ($artifactLive) {
-            Write-Ok "Standalone package unchanged: $plainSha"
-            return [pscustomobject]@{ Changed = $false; Url = $currentUrl; PackageName = [IO.Path]::GetFileName($currentUrl); PlainSha = $plainSha; PackageSha = ""; PlainSize = $plainSize; PackageSize = 0; Version = ""; }
-        }
-        Write-Warn "Standalone metadata matches local binary, but the package URL is not live; republishing"
-    }
-
-    Write-Step "Publishing fileless AiDAStandalone package"
-    $version = (Get-Date -Format "yyyyMMddHHmmss")
-    $packageName = "AiDAStandalone-$($version.Substring(0, 8))-$($version.Substring(8, 6)).pkg"
-    $artifactUrl = ($PublicBaseUrl.TrimEnd("/")) + "/bootstrap-artifacts/" + $packageName
-
-    if ($PlanOnly) {
-        Write-Ok "Plan only: would create $packageName for AiDAStandalone.exe sha256=$plainSha size=$plainSize"
-        return [pscustomobject]@{ Changed = $true; Url = $artifactUrl; PackageName = $packageName; PlainSha = $plainSha; PackageSha = ""; PlainSize = $plainSize; PackageSize = 0; Version = $version }
-    }
-
-    $remoteExe = "/tmp/AiDAStandalone_$DeployId.exe"
-    $remotePkg = "$RemoteArtifactDir/$packageName"
-    Copy-ToRemote $StandalonePath $remoteExe
-    $script = @'
-set -euo pipefail
-cd /home/ruarr/aida-server
-set -a
-. ./.env
-set +a
-if [ -z "${AIDA_BOOTSTRAP_PACKAGE_ENC_KEY_B64:-}" ] || [ -z "${AIDA_BOOTSTRAP_PACKAGE_MAC_KEY_B64:-}" ]; then
-  echo "Bootstrap package keys are not configured on the server" >&2
-  rm -f '__REMOTE_EXE__'
-  exit 1
-fi
-node scripts/create_bootstrap_package.js --input '__REMOTE_EXE__' --output '__REMOTE_PKG__'
-rc=$?
-rm -f '__REMOTE_EXE__'
-exit $rc
-'@
-    $script = $script.Replace("__REMOTE_EXE__", $remoteExe).Replace("__REMOTE_PKG__", $remotePkg)
-    $output = Invoke-RemoteBash $script
-    $json = ($output | Where-Object { ([string]$_).TrimStart().StartsWith("{") } | Select-Object -Last 1)
-    if (-not $json) {
-        Stop-Deploy "Package generation did not return JSON metadata"
-    }
-    $metadata = $json | ConvertFrom-Json
-    if ([string]$metadata.plaintext_sha256 -ne $plainSha -or [int64]$metadata.plaintext_size -ne [int64]$plainSize) {
-        Stop-Deploy "Package metadata does not match local AiDAStandalone.exe"
-    }
-    Write-Ok ("Package created: {0} plaintext_sha256={1} package_sha256={2}" -f $packageName, $metadata.plaintext_sha256, $metadata.package_sha256)
-    return [pscustomobject]@{
-        Changed = $true
-        Url = $artifactUrl
-        PackageName = $packageName
-        PlainSha = [string]$metadata.plaintext_sha256
-        PackageSha = [string]$metadata.package_sha256
-        PlainSize = [int64]$metadata.plaintext_size
-        PackageSize = [int64]$metadata.package_size
-        Version = $version
-    }
-}
-
-function Publish-StandalonePrivateBase([string]$StandalonePath, [string]$DeployId, [hashtable]$RemoteEnv) {
-    if ($SkipStandalone) {
-        Write-Warn "Skipping private standalone base publish because -SkipStandalone was specified"
-        return [pscustomobject]@{ Changed = $false; Sha = ""; Size = 0; Version = "" }
-    }
-    if (-not (Test-Path -LiteralPath $StandalonePath -PathType Leaf)) {
-        Stop-Deploy "AiDAStandalone.exe not found: $StandalonePath"
-    }
-    $plainSha = Get-FileSha256Lower $StandalonePath
-    $plainSize = (Get-Item -LiteralPath $StandalonePath).Length
-    $currentSha = if ($RemoteEnv.ContainsKey("AIDA_STANDALONE_BASE_SHA256")) { ([string]$RemoteEnv["AIDA_STANDALONE_BASE_SHA256"]).ToLowerInvariant() } else { "" }
-    $currentPath = if ($RemoteEnv.ContainsKey("AIDA_STANDALONE_BASE_EXE")) { [string]$RemoteEnv["AIDA_STANDALONE_BASE_EXE"] } else { "" }
-    $remoteHash = ""
-    if ($currentPath -eq $RemotePrivateStandalonePath) {
-        $pathLit = ConvertTo-RemoteShellLiteral $RemotePrivateStandalonePath
-        $probe = Invoke-RemoteSoft "if [ -f $pathLit ]; then sha256sum $pathLit | awk '{print `$1}'; else echo missing; fi"
-        if ($probe.Output) { $remoteHash = ([string]($probe.Output | Select-Object -First 1)).Trim().ToLowerInvariant() }
-    }
-    if (-not $Force -and $currentSha -eq $plainSha -and $remoteHash -eq $plainSha) {
-        Write-Ok "Private standalone base unchanged: $plainSha"
-        return [pscustomobject]@{ Changed = $false; Sha = $plainSha; Size = $plainSize; Version = "" }
-    }
-    Write-Step "Publishing private standalone base"
-    if ($PlanOnly) {
-        Write-Ok "Plan only: would upload private base sha256=$plainSha size=$plainSize to $RemotePrivateStandalonePath"
-        return [pscustomobject]@{ Changed = $true; Sha = $plainSha; Size = $plainSize; Version = $DeployId }
-    }
-    $remoteTmp = "/tmp/AiDAStandalone_private_base_$DeployId.exe"
-    Copy-ToRemote $StandalonePath $remoteTmp
-    $script = @'
-set -euo pipefail
-cd /home/ruarr/aida-server
-install -d -m 700 private
-install -m 600 '__REMOTE_TMP__' '__REMOTE_BASE__'
-rm -f '__REMOTE_TMP__'
-actual=$(sha256sum '__REMOTE_BASE__' | awk '{print $1}')
-if [ "$actual" != '__SHA__' ]; then
-  echo "private standalone base sha mismatch: $actual" >&2
-  exit 1
-fi
-cp .env ".env.bak.private-standalone.__VERSION__"
-AIDA_STANDALONE_BASE_EXE_NEW='__REMOTE_BASE__' AIDA_STANDALONE_BASE_SHA256_NEW='__SHA__' AIDA_STANDALONE_BASE_SIZE_NEW='__SIZE__' AIDA_STANDALONE_BASE_VERSION_NEW='__VERSION__' node <<'NODE'
-const fs = require('fs');
-const p = '.env';
-let s = fs.readFileSync(p, 'utf8');
-const updates = {
-  AIDA_STANDALONE_BASE_EXE: process.env.AIDA_STANDALONE_BASE_EXE_NEW,
-  AIDA_STANDALONE_BASE_SHA256: process.env.AIDA_STANDALONE_BASE_SHA256_NEW,
-  AIDA_STANDALONE_BASE_SIZE: process.env.AIDA_STANDALONE_BASE_SIZE_NEW,
-  AIDA_STANDALONE_BASE_VERSION: process.env.AIDA_STANDALONE_BASE_VERSION_NEW
-};
-for (const pair of Object.entries(updates)) {
-  const key = pair[0];
-  const value = pair[1];
-  const line = key + '=' + value;
-  const re = new RegExp('^' + key + '=.*$', 'm');
-  s = re.test(s) ? s.replace(re, line) : s.replace(/\s*$/, '') + '\n' + line + '\n';
-}
-fs.writeFileSync(p, s, { mode: 0o600 });
-NODE
-stat -c 'private_standalone_size=%s' '__REMOTE_BASE__'
-'@
-    $script = $script.Replace("__REMOTE_TMP__", $remoteTmp).
-        Replace("__REMOTE_BASE__", $RemotePrivateStandalonePath).
-        Replace("__SHA__", $plainSha).
-        Replace("__SIZE__", [string]$plainSize).
-        Replace("__VERSION__", $DeployId)
-    $output = Invoke-RemoteBash $script
-    foreach ($line in $output) {
-        $text = [string]$line
-        if ($text -match "^private_standalone_size=") {
-            Write-Host "  $text"
-        }
-    }
-    Write-Ok "Private standalone base published sha256=$plainSha"
-    return [pscustomobject]@{ Changed = $true; Sha = $plainSha; Size = $plainSize; Version = $DeployId }
 }
 
 function Get-CamoufoxSidecarInputs([string]$ReleaseDir) {
@@ -758,56 +594,6 @@ function Publish-CamoufoxSidecar([string]$ReleaseDir, [string]$DeployId, [hashta
     }
 }
 
-function Update-BootstrapMetadata([pscustomobject]$Package) {
-    if (-not $Package.Changed) { return $false }
-    Write-Step "Updating bootstrap artifact metadata"
-    if ($PlanOnly) {
-        Write-Ok "Plan only: would update bootstrap metadata to $($Package.Url)"
-        return $true
-    }
-    $script = @'
-set -euo pipefail
-cd /home/ruarr/aida-server
-cp .env ".env.bak.__VERSION__"
-AIDA_NEW_ARTIFACT_URL='__URL__' AIDA_NEW_ARTIFACT_SHA256='__PLAIN_SHA__' AIDA_NEW_ARTIFACT_VERSION='__VERSION__' AIDA_NEW_ARTIFACT_SIZE='__PLAIN_SIZE__' AIDA_NEW_PACKAGE_SHA256='__PACKAGE_SHA__' AIDA_NEW_PACKAGE_SIZE='__PACKAGE_SIZE__' node <<'NODE'
-const fs = require('fs');
-const p = '.env';
-let s = fs.readFileSync(p, 'utf8');
-const updates = {
-  AIDA_BOOTSTRAP_ARTIFACT_URL: process.env.AIDA_NEW_ARTIFACT_URL,
-  AIDA_BOOTSTRAP_ARTIFACT_SHA256: process.env.AIDA_NEW_ARTIFACT_SHA256,
-  AIDA_BOOTSTRAP_ARTIFACT_VERSION: process.env.AIDA_NEW_ARTIFACT_VERSION,
-  AIDA_BOOTSTRAP_ARTIFACT_SIZE: process.env.AIDA_NEW_ARTIFACT_SIZE,
-  AIDA_BOOTSTRAP_ARTIFACT_FORMAT: 'encrypted-cbc-hmac-v1',
-  AIDA_BOOTSTRAP_ARTIFACT_NAME: 'AiDAStandalone.exe',
-  AIDA_BOOTSTRAP_PACKAGE_SHA256: process.env.AIDA_NEW_PACKAGE_SHA256,
-  AIDA_BOOTSTRAP_PACKAGE_SIZE: process.env.AIDA_NEW_PACKAGE_SIZE
-};
-for (const pair of Object.entries(updates)) {
-  const key = pair[0];
-  const value = pair[1];
-  const line = key + '=' + value;
-  const re = new RegExp('^' + key + '=.*$', 'm');
-  s = re.test(s) ? s.replace(re, line) : s.replace(/\s*$/, '') + '\n' + line + '\n';
-}
-fs.writeFileSync(p, s, { mode: 0o600 });
-NODE
-awk -F= '/^AIDA_BOOTSTRAP_ARTIFACT_URL=|^AIDA_BOOTSTRAP_ARTIFACT_VERSION=|^AIDA_BOOTSTRAP_ARTIFACT_SIZE=|^AIDA_BOOTSTRAP_PACKAGE_SIZE=/{print}' .env
-'@
-    $script = $script.Replace("__VERSION__", [string]$Package.Version).
-        Replace("__URL__", [string]$Package.Url).
-        Replace("__PLAIN_SHA__", [string]$Package.PlainSha).
-        Replace("__PLAIN_SIZE__", [string]$Package.PlainSize).
-        Replace("__PACKAGE_SHA__", [string]$Package.PackageSha).
-        Replace("__PACKAGE_SIZE__", [string]$Package.PackageSize)
-    $output = Invoke-RemoteBash $script
-    foreach ($line in $output) {
-        Write-Host "  $line"
-    }
-    Write-Ok "Bootstrap metadata updated"
-    return $true
-}
-
 function Update-CamoufoxSidecarMetadata([pscustomobject]$Sidecar) {
     if (-not $Sidecar.Changed) { return $false }
     Write-Step "Updating Camoufox sidecar metadata"
@@ -865,14 +651,13 @@ awk -F= '/^AIDA_CAMOUFOX_SIDECAR_URL=|^AIDA_CAMOUFOX_SIDECAR_SHA256=|^AIDA_CAMOU
     return $true
 }
 
-function Restart-And-Verify([bool]$ShouldRestart, [pscustomobject]$Package, [pscustomobject]$Sidecar) {
+function Restart-And-Verify([bool]$ShouldRestart, [pscustomobject]$Sidecar) {
     Write-Step "Verifying server"
     if ($PlanOnly) {
         Write-Ok "Plan only: would restart API if needed and verify health/Camoufox/bootstrap"
         return
     }
     $restart = if ($ShouldRestart) { "1" } else { "0" }
-    $packageUrl = if ($Package.Url) { [string]$Package.Url } else { "" }
     $sidecarUrl = if ($Sidecar.Url) { [string]$Sidecar.Url } else { "" }
     $mcpUrl = if ($Sidecar.McpUrl) { [string]$Sidecar.McpUrl } else { "" }
     $script = @'
@@ -938,13 +723,13 @@ grep -q 'AIDA_CAMOUFOX_MCP_EXECUTABLE' "$verify_path"
 grep -q 'Install-AidaCamoufoxMcpPatch' "$verify_path"
 grep -q 'camoufox_mcp_hash_required' "$verify_path"
 grep -q 'camoufox_only_delivery_complete' "$verify_path"
-if grep -qE 'AIDA_FILELESS_LAUNCH|Invoke-AidaPEInMemory|Get-AidaPackageBytesWithProgress|Decrypt-AidaPackageBytes|Downloading and verifying encrypted package|launch_inmemory_enter' "$verify_path"; then
-  echo "bootstrap still contains standalone launch markers" >&2
+if grep -qE 'bootstrap-artifacts/[^[:space:]]+\.pkg' "$verify_path"; then
+  echo "bootstrap contains a prohibited executable package publication path" >&2
   exit 1
 fi
 rm -f /tmp/aida_bootstrap_verify_stage0.ps1 /tmp/aida_bootstrap_verify_stage1.ps1
 '@
-    $script = $script.Replace("__RESTART__", $restart).Replace("__PACKAGE_URL__", $packageUrl).Replace("__SIDECAR_URL__", $sidecarUrl).Replace("__MCP_URL__", $mcpUrl)
+    $script = $script.Replace("__RESTART__", $restart).Replace("__SIDECAR_URL__", $sidecarUrl).Replace("__MCP_URL__", $mcpUrl)
     $output = Invoke-RemoteBash $script
     foreach ($line in $output) {
         Write-Host "  $line"
@@ -958,7 +743,6 @@ if (-not (Test-Path -LiteralPath $SshKey -PathType Leaf)) {
 
 $releaseDir = Get-ReleaseDir
 $arcDll = Join-Path $releaseDir "aida_core.dll"
-$standaloneExe = Join-Path $releaseDir "AiDAStandalone.exe"
 $deployId = Get-Date -Format "yyyyMMddHHmmss"
 $restartNeeded = $false
 
@@ -967,7 +751,6 @@ Write-Host "AiDA deployment" -ForegroundColor Cyan
 Write-Host "  BuildDir:       $releaseDir"
 Write-Host "  Server:         $Server"
 Write-Host "  PublicBaseUrl:  $PublicBaseUrl"
-Write-Host "  Standalone:     disabled (Discord/manual distribution)"
 Write-Host ("  Camoufox:       {0}" -f ($(if ($SkipCamoufoxSidecar) { "skipped" } else { "publish full sidecar + MCP patch" })))
 if ($PlanOnly) { Write-Host "  Mode:           PlanOnly" -ForegroundColor Yellow }
 
@@ -975,22 +758,15 @@ Sync-RemoteDeployScripts
 $remoteEnv = Get-RemoteEnvMap
 $arcChanged = Publish-Arc $arcDll $deployId
 if ($arcChanged) { $restartNeeded = $true }
-$package = Publish-StandalonePackage $standaloneExe $deployId $remoteEnv
-$metadataChanged = Update-BootstrapMetadata $package
-if ($metadataChanged) { $restartNeeded = $true }
-$privateBase = Publish-StandalonePrivateBase $standaloneExe $deployId $remoteEnv
-if ($privateBase.Changed) { $restartNeeded = $true }
 $sidecar = Publish-CamoufoxSidecar $releaseDir $deployId $remoteEnv
 $sidecarMetadataChanged = Update-CamoufoxSidecarMetadata $sidecar
 if ($sidecarMetadataChanged) { $restartNeeded = $true }
-Restart-And-Verify $restartNeeded $package $sidecar
+Restart-And-Verify $restartNeeded $sidecar
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Green
 Write-Host "  DEPLOY COMPLETE" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Green
 Write-Host ("  ARC:         {0}" -f ($(if ($SkipArc) { "skipped" } elseif ($arcChanged) { "published" } else { "unchanged" }))) -ForegroundColor White
-Write-Host ("  Standalone:  {0}" -f ($(if ($SkipStandalone) { "skipped" } elseif ($package.Changed) { $package.Url } else { "unchanged" }))) -ForegroundColor White
-Write-Host ("  PrivateBase: {0}" -f ($(if ($SkipStandalone) { "skipped" } elseif ($privateBase.Changed) { $privateBase.Sha } else { "unchanged" }))) -ForegroundColor White
 Write-Host ("  Camoufox:    {0}" -f ($(if ($SkipCamoufoxSidecar) { "skipped" } elseif ($sidecar.Changed) { $sidecar.Url } else { "unchanged" }))) -ForegroundColor White
 Write-Host "============================================" -ForegroundColor Green

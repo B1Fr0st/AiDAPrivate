@@ -1,4 +1,5 @@
 #include "cli_provider_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/providers/cli_provider.hpp"
 
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace aida::analysis::c03_test {
 namespace {
@@ -23,8 +25,23 @@ using json = nlohmann::json;
 
 constexpr std::string_view k_fixture_manifest = "src/standalone/tests/c03/managed_cli/fixture_manifest.json";
 
+struct build_package_fixture_t {
+    std::string id;
+    std::string version;
+    std::string file_name;
+    sha256_digest_t content_hash;
+};
+
+struct build_lock_fixture_t {
+    std::string package_root;
+    std::string sdk_path;
+    sha256_digest_t sdk_hash;
+    std::vector<build_package_fixture_t> packages;
+};
+
 void require(bool condition, const std::string& message)
 {
+    assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -72,7 +89,21 @@ std::filesystem::path source_root()
 
 std::string path_text(const std::filesystem::path& path)
 {
-    return path.lexically_normal().string();
+    return std::filesystem::absolute(path).lexically_normal().string();
+}
+
+std::vector<std::uint8_t> read_bytes(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    require(stream.is_open(), "managed CLI immutable fixture is unavailable");
+    const auto size = stream.tellg();
+    require(size > 0, "managed CLI immutable fixture is empty");
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    stream.seekg(0);
+    stream.read(reinterpret_cast<char*>(bytes.data()),
+        static_cast<std::streamsize>(size));
+    require(stream.good(), "managed CLI immutable fixture could not be read");
+    return bytes;
 }
 
 json load_manifest(const std::filesystem::path& root)
@@ -131,7 +162,7 @@ void validate_manifest(const json& manifest)
 
     const auto& validation = manifest.at("validation");
     require(validation.is_object() && validation.value("deterministic_runs", 0) >= 2 && validation.value("cancellation", false) &&
-        validation.value("offline_startup_gate", false) && validation.value("snapshot_binding", false),
+        validation.value("runtime_identity_gate", false) && validation.value("snapshot_binding", false),
         "managed CLI fixture validation contract is incomplete");
     std::set<std::string> resources;
     for (const auto& value : validation.at("resource_limits"))
@@ -139,9 +170,9 @@ void validate_manifest(const json& manifest)
     require(resources == std::set<std::string>{"maxCpuMs", "maxMemoryBytes"}, "managed CLI fixture resource contract is incomplete");
 }
 
-managed_cli::offline_lock_t fixture_lock(const std::filesystem::path& root)
+build_lock_fixture_t fixture_build_lock(const std::filesystem::path& root)
 {
-    managed_cli::offline_lock_t result;
+    build_lock_fixture_t result;
     result.package_root = path_text(root / ".deps/nuget-offline");
     result.sdk_path = path_text(root / ".deps/dotnet-sdk-10.0.301-win-x64/dotnet.exe");
     result.sdk_hash = digest_hex("a5ccdc3a41d5e5c6014ff64509aed176db39f4f14caffff3dd1997f8907e94d7");
@@ -151,6 +182,48 @@ managed_cli::offline_lock_t fixture_lock(const std::filesystem::path& root)
         {"System.Reflection.Metadata", "9.0.0", "System.Reflection.Metadata.9.0.0.nupkg", digest_hex("6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634")}
     };
     return result;
+}
+
+sha256_digest_t file_digest(const std::filesystem::path& path)
+{
+    auto bytes = read_bytes(path);
+    const auto value = sha256_bytes(bytes.data(), bytes.size());
+    require(value.has_value(), "managed CLI build input could not be hashed");
+    return value.value();
+}
+
+std::optional<sha256_digest_t> verify_fixture_build_lock(
+    const std::filesystem::path& root,
+    const build_lock_fixture_t& lock)
+{
+    const std::vector<build_package_fixture_t> expected{
+        {"ICSharpCode.Decompiler", "10.1.0.8386", "ICSharpCode.Decompiler.10.1.0.8386.nupkg", digest_hex("a6fb2e9be86c1b73e54231e20640d4d566c52f21cba9ad99c3e9100d67e8f5af")},
+        {"System.Collections.Immutable", "9.0.0", "System.Collections.Immutable.9.0.0.nupkg", digest_hex("fbaab954c7a87396e6e1616ca15ea705703d755e696bf3b8c96fa039d8bcc9a7")},
+        {"System.Reflection.Metadata", "9.0.0", "System.Reflection.Metadata.9.0.0.nupkg", digest_hex("6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634")}};
+    if (lock.package_root != path_text(root / ".deps/nuget-offline") ||
+        lock.sdk_path != path_text(root / ".deps/dotnet-sdk-10.0.301-win-x64/dotnet.exe") ||
+        lock.sdk_hash != digest_hex("a5ccdc3a41d5e5c6014ff64509aed176db39f4f14caffff3dd1997f8907e94d7") ||
+        lock.packages.size() != expected.size())
+        return std::nullopt;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto& actual = lock.packages[index];
+        const auto& pinned = expected[index];
+        if (actual.id != pinned.id || actual.version != pinned.version ||
+            actual.file_name != pinned.file_name ||
+            actual.content_hash != pinned.content_hash)
+            return std::nullopt;
+    }
+    if (file_digest(lock.sdk_path) != lock.sdk_hash)
+        return std::nullopt;
+    for (const auto& package : lock.packages) {
+        if (file_digest(std::filesystem::path(lock.package_root) /
+                package.file_name) != package.content_hash)
+            return std::nullopt;
+    }
+    return digest(
+        "ICSharpCode.Decompiler|10.1.0.8386|a6fb2e9be86c1b73e54231e20640d4d566c52f21cba9ad99c3e9100d67e8f5af\n"
+        "System.Collections.Immutable|9.0.0|fbaab954c7a87396e6e1616ca15ea705703d755e696bf3b8c96fa039d8bcc9a7\n"
+        "System.Reflection.Metadata|9.0.0|6af1166dc0a1ed7829b127ac9d1dff4a0c568bfe82e4ec6347cf497ff49f4634");
 }
 
 decompiler_profile_budget_t fixture_profile()
@@ -166,13 +239,14 @@ decompiler_profile_budget_t fixture_profile()
     return result;
 }
 
-decompiler_entity_key_t fixture_entity(const json& fixture, std::size_t index)
+decompiler_entity_key_t fixture_entity(const json& fixture, std::size_t index,
+                                       const sha256_digest_t& module_hash)
 {
     const auto symbol = fixture.at("symbol").get<std::string>();
     const auto separator = symbol.rfind('.');
     require(separator != std::string::npos && separator != 0 && separator + 1 < symbol.size(), "managed CLI fixture symbol is malformed");
     cli_decompiler_entity_identity_t identity;
-    identity.module_hash = digest("managed-cli-fixture-module");
+    identity.module_hash = module_hash;
     identity.assembly_identity = "ManagedCliFixtures, Version=1.0.0.0";
     identity.module_name = "ManagedCliFixtures.dll";
     identity.metadata_token = 0x06000001U + static_cast<std::uint32_t>(index);
@@ -189,26 +263,69 @@ decompiler_entity_key_t fixture_entity(const json& fixture, std::size_t index)
 
 managed_cli::request_t fixture_request(
     const std::filesystem::path& root,
-    const managed_cli::offline_lock_t& lock,
+    const managed_cli::immutable_module_snapshot_t& snapshot,
     const json& fixture,
     std::size_t index)
 {
     managed_cli::worker_identity_t worker;
     worker.provider_version = "10.1.0.8386";
     worker.decompiler_assembly_hash = digest_hex("bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345");
-    worker.worker_build_id = "c03-managed-cli-fixture";
-    worker.worker_build_hash = digest("c03-managed-cli-fixture-build");
-    const auto request = managed_cli::make_request(
-        static_cast<std::uint64_t>(index) + 1,
+    worker.worker_build_id = "aida-managed-decompiler-worker-v3";
+    worker.worker_build_hash = digest(
+        "aida-managed-decompiler-worker-build-v3|snapshot-bound-contract=4fe173593d2e044466706c58b3573ec528930a1762a3177ac53e7b84c166cfa6|tfm=net10.0|runtime=Microsoft.NETCore.App/10.0.9");
+    worker.runtime_manifest_hash = digest("managed-runtime-fixture-v1");
+    const auto request = managed_cli::make_embedded_request(
+        1,
         "fixture-request-" + std::to_string(index + 1),
-        path_text(root / "src/standalone/tests/c03/managed_cli/ManagedCliFixtures.dll"),
-        fixture_entity(fixture, index),
+        path_text(root / "src/standalone/tests/c03/managed_cli/ManagedCliFixtures.csproj") +
+            "#member:ManagedCliFixtures.dll",
+        snapshot,
+        fixture_entity(fixture, index, snapshot.hash),
         7,
+        9,
         fixture_profile(),
-        std::move(worker),
-        lock);
+        std::move(worker));
     require(request.has_value(), "managed CLI fixture request was rejected");
     return request.value();
+}
+
+json response_binding(const managed_cli::request_t& request)
+{
+    const auto& identity = std::get<cli_decompiler_entity_identity_t>(
+        request.entity.identity);
+    return {
+        {"moduleSource", {
+            {"kind", "embedded_member"},
+            {"logicalIdentity", request.module_source.logical_identity},
+            {"moduleHash", request.module_source.module_hash.to_hex()},
+            {"moduleSize", request.module_source.module_size}
+        }},
+        {"entityHash", request.entity_hash.to_hex()},
+        {"metadataToken", identity.metadata_token},
+        {"workspaceGeneration", request.workspace_generation},
+        {"typeGraphRevision", request.type_graph_revision},
+        {"budget", {
+            {"profile", "balanced"},
+            {"maxWallClockMs", request.profile.max_wall_clock_ms},
+            {"maxCpuMs", request.profile.max_cpu_ms},
+            {"maxMemoryBytes", request.profile.max_memory_bytes},
+            {"maxProviderIrNodes", request.profile.max_provider_ir_nodes},
+            {"maxHirNodes", request.profile.max_hir_nodes},
+            {"maxAstNodes", request.profile.max_ast_nodes},
+            {"maxSemanticQueries", request.profile.max_semantic_queries},
+            {"semanticProofsEnabled", request.profile.semantic_proofs_enabled}
+        }},
+        {"runtimeManifestHash", request.worker.runtime_manifest_hash.to_hex()},
+        {"contractHash", request.contract_hash.to_hex()},
+        {"cacheIdentity", request.cache_identity.to_hex()},
+        {"requestBindingHash", request.request_binding_hash.to_hex()},
+        {"provider", {
+            {"version", request.worker.provider_version},
+            {"decompilerAssemblyHash", request.worker.decompiler_assembly_hash.to_hex()},
+            {"workerBuildId", request.worker.worker_build_id},
+            {"workerBuildHash", request.worker.worker_build_hash.to_hex()}
+        }}
+    };
 }
 
 json fixture_response(const managed_cli::request_t& request, const json& fixture)
@@ -217,16 +334,12 @@ json fixture_response(const managed_cli::request_t& request, const json& fixture
     std::string source = fixture.at("symbol").get<std::string>();
     for (const auto& fragment : fixture.at("expected_source_fragments"))
         source += " " + fragment.get<std::string>();
-    return {
+    json result = {
         {"schema", "aida.c03.managed-cli.worker"},
-        {"schemaVersion", 1},
+        {"schemaVersion", managed_cli::k_managed_cli_worker_protocol_version},
         {"kind", "result"},
         {"sequence", request.sequence},
         {"requestId", request.request_id},
-        {"moduleHash", identity.module_hash.to_hex()},
-        {"metadataToken", identity.metadata_token},
-        {"offlineLockHash", request.offline_lock_hash.to_hex()},
-        {"provider", {{"version", request.worker.provider_version}, {"decompilerAssemblyHash", request.worker.decompiler_assembly_hash.to_hex()}}},
         {"identity", {
             {"assemblyIdentity", identity.assembly_identity}, {"moduleName", identity.module_name}, {"declaringType", identity.declaring_type},
             {"methodName", identity.method_name}, {"methodSignature", identity.method_signature}, {"genericArity", identity.generic_arity}
@@ -241,7 +354,7 @@ json fixture_response(const managed_cli::request_t& request, const json& fixture
             {"hasExceptionRegions", coverage_contains(fixture, "exceptions")}
         }})},
         {"typeGraph", {
-            {"revision", 1},
+            {"revision", request.type_graph_revision},
             {"nodes", json::array({
                 {{"id", 1}, {"kind", "reference"}, {"canonicalName", "System.Object"}, {"displayName", "System.Object"}, {"byteSize", nullptr}, {"alignment", 0}, {"signed", false}, {"confidence", 0}},
                 {{"id", 2}, {"kind", "signed_integer"}, {"canonicalName", "System.Int32"}, {"displayName", "System.Int32"}, {"byteSize", 4}, {"alignment", 0}, {"signed", true}, {"confidence", 100}},
@@ -249,6 +362,7 @@ json fixture_response(const managed_cli::request_t& request, const json& fixture
             })},
             {"edges", json::array()}
         }},
+        {"returnTypeId", 2},
         {"ir", {
             {"entryBlockId", 1},
             {"blocks", json::array({{
@@ -262,54 +376,85 @@ json fixture_response(const managed_cli::request_t& request, const json& fixture
         {"unknowns", json::array()},
         {"diagnostics", json::array()}
     };
+    result.update(response_binding(request));
+    return result;
 }
 
 json failure_response(const managed_cli::request_t& request, const std::string& code, const std::string& key)
 {
-    const auto& identity = std::get<cli_decompiler_entity_identity_t>(request.entity.identity);
-    return {
-        {"schema", "aida.c03.managed-cli.worker"}, {"schemaVersion", 1}, {"kind", "failure"}, {"sequence", request.sequence},
-        {"requestId", request.request_id}, {"moduleHash", identity.module_hash.to_hex()}, {"metadataToken", identity.metadata_token},
-        {"offlineLockHash", request.offline_lock_hash.to_hex()},
+    json result = {
+        {"schema", "aida.c03.managed-cli.worker"},
+        {"schemaVersion", managed_cli::k_managed_cli_worker_protocol_version},
+        {"kind", "failure"}, {"sequence", request.sequence},
+        {"requestId", request.request_id},
         {"diagnostics", json::array({{{"severity", "error"}, {"code", code}, {"key", key}, {"args", json::array()},
             {"ilOffset", nullptr}, {"confidence", 100}, {"retryable", false}, {"ordinal", 1}}})}
     };
+    result.update(response_binding(request));
+    return result;
 }
 
-void validate_offline_gate(const std::filesystem::path& root, const managed_cli::offline_lock_t& lock)
+void validate_build_runtime_separation(
+    const std::filesystem::path& root,
+    const build_lock_fixture_t& lock,
+    const managed_cli::immutable_module_snapshot_t& snapshot)
 {
-    const auto verified = managed_cli::verify_offline_lock(lock);
-    require(verified.has_value() && !verified.value().empty(), "managed CLI offline lock verification failed");
+    const auto verified = verify_fixture_build_lock(root, lock);
+    require(verified.has_value() && !verified.value().empty(), "managed CLI build lock verification failed");
     auto tampered = lock;
     tampered.packages.front().content_hash = digest("tampered-package");
-    require(!managed_cli::verify_offline_lock(tampered).has_value(), "managed CLI accepted a tampered offline lock");
+    require(!verify_fixture_build_lock(root, tampered).has_value(), "managed CLI accepted a tampered build lock");
 
     const auto manifest = load_manifest(root);
-    const auto request = fixture_request(root, lock, manifest.at("methods").front(), 0);
-    const auto arguments = managed_cli::make_worker_startup_arguments(request);
-    require(arguments.has_value() && arguments.value().size() == 2 && arguments.value()[0] == "--offline-package-root" &&
-        arguments.value()[1] == request.offline_lock.package_root,
-        "managed CLI worker startup gate arguments are invalid");
+    const auto request = fixture_request(
+        root, snapshot, manifest.at("methods").front(), 0);
+    const auto encoded = managed_cli::serialize_request(request);
+    require(encoded.has_value(), "managed CLI runtime request was rejected");
+    const auto value = json::parse(encoded.value());
+    require(value.contains("runtimeManifestHash") &&
+        !value.contains("offlineLockHash") && !value.contains("packageRoot") &&
+        !value.contains("sdkPath") &&
+        value.at("runtimeManifestHash") == request.worker.runtime_manifest_hash.to_hex(),
+        "managed CLI runtime request leaked build-only package state");
 }
 
 void validate_method_contract(
     const std::filesystem::path& root,
-    const managed_cli::offline_lock_t& lock,
+    const managed_cli::immutable_module_snapshot_t& snapshot,
     const json& fixture,
     std::size_t index)
 {
-    const auto request = fixture_request(root, lock, fixture, index);
+    const auto request = fixture_request(root, snapshot, fixture, index);
     const auto encoded = managed_cli::serialize_request(request);
     require(encoded.has_value(), "managed CLI request encoding failed");
     const auto encoded_json = json::parse(encoded.value());
     require(encoded_json["kind"] == "decompile" && encoded_json["metadataToken"] ==
         std::get<cli_decompiler_entity_identity_t>(request.entity.identity).metadata_token &&
+        encoded_json["moduleSource"]["kind"] == "embedded_member" &&
+        encoded_json["moduleSource"]["logicalIdentity"] == request.module_source.logical_identity &&
+        encoded_json["moduleSource"]["moduleHash"] == request.module_source.module_hash.to_hex() &&
+        encoded_json["moduleSource"]["moduleSize"] == request.module_source.module_size &&
+        encoded_json.find("modulePath") == encoded_json.end() &&
+        encoded_json["entityHash"] == request.entity_hash.to_hex() &&
+        encoded_json["workspaceGeneration"] == request.workspace_generation &&
         encoded_json["budget"]["maxCpuMs"] == request.profile.max_cpu_ms &&
-        encoded_json["budget"]["maxMemoryBytes"] == request.profile.max_memory_bytes,
+        encoded_json["budget"]["maxMemoryBytes"] == request.profile.max_memory_bytes &&
+        encoded_json["budget"]["maxHirNodes"] == request.profile.max_hir_nodes &&
+        encoded_json["budget"]["maxAstNodes"] == request.profile.max_ast_nodes &&
+        encoded_json["budget"]["maxSemanticQueries"] == request.profile.max_semantic_queries &&
+        encoded_json["budget"]["semanticProofsEnabled"] == request.profile.semantic_proofs_enabled &&
+        encoded_json["typeGraphRevision"] == request.type_graph_revision &&
+        encoded_json["runtimeManifestHash"] == request.worker.runtime_manifest_hash.to_hex() &&
+        encoded_json["contractHash"] == request.contract_hash.to_hex() &&
+        encoded_json["cacheIdentity"] == request.cache_identity.to_hex() &&
+        encoded_json["requestBindingHash"] == request.request_binding_hash.to_hex(),
         "managed CLI request contract drifted");
 
-    const auto cancellation = managed_cli::serialize_cancellation(request, request.sequence + 1000, "fixture_cancel");
-    require(cancellation.has_value() && json::parse(cancellation.value())["kind"] == "cancel",
+    const auto cancellation = managed_cli::serialize_cancellation(request, request.sequence + 1, "fixture_cancel");
+    require(cancellation.has_value(), "managed CLI cancellation encoding failed");
+    const auto cancellation_json = json::parse(cancellation.value());
+    require(cancellation_json["kind"] == "cancel" &&
+        cancellation_json["requestBindingHash"] == request.request_binding_hash.to_hex(),
         "managed CLI cancellation encoding failed");
 
     const auto response_json = fixture_response(request, fixture);
@@ -337,9 +482,25 @@ void validate_method_contract(
             "managed CLI accepted duplicate provider IR value IDs");
 
         auto mismatched_hash = response_json;
-        mismatched_hash["moduleHash"] = std::string(64, '0');
+        mismatched_hash["moduleSource"]["moduleHash"] = std::string(64, '0');
         require(!managed_cli::deserialize_response(request, mismatched_hash.dump()).has_value(),
             "managed CLI accepted a mismatched module hash");
+
+        auto mismatched_budget = response_json;
+        mismatched_budget["budget"]["maxMemoryBytes"] =
+            request.profile.max_memory_bytes + 1;
+        require(!managed_cli::deserialize_response(request, mismatched_budget.dump()).has_value(),
+            "managed CLI accepted a mismatched response budget");
+
+        auto mismatched_runtime = response_json;
+        mismatched_runtime["runtimeManifestHash"] = std::string(64, '0');
+        require(!managed_cli::deserialize_response(request, mismatched_runtime.dump()).has_value(),
+            "managed CLI accepted a mismatched runtime identity");
+
+        auto mismatched_provider = response_json;
+        mismatched_provider["provider"]["workerBuildHash"] = std::string(64, '0');
+        require(!managed_cli::deserialize_response(request, mismatched_provider.dump()).has_value(),
+            "managed CLI accepted a mismatched response provider");
 
         auto malformed_token = response_json;
         malformed_token["tokenMap"][0]["token"] = 0x02000001U;
@@ -362,10 +523,11 @@ void validate_method_contract(
 
 void validate_malformed_contracts(
     const std::filesystem::path& root,
-    const managed_cli::offline_lock_t& lock,
+    const managed_cli::immutable_module_snapshot_t& snapshot,
     const json& manifest)
 {
-    const auto request = fixture_request(root, lock, manifest.at("methods").front(), 0);
+    const auto request = fixture_request(
+        root, snapshot, manifest.at("methods").front(), 0);
     for (const auto& malformed : manifest.at("malformed")) {
         const auto decoded = managed_cli::deserialize_response(request,
             failure_response(request, malformed.at("expected_code").get<std::string>(), malformed.at("expected_key").get<std::string>()).dump());
@@ -377,10 +539,11 @@ void validate_malformed_contracts(
 
 void validate_resource_budget_bounds(
     const std::filesystem::path& root,
-    const managed_cli::offline_lock_t& lock,
+    const managed_cli::immutable_module_snapshot_t& snapshot,
     const json& manifest)
 {
-    const auto request = fixture_request(root, lock, manifest.at("methods").front(), 0);
+    const auto request = fixture_request(
+        root, snapshot, manifest.at("methods").front(), 0);
     const auto require_rejected = [&request](const decompiler_profile_budget_t& profile, const char* message) {
         require(!validate_decompiler_profile(profile).valid(), message);
         auto candidate = request;
@@ -406,7 +569,9 @@ void validate_resource_budget_bounds(
 
     auto tiny = request;
     tiny.profile.max_cpu_ms = 1;
-    tiny.profile.max_memory_bytes = 1;
+    tiny.profile.max_memory_bytes = tiny.module_source.module_size * 2;
+    tiny.cache_identity = {};
+    tiny.request_binding_hash = {};
     require(validate_decompiler_profile(tiny.profile).valid(), "managed CLI rejected tiny bounded profile");
     require(managed_cli::serialize_request(tiny).has_value(), "managed CLI rejected tiny bounded request");
 }
@@ -418,13 +583,16 @@ void run_cli_provider_harness()
     const auto root = source_root();
     const auto manifest = load_manifest(root);
     validate_manifest(manifest);
-    const auto lock = fixture_lock(root);
-    validate_offline_gate(root, lock);
+    const auto build_lock = fixture_build_lock(root);
+    const auto snapshot = managed_cli::make_immutable_module_snapshot(read_bytes(
+        root / "src/standalone/tests/c03/managed_cli/GenericAsyncIteratorFixture.cs"));
+    require(snapshot.has_value(), "managed CLI immutable fixture snapshot was rejected");
+    validate_build_runtime_separation(root, build_lock, snapshot.value());
     std::size_t index = 0;
     for (const auto& fixture : manifest.at("methods"))
-        validate_method_contract(root, lock, fixture, index++);
-    validate_malformed_contracts(root, lock, manifest);
-    validate_resource_budget_bounds(root, lock, manifest);
+        validate_method_contract(root, snapshot.value(), fixture, index++);
+    validate_malformed_contracts(root, snapshot.value(), manifest);
+    validate_resource_budget_bounds(root, snapshot.value(), manifest);
 }
 
 }
@@ -436,7 +604,14 @@ int main()
         std::cout << "cli_provider_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& exception) {
+        aida::analysis::c03_test::assertion_telemetry::record_exception(
+            exception.what());
         std::cerr << exception.what() << '\n';
+        return 1;
+    } catch (...) {
+        aida::analysis::c03_test::assertion_telemetry::record_exception(
+            "cli provider harness failed with a non-standard exception");
+        std::cerr << "cli provider harness failed with a non-standard exception\n";
         return 1;
     }
 }

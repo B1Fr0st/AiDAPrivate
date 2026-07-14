@@ -1,4 +1,5 @@
 #include "workbench_model_harness.h"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/workbench/workbench_model.h"
 
@@ -10,9 +11,11 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -21,6 +24,7 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -192,6 +196,73 @@ public:
 
 private:
     std::uint64_t unavailable_;
+};
+
+class persistence_catalog_t final : public document_catalog_adapter_t {
+public:
+    explicit persistence_catalog_t(const workbench_persistence_dto_t& persistence)
+        : persistence_(persistence)
+    {
+    }
+
+    workbench_error_t describe(const document_identity_t& identity,
+                               document_descriptor_t& output) const override
+    {
+        ++calls_;
+        const auto found = std::find_if(
+            persistence_.documents.begin(), persistence_.documents.end(),
+            [&identity](const auto& document) {
+                return document_identity_equal(document.identity, identity);
+            });
+        if (found == persistence_.documents.end())
+            return {workbench_error_code_t::invalid_document, identity.object_id};
+        output.identity = found->identity;
+        output.title = found->title;
+        output.can_open = true;
+        return {};
+    }
+
+    std::size_t calls() const noexcept
+    {
+        return calls_;
+    }
+
+private:
+    const workbench_persistence_dto_t& persistence_;
+    mutable std::size_t calls_ = 0;
+};
+
+class strict_memory_persistence_t final : public workbench_persistence_adapter_t {
+public:
+    explicit strict_memory_persistence_t(workbench_persistence_dto_t initial)
+        : persisted_(std::move(initial))
+    {
+    }
+
+    workbench_error_t load(workspace_id_t workspace,
+                           workbench_persistence_dto_t& output) const override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (workspace != persisted_.workspace)
+            return {workbench_error_code_t::workspace_mismatch, workspace.value};
+        output = persisted_;
+        return {};
+    }
+
+    workbench_error_t store(const workbench_persistence_dto_t& input) override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (input.workspace != persisted_.workspace)
+            return {workbench_error_code_t::workspace_mismatch, input.workspace.value};
+        if (input.revision.value <= persisted_.revision.value)
+            return {workbench_error_code_t::revision_mismatch, input.revision.value};
+        persisted_ = input;
+        return {};
+    }
+
+private:
+    mutable std::mutex mutex_;
+    workbench_persistence_dto_t persisted_;
 };
 
 class navigator_t final : public navigation_adapter_t {
@@ -517,6 +588,7 @@ void verify_restore_missing_documents_and_workspace_bounds()
                                                   missing_second_document,
                                                   missing_document_policy_t::omit);
     require(restored.error.ok() && restored.changed &&
+                restored.snapshot->revision() == workspace_revision_t{2} &&
                 restored.snapshot->persistence().documents.size() == 1 &&
                 restored.snapshot->persistence().views.size() == 1 &&
                 restored.snapshot->persistence().active_document == document_id_t{1},
@@ -844,6 +916,252 @@ void verify_identifier_and_revision_overflow()
             "out-of-range workbench command kind must fail without a successful no-op");
 }
 
+void verify_restored_revision_baseline_and_reopen_cycles()
+{
+    const workspace_id_t equal_revision_workspace{405};
+    auto equal_revision_persisted = make_workspace(equal_revision_workspace);
+    equal_revision_persisted.documents.front().state_token =
+        "authoritative-equal-revision-state";
+    persistence_catalog_t equal_revision_catalog(equal_revision_persisted);
+    workbench_model_t equal_revision_model;
+    workbench_snapshot_ptr_t equal_revision_initial;
+    require(equal_revision_model.create_workspace(
+                make_workspace(equal_revision_workspace),
+                equal_revision_initial).ok(),
+            "equal-revision adoption fixture must initialize");
+    const auto equal_revision_restore = equal_revision_model.restore_workspace(
+        equal_revision_workspace, equal_revision_initial->revision(),
+        equal_revision_persisted, equal_revision_catalog,
+        missing_document_policy_t::reject);
+    require(equal_revision_restore.error.ok() && equal_revision_restore.changed &&
+                equal_revision_restore.snapshot->revision() == workspace_revision_t{1} &&
+                equal_revision_restore.snapshot != equal_revision_initial,
+            "first persistence restore may adopt an authoritative equal revision without rebasing");
+    auto equal_revision_collision = equal_revision_persisted;
+    equal_revision_collision.documents.front().state_token =
+        "divergent-authoritative-equal-revision-state";
+    persistence_catalog_t equal_revision_collision_catalog(
+        equal_revision_collision);
+    const auto equal_revision_collision_result =
+        equal_revision_model.restore_workspace(
+            equal_revision_workspace, equal_revision_restore.snapshot->revision(),
+            equal_revision_collision, equal_revision_collision_catalog,
+            missing_document_policy_t::reject);
+    require(equal_revision_collision_result.error.code ==
+                workbench_error_code_t::revision_mismatch &&
+                !equal_revision_collision_result.changed &&
+                equal_revision_collision_result.snapshot ==
+                    equal_revision_restore.snapshot &&
+                equal_revision_collision_catalog.calls() == 0,
+            "an adopted equal revision must reject divergent replacement state");
+
+    const workspace_id_t workspace{401};
+    auto persisted = make_workspace(workspace);
+    persisted.revision = {3};
+    persisted.documents.front().state_token = "persisted-revision-3";
+    for (auto& panel : persisted.panels)
+        panel.revision = persisted.revision;
+    require(persisted.validate().ok(), "revision baseline fixture must validate");
+    strict_memory_persistence_t persistence(persisted);
+
+    workspace_revision_t expected_persisted_revision{3};
+    for (std::uint64_t cycle = 0; cycle < 3; ++cycle) {
+        workbench_persistence_dto_t loaded;
+        require(persistence.load(workspace, loaded).ok() &&
+                    loaded.revision == expected_persisted_revision,
+                "reopen cycle must load the exact persisted revision");
+        persistence_catalog_t catalog(loaded);
+        workbench_model_t model;
+        workbench_snapshot_ptr_t initial;
+        require(model.create_workspace(make_workspace(workspace), initial).ok(),
+                "reopen cycle must initialize an isolated transient workspace");
+        const auto restored = model.restore_workspace(
+            workspace, initial->revision(), persistence, catalog,
+            missing_document_policy_t::reject);
+        require(restored.error.ok() && restored.changed && restored.snapshot &&
+                    restored.snapshot->revision() == expected_persisted_revision &&
+                    persistence_dto_equal(restored.snapshot->persistence(), loaded),
+                "restore must adopt the persisted revision without rebasing");
+
+        const auto no_op = model.restore_workspace(
+            workspace, restored.snapshot->revision(), loaded, catalog,
+            missing_document_policy_t::reject);
+        require(no_op.error.ok() && !no_op.changed &&
+                    no_op.snapshot == restored.snapshot,
+                "an exact restore must retain the immutable snapshot without revision churn");
+
+        workbench_command_t focus;
+        focus.kind = workbench_command_kind_t::focus_view;
+        focus.workspace = workspace;
+        focus.expected_revision = restored.snapshot->revision();
+        focus.view = cycle % 2U == 0 ? view_id_t{12} : view_id_t{11};
+        const auto mutated = model.execute(focus);
+        require(mutated.error.ok() && mutated.changed && mutated.snapshot &&
+                    mutated.snapshot->revision().value ==
+                        expected_persisted_revision.value + 1U &&
+                    restored.snapshot->revision() == expected_persisted_revision,
+                "first real post-restore mutation must advance exactly once");
+        require(persistence.store(mutated.snapshot->persistence()).ok(),
+                "strict persistence must accept the strictly newer post-restore revision");
+        expected_persisted_revision = mutated.snapshot->revision();
+    }
+
+    workbench_persistence_dto_t latest;
+    require(persistence.load(workspace, latest).ok(),
+            "latest persisted reopen state must remain readable");
+
+    const workspace_id_t reconciled_workspace{404};
+    auto reconciled_persisted = make_workspace(reconciled_workspace);
+    reconciled_persisted.revision = {11};
+    for (auto& panel : reconciled_persisted.panels)
+        panel.revision = reconciled_persisted.revision;
+    workbench_model_t reconciled_model;
+    workbench_snapshot_ptr_t reconciled_initial;
+    require(reconciled_model.create_workspace(make_workspace(reconciled_workspace),
+                                              reconciled_initial).ok(),
+            "reconciled revision fixture must initialize");
+    catalog_t refreshed_catalog;
+    const auto reconciled_restore = reconciled_model.restore_workspace(
+        reconciled_workspace, reconciled_initial->revision(),
+        reconciled_persisted, refreshed_catalog,
+        missing_document_policy_t::reject);
+    require(reconciled_restore.error.ok() && reconciled_restore.changed &&
+                reconciled_restore.snapshot->revision() == workspace_revision_t{12},
+            "restore reconciliation must advance from the persisted baseline exactly once");
+
+    persistence_catalog_t latest_catalog(latest);
+    workbench_model_t current_model;
+    workbench_snapshot_ptr_t current_initial;
+    require(current_model.create_workspace(make_workspace(workspace), current_initial).ok(),
+            "stale-conflict workspace must initialize");
+    const auto current_restore = current_model.restore_workspace(
+        workspace, current_initial->revision(), latest, latest_catalog,
+        missing_document_policy_t::reject);
+    require(current_restore.error.ok() &&
+                current_restore.snapshot->revision() == expected_persisted_revision,
+            "latest persisted revision must restore as the current baseline");
+
+    workbench_command_t no_op_focus;
+    no_op_focus.kind = workbench_command_kind_t::focus_view;
+    no_op_focus.workspace = workspace;
+    no_op_focus.expected_revision = current_restore.snapshot->revision();
+    no_op_focus.view = current_restore.snapshot->focused_view();
+    const auto no_op_focus_result = current_model.execute(no_op_focus);
+    require(no_op_focus_result.error.ok() && !no_op_focus_result.changed &&
+                no_op_focus_result.snapshot == current_restore.snapshot,
+            "a no-op mutation must preserve the restored revision and snapshot identity");
+
+    auto stale = latest;
+    stale.revision = {latest.revision.value - 1U};
+    for (auto& panel : stale.panels)
+        panel.revision = stale.revision;
+    persistence_catalog_t stale_catalog(stale);
+    const auto stale_result = current_model.restore_workspace(
+        workspace, current_restore.snapshot->revision(), stale, stale_catalog,
+        missing_document_policy_t::reject);
+    require(stale_result.error.code == workbench_error_code_t::revision_mismatch &&
+                !stale_result.changed &&
+                stale_result.snapshot == current_restore.snapshot &&
+                stale_catalog.calls() == 0,
+            "stale persisted revisions must fail without publication");
+
+    auto collision = latest;
+    collision.documents.front().state_token = "same-revision-collision";
+    persistence_catalog_t collision_catalog(collision);
+    const auto collision_result = current_model.restore_workspace(
+        workspace, current_restore.snapshot->revision(), collision,
+        collision_catalog, missing_document_policy_t::reject);
+    require(collision_result.error.code == workbench_error_code_t::revision_mismatch &&
+                !collision_result.changed &&
+                collision_result.snapshot == current_restore.snapshot &&
+                collision_catalog.calls() == 0,
+            "same-revision divergent persistence must fail as a revision collision");
+
+    auto corrupt = latest;
+    corrupt.views.clear();
+    persistence_catalog_t corrupt_catalog(corrupt);
+    const auto corrupt_result = current_model.restore_workspace(
+        workspace, current_restore.snapshot->revision(), corrupt,
+        corrupt_catalog, missing_document_policy_t::reject);
+    require(!corrupt_result.error.ok() && !corrupt_result.changed &&
+                corrupt_result.snapshot == current_restore.snapshot &&
+                corrupt_catalog.calls() == 0,
+            "corrupt persisted layout must fail before adapter callbacks or publication");
+
+    std::vector<std::future<workbench_snapshot_ptr_t>> readers;
+    readers.reserve(16);
+    for (std::size_t index = 0; index < 16; ++index) {
+        readers.push_back(std::async(std::launch::async, [&current_model, workspace] {
+            workbench_snapshot_ptr_t snapshot;
+            if (!current_model.snapshot(workspace, snapshot).ok())
+                return workbench_snapshot_ptr_t{};
+            return snapshot;
+        }));
+    }
+    for (auto& reader : readers)
+        require(reader.get() == current_restore.snapshot,
+                "concurrent readers must observe one immutable restored generation");
+
+    const workspace_id_t isolated_workspace{402};
+    auto isolated_persisted = make_workspace(isolated_workspace);
+    isolated_persisted.revision = {9};
+    for (auto& panel : isolated_persisted.panels)
+        panel.revision = isolated_persisted.revision;
+    persistence_catalog_t isolated_catalog(isolated_persisted);
+    workbench_snapshot_ptr_t isolated_initial;
+    require(current_model.create_workspace(make_workspace(isolated_workspace),
+                                           isolated_initial).ok(),
+            "cross-workspace revision fixture must initialize");
+    const auto isolated_restore = current_model.restore_workspace(
+        isolated_workspace, isolated_initial->revision(), isolated_persisted,
+        isolated_catalog, missing_document_policy_t::reject);
+    workbench_snapshot_ptr_t preserved_current;
+    require(isolated_restore.error.ok() &&
+                isolated_restore.snapshot->revision() == workspace_revision_t{9} &&
+                current_model.snapshot(workspace, preserved_current).ok() &&
+                preserved_current == current_restore.snapshot,
+            "restoring another workspace must not alter the first revision lineage");
+
+    const auto maximum = (std::numeric_limits<std::uint64_t>::max)();
+    const workspace_id_t overflow_workspace{403};
+    auto overflow_persisted = make_workspace(overflow_workspace);
+    overflow_persisted.revision = {maximum};
+    for (auto& panel : overflow_persisted.panels)
+        panel.revision = overflow_persisted.revision;
+    workbench_model_t overflow_model;
+    workbench_snapshot_ptr_t overflow_initial;
+    require(overflow_model.create_workspace(make_workspace(overflow_workspace),
+                                            overflow_initial).ok(),
+            "restore-overflow workspace must initialize");
+    catalog_t refreshing_catalog;
+    const auto overflow_restore = overflow_model.restore_workspace(
+        overflow_workspace, overflow_initial->revision(), overflow_persisted,
+        refreshing_catalog, missing_document_policy_t::reject);
+    require(overflow_restore.error.code == workbench_error_code_t::revision_overflow &&
+                !overflow_restore.changed &&
+                overflow_restore.snapshot == overflow_initial,
+            "reconciliation above the maximum persisted revision must fail atomically");
+
+    persistence_catalog_t overflow_catalog(overflow_persisted);
+    const auto maximum_restore = overflow_model.restore_workspace(
+        overflow_workspace, overflow_initial->revision(), overflow_persisted,
+        overflow_catalog, missing_document_policy_t::reject);
+    require(maximum_restore.error.ok() && maximum_restore.changed &&
+                maximum_restore.snapshot->revision() == workspace_revision_t{maximum},
+            "an exact maximum persisted revision must remain a valid immutable baseline");
+    workbench_command_t overflow_mutation;
+    overflow_mutation.kind = workbench_command_kind_t::focus_view;
+    overflow_mutation.workspace = overflow_workspace;
+    overflow_mutation.expected_revision = maximum_restore.snapshot->revision();
+    overflow_mutation.view = {12};
+    const auto overflow_mutation_result = overflow_model.execute(overflow_mutation);
+    require(overflow_mutation_result.error.code ==
+                workbench_error_code_t::revision_overflow &&
+                !overflow_mutation_result.changed &&
+                overflow_mutation_result.snapshot == maximum_restore.snapshot,
+            "a restored maximum revision must reject mutation without wraparound");
+}
+
 }
 
 bool run_workbench_model_harness(std::string& failure)
@@ -855,9 +1173,11 @@ bool run_workbench_model_harness(std::string& failure)
         verify_concurrent_workspaces_and_unlocked_adapters();
         verify_capacity_boundaries();
         verify_identifier_and_revision_overflow();
+        verify_restored_revision_baseline_and_reopen_cycles();
         failure.clear();
         return true;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         failure = exception.what();
         return false;
     }

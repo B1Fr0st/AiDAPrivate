@@ -2,7 +2,7 @@ param(
     [string]$Python = "",
     [string]$SourceRoot = "",
     [string]$OutputDir = "",
-    [ValidateSet("auto", "pyinstaller", "nuitka")]
+    [ValidateSet("auto", "pyinstaller")]
     [string]$Backend = "auto",
     [int]$Jobs = 0,
     [switch]$Force,
@@ -13,52 +13,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$AidaFrozenMcpBuildDependencySchema = "20260621-reuse-venv-v1"
-$AidaFrozenMcpBuildRequirements = @(
-    "pip",
-    "wheel",
-    "setuptools",
-    "pyinstaller",
-    "rich",
-    "rich-click",
-    "tzdata"
-)
-
 function Resolve-RepoRoot {
     $scriptDir = Split-Path -Parent $PSCommandPath
     return (Resolve-Path (Join-Path $scriptDir "..")).Path
-}
-
-function Resolve-Python {
-    param([string]$Requested)
-    if ($Requested) {
-        $resolved = Resolve-Path -LiteralPath $Requested -ErrorAction Stop
-        return $resolved.Path
-    }
-    $repoRoot = Resolve-RepoRoot
-    $candidateRoots = @(
-        (Join-Path $repoRoot ".deps\camoufox-runtime\python.exe"),
-        (Join-Path $repoRoot "build-ninja\deps\camoufox-runtime\python.exe"),
-        "$env:LOCALAPPDATA\AiDA\runtimes\python\Python312-3.12.10-x64\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
-    )
-    foreach ($candidate in $candidateRoots) {
-        if ($candidate -and [IO.File]::Exists($candidate)) {
-            return (Resolve-Path -LiteralPath $candidate).Path
-        }
-    }
-    $py = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($py) {
-        try {
-            $candidate = (& $py.Source -3.12 -c "import sys; print(sys.executable)" 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $candidate -and [IO.File]::Exists([string]$candidate)) {
-                return [string]$candidate
-            }
-        } catch {
-        }
-    }
-    throw "Python 3.12 or 3.13 is required to build the frozen Camoufox reverse MCP executable."
 }
 
 function Resolve-CamoufoxBrowser {
@@ -74,60 +31,6 @@ function Resolve-CamoufoxBrowser {
         }
     }
     return ""
-}
-
-function Resolve-PatchedCamoufoxPackage {
-    param([string]$RepoRoot)
-    $candidates = @(
-        (Join-Path $RepoRoot ".deps\camoufox-runtime\Lib\site-packages\camoufox"),
-        (Join-Path $RepoRoot "build-ninja\deps\camoufox-runtime\Lib\site-packages\camoufox"),
-        (Join-Path $RepoRoot "camoufox-runtime\Lib\site-packages\camoufox")
-    )
-    foreach ($candidate in $candidates) {
-        $fingerprints = Join-Path $candidate "fingerprints.py"
-        if ($candidate -and [IO.Directory]::Exists($candidate) -and [IO.File]::Exists($fingerprints)) {
-            if (Select-String -LiteralPath $fingerprints -Pattern "def generate_context_fingerprint" -Quiet) {
-                return (Resolve-Path -LiteralPath $candidate).Path
-            }
-        }
-    }
-    throw "AiDA patched Camoufox package with generate_context_fingerprint was not found."
-}
-
-function Install-PatchedCamoufoxPackage {
-    param(
-        [string]$VenvPython,
-        [string]$RepoRoot
-    )
-    $package = Resolve-PatchedCamoufoxPackage $RepoRoot
-    $sitePackages = (& $VenvPython -c "import site; print(site.getsitepackages()[0])")
-    if ($LASTEXITCODE -ne 0 -or -not $sitePackages) {
-        throw "Failed to resolve venv site-packages."
-    }
-    $sitePackages = [string]$sitePackages
-    if (-not [IO.Directory]::Exists($sitePackages)) {
-        throw "Resolved venv site-packages directory does not exist: $sitePackages"
-    }
-    $dest = Join-Path $sitePackages "camoufox"
-    $fingerprints = Join-Path $package "fingerprints.py"
-    $packageNewest = Get-TreeNewestWriteTimeUtc -Root $package -Include @("*.py", "*.json", "*.dat")
-    $packageKey = "$package|$(Get-FileSha256OrEmpty $fingerprints)|$($packageNewest.ToString('o'))"
-    $packageKeyFile = Join-Path $sitePackages ".aida-patched-camoufox-key"
-    if ([IO.Directory]::Exists($dest) -and [IO.File]::Exists($packageKeyFile)) {
-        $existingKey = (Get-Content -LiteralPath $packageKeyFile -Raw).Trim()
-        if ($existingKey -eq $packageKey) {
-            Write-Output "patched_camoufox_package=$package"
-            Write-Output "patched_camoufox_package_copy=skipped"
-            return
-        }
-    }
-    if ([IO.Directory]::Exists($dest)) {
-        Remove-Item -LiteralPath $dest -Recurse -Force
-    }
-    Copy-Item -LiteralPath $package -Destination $dest -Recurse -Force
-    Set-Content -LiteralPath $packageKeyFile -Value $packageKey -Encoding ASCII
-    Write-Output "patched_camoufox_package=$package"
-    Write-Output "patched_camoufox_package_copy=ok"
 }
 
 function Get-RequiredFrozenMcpTools {
@@ -288,116 +191,207 @@ function Get-FileSha256OrEmpty {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
 
-function Get-FrozenMcpDependencyKey {
+function Resolve-LockedRepositoryPath {
     param(
-        [string]$PythonExe,
-        [string]$SourceRoot,
-        [string]$RepoRoot
+        [string]$RepoRoot,
+        [string]$RelativePath,
+        [switch]$Directory
     )
-    $pythonVersion = (& $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{sys.executable}')" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $pythonVersion) {
-        throw "Failed to query Python dependency key from $PythonExe"
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or [IO.Path]::IsPathRooted($RelativePath) -or
+        $RelativePath.Contains("\") -or $RelativePath.Contains(":") -or
+        ($RelativePath -split "/" | Where-Object { $_ -eq "" -or $_ -eq "." -or $_ -eq ".." })) {
+        throw "Offline build lock contains an unsafe relative path: $RelativePath"
     }
-    $dependencyInputs = @(
-        "pyproject.toml",
-        "setup.cfg",
-        "setup.py",
-        "requirements.txt",
-        "requirements-dev.txt",
-        "poetry.lock",
-        "uv.lock",
-        "pdm.lock"
+    $candidate = [IO.Path]::GetFullPath((Join-Path $RepoRoot ($RelativePath -replace "/", "\")))
+    $root = [IO.Path]::GetFullPath($RepoRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if (-not $candidate.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Offline build lock path escapes the repository: $RelativePath"
+    }
+    $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Offline build lock path is a reparse point: $RelativePath"
+    }
+    if ($Directory -and -not $item.PSIsContainer) {
+        throw "Offline build lock requires a directory: $RelativePath"
+    }
+    if (-not $Directory -and $item.PSIsContainer) {
+        throw "Offline build lock requires a regular file: $RelativePath"
+    }
+    return $item.FullName
+}
+
+function Assert-LockedFile {
+    param(
+        [string]$RepoRoot,
+        [string]$RelativePath,
+        [string]$ExpectedSha256,
+        [Nullable[Int64]]$ExpectedSize = $null
     )
-    $lines = [System.Collections.Generic.List[string]]::new()
-    $lines.Add("schema=$AidaFrozenMcpBuildDependencySchema")
-    $lines.Add("python=$pythonVersion")
-    $lines.Add("source=$SourceRoot")
-    $lines.Add("requirements=$($AidaFrozenMcpBuildRequirements -join ',')")
-    foreach ($relative in $dependencyInputs) {
-        $path = Join-Path $SourceRoot $relative
-        $lines.Add("$relative=$(Get-FileSha256OrEmpty $path)")
+    if ($ExpectedSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "Offline build lock has an invalid SHA-256: $RelativePath"
     }
-    $patchedCamoufox = Resolve-PatchedCamoufoxPackage $RepoRoot
-    $fingerprints = Join-Path $patchedCamoufox "fingerprints.py"
-    $lines.Add("patched_camoufox=$patchedCamoufox")
-    $lines.Add("patched_camoufox_fingerprints=$(Get-FileSha256OrEmpty $fingerprints)")
-    $text = ($lines -join "`n")
-    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $path = Resolve-LockedRepositoryPath -RepoRoot $RepoRoot -RelativePath $RelativePath
+    $item = Get-Item -LiteralPath $path -Force
+    if ($null -ne $ExpectedSize -and $item.Length -ne $ExpectedSize.Value) {
+        throw "Offline build lock size mismatch: $RelativePath"
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+    if (-not (Test-FixedTimeBytesEqual (Convert-HexToBytes $actual) (Convert-HexToBytes $ExpectedSha256))) {
+        throw "Offline build lock hash mismatch: $RelativePath"
+    }
+    return $path
+}
+
+function Convert-HexToBytes {
+    param([string]$Hex)
+    if (-not $Hex -or ($Hex.Length % 2) -ne 0 -or $Hex -notmatch '^[0-9a-fA-F]+$') {
+        throw "Invalid hexadecimal value."
+    }
+    $bytes = [byte[]]::new($Hex.Length / 2)
+    for ($index = 0; $index -lt $bytes.Length; ++$index) {
+        $bytes[$index] = [Convert]::ToByte($Hex.Substring($index * 2, 2), 16)
+    }
+    return $bytes
+}
+
+function Test-FixedTimeBytesEqual {
+    param(
+        [byte[]]$Left,
+        [byte[]]$Right
+    )
+    if ($null -eq $Left -or $null -eq $Right -or $Left.Length -ne $Right.Length) {
+        return $false
+    }
+    $difference = 0
+    for ($index = 0; $index -lt $Left.Length; ++$index) {
+        $difference = $difference -bor ($Left[$index] -bxor $Right[$index])
+    }
+    return $difference -eq 0
+}
+
+function Convert-HexToBase64Url {
+    param([string]$Hex)
+    return [Convert]::ToBase64String((Convert-HexToBytes $Hex)).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
+
+function Assert-WheelRecordEntries {
+    param(
+        [string]$EnvironmentRoot,
+        [string]$SitePackages,
+        [string]$RecordPath
+    )
+    $environment = [IO.Path]::GetFullPath($EnvironmentRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    foreach ($row in (Get-Content -LiteralPath $RecordPath -Encoding UTF8 | ConvertFrom-Csv -Header Path,Digest,Size)) {
+        if ([string]::IsNullOrWhiteSpace($row.Path)) {
+            throw "Offline wheel RECORD contains an empty path: $RecordPath"
+        }
+        $candidate = [IO.Path]::GetFullPath((Join-Path $SitePackages ($row.Path -replace "/", "\")))
+        if (-not $candidate.StartsWith($environment + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Offline wheel RECORD escapes the pinned environment: $RecordPath"
+        }
+        if ([string]::IsNullOrWhiteSpace($row.Digest)) {
+            continue
+        }
+        if ($row.Digest -notmatch '^sha256=([A-Za-z0-9_-]{43})$') {
+            throw "Offline wheel RECORD uses a non-SHA-256 digest: $RecordPath"
+        }
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Offline wheel RECORD references a non-regular file: $candidate"
+        }
+        if ($row.Size -match '^[0-9]+$' -and $item.Length -ne [Int64]$row.Size) {
+            throw "Offline wheel RECORD size mismatch: $candidate"
+        }
+        $actual = Convert-HexToBase64Url ((Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant())
+        if (-not (Test-FixedTimeBytesEqual ([Text.Encoding]::ASCII.GetBytes($actual)) ([Text.Encoding]::ASCII.GetBytes($Matches[1])))) {
+            throw "Offline wheel RECORD hash mismatch: $candidate"
+        }
+    }
+}
+
+function Resolve-OfflineFrozenMcpBuildEnvironment {
+    param(
+        [string]$RepoRoot,
+        [string]$RequestedPython,
+        [string]$RequestedSourceRoot
+    )
+    $lockPath = Resolve-LockedRepositoryPath -RepoRoot $RepoRoot -RelativePath "packaging/c03_camoufox_reverse_mcp_build.lock.json"
+    $lock = Get-Content -LiteralPath $lockPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($lock.schema -ne "aida.c03.camoufox-reverse-mcp-offline-build-lock" -or
+        [int]$lock.schema_version -ne 2 -or -not [bool]$lock.network_fetch_forbidden -or
+        $lock.freezer.backend -ne "pyinstaller" -or $lock.freezer.version -ne "6.21.0" -or
+        -not [bool]$lock.runtime_graph.verify_every_record_entry -or
+        -not [bool]$lock.runtime_graph.unexpected_distributions_forbidden) {
+        throw "Camoufox reverse MCP offline build lock is malformed or downgraded."
+    }
+    $environmentRoot = Resolve-LockedRepositoryPath -RepoRoot $RepoRoot -RelativePath ([string]$lock.environment_root) -Directory
+    $python = Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.interpreter.relative_path) -ExpectedSha256 ([string]$lock.interpreter.sha256) -ExpectedSize ([Int64]$lock.interpreter.size_bytes)
+    if ($RequestedPython) {
+        $resolvedRequested = (Resolve-Path -LiteralPath $RequestedPython -ErrorAction Stop).Path
+        if (-not [string]::Equals($resolvedRequested, $python, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Only the pinned offline Camoufox reverse MCP interpreter is permitted."
+        }
+    }
+    $version = (& $python -I -S -c "import sys; print('.'.join(str(v) for v in sys.version_info[:3]))" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $version -ne [string]$lock.interpreter.version) {
+        throw "Pinned offline Camoufox reverse MCP interpreter version mismatch."
+    }
+    Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.freezer.metadata_relative_path) -ExpectedSha256 ([string]$lock.freezer.metadata_sha256) | Out-Null
+    Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.freezer.record_relative_path) -ExpectedSha256 ([string]$lock.freezer.record_sha256) | Out-Null
+    Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.freezer.license_relative_path) -ExpectedSha256 ([string]$lock.freezer.license_sha256) | Out-Null
+    $sourceRoot = Resolve-LockedRepositoryPath -RepoRoot $RepoRoot -RelativePath ([string]$lock.source.root_relative_path) -Directory
+    if ($RequestedSourceRoot) {
+        $resolvedSource = (Resolve-Path -LiteralPath $RequestedSourceRoot -ErrorAction Stop).Path
+        if (-not [string]::Equals($resolvedSource, $sourceRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Only the source root bound by the offline build lock is permitted."
+        }
+    }
+    Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.source.project_relative_path) -ExpectedSha256 ([string]$lock.source.project_sha256) | Out-Null
+    Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.source.package_marker_relative_path) -ExpectedSha256 ([string]$lock.source.package_marker_sha256) | Out-Null
+    $binding = Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.source.environment_binding_relative_path) -ExpectedSha256 ([string]$lock.source.environment_binding_sha256)
+    $boundSource = (Get-Content -LiteralPath $binding -Raw -Encoding UTF8).Trim()
+    $expectedBoundSource = [IO.Path]::GetFullPath((Join-Path $sourceRoot "src"))
+    if (-not [string]::Equals([IO.Path]::GetFullPath($boundSource), $expectedBoundSource, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Offline Camoufox reverse MCP source binding does not match the locked source root."
+    }
+    $fingerprints = Assert-LockedFile -RepoRoot $RepoRoot -RelativePath ([string]$lock.patched_camoufox.fingerprints_relative_path) -ExpectedSha256 ([string]$lock.patched_camoufox.fingerprints_sha256)
+    if (-not (Select-String -LiteralPath $fingerprints -SimpleMatch ([string]$lock.patched_camoufox.required_symbol) -Quiet)) {
+        throw "Pinned patched Camoufox package is missing its privacy fingerprint contract."
+    }
+    $patchedPackage = Resolve-LockedRepositoryPath -RepoRoot $RepoRoot -RelativePath ([string]$lock.patched_camoufox.package_relative_path) -Directory
+    $sitePackages = Resolve-LockedRepositoryPath -RepoRoot $RepoRoot -RelativePath ([string]$lock.runtime_graph.site_packages_relative_path) -Directory
+    $records = @(Get-ChildItem -LiteralPath $sitePackages -Directory -Filter "*.dist-info" | Sort-Object Name | ForEach-Object {
+        $record = Join-Path $_.FullName "RECORD"
+        $metadata = Join-Path $_.FullName "METADATA"
+        if (-not [IO.File]::Exists($record) -or -not [IO.File]::Exists($metadata)) {
+            throw "Pinned offline distribution is missing METADATA or RECORD: $($_.FullName)"
+        }
+        Assert-WheelRecordEntries -EnvironmentRoot $environmentRoot -SitePackages $sitePackages -RecordPath $record
+        "$($_.Name)|$((Get-FileHash -Algorithm SHA256 -LiteralPath $record).Hash.ToLowerInvariant())|$((Get-FileHash -Algorithm SHA256 -LiteralPath $metadata).Hash.ToLowerInvariant())"
+    })
+    if ($records.Count -ne [int]$lock.runtime_graph.distribution_count) {
+        throw "Pinned offline distribution count mismatch."
+    }
+    $aggregateText = ($records -join "`n") + "`n"
+    $sha = [Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
-        return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace "-", "").ToLowerInvariant()
+        $aggregate = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($aggregateText))) -replace "-", "").ToLowerInvariant()
     } finally {
         $sha.Dispose()
     }
-}
-
-function Install-EditableReverseMcpSource {
-    param(
-        [string]$VenvPython,
-        [string]$SourceRoot,
-        [string]$VenvDir
-    )
-    $marker = Join-Path $VenvDir ".aida-source-root.txt"
-    $current = ""
-    if ([IO.File]::Exists($marker)) {
-        $current = (Get-Content -LiteralPath $marker -Raw).Trim()
+    if ($aggregate -ne [string]$lock.runtime_graph.record_metadata_aggregate_sha256) {
+        throw "Pinned offline distribution graph digest mismatch."
     }
-    $expectedPackageRoot = [IO.Path]::GetFullPath((Join-Path $SourceRoot "src\camoufox_reverse_mcp")).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    $installedPackageFile = (& $VenvPython -c "import pathlib, camoufox_reverse_mcp; print(pathlib.Path(camoufox_reverse_mcp.__file__).resolve())" 2>$null)
-    $installedOk = $false
-    if ($LASTEXITCODE -eq 0 -and $installedPackageFile) {
-        $installedPath = [IO.Path]::GetFullPath([string]$installedPackageFile)
-        $installedOk = $installedPath.StartsWith($expectedPackageRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+    Write-Output "offline_build_lock=$lockPath"
+    Write-Output "offline_build_lock_sha256=$(Get-FileSha256OrEmpty $lockPath)"
+    Write-Output "offline_build_environment=$environmentRoot"
+    Write-Output "offline_distribution_count=$($records.Count)"
+    return [pscustomobject]@{
+        Python = $python
+        SourceRoot = $sourceRoot
+        SitePackages = $sitePackages
+        PatchedPackageParent = Split-Path -Parent $patchedPackage
     }
-    if ($current -eq $SourceRoot -and $installedOk) {
-        Write-Output "source_mcp_editable_install_skipped=1"
-        return
-    }
-    & $VenvPython -m pip install --disable-pip-version-check --no-deps -e $SourceRoot
-    if ($LASTEXITCODE -ne 0) { throw "camoufox-reverse-mcp editable source install failed" }
-    Set-Content -LiteralPath $marker -Value $SourceRoot -Encoding ASCII
-    Write-Output "source_mcp_editable_install=ok"
-}
-
-function Ensure-FrozenMcpBuildVenv {
-    param(
-        [string]$PythonExe,
-        [string]$SourceRoot,
-        [string]$OutputDir,
-        [string]$RepoRoot,
-        [switch]$Force
-    )
-    $script:AidaFrozenMcpVenvPython = ""
-    $venv = Join-Path $OutputDir ".camoufox-reverse-mcp-build-venv"
-    $venvPython = Join-Path $venv "Scripts\python.exe"
-    $key = Get-FrozenMcpDependencyKey -PythonExe $PythonExe -SourceRoot $SourceRoot -RepoRoot $RepoRoot
-    $keyFile = Join-Path $venv ".aida-dependency-key"
-    $existingKey = ""
-    if ([IO.File]::Exists($keyFile)) {
-        $existingKey = (Get-Content -LiteralPath $keyFile -Raw).Trim()
-    }
-    $needsInstall = $Force -or -not [IO.File]::Exists($venvPython) -or $existingKey -ne $key
-    Write-Output "build_venv=$venv"
-    Write-Output "build_venv_dependency_key=$key"
-    if ($needsInstall) {
-        Write-Output "build_dependency_install=required"
-        Remove-DirectoryInsideWithRetry -Path $venv -AllowedRoot $OutputDir
-        & $PythonExe -m venv $venv
-        if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
-        $venvPython = Join-Path $venv "Scripts\python.exe"
-        & $venvPython -m pip install --disable-pip-version-check --upgrade $AidaFrozenMcpBuildRequirements
-        if ($LASTEXITCODE -ne 0) { throw "build dependency install failed" }
-        & $venvPython -m pip install --disable-pip-version-check -e $SourceRoot
-        if ($LASTEXITCODE -ne 0) { throw "camoufox-reverse-mcp dependency install failed" }
-        Set-Content -LiteralPath $keyFile -Value $key -Encoding ASCII
-        Set-Content -LiteralPath (Join-Path $venv ".aida-source-root.txt") -Value $SourceRoot -Encoding ASCII
-        Write-Output "build_dependency_install=ok"
-    } else {
-        Write-Output "build_dependency_install=skipped"
-        Install-EditableReverseMcpSource -VenvPython $venvPython -SourceRoot $SourceRoot -VenvDir $venv
-    }
-    Install-PatchedCamoufoxPackage -VenvPython $venvPython -RepoRoot $RepoRoot
-    $script:AidaFrozenMcpVenvPython = $venvPython
 }
 
 function Get-TreeNewestWriteTimeUtc {
@@ -1058,17 +1052,10 @@ if ($ContractCheckOnly) {
     exit 0
 }
 
-$SourceRoot = (Resolve-Path -LiteralPath $SourceRoot -ErrorAction Stop).Path
-if (-not [IO.File]::Exists((Join-Path $SourceRoot "pyproject.toml"))) {
-    throw "camoufox-reverse-mcp pyproject.toml was not found at $SourceRoot"
-}
+$offlineBuild = Resolve-OfflineFrozenMcpBuildEnvironment -RepoRoot $repoRoot -RequestedPython $Python -RequestedSourceRoot $SourceRoot
+$Python = $offlineBuild.Python
+$SourceRoot = $offlineBuild.SourceRoot
 Assert-SourceAddonPolicyContract -SourceRoot $SourceRoot
-
-$Python = Resolve-Python $Python
-$version = (& $Python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-if ($LASTEXITCODE -ne 0 -or -not ($version -match '^3\.(12|13)$')) {
-    throw "Nuitka build requires Python 3.12 or 3.13; got $version from $Python"
-}
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
@@ -1118,19 +1105,17 @@ if ([IO.File]::Exists($target) -and -not $Force) {
 
 $stamp = Get-Date -Format "yyyyMMddHHmmss"
 $workRoot = Join-Path $OutputDir ".camoufox-reverse-mcp-build-$stamp"
-$buildOut = Join-Path $workRoot "nuitka-out"
 New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+$priorPythonPath = $env:PYTHONPATH
 
 try {
-    $script:AidaFrozenMcpVenvPython = ""
     $selectedBackend = $Backend.ToLowerInvariant()
     if ($selectedBackend -eq "auto") { $selectedBackend = "pyinstaller" }
-    if ($selectedBackend -eq "nuitka") {
-        $script:AidaFrozenMcpBuildRequirements = $script:AidaFrozenMcpBuildRequirements + @("nuitka", "zstandard", "ordered-set")
+    if ($selectedBackend -ne "pyinstaller") {
+        throw "Only the pinned offline PyInstaller backend is permitted."
     }
-    Ensure-FrozenMcpBuildVenv -PythonExe $Python -SourceRoot $SourceRoot -OutputDir $OutputDir -RepoRoot $repoRoot -Force:$Force
-    $venvPython = $script:AidaFrozenMcpVenvPython
-    if (-not [IO.File]::Exists($venvPython)) { throw "Reusable Camoufox reverse MCP build venv did not produce python.exe" }
+    $venvPython = $Python
+    $env:PYTHONPATH = (@((Join-Path $SourceRoot "src"), $offlineBuild.PatchedPackageParent, $offlineBuild.SitePackages) -join [IO.Path]::PathSeparator)
     Invoke-SourceMcpContractCheck -PythonExe $venvPython
     $entry = Join-Path $workRoot "aida_camoufox_reverse_mcp_launcher.py"
 @'
@@ -2047,11 +2032,10 @@ if __name__ == "__main__":
     from camoufox_reverse_mcp.__main__ import main
     raise SystemExit(main())
 '@ | Set-Content -LiteralPath $entry -Encoding UTF8
-    if ($selectedBackend -eq "pyinstaller") {
-        $pyiWork = Join-Path $workRoot "pyinstaller-work"
-        $pyiSpec = Join-Path $workRoot "pyinstaller-spec"
-        $pyiHooks = Join-Path $workRoot "pyinstaller-hooks"
-        New-Item -ItemType Directory -Force -Path $pyiHooks | Out-Null
+    $pyiWork = Join-Path $workRoot "pyinstaller-work"
+    $pyiSpec = Join-Path $workRoot "pyinstaller-spec"
+    $pyiHooks = Join-Path $workRoot "pyinstaller-hooks"
+    New-Item -ItemType Directory -Force -Path $pyiHooks | Out-Null
         @'
 from PyInstaller.utils.hooks import collect_all
 
@@ -2069,9 +2053,9 @@ def _filter(name):
 
 datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_filter, on_error="ignore")
 '@ | Set-Content -LiteralPath (Join-Path $pyiHooks "hook-browserforge.py") -Encoding UTF8
-        $pyiBuildLog = Join-Path $workRoot "pyinstaller-build.stdout.log"
-        $pyiErrorLog = Join-Path $workRoot "pyinstaller-build.stderr.log"
-        $pyiArgs = @(
+    $pyiBuildLog = Join-Path $workRoot "pyinstaller-build.stdout.log"
+    $pyiErrorLog = Join-Path $workRoot "pyinstaller-build.stderr.log"
+    $pyiArgs = @(
             "-m", "PyInstaller",
             "--noconfirm",
             "--clean",
@@ -2108,59 +2092,25 @@ datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_
             "--hidden-import", "ua_parser",
             "--hidden-import", "ua_parser_builtins",
             $entry
-        )
-        $pyiProcess = Start-Process -FilePath $venvPython -ArgumentList $pyiArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput $pyiBuildLog -RedirectStandardError $pyiErrorLog
-        $pyiExitCode = $pyiProcess.ExitCode
-        Write-Output "pyinstaller_exit_code=$pyiExitCode"
-        Write-Output "pyinstaller_build_log=$pyiBuildLog"
-        Write-Output "pyinstaller_stderr_log=$pyiErrorLog"
-        if ($pyiExitCode -ne 0) {
-            if (Test-Path -LiteralPath $pyiBuildLog) {
-                Get-Content -LiteralPath $pyiBuildLog
-            }
-            if (Test-Path -LiteralPath $pyiErrorLog) {
-                Get-Content -LiteralPath $pyiErrorLog
-            }
-            throw "PyInstaller build failed"
+    )
+    $pyiProcess = Start-Process -FilePath $venvPython -ArgumentList $pyiArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput $pyiBuildLog -RedirectStandardError $pyiErrorLog
+    $pyiExitCode = $pyiProcess.ExitCode
+    Write-Output "pyinstaller_exit_code=$pyiExitCode"
+    Write-Output "pyinstaller_build_log=$pyiBuildLog"
+    Write-Output "pyinstaller_stderr_log=$pyiErrorLog"
+    if ($pyiExitCode -ne 0) {
+        if (Test-Path -LiteralPath $pyiBuildLog) {
+            Get-Content -LiteralPath $pyiBuildLog
         }
-        $built = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe"
-        if (-not [IO.File]::Exists($built)) { throw "PyInstaller onefile output executable was not produced" }
-        New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
-        Copy-Item -LiteralPath $built -Destination $target -Force
-    } elseif ($selectedBackend -eq "nuitka") {
-        & $venvPython -m nuitka `
-            --standalone `
-            --onefile `
-            --assume-yes-for-downloads `
-            --remove-output `
-            --disable-cache=ccache `
-            --jobs=$Jobs `
-            --output-dir=$buildOut `
-            --output-filename=AiDA_CamoufoxReverseMcp.exe `
-            --include-package=camoufox_reverse_mcp `
-            --include-package-data=camoufox_reverse_mcp `
-            --include-package=mcp `
-            --include-package=camoufox `
-            --include-package=browserforge `
-            --include-package-data=browserforge `
-            --include-package=apify_fingerprint_datapoints `
-            --include-package-data=apify_fingerprint_datapoints `
-            --include-package=language_tags `
-            --include-package-data=language_tags `
-            --include-package=ua_parser `
-            --include-package-data=ua_parser `
-            --include-package=ua_parser_builtins `
-            --include-package-data=ua_parser_builtins `
-            --include-package=playwright `
-            --include-package=esprima `
-            $entry
-        if ($LASTEXITCODE -ne 0) { throw "Nuitka build failed" }
-        $built = Join-Path $buildOut "AiDA_CamoufoxReverseMcp.exe"
-        if (-not [IO.File]::Exists($built)) { throw "Nuitka output executable was not produced" }
-        Copy-Item -LiteralPath $built -Destination $target -Force
-    } else {
-        throw "Unsupported backend: $Backend"
+        if (Test-Path -LiteralPath $pyiErrorLog) {
+            Get-Content -LiteralPath $pyiErrorLog
+        }
+        throw "PyInstaller build failed"
     }
+    $built = Join-Path $OutputDir "AiDA_CamoufoxReverseMcp.exe"
+    if (-not [IO.File]::Exists($built)) { throw "PyInstaller onefile output executable was not produced" }
+    New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+    Copy-Item -LiteralPath $built -Destination $target -Force
     if (-not [IO.File]::Exists($target)) { throw "Frozen executable was not produced at $target" }
     Assert-FrozenMcpCustomerSafeExecutable $target
     Copy-Item -LiteralPath $target -Destination $flatTarget -Force
@@ -2178,6 +2128,7 @@ datas, binaries, hiddenimports = collect_all("browserforge", filter_submodules=_
     Write-Output "frozen_mcp_flat_size=$flatSize"
     Write-Output "frozen_mcp_flat_sha256=$flatHash"
 } finally {
+    $env:PYTHONPATH = $priorPythonPath
     if ([IO.Directory]::Exists($workRoot)) {
         Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

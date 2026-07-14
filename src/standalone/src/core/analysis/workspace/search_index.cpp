@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -326,6 +327,212 @@ workspace_result_t<search_page_t> filtered_page(std::size_t candidate_count,
     page.truncated = page.next_offset < page.total;
     return workspace_result_t<search_page_t>::success(std::move(page));
 }
+
+constexpr std::uint32_t kSerializedSearchMagic = 0x58444953U;
+constexpr std::uint64_t kSerializedSearchMaximumBytes = 8ULL << 30;
+
+class search_blob_writer_t final {
+public:
+    search_blob_writer_t(const search_index_t::serialized_sink_t& sink,
+                         const cancellation_token_t& cancel)
+        : sink_(sink), cancel_(cancel) {}
+
+    void u8(std::uint8_t value) { append(&value, sizeof(value)); }
+    void u32(std::uint32_t value) {
+        std::array<std::uint8_t, 4> bytes{};
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            bytes[shift / 8] = static_cast<std::uint8_t>(value >> shift);
+        append(bytes.data(), bytes.size());
+    }
+    void u64(std::uint64_t value) {
+        std::array<std::uint8_t, 8> bytes{};
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            bytes[shift / 8] = static_cast<std::uint8_t>(value >> shift);
+        append(bytes.data(), bytes.size());
+    }
+    template <std::size_t Size>
+    void fixed(const std::array<std::uint8_t, Size>& value) {
+        append(value.data(), value.size());
+    }
+    void bytes(const void* data, std::size_t size) {
+        u64(size);
+        append(static_cast<const std::uint8_t*>(data), size);
+    }
+    bool failed() const noexcept { return error_.has_value(); }
+    std::uint64_t size() const noexcept { return size_; }
+    workspace_result_t<void> finish() {
+        poll();
+        if (error_)
+            return workspace_result_t<void>::failure(*error_);
+        return workspace_result_t<void>::success();
+    }
+
+private:
+    void poll() {
+        if (!error_ && cancel_.stop_requested())
+            error_ = stop_error(cancel_, "search_index.serialize");
+    }
+    void append(const std::uint8_t* data, std::size_t size) {
+        if (error_)
+            return;
+        if ((!data && size != 0) ||
+            size > kSerializedSearchMaximumBytes - size_) {
+            error_ = make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "serialized search index exceeds its bounded byte limit",
+                "search_index.serialize");
+            return;
+        }
+        for (std::size_t offset = 0; offset < size;) {
+            poll();
+            if (error_)
+                return;
+            const auto count = (std::min)(size - offset,
+                                          static_cast<std::size_t>(64U << 10));
+            try {
+                auto written = sink_(data + offset, count);
+                if (!written) {
+                    error_ = written.error();
+                    return;
+                }
+            } catch (const std::bad_alloc&) {
+                error_ = make_workspace_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "serialized search sink exhausted its memory budget",
+                    "search_index.serialize");
+                return;
+            } catch (const std::exception& exception) {
+                error_ = make_workspace_error(
+                    workspace_error_code_t::persistence_failure,
+                    std::string("serialized search sink failed: ") + exception.what(),
+                    "search_index.serialize");
+                return;
+            } catch (...) {
+                error_ = make_workspace_error(
+                    workspace_error_code_t::persistence_failure,
+                    "serialized search sink failed",
+                    "search_index.serialize");
+                return;
+            }
+            offset += count;
+            size_ += count;
+        }
+    }
+
+    const search_index_t::serialized_sink_t& sink_;
+    const cancellation_token_t& cancel_;
+    std::uint64_t size_ = 0;
+    std::optional<workspace_error_t> error_;
+};
+
+class search_blob_reader_t final {
+public:
+    search_blob_reader_t(const std::vector<std::uint8_t>& input,
+                         const cancellation_token_t& cancel)
+        : input_(input), cancel_(cancel) {}
+
+    std::uint8_t u8() {
+        const auto* value = take(1);
+        return value ? value[0] : 0;
+    }
+    std::uint32_t u32() {
+        const auto* value = take(4);
+        if (!value)
+            return 0;
+        std::uint32_t result = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            result |= static_cast<std::uint32_t>(value[shift / 8]) << shift;
+        return result;
+    }
+    std::uint64_t u64() {
+        const auto* value = take(8);
+        if (!value)
+            return 0;
+        std::uint64_t result = 0;
+        for (unsigned shift = 0; shift < 64; shift += 8)
+            result |= static_cast<std::uint64_t>(value[shift / 8]) << shift;
+        return result;
+    }
+    template <std::size_t Size>
+    std::array<std::uint8_t, Size> fixed() {
+        std::array<std::uint8_t, Size> result{};
+        const auto* value = take(Size);
+        if (value)
+            std::memcpy(result.data(), value, Size);
+        return result;
+    }
+    std::vector<char> bytes(std::uint64_t maximum) {
+        const auto size = u64();
+        if (failed() || size > maximum || size > remaining() ||
+            size > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
+            fail("serialized search byte range exceeds its bounded input");
+            return {};
+        }
+        std::vector<char> result;
+        result.resize(static_cast<std::size_t>(size));
+        if (size != 0) {
+            const auto* value = take(static_cast<std::size_t>(size));
+            if (value)
+                std::memcpy(result.data(), value, result.size());
+        }
+        return result;
+    }
+    std::size_t count(std::uint64_t maximum,
+                      std::size_t minimum_bytes_per_record) {
+        const auto value = u64();
+        std::uint64_t minimum_bytes = 0;
+        if (failed() || value > maximum ||
+            !checked_mul_u64(value, minimum_bytes_per_record, minimum_bytes) ||
+            minimum_bytes > remaining() ||
+            value > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
+            fail("serialized search record count exceeds its bounded input");
+            return 0;
+        }
+        return static_cast<std::size_t>(value);
+    }
+    bool failed() const noexcept { return error_.has_value(); }
+    void reject(std::string message) { fail(std::move(message)); }
+    workspace_result_t<void> finish() {
+        if (!error_ && cancel_.stop_requested())
+            error_ = stop_error(cancel_, "search_index.restore");
+        if (!error_ && offset_ != input_.size())
+            fail("serialized search index contains trailing bytes");
+        if (error_)
+            return workspace_result_t<void>::failure(*error_);
+        return workspace_result_t<void>::success();
+    }
+
+private:
+    std::uint64_t remaining() const noexcept {
+        return static_cast<std::uint64_t>(input_.size() - offset_);
+    }
+    const std::uint8_t* take(std::size_t size) {
+        if (error_)
+            return nullptr;
+        if (cancel_.stop_requested()) {
+            error_ = stop_error(cancel_, "search_index.restore");
+            return nullptr;
+        }
+        if (size > input_.size() - offset_) {
+            fail("serialized search index is truncated");
+            return nullptr;
+        }
+        const auto* result = input_.data() + offset_;
+        offset_ += size;
+        return result;
+    }
+    void fail(std::string message) {
+        if (!error_)
+            error_ = make_workspace_error(workspace_error_code_t::integrity_failure,
+                                          std::move(message),
+                                          "search_index.restore");
+    }
+
+    const std::vector<std::uint8_t>& input_;
+    const cancellation_token_t& cancel_;
+    std::size_t offset_ = 0;
+    std::optional<workspace_error_t> error_;
+};
 
 }
 
@@ -922,6 +1129,684 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
                 "search-index allocation exceeds container limits", "search_index"));
     }
+}
+
+workspace_result_t<std::uint64_t> search_index_t::serialized_size(
+    const cancellation_token_t& cancel) const {
+    std::uint64_t total = 0;
+    const serialized_sink_t sink = [&](const std::uint8_t*, std::size_t size) {
+        std::uint64_t updated = 0;
+        if (!checked_add_u64(total, size, updated) ||
+            updated > kSerializedSearchMaximumBytes) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "serialized search index size exceeds its budget",
+                                     "search_index.serialize"));
+        }
+        total = updated;
+        return workspace_result_t<void>::success();
+    };
+    auto serialized = serialize_to(sink, cancel);
+    if (!serialized)
+        return workspace_result_t<std::uint64_t>::failure(serialized.error());
+    return workspace_result_t<std::uint64_t>::success(total);
+}
+
+workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::restore(
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    std::vector<data_candidate_record_t> data_candidates,
+    std::vector<switch_record_t> switches,
+    std::vector<type_candidate_record_t> types,
+    std::shared_ptr<analysis_metrics_t> metrics,
+    const search_index_limits_t& limits,
+    const std::vector<std::uint8_t>& serialized,
+    const cancellation_token_t& cancel) {
+    try {
+        if (!snapshot || serialized.empty() ||
+            serialized.size() > kSerializedSearchMaximumBytes ||
+            serialized.size() > limits.max_index_bytes ||
+            (!snapshot->normalized_image && !snapshot->image) ||
+            limits.max_entries == 0 ||
+            limits.max_entries > std::numeric_limits<std::uint32_t>::max() ||
+            limits.max_trigram_postings == 0 ||
+            limits.max_indexed_text_bytes == 0 ||
+            limits.max_index_bytes == 0 ||
+            limits.max_query_bytes == 0 ||
+            limits.max_query_bytes > 16U * 1024U * 1024U ||
+            limits.max_results_per_query == 0 ||
+            limits.max_results_per_query > (1U << 20) ||
+            limits.cancellation_check_interval == 0 ||
+            cancel.stop_requested()) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                cancel.stop_requested()
+                    ? stop_error(cancel, "search_index.restore")
+                    : make_workspace_error(workspace_error_code_t::invalid_argument,
+                                           "serialized search restore input is invalid",
+                                           "search_index.restore"));
+        }
+        constexpr std::size_t serialized_accounting_bytes = 11U * sizeof(std::uint64_t);
+        const auto serialized_resident_bytes = vector_bytes(
+            serialized.capacity(), sizeof(std::uint8_t));
+        if (serialized.size() < serialized_accounting_bytes) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "serialized search accounting is truncated",
+                                     "search_index.restore"));
+        }
+        const auto read_tail_u64 = [&](std::size_t offset) {
+            std::uint64_t value = 0;
+            for (unsigned shift = 0; shift < 64; shift += 8) {
+                value |= static_cast<std::uint64_t>(serialized[offset + shift / 8])
+                    << shift;
+            }
+            return value;
+        };
+        const auto declared_memory_bytes = read_tail_u64(
+            serialized.size() - serialized_accounting_bytes);
+        if (serialized_resident_bytes ==
+                (std::numeric_limits<std::uint64_t>::max)() ||
+            declared_memory_bytes == 0 ||
+            declared_memory_bytes > limits.max_index_bytes ||
+            serialized_resident_bytes >
+                limits.max_index_bytes - declared_memory_bytes) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                    "serialized search restore exceeds its combined resident-memory budget",
+                    "search_index.restore"));
+        }
+        search_blob_reader_t reader(serialized, cancel);
+        if (reader.u32() != kSerializedSearchMagic ||
+            reader.u32() != serialized_version) {
+            reader.reject("serialized search header is invalid");
+        }
+        auto impl = std::make_unique<impl_t>();
+        impl->identity.binary_id.bytes = reader.fixed<32>();
+        impl->identity.load_profile_hash.bytes = reader.fixed<32>();
+        const auto has_provider_hash = reader.u8();
+        const auto provider_hash = reader.fixed<32>();
+        if (has_provider_hash > 1U)
+            reader.reject("serialized provider-hash marker is invalid");
+        if (has_provider_hash != 0) {
+            sha256_digest_t digest;
+            digest.bytes = provider_hash;
+            impl->identity.provider_content_hash = digest;
+        } else if (std::any_of(provider_hash.begin(), provider_hash.end(),
+                               [](std::uint8_t value) { return value != 0; })) {
+            reader.reject("serialized absent provider hash is not canonical");
+        }
+        impl->identity.generation = reader.u64();
+        impl->identity.analysis_revision = reader.u64();
+        impl->identity.overlay_revision = reader.u64();
+        impl->identity.provider_size = reader.u64();
+        impl->architecture = static_cast<architecture_id_t>(reader.u8());
+        impl->architecture_mode = static_cast<architecture_mode_t>(reader.u8());
+        impl->cursor_integrity_key[0] = reader.u64();
+        impl->cursor_integrity_key[1] = reader.u64();
+        impl->limits.max_entries = reader.u64();
+        impl->limits.max_trigram_postings = reader.u64();
+        impl->limits.max_indexed_text_bytes = reader.u64();
+        impl->limits.max_index_bytes = reader.u64();
+        impl->limits.max_query_bytes = reader.u32();
+        impl->limits.max_results_per_query = reader.u32();
+        impl->limits.cancellation_check_interval = reader.u32();
+        const auto expected_identity = snapshot_identity(*snapshot);
+        const auto expected_architecture = snapshot->normalized_image
+            ? snapshot->normalized_image->architecture
+            : snapshot->image->architecture();
+        const auto expected_architecture_mode = snapshot->normalized_image
+            ? snapshot->normalized_image->architecture_mode
+            : snapshot->image->architecture_mode();
+        if (impl->identity != expected_identity ||
+            !impl->identity.valid() ||
+            impl->architecture != expected_architecture ||
+            impl->architecture_mode != expected_architecture_mode ||
+            (impl->cursor_integrity_key[0] == 0 &&
+             impl->cursor_integrity_key[1] == 0) ||
+            impl->limits.max_entries == 0 ||
+            impl->limits.max_entries > limits.max_entries ||
+            impl->limits.max_trigram_postings == 0 ||
+            impl->limits.max_trigram_postings > limits.max_trigram_postings ||
+            impl->limits.max_indexed_text_bytes == 0 ||
+            impl->limits.max_indexed_text_bytes > limits.max_indexed_text_bytes ||
+            impl->limits.max_index_bytes == 0 ||
+            impl->limits.max_index_bytes > limits.max_index_bytes ||
+            impl->limits.max_query_bytes == 0 ||
+            impl->limits.max_query_bytes > limits.max_query_bytes ||
+            impl->limits.max_results_per_query == 0 ||
+            impl->limits.max_results_per_query > limits.max_results_per_query ||
+            impl->limits.cancellation_check_interval == 0) {
+            reader.reject("serialized search identity or limits are inconsistent");
+        }
+
+        const auto string_count = reader.count(
+            impl->limits.max_entries * 2ULL, sizeof(std::uint32_t));
+        impl->strings.offsets.reserve(string_count);
+        for (std::size_t index = 0; index < string_count; ++index)
+            impl->strings.offsets.push_back(reader.u32());
+        const auto length_count = reader.count(
+            impl->limits.max_entries * 2ULL, sizeof(std::uint32_t));
+        impl->strings.lengths.reserve(length_count);
+        for (std::size_t index = 0; index < length_count; ++index)
+            impl->strings.lengths.push_back(reader.u32());
+        impl->strings.bytes = reader.bytes(
+            impl->limits.max_indexed_text_bytes);
+        if (string_count != length_count) {
+            reader.reject("serialized search string tables differ in length");
+        }
+        for (std::size_t index = 0; index < impl->strings.offsets.size(); ++index) {
+            const auto offset = impl->strings.offsets[index];
+            const auto length = impl->strings.lengths[index];
+            if (offset > impl->strings.bytes.size() ||
+                length > impl->strings.bytes.size() - offset) {
+                reader.reject("serialized search string range is invalid");
+                break;
+            }
+        }
+
+        const auto record_count = reader.count(impl->limits.max_entries, 41U);
+        impl->records.reserve(record_count);
+        for (std::size_t index = 0; index < record_count; ++index) {
+            packed_search_record_t record;
+            record.entity_id = reader.u64();
+            record.numeric_value = reader.u64();
+            record.address.value = reader.u64();
+            record.address.metadata = reader.u32();
+            record.text.value = reader.u32();
+            record.normalized_text.value = reader.u32();
+            record.auxiliary_flags = reader.u32();
+            record.kind = static_cast<search_entity_kind_t>(reader.u8());
+            if (record.entity_id == 0 ||
+                record.kind > search_entity_kind_t::byte_sequence ||
+                (record.text.valid() && !impl->strings.lookup(record.text)) ||
+                (record.normalized_text.valid() &&
+                 !impl->strings.lookup(record.normalized_text))) {
+                reader.reject("serialized search record is invalid");
+                break;
+            }
+            impl->records.push_back(record);
+        }
+        const auto text_count = reader.count(impl->limits.max_entries, 8U);
+        impl->text_references.reserve(text_count);
+        for (std::size_t index = 0; index < text_count; ++index) {
+            packed_text_reference_t reference;
+            reference.record = reader.u32();
+            reference.normalized.value = reader.u32();
+            if (reference.record >= impl->records.size() ||
+                !impl->strings.lookup(reference.normalized) ||
+                impl->records[reference.record].normalized_text.value !=
+                    reference.normalized.value) {
+                reader.reject("serialized text reference is invalid");
+                break;
+            }
+            impl->text_references.push_back(reference);
+        }
+        const auto read_u32_vector = [&](std::vector<std::uint32_t>& output,
+                                         std::uint64_t maximum) {
+            const auto count = reader.count(maximum, sizeof(std::uint32_t));
+            output.reserve(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                const auto reference = reader.u32();
+                if (reference >= impl->records.size()) {
+                    reader.reject("serialized packed reference is out of range");
+                    return;
+                }
+                output.push_back(reference);
+            }
+        };
+        read_u32_vector(impl->address_references, impl->limits.max_entries);
+        read_u32_vector(impl->entity_kind_references, impl->limits.max_entries);
+        read_u32_vector(impl->entity_id_references, impl->limits.max_entries);
+        read_u32_vector(impl->instruction_references, impl->limits.max_entries);
+        const auto opcode_count = reader.count(impl->limits.max_entries, 8U);
+        impl->opcode_references.reserve(opcode_count);
+        for (std::size_t index = 0; index < opcode_count; ++index) {
+            packed_key32_reference_t reference{reader.u32(), reader.u32()};
+            if (reference.record >= impl->records.size()) {
+                reader.reject("serialized opcode reference is out of range");
+                break;
+            }
+            impl->opcode_references.push_back(reference);
+        }
+        const auto immediate_count = reader.count(impl->limits.max_entries, 12U);
+        impl->immediate_references.reserve(immediate_count);
+        for (std::size_t index = 0; index < immediate_count; ++index) {
+            packed_key64_reference_t reference{reader.u64(), reader.u32()};
+            if (reference.record >= impl->records.size()) {
+                reader.reject("serialized immediate reference is out of range");
+                break;
+            }
+            impl->immediate_references.push_back(reference);
+        }
+        const auto trigram_count = reader.count(
+            impl->limits.max_trigram_postings, 12U);
+        impl->trigram_spans.reserve(trigram_count);
+        for (std::size_t index = 0; index < trigram_count; ++index) {
+            packed_trigram_span_t span{reader.u32(), reader.u32(), reader.u32()};
+            impl->trigram_spans.push_back(span);
+        }
+        read_u32_vector(impl->trigram_postings,
+                        impl->limits.max_trigram_postings);
+        impl->accounting.memory_bytes = reader.u64();
+        impl->accounting.source_text_bytes = reader.u64();
+        impl->accounting.referenced_text_bytes = reader.u64();
+        impl->accounting.unique_text_bytes = reader.u64();
+        impl->accounting.record_count = reader.u64();
+        impl->accounting.text_reference_count = reader.u64();
+        impl->accounting.address_reference_count = reader.u64();
+        impl->accounting.entity_reference_count = reader.u64();
+        impl->accounting.trigram_count = reader.u64();
+        impl->accounting.trigram_posting_count = reader.u64();
+        impl->accounting.string_count = reader.u64();
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                finished.error());
+
+        const auto reference_valid = [&](std::uint32_t reference) {
+            return reference < impl->records.size();
+        };
+        const bool records_sorted = std::is_sorted(
+            impl->records.begin(), impl->records.end(), record_less);
+        const bool opcode_sorted = std::is_sorted(
+            impl->opcode_references.begin(), impl->opcode_references.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.key != rhs.key ? lhs.key < rhs.key
+                                          : lhs.record < rhs.record;
+            });
+        const bool immediate_sorted = std::is_sorted(
+            impl->immediate_references.begin(), impl->immediate_references.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.key != rhs.key ? lhs.key < rhs.key
+                                          : lhs.record < rhs.record;
+            });
+        const bool opcode_unique = std::adjacent_find(
+            impl->opcode_references.begin(), impl->opcode_references.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.key == rhs.key && lhs.record == rhs.record;
+            }) == impl->opcode_references.end();
+        const bool immediate_unique = std::adjacent_find(
+            impl->immediate_references.begin(),
+            impl->immediate_references.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.key == rhs.key && lhs.record == rhs.record;
+            }) == impl->immediate_references.end();
+        const bool address_sorted = std::is_sorted(
+            impl->address_references.begin(), impl->address_references.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) {
+                return record_less(impl->records[lhs], impl->records[rhs]);
+            });
+        const bool entity_kind_sorted = std::is_sorted(
+            impl->entity_kind_references.begin(),
+            impl->entity_kind_references.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) {
+                const auto& left = impl->records[lhs];
+                const auto& right = impl->records[rhs];
+                if (left.kind != right.kind)
+                    return left.kind < right.kind;
+                if (left.entity_id != right.entity_id)
+                    return left.entity_id < right.entity_id;
+                return lhs < rhs;
+            });
+        const bool entity_id_sorted = std::is_sorted(
+            impl->entity_id_references.begin(),
+            impl->entity_id_references.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) {
+                const auto& left = impl->records[lhs];
+                const auto& right = impl->records[rhs];
+                if (left.entity_id != right.entity_id)
+                    return left.entity_id < right.entity_id;
+                if (left.kind != right.kind)
+                    return left.kind < right.kind;
+                return lhs < rhs;
+            });
+        const bool instruction_sorted = std::is_sorted(
+            impl->instruction_references.begin(),
+            impl->instruction_references.end());
+        const bool text_sorted = std::is_sorted(
+            impl->text_references.begin(), impl->text_references.end(),
+            [&](const auto& lhs, const auto& rhs) {
+                const auto left = impl->strings.lookup(lhs.normalized)
+                    .value_or(std::string_view{});
+                const auto right = impl->strings.lookup(rhs.normalized)
+                    .value_or(std::string_view{});
+                if (left != right)
+                    return left < right;
+                return record_less(impl->records[lhs.record],
+                                   impl->records[rhs.record]);
+            });
+        const bool text_records_unique = std::adjacent_find(
+            impl->text_references.begin(), impl->text_references.end(),
+            [](const auto& lhs, const auto& rhs) {
+                return lhs.record == rhs.record;
+            }) == impl->text_references.end();
+        bool trigram_valid = std::is_sorted(
+            impl->trigram_spans.begin(), impl->trigram_spans.end(),
+            [](const auto& lhs, const auto& rhs) { return lhs.key < rhs.key; });
+        std::uint64_t next_posting = 0;
+        std::optional<std::uint32_t> previous_trigram;
+        for (const auto& span : impl->trigram_spans) {
+            if ((previous_trigram && *previous_trigram >= span.key) ||
+                span.begin != next_posting || span.count == 0 ||
+                span.begin > impl->trigram_postings.size() ||
+                span.count > impl->trigram_postings.size() - span.begin ||
+                !std::is_sorted(
+                    impl->trigram_postings.begin() + span.begin,
+                    impl->trigram_postings.begin() + span.begin + span.count) ||
+                std::adjacent_find(
+                    impl->trigram_postings.begin() + span.begin,
+                    impl->trigram_postings.begin() + span.begin + span.count) !=
+                    impl->trigram_postings.begin() + span.begin + span.count) {
+                trigram_valid = false;
+                break;
+            }
+            previous_trigram = span.key;
+            next_posting += span.count;
+        }
+        trigram_valid = trigram_valid &&
+            next_posting == impl->trigram_postings.size();
+        std::uint64_t expected_records = 0;
+        const std::array<std::uint64_t, 6> source_counts{
+            snapshot->symbols.size(), snapshot->strings.size(),
+            snapshot->instructions.size(), data_candidates.size(),
+            switches.size(), types.size()};
+        bool source_count_valid = true;
+        for (const auto count : source_counts) {
+            std::uint64_t updated = 0;
+            if (!checked_add_u64(expected_records, count, updated)) {
+                source_count_valid = false;
+                break;
+            }
+            expected_records = updated;
+        }
+        const auto references_unique = [](const auto& references) {
+            return std::adjacent_find(references.begin(), references.end()) ==
+                references.end();
+        };
+        const bool entity_keys_unique = std::adjacent_find(
+            impl->entity_kind_references.begin(),
+            impl->entity_kind_references.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) {
+                const auto& left = impl->records[lhs];
+                const auto& right = impl->records[rhs];
+                return left.kind == right.kind &&
+                       left.entity_id == right.entity_id;
+            }) == impl->entity_kind_references.end();
+        if (!source_count_valid || expected_records != impl->records.size() ||
+            !records_sorted || !address_sorted || !entity_kind_sorted ||
+            !entity_id_sorted || !instruction_sorted || !text_sorted ||
+            !text_records_unique ||
+            !opcode_sorted ||
+            !immediate_sorted || !opcode_unique || !immediate_unique ||
+            !trigram_valid || !entity_keys_unique ||
+            impl->address_references.size() != impl->records.size() ||
+            impl->entity_kind_references.size() != impl->records.size() ||
+            impl->entity_id_references.size() != impl->records.size() ||
+            impl->instruction_references.size() !=
+                snapshot->instructions.size() ||
+            impl->opcode_references.size() != snapshot->instructions.size() ||
+            !references_unique(impl->address_references) ||
+            !references_unique(impl->entity_kind_references) ||
+            !references_unique(impl->entity_id_references) ||
+            !references_unique(impl->instruction_references) ||
+            !std::all_of(impl->trigram_postings.begin(),
+                         impl->trigram_postings.end(),
+                         [&](std::uint32_t reference) {
+                             return reference < impl->text_references.size();
+                         }) ||
+            !std::all_of(impl->address_references.begin(),
+                         impl->address_references.end(), reference_valid) ||
+            !std::all_of(impl->instruction_references.begin(),
+                         impl->instruction_references.end(),
+                         [&](std::uint32_t reference) {
+                             return reference_valid(reference) &&
+                                 impl->records[reference].kind ==
+                                     search_entity_kind_t::instruction;
+                         }) ||
+            !std::all_of(impl->opcode_references.begin(),
+                         impl->opcode_references.end(),
+                         [&](const auto& reference) {
+                             return reference_valid(reference.record) &&
+                                 impl->records[reference.record].kind ==
+                                     search_entity_kind_t::instruction &&
+                                 impl->records[reference.record].numeric_value ==
+                                     reference.key;
+                         }) ||
+            !std::all_of(impl->immediate_references.begin(),
+                         impl->immediate_references.end(),
+                         [&](const auto& reference) {
+                             return reference_valid(reference.record) &&
+                                 impl->records[reference.record].kind ==
+                                     search_entity_kind_t::instruction;
+                         }) ||
+            impl->accounting.record_count != impl->records.size() ||
+            impl->accounting.text_reference_count != impl->text_references.size() ||
+            impl->accounting.address_reference_count != impl->address_references.size() ||
+            impl->accounting.entity_reference_count != impl->entity_kind_references.size() ||
+            impl->accounting.trigram_count != impl->trigram_spans.size() ||
+            impl->accounting.trigram_posting_count != impl->trigram_postings.size() ||
+            impl->accounting.string_count != impl->strings.offsets.size() ||
+            impl->accounting.unique_text_bytes != impl->strings.bytes.size() ||
+            impl->accounting.source_text_bytes >
+                impl->limits.max_indexed_text_bytes ||
+            impl->accounting.referenced_text_bytes >
+                impl->limits.max_indexed_text_bytes ||
+            impl->accounting.memory_bytes > impl->limits.max_index_bytes) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                make_workspace_error(workspace_error_code_t::integrity_failure,
+                                     "serialized search index invariants are inconsistent",
+                                     "search_index.restore"));
+        }
+        impl->snapshot = snapshot;
+        impl->snapshot_owner = snapshot;
+        impl->data_candidates = std::move(data_candidates);
+        impl->switches = std::move(switches);
+        impl->types = std::move(types);
+        impl->metrics = std::move(metrics);
+        std::uint64_t restored_memory_bytes = sizeof(impl_t);
+        const std::array<std::uint64_t, 16> restored_allocations{
+            vector_bytes(impl->strings.offsets.capacity(),
+                         sizeof(std::uint32_t)),
+            vector_bytes(impl->strings.lengths.capacity(),
+                         sizeof(std::uint32_t)),
+            vector_bytes(impl->strings.bytes.capacity(), sizeof(char)),
+            vector_bytes(impl->records.capacity(),
+                         sizeof(packed_search_record_t)),
+            vector_bytes(impl->text_references.capacity(),
+                         sizeof(packed_text_reference_t)),
+            vector_bytes(impl->address_references.capacity(),
+                         sizeof(std::uint32_t)),
+            vector_bytes(impl->entity_kind_references.capacity(),
+                         sizeof(std::uint32_t)),
+            vector_bytes(impl->entity_id_references.capacity(),
+                         sizeof(std::uint32_t)),
+            vector_bytes(impl->instruction_references.capacity(),
+                         sizeof(std::uint32_t)),
+            vector_bytes(impl->opcode_references.capacity(),
+                         sizeof(packed_key32_reference_t)),
+            vector_bytes(impl->immediate_references.capacity(),
+                         sizeof(packed_key64_reference_t)),
+            vector_bytes(impl->trigram_spans.capacity(),
+                         sizeof(packed_trigram_span_t)),
+            vector_bytes(impl->trigram_postings.capacity(),
+                         sizeof(std::uint32_t)),
+            vector_bytes(impl->data_candidates.capacity(),
+                         sizeof(data_candidate_record_t)),
+            vector_bytes(impl->switches.capacity(), sizeof(switch_record_t)),
+            vector_bytes(impl->types.capacity(),
+                         sizeof(type_candidate_record_t))};
+        for (const auto allocation : restored_allocations) {
+            std::uint64_t updated = 0;
+            if (allocation == (std::numeric_limits<std::uint64_t>::max)() ||
+                !checked_add_u64(restored_memory_bytes, allocation, updated)) {
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::range_overflow,
+                        "restored search-index memory accounting overflows",
+                        "search_index.restore"));
+            }
+            restored_memory_bytes = updated;
+        }
+        for (const auto& dispatch : impl->switches) {
+            std::uint64_t updated = 0;
+            const auto bytes = vector_bytes(
+                dispatch.case_targets.capacity(), sizeof(address_t));
+            if (bytes == (std::numeric_limits<std::uint64_t>::max)() ||
+                !checked_add_u64(restored_memory_bytes, bytes, updated)) {
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::range_overflow,
+                        "restored search-index switch accounting overflows",
+                        "search_index.restore"));
+            }
+            restored_memory_bytes = updated;
+        }
+        for (const auto& type : impl->types) {
+            std::uint64_t updated = 0;
+            const auto bytes = static_cast<std::uint64_t>(
+                type.display_name.capacity()) +
+                static_cast<std::uint64_t>(type.canonical_type.capacity());
+            if (!checked_add_u64(restored_memory_bytes, bytes, updated)) {
+                return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::range_overflow,
+                        "restored search-index type accounting overflows",
+                        "search_index.restore"));
+            }
+            restored_memory_bytes = updated;
+        }
+        std::uint64_t restored_peak_bytes = 0;
+        if (!checked_add_u64(restored_memory_bytes, serialized_resident_bytes,
+                             restored_peak_bytes) ||
+            restored_memory_bytes > declared_memory_bytes ||
+            restored_memory_bytes > impl->limits.max_index_bytes ||
+            restored_peak_bytes > limits.max_index_bytes) {
+            return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+                make_workspace_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "restored search-index resident-memory budget is exceeded",
+                    "search_index.restore"));
+        }
+        impl->accounting.memory_bytes = restored_memory_bytes;
+        if (impl->metrics)
+            impl->metrics->set(analysis_metric_t::indexed_bytes,
+                               restored_memory_bytes);
+        impl->snapshot.reset();
+        return workspace_result_t<std::shared_ptr<search_index_t>>::success(
+            std::shared_ptr<search_index_t>(
+                new search_index_t(std::move(impl))));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "serialized search restore exhausted memory",
+                                 "search_index.restore"));
+    } catch (const std::length_error&) {
+        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "serialized search restore exceeds container limits",
+                                 "search_index.restore"));
+    }
+}
+
+workspace_result_t<void> search_index_t::serialize_to(
+    const serialized_sink_t& sink,
+    const cancellation_token_t& cancel) const {
+    if (!impl_ || !sink) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "search serialization requires an index and byte sink",
+                                 "search_index.serialize"));
+    }
+    if (cancel.stop_requested())
+        return workspace_result_t<void>::failure(
+            stop_error(cancel, "search_index.serialize"));
+    search_blob_writer_t writer(sink, cancel);
+    writer.u32(kSerializedSearchMagic);
+    writer.u32(serialized_version);
+    writer.fixed(impl_->identity.binary_id.bytes);
+    writer.fixed(impl_->identity.load_profile_hash.bytes);
+    writer.u8(impl_->identity.provider_content_hash ? 1U : 0U);
+    if (impl_->identity.provider_content_hash)
+        writer.fixed(impl_->identity.provider_content_hash->bytes);
+    else
+        writer.fixed(std::array<std::uint8_t, 32>{});
+    writer.u64(impl_->identity.generation);
+    writer.u64(impl_->identity.analysis_revision);
+    writer.u64(impl_->identity.overlay_revision);
+    writer.u64(impl_->identity.provider_size);
+    writer.u8(static_cast<std::uint8_t>(impl_->architecture));
+    writer.u8(static_cast<std::uint8_t>(impl_->architecture_mode));
+    writer.u64(impl_->cursor_integrity_key[0]);
+    writer.u64(impl_->cursor_integrity_key[1]);
+    writer.u64(impl_->limits.max_entries);
+    writer.u64(impl_->limits.max_trigram_postings);
+    writer.u64(impl_->limits.max_indexed_text_bytes);
+    writer.u64(impl_->limits.max_index_bytes);
+    writer.u32(impl_->limits.max_query_bytes);
+    writer.u32(impl_->limits.max_results_per_query);
+    writer.u32(impl_->limits.cancellation_check_interval);
+
+    writer.u64(impl_->strings.offsets.size());
+    for (const auto value : impl_->strings.offsets)
+        writer.u32(value);
+    writer.u64(impl_->strings.lengths.size());
+    for (const auto value : impl_->strings.lengths)
+        writer.u32(value);
+    writer.bytes(impl_->strings.bytes.data(), impl_->strings.bytes.size());
+
+    writer.u64(impl_->records.size());
+    for (const auto& record : impl_->records) {
+        writer.u64(record.entity_id);
+        writer.u64(record.numeric_value);
+        writer.u64(record.address.value);
+        writer.u32(record.address.metadata);
+        writer.u32(record.text.value);
+        writer.u32(record.normalized_text.value);
+        writer.u32(record.auxiliary_flags);
+        writer.u8(static_cast<std::uint8_t>(record.kind));
+    }
+    writer.u64(impl_->text_references.size());
+    for (const auto& reference : impl_->text_references) {
+        writer.u32(reference.record);
+        writer.u32(reference.normalized.value);
+    }
+    const auto write_u32_vector = [&](const std::vector<std::uint32_t>& values) {
+        writer.u64(values.size());
+        for (const auto value : values)
+            writer.u32(value);
+    };
+    write_u32_vector(impl_->address_references);
+    write_u32_vector(impl_->entity_kind_references);
+    write_u32_vector(impl_->entity_id_references);
+    write_u32_vector(impl_->instruction_references);
+    writer.u64(impl_->opcode_references.size());
+    for (const auto& reference : impl_->opcode_references) {
+        writer.u32(reference.key);
+        writer.u32(reference.record);
+    }
+    writer.u64(impl_->immediate_references.size());
+    for (const auto& reference : impl_->immediate_references) {
+        writer.u64(reference.key);
+        writer.u32(reference.record);
+    }
+    writer.u64(impl_->trigram_spans.size());
+    for (const auto& span : impl_->trigram_spans) {
+        writer.u32(span.key);
+        writer.u32(span.begin);
+        writer.u32(span.count);
+    }
+    write_u32_vector(impl_->trigram_postings);
+    writer.u64(impl_->accounting.memory_bytes);
+    writer.u64(impl_->accounting.source_text_bytes);
+    writer.u64(impl_->accounting.referenced_text_bytes);
+    writer.u64(impl_->accounting.unique_text_bytes);
+    writer.u64(impl_->accounting.record_count);
+    writer.u64(impl_->accounting.text_reference_count);
+    writer.u64(impl_->accounting.address_reference_count);
+    writer.u64(impl_->accounting.entity_reference_count);
+    writer.u64(impl_->accounting.trigram_count);
+    writer.u64(impl_->accounting.trigram_posting_count);
+    writer.u64(impl_->accounting.string_count);
+    return writer.finish();
 }
 
 search_generation_identity_t search_index_t::identity() const noexcept {

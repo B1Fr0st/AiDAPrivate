@@ -2,19 +2,21 @@
 
 #include "../workbench_contracts.h"
 #include "../../analysis/decompiler/decompiler_contracts.hpp"
+#include "../../analysis/decompiler/managed_entity_binding.hpp"
 
 #include <cstdint>
 #include <list>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aida {
 namespace workbench {
 namespace pseudocode_document {
 
-inline constexpr std::uint32_t k_pseudocode_document_schema_version = 1;
+inline constexpr std::uint32_t k_pseudocode_document_schema_version = 2;
 inline constexpr std::uint32_t k_pseudocode_document_max_line_length = 4096;
 inline constexpr std::uint32_t k_pseudocode_document_max_page_lines = 1024;
 inline constexpr std::uint32_t k_pseudocode_document_max_diagnostics = 256;
@@ -63,6 +65,7 @@ enum class pseudocode_cache_state_t : std::uint8_t {
 
 struct pseudocode_request_t {
     aida::analysis::decompiler_entity_key_t entity;
+    std::optional<aida::analysis::generation_bound_decompiler_entity_t> binding;
     aida::analysis::decompiler_profile_id_t profile =
         aida::analysis::decompiler_profile_id_t::balanced;
     std::uint64_t workspace_generation = 0;
@@ -165,6 +168,12 @@ public:
     virtual ~pseudocode_source_adapter_t() = default;
     virtual std::uint64_t current_generation() const noexcept = 0;
     virtual bool generation_current(std::uint64_t generation) const noexcept = 0;
+    virtual bool binding_current(
+        const std::optional<aida::analysis::generation_bound_decompiler_entity_t>&
+            binding) const noexcept
+    {
+        return !binding || generation_current(binding->generation);
+    }
     virtual workbench_error_t resolve_request(
         std::uint64_t function_address,
         aida::analysis::decompiler_profile_id_t profile,
@@ -175,6 +184,19 @@ public:
         static_cast<void>(timeout_ms);
         output = {};
         return {workbench_error_code_t::adapter_rejected, function_address};
+    }
+    virtual workbench_error_t resolve_request(
+        const aida::analysis::decompiler_entity_locator_t& locator,
+        aida::analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms,
+        pseudocode_request_t& output) const
+    {
+        if (!locator.address || locator.token || locator.artifact_ordinal ||
+            locator.expected_kind) {
+            output = {};
+            return {workbench_error_code_t::adapter_rejected, 0};
+        }
+        return resolve_request(*locator.address, profile, timeout_ms, output);
     }
     virtual workbench_error_t request_decompilation(
         const pseudocode_request_t& request,
@@ -204,6 +226,7 @@ public:
 
 struct pseudocode_cached_document_t {
     aida::analysis::decompiler_entity_key_t entity;
+    std::optional<aida::analysis::generation_bound_decompiler_entity_t> binding;
     std::uint64_t workspace_generation = 0;
     pseudocode_cache_state_t state = pseudocode_cache_state_t::empty;
     std::uint64_t job_id = 0;
@@ -258,11 +281,17 @@ public:
         aida::analysis::decompiler_profile_id_t profile,
         std::uint64_t timeout_ms,
         pseudocode_request_t& output) const;
+    pseudocode_error_t resolve_request(
+        const aida::analysis::decompiler_entity_locator_t& locator,
+        aida::analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms,
+        pseudocode_request_t& output) const;
     pseudocode_error_t request(const pseudocode_request_t& request);
     pseudocode_error_t request(const pseudocode_request_t& request,
                                bool force_refresh);
     pseudocode_error_t activate(
         const aida::analysis::decompiler_entity_key_t& entity);
+    pseudocode_error_t activate(const pseudocode_request_t& request);
     pseudocode_error_t cancel(std::uint64_t job_id);
     pseudocode_error_t poll(std::uint64_t job_id);
     pseudocode_error_t page(const pseudocode_page_request_t& request,
@@ -283,6 +312,8 @@ public:
     const pseudocode_cached_document_t* cached_document() const noexcept;
     const pseudocode_cached_document_t* cached_document(
         const aida::analysis::decompiler_entity_key_t& entity) const noexcept;
+    const pseudocode_cached_document_t* cached_document(
+        const pseudocode_request_t& request) const noexcept;
     std::uint64_t current_generation() const noexcept;
     bool generation_current(std::uint64_t generation) const noexcept;
     bool is_stale() const noexcept;
@@ -298,6 +329,8 @@ private:
                             std::uint64_t subject = 0) const noexcept;
     pseudocode_error_t stale() const noexcept;
     bool lease_current(std::uint64_t generation) const noexcept;
+    bool entry_current(
+        const pseudocode_cached_document_t& entry) const noexcept;
     pseudocode_error_t validate_document(
         const aida::analysis::decompiler_document_t& document,
         const pseudocode_cached_document_t& cache_entry) const;
@@ -307,6 +340,10 @@ private:
         const aida::analysis::decompiler_entity_key_t& entity);
     const pseudocode_cached_document_t* find_cached(
         const aida::analysis::decompiler_entity_key_t& entity) const;
+    pseudocode_cached_document_t* find_cached(
+        const pseudocode_request_t& request);
+    const pseudocode_cached_document_t* find_cached(
+        const pseudocode_request_t& request) const;
     bool evict_oldest();
 
     pseudocode_source_adapter_t* source_;
@@ -322,6 +359,10 @@ private:
 bool pseudocode_page_request_valid(const pseudocode_page_request_t& request) noexcept;
 bool pseudocode_selection_valid(const pseudocode_selection_t& selection) noexcept;
 bool pseudocode_request_valid(const pseudocode_request_t& request);
+std::optional<aida::analysis::decompiler_entity_locator_t>
+parse_pseudocode_entity_locator(std::string_view value) noexcept;
+std::optional<std::string> canonical_pseudocode_entity_locator(
+    const aida::analysis::decompiler_entity_locator_t& locator);
 
 }
 }

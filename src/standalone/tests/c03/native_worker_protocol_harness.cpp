@@ -1,4 +1,5 @@
 #include "native_worker_protocol_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/native_worker_host.hpp"
 #include "../../workers/native_decompiler/native_worker_runtime.hpp"
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -119,8 +121,7 @@ public:
             if (!std::filesystem::copy_file(source, worker_path_, std::filesystem::copy_options::none, error) || error)
                 throw std::runtime_error("fake native worker could not be staged");
         } catch (...) {
-            std::error_code ignored;
-            std::filesystem::remove_all(root_, ignored);
+            cleanup();
             root_.clear();
             throw;
         }
@@ -128,10 +129,7 @@ public:
 
     ~fixture_workspace_t()
     {
-        if (!root_.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove_all(root_, ignored);
-        }
+        cleanup();
     }
 
     fixture_workspace_t(const fixture_workspace_t&) = delete;
@@ -141,12 +139,32 @@ public:
     const std::filesystem::path& worker_path() const noexcept { return worker_path_; }
 
 private:
+    void cleanup() noexcept
+    {
+        if (root_.empty())
+            return;
+        const DWORD root_attributes = GetFileAttributesW(root_.c_str());
+        if (root_attributes == INVALID_FILE_ATTRIBUTES ||
+            (root_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != FILE_ATTRIBUTE_DIRECTORY)
+            return;
+        if (!worker_path_.empty()) {
+            const DWORD worker_attributes = GetFileAttributesW(worker_path_.c_str());
+            if (worker_attributes != INVALID_FILE_ATTRIBUTES &&
+                (worker_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0) {
+                SetFileAttributesW(worker_path_.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(worker_path_.c_str());
+            }
+        }
+        RemoveDirectoryW(root_.c_str());
+    }
+
     std::filesystem::path root_;
     std::filesystem::path worker_path_;
 };
 
 void require(bool condition, std::string_view message)
 {
+    assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -156,6 +174,13 @@ sha256_digest_t digest(std::string_view value)
     sha256_digest_t result;
     require(wire::sha256(value.data(), value.size(), result), "SHA-256 calculation failed");
     return result;
+}
+
+sha256_digest_t locked_digest(std::string_view value)
+{
+    const auto parsed = sha256_digest_t::from_hex(std::string(value));
+    require(parsed.has_value(), "locked SHA-256 value is malformed");
+    return *parsed;
 }
 
 sha256_digest_t file_digest(const std::filesystem::path& path)
@@ -211,6 +236,25 @@ native_worker_manifest_t manifest_fixture(const sha256_digest_t& worker_hash, st
 native_worker_manifest_t manifest_fixture()
 {
     return manifest_fixture(digest("worker-binary"), "replay");
+}
+
+native_worker_manifest_t managed_manifest_fixture()
+{
+    native_worker_manifest_t result;
+    result.schema_version = k_managed_worker_manifest_schema_version;
+    result.worker_relative_path = std::string(k_managed_worker_binary_artifact_relative_path);
+    result.worker_binary_hash = digest("managed-worker-binary");
+    result.provider.provider = decompiler_provider_id_t::ilspy_cli;
+    result.provider.provider_name = "ICSharpCode.Decompiler";
+    result.provider.provider_version = "10.1.0.8386";
+    result.provider.provider_binary_hash = locked_digest(
+        "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345");
+    result.provider.worker_build_id = "aida-managed-decompiler-worker-v3";
+    result.provider.worker_build_hash = locked_digest(
+        "4dd8c0d095629437387a4b631fd9ac3c3cb8e840f6b7af277ccc2ad49d4bc3b7");
+    result.worker_protocol_hash = native_worker_protocol_hash();
+    result.managed_runtime_manifest_hash = digest("managed-runtime-manifest");
+    return result;
 }
 
 decompiler_worker_message_t heartbeat(const wire::session_material_t& session, std::uint64_t sequence)
@@ -310,10 +354,22 @@ void truncation_contract()
 
 void manifest_and_snapshot_contracts()
 {
+    require(k_decompiler_worker_protocol_version == 3 &&
+        native_worker_protocol_hash() == stable_serialization_hash(wire::k_protocol_hash_material) &&
+        std::string_view(wire::k_protocol_hash_material).find(
+            "bounded-native-printc-evidence|control-frame-8m|result-frame-80m|provider-artifacts-48m|printc-8m") !=
+            std::string_view::npos,
+        "native worker protocol identity does not bind the PrintC evidence extension");
     require(k_native_worker_binary_artifact_relative_path == "deps/AiDA_NativeDecompilerWorker.exe" &&
         k_native_worker_manifest_artifact_relative_path == "deps/AiDA_NativeDecompilerWorker.manifest.bin" &&
-        k_native_worker_manifest_digest_relative_path == "deps/AiDA_NativeDecompilerWorker.manifest.sha256",
-        "native worker production artifact paths drifted from the packaging contract");
+        k_native_worker_manifest_digest_relative_path == "deps/AiDA_NativeDecompilerWorker.manifest.sha256" &&
+        k_managed_worker_binary_artifact_relative_path == "deps/AiDA_ManagedDecompilerWorker.exe" &&
+        k_managed_worker_manifest_artifact_relative_path == "deps/AiDA_ManagedDecompilerWorker.manifest.bin" &&
+        k_managed_worker_manifest_digest_relative_path == "deps/AiDA_ManagedDecompilerWorker.manifest.sha256" &&
+        k_managed_runtime_manifest_artifact_relative_path == "deps/AiDA_ManagedRuntime.manifest.json" &&
+        k_managed_runtime_manifest_digest_relative_path == "deps/AiDA_ManagedRuntime.manifest.sha256" &&
+        k_managed_dotnet_root_relative_path == "deps/dotnet",
+        "worker production artifact paths drifted from the packaging contract");
     const auto manifest = manifest_fixture();
     const std::string serialized = serialize_native_worker_manifest(manifest);
     require(!serialized.empty(), "manifest did not serialize");
@@ -332,6 +388,26 @@ void manifest_and_snapshot_contracts()
         "manifest hash mismatch fixture is ineffective");
     tampered.pop_back();
     require(!deserialize_native_worker_manifest(tampered).valid(), "truncated manifest was accepted");
+    const auto managed_manifest = managed_manifest_fixture();
+    const auto managed_serialized = serialize_native_worker_manifest(managed_manifest);
+    require(!managed_serialized.empty(), "managed manifest v3 did not serialize");
+    const auto managed_decoded = deserialize_native_worker_manifest(managed_serialized);
+    require(managed_decoded.valid() && managed_decoded.value &&
+        managed_decoded.value->schema_version == k_managed_worker_manifest_schema_version &&
+        managed_decoded.value->provider.provider == decompiler_provider_id_t::ilspy_cli &&
+        managed_decoded.value->managed_runtime_manifest_hash ==
+            managed_manifest.managed_runtime_manifest_hash &&
+        managed_serialized.size() >= managed_manifest.managed_runtime_manifest_hash.bytes.size() &&
+        std::equal(managed_manifest.managed_runtime_manifest_hash.bytes.begin(),
+            managed_manifest.managed_runtime_manifest_hash.bytes.end(),
+            reinterpret_cast<const std::uint8_t*>(managed_serialized.data()) +
+                managed_serialized.size() -
+                managed_manifest.managed_runtime_manifest_hash.bytes.size()),
+        "managed manifest v3 runtime identity did not round trip as the final digest field");
+    auto truncated_managed = managed_serialized;
+    truncated_managed.pop_back();
+    require(!deserialize_native_worker_manifest(truncated_managed).valid(),
+        "managed manifest v3 accepted a truncated runtime identity");
     auto snapshot = make_native_worker_snapshot({0x48, 0x31, 0xc0, 0xc3});
     require(snapshot.has_value() && snapshot->valid(), "read-only snapshot factory failed");
     sha256_digest_t verified;
@@ -555,6 +631,26 @@ void fixture_inventory()
         require(!fixture.empty(), "fixture identifier is empty");
 }
 
+void result_frame_contracts()
+{
+    require(runtime::classify_document_payload_size(1) ==
+        runtime::document_send_status_t::sent,
+        "result-frame classifier rejected a bounded payload");
+    require(runtime::classify_document_payload_size(
+        k_decompiler_worker_result_frame_max_bytes) ==
+        runtime::document_send_status_t::sent,
+        "result-frame classifier rejected the exact frame boundary");
+    require(runtime::classify_document_payload_size(
+        k_decompiler_worker_result_frame_max_bytes + 1U) ==
+        runtime::document_send_status_t::resource_limit,
+        "result-frame classifier accepted a one-byte-over payload");
+    runtime::startup_t unavailable_channel;
+    require(!runtime::send_failure(unavailable_channel, 1,
+        decompiler_diagnostic_code_t::resource_limit,
+        "decompiler.isolated_worker.result_frame_limit"),
+        "resource-limit fallback unexpectedly succeeded without an authenticated channel");
+}
+
 }
 
 bool run_native_worker_protocol_harness(std::string& failure)
@@ -565,13 +661,17 @@ bool run_native_worker_protocol_harness(std::string& failure)
         frame_round_trip_and_replay();
         rejected_header_diagnostics();
         truncation_contract();
+        result_frame_contracts();
         fixture_inventory();
         failure.clear();
         return true;
     } catch (const std::exception& error) {
+        assertion_telemetry::record_exception(error.what());
         failure = error.what();
         return false;
     } catch (...) {
+        assertion_telemetry::record_exception(
+            "native worker protocol harness failed with a non-standard exception");
         failure = "native worker protocol harness failed with a non-standard exception";
         return false;
     }
@@ -590,12 +690,46 @@ bool run_native_worker_host_harness(const native_worker_host_harness_paths_t& pa
         failure.clear();
         return true;
     } catch (const std::exception& error) {
+        assertion_telemetry::record_exception(error.what());
         failure = error.what();
         return false;
     } catch (...) {
+        assertion_telemetry::record_exception(
+            "native worker host harness failed with a non-standard exception");
         failure = "native worker host harness failed with a non-standard exception";
         return false;
     }
 }
 
+}
+
+int main(int argc, char** argv)
+{
+    if (argc == 2 && std::string_view(argv[1]) == "--protocol-only") {
+        std::string failure;
+        if (!aida::analysis::c03_test::run_native_worker_protocol_harness(failure)) {
+            std::cerr << failure << '\n';
+            return 1;
+        }
+        return 0;
+    }
+    if (argc != 3) {
+        aida::analysis::c03_test::assertion_telemetry::record_assertion(false,
+            "native worker protocol harness arguments are invalid", __FILE__, __LINE__);
+        std::cerr << "usage: native_worker_protocol_harness --protocol-only | <fake-worker> <scratch-root>\n";
+        return 2;
+    }
+    std::string failure;
+    if (!aida::analysis::c03_test::run_native_worker_protocol_harness(failure)) {
+        std::cerr << failure << '\n';
+        return 1;
+    }
+    aida::analysis::c03_test::native_worker_host_harness_paths_t paths;
+    paths.fake_worker_path = std::filesystem::u8path(argv[1]);
+    paths.scratch_root = std::filesystem::u8path(argv[2]);
+    if (!aida::analysis::c03_test::run_native_worker_host_harness(paths, failure)) {
+        std::cerr << failure << '\n';
+        return 1;
+    }
+    return 0;
 }

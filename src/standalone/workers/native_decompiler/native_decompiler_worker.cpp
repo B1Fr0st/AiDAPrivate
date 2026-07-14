@@ -43,6 +43,18 @@ int wmain(int argc, wchar_t** argv)
             "decompiler.isolated_worker.provider_artifacts");
         return 8;
     }
-    return runtime::send_document(startup, job->job_id,
-        std::move(result.provider_artifacts), std::move(*result.document)) ? 0 : 9;
+    const auto send_status = runtime::send_document(startup, job->job_id,
+        std::move(result.provider_artifacts), std::move(*result.document),
+        std::move(result.printc_evidence));
+    if (send_status == runtime::document_send_status_t::sent)
+        return 0;
+    if (send_status == runtime::document_send_status_t::resource_limit)
+        return runtime::send_failure(startup, job->job_id,
+            decompiler_diagnostic_code_t::resource_limit,
+            "decompiler.isolated_worker.result_frame_limit") ? 9 : 10;
+    if (send_status == runtime::document_send_status_t::invalid_contract)
+        return runtime::send_failure(startup, job->job_id,
+            decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.isolated_worker.result_contract") ? 11 : 12;
+    return 13;
 }

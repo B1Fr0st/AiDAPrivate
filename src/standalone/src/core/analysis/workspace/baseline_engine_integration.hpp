@@ -5,6 +5,7 @@
 #include "c03_analysis_contracts.hpp"
 #include "pe_baseline_analyzer.hpp"
 #include "workspace_types.hpp"
+#include "../decompiler/managed_entity_binding.hpp"
 #include "../../infra/taskflow_runtime.hpp"
 
 #include <atomic>
@@ -24,6 +25,8 @@ struct baseline_engine_integration_config_t {
     bool enforce_c03_contracts = true;
     bool enforce_resource_budget = true;
     bool reject_live_targets = true;
+    bool admit_managed_metadata = true;
+    readers::managed::managed_reader_limits_t managed_reader_limits = {};
     std::uint64_t cancellation_checkpoint_interval_ms =
         c03::max_cancellation_checkpoint_milliseconds;
 };
@@ -41,6 +44,8 @@ struct baseline_engine_integration_metrics_t {
     std::uint64_t graph_rejections = 0;
     std::uint64_t publish_completions = 0;
     std::uint64_t publish_failures = 0;
+    std::uint64_t managed_admissions = 0;
+    std::uint64_t managed_admission_failures = 0;
 };
 
 struct baseline_engine_integration_snapshot_t {

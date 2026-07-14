@@ -1,13 +1,16 @@
 ﻿#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#include <aclapi.h>
 #include <intrin.h>
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 #include <shlobj.h>
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
 #include "mcp_standalone.hpp"
+#include "compat/c03_compatibility_registration.hpp"
 #include "mcp_capacity_governor_diag.hpp"
 #include "downstream_producer_governor.hpp"
 #include "standalone_driver.hpp"
@@ -98,10 +101,7 @@ namespace
     thread_local std::uint64_t tls_http_request_id = 0;
     thread_local std::uint64_t tls_http_request_start_tick = 0;
     thread_local bool tls_http_request_counted = false;
-    thread_local std::string tls_current_call_diag_id;
-    thread_local std::string tls_current_call_request_id;
-    thread_local std::string tls_current_call_tool_name;
-    thread_local std::uint64_t tls_current_call_deadline_ms = 0;
+    thread_local bool tls_local_capability_authenticated = false;
     std::mutex g_pre_dispatch_validation_hook_mtx;
     tool_validation_hook_t g_pre_dispatch_validation_hook;
     thread_local std::size_t tls_pre_dispatch_validation_depth = 0;
@@ -3880,24 +3880,198 @@ bool lifecycle_authorized(std::string* reason)
     return true;
 }
 
+static std::string generate_secure_token(std::string_view prefix, std::size_t byte_count)
+{
+    if (byte_count == 0 || byte_count > 64)
+        return {};
+    std::array<unsigned char, 64> random_bytes{};
+    const NTSTATUS status = BCryptGenRandom(
+        nullptr, random_bytes.data(), static_cast<ULONG>(byte_count),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status != 0) {
+        RtlSecureZeroMemory(random_bytes.data(), random_bytes.size());
+        return {};
+    }
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string token;
+    token.reserve(prefix.size() + byte_count * 2U);
+    token.append(prefix.data(), prefix.size());
+    for (std::size_t index = 0; index < byte_count; ++index) {
+        token.push_back(hex[random_bytes[index] >> 4U]);
+        token.push_back(hex[random_bytes[index] & 0x0fU]);
+    }
+    RtlSecureZeroMemory(random_bytes.data(), random_bytes.size());
+    return token;
+}
+
 static std::string generate_session_id()
 {
+    return generate_secure_token("sa-", 32);
+}
 
-    unsigned char rnd[16] = {};
-    NTSTATUS st = BCryptGenRandom(nullptr, rnd, sizeof(rnd),
-                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (st != 0) {
-
-        auto t = std::chrono::steady_clock::now().time_since_epoch().count();
-        for (size_t i = 0; i < sizeof(rnd); ++i)
-            rnd[i] = static_cast<unsigned char>((t >> (i * 8)) ^ i);
+static bool constant_time_equal_bounded(std::string_view supplied,
+                                        std::string_view expected,
+                                        std::size_t maximum) noexcept
+{
+    const std::size_t compared = (std::min)(expected.size(), maximum);
+    std::size_t difference = supplied.size() ^ expected.size();
+    difference |= expected.size() > maximum ? 1U : 0U;
+    for (std::size_t index = 0; index < compared; ++index) {
+        const unsigned char actual = index < supplied.size()
+            ? static_cast<unsigned char>(supplied[index]) : 0U;
+        difference |= static_cast<std::size_t>(
+            actual ^ static_cast<unsigned char>(expected[index]));
     }
-    char buf[48];
-    snprintf(buf, sizeof(buf),
-             "sa-%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-             rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7],
-             rnd[8], rnd[9], rnd[10], rnd[11], rnd[12], rnd[13], rnd[14], rnd[15]);
-    return buf;
+    return difference == 0;
+}
+
+class scoped_secret_string_t final
+{
+public:
+    explicit scoped_secret_string_t(std::string& value) noexcept : value_(&value) {}
+    ~scoped_secret_string_t()
+    {
+        if (value_ != nullptr && !value_->empty())
+            RtlSecureZeroMemory(value_->data(), value_->size());
+    }
+    scoped_secret_string_t(const scoped_secret_string_t&) = delete;
+    scoped_secret_string_t& operator=(const scoped_secret_string_t&) = delete;
+
+private:
+    std::string* value_ = nullptr;
+};
+
+static local_request_auth_result_t authorize_local_request_impl(
+    const local_request_auth_input_t& input,
+    std::string_view expected_capability,
+    std::string_view expected_run_binding)
+{
+    local_request_auth_result_t result;
+    const bool loopback = input.remote_address == "127.0.0.1" ||
+        input.remote_address == "::1" || input.remote_address == "localhost";
+    const std::string expected_host = "127.0.0.1:" + std::to_string(input.bound_port);
+    const std::string expected_localhost = "localhost:" + std::to_string(input.bound_port);
+    std::string normalized_host;
+    normalized_host.reserve((std::min)(input.host.size(), std::size_t{128}));
+    for (const unsigned char value : input.host) {
+        if (normalized_host.size() == 128U)
+            break;
+        normalized_host.push_back(static_cast<char>(std::tolower(value)));
+    }
+    const bool host_valid = input.host.size() == normalized_host.size() &&
+        (normalized_host == expected_host || normalized_host == expected_localhost);
+    std::string expected_authorization = "Bearer " + std::string(expected_capability);
+    scoped_secret_string_t expected_authorization_guard(expected_authorization);
+    (void)expected_authorization_guard;
+    const bool capability_valid = constant_time_equal_bounded(
+        input.authorization, expected_authorization, 160U);
+    const bool run_binding_valid = constant_time_equal_bounded(
+        input.run_binding, expected_run_binding, 160U);
+
+    if (!loopback) {
+        result.status = local_request_auth_status_t::invalid_remote;
+        return result;
+    }
+    if (!host_valid || input.bound_port <= 0 || input.bound_port > 65535) {
+        result.status = local_request_auth_status_t::invalid_host;
+        return result;
+    }
+    if (!input.origin.empty()) {
+        result.status = local_request_auth_status_t::browser_origin_forbidden;
+        return result;
+    }
+    if (input.method == "GET" && input.path == "/health") {
+        result.status = local_request_auth_status_t::health_read_only;
+        result.allowed = true;
+        return result;
+    }
+    if (input.authorization.empty()) {
+        result.status = local_request_auth_status_t::capability_missing;
+        return result;
+    }
+    if (expected_capability.empty() || !capability_valid) {
+        result.status = local_request_auth_status_t::capability_rejected;
+        return result;
+    }
+    if (input.run_binding.empty()) {
+        result.status = local_request_auth_status_t::run_binding_missing;
+        return result;
+    }
+    if (expected_run_binding.empty() || !run_binding_valid) {
+        result.status = local_request_auth_status_t::run_binding_rejected;
+        return result;
+    }
+    result.status = local_request_auth_status_t::allowed;
+    result.allowed = true;
+    result.capability_authenticated = true;
+    return result;
+}
+
+local_request_auth_result_t authorize_local_request(
+    const local_request_auth_input_t& input,
+    std::string_view expected_capability,
+    std::string_view expected_run_binding) noexcept
+{
+    try {
+        return authorize_local_request_impl(
+            input, expected_capability, expected_run_binding);
+    } catch (...) {
+        return {};
+    }
+}
+
+static bool route_secret_equal(std::string_view supplied,
+                               std::string_view prefix,
+                               std::string_view expected) noexcept
+{
+    std::size_t difference = supplied.size() ^ (prefix.size() + expected.size());
+    for (std::size_t index = 0; index < prefix.size(); ++index) {
+        const unsigned char actual = index < supplied.size()
+            ? static_cast<unsigned char>(supplied[index]) : 0U;
+        difference |= static_cast<std::size_t>(
+            actual ^ static_cast<unsigned char>(prefix[index]));
+    }
+    for (std::size_t reverse = expected.size(); reverse != 0; --reverse) {
+        const std::size_t index = reverse - 1U;
+        const std::size_t supplied_index = prefix.size() + index;
+        const unsigned char actual = supplied_index < supplied.size()
+            ? static_cast<unsigned char>(supplied[supplied_index]) : 0U;
+        difference |= static_cast<std::size_t>(
+            actual ^ static_cast<unsigned char>(expected[index]));
+    }
+    return difference == 0 && !expected.empty();
+}
+
+bool verify_local_route_capability(
+    std::string_view authorization,
+    std::string_view run_binding,
+    std::string_view origin,
+    std::string_view expected_capability,
+    std::string_view expected_run_binding) noexcept
+{
+    const bool capability_valid = route_secret_equal(
+        authorization, "Bearer ", expected_capability);
+    const bool run_binding_valid = route_secret_equal(
+        run_binding, std::string_view{}, expected_run_binding);
+    return capability_valid && run_binding_valid && origin.empty();
+}
+
+static bool require_local_http_capability(
+    const httplib::Request& request,
+    httplib::Response& response,
+    std::string_view expected_capability,
+    std::string_view expected_run_binding)
+{
+    if (tls_local_capability_authenticated && verify_local_route_capability(
+            request.get_header_value("Authorization"),
+            request.get_header_value("X-AiDA-MCP-Run-Id"),
+            request.get_header_value("Origin"),
+            expected_capability, expected_run_binding))
+        return true;
+    response.status = 403;
+    response.set_header("Cache-Control", "no-store");
+    response.set_content(R"({"status":"rejected","error":"MCP local authorization failed","code":"MCP_LOCAL_AUTH_REQUIRED","disposition":"not_started"})", "application/json");
+    return false;
 }
 
 static std::string read_env_var(const char* name)
@@ -4703,7 +4877,6 @@ namespace
 
     std::mutex                                                       g_in_flight_mutex;
     std::map<std::string, std::vector<cancel_token_ptr_t>>            g_in_flight_cancels;
-    thread_local std::atomic<bool>*                                  tls_current_cancel_token = nullptr;
 
     std::string cancel_key_for_id(const json& id)
     {
@@ -5256,131 +5429,62 @@ namespace
 
 }
 
-cancel_token_ptr_t make_call_cancel_token(bool cancelled)
-{
-    auto token = std::make_shared<std::atomic<bool>>(cancelled);
-    return token;
-}
-
-void signal_call_cancel_token(const cancel_token_ptr_t& token) noexcept
-{
-    if (token)
-        token->store(true, std::memory_order_release);
-}
-
-std::atomic<bool>* current_cancel_token() noexcept
-{
-    return tls_current_cancel_token;
-}
-
-bool current_call_cancelled() noexcept
-{
-    std::atomic<bool>* tok = tls_current_cancel_token;
-    return tok && tok->load(std::memory_order_acquire);
-}
-
-const char* current_call_diag_id() noexcept
-{
-    return tls_current_call_diag_id.c_str();
-}
-
-const char* current_call_request_id() noexcept
-{
-    return tls_current_call_request_id.c_str();
-}
-
-const char* current_call_tool_name() noexcept
-{
-    return tls_current_call_tool_name.c_str();
-}
-
-std::uint64_t current_call_deadline_ms() noexcept
-{
-    return tls_current_call_deadline_ms;
-}
-
-scoped_call_metadata_t::scoped_call_metadata_t(const std::string& diag_id, const std::string& tool_name, std::uint64_t deadline_ms)
-    : scoped_call_metadata_t(diag_id, std::string(), tool_name, deadline_ms)
-{
-}
-
-scoped_call_metadata_t::scoped_call_metadata_t(const std::string& diag_id, const std::string& request_id, const std::string& tool_name, std::uint64_t deadline_ms)
-    : _prev_diag(tls_current_call_diag_id)
-    , _prev_request(tls_current_call_request_id)
-    , _prev_tool(tls_current_call_tool_name)
-    , _prev_deadline(tls_current_call_deadline_ms)
-    , _active(true)
-{
-    tls_current_call_diag_id = diag_id;
-    tls_current_call_request_id = request_id.empty() ? diag_id : request_id;
-    tls_current_call_tool_name = tool_name;
-    tls_current_call_deadline_ms = deadline_ms;
-}
-
-scoped_call_metadata_t::~scoped_call_metadata_t()
-{
-    if (!_active)
-        return;
-    tls_current_call_diag_id = std::move(_prev_diag);
-    tls_current_call_request_id = std::move(_prev_request);
-    tls_current_call_tool_name = std::move(_prev_tool);
-    tls_current_call_deadline_ms = _prev_deadline;
-    _active = false;
-}
-
-scoped_call_cancel_t::scoped_call_cancel_t(cancel_token_ptr_t token)
-    : _token(std::move(token))
-{
-    if (_token) {
-        _previous = tls_current_cancel_token;
-        tls_current_cancel_token = _token.get();
-        _active = true;
-    }
-}
-
-scoped_call_cancel_t::~scoped_call_cancel_t()
-{
-    release();
-}
-
-scoped_call_cancel_t::scoped_call_cancel_t(scoped_call_cancel_t&& other) noexcept
-    : _token(std::move(other._token))
-    , _previous(other._previous)
-    , _active(other._active)
-{
-    other._previous = nullptr;
-    other._active = false;
-}
-
-scoped_call_cancel_t& scoped_call_cancel_t::operator=(scoped_call_cancel_t&& other) noexcept
-{
-    if (this != &other) {
-        release();
-        _token = std::move(other._token);
-        _previous = other._previous;
-        _active = other._active;
-        other._previous = nullptr;
-        other._active = false;
-    }
-    return *this;
-}
-
-void scoped_call_cancel_t::cancel() noexcept
-{
-    signal_call_cancel_token(_token);
-}
-
-void scoped_call_cancel_t::release() noexcept
-{
-    if (!_active)
-        return;
-    tls_current_cancel_token = _previous;
-    _previous = nullptr;
-    _active = false;
-}
-
 server_t::server_t()  = default;
 server_t::~server_t() { stop(); }
+
+void register_c03_compatibility_tools(server_t& server)
+{
+    set_pre_dispatch_validation_hook(c03_compatibility_validation_hook());
+    register_c03_compatibility_tools(
+        server.registry(), make_application_c03_compatibility_runtime_config());
+}
+
+bool server_t::rotate_local_capability() noexcept
+{
+    try {
+        std::string capability = generate_secure_token("", 32);
+        std::string run_binding = generate_secure_token("run-", 32);
+        if (capability.size() != 64U || run_binding.size() != 68U) {
+            if (!capability.empty())
+                RtlSecureZeroMemory(capability.data(), capability.size());
+            if (!run_binding.empty())
+                RtlSecureZeroMemory(run_binding.data(), run_binding.size());
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(_local_capability_mtx);
+        if (!_local_capability.empty())
+            RtlSecureZeroMemory(_local_capability.data(), _local_capability.size());
+        if (!_local_run_binding.empty())
+            RtlSecureZeroMemory(_local_run_binding.data(), _local_run_binding.size());
+        _local_capability = std::move(capability);
+        _local_run_binding = std::move(run_binding);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void server_t::clear_local_capability() noexcept
+{
+    std::lock_guard<std::mutex> lock(_local_capability_mtx);
+    if (!_local_capability.empty())
+        RtlSecureZeroMemory(_local_capability.data(), _local_capability.size());
+    if (!_local_run_binding.empty())
+        RtlSecureZeroMemory(_local_run_binding.data(), _local_run_binding.size());
+    _local_capability.clear();
+    _local_run_binding.clear();
+}
+
+bool server_t::snapshot_local_capability(std::string& capability,
+                                         std::string& run_binding) const
+{
+    std::lock_guard<std::mutex> lock(_local_capability_mtx);
+    if (_local_capability.size() != 64U || _local_run_binding.size() != 68U)
+        return false;
+    capability = _local_capability;
+    run_binding = _local_run_binding;
+    return true;
+}
 
 static bool is_camoufox_reverse_tool_name(const std::string& name)
 {
@@ -12621,6 +12725,16 @@ static tool_result_t invoke_tool_with_concurrency_policy(
     const std::function<tool_result_t(const json&)>& handler,
     tool_invocation_metrics_t* metrics = nullptr)
 {
+    if (tool.production_registry_dispatch) {
+        direct_dispatch_options_t options;
+        options.external_visible_only = false;
+        if (auto* token = current_cancel_token())
+            options.cancellation = cancel_token_ptr_t(token, [](std::atomic<bool>*) {});
+        options.deadline_ms = current_call_deadline_ms();
+        options.request_id = current_call_request_id();
+        options.diagnostic_id = current_call_diag_id();
+        return invoke_registered_tool_definition(tool, arguments, options);
+    }
     const bool session_manager = is_analysis_session_management_tool(tool.name);
     const bool session_independent = tool.target_independent ||
         is_active_session_independent_tool(tool.name);
@@ -12840,27 +12954,17 @@ bool server_t::register_tool(tool_def_t tool)
                 false});
         }
     }
-    std::lock_guard<std::mutex> lk(_tools_mtx);
-    auto dup = std::find_if(_tools.begin(), _tools.end(), [&](const tool_def_t& existing) {
-        return existing.name == tool.name;
-    });
-    if (dup != _tools.end()) {
-        if (tool.name == "decompile_function" &&
-            dup->visibility == tool_visibility_t::external_visible &&
-            tool.visibility == tool_visibility_t::external_visible) {
-            diag::log_tagged_fmt("mcp_srv",
-                "register_tool updated name='%s' visibility=%d",
-                tool.name.c_str(), static_cast<int>(tool.visibility));
-            *dup = std::move(tool);
-            return true;
-        }
+    const std::string name = tool.name;
+    const tool_visibility_t visibility = tool.visibility;
+    const auto existing = _registry.find_tool(name, false);
+    const bool registered = _registry.register_tool(std::move(tool));
+    if (!registered && existing) {
         diag::log_tagged_fmt("mcp_srv",
             "register_tool duplicate skipped name='%s' existing_visibility=%d new_visibility=%d",
-            tool.name.c_str(), static_cast<int>(dup->visibility), static_cast<int>(tool.visibility));
-        return false;
+            name.c_str(), static_cast<int>(existing->visibility),
+            static_cast<int>(visibility));
     }
-    _tools.push_back(std::move(tool));
-    return true;
+    return registered;
 }
 
 bool server_t::register_tool(
@@ -12922,22 +13026,17 @@ tool_result_t server_t::call_registered_tool(const std::string& name, const json
     tool_def_t found;
     bool found_tool = false;
     std::function<tool_result_t(const json&)> handler_copy;
-    {
-        std::lock_guard<std::mutex> lk(_tools_mtx);
-        for (const auto& t : _tools) {
-            if (t.name != name)
-                continue;
-            if (external_visible_only && !is_external_mcp_tool(t)) {
-                json details = rejection_details("not_external", name);
-                auto tr = tool_result_t::error("Unknown tool: " + name, "MCP_TOOL_CALL_REJECTED", details);
-                record_tool_audit_event(name, arguments, "rejected", false, details, tr.text, call_begin, diag_id, request_id);
-                return tr;
-            }
-            found = t;
-            handler_copy = t.handler;
-            found_tool = true;
-            break;
+    const auto registered = _registry.find_tool(name, false);
+    if (registered) {
+        if (external_visible_only && !is_external_mcp_tool(*registered)) {
+            json details = rejection_details("not_external", name);
+            auto tr = tool_result_t::error("Unknown tool: " + name, "MCP_TOOL_CALL_REJECTED", details);
+            record_tool_audit_event(name, arguments, "rejected", false, details, tr.text, call_begin, diag_id, request_id);
+            return tr;
         }
+        found = *registered;
+        handler_copy = registered->handler;
+        found_tool = true;
     }
 
     if (!found_tool) {
@@ -13689,11 +13788,11 @@ tool_result_t server_t::describe_tools(const json& params)
     limit = (std::max)(1, (std::min)(limit, 100));
 
     std::vector<tool_def_t> matches;
+    const auto registered_tools = _registry.snapshot_tools();
     {
-        std::lock_guard<std::mutex> lk(_tools_mtx);
         if (!names.empty()) {
             for (const auto& wanted : names) {
-                for (const auto& tool : _tools) {
+                for (const auto& tool : registered_tools) {
                     if (!is_external_mcp_tool(tool))
                         continue;
                     if (tool.name == wanted) {
@@ -13706,7 +13805,7 @@ tool_result_t server_t::describe_tools(const json& params)
                 }
             }
         } else if (!group.empty()) {
-            for (const auto& tool : _tools) {
+            for (const auto& tool : registered_tools) {
                 if (current_call_cancelled())
                     return tool_result_t::error("Tool description query cancelled.");
                 if (!is_external_mcp_tool(tool))
@@ -13720,7 +13819,7 @@ tool_result_t server_t::describe_tools(const json& params)
         } else if (!prefix.empty() || !query.empty()) {
             const std::string prefix_l = lower_ascii(prefix);
             const std::string query_l = lower_ascii(query);
-            for (const auto& tool : _tools) {
+            for (const auto& tool : registered_tools) {
                 if (current_call_cancelled())
                     return tool_result_t::error("Tool description query cancelled.");
                 if (!is_external_mcp_tool(tool))
@@ -13929,12 +14028,9 @@ json server_t::handle_tools_list(const json& id, const json& params)
 {
     json tools_arr = json::array();
     const bool compact = !wants_full_tool_list(params);
-    {
-        std::lock_guard<std::mutex> lk(_tools_mtx);
-        for (const auto& t : _tools) {
-            if (!is_external_mcp_tool(t)) continue;
-            tools_arr.push_back(tool_schema(t, compact));
-        }
+    for (const auto& t : _registry.snapshot_tools()) {
+        if (!is_external_mcp_tool(t)) continue;
+        tools_arr.push_back(tool_schema(t, compact));
     }
     diag::log_tagged_fmt("mcp_srv", "handle_tools_list compact=%d count=%zu",
         compact ? 1 : 0, tools_arr.size());
@@ -14050,20 +14146,15 @@ json server_t::handle_tools_call(const json& id, const json& params)
     tool_def_t found;
     bool found_tool = false;
     std::function<tool_result_t(const json&)> handler_copy;
-    {
-        std::lock_guard<std::mutex> lk(_tools_mtx);
-        for (const auto& t : _tools) {
-            if (t.name == tool_name) {
-                if (!is_external_mcp_tool(t)) {
-                    record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "not_external"}}, "Unknown tool: " + tool_name, call_begin, diag_id, request_id);
-                    return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
-                }
-                found = t;
-                handler_copy = t.handler;
-                found_tool = true;
-                break;
-            }
+    const auto registered_tool = _registry.find_tool(tool_name, false);
+    if (registered_tool) {
+        if (!is_external_mcp_tool(*registered_tool)) {
+            record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "not_external"}}, "Unknown tool: " + tool_name, call_begin, diag_id, request_id);
+            return make_error(id, JSONRPC_INVALID_PARAMS, "Unknown tool: " + tool_name);
         }
+        found = *registered_tool;
+        handler_copy = registered_tool->handler;
+        found_tool = true;
     }
 
     if (!found_tool)
@@ -15073,6 +15164,12 @@ json server_t::route_request(const json& msg)
 {
     require_mcp_runtime_authorized("route_request");
 
+    if (tls_http_request_id != 0 && !tls_local_capability_authenticated)
+        return make_error(
+            msg.is_object() && msg.contains("id") ? msg["id"] : json(nullptr),
+            JSONRPC_INVALID_REQUEST,
+            "MCP local capability transport authentication is required.");
+
     if (!msg.is_object())
         return make_error(nullptr, JSONRPC_INVALID_REQUEST, "Request must be a JSON object");
 
@@ -15128,15 +15225,10 @@ json server_t::route_request(const json& msg)
         !pre_dispatch_validation_active()) {
         tool_def_t validation_tool;
         bool validation_tool_found = false;
-        {
-            std::lock_guard<std::mutex> lk(_tools_mtx);
-            for (const auto& tool : _tools) {
-                if (tool.name == routed_tool_name && is_external_mcp_tool(tool)) {
-                    validation_tool = tool;
-                    validation_tool_found = true;
-                    break;
-                }
-            }
+        const auto registered_tool = _registry.find_tool(routed_tool_name, true);
+        if (registered_tool) {
+            validation_tool = *registered_tool;
+            validation_tool_found = true;
         }
         if (validation_tool_found && !validation_tool.input_schema.is_null()) {
             const std::uint64_t validation_gate = standalone_license::inline_gate_check(
@@ -15362,15 +15454,10 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
             }
             tool_def_t validation_tool;
             bool validation_tool_found = false;
-            {
-                std::lock_guard<std::mutex> lk(self->_tools_mtx);
-                for (const auto& tool : self->_tools) {
-                    if (tool.name == tool_name && is_external_mcp_tool(tool)) {
-                        validation_tool = tool;
-                        validation_tool_found = true;
-                        break;
-                    }
-                }
+            const auto registered_tool = self->_registry.find_tool(tool_name, true);
+            if (registered_tool) {
+                validation_tool = *registered_tool;
+                validation_tool_found = true;
             }
             if (!validation_tool_found)
                 continue;
@@ -15698,15 +15785,10 @@ std::string handle_body(server_t* self, const std::string& body, const std::func
             if (item_method == "tools/call" && !item_tool.empty() && item.is_object() && item.contains("params") && item["params"].is_object()) {
                 tool_def_t batch_tool;
                 bool batch_tool_found = false;
-                {
-                    std::lock_guard<std::mutex> lk(self->_tools_mtx);
-                    for (const auto& t : self->_tools) {
-                        if (t.name == item_tool && is_external_mcp_tool(t)) {
-                            batch_tool = t;
-                            batch_tool_found = true;
-                            break;
-                        }
-                    }
+                const auto registered_tool = self->_registry.find_tool(item_tool, true);
+                if (registered_tool) {
+                    batch_tool = *registered_tool;
+                    batch_tool_found = true;
                 }
                 const json batch_arguments = item["params"].contains("arguments") && item["params"]["arguments"].is_object()
                     ? item["params"]["arguments"] : json::object();
@@ -15998,9 +16080,15 @@ bool server_t::start(int port)
     _stop_requested = false;
     _port = 0;
 
+    if (!rotate_local_capability()) {
+        diag::log_tagged("mcp_srv", "start rejected local capability generation failed");
+        return false;
+    }
+
     if (!_server_done.load(std::memory_order_acquire)) {
         diag::log_tagged_fmt("mcp_srv", "start rejected server worker already starting port=%d", port);
         log_runtime_executor_stats("start rejected");
+        clear_local_capability();
         return false;
     }
 
@@ -16009,6 +16097,7 @@ bool server_t::start(int port)
     if (!install_server_worker_lifetime(this, worker_lifetime)) {
         _server_done.store(true, std::memory_order_release);
         diag::log_tagged_fmt("mcp_srv", "start rejected server worker lifetime already installed port=%d", port);
+        clear_local_capability();
         return false;
     }
 
@@ -16019,6 +16108,7 @@ bool server_t::start(int port)
         log_runtime_executor_stats("server_worker entry");
         if (_stop_requested.load(std::memory_order_acquire)) {
             diag::log_tagged_fmt("mcp_srv", "server_worker cancelled before listen port=%d tid=%lu", port, static_cast<unsigned long>(tid));
+            clear_local_capability();
             _server_worker_tid.store(0, std::memory_order_release);
             _server_done.store(true, std::memory_order_release);
             return;
@@ -16032,6 +16122,7 @@ bool server_t::start(int port)
             diag::log_tagged_fmt("mcp_srv", "server_worker exception port=%d err='<unknown>'", port);
             _running.store(false, std::memory_order_release);
         }
+        clear_local_capability();
         diag::log_tagged_fmt("mcp_srv", "server_worker exited port=%d tid=%lu", port, static_cast<unsigned long>(GetCurrentThreadId()));
         _server_worker_tid.store(0, std::memory_order_release);
         _server_done.store(true, std::memory_order_release);
@@ -16066,6 +16157,7 @@ bool server_t::start(int port)
         mark_server_worker_start(worker_lifetime, false);
         erase_server_worker_lifetime(this, worker_lifetime);
         _server_done.store(true, std::memory_order_release);
+        clear_local_capability();
         return false;
     }
     mark_server_worker_start(worker_lifetime, true);
@@ -16099,6 +16191,7 @@ void server_t::stop()
             }
             erase_server_worker_lifetime(this, worker_lifetime);
         }
+        clear_local_capability();
         diag::log_tagged_fmt("mcp_srv", "stop already stopped");
         return;
     }
@@ -16207,29 +16300,71 @@ void server_t::server_thread_func(int port)
         kMcpPayloadMaxLength,
         kMcpMaxBatchItems,
         kSseMaxQueuedEvents);
-    {
-        std::lock_guard<std::mutex> lk(_server_mtx);
-        _active_server = &svr;
-    }
-
-    std::string session_id = generate_session_id();
+    std::string local_capability;
+    std::string run_binding;
+    if (!snapshot_local_capability(local_capability, run_binding))
+        throw std::runtime_error("MCP local capability state is unavailable");
+    scoped_secret_string_t local_capability_guard(local_capability);
+    (void)local_capability_guard;
+    scoped_secret_string_t run_binding_guard(run_binding);
+    (void)run_binding_guard;
+    std::string session_id = run_binding;
+    scoped_secret_string_t session_id_guard(session_id);
+    (void)session_id_guard;
     diag::log_tagged_fmt("mcp_srv", "server_thread_func session_hash='%s'", mcp_identity_hash_text(session_id).c_str());
 
     svr.set_default_headers({
-        {"Access-Control-Allow-Origin",  "*"},
-        {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"},
-        {"Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, MCP-Protocol-Version, Accept, Authorization, Last-Event-ID"},
-        {"Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version"}
+        {"Cache-Control", "no-store"},
+        {"Pragma", "no-cache"},
+        {"X-Content-Type-Options", "nosniff"}
     });
 
-    svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+    svr.set_pre_routing_handler([this, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
         tls_http_ingress_admission.reset();
         tls_reserved_control_lane.reset();
         tls_http_request_counted = false;
+        tls_local_capability_authenticated = false;
         tls_http_request_id = g_http_request_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
         tls_http_request_start_tick = mcp_now_ms();
-        tls_route_identity = make_mcp_route_identity(req, tls_http_request_id);
         update_current_executor_task_http(tls_http_request_id, req.method, req.path);
+        local_request_auth_input_t auth_input;
+        auth_input.method = req.method;
+        auth_input.path = req.path;
+        auth_input.remote_address = req.remote_addr;
+        auth_input.host = req.get_header_value("Host");
+        auth_input.origin = req.get_header_value("Origin");
+        auth_input.authorization = req.get_header_value("Authorization");
+        auth_input.run_binding = req.get_header_value("X-AiDA-MCP-Run-Id");
+        auth_input.bound_port = _port;
+        const auto auth = authorize_local_request(
+            auth_input, local_capability, run_binding);
+        if (!auth_input.authorization.empty())
+            RtlSecureZeroMemory(auth_input.authorization.data(), auth_input.authorization.size());
+        if (!auth_input.run_binding.empty())
+            RtlSecureZeroMemory(auth_input.run_binding.data(), auth_input.run_binding.size());
+        if (!auth.allowed) {
+            tls_route_identity = mcp_route_identity_t{};
+            tls_route_identity.http_request_id = tls_http_request_id;
+            tls_route_identity.path = mcp_identity_sanitize(req.path, 120);
+            tls_route_identity.http_method = mcp_identity_sanitize(req.method, 16);
+            tls_route_identity.route = tls_route_identity.path;
+            tls_route_identity.transport = "HTTP-REJECTED";
+            tls_route_identity.surface = "AUTH";
+            tls_route_identity.remote = mcp_identity_sanitize(remote_endpoint(req), 120);
+            tls_route_identity.principal_id = "unauthorized-local-client";
+            tls_route_identity.principal_source = "local_capability_gate";
+            res.status = 403;
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(R"({"status":"rejected","error":"MCP local authorization failed","code":"MCP_LOCAL_AUTH_REQUIRED","disposition":"not_started"})", "application/json");
+            diag::log_tagged_fmt("mcp_srv",
+                "local_auth_rejected id=%llu method=%s path=%s status=%u remote=%s",
+                static_cast<unsigned long long>(tls_http_request_id),
+                req.method.c_str(), req.path.c_str(),
+                static_cast<unsigned>(auth.status), remote_endpoint(req).c_str());
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        tls_local_capability_authenticated = auth.capability_authenticated;
+        tls_route_identity = make_mcp_route_identity(req, tls_http_request_id);
         try {
             if (!mcp_try_admit_http_ingress(req, res))
                 return httplib::Server::HandlerResponse::Handled;
@@ -16327,10 +16462,13 @@ void server_t::server_thread_func(int port)
         tls_http_request_id = 0;
         tls_http_request_start_tick = 0;
         tls_http_request_counted = false;
+        tls_local_capability_authenticated = false;
         tls_route_identity = mcp_route_identity_t{};
     });
 
-    svr.Options(".*", [](const httplib::Request& req, httplib::Response& res) {
+    svr.Options(".*", [&local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         diag::log_tagged_fmt("mcp_srv",
             "OPTIONS path=%s acrm=%s acrh=%s",
             req.path.c_str(),
@@ -16339,7 +16477,9 @@ void server_t::server_thread_func(int port)
         res.status = 204;
     });
 
-    svr.Post("/mcp", [this, &session_id](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/mcp", [this, &session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("http_post_mcp");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_post_mcp",
             capacity_route_context(current_mcp_transport(), "/mcp", "POST", current_mcp_principal(),
@@ -16364,7 +16504,9 @@ void server_t::server_thread_func(int port)
             res.set_content(response_body, "application/json");
     });
 
-    svr.Get("/mcp", [this, &session_id](const httplib::Request& req, httplib::Response& res) {
+    svr.Get("/mcp", [this, &session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("http_get_mcp");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_get_mcp",
             capacity_route_context(current_mcp_transport(), "/mcp", "GET", current_mcp_principal(),
@@ -16493,7 +16635,9 @@ void server_t::server_thread_func(int port)
         }
     });
 
-    svr.Delete("/mcp", [&session_id](const httplib::Request&, httplib::Response& res) {
+    svr.Delete("/mcp", [&session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("http_delete_mcp");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_delete_mcp",
             capacity_route_context(current_mcp_transport(), "/mcp", "DELETE", current_mcp_principal(),
@@ -16506,7 +16650,9 @@ void server_t::server_thread_func(int port)
         res.set_content("{}", "application/json");
     });
 
-    svr.Post("/ida-plugin-auth", [this](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/ida-plugin-auth", [this, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         const std::uint64_t t0 = mcp_now_ms();
         diag::log_tagged_fmt("mcp_srv",
             "ida_plugin_auth_entry remote=%s pid=%lu tid=%lu body_len=%zu",
@@ -16950,7 +17096,9 @@ void server_t::server_thread_func(int port)
             health["executors"].size());
     });
 
-    svr.Get("/", [this](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/", [this, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         json health;
         health["status"] = "ok";
         health["server"] = SERVER_NAME;
@@ -16958,14 +17106,15 @@ void server_t::server_thread_func(int port)
         health["sse"] = "/sse";
         health["health"] = "/health";
         size_t external_tools = 0;
-        { std::lock_guard<std::mutex> lk(_tools_mtx);
-          for (const auto& t : _tools)
-              if (is_external_mcp_tool(t)) ++external_tools; }
+        for (const auto& t : _registry.snapshot_tools())
+            if (is_external_mcp_tool(t)) ++external_tools;
         health["tools_count"] = external_tools;
         res.set_content(json_dump_safe(health), "application/json");
     });
 
-    svr.Get("/api/tools", [this](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/api/tools", [this, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("api_tools_list");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_api_tools",
             capacity_route_context(current_mcp_transport(), "/api/tools", "GET", current_mcp_principal(),
@@ -16973,15 +17122,16 @@ void server_t::server_thread_func(int port)
                 std::to_string(tls_http_request_id)));
         capacity_diag::scoped_activity_t ingress_activity(ingress_capacity, mcp_now_ms());
         json tools_arr = json::array();
-        { std::lock_guard<std::mutex> lk(_tools_mtx);
-          for (const auto& t : _tools) {
-              if (!is_external_mcp_tool(t)) continue;
-              tools_arr.push_back(tool_schema(t, false));
-          } }
+        for (const auto& t : _registry.snapshot_tools()) {
+            if (!is_external_mcp_tool(t)) continue;
+            tools_arr.push_back(tool_schema(t, false));
+        }
         res.set_content(json_dump_safe(tools_arr, 2), "application/json");
     });
 
-    svr.Post("/api/tools/call", [this](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/api/tools/call", [this, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("api_tools_call");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_api_tools_call",
             capacity_route_context(current_mcp_transport(), "/api/tools/call", "POST", current_mcp_principal(),
@@ -17015,21 +17165,18 @@ void server_t::server_thread_func(int port)
         tool_def_t found;
         bool found_tool = false;
         std::function<tool_result_t(const json&)> handler_copy;
-        { std::lock_guard<std::mutex> lk(_tools_mtx);
-          for (const auto& t : _tools) {
-              if (t.name == tool_name) {
-                  if (!is_external_mcp_tool(t)) {
-                      record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "not_external"}}, "Unknown tool: " + tool_name, api_call_begin, api_diag_id, api_request_id);
-                      res.status = 404;
-                      res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
-                      return;
-                  }
-                  found = t;
-                  handler_copy = t.handler;
-                  found_tool = true;
-                  break;
-              }
-          } }
+        const auto registered_tool = _registry.find_tool(tool_name, false);
+        if (registered_tool) {
+            if (!is_external_mcp_tool(*registered_tool)) {
+                record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "not_external"}}, "Unknown tool: " + tool_name, api_call_begin, api_diag_id, api_request_id);
+                res.status = 404;
+                res.set_content(json_dump_safe({{"error", "Unknown tool: " + tool_name}}), "application/json");
+                return;
+            }
+            found = *registered_tool;
+            handler_copy = registered_tool->handler;
+            found_tool = true;
+        }
 
         if (!found_tool) {
             record_tool_audit_event(tool_name, arguments, "rejected", false, json{{"reason", "unknown_tool"}}, "Unknown tool: " + tool_name, api_call_begin, api_diag_id, api_request_id);
@@ -17234,7 +17381,10 @@ void server_t::server_thread_func(int port)
         }
     };
 
-    svr.Get("/sse", [this, &sse_sessions, &sse_mtx, &cleanup_sse_sessions](const httplib::Request& req, httplib::Response& res) {
+    svr.Get("/sse", [this, &sse_sessions, &sse_mtx, &cleanup_sse_sessions,
+                     &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("http_get_sse");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_get_sse",
             capacity_route_context(current_mcp_transport(), "/sse", "GET", current_mcp_principal(),
@@ -17244,6 +17394,12 @@ void server_t::server_thread_func(int port)
         cleanup_sse_sessions("before_open");
         auto session = std::make_shared<sse_session_t>();
         session->id = generate_session_id();
+        if (session->id.empty()) {
+            res.status = 503;
+            res.set_content(R"({"status":"rejected","error":"MCP session entropy unavailable","code":"MCP_SESSION_ENTROPY_UNAVAILABLE","disposition":"not_started"})", "application/json");
+            diag::log_tagged("mcp_srv", "sse_session_open_rejected entropy_unavailable");
+            return;
+        }
         auto stream_state = acquire_stream_slot("GET /sse", req, res);
         if (!stream_state)
             return;
@@ -17403,7 +17559,10 @@ void server_t::server_thread_func(int port)
         }
     });
 
-    svr.Post("/message", [this, &sse_sessions, &sse_mtx, &cleanup_sse_sessions](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/message", [this, &sse_sessions, &sse_mtx, &cleanup_sse_sessions,
+                          &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("http_post_message");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_post_message",
             capacity_route_context(current_mcp_transport(), "/message", "POST", current_mcp_principal(),
@@ -17444,7 +17603,9 @@ void server_t::server_thread_func(int port)
         res.set_content("Accepted", "text/plain");
     });
 
-    svr.Post("/sse", [this, &session_id](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/sse", [this, &session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("http_post_sse");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_post_sse",
             capacity_route_context(current_mcp_transport(), "/sse", "POST", current_mcp_principal(),
@@ -17466,7 +17627,9 @@ void server_t::server_thread_func(int port)
         else res.set_content(response_body, "application/json");
     });
 
-    svr.Delete("/sse", [&session_id](const httplib::Request&, httplib::Response& res) {
+    svr.Delete("/sse", [&session_id, &local_capability, &run_binding](const httplib::Request& req, httplib::Response& res) {
+        if (!require_local_http_capability(req, res, local_capability, run_binding))
+            return;
         require_mcp_runtime_authorized("http_delete_sse");
         const capacity_diag::prediction_t ingress_capacity = diagnose_capacity("http_ingress_delete_sse",
             capacity_route_context(current_mcp_transport(), "/sse", "DELETE", current_mcp_principal(),
@@ -17485,11 +17648,23 @@ void server_t::server_thread_func(int port)
                    reinterpret_cast<const char*>(&yes), sizeof(yes));
     });
 
+    {
+        std::lock_guard<std::mutex> lk(_server_mtx);
+        if (_stop_requested.load(std::memory_order_acquire))
+            return;
+        _active_server = &svr;
+    }
     int bound_port = 0;
-    if (port > 0 && svr.bind_to_port("127.0.0.1", port))
-        bound_port = port;
-    if (bound_port <= 0)
-        bound_port = svr.bind_to_any_port("127.0.0.1");
+    try {
+        if (port > 0 && svr.bind_to_port("127.0.0.1", port))
+            bound_port = port;
+        if (bound_port <= 0)
+            bound_port = svr.bind_to_any_port("127.0.0.1");
+    } catch (...) {
+        std::lock_guard<std::mutex> lk(_server_mtx);
+        _active_server = nullptr;
+        throw;
+    }
 
     if (bound_port <= 0) {
         diag::log_tagged_fmt("mcp_srv", "server_thread_func bind fail port=%d", port);
@@ -17502,9 +17677,8 @@ void server_t::server_thread_func(int port)
     _port = bound_port;
     _running = true;
     size_t external_tools = 0;
-    { std::lock_guard<std::mutex> lk(_tools_mtx);
-      for (const auto& t : _tools)
-          if (is_external_mcp_tool(t)) ++external_tools; }
+    for (const auto& t : _registry.snapshot_tools())
+        if (is_external_mcp_tool(t)) ++external_tools;
     g_cached_external_tool_count.store(external_tools, std::memory_order_release);
     g_cached_health_ready.store(true, std::memory_order_release);
     diag::log_tagged_fmt("mcp_srv",
@@ -17517,9 +17691,16 @@ void server_t::server_thread_func(int port)
         static_cast<unsigned long>(GetCurrentProcessId()),
         static_cast<unsigned long>(GetCurrentThreadId()));
 
-    svr.listen_after_bind();
+    try {
+        svr.listen_after_bind();
+    } catch (...) {
+        std::lock_guard<std::mutex> lk(_server_mtx);
+        _active_server = nullptr;
+        throw;
+    }
 
     diag::log_tagged_fmt("mcp_srv", "server_thread_func listen_after_bind returned port=%d", bound_port);
+    { std::lock_guard<std::mutex> lk(_server_mtx); _active_server = nullptr; }
     cleanup_sse_sessions("listen_after_bind_returned");
     mcp_standalone::downstream::governor_t::instance().request_shutdown();
     release_all_stream_slots("listen_after_bind_returned");
@@ -17528,7 +17709,6 @@ void server_t::server_thread_func(int port)
     command_sessions::release_all_for_shutdown("listen_after_bind_returned");
     g_cached_health_ready.store(false, std::memory_order_release);
     _running = false;
-    { std::lock_guard<std::mutex> lk(_server_mtx); _active_server = nullptr; }
 }
 
 static std::string get_home_dir()
@@ -17603,11 +17783,102 @@ static bool read_file_to_string(const std::string& path, std::string& out)
 
 static bool write_string_to_file(const std::string& path, const std::string& content)
 {
-    if (!ensure_parent_dir(path)) return false;
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) return false;
-    ofs << content;
-    return ofs.good();
+    if (!ensure_parent_dir(path))
+        return false;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    DWORD token_bytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &token_bytes);
+    if (token_bytes == 0) {
+        CloseHandle(token);
+        return false;
+    }
+    std::vector<std::uint8_t> token_buffer(token_bytes);
+    if (!GetTokenInformation(
+            token, TokenUser, token_buffer.data(), token_bytes, &token_bytes)) {
+        CloseHandle(token);
+        return false;
+    }
+    CloseHandle(token);
+    const auto* token_user = reinterpret_cast<const TOKEN_USER*>(token_buffer.data());
+    std::array<std::uint8_t, SECURITY_MAX_SID_SIZE> system_sid{};
+    DWORD system_sid_bytes = static_cast<DWORD>(system_sid.size());
+    if (!CreateWellKnownSid(
+            WinLocalSystemSid, nullptr, system_sid.data(), &system_sid_bytes))
+        return false;
+
+    std::array<EXPLICIT_ACCESSW, 2> access{};
+    access[0].grfAccessPermissions = GENERIC_ALL;
+    access[0].grfAccessMode = SET_ACCESS;
+    access[0].grfInheritance = NO_INHERITANCE;
+    access[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access[0].Trustee.TrusteeType = TRUSTEE_IS_USER;
+    access[0].Trustee.ptstrName = static_cast<LPWSTR>(token_user->User.Sid);
+    access[1].grfAccessPermissions = GENERIC_ALL;
+    access[1].grfAccessMode = SET_ACCESS;
+    access[1].grfInheritance = NO_INHERITANCE;
+    access[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access[1].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    access[1].Trustee.ptstrName = reinterpret_cast<LPWSTR>(system_sid.data());
+    PACL acl = nullptr;
+    if (SetEntriesInAclW(
+            static_cast<ULONG>(access.size()), access.data(), nullptr, &acl) != ERROR_SUCCESS)
+        return false;
+
+    SECURITY_DESCRIPTOR descriptor{};
+    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+        !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)) {
+        LocalFree(acl);
+        return false;
+    }
+    SECURITY_ATTRIBUTES attributes{};
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = &descriptor;
+    const std::filesystem::path target(path);
+    static std::atomic<std::uint64_t> write_sequence{0};
+    const std::uint64_t sequence = write_sequence.fetch_add(1, std::memory_order_acq_rel) + 1U;
+    const std::filesystem::path temporary = target.wstring() + L".aida-" +
+        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(sequence) + L".tmp";
+    HANDLE file = CreateFileW(
+        temporary.c_str(), GENERIC_WRITE, 0, &attributes, CREATE_NEW,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        LocalFree(acl);
+        return false;
+    }
+    bool written = true;
+    std::size_t offset = 0;
+    while (offset < content.size()) {
+        const DWORD chunk = static_cast<DWORD>((std::min)(
+            content.size() - offset,
+            static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+        DWORD completed = 0;
+        if (!WriteFile(file, content.data() + offset, chunk, &completed, nullptr) ||
+            completed != chunk) {
+            written = false;
+            break;
+        }
+        offset += completed;
+    }
+    if (written)
+        written = FlushFileBuffers(file) != FALSE;
+    CloseHandle(file);
+    if (written) {
+        written = MoveFileExW(
+            temporary.c_str(), target.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+    }
+    if (written) {
+        written = SetNamedSecurityInfoW(
+            const_cast<LPWSTR>(target.c_str()), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, acl, nullptr) == ERROR_SUCCESS;
+    }
+    if (!written)
+        DeleteFileW(temporary.c_str());
+    LocalFree(acl);
+    return written;
 }
 
 static std::string strip_jsonc(const std::string& input)
@@ -17659,6 +17930,18 @@ struct client_cfg_t {
     const char* name;
     enum { URL, SERVERURL, OPENCODE, VSCODE, VSCODE_JSON, CLINE, ZED, CODEX, CLAUDE_CODE } format;
     const char* win_path;
+};
+
+struct client_handoff_t {
+    std::string authorization;
+    std::string run_binding;
+
+    json headers() const {
+        return json{
+            {"Authorization", authorization},
+            {"X-AiDA-MCP-Run-Id", run_binding},
+        };
+    }
 };
 
 static const client_cfg_t g_clients[] = {
@@ -17715,7 +17998,8 @@ static void erase_managed_keys(json& root)
         root.erase(key);
 }
 
-static bool write_mcpservers(const std::string& path, const std::string& url, const char* key)
+static bool write_mcpservers(const std::string& path, const std::string& url,
+                             const char* key, const client_handoff_t& handoff)
 {
     json config;
     if (std::filesystem::exists(path)) parse_json_file(path, config, false);
@@ -17726,10 +18010,12 @@ static bool write_mcpservers(const std::string& path, const std::string& url, co
     config["mcpServers"][MCP_NAME] = json::object();
     config["mcpServers"][MCP_NAME]["type"] = "http";
     config["mcpServers"][MCP_NAME][key] = url;
+    config["mcpServers"][MCP_NAME]["headers"] = handoff.headers();
     return write_json_file(path, config);
 }
 
-static bool write_opencode(const std::string& path, const std::string& url)
+static bool write_opencode(const std::string& path, const std::string& url,
+                           const client_handoff_t& handoff)
 {
     json config;
     if (std::filesystem::exists(path)) parse_json_file(path, config, true);
@@ -17737,11 +18023,13 @@ static bool write_opencode(const std::string& path, const std::string& url)
     if (!config.contains("mcp") || !config["mcp"].is_object())
         config["mcp"] = json::object();
     erase_managed_keys(config["mcp"]);
-    config["mcp"][MCP_NAME] = {{"type", "remote"}, {"url", url}};
+    config["mcp"][MCP_NAME] = {
+        {"type", "remote"}, {"url", url}, {"headers", handoff.headers()}};
     return write_json_file(path, config);
 }
 
-static bool write_vscode(const std::string& path, const std::string& url)
+static bool write_vscode(const std::string& path, const std::string& url,
+                         const client_handoff_t& handoff)
 {
     json config;
     if (std::filesystem::exists(path)) parse_json_file(path, config, true);
@@ -17750,11 +18038,13 @@ static bool write_vscode(const std::string& path, const std::string& url)
     if (!config["mcp"].contains("servers") || !config["mcp"]["servers"].is_object())
         config["mcp"]["servers"] = json::object();
     erase_managed_keys(config["mcp"]["servers"]);
-    config["mcp"]["servers"][MCP_NAME] = {{"type", "http"}, {"url", url}};
+    config["mcp"]["servers"][MCP_NAME] = {
+        {"type", "http"}, {"url", url}, {"headers", handoff.headers()}};
     return write_json_file(path, config);
 }
 
-static bool write_vscode_json(const std::string& path, const std::string& url)
+static bool write_vscode_json(const std::string& path, const std::string& url,
+                              const client_handoff_t& handoff)
 {
     json config;
     if (std::filesystem::exists(path)) parse_json_file(path, config, true);
@@ -17762,11 +18052,13 @@ static bool write_vscode_json(const std::string& path, const std::string& url)
     if (!config.contains("servers") || !config["servers"].is_object())
         config["servers"] = json::object();
     erase_managed_keys(config["servers"]);
-    config["servers"][MCP_NAME] = {{"type", "http"}, {"url", url}};
+    config["servers"][MCP_NAME] = {
+        {"type", "http"}, {"url", url}, {"headers", handoff.headers()}};
     return write_json_file(path, config);
 }
 
-static bool write_cline(const std::string& path, const std::string& url)
+static bool write_cline(const std::string& path, const std::string& url,
+                        const client_handoff_t& handoff)
 {
     json config;
     if (std::filesystem::exists(path)) parse_json_file(path, config, false);
@@ -17777,11 +18069,13 @@ static bool write_cline(const std::string& path, const std::string& url)
     json entry;
     entry["type"] = "http";
     entry["url"] = url;
+    entry["headers"] = handoff.headers();
     config["mcpServers"][MCP_NAME] = entry;
     return write_json_file(path, config);
 }
 
-static bool write_zed(const std::string& path, const std::string& url)
+static bool write_zed(const std::string& path, const std::string& url,
+                      const client_handoff_t& handoff)
 {
     json config;
     if (std::filesystem::exists(path)) parse_json_file(path, config, true);
@@ -17789,11 +18083,13 @@ static bool write_zed(const std::string& path, const std::string& url)
     if (!config.contains("context_servers") || !config["context_servers"].is_object())
         config["context_servers"] = json::object();
     erase_managed_keys(config["context_servers"]);
-    config["context_servers"][MCP_NAME] = {{"settings", {{"url", url}}}};
+    config["context_servers"][MCP_NAME] = {
+        {"settings", {{"url", url}, {"headers", handoff.headers()}}}};
     return write_json_file(path, config);
 }
 
-static bool write_codex(const std::string& path, const std::string& url)
+static bool write_codex(const std::string& path, const std::string& url,
+                        const client_handoff_t& handoff)
 {
     std::string content;
     if (std::filesystem::exists(path)) read_file_to_string(path, content);
@@ -17817,10 +18113,13 @@ static bool write_codex(const std::string& path, const std::string& url)
         content += "\n";
     }
     content += "\n[mcp_servers." + std::string(MCP_NAME) + "]\nurl = \"" + url + "\"\n";
+    content += "http_headers = { Authorization = \"" + handoff.authorization +
+        "\", \"X-AiDA-MCP-Run-Id\" = \"" + handoff.run_binding + "\" }\n";
     return write_string_to_file(path, content);
 }
 
-static bool write_claude_code(const std::string& path, const std::string& url)
+static bool write_claude_code(const std::string& path, const std::string& url,
+                              const client_handoff_t& handoff)
 {
     json config;
     if (std::filesystem::exists(path)) parse_json_file(path, config, false);
@@ -17828,7 +18127,8 @@ static bool write_claude_code(const std::string& path, const std::string& url)
     if (!config.contains("mcpServers") || !config["mcpServers"].is_object())
         config["mcpServers"] = json::object();
     erase_managed_keys(config["mcpServers"]);
-    config["mcpServers"][MCP_NAME] = {{"type", "http"}, {"url", url}};
+    config["mcpServers"][MCP_NAME] = {
+        {"type", "http"}, {"url", url}, {"headers", handoff.headers()}};
     return write_json_file(path, config);
 }
 
@@ -17856,6 +18156,24 @@ void server_t::write_client_configs() const
     std::string port_str = std::to_string(_port);
     std::string http_url = "http://127.0.0.1:" + port_str + "/mcp";
     std::string sse_url = "http://127.0.0.1:" + port_str + "/sse";
+    std::string capability;
+    std::string run_binding;
+    if (!snapshot_local_capability(capability, run_binding)) {
+        diag::log_tagged("mcp_config", "write_client_configs_skipped_capability_unavailable");
+        return;
+    }
+    scoped_secret_string_t capability_guard(capability);
+    (void)capability_guard;
+    scoped_secret_string_t run_binding_guard(run_binding);
+    (void)run_binding_guard;
+    client_handoff_t handoff{
+        "Bearer " + capability,
+        run_binding,
+    };
+    scoped_secret_string_t authorization_guard(handoff.authorization);
+    (void)authorization_guard;
+    scoped_secret_string_t handoff_run_binding_guard(handoff.run_binding);
+    (void)handoff_run_binding_guard;
     diag::log_tagged_fmt("mcp_config", "write_client_configs_start url='%s' sse='%s'", http_url.c_str(), sse_url.c_str());
 
     std::set<std::string> written;
@@ -17887,15 +18205,15 @@ void server_t::write_client_configs() const
             diag::log_tagged_fmt("mcp_config", "client_write_start name='%s' path='%s'", def.name, path.c_str());
             bool success = false;
             switch (def.format) {
-            case client_cfg_t::URL:          success = write_mcpservers(path, http_url, "url"); break;
-            case client_cfg_t::SERVERURL:    success = write_mcpservers(path, http_url, "serverUrl"); break;
-            case client_cfg_t::OPENCODE:     success = write_opencode(path, http_url); break;
-            case client_cfg_t::VSCODE:       success = write_vscode(path, http_url); break;
-            case client_cfg_t::VSCODE_JSON:  success = write_vscode_json(path, http_url); break;
-            case client_cfg_t::CLINE:        success = write_cline(path, http_url); break;
-            case client_cfg_t::ZED:          success = write_zed(path, http_url); break;
-            case client_cfg_t::CODEX:        success = write_codex(path, http_url); break;
-            case client_cfg_t::CLAUDE_CODE:  success = write_claude_code(path, http_url); break;
+            case client_cfg_t::URL:          success = write_mcpservers(path, http_url, "url", handoff); break;
+            case client_cfg_t::SERVERURL:    success = write_mcpservers(path, http_url, "serverUrl", handoff); break;
+            case client_cfg_t::OPENCODE:     success = write_opencode(path, http_url, handoff); break;
+            case client_cfg_t::VSCODE:       success = write_vscode(path, http_url, handoff); break;
+            case client_cfg_t::VSCODE_JSON:  success = write_vscode_json(path, http_url, handoff); break;
+            case client_cfg_t::CLINE:        success = write_cline(path, http_url, handoff); break;
+            case client_cfg_t::ZED:          success = write_zed(path, http_url, handoff); break;
+            case client_cfg_t::CODEX:        success = write_codex(path, http_url, handoff); break;
+            case client_cfg_t::CLAUDE_CODE:  success = write_claude_code(path, http_url, handoff); break;
             }
 
             if (success) {

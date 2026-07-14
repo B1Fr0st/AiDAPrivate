@@ -1,5 +1,7 @@
 #include "overlay_apply_engine.hpp"
 
+#include "decompiler/decompiler_contracts.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -9,6 +11,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace aida::analysis {
 
@@ -22,6 +25,37 @@ constexpr std::uint8_t k_last_overlay_operation_ordinal =
 bool has_nonzero_bytes(const std::array<std::uint8_t, 32>& value) noexcept
 {
     return std::any_of(value.begin(), value.end(), [](std::uint8_t byte) { return byte != 0; });
+}
+
+std::optional<std::array<std::uint8_t, 32>> managed_artifact_hash(
+    const decompiler_entity_key_t& entity) noexcept
+{
+    switch (entity.kind) {
+    case decompiler_entity_kind_t::cli_method: {
+        const auto* identity =
+            std::get_if<cli_decompiler_entity_identity_t>(&entity.identity);
+        return identity ? std::optional<std::array<std::uint8_t, 32>>(
+                              identity->module_hash.bytes)
+                        : std::nullopt;
+    }
+    case decompiler_entity_kind_t::jvm_method: {
+        const auto* identity =
+            std::get_if<jvm_decompiler_entity_identity_t>(&entity.identity);
+        return identity ? std::optional<std::array<std::uint8_t, 32>>(
+                              identity->class_artifact_hash.bytes)
+                        : std::nullopt;
+    }
+    case decompiler_entity_kind_t::dalvik_method: {
+        const auto* identity =
+            std::get_if<dalvik_decompiler_entity_identity_t>(&entity.identity);
+        return identity ? std::optional<std::array<std::uint8_t, 32>>(
+                              identity->dex_hash.bytes)
+                        : std::nullopt;
+    }
+    case decompiler_entity_kind_t::native_function:
+        return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 bool valid_architecture(overlay_architecture_v9_t architecture) noexcept
@@ -126,10 +160,39 @@ bool range_is_valid_for_target(const overlay_static_range_v9_t& range,
         range.size <= target.image_size - range.offset;
 }
 
-bool operation_requires_range(overlay_operation_kind_v9_t kind) noexcept
+bool canonical_managed_payload(
+    const overlay_operation_v9_t& operation) noexcept
 {
-    return kind != overlay_operation_kind_v9_t::type_declaration &&
-        kind != overlay_operation_kind_v9_t::enum_definition;
+    const auto& payload = operation.payload;
+    if (!payload.signature.empty() || !payload.bytes.empty() ||
+        !payload.assembly.empty() || !payload.integer_type.empty() ||
+        !payload.integer_value.empty() || payload.reanalysis_flags != 0 ||
+        payload.stack_offset != 0)
+        return false;
+    switch (operation.kind) {
+    case overlay_operation_kind_v9_t::comment:
+    case overlay_operation_kind_v9_t::comment_update:
+        return payload.name.empty() && payload.type.empty() &&
+            payload.variable.empty();
+    case overlay_operation_kind_v9_t::name:
+        return payload.text.empty() && payload.type.empty() &&
+            payload.variable.empty();
+    case overlay_operation_kind_v9_t::type_application:
+    case overlay_operation_kind_v9_t::type_update:
+        return payload.text.empty() &&
+            (payload.name.empty() != payload.variable.empty());
+    default:
+        return false;
+    }
+}
+
+bool operation_requires_range(const overlay_operation_v9_t& operation) noexcept
+{
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity)
+        return false;
+    return operation.kind != overlay_operation_kind_v9_t::type_declaration &&
+        operation.kind != overlay_operation_kind_v9_t::enum_definition;
 }
 
 overlay_operation_kind_v9_t entity_domain(overlay_operation_kind_v9_t kind) noexcept
@@ -150,6 +213,8 @@ overlay_entity_key_v9_t make_entity_key(const overlay_operation_v9_t& operation)
 {
     overlay_entity_key_v9_t key;
     key.domain = entity_domain(operation.kind);
+    key.target_discriminator = operation.target_discriminator;
+    key.managed_locator = operation.managed_locator;
     key.range = operation.range;
     if (key.domain == overlay_operation_kind_v9_t::comment ||
         key.domain == overlay_operation_kind_v9_t::stack_variable ||
@@ -332,6 +397,26 @@ overlay_apply_code_v9_t validate_operation(const overlay_operation_v9_t& operati
 {
     if (!valid_operation_kind(operation.kind))
         return overlay_apply_code_v9_t::invalid_operation;
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::native_address) {
+        if (operation.managed_locator)
+            return overlay_apply_code_v9_t::invalid_operation;
+    } else if (operation.target_discriminator ==
+               overlay_target_discriminator_v9_t::managed_entity) {
+        if (!operation.managed_locator ||
+            !operation.managed_locator->valid() ||
+            operation.managed_locator->provider_hash != target.image_hash ||
+            operation.managed_locator->generation != target.generation ||
+            !managed_overlay_operation_kind_v9(operation.kind) ||
+            !canonical_managed_payload(operation) ||
+            !range_is_empty(operation.range))
+            return overlay_apply_code_v9_t::invalid_operation;
+        if (operation.managed_locator->serialized_entity.size() >
+            limits.max_managed_entity_bytes)
+            return overlay_apply_code_v9_t::limit_exceeded;
+    } else {
+        return overlay_apply_code_v9_t::invalid_operation;
+    }
     const auto& payload = operation.payload;
     if (!bounded_string(payload.name, limits.max_text_bytes) ||
         !bounded_string(payload.text, limits.max_text_bytes) ||
@@ -351,7 +436,12 @@ overlay_apply_code_v9_t validate_operation(const overlay_operation_v9_t& operati
         if (!add_size(payload_bytes, size, limits.max_transaction_payload_bytes))
             return overlay_apply_code_v9_t::limit_exceeded;
     }
-    if (operation_requires_range(operation.kind)) {
+    if (operation.managed_locator &&
+        !add_size(payload_bytes,
+                  operation.managed_locator->serialized_entity.size(),
+                  limits.max_transaction_payload_bytes))
+        return overlay_apply_code_v9_t::limit_exceeded;
+    if (operation_requires_range(operation)) {
         if (!range_is_valid_for_target(operation.range, target))
             return overlay_apply_code_v9_t::invalid_operation;
     } else if (!range_is_empty(operation.range)) {
@@ -466,6 +556,18 @@ std::string byte_hex(const std::vector<std::uint8_t>& bytes)
     return result;
 }
 
+std::string string_hex(const std::string& bytes)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result(bytes.size() * 2, '0');
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(bytes[index]);
+        result[index * 2] = digits[byte >> 4];
+        result[index * 2 + 1] = digits[byte & 0x0f];
+    }
+    return result;
+}
+
 int hex_nibble(char value) noexcept
 {
     if (value >= '0' && value <= '9')
@@ -501,6 +603,21 @@ bool parse_byte_hex(const std::string& value, std::vector<std::uint8_t>& bytes)
         if (high < 0 || low < 0)
             return false;
         bytes[index] = static_cast<std::uint8_t>((high << 4) | low);
+    }
+    return true;
+}
+
+bool parse_string_hex(const std::string& value, std::string& bytes)
+{
+    if ((value.size() & 1U) != 0)
+        return false;
+    bytes.resize(value.size() / 2);
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        const int high = hex_nibble(value[index * 2]);
+        const int low = hex_nibble(value[index * 2 + 1]);
+        if (high < 0 || low < 0)
+            return false;
+        bytes[index] = static_cast<char>((high << 4) | low);
     }
     return true;
 }
@@ -583,7 +700,7 @@ std::optional<overlay_target_identity_v9_t> parse_target_json_v9(const json& val
 
 json operation_json_v9(const overlay_operation_v9_t& operation)
 {
-    return json{{"kind", static_cast<std::uint8_t>(operation.kind)},
+    json result{{"kind", static_cast<std::uint8_t>(operation.kind)},
                 {"payload", json{{"assembly", operation.payload.assembly},
                                  {"bytes", byte_hex(operation.payload.bytes)},
                                  {"integer_type", operation.payload.integer_type},
@@ -598,20 +715,44 @@ json operation_json_v9(const overlay_operation_v9_t& operation)
                 {"range", json{{"offset", std::to_string(operation.range.offset)},
                                {"size", std::to_string(operation.range.size)}}},
                 {"remove", operation.remove}};
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity &&
+        operation.managed_locator) {
+        const auto& locator = *operation.managed_locator;
+        result["target_discriminator"] = static_cast<std::uint8_t>(
+            operation.target_discriminator);
+        result["managed_locator"] = json{
+            {"artifact_hash", fixed_hex(locator.artifact_hash)},
+            {"entity_hash", fixed_hex(locator.entity_hash)},
+            {"generation", std::to_string(locator.generation)},
+            {"provider_hash", fixed_hex(locator.provider_hash)},
+            {"provider_size", std::to_string(locator.provider_size)},
+            {"serialized_entity", string_hex(locator.serialized_entity)},
+            {"workspace_id", fixed_hex(locator.workspace_id)}};
+        result.erase("range");
+    }
+    return result;
 }
 
 std::optional<overlay_operation_v9_t> parse_operation_json_v9(
     const json& value, const overlay_target_identity_v9_t& target) noexcept
 {
     try {
-        static constexpr std::array<const char*, 4> fields{{"kind", "payload", "range", "remove"}};
+        static constexpr std::array<const char*, 4> native_fields{{
+            "kind", "payload", "range", "remove"}};
+        static constexpr std::array<const char*, 5> managed_fields{{
+            "kind", "managed_locator", "payload", "remove",
+            "target_discriminator"}};
         static constexpr std::array<const char*, 2> range_fields{{"offset", "size"}};
         static constexpr std::array<const char*, 11> payload_fields{{
             "assembly", "bytes", "integer_type", "integer_value", "name", "reanalysis_flags",
             "signature", "stack_offset", "text", "type", "variable"
         }};
-        if (!exact_fields(value, fields) || !value["kind"].is_number_unsigned() ||
-            !value["remove"].is_boolean() || !exact_fields(value["range"], range_fields) ||
+        const bool managed = exact_fields(value, managed_fields);
+        if ((!managed && !exact_fields(value, native_fields)) ||
+            !value["kind"].is_number_unsigned() ||
+            !value["remove"].is_boolean() ||
+            (!managed && !exact_fields(value["range"], range_fields)) ||
             !exact_fields(value["payload"], payload_fields))
             return std::nullopt;
         const auto ordinal = value["kind"].get<unsigned>();
@@ -628,8 +769,55 @@ std::optional<overlay_operation_v9_t> parse_operation_json_v9(
         overlay_operation_v9_t operation;
         operation.kind = static_cast<overlay_operation_kind_v9_t>(ordinal);
         operation.remove = value["remove"].get<bool>();
-        if (!parse_decimal(value["range"]["offset"], operation.range.offset) ||
-            !parse_decimal(value["range"]["size"], operation.range.size) ||
+        if (managed) {
+            static constexpr std::array<const char*, 7> locator_fields{{
+                "artifact_hash", "entity_hash", "generation", "provider_hash",
+                "provider_size", "serialized_entity", "workspace_id"}};
+            if (!value["target_discriminator"].is_number_unsigned() ||
+                value["target_discriminator"].get<unsigned>() !=
+                    static_cast<unsigned>(
+                        overlay_target_discriminator_v9_t::managed_entity) ||
+                !exact_fields(value["managed_locator"], locator_fields))
+                return std::nullopt;
+            const auto& encoded = value["managed_locator"];
+            for (const char* field : {"artifact_hash", "entity_hash", "generation",
+                                      "provider_hash", "provider_size",
+                                      "serialized_entity", "workspace_id"}) {
+                if (!encoded[field].is_string())
+                    return std::nullopt;
+            }
+            const auto& serialized_entity =
+                encoded["serialized_entity"].get_ref<const std::string&>();
+            if (serialized_entity.empty() ||
+                serialized_entity.size() >
+                    k_overlay_managed_entity_serialization_limit * 2U ||
+                (serialized_entity.size() & 1U) != 0)
+                return std::nullopt;
+            overlay_managed_entity_locator_v9_t locator;
+            if (!parse_fixed_hex(
+                    encoded["workspace_id"].get_ref<const std::string&>(),
+                    locator.workspace_id) ||
+                !parse_fixed_hex(
+                    encoded["provider_hash"].get_ref<const std::string&>(),
+                    locator.provider_hash) ||
+                !parse_fixed_hex(
+                    encoded["artifact_hash"].get_ref<const std::string&>(),
+                    locator.artifact_hash) ||
+                !parse_fixed_hex(
+                    encoded["entity_hash"].get_ref<const std::string&>(),
+                    locator.entity_hash) ||
+                !parse_decimal(encoded["provider_size"], locator.provider_size) ||
+                !parse_decimal(encoded["generation"], locator.generation) ||
+                !parse_string_hex(serialized_entity, locator.serialized_entity) ||
+                !locator.valid())
+                return std::nullopt;
+            operation.target_discriminator =
+                overlay_target_discriminator_v9_t::managed_entity;
+            operation.managed_locator = std::move(locator);
+        }
+        if ((!managed &&
+             (!parse_decimal(value["range"]["offset"], operation.range.offset) ||
+              !parse_decimal(value["range"]["size"], operation.range.size))) ||
             !parse_decimal(payload["stack_offset"], operation.payload.stack_offset))
             return std::nullopt;
         operation.payload.assembly = payload["assembly"].get<std::string>();
@@ -663,6 +851,16 @@ overlay_operation_kind_from_ordinal(std::uint8_t ordinal) noexcept
     if (ordinal > k_last_overlay_operation_ordinal)
         return std::nullopt;
     return static_cast<overlay_operation_kind_v9_t>(ordinal);
+}
+
+bool managed_overlay_operation_kind_v9(
+    overlay_operation_kind_v9_t kind) noexcept
+{
+    return kind == overlay_operation_kind_v9_t::comment ||
+        kind == overlay_operation_kind_v9_t::comment_update ||
+        kind == overlay_operation_kind_v9_t::name ||
+        kind == overlay_operation_kind_v9_t::type_application ||
+        kind == overlay_operation_kind_v9_t::type_update;
 }
 
 bool overlay_target_identity_v9_t::valid() const noexcept
@@ -699,6 +897,62 @@ bool overlay_static_range_v9_t::operator!=(const overlay_static_range_v9_t& othe
     return !(*this == other);
 }
 
+bool overlay_managed_entity_locator_v9_t::valid() const noexcept
+{
+    if (!has_nonzero_bytes(workspace_id) || !has_nonzero_bytes(provider_hash) ||
+        !has_nonzero_bytes(artifact_hash) || !has_nonzero_bytes(entity_hash) ||
+        provider_size == 0 || generation == 0 ||
+        generation == (std::numeric_limits<std::uint64_t>::max)() ||
+        serialized_entity.empty() ||
+        serialized_entity.size() > k_overlay_managed_entity_serialization_limit)
+        return false;
+    try {
+        const auto decoded = deserialize_decompiler_entity_key(serialized_entity);
+        if (!decoded.valid() || !decoded.value)
+            return false;
+        const auto canonical = serialize_decompiler_entity_key(*decoded.value);
+        const auto artifact = managed_artifact_hash(*decoded.value);
+        return canonical == serialized_entity && artifact &&
+            *artifact == artifact_hash &&
+            stable_serialization_hash(serialized_entity).bytes == entity_hash;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool overlay_managed_entity_locator_v9_t::stable_identity_equal(
+    const overlay_managed_entity_locator_v9_t& other) const noexcept
+{
+    return workspace_id == other.workspace_id &&
+        provider_hash == other.provider_hash &&
+        artifact_hash == other.artifact_hash &&
+        entity_hash == other.entity_hash &&
+        provider_size == other.provider_size &&
+        serialized_entity == other.serialized_entity;
+}
+
+bool overlay_managed_entity_locator_v9_t::stable_identity_less(
+    const overlay_managed_entity_locator_v9_t& other) const noexcept
+{
+    return std::tie(workspace_id, provider_hash, artifact_hash, entity_hash,
+                    provider_size, serialized_entity) <
+        std::tie(other.workspace_id, other.provider_hash, other.artifact_hash,
+                 other.entity_hash, other.provider_size,
+                 other.serialized_entity);
+}
+
+bool overlay_managed_entity_locator_v9_t::operator==(
+    const overlay_managed_entity_locator_v9_t& other) const noexcept
+{
+    return stable_identity_equal(other) && generation == other.generation;
+}
+
+bool overlay_managed_entity_locator_v9_t::operator!=(
+    const overlay_managed_entity_locator_v9_t& other) const noexcept
+{
+    return !(*this == other);
+}
+
 bool overlay_payload_v9_t::operator==(const overlay_payload_v9_t& other) const noexcept
 {
     return name == other.name && text == other.text && type == other.type &&
@@ -715,8 +969,10 @@ bool overlay_payload_v9_t::operator!=(const overlay_payload_v9_t& other) const n
 
 bool overlay_operation_v9_t::operator==(const overlay_operation_v9_t& other) const noexcept
 {
-    return kind == other.kind && range == other.range && payload == other.payload &&
-        remove == other.remove;
+    return kind == other.kind &&
+        target_discriminator == other.target_discriminator &&
+        range == other.range && managed_locator == other.managed_locator &&
+        payload == other.payload && remove == other.remove;
 }
 
 bool overlay_operation_v9_t::operator!=(const overlay_operation_v9_t& other) const noexcept
@@ -738,8 +994,14 @@ bool overlay_operation_record_v9_t::operator!=(
 
 bool overlay_entity_key_v9_t::operator==(const overlay_entity_key_v9_t& other) const noexcept
 {
-    return domain == other.domain && range == other.range && stack_offset == other.stack_offset &&
-        qualifier == other.qualifier;
+    if (domain != other.domain ||
+        target_discriminator != other.target_discriminator ||
+        range != other.range || stack_offset != other.stack_offset ||
+        qualifier != other.qualifier ||
+        managed_locator.has_value() != other.managed_locator.has_value())
+        return false;
+    return !managed_locator || managed_locator->stable_identity_equal(
+        *other.managed_locator);
 }
 
 bool overlay_entity_key_v9_t::operator!=(const overlay_entity_key_v9_t& other) const noexcept
@@ -749,8 +1011,17 @@ bool overlay_entity_key_v9_t::operator!=(const overlay_entity_key_v9_t& other) c
 
 bool overlay_entity_key_v9_t::operator<(const overlay_entity_key_v9_t& other) const noexcept
 {
-    return std::tie(domain, range.offset, range.size, stack_offset, qualifier) <
-        std::tie(other.domain, other.range.offset, other.range.size, other.stack_offset, other.qualifier);
+    const auto lhs_prefix = std::tie(domain, target_discriminator, range.offset,
+                                     range.size, stack_offset, qualifier);
+    const auto rhs_prefix = std::tie(other.domain, other.target_discriminator,
+                                     other.range.offset, other.range.size,
+                                     other.stack_offset, other.qualifier);
+    if (lhs_prefix != rhs_prefix)
+        return lhs_prefix < rhs_prefix;
+    if (managed_locator.has_value() != other.managed_locator.has_value())
+        return managed_locator.has_value() < other.managed_locator.has_value();
+    return managed_locator && managed_locator->stable_identity_less(
+        *other.managed_locator);
 }
 
 overlay_entity_key_v9_t
@@ -765,6 +1036,27 @@ std::optional<overlay_operation_kind_v9_t> overlay_operation_kind_for_item_v9(
 {
     if (!valid_operation_kind(entity.domain))
         return std::nullopt;
+    if (entity.target_discriminator ==
+        overlay_target_discriminator_v9_t::native_address) {
+        if (entity.managed_locator)
+            return std::nullopt;
+    } else if (entity.target_discriminator ==
+               overlay_target_discriminator_v9_t::managed_entity) {
+        if (!entity.managed_locator || !entity.managed_locator->valid() ||
+            !managed_overlay_operation_kind_v9(entity.domain) ||
+            !range_is_empty(entity.range))
+            return std::nullopt;
+        overlay_operation_v9_t materialized;
+        materialized.kind = entity.domain;
+        materialized.target_discriminator = entity.target_discriminator;
+        materialized.managed_locator = entity.managed_locator;
+        materialized.payload = payload;
+        if (!canonical_managed_payload(materialized) ||
+            !nonempty_for_update(materialized))
+            return std::nullopt;
+    } else {
+        return std::nullopt;
+    }
     if (entity.domain != overlay_operation_kind_v9_t::byte_patch)
         return entity.domain;
     if (entity.range.size != 0 || payload.bytes.empty())

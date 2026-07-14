@@ -15,6 +15,8 @@
 #include "../infra/taskflow_runtime.hpp"
 #include "../scanner/aob_generator.hpp"
 #include "../scanner/scan_hub_view.hpp"
+#include "../ui/components.hpp"
+#include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
 #include "../../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
@@ -525,12 +527,16 @@ void render_xref_popup(const workspace_context_t& context) {
         entries = context.view->xref_results;
         scanning = context.view->xref_scanning.load(std::memory_order_acquire);
     }
-    ImGui::InputTextWithHint("##xref_filter", "Filter name or address",
-        context.view->xref_popup_filter, sizeof(context.view->xref_popup_filter));
+    static_cast<void>(aida::ui::search_field("xref_filter",
+        context.view->xref_popup_filter, sizeof(context.view->xref_popup_filter),
+        "Filter by name or address", 620.0f));
     if (scanning)
-        ImGui::TextUnformatted("Searching the workspace index...");
+        aida::ui::inline_notice("xref_scanning", "Searching cross references",
+            "Querying the workspace index for matching callers and targets.",
+            aida::ui::status_kind_t::info);
     ImGui::BeginChild("##xref_rows", ImVec2(620.0f, 320.0f), true);
     const std::string filter(context.view->xref_popup_filter);
+    std::size_t visible_entries = 0;
     for (const auto& entry : entries) {
         char address[32]{};
         std::snprintf(address, sizeof(address), "%016llX",
@@ -538,6 +544,7 @@ void render_xref_popup(const workspace_context_t& context) {
         if (!filter.empty() && entry.function_name.find(filter) == std::string::npos &&
             std::string(address).find(filter) == std::string::npos)
             continue;
+        ++visible_entries;
         std::string label = std::string(address) + "  " + entry.function_name;
         if (ImGui::Selectable(label.c_str(), false,
                 ImGuiSelectableFlags_AllowDoubleClick) &&
@@ -546,8 +553,14 @@ void render_xref_popup(const workspace_context_t& context) {
             ImGui::CloseCurrentPopup();
         }
     }
+    if (visible_entries == 0 && !scanning)
+        aida::ui::empty_state("xref_empty", "No cross references found",
+            filter.empty() ? "No indexed references target this location."
+                           : "No references match the current filter.",
+            nullptr, ImVec2(0.0f, 140.0f));
     ImGui::EndChild();
-    if (ImGui::Button("Close", ImVec2(110.0f, 0.0f))) {
+    if (aida::ui::button("Close", aida::ui::button_kind_t::secondary,
+            aida::ui::size_t_::sm, ImVec2(110.0f, 28.0f))) {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         context.view->xref_popup_open = false;
         ImGui::CloseCurrentPopup();
@@ -1089,7 +1102,9 @@ void render(float, float, float width, float height,
             const workspace_context_t& context, float) {
     if (!context) {
         ImGui::BeginChild("##workspace_disassembly_empty", ImVec2(width, height), false);
-        ImGui::TextUnformatted("No analysis workspace is selected.");
+        aida::ui::empty_state("disassembly_workspace_empty", "No workspace selected",
+            "Open or attach to a target to inspect its disassembly.", nullptr,
+            ImVec2(0.0f, (std::max)(152.0f, height - aida::ui::metrics::spacing::lg)));
         ImGui::EndChild();
         return;
     }
@@ -1098,19 +1113,36 @@ void render(float, float, float width, float height,
     ImGui::BeginChild("##workspace_disassembly", ImVec2(width, height), false);
     const auto& theme = aida::ui::resolved();
     ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(theme.text_primary, alpha));
-    file_metadata_banner::render(context, alpha);
-    if (ImGui::Button("<"))
-        navigate_back(context);
-    ImGui::SameLine();
-    if (ImGui::Button(">"))
-        navigate_forward(context);
-    ImGui::SameLine();
-    if (ImGui::Button("Go to")) {
+
+    const bool can_rebase =
+        context.workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
+        context.image;
+    aida::ui::status_kind_t header_status = aida::ui::status_kind_t::success;
+    if (context.progress.readiness == aida::analysis::workspace_readiness_t::failed)
+        header_status = aida::ui::status_kind_t::error;
+    else if (context.progress.readiness == aida::analysis::workspace_readiness_t::analyzing ||
+             context.progress.readiness == aida::analysis::workspace_readiness_t::partial ||
+             context.progress.readiness == aida::analysis::workspace_readiness_t::cancelling)
+        header_status = aida::ui::status_kind_t::info;
+    const auto header = aida::ui::view_header("Disassembly",
+        context.workspace->identity().bin_name().c_str(), "Go to",
+        can_rebase ? "Rebase" : nullptr, header_status);
+    if (header.primary_clicked) {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         context.view->goto_visible = true;
         context.view->goto_buf[0] = '\0';
     }
-    ImGui::SameLine();
+    if (header.secondary_clicked && can_rebase) {
+        const auto base = display_image_base(context);
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        std::snprintf(context.view->rebase_buf, sizeof(context.view->rebase_buf),
+            "0x%llX", static_cast<unsigned long long>(base));
+        context.view->rebase_error.clear();
+        context.view->rebase_popup_open = true;
+        ImGui::OpenPopup("Rebase###disasm_rebase_modal");
+    }
+    file_metadata_banner::render(context, alpha);
+
     bool show_bytes = false;
     int address_format = 0;
     int active_section = -1;
@@ -1120,6 +1152,19 @@ void render(float, float, float width, float height,
         address_format = static_cast<int>(context.view->addr_format);
         active_section = context.view->active_section;
     }
+    aida::ui::begin_toolbar("##disassembly_toolbar",
+        aida::ui::metrics::control::toolbar_h +
+        aida::ui::metrics::toolbar::padding_y * 2.0f + 2.0f);
+    aida::ui::begin_toolbar_group("history");
+    if (aida::ui::toolbar_button("back", "Back", false, false,
+            "Navigate to the previous location"))
+        navigate_back(context);
+    ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+    if (aida::ui::toolbar_button("forward", "Forward", false, false,
+            "Navigate to the next location"))
+        navigate_forward(context);
+    aida::ui::end_toolbar_group();
+    aida::ui::begin_toolbar_group("display");
     if (ImGui::Checkbox("Bytes", &show_bytes)) {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         context.view->show_bytes = show_bytes;
@@ -1154,19 +1199,9 @@ void render(float, float, float width, float height,
             ImGui::EndCombo();
         }
     }
-    if (context.workspace->target_kind() == aida::analysis::target_kind_t::static_file &&
-        context.image) {
-        ImGui::SameLine();
-        if (ImGui::Button("Rebase")) {
-            const auto base = display_image_base(context);
-            std::lock_guard<std::mutex> lock(context.view->mutex);
-            std::snprintf(context.view->rebase_buf, sizeof(context.view->rebase_buf),
-                "0x%llX", static_cast<unsigned long long>(base));
-            context.view->rebase_error.clear();
-            context.view->rebase_popup_open = true;
-            ImGui::OpenPopup("Rebase###disasm_rebase_modal");
-        }
-    }
+    aida::ui::end_toolbar_group(false);
+    aida::ui::end_toolbar();
+
     const auto progress = context.progress;
     if (progress.readiness == aida::analysis::workspace_readiness_t::analyzing ||
         progress.readiness == aida::analysis::workspace_readiness_t::partial ||
@@ -1174,34 +1209,51 @@ void render(float, float, float width, float height,
         const float fraction = progress.total_units == 0 ? 0.0f :
             static_cast<float>(progress.completed_units) /
             static_cast<float>(progress.total_units);
-        ImGui::ProgressBar((std::clamp)(fraction, 0.0f, 1.0f), ImVec2(-90.0f, 0.0f),
-            progress.phase.c_str());
-        ImGui::SameLine();
-        if (progress.readiness != aida::analysis::workspace_readiness_t::cancelling &&
-            ImGui::Button("Cancel"))
+        char progress_message[128]{};
+        std::snprintf(progress_message, sizeof(progress_message), "%llu of %llu units · %.0f%%",
+            static_cast<unsigned long long>(progress.completed_units),
+            static_cast<unsigned long long>(progress.total_units),
+            (std::clamp)(fraction, 0.0f, 1.0f) * 100.0f);
+        if (aida::ui::inline_notice("analysis_progress", progress.phase.c_str(),
+                progress_message, aida::ui::status_kind_t::info,
+                progress.readiness == aida::analysis::workspace_readiness_t::cancelling
+                    ? nullptr : "Cancel"))
             context.workspace->request_cancel();
     }
-    if (progress.error)
-        ImGui::TextWrapped("%s: %s", progress.error->stable_code().c_str(),
-            progress.error->message.c_str());
+    if (progress.error) {
+        const std::string message = progress.error->stable_code() + ": " +
+            progress.error->message;
+        aida::ui::inline_notice("analysis_error", "Analysis failed", message.c_str(),
+            aida::ui::status_kind_t::error);
+    }
+    std::string mutation_error;
+    std::string format_error;
+    std::string export_error;
+    std::string export_status;
     {
         std::lock_guard<std::mutex> lock(context.view->mutex);
-        if (!context.view->mutation_error.empty())
-            ImGui::TextWrapped("Overlay: %s", context.view->mutation_error.c_str());
-        if (!context.view->format_error.empty()) {
-            ImGui::TextWrapped("Formatting: %s", context.view->format_error.c_str());
-            ImGui::SameLine();
-            if (ImGui::Button("Retry")) {
-                context.view->format_error.clear();
-                context.view->formatted.clear();
-                context.view->pending_format_pages.clear();
-            }
-        }
-        if (!context.view->export_error.empty())
-            ImGui::TextWrapped("Export: %s", context.view->export_error.c_str());
-        else if (!context.view->export_status.empty())
-            ImGui::TextUnformatted(context.view->export_status.c_str());
+        mutation_error = context.view->mutation_error;
+        format_error = context.view->format_error;
+        export_error = context.view->export_error;
+        export_status = context.view->export_status;
     }
+    if (!mutation_error.empty())
+        aida::ui::inline_notice("overlay_error", "Overlay update failed",
+            mutation_error.c_str(), aida::ui::status_kind_t::error);
+    if (!format_error.empty() &&
+        aida::ui::inline_notice("format_error", "Formatting failed", format_error.c_str(),
+            aida::ui::status_kind_t::error, "Retry")) {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        context.view->format_error.clear();
+        context.view->formatted.clear();
+        context.view->pending_format_pages.clear();
+    }
+    if (!export_error.empty())
+        aida::ui::inline_notice("export_error", "Export failed", export_error.c_str(),
+            aida::ui::status_kind_t::error);
+    else if (!export_status.empty())
+        aida::ui::inline_notice("export_status", "Listing export", export_status.c_str(),
+            aida::ui::status_kind_t::info);
     if (context.view->rebase_popup_open &&
         ImGui::BeginPopupModal("Rebase###disasm_rebase_modal", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
@@ -1210,10 +1262,13 @@ void render(float, float, float width, float height,
             context.view->rebase_buf, sizeof(context.view->rebase_buf),
             ImGuiInputTextFlags_EnterReturnsTrue);
         if (!context.view->rebase_error.empty())
-            ImGui::TextWrapped("%s", context.view->rebase_error.c_str());
-        const bool apply = ImGui::Button("Apply") || enter;
-        ImGui::SameLine();
-        const bool cancel = ImGui::Button("Cancel") ||
+            aida::ui::inline_notice("rebase_error", "Invalid image base",
+                context.view->rebase_error.c_str(), aida::ui::status_kind_t::error);
+        const bool apply = aida::ui::button("Apply", aida::ui::button_kind_t::primary,
+            aida::ui::size_t_::sm) || enter;
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+        const bool cancel = aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
+            aida::ui::size_t_::sm) ||
             ImGui::IsKeyPressed(ImGuiKey_Escape, false);
         if (apply) {
             const auto base = parse_address_text(context, context.view->rebase_buf);
@@ -1247,25 +1302,50 @@ void render(float, float, float width, float height,
         goto_visible = context.view->goto_visible;
     }
     if (goto_visible) {
-        ImGui::SetNextItemWidth(240.0f);
-        const bool enter = ImGui::InputTextWithHint("##goto_address", "VA, RVA, or symbol",
-            context.view->goto_buf, sizeof(context.view->goto_buf),
-            ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        const bool go = ImGui::Button("Go") || enter;
+        aida::ui::begin_toolbar("##disassembly_goto",
+            aida::ui::metrics::control::toolbar_h +
+            aida::ui::metrics::toolbar::padding_y * 2.0f + 2.0f);
+        ImGui::PushID("goto_address");
+        const ImGuiID goto_input = ImGui::GetID("##input");
+        ImGui::PopID();
+        static_cast<void>(aida::ui::search_field("goto_address", context.view->goto_buf,
+            sizeof(context.view->goto_buf), "VA, RVA, or symbol", 300.0f));
+        const bool enter = ImGui::GetActiveID() == goto_input &&
+            ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+        const bool go = aida::ui::toolbar_button("goto_submit", "Go", false, false,
+            "Navigate to the resolved address") || enter;
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        const bool close_goto = aida::ui::toolbar_button("goto_close", "Close", false,
+            false, "Close address search");
+        aida::ui::end_toolbar();
         if (go) {
             if (auto value = parse_address_text(context, context.view->goto_buf))
                 goto_address(*value, context);
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->goto_visible = false;
+        } else if (close_goto) {
             std::lock_guard<std::mutex> lock(context.view->mutex);
             context.view->goto_visible = false;
         }
     }
     const auto range = instruction_range(context);
     if (!range || !context.publication->snapshot || range->first >= range->second) {
-        ImGui::Separator();
-        ImGui::TextUnformatted(progress.readiness == aida::analysis::workspace_readiness_t::failed
-            ? "Analysis failed before any instruction records were published."
-            : "Instruction records are not available at this readiness level.");
+        if (progress.readiness == aida::analysis::workspace_readiness_t::failed) {
+            aida::ui::error_state("disassembly_unavailable", "Disassembly unavailable",
+                "Analysis failed before any instruction records were published.", nullptr,
+                ImVec2(0.0f, 152.0f));
+        } else if (progress.readiness == aida::analysis::workspace_readiness_t::analyzing ||
+                   progress.readiness == aida::analysis::workspace_readiness_t::partial ||
+                   progress.readiness == aida::analysis::workspace_readiness_t::cancelling) {
+            aida::ui::loading_state("disassembly_loading", "Preparing disassembly",
+                "Instruction records will appear as soon as analysis publishes them.",
+                ImVec2(0.0f, 152.0f));
+        } else {
+            aida::ui::empty_state("disassembly_no_records", "No instructions available",
+                "This target has no instruction records at the current readiness level.", nullptr,
+                ImVec2(0.0f, 152.0f));
+        }
         ImGui::PopStyleColor();
         ImGui::EndChild();
         ImGui::PopID();
@@ -1273,14 +1353,32 @@ void render(float, float, float width, float height,
         rename_dialog::render();
         return;
     }
-    ImGui::Separator();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImGui::ColorConvertU32ToFloat4(theme.panel_header));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+        ImVec2(aida::ui::metrics::table::cell_pad_x,
+            aida::ui::metrics::table::cell_pad_y));
+    ImGui::BeginChild("##instruction_header", ImVec2(0.0f,
+        aida::ui::metrics::table::header_h), true,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::TextDisabled("Address");
+    if (show_bytes) {
+        ImGui::SameLine(170.0f);
+        ImGui::TextDisabled("Bytes");
+    }
+    ImGui::SameLine(show_bytes ? 470.0f : 190.0f);
+    ImGui::TextDisabled("Instruction");
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
     ImGui::BeginChild("##instruction_rows", ImVec2(0.0f, 0.0f), false,
         ImGuiWindowFlags_HorizontalScrollbar);
     const auto& instructions = context.publication->snapshot->instructions;
     const std::size_t count_size = range->second - range->first;
     const int count = count_size > static_cast<std::size_t>((std::numeric_limits<int>::max)())
         ? (std::numeric_limits<int>::max)() : static_cast<int>(count_size);
-    const float row_height = ImGui::GetTextLineHeightWithSpacing();
+    const float row_height = (std::max)(aida::ui::metrics::table::compact_row_h,
+        ImGui::GetTextLineHeightWithSpacing());
     std::optional<aida::analysis::address_t> selection;
     bool scroll_to_selection = false;
     {

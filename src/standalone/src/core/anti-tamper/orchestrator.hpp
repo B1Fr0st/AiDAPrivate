@@ -1347,6 +1347,34 @@ inline void handle_dma_key_scrub_if_requested()
     webhook::write_log_critical("dma_defense", "DMA_KEY_SCRUB_COMPLETE");
 }
 
+struct dma_preflight_policy_result_t
+{
+    bool hvci_active;
+    bool iommu_off;
+    bool iommu_bypassed;
+    bool refuse_multiple_unknown;
+    bool refuse_unprotected_unknown;
+};
+
+constexpr dma_preflight_policy_result_t evaluate_dma_preflight_policy(
+    bool hvci_active,
+    bool iommu_present,
+    bool vtd_enabled,
+    bool amd_vi_enabled,
+    bool remapping_bypassed,
+    uint32_t unknown_clusters) noexcept
+{
+    const bool iommu_off = !iommu_present || (!vtd_enabled && !amd_vi_enabled);
+    const bool iommu_bypassed = iommu_present && remapping_bypassed;
+    return {
+        hvci_active,
+        iommu_off,
+        iommu_bypassed,
+        unknown_clusters >= 2,
+        unknown_clusters >= 1 && (iommu_off || iommu_bypassed)
+    };
+}
+
 inline bool check_dma_preflight()
 {
     if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
@@ -1374,10 +1402,8 @@ inline bool check_dma_preflight()
         static_cast<unsigned long long>(GetTickCount64() - preflight_tick));
 
     if (hv_present)
-    {
-        webhook::write_log("dma_preflight", "skip_hypervisor_present");
-        return false;
-    }
+        webhook::write_log_critical("dma_preflight",
+            "hypervisor_present iommu_enforcement_preserved");
 
     driver_bridge::iommu_status_t iommu{};
     SetLastError(ERROR_SUCCESS);
@@ -1430,17 +1456,19 @@ inline bool check_dma_preflight()
 
     uint32_t unknown_clusters = pcie.unknown_count;
 
-    bool hvci_active = hv_preflight::g_hvci_enabled || vbs_enforcement::hvci_active();
+    const bool hvci_active = hv_preflight::g_hvci_enabled || vbs_enforcement::hvci_active();
+    const auto dma_policy = evaluate_dma_preflight_policy(
+        hvci_active,
+        iommu.iommu_present,
+        iommu.vtd_enabled,
+        iommu.amd_vi_enabled,
+        iommu.remapping_bypassed,
+        unknown_clusters);
 
-    if (hvci_active)
-    {
-        webhook::write_log_critical("dma_preflight", "hvci_bypass_active iommu_off_check_skipped");
-    }
+    if (dma_policy.hvci_active)
+        webhook::write_log_critical("dma_preflight", "hvci_active iommu_enforcement_preserved");
 
-    bool iommu_off = hvci_active ? false : (iommu.iommu_present && !iommu.vtd_enabled && !iommu.amd_vi_enabled);
-    bool iommu_bypassed = iommu.iommu_present && iommu.remapping_bypassed;
-
-    if (unknown_clusters >= 2)
+    if (dma_policy.refuse_multiple_unknown)
     {
         webhook::write_log_critical_fmt("dma_preflight",
             "refuse reason=unknown_clusters_2plus count=%u", unknown_clusters);
@@ -1453,12 +1481,12 @@ inline bool check_dma_preflight()
         return true;
     }
 
-    if ((iommu_off || iommu_bypassed) && unknown_clusters >= 1)
+    if (dma_policy.refuse_unprotected_unknown)
     {
         webhook::write_log_critical_fmt("dma_preflight",
             "refuse reason=iommu_off_with_unknown iommu_off=%d bypassed=%d unknown=%u",
-            iommu_off ? 1 : 0,
-            iommu_bypassed ? 1 : 0,
+            dma_policy.iommu_off ? 1 : 0,
+            dma_policy.iommu_bypassed ? 1 : 0,
             unknown_clusters);
         webhook::send_debug_log("dma_preflight", "unsupported_iommu_off_with_unknown_dma_device", true);
         std::wstring msg = WOBFSTR(L"Unsupported hardware configuration. AiDA cannot start on this system.");
@@ -1471,8 +1499,8 @@ inline bool check_dma_preflight()
 
     webhook::write_log_critical_fmt("dma_preflight",
         "pass iommu_off=%d bypassed=%d unknown=%u elapsed_ms=%llu",
-        iommu_off ? 1 : 0,
-        iommu_bypassed ? 1 : 0,
+        dma_policy.iommu_off ? 1 : 0,
+        dma_policy.iommu_bypassed ? 1 : 0,
         unknown_clusters,
         static_cast<unsigned long long>(GetTickCount64() - preflight_tick));
 
@@ -2097,18 +2125,24 @@ inline bool initialize()
     }
 
     {
-        bool veh_protect_ok = false;
+        bool veh_chain_ok = false;
         __try
         {
-            veh_protect_ok = anti_hook::veh_chain::install_veh_insertion_protection();
+            veh_chain_ok = anti_hook::veh_chain::verify_chain();
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            veh_protect_ok = false;
+            veh_chain_ok = false;
         }
-        webhook::write_log("init", veh_protect_ok
-            ? "veh_insertion_protection_installed_ok"
-            : "veh_insertion_protection_failed_non_fatal");
+        webhook::write_log("init", veh_chain_ok
+            ? "veh_chain_passive_monitor_ready"
+            : "veh_chain_passive_monitor_failed");
+        if (!veh_chain_ok)
+        {
+            enforce_violation_id(aida::reason_ids::reason_id_hook_at_startup,
+                "veh_chain_passive_monitor_failed");
+            return false;
+        }
     }
 
     webhook::write_log_critical("init", "ambient_tool_posture_enforcement_removed");

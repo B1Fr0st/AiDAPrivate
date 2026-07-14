@@ -1,4 +1,5 @@
 #include "x86_tile_decoder_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decode/x86_tile_decoder.hpp"
 #include "../../src/core/analysis/provider_snapshot.hpp"
@@ -36,6 +37,8 @@ static_assert(std::is_same_v<decltype(&worker_owned_x86_tile_decoder_t::decode_t
 
 void require(bool condition, const char* message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -43,7 +46,10 @@ void require(bool condition, const char* message)
 template <typename value_t>
 value_t require_value(workspace_result_t<value_t> result, const char* message)
 {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(message);
     return result.take_value();
 }
@@ -431,6 +437,7 @@ int run_x86_tile_decoder_harness()
         std::cout << "x86 tile decoder harness passed\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::filesystem::remove_all(root, cleanup_error);
         std::cerr << "x86 tile decoder harness failed: " << error.what() << '\n';
         return 1;

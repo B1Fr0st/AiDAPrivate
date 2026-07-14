@@ -27,6 +27,7 @@ struct provider_output_t {
     hir_function_t hir;
     type_graph_t type_graph;
     std::string serialized;
+    std::optional<std::string> printc_evidence;
     std::vector<decompiler_diagnostic_t> diagnostics;
 };
 
@@ -103,7 +104,8 @@ std::optional<provider_output_t> execute_native(
     if (!snapshot || !identity || job.cache_key.entity.kind != decompiler_entity_kind_t::native_function)
         return std::nullopt;
     std::uint64_t entry = 0;
-    if (!checked_entry_address(*identity, snapshot->image_base, snapshot->virtual_image.size(), entry)) {
+    if (!checked_entry_address(*identity, snapshot->image_base,
+            static_cast<std::size_t>(snapshot->image_size), entry)) {
         diagnostics.push_back(failure(decompiler_diagnostic_code_t::invalid_contract,
             "decompiler.native_worker.entry_binding"));
         return std::nullopt;
@@ -120,14 +122,30 @@ std::optional<provider_output_t> execute_native(
     ghidra_decompiler::ghidra_decompile_result_limits_t limits;
     limits.max_result_bytes = (std::min<std::uint64_t>)(
         limits.max_result_bytes, job.profile.max_memory_bytes);
-    const auto output = ghidra_decompiler::decompile_isolated_buffer(
-        snapshot->virtual_image.data(), snapshot->virtual_image.size(), snapshot->image_base,
-        entry, job.cache_key.language.language_id, &cancelled, deadline, limits, capture);
+    limits.capture_printc_evidence = job.request_printc_evidence;
+    std::vector<aida_ghidra::region_t> regions;
+    regions.reserve(snapshot->ranges.size());
+    for (auto& source : snapshot->ranges) {
+        aida_ghidra::region_t region;
+        region.start_va = snapshot->image_base + source.relative_virtual_address;
+        region.data = std::move(source.bytes);
+        regions.push_back(std::move(region));
+    }
+    const auto output = ghidra_decompiler::decompile_isolated_regions(
+        std::move(regions), snapshot->image_base, snapshot->image_size, entry,
+        job.cache_key.language.language_id, &cancelled, deadline, limits, capture);
     if (output.is_error || !output.typed_artifacts) {
         diagnostics.insert(diagnostics.end(), output.typed_diagnostics.begin(), output.typed_diagnostics.end());
         if (diagnostics.empty())
             diagnostics.push_back(failure(decompiler_diagnostic_code_t::provider_failure,
                 "decompiler.native_worker.provider_failed"));
+        return std::nullopt;
+    }
+    if (job.request_printc_evidence &&
+        (!output.printc_evidence || output.printc_evidence->empty() ||
+         output.printc_evidence->size() > k_decompiler_worker_printc_evidence_max_bytes)) {
+        diagnostics.push_back(failure(decompiler_diagnostic_code_t::provider_failure,
+            "decompiler.native_worker.printc_evidence_required"));
         return std::nullopt;
     }
     provider_output_t result;
@@ -136,6 +154,7 @@ std::optional<provider_output_t> execute_native(
     result.type_graph = output.typed_artifacts->type_graph;
     result.diagnostics = output.typed_diagnostics;
     result.serialized = ghidra_ir_adapter::serialize_artifacts(*output.typed_artifacts);
+    result.printc_evidence = output.printc_evidence;
     if (result.serialized.empty()) {
         diagnostics.push_back(failure(decompiler_diagnostic_code_t::malformed_serialization,
             "decompiler.native_worker.provider_serialize"));
@@ -210,6 +229,12 @@ bool validate_output(const provider_output_t& output, const decompiler_worker_jo
 result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_request_t& job)
 {
     result_t result;
+    if (job.request_printc_evidence &&
+        job.cache_key.provider.provider != decompiler_provider_id_t::ghidra_native) {
+        result.diagnostics.push_back(failure(decompiler_diagnostic_code_t::worker_protocol_failure,
+            "decompiler.isolated_worker.printc_provider"));
+        return result;
+    }
     const auto bytes = snapshot_bytes(startup);
     if (!bytes) {
         result.diagnostics.push_back(failure(decompiler_diagnostic_code_t::resource_limit,
@@ -263,6 +288,7 @@ result_t produce(const runtime::startup_t& startup, const decompiler_worker_job_
     }
     result.document = std::move(*rendered.document);
     result.provider_artifacts = std::move(output->serialized);
+    result.printc_evidence = std::move(output->printc_evidence);
     result.document->diagnostics.insert(result.document->diagnostics.end(),
         output->provider_ir.diagnostics.begin(), output->provider_ir.diagnostics.end());
     result.document->diagnostics.insert(result.document->diagnostics.end(),

@@ -1,4 +1,5 @@
 #include "capstone_tile_decoder_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decode/capstone_tile_decoder.hpp"
 
@@ -72,6 +73,7 @@ private:
 
 void require(bool condition, std::string_view message)
 {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -483,6 +485,7 @@ bool run_capstone_tile_decoder_harness(std::string& failure)
         test_deterministic_records_and_cancellation();
         return true;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure = error.what();
         return false;
     }

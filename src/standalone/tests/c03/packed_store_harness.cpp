@@ -1,4 +1,5 @@
 #include "packed_store_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/packed_analysis_store.hpp"
 
@@ -13,6 +14,7 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -20,14 +22,18 @@ void require(bool condition, const char* message)
 template <typename value_t>
 value_t require_value(packed_store_result_t<value_t> result, const char* message)
 {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	assertion_telemetry::record_assertion(accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(message);
     return std::move(result).take_value();
 }
 
 void require_success(packed_store_result_t<void> result, const char* message)
 {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	assertion_telemetry::record_assertion(accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(message);
 }
 

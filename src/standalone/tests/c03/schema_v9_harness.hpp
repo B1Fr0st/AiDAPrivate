@@ -34,6 +34,7 @@ schema_v9_fixture_result_t run_cache_key_round_trip();
 schema_v9_fixture_result_t run_workbench_round_trip();
 schema_v9_fixture_result_t run_generation_atomicity();
 schema_v9_fixture_result_t run_database_open_queue_path();
+schema_v9_fixture_result_t run_baseline_persistence_entry_path();
 
 schema_v9_harness_summary_t run_all_schema_v9_fixtures();
 

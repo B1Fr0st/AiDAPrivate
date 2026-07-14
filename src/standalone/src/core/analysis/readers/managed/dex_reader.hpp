@@ -14,7 +14,7 @@
 namespace aida::analysis::readers::managed {
 
 struct dex_parse_limits_t {
-    dex_parse_limits_t parser_limits;
+    ::aida::analysis::dex_parse_limits_t parser_limits;
     std::uint32_t max_types = 1U << 20;
     std::uint32_t max_methods = 1U << 20;
     std::uint32_t max_fields = 1U << 20;

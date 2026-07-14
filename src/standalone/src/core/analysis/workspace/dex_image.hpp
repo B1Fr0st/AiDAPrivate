@@ -61,9 +61,16 @@ struct dex_compact_dex_features_t {
     std::uint32_t declared_header_size = 0;
     std::uint32_t feature_flags = 0;
     std::uint32_t unknown_feature_flags = 0;
+    std::uint32_t debug_info_offsets_position = 0;
+    std::uint32_t debug_info_offsets_table_offset = 0;
+    std::uint32_t debug_info_base = 0;
+    std::uint32_t owned_data_begin = 0;
+    std::uint32_t owned_data_end = 0;
     bool default_methods = false;
     bool compact_code_items = true;
     bool debug_info_offset_table = true;
+
+    bool valid(std::uint32_t method_count, std::uint32_t data_size) const noexcept;
 };
 
 struct dex_container_info_t {
@@ -191,6 +198,7 @@ struct dex_debug_info_t {
 
 struct dex_code_item_t {
     std::uint32_t offset = 0;
+    std::uint32_t instructions_offset = 0;
     std::uint16_t registers_size = 0;
     std::uint16_t ins_size = 0;
     std::uint16_t outs_size = 0;
@@ -253,6 +261,7 @@ struct dex_image_t {
     dex_header_t header;
     dex_managed_identity_t managed_identity;
     std::uint64_t dex_offset = 0;
+    std::uint64_t payload_size = 0;
     std::vector<dex_map_item_t> map_items;
     std::vector<dex_string_t> strings;
     std::vector<dex_type_t> types;

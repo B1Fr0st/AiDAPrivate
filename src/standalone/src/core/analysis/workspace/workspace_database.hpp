@@ -24,7 +24,7 @@ namespace aida::analysis {
 inline constexpr std::uint32_t workspace_database_schema_version = workspace_schema_v9_version;
 inline constexpr std::uint32_t workspace_instruction_blob_version = 2;
 inline constexpr std::uint64_t workspace_decompiler_cache_record_limit = 64ULL << 20;
-inline constexpr std::uint64_t workspace_search_blob_limit = 512ULL << 20;
+inline constexpr std::uint64_t workspace_search_blob_limit = 8ULL << 30;
 
 struct workspace_database_versions_t {
     std::string engine_version;
@@ -41,6 +41,9 @@ struct workspace_database_options_t {
     std::uint32_t passive_checkpoint_pages = 4096;
     std::uint64_t instruction_chunk_records = 4096;
     std::uint64_t max_persisted_fact_records = 200000000;
+    std::uint64_t packed_generation_quota_bytes =
+        packed_generation_default_quota_bytes;
+    std::uint32_t packed_stream_page_size = 256U << 10;
 };
 
 struct decompiler_cache_key_t {
@@ -105,19 +108,35 @@ struct persisted_search_products_t {
     std::vector<type_candidate_record_t> types;
     std::uint32_t search_index_blob_version = 0;
     std::vector<std::uint8_t> search_index_blob;
+    std::shared_ptr<const search_index_t> live_index;
 };
 
-using packed_baseline_domains_t =
-    std::vector<std::pair<packed_page_type_t, std::vector<std::uint8_t>>>;
+workspace_result_t<std::vector<std::uint8_t>>
+encode_managed_publication_domain(
+    const managed_artifact_publication_t& publication,
+    const cancellation_token_t& cancel = {});
 
-workspace_result_t<packed_baseline_domains_t> encode_packed_baseline_domains(
-    const analysis_snapshot_t& snapshot,
-    const persisted_search_products_t& search_products,
+workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>
+decode_managed_publication_domain(
+    const std::vector<std::uint8_t>& payload,
+    const workspace_identity_t& identity,
+    const byte_provider_t& provider,
+    std::uint64_t expected_generation,
+    std::uint64_t expected_analysis_revision,
+    std::uint64_t expected_overlay_revision,
+    std::uint64_t maximum_payload_bytes = managed_publication_max_payload_bytes,
     const cancellation_token_t& cancel = {});
 
 workspace_result_t<std::vector<std::uint8_t>> encode_packed_baseline_manifest(
     const analysis_snapshot_t& snapshot,
     const std::string& candidate_token,
+    const cancellation_token_t& cancel = {});
+
+workspace_result_t<std::shared_ptr<search_index_t>> restore_persisted_search_index(
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    persisted_search_products_t products,
+    std::shared_ptr<analysis_metrics_t> metrics,
+    const search_index_limits_t& limits = {},
     const cancellation_token_t& cancel = {});
 
 workspace_result_t<void> migrate_workspace_database_schema(
@@ -179,7 +198,20 @@ public:
         cancellation_token_t cancel = {});
     persistence_ticket_t persist_snapshot(
         std::shared_ptr<const analysis_snapshot_t> snapshot,
+        std::shared_ptr<const managed_artifact_publication_t> managed_publication,
+        std::string analysis_settings_json,
+        std::string analysis_metrics_json,
+        cancellation_token_t cancel = {});
+    persistence_ticket_t persist_snapshot(
+        std::shared_ptr<const analysis_snapshot_t> snapshot,
         persisted_search_products_t search_products,
+        std::string analysis_settings_json,
+        std::string analysis_metrics_json,
+        cancellation_token_t cancel = {});
+    persistence_ticket_t persist_snapshot(
+        std::shared_ptr<const analysis_snapshot_t> snapshot,
+        persisted_search_products_t search_products,
+        std::shared_ptr<const managed_artifact_publication_t> managed_publication,
         std::string analysis_settings_json,
         std::string analysis_metrics_json,
         cancellation_token_t cancel = {});
@@ -196,6 +228,13 @@ public:
         std::uint64_t expected_analysis_revision,
         std::uint64_t expected_overlay_revision,
         const cancellation_token_t& cancel = {}) const;
+    workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>
+        load_managed_publication(
+            std::shared_ptr<const byte_provider_t> provider,
+            std::uint64_t expected_generation,
+            std::uint64_t expected_analysis_revision,
+            std::uint64_t expected_overlay_revision,
+            const cancellation_token_t& cancel = {}) const;
 
     persistence_ticket_t store_decompiler_cache(
         decompiler_cache_record_t record,
@@ -207,16 +246,6 @@ public:
         std::optional<std::uint64_t> function_rva,
         std::optional<std::uint64_t> minimum_overlay_revision,
         cancellation_token_t cancel = {});
-    persistence_ticket_t publish_packed_generation(
-        packed_generation_publication_t publication,
-        cancellation_token_t cancel = {});
-    persistence_ticket_t publish_packed_generation(
-        packed_generation_publication_t publication,
-        std::shared_ptr<const workspace_persistence_candidate_t> candidate,
-        cancellation_token_t cancel = {});
-    workspace_result_t<std::optional<packed_generation_publication_t>>
-        load_packed_generation(std::uint64_t generation,
-                               const cancellation_token_t& cancel = {}) const;
     persistence_ticket_t store_workbench_state(
         workbench_state_record_t record,
         cancellation_token_t cancel = {});
@@ -240,7 +269,8 @@ private:
                          std::shared_ptr<persistence_queue_t> queue);
 
     persistence_ticket_t enqueue_write(std::string label, writer_operation_t operation,
-                                       cancellation_token_t cancel);
+                                       cancellation_token_t cancel,
+                                       std::uint64_t reservation_bytes = 0);
     workspace_result_t<void> with_reader(
         const reader_operation_t& operation,
         const cancellation_token_t& cancel = {}) const;

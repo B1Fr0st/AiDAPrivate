@@ -875,9 +875,9 @@ int main()
         if (!loaded || !loaded.value())
             throw fixture_error_t("persisted baseline snapshot did not reopen");
         auto persisted_snapshot = loaded.take_value();
-        if (!persisted_snapshot->baseline_complete ||
+        if (persisted_snapshot->baseline_complete ||
             persisted_snapshot->overlay_revision != persisted_revision)
-            throw fixture_error_t("persisted baseline snapshot revision or completeness diverged");
+            throw fixture_error_t("persisted projected snapshot revision or completeness diverged");
         auto products = reopened->database()->load_search_products(
             persisted_snapshot->generation, persisted_snapshot->analysis_revision,
             persisted_snapshot->overlay_revision, reopened->cancellation_token());
@@ -893,8 +893,8 @@ int main()
             throw fixture_error_t(rebuilt_index.error().stable_code() + ":" + rebuilt_index.error().message);
         auto published = reopened->publish_analysis_bundle(
             reopened->generation(), reopened->analysis_revision(),
-            persisted_snapshot, rebuilt_index.take_value(), true);
-        if (!published || reopened->progress().readiness != workspace_readiness_t::baseline_ready ||
+            persisted_snapshot, rebuilt_index.take_value(), false);
+        if (!published || reopened->progress().readiness != workspace_readiness_t::partial ||
             !reopened->snapshot() || !reopened->search_index())
             throw fixture_error_t("warm reopen did not publish the persisted snapshot and rebuilt search index");
         close_workspace(reopened, true);

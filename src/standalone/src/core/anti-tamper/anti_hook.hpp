@@ -369,6 +369,36 @@ namespace detail {
         return true;
     }
 
+    inline bool constant_time_hash32_equal(const uint8_t* lhs, const uint8_t* rhs)
+    {
+        if (!lhs || !rhs) return false;
+        uint8_t difference = 0;
+        for (size_t i = 0; i < 32; ++i)
+            difference |= static_cast<uint8_t>(lhs[i] ^ rhs[i]);
+        return difference == 0;
+    }
+
+    inline bool prologue_evidence_matches_baseline(
+        const uint8_t* trusted_hash,
+        uint32_t trusted_crc,
+        bool current_hash_ok,
+        const uint8_t* current_hash,
+        bool current_crc_ok,
+        uint32_t current_crc,
+        bool kernel_read_ok,
+        uint64_t kernel_crc)
+    {
+        if (!current_hash_ok || !current_crc_ok || !kernel_read_ok)
+            return false;
+        const bool hash_matches = constant_time_hash32_equal(trusted_hash, current_hash);
+        const uint64_t trusted_crc64 = static_cast<uint64_t>(trusted_crc);
+        const bool user_crc_matches = current_crc == trusted_crc;
+        const bool kernel_crc_matches = kernel_crc == trusted_crc64;
+        const bool transport_consistent = kernel_crc == static_cast<uint64_t>(current_crc);
+        return hash_matches && user_crc_matches && kernel_crc_matches
+            && transport_consistent;
+    }
+
     inline const char* const k_critical_ntdll_funcs[] = {
         "NtQueryInformationProcess",
         "NtQuerySystemInformation",
@@ -399,6 +429,7 @@ namespace detail {
     {
         std::string name;
         uint8_t hash[32];
+        uint32_t crc32;
         uint64_t cached_va;
     };
 
@@ -793,25 +824,31 @@ namespace baseline {
         const char* const* names, size_t name_count)
     {
         out.clear();
-        if (!mod) return false;
+        if (!mod || !names || name_count == 0) return false;
 
         for (size_t i = 0; i < name_count; ++i)
         {
             const char* name = names[i];
             auto* addr = reinterpret_cast<const uint8_t*>(GetProcAddress(mod, name));
-            if (!addr) continue;
+            if (!addr) {
+                out.clear();
+                return false;
+            }
 
             detail::prologue_baseline_t b{};
             b.name = name;
             b.cached_va = reinterpret_cast<uint64_t>(addr);
 
-            if (!seh_hash_prologue(addr, b.hash))
-                continue;
+            if (!seh_hash_prologue(addr, b.hash)
+                || !detail::crc32_bytes(addr, detail::k_prologue_bytes, &b.crc32)) {
+                out.clear();
+                return false;
+            }
 
             out.push_back(std::move(b));
         }
 
-        return !out.empty();
+        return out.size() == name_count;
     }
 
     inline bool capture_all()
@@ -835,10 +872,13 @@ namespace baseline {
 
         capture_self_prologues();
 
-        bool any = ok_n || ok_k;
-        if (any)
-            detail::baselines_captured().store(true);
-        return any;
+        const bool complete = ok_n && ok_k;
+        if (!complete) {
+            detail::ntdll_baselines().clear();
+            detail::kernel32_baselines().clear();
+        }
+        detail::baselines_captured().store(complete);
+        return complete;
     }
 
 }
@@ -878,6 +918,12 @@ namespace veh_chain {
     }
 
     inline std::atomic<bool>& baseline_set()
+    {
+        static std::atomic<bool> v{false};
+        return v;
+    }
+
+    inline std::atomic<bool>& baseline_capture_attempted()
     {
         static std::atomic<bool> v{false};
         return v;
@@ -991,6 +1037,11 @@ namespace veh_chain {
     {
         std::lock_guard<std::mutex> lk(chain_mtx());
         if (baseline_set().load()) return true;
+        bool expected = false;
+        if (!baseline_capture_attempted().compare_exchange_strong(expected, true))
+            return false;
+        if (!baseline_handlers().empty() || baseline_count().load() != 0)
+            return false;
 
         uint32_t count = 0;
         std::vector<uint64_t> hs;
@@ -1005,15 +1056,12 @@ namespace veh_chain {
     inline bool verify_chain()
     {
         if (!baseline_set().load())
-        {
-            capture_baseline();
-            return true;
-        }
+            return capture_baseline();
 
         std::lock_guard<std::mutex> lk(chain_mtx());
         std::vector<uint64_t> hs;
         uint32_t count = 0;
-        if (!walk_chain(hs, count)) return true;
+        if (!walk_chain(hs, count)) return false;
 
         if (count != baseline_count().load()) return false;
 
@@ -1024,229 +1072,6 @@ namespace veh_chain {
             if (hs[i] != base[i]) return false;
         }
         return true;
-    }
-
-    inline bool is_microsoft_module(HMODULE mod)
-    {
-        if (!mod) return false;
-        wchar_t path[MAX_PATH]{};
-        DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
-        if (len == 0) return false;
-        CharLowerBuffW(path, len);
-
-        const wchar_t* const k_ms_modules[] = {
-            L"ntdll.dll",
-            L"kernelbase.dll",
-            L"kernel32.dll",
-            L"vcruntime140.dll",
-            L"vcruntime140_1.dll",
-            L"msvcp140.dll",
-            L"ucrtbase.dll",
-        };
-
-        for (const wchar_t* ms_name : k_ms_modules)
-        {
-            if (wcsstr(path, ms_name))
-                return true;
-        }
-        return false;
-    }
-
-    inline bool is_baseline_handler(uint64_t handler_va)
-    {
-        const auto& base = baseline_handlers();
-        for (uint64_t bh : base)
-        {
-            if (bh == handler_va) return true;
-        }
-        return false;
-    }
-
-    inline uint32_t remove_foreign_handlers()
-    {
-        uint64_t head_addr = list_head_addr().load();
-        if (head_addr == 0)
-        {
-            head_addr = locate_veh_list_head();
-            if (head_addr == 0) return 0;
-            list_head_addr().store(head_addr);
-        }
-
-        auto* head = reinterpret_cast<_VECTORED_HANDLER_LIST*>(head_addr);
-        if (!pointer_readable(head, sizeof(_VECTORED_HANDLER_LIST)))
-            return 0;
-
-        uint32_t removed = 0;
-
-        __try
-        {
-            LIST_ENTRY* cursor = head->ListHead.Flink;
-            uint32_t guard = 0;
-            while (cursor != &head->ListHead && guard < 256)
-            {
-                if (!pointer_readable(cursor, sizeof(LIST_ENTRY)))
-                    break;
-
-                auto* entry = CONTAINING_RECORD(cursor, _VECTORED_HANDLER_ENTRY, Entry);
-                if (!pointer_readable(entry, sizeof(_VECTORED_HANDLER_ENTRY)))
-                    break;
-
-                uint64_t handler_va = reinterpret_cast<uint64_t>(entry->VectoredHandler);
-                LIST_ENTRY* next = cursor->Flink;
-
-                bool is_known = is_baseline_handler(handler_va);
-                bool is_ms = false;
-                if (!is_known)
-                {
-                    HMODULE owner_mod = nullptr;
-                    BOOL owner_ok = GetModuleHandleExW(
-                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                        reinterpret_cast<LPCWSTR>(handler_va), &owner_mod);
-                    is_ms = owner_ok && owner_mod && is_microsoft_module(owner_mod);
-                }
-
-                if (!is_known && !is_ms)
-                {
-                    LIST_ENTRY* prev = cursor->Blink;
-                    if (prev && next)
-                    {
-                        prev->Flink = next;
-                        next->Blink = prev;
-                        ++removed;
-                        char dbg[256];
-                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                            "veh_foreign_handler_removed va=0x%llX",
-                            static_cast<unsigned long long>(handler_va));
-                        webhook::write_log_critical("veh_chain", dbg);
-                    }
-                }
-
-                cursor = next;
-                ++guard;
-                if (!cursor) break;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return removed;
-        }
-        return removed;
-    }
-
-    inline PVOID WINAPI veh_hook_AddVectoredExceptionHandler(
-        ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-    {
-        if (!Handler) return nullptr;
-
-        HMODULE self_mod = GetModuleHandleW(nullptr);
-        uint64_t self_base = reinterpret_cast<uint64_t>(self_mod);
-        uint64_t self_end = 0;
-        if (self_mod)
-        {
-            MODULEINFO mi{};
-            if (GetModuleInformation(GetCurrentProcess(), self_mod, &mi, sizeof(mi)))
-                self_end = self_base + mi.SizeOfImage;
-        }
-
-        HMODULE caller_mod = nullptr;
-        BOOL owner_ok = GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(_ReturnAddress()),
-            &caller_mod);
-
-        bool caller_is_self = false;
-        if (owner_ok && caller_mod && self_mod)
-        {
-            uint64_t caller_addr = reinterpret_cast<uint64_t>(_ReturnAddress());
-            caller_is_self = caller_addr >= self_base && caller_addr < self_end;
-        }
-
-        if (!caller_is_self)
-        {
-            char dbg[256];
-            _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                "veh_insertion_blocked foreign_handler=0x%llX",
-                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(Handler)));
-            webhook::write_log_critical("veh_chain", dbg);
-            return nullptr;
-        }
-
-        using AddVEH_t = PVOID(WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
-        static AddVEH_t s_real_AddVEH = nullptr;
-        if (!s_real_AddVEH)
-        {
-            HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-            if (k32)
-                s_real_AddVEH = reinterpret_cast<AddVEH_t>(
-                    GetProcAddress(k32, "AddVectoredExceptionHandler"));
-        }
-        if (!s_real_AddVEH) return nullptr;
-        return s_real_AddVEH(First, Handler);
-    }
-
-    inline bool install_veh_insertion_protection()
-    {
-        HMODULE self_mod = GetModuleHandleW(nullptr);
-        if (!self_mod) return false;
-
-        auto* base = reinterpret_cast<uint8_t*>(self_mod);
-        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-
-        const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-        if (imp_dir.VirtualAddress == 0 || imp_dir.Size == 0) return false;
-
-        auto* imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
-            base + imp_dir.VirtualAddress);
-
-        FARPROC real_AddVEH = nullptr;
-        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-        if (k32)
-            real_AddVEH = GetProcAddress(k32, "AddVectoredExceptionHandler");
-        if (!real_AddVEH) return false;
-
-        for (; imp->Name != 0; ++imp)
-        {
-            const char* dll_name = reinterpret_cast<const char*>(base + imp->Name);
-            if (_stricmp(dll_name, "kernel32.dll") != 0 &&
-                _stricmp(dll_name, "KERNEL32.dll") != 0 &&
-                _stricmp(dll_name, "kernel32") != 0)
-                continue;
-
-            if (imp->FirstThunk == 0) continue;
-            auto* iat = reinterpret_cast<uintptr_t*>(base + imp->FirstThunk);
-            auto* ilt = (imp->OriginalFirstThunk != 0)
-                ? reinterpret_cast<uintptr_t*>(base + imp->OriginalFirstThunk)
-                : iat;
-
-            for (size_t i = 0; iat[i] != 0; ++i)
-            {
-                if (IMAGE_SNAP_BY_ORDINAL(ilt[i])) continue;
-                auto* name_ref = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
-                    base + (ilt[i] & ~IMAGE_ORDINAL_FLAG));
-                if (strcmp(name_ref->Name, "AddVectoredExceptionHandler") != 0)
-                    continue;
-
-                if (reinterpret_cast<FARPROC>(iat[i]) != real_AddVEH)
-                    continue;
-
-                DWORD old_prot = 0;
-                if (!VirtualProtect(&iat[i], sizeof(uintptr_t),
-                    PAGE_READWRITE, &old_prot))
-                    continue;
-
-                iat[i] = reinterpret_cast<uintptr_t>(&veh_hook_AddVectoredExceptionHandler);
-
-                VirtualProtect(&iat[i], sizeof(uintptr_t), old_prot, &old_prot);
-                FlushInstructionCache(GetCurrentProcess(), &iat[i], sizeof(uintptr_t));
-
-                webhook::write_log("veh_chain", "veh_insertion_protection_installed");
-                return true;
-            }
-        }
-        return false;
     }
 
 }
@@ -1510,11 +1335,17 @@ inline bool capture_self_prologues()
         b.name = entry.name;
         b.cached_va = entry.address;
 
-        uint8_t hash[32];
-        if (!baseline::seh_hash_prologue(addr, hash))
-            continue;
+        uint8_t hash[32]{};
+        uint32_t crc = 0;
+        if (!baseline::seh_hash_prologue(addr, hash)
+            || !detail::crc32_bytes(addr, detail::k_prologue_bytes, &crc)) {
+            baselines.clear();
+            detail::self_prologues_captured().store(false);
+            return false;
+        }
 
         memcpy(b.hash, hash, 32);
+        b.crc32 = crc;
         baselines.push_back(std::move(b));
     }
 
@@ -1524,10 +1355,14 @@ inline bool capture_self_prologues()
 
 inline bool verify_self_prologue_hashes(std::string& mismatched_name)
 {
-    if (!detail::self_prologues_captured().load())
-        return true;
-
     std::lock_guard<std::mutex> lk(detail::self_func_mtx());
+    if (detail::self_func_inventory().empty())
+        return true;
+    if (!detail::self_prologues_captured().load()
+        || detail::self_baselines().size() != detail::self_func_inventory().size()) {
+        mismatched_name = "self_baseline_state";
+        return false;
+    }
     for (const auto& b : detail::self_baselines())
     {
         auto* addr = reinterpret_cast<const uint8_t*>(b.cached_va);
@@ -2210,13 +2045,20 @@ inline bool verify_iat_module_identity(const std::vector<state::iat_entry_t>& sn
 
 inline bool verify_prologue_hashes(std::string& mismatched_name)
 {
-    if (!detail::baselines_captured().load())
-        baseline::capture_all();
+    if (!detail::baselines_captured().load()
+        && !baseline::capture_all()) {
+        mismatched_name = "module_baseline_capture";
+        return false;
+    }
 
     std::lock_guard<std::mutex> lk(detail::baseline_mtx());
 
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     HMODULE k32   = GetModuleHandleW(L"kernel32.dll");
+    if (!ntdll || !k32) {
+        mismatched_name = "module_baseline_module";
+        return false;
+    }
 
     const std::vector<detail::prologue_baseline_t>* sets[2] = {
         &detail::ntdll_baselines(), &detail::kernel32_baselines()
@@ -2225,21 +2067,26 @@ inline bool verify_prologue_hashes(std::string& mismatched_name)
 
     for (size_t s = 0; s < 2; ++s)
     {
-        if (!mods[s]) continue;
+        if (sets[s]->empty()) {
+            mismatched_name = s == 0 ? "ntdll_baseline" : "kernel32_baseline";
+            return false;
+        }
         for (const auto& b : *sets[s])
         {
             auto* addr = reinterpret_cast<const uint8_t*>(
                 GetProcAddress(mods[s], b.name.c_str()));
-            if (!addr) continue;
+            if (!addr || reinterpret_cast<uint64_t>(addr) != b.cached_va) {
+                mismatched_name = b.name;
+                return false;
+            }
 
             uint8_t hash[32]{};
-            if (!baseline::seh_hash_prologue(addr, hash))
-                continue;
+            if (!baseline::seh_hash_prologue(addr, hash)) {
+                mismatched_name = b.name;
+                return false;
+            }
 
-            if (memcmp(hash, b.hash, 32) != 0)
-            {
-                if (s == 0 && detail::system_owned_nt_export_wrapper(b.name.c_str(), addr))
-                    continue;
+            if (!detail::constant_time_hash32_equal(hash, b.hash)) {
                 mismatched_name = b.name;
                 return false;
             }
@@ -2254,11 +2101,33 @@ inline bool verify_prologue_hashes_kernel(std::string& mismatched_name)
     if (!driver_bridge::is_loaded() || !driver_bridge::using_kernel_driver())
         return verify_prologue_hashes(mismatched_name);
 
-    if (!detail::baselines_captured().load())
-        baseline::capture_all();
+    auto fail = [&](const char* name, const char* reason,
+                    uint64_t va, bool hash_ok, bool crc_ok,
+                    bool kernel_ok, uint32_t trusted_crc,
+                    uint32_t current_crc, uint64_t kernel_crc) {
+        mismatched_name = name && *name ? name : "prologue_baseline";
+        char dbg[512];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "kernel_prologue_reject name=%s reason=%s va=0x%llX hash_ok=%d crc_ok=%d kernel_ok=%d trusted_crc=0x%08X current_crc=0x%08X kernel_crc=0x%016llX",
+            mismatched_name.c_str(), reason ? reason : "unknown",
+            static_cast<unsigned long long>(va),
+            hash_ok ? 1 : 0, crc_ok ? 1 : 0, kernel_ok ? 1 : 0,
+            trusted_crc, current_crc,
+            static_cast<unsigned long long>(kernel_crc));
+        webhook::write_log_critical("prologue_kernel", dbg);
+        return false;
+    };
+
+    if (!detail::baselines_captured().load()
+        && !baseline::capture_all())
+        return fail("module_baseline", "capture_failed", 0,
+            false, false, false, 0, 0, 0);
 
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     HMODULE k32   = GetModuleHandleW(L"kernel32.dll");
+    if (!ntdll || !k32)
+        return fail("module_baseline", "module_unavailable", 0,
+            false, false, false, 0, 0, 0);
 
     const std::vector<detail::prologue_baseline_t>* sets[2] = {
         &detail::ntdll_baselines(), &detail::kernel32_baselines()
@@ -2270,40 +2139,35 @@ inline bool verify_prologue_hashes_kernel(std::string& mismatched_name)
 
         for (size_t s = 0; s < 2; ++s)
         {
-            if (!mods[s]) continue;
+            if (sets[s]->empty())
+                return fail(s == 0 ? "ntdll_baseline" : "kernel32_baseline",
+                    "baseline_empty", 0, false, false, false, 0, 0, 0);
             for (const auto& b : *sets[s])
             {
                 auto* addr = reinterpret_cast<const uint8_t*>(
                     GetProcAddress(mods[s], b.name.c_str()));
-                if (!addr) continue;
+                if (!addr || reinterpret_cast<uint64_t>(addr) != b.cached_va)
+                    return fail(b.name.c_str(), "export_address_changed",
+                        reinterpret_cast<uint64_t>(addr), false, false,
+                        false, b.crc32, 0, 0);
 
-                uint64_t kernel_hash = 0;
-                if (!driver_bridge::kernel_read_prologue_hash(
-                        b.cached_va,
-                        static_cast<uint32_t>(detail::k_prologue_bytes),
-                        kernel_hash))
-                    continue;
+                uint8_t current_hash[32]{};
+                const bool hash_ok = baseline::seh_hash_prologue(addr, current_hash);
+                uint32_t current_crc = 0;
+                const bool crc_ok = detail::crc32_bytes(addr,
+                    detail::k_prologue_bytes, &current_crc);
+                uint64_t kernel_crc = 0;
+                const bool kernel_ok = driver_bridge::kernel_read_prologue_hash(
+                    b.cached_va,
+                    static_cast<uint32_t>(detail::k_prologue_bytes),
+                    kernel_crc);
 
-                uint32_t um_crc = 0;
-                if (!detail::crc32_bytes(addr, detail::k_prologue_bytes, &um_crc))
-                {
-                    continue;
-                }
-
-                if (static_cast<uint64_t>(um_crc) != kernel_hash)
-                {
-                    if (s == 0 && detail::system_owned_nt_export_wrapper(b.name.c_str(), addr))
-                        continue;
-                    mismatched_name = b.name;
-                    char dbg[256];
-                    _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                        "kernel_prologue_hash_mismatch name=%s um_crc=0x%08X kernel_hash=0x%016llX va=0x%llX",
-                        b.name.c_str(), um_crc,
-                        static_cast<unsigned long long>(kernel_hash),
-                        static_cast<unsigned long long>(b.cached_va));
-                    webhook::write_log_critical("prologue_kernel", dbg);
-                    return false;
-                }
+                if (!detail::prologue_evidence_matches_baseline(
+                        b.hash, b.crc32, hash_ok, current_hash,
+                        crc_ok, current_crc, kernel_ok, kernel_crc))
+                    return fail(b.name.c_str(), "baseline_or_transport_mismatch",
+                        b.cached_va, hash_ok, crc_ok, kernel_ok,
+                        b.crc32, current_crc, kernel_crc);
             }
         }
     }
@@ -2311,41 +2175,29 @@ inline bool verify_prologue_hashes_kernel(std::string& mismatched_name)
     if (detail::self_prologues_captured().load())
     {
         std::lock_guard<std::mutex> slk(detail::self_func_mtx());
+        if (detail::self_baselines().empty())
+            return fail("self_baseline", "baseline_empty", 0,
+                false, false, false, 0, 0, 0);
         for (const auto& b : detail::self_baselines())
         {
-            uint64_t kernel_hash = 0;
-            if (!driver_bridge::kernel_read_prologue_hash(
-                    b.cached_va,
-                    static_cast<uint32_t>(detail::k_prologue_bytes),
-                    kernel_hash))
-                continue;
-
             auto* addr = reinterpret_cast<const uint8_t*>(b.cached_va);
-            uint32_t um_crc = 0;
-            if (!detail::crc32_bytes(addr, detail::k_prologue_bytes, &um_crc))
-            {
-                mismatched_name = b.name;
-                char dbg[256];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "kernel_self_prologue_seh name=%s va=0x%llX",
-                    b.name.c_str(),
-                    static_cast<unsigned long long>(b.cached_va));
-                webhook::write_log_critical("prologue_kernel", dbg);
-                return false;
-            }
+            uint8_t current_hash[32]{};
+            const bool hash_ok = baseline::seh_hash_prologue(addr, current_hash);
+            uint32_t current_crc = 0;
+            const bool crc_ok = detail::crc32_bytes(addr,
+                detail::k_prologue_bytes, &current_crc);
+            uint64_t kernel_crc = 0;
+            const bool kernel_ok = driver_bridge::kernel_read_prologue_hash(
+                b.cached_va,
+                static_cast<uint32_t>(detail::k_prologue_bytes),
+                kernel_crc);
 
-            if (static_cast<uint64_t>(um_crc) != kernel_hash)
-            {
-                mismatched_name = b.name;
-                char dbg[256];
-                _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
-                    "kernel_self_prologue_hash_mismatch name=%s um_crc=0x%08X kernel_hash=0x%016llX va=0x%llX",
-                    b.name.c_str(), um_crc,
-                    static_cast<unsigned long long>(kernel_hash),
-                    static_cast<unsigned long long>(b.cached_va));
-                webhook::write_log_critical("prologue_kernel", dbg);
-                return false;
-            }
+            if (!detail::prologue_evidence_matches_baseline(
+                    b.hash, b.crc32, hash_ok, current_hash,
+                    crc_ok, current_crc, kernel_ok, kernel_crc))
+                return fail(b.name.c_str(), "self_baseline_or_transport_mismatch",
+                    b.cached_va, hash_ok, crc_ok, kernel_ok,
+                    b.crc32, current_crc, kernel_crc);
         }
     }
 
@@ -2690,13 +2542,7 @@ inline hook_report_t scan_impl(const std::vector<state::iat_entry_t>& iat_snap, 
 
     report.veh_chain_tampered = !veh_chain::verify_chain();
     if (report.veh_chain_tampered)
-    {
         webhook::send_debug_log("veh_chain", "veh_chain_modified", true);
-        uint32_t removed = veh_chain::remove_foreign_handlers();
-        if (removed > 0)
-            webhook::write_log_critical_fmt("veh_chain",
-                "foreign_handlers_removed count=%u", removed);
-    }
 
     auto& rt = state::get();
     if (rt.code_snap.text_base != 0 && rt.code_snap.text_size != 0)

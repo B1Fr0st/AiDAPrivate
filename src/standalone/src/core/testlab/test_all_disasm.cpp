@@ -148,6 +148,7 @@ namespace {
         case center_view_t::graph_view: return "graph_view";
         case center_view_t::image_view: return "image_view";
         case center_view_t::test_lab: return "test_lab";
+        case center_view_t::workbench: return "workbench";
         default: return "unknown";
         }
     }
@@ -3421,6 +3422,9 @@ namespace {
     void test_center_view_test_lab(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         select_center_view(hf, passed, failed, skipped, "center_view.test_lab", center_view_t::test_lab);
     }
+    void test_center_view_workbench(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
+        select_center_view(hf, passed, failed, skipped, "center_view.workbench", center_view_t::workbench);
+    }
 
 }
 
@@ -3570,6 +3574,7 @@ void phase_disasm_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& f
         { "center_view_graph_view",                  test_center_view_graph_view                  },
         { "center_view_image_view",                  test_center_view_image_view                  },
         { "center_view_test_lab",                    test_center_view_test_lab                    },
+        { "center_view_workbench",                   test_center_view_workbench                   },
     };
 
     int total = static_cast<int>(sizeof(tests) / sizeof(tests[0]));

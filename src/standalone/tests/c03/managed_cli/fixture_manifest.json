@@ -67,7 +67,7 @@
     "deterministic_runs": 2,
     "cancellation": true,
     "resource_limits": ["maxCpuMs", "maxMemoryBytes"],
-    "offline_startup_gate": true,
+    "runtime_identity_gate": true,
     "snapshot_binding": true
   }
 }

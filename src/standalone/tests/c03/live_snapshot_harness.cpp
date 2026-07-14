@@ -1,4 +1,5 @@
 #include "live_snapshot_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/live_snapshot_provider.hpp"
 
@@ -46,6 +47,7 @@ static_assert(!has_write_page_member_t<live_snapshot_adapter_t>::value,
 
 void require(bool condition, std::string_view message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
@@ -588,6 +590,7 @@ int main()
         std::cout << "live_snapshot_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

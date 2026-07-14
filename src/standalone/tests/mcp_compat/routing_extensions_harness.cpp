@@ -1,4 +1,5 @@
 #include "routing_extensions_harness.hpp"
+#include "../c03/assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/mcp/compat/handlers/routing_extensions.hpp"
 #include "../../src/core/mcp/ida_compat_schemas.hpp"
@@ -52,6 +53,11 @@ struct backend_state_t final {
         } else {
             output = json{{"result", "ok"}};
         }
+        output["_meta"] = json{{"aida", json{{"producer", "fixture-backend"}, {"generation", 9}}}};
+        if (output.contains("results") && !output["results"].empty()) {
+            output["results"][0]["_meta"] =
+                json{{"aida", json{{"producer", "fixture-nested"}}}};
+        }
         return adapter_result_t<adapter_response_t>::success({output.dump(), false});
     }
 
@@ -59,6 +65,7 @@ struct backend_state_t final {
 };
 
 void require(bool condition, std::string_view message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(std::string(message));
     }
@@ -66,10 +73,29 @@ void require(bool condition, std::string_view message) {
 
 void require_fixture(bool condition, std::string_view tool, std::string_view category,
                      std::string_view detail) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, detail, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(
             std::string(tool) + " " + std::string(category) + " fixture: " + std::string(detail));
     }
+}
+
+bool contains_nested_aida_provenance(const json& node) {
+    if (node.is_object()) {
+        const auto metadata = node.find("_meta");
+        if (metadata != node.end() && metadata->is_object() && metadata->contains("aida"))
+            return true;
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            if (contains_nested_aida_provenance(it.value()))
+                return true;
+        }
+    } else if (node.is_array()) {
+        for (const auto& item : node) {
+            if (contains_nested_aida_provenance(item))
+                return true;
+        }
+    }
+    return false;
 }
 
 target_record_t make_target(std::uint64_t target_id, std::uint32_t pid,
@@ -291,8 +317,20 @@ void verify_analyze_funcs(routing_extensions_t& extensions, backend_state_t& bac
                     "analyze_funcs", "valid", "canonical arguments were altered in routing");
     require_fixture(result.structured_content().contains("results"),
                     "analyze_funcs", "valid", "output missing results array");
+    const auto text_payload = json::parse(result.text(), nullptr, false);
+    require_fixture(text_payload.is_object() &&
+                        !contains_nested_aida_provenance(text_payload) &&
+                        !contains_nested_aida_provenance(result.structured_content()),
+                    "analyze_funcs", "provenance",
+                    "backend provenance leaked into a structured or text payload");
     require_fixture(result.aida_metadata().value("tool", std::string()) == "analyze_funcs",
                     "analyze_funcs", "valid", "tool provenance is absent");
+    require_fixture(result.aida_metadata().value(
+                        "removed_nested_aida_provenance", std::size_t{0}) == 2 &&
+                        result.aida_metadata().at("retained_backend_provenance")
+                            .value("producer", std::string()) == "fixture-backend",
+                    "analyze_funcs", "provenance",
+                    "backend provenance was not transferred to trusted top-level metadata");
     ++completed;
 }
 
@@ -315,6 +353,18 @@ void verify_find_insns(routing_extensions_t& extensions, backend_state_t& backen
                     "find_insns", "valid", "canonical arguments were altered in routing");
     require_fixture(result.structured_content().contains("results"),
                     "find_insns", "valid", "output missing results array");
+    const auto text_payload = json::parse(result.text(), nullptr, false);
+    require_fixture(text_payload.is_object() &&
+                        !contains_nested_aida_provenance(text_payload) &&
+                        !contains_nested_aida_provenance(result.structured_content()),
+                    "find_insns", "provenance",
+                    "backend provenance leaked into a structured or text payload");
+    require_fixture(result.aida_metadata().value(
+                        "removed_nested_aida_provenance", std::size_t{0}) == 2 &&
+                        result.aida_metadata().at("retained_backend_provenance")
+                            .value("producer", std::string()) == "fixture-backend",
+                    "find_insns", "provenance",
+                    "backend provenance was not transferred to trusted top-level metadata");
     ++completed;
 }
 
@@ -707,6 +757,7 @@ bool run_routing_extensions_harness(std::string& failure) {
     try {
         verify_routing_extensions();
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure.assign(error.what());
         return false;
     }

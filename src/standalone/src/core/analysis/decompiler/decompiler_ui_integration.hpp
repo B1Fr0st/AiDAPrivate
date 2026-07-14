@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decompiler_service.hpp"
+#include "managed_entity_binding.hpp"
 #include "../workspace/analysis_workspace.hpp"
 #include "../workspace/workspace_types.hpp"
 
@@ -73,7 +74,15 @@ struct decompiler_ui_result_t {
     decompiler_pipeline_status_t status = decompiler_pipeline_status_t::invalid_request;
     std::string function_symbol;
     std::string rendered_text;
+    std::shared_ptr<const decompiler_provider_ir_cache_value_t> provider_stage;
+    std::shared_ptr<const decompiler_normalized_cache_value_t> normalized_stage;
     std::shared_ptr<const decompiler_document_t> document;
+    std::optional<decompiler_provider_descriptor_t> provider;
+    std::optional<pseudocode_readability_report_t> readability;
+    std::string language_id;
+    std::uint64_t workspace_generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
     std::vector<decompiler_ui_source_mapping_t> source_mappings;
     std::vector<decompiler_ui_diagnostic_t> diagnostics;
     std::uint64_t elapsed_ms = 0;
@@ -94,6 +103,9 @@ struct decompiler_ui_integration_config_t {
     bool preserve_shortcuts = true;
     bool preserve_source_mappings = true;
     bool preserve_diagnostics = true;
+    std::size_t max_managed_capture_cache_entries = 16;
+    std::uint64_t max_managed_capture_bytes = 64ULL << 20;
+    readers::managed::managed_reader_limits_t managed_reader_limits = {};
 };
 
 struct decompiler_ui_integration_metrics_t {
@@ -108,6 +120,9 @@ struct decompiler_ui_integration_metrics_t {
     std::uint64_t cache_hits = 0;
     std::uint64_t deadline_exceeded = 0;
     std::uint64_t cancelled = 0;
+    std::uint64_t entity_resolutions = 0;
+    std::uint64_t entity_resolution_failures = 0;
+    std::uint64_t managed_capture_cache_hits = 0;
 };
 
 class decompiler_ui_integration_t final {
@@ -120,6 +135,8 @@ public:
         create_production(std::shared_ptr<analysis_workspace_t> workspace,
                           std::filesystem::path runtime_root = {},
                           decompiler_ui_integration_config_t config = {});
+    static workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>
+        production_for_workspace(std::shared_ptr<analysis_workspace_t> workspace);
 
     ~decompiler_ui_integration_t();
     decompiler_ui_integration_t(const decompiler_ui_integration_t&) = delete;
@@ -135,7 +152,42 @@ public:
                          decompiler_profile_id_t profile = decompiler_profile_id_t::balanced,
                          decompiler_pipeline_cache_mode_t cache_mode =
                              decompiler_pipeline_cache_mode_t::read_write,
+                          const cancellation_token_t& cancel = {});
+    workspace_result_t<decompiler_ui_result_t>
+        decompile_cli(std::shared_ptr<const managed_cli::request_t> request,
+                      decompiler_ui_invocation_source_t source =
+                          decompiler_ui_invocation_source_t::api_call,
+                      decompiler_pipeline_cache_mode_t cache_mode =
+                          decompiler_pipeline_cache_mode_t::read_write,
+                      const cancellation_token_t& cancel = {});
+    workspace_result_t<decompiler_ui_result_t>
+        decompile_jvm(std::shared_ptr<const jvm_ssa::jvm_method_input_t> input,
+                      decompiler_ui_invocation_source_t source =
+                          decompiler_ui_invocation_source_t::api_call,
+                      decompiler_profile_id_t profile = decompiler_profile_id_t::balanced,
+                      decompiler_pipeline_cache_mode_t cache_mode =
+                          decompiler_pipeline_cache_mode_t::read_write,
+                      const cancellation_token_t& cancel = {});
+    workspace_result_t<decompiler_ui_result_t>
+        decompile_dalvik(std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t> capture,
+                         decompiler_ui_invocation_source_t source =
+                             decompiler_ui_invocation_source_t::api_call,
+                         decompiler_profile_id_t profile = decompiler_profile_id_t::balanced,
+                         decompiler_pipeline_cache_mode_t cache_mode =
+                             decompiler_pipeline_cache_mode_t::read_write,
                          const cancellation_token_t& cancel = {});
+    workspace_result_t<generation_bound_decompiler_entity_t>
+        resolve_entity_at(const decompiler_entity_locator_t& locator,
+                          const cancellation_token_t& cancel = {});
+    workspace_result_t<decompiler_ui_result_t>
+        decompile_entity(
+            const generation_bound_decompiler_entity_t& binding,
+            decompiler_ui_invocation_source_t source =
+                decompiler_ui_invocation_source_t::api_call,
+            decompiler_profile_id_t profile = decompiler_profile_id_t::balanced,
+            decompiler_pipeline_cache_mode_t cache_mode =
+                decompiler_pipeline_cache_mode_t::read_write,
+            const cancellation_token_t& cancel = {});
 
     workspace_result_t<void> invalidate_workspace();
 
@@ -158,6 +210,11 @@ public:
         map_pipeline_result(const decompiler_pipeline_result_t& result);
 
 private:
+    workspace_result_t<decompiler_ui_result_t>
+        execute_pipeline(decompiler_pipeline_request_t request,
+                         decompiler_ui_invocation_source_t source,
+                         bool require_complete_source_map,
+                         const cancellation_token_t& cancel);
     struct impl_t;
     explicit decompiler_ui_integration_t(std::unique_ptr<impl_t> impl);
     std::unique_ptr<impl_t> impl_;

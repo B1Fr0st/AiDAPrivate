@@ -1,0 +1,28 @@
+{
+  "schema": "aida.c03.benchmark-search-receipt",
+  "schema_version": 1,
+  "receipt_id": "c03-safe-headless-not-run-contract-selftest",
+  "authorization_id": "c03-safe-headless-not-run-contract-selftest",
+  "target_execution_forbidden": true,
+  "searched_roots": ["synthetic-source-contract-only"],
+  "candidates": [
+    {
+      "path": "synthetic-no-qualifying-production-image",
+      "rejection_codes": ["contract_selftest_only"]
+    }
+  ],
+  "evidence": {
+    "harness": {
+      "path": "bin/aida_c03_a06_benchmark_sla_receipt_harness.exe",
+      "max_bytes": 536870912
+    },
+    "runtime": {
+      "path": "bin/aida_c03_a06_benchmark_sla_receipt_harness.exe",
+      "max_bytes": 536870912
+    },
+    "source_provenance": {
+      "path": "src/standalone/tests/c03/fixtures/external_sla_qualification_policy.json",
+      "max_bytes": 4194304
+    }
+  }
+}

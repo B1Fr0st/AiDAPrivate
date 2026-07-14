@@ -1,4 +1,5 @@
 #include "type_handlers_harness.hpp"
+#include "../c03/assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/mcp/compat/handlers/types.hpp"
 
@@ -19,6 +20,7 @@ using protocol::cancellation_token_t;
 using protocol::json;
 
 void require(bool condition, std::string_view message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(std::string(message));
     }
@@ -26,6 +28,7 @@ void require(bool condition, std::string_view message) {
 
 void require_fixture(bool condition, std::string_view tool, std::string_view category,
                      std::string_view detail) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, detail, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(
             std::string(tool) + " " + std::string(category) + " fixture: " + std::string(detail));
@@ -737,6 +740,7 @@ bool run_type_handlers_harness(std::string& failure) {
     try {
         verify_type_handlers();
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure.assign(error.what());
         return false;
     }

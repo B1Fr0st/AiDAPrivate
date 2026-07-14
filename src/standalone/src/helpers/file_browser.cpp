@@ -580,7 +580,7 @@ void open_path(const std::string& path)
     bool found = analysis_session::find_session_by_path(path, &existing_idx);
     if (found) {
         if (analysis_session::switch_session(existing_idx)) {
-            globals::ui::active_center_view = center_view_t::disassembly;
+            globals::ui::active_center_view = center_view_t::workbench;
             record_recent_workspace(path);
             diag::log_tagged_fmt("file_browser",
                 "open_path -> existing_session idx=%llu",
@@ -598,7 +598,7 @@ void open_path(const std::string& path)
 
     bool started = analysis_session::open_session(path);
     if (started) {
-        globals::ui::active_center_view = center_view_t::disassembly;
+        globals::ui::active_center_view = center_view_t::workbench;
         record_recent_workspace(path);
         diag::log_tagged_fmt("file_browser",
             "open_path -> new_session path=%s ext=%s", path.c_str(), ext.c_str());
@@ -900,7 +900,7 @@ void render_pending_confirm_modal()
             file_browser::pending_open_filename.clear();
         } else if (switch_now && already_open) {
             if (analysis_session::switch_session(existing_idx)) {
-                globals::ui::active_center_view = center_view_t::disassembly;
+                globals::ui::active_center_view = center_view_t::workbench;
                 diag::log_tagged_fmt("file_open", "explorer_click_switch idx=%llu",
                     static_cast<unsigned long long>(existing_idx));
             }

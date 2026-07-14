@@ -4,9 +4,7 @@
 #include "../analysis/decompiler/decompiler_service.hpp"
 #include "../analysis/decompiler/decompiler_ui_integration.hpp"
 #include "../analysis/workspace/analysis_workspace.hpp"
-#include "../analysis/workspace/decompiler_service.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
-#include "../disasm/ghidra_adapters/aida_arch_map.hpp"
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
@@ -14,7 +12,6 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
-#include <future>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -50,6 +47,43 @@ bool checked_add(std::uint64_t lhs, std::uint64_t rhs,
         return false;
     output = lhs + rhs;
     return true;
+}
+
+template <typename T, typename Compare, typename Cancellation>
+bool bounded_stable_sort(std::vector<T>& values, Compare compare,
+                         const Cancellation* cancellation)
+{
+    if (values.size() < 2)
+        return !(cancellation && cancellation->cancelled());
+    std::vector<T> scratch(values.size());
+    for (std::size_t width = 1; width < values.size();) {
+        for (std::size_t first = 0; first < values.size();) {
+            if (cancellation && cancellation->cancelled())
+                return false;
+            const auto middle = (std::min)(values.size(), first + width);
+            const auto last = (std::min)(values.size(), middle + width);
+            auto left = first;
+            auto right = middle;
+            auto output = first;
+            while (left < middle || right < last) {
+                if ((output & 0xFFU) == 0U && cancellation &&
+                    cancellation->cancelled())
+                    return false;
+                if (left < middle &&
+                    (right == last || !compare(values[right], values[left]))) {
+                    scratch[output++] = std::move(values[left++]);
+                } else {
+                    scratch[output++] = std::move(values[right++]);
+                }
+            }
+            first = last;
+        }
+        values.swap(scratch);
+        if (width > values.size() / 2U)
+            break;
+        width *= 2U;
+    }
+    return !(cancellation && cancellation->cancelled());
 }
 
 std::uint64_t stable_hash(std::string_view value) noexcept
@@ -175,8 +209,21 @@ bool analysis_document_descriptor(const document_identity_t& identity,
 {
     output = {};
     const auto* title = analysis_document_title(identity.kind);
+    const auto managed_locator =
+        identity.kind == document_kind_t::pseudocode &&
+        !identity.has_address
+            ? pseudocode_document::parse_pseudocode_entity_locator(
+                identity.provider_key)
+            : std::nullopt;
+    const auto canonical_managed_locator = managed_locator
+        ? pseudocode_document::canonical_pseudocode_entity_locator(
+            *managed_locator)
+        : std::nullopt;
+    const bool managed_identity = canonical_managed_locator &&
+        *canonical_managed_locator == identity.provider_key;
     if (!title || !identity.workspace.valid() || identity.object_id != 1 ||
-        identity.variant_id != 0 || identity.provider_key != "analysis" ||
+        identity.variant_id != 0 ||
+        (identity.provider_key != "analysis" && !managed_identity) ||
         (identity.has_address && identity.address == 0))
         return false;
     output.identity = identity;
@@ -186,13 +233,16 @@ bool analysis_document_descriptor(const document_identity_t& identity,
         stream << title << " 0x" << std::uppercase << std::hex
                << identity.address;
         output.title = stream.str();
+    } else if (managed_identity) {
+        output.title = std::string(title) + " " + identity.provider_key;
     }
     output.can_open = true;
     return true;
 }
 
 class workbench_analysis_source_t final
-    : public std::enable_shared_from_this<workbench_analysis_source_t> {
+    : public std::enable_shared_from_this<workbench_analysis_source_t>,
+      public navigator::navigator_packed_store_adapter_t {
 public:
     workbench_analysis_source_t(
         workspace_id_t workspace,
@@ -250,8 +300,7 @@ public:
             });
         if (publication_match == publications_.end()) {
             publications_.push_back(std::move(publication));
-        } else if ((*publication_match)->analysis_revision !=
-                   publication->analysis_revision) {
+        } else if (!same_publication(*publication_match, publication)) {
             *publication_match = std::move(publication);
         }
         while (publications_.size() > generation_limit_)
@@ -320,7 +369,7 @@ public:
         return same_publication(bound, current);
     }
 
-    std::uint64_t current_generation() const noexcept
+    std::uint64_t current_generation() const noexcept override
     {
         if (!analysis_workspace_)
             return 0;
@@ -331,6 +380,319 @@ public:
     bool generation_available(std::uint64_t generation) const
     {
         return publication(generation) != nullptr;
+    }
+
+    bool generation_current(std::uint64_t generation) const noexcept override
+    {
+        try {
+            const auto current = analysis_workspace_
+                ? analysis_workspace_->analysis_publication() : nullptr;
+            return current && current->generation == generation &&
+                   current->snapshot && !analysis_workspace_->closing() &&
+                   !analysis_workspace_->closed();
+        } catch (...) {
+            return false;
+        }
+    }
+
+    std::uint64_t record_count(
+        navigator::navigator_domain_t domain,
+        std::uint64_t generation) const noexcept override
+    {
+        try {
+            const auto retained = publication(generation);
+            if (!retained || !retained->snapshot)
+                return 0;
+            const auto& snapshot = *retained->snapshot;
+            const auto image = snapshot.normalized_image;
+            switch (domain) {
+            case navigator::navigator_domain_t::binaries:
+                return 1;
+            case navigator::navigator_domain_t::sections:
+                return image ? (image->sections.empty()
+                    ? image->segments.size() : image->sections.size()) : 0;
+            case navigator::navigator_domain_t::functions:
+                return snapshot.functions.size();
+            case navigator::navigator_domain_t::imports:
+                return image ? image->imports.size() : 0;
+            case navigator::navigator_domain_t::exports:
+                return image ? image->exports.size() : 0;
+            case navigator::navigator_domain_t::strings:
+                return snapshot.strings.size();
+            case navigator::navigator_domain_t::symbols:
+                return snapshot.symbols.size();
+            case navigator::navigator_domain_t::types:
+                return snapshot.rich_facts.type_candidates.size();
+            case navigator::navigator_domain_t::diagnostics:
+                return snapshot.rich_facts.metadata_conflicts.size();
+            case navigator::navigator_domain_t::bookmarks:
+                return analysis_workspace_->view_state().bookmarks.size();
+            case navigator::navigator_domain_t::progress:
+                return 1;
+            case navigator::navigator_domain_t::invalid:
+                return 0;
+            }
+        } catch (...) {
+        }
+        return 0;
+    }
+
+    bool record_at(navigator::navigator_domain_t domain,
+                   std::uint64_t generation, std::uint64_t ordinal,
+                   navigator::navigator_item_view_t& output) const noexcept override
+    {
+        output = {};
+        try {
+            const auto retained = publication(generation);
+            if (!retained || !retained->snapshot)
+                return false;
+            const auto& snapshot = *retained->snapshot;
+            const auto image = snapshot.normalized_image;
+            output.domain = domain;
+            output.selectable = true;
+            output.expandable = false;
+            switch (domain) {
+            case navigator::navigator_domain_t::binaries:
+                if (ordinal != 0)
+                    return false;
+                output.id = navigator_row_identity(domain, 1);
+                output.label = analysis_workspace_->identity().bin_name();
+                output.secondary = image
+                    ? std::string_view(image->format_name) : std::string_view{};
+                output.detail = "Static binary";
+                output.has_address = image && image->image_size != 0;
+                output.address = image ? image->image_base : 0;
+                output.metric = analysis_workspace_->provider().size();
+                break;
+            case navigator::navigator_domain_t::sections:
+                if (!image)
+                    return false;
+                if (!image->sections.empty()) {
+                    if (ordinal >= image->sections.size())
+                        return false;
+                    const auto& section = image->sections[
+                        static_cast<std::size_t>(ordinal)];
+                    output.id = navigator_row_identity(
+                        domain, section.index + 1ULL);
+                    output.label = section.name.empty()
+                        ? std::string_view("Unnamed section") : section.name;
+                    output.secondary = "Section";
+                    output.has_address = section.virtual_size != 0;
+                    output.address = section.virtual_address;
+                    output.metric = section.virtual_size;
+                } else {
+                    if (ordinal >= image->segments.size())
+                        return false;
+                    const auto& segment = image->segments[
+                        static_cast<std::size_t>(ordinal)];
+                    output.id = navigator_row_identity(
+                        domain, segment.index + 1ULL);
+                    output.label = segment.name.empty()
+                        ? std::string_view("Unnamed segment") : segment.name;
+                    output.secondary = "Segment";
+                    output.has_address = segment.virtual_size != 0;
+                    output.address = segment.virtual_address;
+                    output.metric = segment.virtual_size;
+                }
+                break;
+            case navigator::navigator_domain_t::functions: {
+                if (ordinal >= snapshot.functions.size())
+                    return false;
+                const auto& function = snapshot.functions[
+                    static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(
+                    domain, function.id != 0 ? function.id : function.start.value);
+                const auto symbol = std::lower_bound(
+                    snapshot.symbols.begin(), snapshot.symbols.end(),
+                    function.start,
+                    [](const analysis::symbol_record_t& candidate,
+                       const analysis::address_t& address) {
+                        return candidate.address < address;
+                    });
+                output.label = symbol == snapshot.symbols.end() ||
+                               symbol->address != function.start ||
+                               symbol->name.empty()
+                    ? std::string_view("Function") : symbol->name;
+                output.secondary = function.thunk ? "Thunk" : "Function";
+                output.has_address = true;
+                output.address = function.start.value;
+                output.metric = function.block_count;
+                break;
+            }
+            case navigator::navigator_domain_t::imports: {
+                if (!image || ordinal >= image->imports.size())
+                    return false;
+                const auto& import = image->imports[
+                    static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(
+                    domain, import.address.value != 0
+                        ? import.address.value : ordinal + 1U);
+                output.label = import.name && !import.name->empty()
+                    ? std::string_view(*import.name)
+                    : std::string_view("Ordinal import");
+                output.secondary = import.library;
+                output.detail = import.delayed ? "Delay import" : "Import";
+                output.has_address = import.address.value != 0;
+                output.address = import.address.value;
+                break;
+            }
+            case navigator::navigator_domain_t::exports: {
+                if (!image || ordinal >= image->exports.size())
+                    return false;
+                const auto& exported = image->exports[
+                    static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(
+                    domain, exported.address.value != 0
+                        ? exported.address.value : exported.ordinal + 1U);
+                output.label = exported.name && !exported.name->empty()
+                    ? std::string_view(*exported.name)
+                    : std::string_view("Ordinal export");
+                output.secondary = exported.forwarder
+                    ? std::string_view(*exported.forwarder)
+                    : std::string_view("Export");
+                output.has_address = exported.address.value != 0;
+                output.address = exported.address.value;
+                output.metric = exported.ordinal;
+                break;
+            }
+            case navigator::navigator_domain_t::strings: {
+                if (ordinal >= snapshot.strings.size())
+                    return false;
+                const auto& value = snapshot.strings[
+                    static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(
+                    domain, value.id != 0 ? value.id : value.address.value);
+                output.label = value.value.empty()
+                    ? std::string_view("Empty string") : value.value;
+                output.secondary = "String";
+                output.has_address = true;
+                output.address = value.address.value;
+                output.metric = value.byte_length;
+                break;
+            }
+            case navigator::navigator_domain_t::symbols: {
+                if (ordinal >= snapshot.symbols.size())
+                    return false;
+                const auto& symbol = snapshot.symbols[
+                    static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(
+                    domain, symbol.id != 0 ? symbol.id : symbol.address.value);
+                output.label = symbol.name.empty()
+                    ? std::string_view("Unnamed symbol") : symbol.name;
+                output.secondary = "Symbol";
+                output.has_address = true;
+                output.address = symbol.address.value;
+                output.metric = symbol.confidence;
+                break;
+            }
+            case navigator::navigator_domain_t::types: {
+                if (ordinal >= snapshot.rich_facts.type_candidates.size())
+                    return false;
+                const auto& type = snapshot.rich_facts.type_candidates[
+                    static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(
+                    domain, type.id != 0 ? type.id : ordinal + 1U);
+                output.label = type.display_name.empty()
+                    ? std::string_view("Unnamed type") : type.display_name;
+                output.secondary = type.canonical_type;
+                output.detail = type.source_key;
+                output.has_address = type.address.has_value();
+                output.address = type.address ? type.address->value : 0;
+                output.metric = type.confidence;
+                break;
+            }
+            case navigator::navigator_domain_t::diagnostics: {
+                if (ordinal >= snapshot.rich_facts.metadata_conflicts.size())
+                    return false;
+                const auto& conflict = snapshot.rich_facts.metadata_conflicts[
+                    static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(
+                    domain, conflict.id != 0 ? conflict.id : ordinal + 1U);
+                output.label = conflict.identity.empty()
+                    ? std::string_view("Metadata conflict") : conflict.identity;
+                output.secondary = conflict.selected_value;
+                output.detail = conflict.rejected_value;
+                output.has_address = conflict.address.has_value();
+                output.address = conflict.address ? conflict.address->value : 0;
+                output.metric = conflict.selected_confidence;
+                output.severity = navigator::navigator_severity_t::warning;
+                break;
+            }
+            case navigator::navigator_domain_t::bookmarks: {
+                const auto bookmarks = analysis_workspace_->view_state().bookmarks;
+                if (ordinal >= bookmarks.size())
+                    return false;
+                const auto address = bookmarks[static_cast<std::size_t>(ordinal)];
+                output.id = navigator_row_identity(domain, address.value);
+                output.label = "Bookmark";
+                output.secondary = "Workspace bookmark";
+                output.has_address = true;
+                output.address = address.value;
+                break;
+            }
+            case navigator::navigator_domain_t::progress: {
+                if (ordinal != 0)
+                    return false;
+                const auto progress = analysis_workspace_->progress();
+                output.id = navigator_row_identity(domain, generation);
+                output.label = "Analysis progress";
+                output.secondary = "Workspace analysis state";
+                output.metric = progress.completed_units;
+                output.selectable = false;
+                output.severity = progress.error
+                    ? navigator::navigator_severity_t::error
+                    : navigator::navigator_severity_t::information;
+                break;
+            }
+            case navigator::navigator_domain_t::invalid:
+                return false;
+            }
+            return output.id.valid() && !output.label.empty() &&
+                   generation_current(generation);
+        } catch (...) {
+            output = {};
+            return false;
+        }
+    }
+
+    std::uint64_t tree_child_count(
+        navigator::navigator_domain_t domain, std::uint64_t generation,
+        navigator::navigator_row_id_t parent) const noexcept override
+    {
+        return parent.valid() ? 0 : record_count(domain, generation);
+    }
+
+    bool tree_child_at(navigator::navigator_domain_t domain,
+                       std::uint64_t generation,
+                       navigator::navigator_row_id_t parent,
+                       std::uint64_t ordinal,
+                       navigator::navigator_item_view_t& output) const noexcept override
+    {
+        if (parent.valid()) {
+            output = {};
+            return false;
+        }
+        return record_at(domain, generation, ordinal, output);
+    }
+
+    bool navigation_document(
+        navigator::navigator_domain_t domain, std::uint64_t generation,
+        navigator::navigator_row_id_t id, std::uint64_t address,
+        document_identity_t& output) const override
+    {
+        output = {};
+        if (!generation_current(generation) || !id.valid() || address == 0 ||
+            domain == navigator::navigator_domain_t::binaries ||
+            domain == navigator::navigator_domain_t::progress ||
+            domain == navigator::navigator_domain_t::invalid)
+            return false;
+        output.workspace = workspace_;
+        output.kind = document_kind_t::disassembly;
+        output.object_id = 1;
+        output.provider_key = "analysis";
+        output.has_address = true;
+        output.address = address;
+        return true;
     }
 
     bool overlay_snapshot(std::uint64_t generation,
@@ -483,16 +845,24 @@ public:
     }
 
 private:
+    static navigator::navigator_row_id_t navigator_row_identity(
+        navigator::navigator_domain_t domain, std::uint64_t value) noexcept
+    {
+        std::uint64_t hash = k_shell_fnv_offset;
+        hash ^= static_cast<std::uint8_t>(domain);
+        hash *= k_shell_fnv_prime;
+        for (std::uint32_t shift = 0; shift != 64; shift += 8) {
+            hash ^= static_cast<std::uint8_t>(value >> shift);
+            hash *= k_shell_fnv_prime;
+        }
+        return {hash == 0 ? 1 : hash};
+    }
+
     static bool same_publication(
         const std::shared_ptr<const analysis::analysis_publication_t>& lhs,
         const std::shared_ptr<const analysis::analysis_publication_t>& rhs)
     {
-        return lhs && rhs && lhs->snapshot && rhs->snapshot &&
-               lhs->snapshot == rhs->snapshot &&
-               lhs->generation == rhs->generation &&
-               lhs->analysis_revision == rhs->analysis_revision &&
-               lhs->binary_id == rhs->binary_id &&
-               lhs->load_profile_hash == rhs->load_profile_hash;
+        return lhs && rhs && lhs == rhs;
     }
 
     std::uint64_t current_generation_locked() const noexcept
@@ -1450,13 +1820,15 @@ struct graph_materialization_t final {
     std::vector<graph_node_range_t> ranges;
 };
 
-void sort_graph_ranges(std::vector<graph_node_range_t>& ranges)
+bool sort_graph_ranges(
+    std::vector<graph_node_range_t>& ranges,
+    const graph_document::graph_cancellation_t* cancellation)
 {
-    std::sort(ranges.begin(), ranges.end(),
+    return bounded_stable_sort(ranges,
         [](const graph_node_range_t& lhs, const graph_node_range_t& rhs) {
             return std::tie(lhs.begin, lhs.end, lhs.node.value) <
                    std::tie(rhs.begin, rhs.end, rhs.node.value);
-        });
+        }, cancellation);
 }
 
 graph_document::graph_node_id_t graph_node_for_address(
@@ -1523,10 +1895,15 @@ std::string function_label(const graph_function_index_t& functions,
     return "sub_" + hexadecimal(address);
 }
 
-void finalize_graph_edges(graph_materialization_t& output,
-                          std::vector<graph_edge_candidate_t> candidates)
+graph_document::graph_source_result_t finalize_graph_edges(
+    graph_materialization_t& output,
+    std::vector<graph_edge_candidate_t> candidates,
+    const graph_document::graph_source_limits_t& limits,
+    const graph_document::graph_cancellation_t* cancellation)
 {
-    std::sort(candidates.begin(), candidates.end(),
+    if (candidates.size() > limits.max_edges)
+        return graph_document::graph_source_result_t::limit_exceeded;
+    if (!bounded_stable_sort(candidates,
         [](const graph_edge_candidate_t& lhs,
            const graph_edge_candidate_t& rhs) {
             return std::tie(lhs.source.value, lhs.target.value, lhs.kind,
@@ -1535,10 +1912,11 @@ void finalize_graph_edges(graph_materialization_t& output,
                    std::tie(rhs.source.value, rhs.target.value, rhs.kind,
                             rhs.site_address, rhs.stable_source_id,
                             rhs.label);
-        });
+        }, cancellation))
+        return graph_document::graph_source_result_t::cancelled;
     output.total_edges = candidates.size();
-    if (output.total_edges > graph_document::k_graph_document_max_edges)
-        return;
+    if (output.total_edges > limits.max_edges)
+        return graph_document::graph_source_result_t::limit_exceeded;
 
     std::map<std::uint64_t, std::size_t> node_indices;
     for (std::size_t index = 0; index < output.nodes.size(); ++index) {
@@ -1547,7 +1925,7 @@ void finalize_graph_edges(graph_materialization_t& output,
             output.total_edges =
                 graph_document::k_graph_document_max_edges + 1U;
             output.edges.clear();
-            return;
+            return graph_document::graph_source_result_t::rejected;
         }
     }
 
@@ -1559,6 +1937,11 @@ void finalize_graph_edges(graph_materialization_t& output,
     bool have_previous = false;
     std::uint64_t parallel_ordinal = 0;
     for (auto& candidate : candidates) {
+        if ((output.edges.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled()) {
+            output.edges.clear();
+            return graph_document::graph_source_result_t::cancelled;
+        }
         const auto identity = std::make_tuple(
             candidate.source.value, candidate.target.value,
             candidate.kind, candidate.site_address);
@@ -1587,7 +1970,7 @@ void finalize_graph_edges(graph_materialization_t& output,
             output.edges.clear();
             output.total_edges =
                 graph_document::k_graph_document_max_edges + 1U;
-            return;
+            return graph_document::graph_source_result_t::rejected;
         }
         const auto source = node_indices.find(edge.source.value);
         const auto target = node_indices.find(edge.target.value);
@@ -1602,13 +1985,17 @@ void finalize_graph_edges(graph_materialization_t& output,
         output.edges.push_back(std::move(edge));
     }
     output.total_edges = output.edges.size();
+    return graph_document::graph_source_result_t::success;
 }
 
-std::shared_ptr<graph_materialization_t> build_cfg_graph(
+graph_document::graph_source_result_t build_cfg_graph(
     const std::shared_ptr<const analysis::analysis_publication_t>& publication,
-    std::uint64_t function_address)
+    std::uint64_t function_address,
+    const graph_document::graph_source_limits_t& limits,
+    const graph_document::graph_cancellation_t* cancellation,
+    std::shared_ptr<graph_materialization_t>& output)
 {
-    auto output = std::make_shared<graph_materialization_t>();
+    output = std::make_shared<graph_materialization_t>();
     output->generation = publication->generation;
     output->kind = graph_document::graph_kind_t::cfg;
     output->function_address = function_address;
@@ -1619,9 +2006,11 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
         const analysis::function_record_t* function = nullptr;
         std::size_t traversed_functions = 0;
         for (const auto& candidate : snapshot.functions) {
-            if (traversed_functions >=
-                graph_document::k_graph_document_max_nodes)
-                break;
+            if ((traversed_functions & 0xFFU) == 0U && cancellation &&
+                cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
+            if (traversed_functions >= limits.max_nodes)
+                return graph_document::graph_source_result_t::limit_exceeded;
             ++traversed_functions;
             if (function_address >= candidate.start.value &&
                 function_address < candidate.end.value) {
@@ -1630,27 +2019,27 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
             }
         }
         if (!function) {
-            if (traversed_functions < snapshot.functions.size())
-                output->total_nodes =
-                    graph_document::k_graph_document_max_nodes + 1U;
-            return output;
+            return graph_document::graph_source_result_t::not_found;
         }
         if (function->block_membership_count != 0) {
             const auto first = static_cast<std::size_t>(
                 function->first_block_membership);
             const auto count = static_cast<std::size_t>(
                 function->block_membership_count);
-            if (count > graph_document::k_graph_document_max_nodes ||
+            if (count > limits.max_nodes ||
                 first > snapshot.function_block_memberships.size() ||
                 count > snapshot.function_block_memberships.size() - first) {
-                output->total_nodes =
-                    graph_document::k_graph_document_max_nodes + 1U;
-                return output;
+                return count > limits.max_nodes
+                    ? graph_document::graph_source_result_t::limit_exceeded
+                    : graph_document::graph_source_result_t::rejected;
             }
             block_indices.reserve(count);
             std::unordered_set<analysis::entity_id_t> membership_ids;
             membership_ids.reserve(count);
             for (std::size_t offset = 0; offset < count; ++offset) {
+                if ((offset & 0xFFU) == 0U && cancellation &&
+                    cancellation->cancelled())
+                    return graph_document::graph_source_result_t::cancelled;
                 const auto& membership =
                     snapshot.function_block_memberships[first + offset];
                 const auto block_index =
@@ -1660,45 +2049,43 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
                     block_index >= snapshot.blocks.size() ||
                     snapshot.blocks[block_index].id != membership.block_id ||
                     !membership_ids.insert(membership.block_id).second) {
-                    output->total_nodes =
-                        graph_document::k_graph_document_max_nodes + 1U;
-                    return output;
+                    return graph_document::graph_source_result_t::rejected;
                 }
                 block_indices.push_back(block_index);
             }
         } else {
             const auto first = static_cast<std::size_t>(function->first_block);
             const auto count = static_cast<std::size_t>(function->block_count);
-            if (count > graph_document::k_graph_document_max_nodes ||
+            if (count > limits.max_nodes ||
                 first > snapshot.blocks.size() ||
                 count > snapshot.blocks.size() - first) {
-                output->total_nodes =
-                    graph_document::k_graph_document_max_nodes + 1U;
-                return output;
+                return count > limits.max_nodes
+                    ? graph_document::graph_source_result_t::limit_exceeded
+                    : graph_document::graph_source_result_t::rejected;
             }
             block_indices.reserve(count);
             for (std::size_t offset = 0; offset < count; ++offset)
                 block_indices.push_back(first + offset);
         }
     } else {
-        if (snapshot.blocks.size() >
-            graph_document::k_graph_document_max_nodes) {
+        if (snapshot.blocks.size() > limits.max_nodes) {
             output->total_nodes = snapshot.blocks.size();
             output->total_edges = snapshot.edges.size();
-            return output;
+            return graph_document::graph_source_result_t::limit_exceeded;
         }
         block_indices.reserve(snapshot.blocks.size());
         for (std::size_t index = 0; index < snapshot.blocks.size(); ++index)
             block_indices.push_back(index);
     }
 
-    std::sort(block_indices.begin(), block_indices.end(),
+    if (!bounded_stable_sort(block_indices,
         [&snapshot](std::size_t lhs, std::size_t rhs) {
             const auto& left = snapshot.blocks[lhs];
             const auto& right = snapshot.blocks[rhs];
             return std::tie(left.start.value, left.end.value, left.id, lhs) <
                    std::tie(right.start.value, right.end.value, right.id, rhs);
-        });
+        }, cancellation))
+        return graph_document::graph_source_result_t::cancelled;
 
     std::unordered_map<analysis::entity_id_t,
                        graph_document::graph_node_id_t> block_nodes;
@@ -1706,6 +2093,9 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
     stable_node_ids.reserve(block_indices.size());
     output->total_nodes = block_indices.size();
     for (const auto block_index : block_indices) {
+        if ((output->nodes.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
         const auto& block = snapshot.blocks[block_index];
         graph_document::graph_node_view_t node;
         node.id = graph_node_identity(block.id, block.start.value, "cfg");
@@ -1719,7 +2109,7 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
             output->nodes.clear();
             output->ranges.clear();
             output->total_edges = snapshot.edges.size();
-            return output;
+            return graph_document::graph_source_result_t::rejected;
         }
         if (block.id != 0)
             block_nodes.emplace(block.id, node.id);
@@ -1730,22 +2120,20 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
         range.node = output->nodes.back().id;
         output->ranges.push_back(range);
     }
-    sort_graph_ranges(output->ranges);
+    if (!sort_graph_ranges(output->ranges, cancellation))
+        return graph_document::graph_source_result_t::cancelled;
 
     std::vector<graph_edge_candidate_t> edges;
     edges.reserve((std::min)(snapshot.edges.size(),
-        static_cast<std::size_t>(graph_document::k_graph_document_max_edges + 1U)));
+        static_cast<std::size_t>(limits.max_edges + 1U)));
     std::uint64_t traversed_edges = 0;
     for (const auto& source_edge : snapshot.edges) {
         ++traversed_edges;
-        if (traversed_edges > graph_document::k_graph_document_max_edges) {
-            output->nodes.clear();
-            output->ranges.clear();
-            output->total_nodes =
-                graph_document::k_graph_document_max_nodes + 1U;
-            output->total_edges = traversed_edges;
-            return output;
-        }
+        if ((traversed_edges & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        if (traversed_edges > limits.max_edges)
+            return graph_document::graph_source_result_t::limit_exceeded;
         auto source = block_nodes.find(source_edge.source_entity);
         auto source_node = source != block_nodes.end()
             ? source->second
@@ -1769,44 +2157,51 @@ std::shared_ptr<graph_materialization_t> build_cfg_graph(
         edge.site_address = source_edge.source.value;
         edge.stable_source_id = source_edge.id;
         edges.push_back(std::move(edge));
-        if (edges.size() > graph_document::k_graph_document_max_edges)
+        if (edges.size() > limits.max_edges)
             break;
     }
-    finalize_graph_edges(*output, std::move(edges));
-    return output;
+    return finalize_graph_edges(*output, std::move(edges), limits,
+                                cancellation);
 }
 
-std::shared_ptr<graph_materialization_t> build_call_graph(
+graph_document::graph_source_result_t build_call_graph(
     const std::shared_ptr<const analysis::analysis_publication_t>& publication,
-    std::uint64_t function_address)
+    std::uint64_t function_address,
+    const graph_document::graph_source_limits_t& limits,
+    const graph_document::graph_cancellation_t* cancellation,
+    std::shared_ptr<graph_materialization_t>& output)
 {
-    auto output = std::make_shared<graph_materialization_t>();
+    output = std::make_shared<graph_materialization_t>();
     output->generation = publication->generation;
     output->kind = graph_document::graph_kind_t::call_graph;
     output->function_address = function_address;
     const auto& snapshot = *publication->snapshot;
 
-    if (snapshot.call_graph.nodes.size() >
-            graph_document::k_graph_document_max_nodes ||
-        snapshot.call_graph.edges.size() >
-            graph_document::k_graph_document_max_edges) {
+    if (snapshot.call_graph.nodes.size() > limits.max_nodes ||
+        snapshot.call_graph.edges.size() > limits.max_edges) {
         output->total_nodes = snapshot.call_graph.nodes.size();
         output->total_edges = snapshot.call_graph.edges.size();
-        return output;
+        return graph_document::graph_source_result_t::limit_exceeded;
     }
 
     std::unordered_set<analysis::entity_id_t> required_functions;
     required_functions.reserve(snapshot.call_graph.nodes.size());
-    for (const auto& node : snapshot.call_graph.nodes)
+    for (const auto& node : snapshot.call_graph.nodes) {
+        if ((required_functions.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
         required_functions.insert(node.function_id);
+    }
 
     graph_function_index_t functions;
     functions.reserve(required_functions.size());
     std::size_t traversed_functions = 0;
     for (const auto& function : snapshot.functions) {
-        if (traversed_functions >=
-            graph_document::k_graph_document_max_nodes)
-            break;
+        if ((traversed_functions & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        if (traversed_functions >= limits.max_nodes)
+            return graph_document::graph_source_result_t::limit_exceeded;
         ++traversed_functions;
         if (required_functions.find(function.id) != required_functions.end())
             functions.emplace(function.id, &function);
@@ -1825,7 +2220,10 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
     symbols.reserve(required_symbols.size());
     std::size_t traversed_symbols = 0;
     for (const auto& symbol : snapshot.symbols) {
-        if (traversed_symbols >= graph_document::k_graph_document_max_nodes ||
+        if ((traversed_symbols & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        if (traversed_symbols >= limits.max_nodes ||
             symbols.size() == required_symbols.size())
             break;
         ++traversed_symbols;
@@ -1842,18 +2240,17 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
                 return node.address.value == function_address;
             });
         if (focus == snapshot.call_graph.nodes.end())
-            return output;
+            return graph_document::graph_source_result_t::not_found;
         focus_function = focus->function_id;
         included_functions.insert(focus->function_id);
         std::uint64_t traversed_edges = 0;
         for (const auto& edge : snapshot.call_graph.edges) {
             ++traversed_edges;
-            if (traversed_edges > graph_document::k_graph_document_max_edges) {
-                output->total_nodes =
-                    graph_document::k_graph_document_max_nodes + 1U;
-                output->total_edges = traversed_edges;
-                return output;
-            }
+            if ((traversed_edges & 0xFFU) == 0U && cancellation &&
+                cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
+            if (traversed_edges > limits.max_edges)
+                return graph_document::graph_source_result_t::limit_exceeded;
             if (edge.source_function_id == *focus_function) {
                 if (edge.target_function_id)
                     included_functions.insert(*edge.target_function_id);
@@ -1869,12 +2266,15 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
     std::unordered_set<std::uint64_t> stable_node_ids;
     stable_node_ids.reserve(snapshot.call_graph.nodes.size());
     for (const auto& source_node : snapshot.call_graph.nodes) {
+        if ((output->total_nodes & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
         if (focus_function &&
             included_functions.find(source_node.function_id) ==
                 included_functions.end())
             continue;
         ++output->total_nodes;
-        if (output->total_nodes > graph_document::k_graph_document_max_nodes)
+        if (output->total_nodes > limits.max_nodes)
             break;
         graph_document::graph_node_view_t node;
         node.id = graph_node_identity(source_node.function_id,
@@ -1910,19 +2310,23 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
         range.node = output->nodes.back().id;
         output->ranges.push_back(range);
     }
-    if (output->total_nodes > graph_document::k_graph_document_max_nodes) {
+    if (output->total_nodes > limits.max_nodes) {
         output->nodes.clear();
         output->ranges.clear();
         output->total_edges = snapshot.call_graph.edges.size();
-        return output;
+        return graph_document::graph_source_result_t::limit_exceeded;
     }
-    sort_graph_ranges(output->ranges);
+    if (!sort_graph_ranges(output->ranges, cancellation))
+        return graph_document::graph_source_result_t::cancelled;
 
     std::vector<graph_edge_candidate_t> edges;
     edges.reserve((std::min)(snapshot.call_graph.edges.size(),
         static_cast<std::size_t>(
-            graph_document::k_graph_document_max_edges + 1U)));
+            limits.max_edges + 1U)));
     for (const auto& source_edge : snapshot.call_graph.edges) {
+        if ((edges.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
         const auto source = function_nodes.find(source_edge.source_function_id);
         if (source == function_nodes.end() || !source_edge.target_function_id)
             continue;
@@ -1939,15 +2343,15 @@ std::shared_ptr<graph_materialization_t> build_call_graph(
         edge.site_address = source_edge.call_site.value;
         edge.stable_source_id = source_edge.id;
         edges.push_back(std::move(edge));
-        if (edges.size() > graph_document::k_graph_document_max_edges)
+        if (edges.size() > limits.max_edges)
             break;
     }
     for (auto& node : output->nodes) {
         node.in_degree = 0;
         node.out_degree = 0;
     }
-    finalize_graph_edges(*output, std::move(edges));
-    return output;
+    return finalize_graph_edges(*output, std::move(edges), limits,
+                                cancellation);
 }
 
 class production_graph_source_t final
@@ -1989,197 +2393,210 @@ public:
                kind == graph_document::graph_kind_t::call_graph;
     }
 
-    std::uint64_t node_count(std::uint64_t generation,
-                             graph_document::graph_kind_t kind,
-                             std::uint64_t function_address) const noexcept override
-    {
-        const auto graph = materialize(generation, kind, function_address);
-        return graph ? graph->total_nodes
-                     : graph_document::k_graph_document_max_nodes + 1U;
-    }
-
-    std::uint64_t edge_count(std::uint64_t generation,
-                             graph_document::graph_kind_t kind,
-                             std::uint64_t function_address) const noexcept override
-    {
-        const auto graph = materialize(generation, kind, function_address);
-        return graph ? graph->total_edges
-                     : graph_document::k_graph_document_max_edges + 1U;
-    }
-
-    bool node_at(std::uint64_t generation, graph_document::graph_kind_t kind,
-                 std::uint64_t function_address, std::uint64_t ordinal,
-                 graph_document::graph_node_view_t& output) const noexcept override
+    graph_document::graph_source_result_t counts(
+        std::uint64_t generation, graph_document::graph_kind_t kind,
+        std::uint64_t function_address,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_source_counts_t& output) const noexcept override
     {
         output = {};
-        try {
-            const auto graph = materialize(generation, kind, function_address);
-            if (!graph || ordinal >= graph->nodes.size())
-                return false;
-            output = graph->nodes[static_cast<std::size_t>(ordinal)];
-            return true;
-        } catch (...) {
-            output = {};
-            return false;
-        }
+        std::shared_ptr<const graph_materialization_t> graph;
+        const auto result = materialize(generation, kind, function_address,
+                                        limits, cancellation, graph);
+        if (result != graph_document::graph_source_result_t::success)
+            return result;
+        output.nodes = graph->total_nodes;
+        output.edges = graph->total_edges;
+        return graph_document::graph_source_result_t::success;
     }
 
-    bool edge_at(std::uint64_t generation, graph_document::graph_kind_t kind,
-                 std::uint64_t function_address, std::uint64_t ordinal,
-                 graph_document::graph_edge_view_t& output) const noexcept override
+    graph_document::graph_source_result_t node_at(
+        std::uint64_t generation, graph_document::graph_kind_t kind,
+        std::uint64_t function_address, std::uint64_t ordinal,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_node_view_t& output) const noexcept override
     {
         output = {};
-        try {
-            const auto graph = materialize(generation, kind, function_address);
-            if (!graph || ordinal >= graph->edges.size())
-                return false;
-            output = graph->edges[static_cast<std::size_t>(ordinal)];
-            return true;
-        } catch (...) {
-            output = {};
-            return false;
-        }
+        std::shared_ptr<const graph_materialization_t> graph;
+        const auto result = materialize(generation, kind, function_address,
+                                        limits, cancellation, graph);
+        if (result != graph_document::graph_source_result_t::success)
+            return result;
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        if (ordinal >= graph->nodes.size())
+            return graph_document::graph_source_result_t::not_found;
+        output = graph->nodes[static_cast<std::size_t>(ordinal)];
+        return graph_document::graph_source_result_t::success;
     }
 
-    bool node_by_address(
+    graph_document::graph_source_result_t edge_at(
+        std::uint64_t generation, graph_document::graph_kind_t kind,
+        std::uint64_t function_address, std::uint64_t ordinal,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_edge_view_t& output) const noexcept override
+    {
+        output = {};
+        std::shared_ptr<const graph_materialization_t> graph;
+        const auto result = materialize(generation, kind, function_address,
+                                        limits, cancellation, graph);
+        if (result != graph_document::graph_source_result_t::success)
+            return result;
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
+        if (ordinal >= graph->edges.size())
+            return graph_document::graph_source_result_t::not_found;
+        output = graph->edges[static_cast<std::size_t>(ordinal)];
+        return graph_document::graph_source_result_t::success;
+    }
+
+    graph_document::graph_source_result_t node_by_address(
         std::uint64_t generation, graph_document::graph_kind_t kind,
         std::uint64_t function_address, std::uint64_t address,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
         graph_document::graph_node_view_t& output,
         std::uint64_t& ordinal) const noexcept override
     {
         output = {};
         ordinal = 0;
-        try {
-            const auto graph = materialize(generation, kind, function_address);
-            if (!graph)
-                return false;
-            const auto node = graph_node_for_address(graph->ranges, address);
-            if (!node.valid())
-                return false;
-            return node_by_id(generation, kind, function_address, node,
-                              output, ordinal);
-        } catch (...) {
-            output = {};
-            ordinal = 0;
-            return false;
-        }
+        std::shared_ptr<const graph_materialization_t> graph;
+        const auto result = materialize(generation, kind, function_address,
+                                        limits, cancellation, graph);
+        if (result != graph_document::graph_source_result_t::success)
+            return result;
+        const auto id = graph_node_for_address(graph->ranges, address);
+        if (!id.valid())
+            return graph_document::graph_source_result_t::not_found;
+        return find_node(*graph, id, cancellation, output, ordinal);
     }
 
-    bool node_by_id(std::uint64_t generation,
-                    graph_document::graph_kind_t kind,
-                    std::uint64_t function_address,
-                    graph_document::graph_node_id_t id,
-                    graph_document::graph_node_view_t& output,
-                    std::uint64_t& ordinal) const noexcept override
+    graph_document::graph_source_result_t node_by_id(
+        std::uint64_t generation, graph_document::graph_kind_t kind,
+        std::uint64_t function_address, graph_document::graph_node_id_t id,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_node_view_t& output,
+        std::uint64_t& ordinal) const noexcept override
     {
         output = {};
         ordinal = 0;
-        try {
-            const auto graph = materialize(generation, kind, function_address);
-            if (!graph)
-                return false;
-            const auto found = std::find_if(
-                graph->nodes.begin(), graph->nodes.end(),
-                [id](const auto& node) { return node.id == id; });
-            if (found == graph->nodes.end())
-                return false;
-            ordinal = static_cast<std::uint64_t>(found - graph->nodes.begin());
-            output = *found;
-            return true;
-        } catch (...) {
-            output = {};
-            ordinal = 0;
-            return false;
-        }
+        std::shared_ptr<const graph_materialization_t> graph;
+        const auto result = materialize(generation, kind, function_address,
+                                        limits, cancellation, graph);
+        if (result != graph_document::graph_source_result_t::success)
+            return result;
+        return find_node(*graph, id, cancellation, output, ordinal);
     }
 
-    bool edge_by_id(std::uint64_t generation,
-                    graph_document::graph_kind_t kind,
-                    std::uint64_t function_address,
-                    graph_document::graph_edge_id_t id,
-                    graph_document::graph_edge_view_t& output,
-                    std::uint64_t& ordinal) const noexcept override
+    graph_document::graph_source_result_t edge_by_id(
+        std::uint64_t generation, graph_document::graph_kind_t kind,
+        std::uint64_t function_address, graph_document::graph_edge_id_t id,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_edge_view_t& output,
+        std::uint64_t& ordinal) const noexcept override
     {
         output = {};
         ordinal = 0;
-        try {
-            const auto graph = materialize(generation, kind, function_address);
-            if (!graph)
-                return false;
-            const auto found = std::find_if(
-                graph->edges.begin(), graph->edges.end(),
-                [id](const auto& edge) { return edge.id == id; });
-            if (found == graph->edges.end())
-                return false;
-            ordinal = static_cast<std::uint64_t>(found - graph->edges.begin());
-            output = *found;
-            return true;
-        } catch (...) {
-            output = {};
-            ordinal = 0;
-            return false;
+        std::shared_ptr<const graph_materialization_t> graph;
+        const auto result = materialize(generation, kind, function_address,
+                                        limits, cancellation, graph);
+        if (result != graph_document::graph_source_result_t::success)
+            return result;
+        for (std::size_t index = 0; index < graph->edges.size(); ++index) {
+            if ((index & 0xFFU) == 0U && cancellation &&
+                cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
+            if (graph->edges[index].id != id)
+                continue;
+            ordinal = index;
+            output = graph->edges[index];
+            return graph_document::graph_source_result_t::success;
         }
+        return graph_document::graph_source_result_t::not_found;
     }
 
-    bool address_for_node(std::uint64_t generation,
-                          graph_document::graph_node_id_t node,
-                          std::uint64_t& address) const noexcept
+    graph_document::graph_source_result_t address_for_node(
+        std::uint64_t generation, graph_document::graph_node_id_t node,
+        const graph_document::graph_cancellation_t* cancellation,
+        std::uint64_t& address) const noexcept
     {
         address = 0;
         try {
+            if (cancellation && cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
             const auto publication = lease_.source->publication(generation);
-            if (!publication)
-                return false;
+            if (!publication || !publication->snapshot)
+                return graph_document::graph_source_result_t::not_found;
+            const auto total = publication->snapshot->blocks.size() +
+                               publication->snapshot->call_graph.nodes.size();
             if (publication->snapshot->blocks.size() >
                     graph_document::k_graph_document_max_nodes ||
                 publication->snapshot->call_graph.nodes.size() >
-                    graph_document::k_graph_document_max_nodes)
-                return false;
+                    graph_document::k_graph_document_max_nodes ||
+                total > 2U * graph_document::k_graph_document_max_nodes)
+                return graph_document::graph_source_result_t::limit_exceeded;
 
-            std::lock_guard<std::mutex> lock(node_address_mutex_);
-            if (node_address_generation_ != generation) {
-                std::unordered_map<std::uint64_t, std::uint64_t> addresses;
-                addresses.reserve(publication->snapshot->blocks.size() +
-                                  publication->snapshot->call_graph.nodes.size());
-                for (const auto& block : publication->snapshot->blocks) {
-                    const auto id = graph_node_identity(
-                        block.id, block.start.value, "cfg");
-                    if (!id.valid() ||
-                        !addresses.emplace(id.value, block.start.value).second) {
-                        node_addresses_.clear();
-                        node_address_generation_ = generation;
-                        node_address_index_valid_ = false;
-                        return false;
-                    }
+            std::unordered_map<std::uint64_t, std::uint64_t> addresses;
+            {
+                std::lock_guard<std::mutex> lock(node_address_mutex_);
+                if (node_address_generation_ == generation &&
+                    node_address_index_valid_) {
+                    const auto found = node_addresses_.find(node.value);
+                    if (found == node_addresses_.end())
+                        return graph_document::graph_source_result_t::not_found;
+                    address = found->second;
+                    return graph_document::graph_source_result_t::success;
                 }
-                for (const auto& source_node :
-                     publication->snapshot->call_graph.nodes) {
-                    const auto id = graph_node_identity(
-                        source_node.function_id, source_node.address.value,
-                        "call");
-                    if (!id.valid() ||
-                        !addresses.emplace(id.value,
-                                           source_node.address.value).second) {
-                        node_addresses_.clear();
-                        node_address_generation_ = generation;
-                        node_address_index_valid_ = false;
-                        return false;
-                    }
-                }
+            }
+            addresses.reserve(total);
+            std::size_t inspected = 0;
+            for (const auto& block : publication->snapshot->blocks) {
+                if ((inspected++ & 0xFFU) == 0U && cancellation &&
+                    cancellation->cancelled())
+                    return graph_document::graph_source_result_t::cancelled;
+                const auto id = graph_node_identity(
+                    block.id, block.start.value, "cfg");
+                if (!id.valid() ||
+                    !addresses.emplace(id.value, block.start.value).second)
+                    return graph_document::graph_source_result_t::rejected;
+            }
+            for (const auto& source_node :
+                 publication->snapshot->call_graph.nodes) {
+                if ((inspected++ & 0xFFU) == 0U && cancellation &&
+                    cancellation->cancelled())
+                    return graph_document::graph_source_result_t::cancelled;
+                const auto id = graph_node_identity(
+                    source_node.function_id, source_node.address.value,
+                    "call");
+                if (!id.valid() ||
+                    !addresses.emplace(id.value,
+                                       source_node.address.value).second)
+                    return graph_document::graph_source_result_t::rejected;
+            }
+            if (!generation_current(generation) ||
+                (cancellation && cancellation->cancelled()))
+                return cancellation && cancellation->cancelled()
+                    ? graph_document::graph_source_result_t::cancelled
+                    : graph_document::graph_source_result_t::rejected;
+            {
+                std::lock_guard<std::mutex> lock(node_address_mutex_);
                 node_addresses_ = std::move(addresses);
                 node_address_generation_ = generation;
                 node_address_index_valid_ = true;
+                const auto found = node_addresses_.find(node.value);
+                if (found == node_addresses_.end())
+                    return graph_document::graph_source_result_t::not_found;
+                address = found->second;
             }
-            if (!node_address_index_valid_)
-                return false;
-            const auto found = node_addresses_.find(node.value);
-            if (found == node_addresses_.end())
-                return false;
-            address = found->second;
-            return true;
+            return graph_document::graph_source_result_t::success;
         } catch (...) {
             address = 0;
-            return false;
+            return graph_document::graph_source_result_t::rejected;
         }
     }
 
@@ -2191,14 +2608,23 @@ private:
         std::shared_ptr<const graph_materialization_t> graph;
     };
 
-    std::shared_ptr<const graph_materialization_t> materialize(
+    graph_document::graph_source_result_t materialize(
         std::uint64_t generation,
         graph_document::graph_kind_t kind,
-        std::uint64_t function_address) const noexcept
+        std::uint64_t function_address,
+        const graph_document::graph_source_limits_t& limits,
+        const graph_document::graph_cancellation_t* cancellation,
+        std::shared_ptr<const graph_materialization_t>& output) const noexcept
     {
+        output.reset();
         try {
-            if (!supports_kind(kind) || !generation_available(generation))
-                return {};
+            if (!graph_document::graph_source_limits_valid(limits) ||
+                !supports_kind(kind))
+                return graph_document::graph_source_result_t::rejected;
+            if (cancellation && cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
+            if (!generation_available(generation))
+                return graph_document::graph_source_result_t::not_found;
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 const auto found = std::find_if(
@@ -2208,32 +2634,78 @@ private:
                                entry.kind == kind &&
                                entry.function_address == function_address;
                     });
-                if (found != cache_.end())
-                    return found->graph;
+                if (found != cache_.end()) {
+                    if (found->graph->total_nodes > limits.max_nodes ||
+                        found->graph->total_edges > limits.max_edges)
+                        return graph_document::graph_source_result_t::limit_exceeded;
+                    output = found->graph;
+                    return graph_document::graph_source_result_t::success;
+                }
             }
             const auto publication = lease_.source->publication(generation);
-            if (!publication)
-                return {};
+            if (!publication || !publication->snapshot)
+                return graph_document::graph_source_result_t::not_found;
             std::shared_ptr<graph_materialization_t> built;
+            graph_document::graph_source_result_t result;
             if (kind == graph_document::graph_kind_t::cfg)
-                built = build_cfg_graph(publication, function_address);
+                result = build_cfg_graph(publication, function_address,
+                                         limits, cancellation, built);
             else
-                built = build_call_graph(publication, function_address);
-            if (!built)
-                return {};
+                result = build_call_graph(publication, function_address,
+                                          limits, cancellation, built);
+            if (result != graph_document::graph_source_result_t::success ||
+                !built)
+                return result;
+            if (cancellation && cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
+            if (!generation_current(generation))
+                return graph_document::graph_source_result_t::rejected;
             std::lock_guard<std::mutex> lock(cache_mutex_);
+            const auto existing = std::find_if(
+                cache_.begin(), cache_.end(),
+                [generation, kind, function_address](const cache_entry_t& entry) {
+                    return entry.generation == generation &&
+                           entry.kind == kind &&
+                           entry.function_address == function_address;
+                });
+            if (existing != cache_.end()) {
+                output = existing->graph;
+                return graph_document::graph_source_result_t::success;
+            }
             cache_entry_t entry;
             entry.generation = generation;
             entry.kind = kind;
             entry.function_address = function_address;
             entry.graph = built;
             cache_.push_back(std::move(entry));
-            while (cache_.size() > cache_limit_)
+            while (cache_.size() > (std::max<std::size_t>)(1U, cache_limit_))
                 cache_.pop_front();
-            return built;
+            output = std::move(built);
+            return graph_document::graph_source_result_t::success;
         } catch (...) {
-            return {};
+            output.reset();
+            return graph_document::graph_source_result_t::rejected;
         }
+    }
+
+    static graph_document::graph_source_result_t find_node(
+        const graph_materialization_t& graph,
+        graph_document::graph_node_id_t id,
+        const graph_document::graph_cancellation_t* cancellation,
+        graph_document::graph_node_view_t& output,
+        std::uint64_t& ordinal) noexcept
+    {
+        for (std::size_t index = 0; index < graph.nodes.size(); ++index) {
+            if ((index & 0xFFU) == 0U && cancellation &&
+                cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
+            if (graph.nodes[index].id != id)
+                continue;
+            ordinal = index;
+            output = graph.nodes[index];
+            return graph_document::graph_source_result_t::success;
+        }
+        return graph_document::graph_source_result_t::not_found;
     }
 
     analysis_document_lease_t lease_;
@@ -2256,40 +2728,62 @@ public:
     {
     }
 
-    std::uint32_t overlay_count(std::uint64_t generation) const noexcept override
+    graph_document::graph_source_result_t overlay_count(
+        std::uint64_t generation, std::uint32_t limit,
+        const graph_document::graph_cancellation_t* cancellation,
+        std::uint32_t& output) const noexcept override
     {
+        output = 0;
         try {
-            const auto projection = refresh_projection(generation);
-            return projection
-                ? projection->count
-                : graph_document::k_graph_document_max_overlays + 1U;
+            if (limit == 0 || limit > graph_document::k_graph_document_max_overlays)
+                return graph_document::graph_source_result_t::rejected;
+            std::shared_ptr<const projection_t> projection;
+            const auto result = refresh_projection(
+                generation, limit, cancellation, projection);
+            if (result != graph_document::graph_source_result_t::success)
+                return result;
+            output = projection->count;
+            return graph_document::graph_source_result_t::success;
         } catch (...) {
-            return graph_document::k_graph_document_max_overlays + 1U;
+            output = 0;
+            return graph_document::graph_source_result_t::rejected;
         }
     }
 
-    bool overlay_node(std::uint64_t generation,
-                      graph_document::graph_node_id_t node,
-                      std::string& text) const noexcept override
+    graph_document::graph_source_result_t overlay_node(
+        std::uint64_t generation, graph_document::graph_node_id_t node,
+        std::uint32_t max_label_bytes,
+        const graph_document::graph_cancellation_t* cancellation,
+        std::string& text) const noexcept override
     {
         text.clear();
         try {
+            if (max_label_bytes == 0 ||
+                max_label_bytes > graph_document::k_graph_document_max_label_bytes)
+                return graph_document::graph_source_result_t::rejected;
             auto projection = cached_projection(generation);
-            if (!projection)
-                projection = refresh_projection(generation);
-            if (!projection || projection->exhausted)
-                return false;
+            if (!projection) {
+                const auto refreshed = refresh_projection(
+                    generation, graph_document::k_graph_document_max_overlays,
+                    cancellation, projection);
+                if (refreshed != graph_document::graph_source_result_t::success)
+                    return refreshed;
+            }
             std::uint64_t address = 0;
-            if (!graph_->address_for_node(generation, node, address))
-                return false;
+            const auto resolved = graph_->address_for_node(
+                generation, node, cancellation, address);
+            if (resolved != graph_document::graph_source_result_t::success)
+                return resolved;
             const auto found = projection->labels.find(address);
             if (found == projection->labels.end())
-                return false;
+                return graph_document::graph_source_result_t::not_found;
+            if (found->second.size() > max_label_bytes)
+                return graph_document::graph_source_result_t::limit_exceeded;
             text = found->second;
-            return true;
+            return graph_document::graph_source_result_t::success;
         } catch (...) {
             text.clear();
-            return false;
+            return graph_document::graph_source_result_t::rejected;
         }
     }
 
@@ -2298,7 +2792,6 @@ private:
         std::uint64_t generation = 0;
         std::uint64_t revision = 0;
         std::uint32_t count = 0;
-        bool exhausted = false;
         std::unordered_map<std::uint64_t, std::string> labels;
     };
 
@@ -2316,19 +2809,25 @@ private:
         return *found;
     }
 
-    std::shared_ptr<const projection_t> refresh_projection(
-        std::uint64_t generation) const
+    graph_document::graph_source_result_t refresh_projection(
+        std::uint64_t generation,
+        std::uint32_t limit,
+        const graph_document::graph_cancellation_t* cancellation,
+        std::shared_ptr<const projection_t>& output) const
     {
+        output.reset();
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
         analysis::overlay_snapshot_t snapshot;
         if (!source_->current_overlay_snapshot(generation, snapshot))
-            return {};
+            return graph_document::graph_source_result_t::not_found;
         const auto publication = source_->publication(generation);
         if (!publication || !publication->snapshot ||
             publication->snapshot->blocks.size() >
                 graph_document::k_graph_document_max_nodes ||
             publication->snapshot->call_graph.nodes.size() >
                 graph_document::k_graph_document_max_nodes)
-            return {};
+            return graph_document::graph_source_result_t::limit_exceeded;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto found = std::find_if(
@@ -2337,8 +2836,12 @@ private:
                     return projection->generation == generation &&
                            projection->revision == snapshot.revision;
                 });
-            if (found != projections_.end())
-                return *found;
+            if (found != projections_.end()) {
+                if ((*found)->count > limit)
+                    return graph_document::graph_source_result_t::limit_exceeded;
+                output = *found;
+                return graph_document::graph_source_result_t::success;
+            }
         }
 
         auto projection = std::make_shared<projection_t>();
@@ -2347,16 +2850,28 @@ private:
         std::unordered_set<std::uint64_t> graph_addresses;
         graph_addresses.reserve(publication->snapshot->blocks.size() +
                                 publication->snapshot->call_graph.nodes.size());
-        for (const auto& block : publication->snapshot->blocks)
+        std::size_t inspected = 0;
+        for (const auto& block : publication->snapshot->blocks) {
+            if ((inspected++ & 0xFFU) == 0U && cancellation &&
+                cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
             graph_addresses.insert(block.start.value);
+        }
         for (const auto& source_node :
-             publication->snapshot->call_graph.nodes)
+             publication->snapshot->call_graph.nodes) {
+            if ((inspected++ & 0xFFU) == 0U && cancellation &&
+                cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
             graph_addresses.insert(source_node.address.value);
+        }
 
         std::unordered_map<std::uint64_t, std::string> names;
         std::size_t count = 0;
         for (auto iterator = snapshot.items.rbegin();
              iterator != snapshot.items.rend(); ++iterator) {
+            if ((count & 0xFFU) == 0U && cancellation &&
+                cancellation->cancelled())
+                return graph_document::graph_source_result_t::cancelled;
             const auto& operation = iterator->second;
             if (operation.remove ||
                 graph_addresses.find(operation.address.value) ==
@@ -2371,22 +2886,14 @@ private:
             if (!is_name && !is_comment)
                 continue;
             ++count;
-            if (count > graph_document::k_graph_document_max_overlays) {
-                projection->count =
-                    graph_document::k_graph_document_max_overlays + 1U;
-                projection->exhausted = true;
-                projection->labels.clear();
-                break;
-            }
+            if (count > limit ||
+                count > graph_document::k_graph_document_max_overlays)
+                return graph_document::graph_source_result_t::limit_exceeded;
             if ((is_name && operation.name.size() >
                     graph_document::k_graph_document_max_label_bytes) ||
                 (is_comment && operation.text.size() >
                     graph_document::k_graph_document_max_label_bytes)) {
-                projection->count =
-                    graph_document::k_graph_document_max_overlays + 1U;
-                projection->exhausted = true;
-                projection->labels.clear();
-                break;
+                return graph_document::graph_source_result_t::limit_exceeded;
             }
             if (is_name && !operation.name.empty())
                 names.emplace(operation.address.value, operation.name);
@@ -2394,11 +2901,11 @@ private:
                 projection->labels.emplace(operation.address.value,
                                            operation.text);
         }
-        if (!projection->exhausted) {
-            projection->count = static_cast<std::uint32_t>(count);
-            for (auto& [address, name] : names)
-                projection->labels.insert_or_assign(address, std::move(name));
-        }
+        projection->count = static_cast<std::uint32_t>(count);
+        for (auto& [address, name] : names)
+            projection->labels.insert_or_assign(address, std::move(name));
+        if (cancellation && cancellation->cancelled())
+            return graph_document::graph_source_result_t::cancelled;
 
         std::lock_guard<std::mutex> lock(mutex_);
         const auto existing = std::find_if(
@@ -2408,13 +2915,14 @@ private:
             });
         if (existing != projections_.end()) {
             if ((*existing)->revision > projection->revision)
-                return *existing;
+                projection = std::const_pointer_cast<projection_t>(*existing);
             projections_.erase(existing);
         }
         projections_.push_back(projection);
         while (projections_.size() > 2U)
             projections_.pop_front();
-        return projection;
+        output = std::move(projection);
+        return graph_document::graph_source_result_t::success;
     }
 
     std::shared_ptr<workbench_analysis_source_t> source_;
@@ -2434,7 +2942,6 @@ struct diff_materialization_t final {
     diff_document::diff_scope_t scope;
     std::vector<diff_document::diff_entry_t> entries;
     diff_document::diff_summary_t summary;
-    bool exhausted = false;
 };
 
 using diff_entity_map_t = std::map<std::string, diff_entity_value_t>;
@@ -2463,12 +2970,17 @@ bool append_diff_entity(diff_entity_map_t& output,
     return output.emplace(std::move(key), std::move(record)).second;
 }
 
-bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot,
-                                   std::size_t limit,
-                                   diff_entity_map_t& output)
+diff_document::diff_source_result_t append_snapshot_diff_entities(
+    const analysis::analysis_snapshot_t& snapshot,
+    std::size_t limit,
+    const diff_document::diff_cancellation_t* cancellation,
+    diff_entity_map_t& output)
 {
     output.clear();
     for (const auto& instruction : snapshot.instructions) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         const auto identity = instruction.id != 0
             ? instruction.id : instruction.address.value;
         std::ostringstream value;
@@ -2481,9 +2993,12 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 diff_key("instruction", identity),
                 diff_document::diff_domain_t::instruction,
                 instruction.address.value, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
     for (const auto& function : snapshot.functions) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         const auto identity = function.id != 0
             ? function.id : function.start.value;
         std::ostringstream value;
@@ -2497,9 +3012,12 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 diff_key("function", identity),
                 diff_document::diff_domain_t::function,
                 function.start.value, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
     for (const auto& string_record : snapshot.strings) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         const auto identity = string_record.id != 0
             ? string_record.id : string_record.address.value;
         std::ostringstream value;
@@ -2511,9 +3029,12 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 diff_key("string", identity),
                 diff_document::diff_domain_t::string,
                 string_record.address.value, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
     for (const auto& symbol : snapshot.symbols) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         auto domain = diff_document::diff_domain_t::symbol;
         if (symbol.kind == analysis::symbol_kind_t::import_symbol)
             domain = diff_document::diff_domain_t::import;
@@ -2529,9 +3050,12 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
         if (!append_diff_entity(output, limit,
                 diff_key("symbol", identity), domain,
                 symbol.address.value, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
     for (const auto& type : snapshot.rich_facts.type_candidates) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         const auto fallback_identity =
             std::to_string(type.source_key.size()) + ":" + type.source_key +
             ":" + std::to_string(type.display_name.size()) + ":" +
@@ -2549,13 +3073,16 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 diff_key("type", identity),
                 diff_document::diff_domain_t::type,
                 type.address ? type.address->value : 0, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
 
     const auto image = snapshot.normalized_image;
     if (!image)
-        return true;
+        return diff_document::diff_source_result_t::success;
     for (const auto& section : image->sections) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         std::ostringstream value;
         value << "name=" << section.name
               << ";virtual_size=" << section.virtual_size
@@ -2567,11 +3094,14 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 diff_key("section", section.index),
                 diff_document::diff_domain_t::section,
                 section.virtual_address, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
     std::unordered_map<std::string, std::uint64_t> import_occurrences;
     import_occurrences.reserve((std::min)(image->imports.size(), limit));
     for (const auto& imported : image->imports) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         const auto imported_name =
             imported.name ? *imported.name : std::string{};
         std::ostringstream logical_identity;
@@ -2595,9 +3125,12 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 diff_key("import", stable_hash(identity)),
                 diff_document::diff_domain_t::import,
                 imported.address.value, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
     for (const auto& exported : image->exports) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         std::ostringstream value;
         value << "name=" << (exported.name ? *exported.name : std::string{})
               << ";ordinal=" << exported.ordinal
@@ -2607,9 +3140,9 @@ bool append_snapshot_diff_entities(const analysis::analysis_snapshot_t& snapshot
                 diff_key("export", exported.ordinal),
                 diff_document::diff_domain_t::export_entry,
                 exported.address.value, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
-    return true;
+    return diff_document::diff_source_result_t::success;
 }
 
 std::uint64_t hash_overlay_bytes(const std::vector<std::uint8_t>& bytes) noexcept
@@ -2622,12 +3155,17 @@ std::uint64_t hash_overlay_bytes(const std::vector<std::uint8_t>& bytes) noexcep
     return hash == 0 ? 1 : hash;
 }
 
-bool append_overlay_diff_entities(const analysis::overlay_snapshot_t& snapshot,
-                                  std::size_t limit,
-                                  diff_entity_map_t& output)
+diff_document::diff_source_result_t append_overlay_diff_entities(
+    const analysis::overlay_snapshot_t& snapshot,
+    std::size_t limit,
+    const diff_document::diff_cancellation_t* cancellation,
+    diff_entity_map_t& output)
 {
     output.clear();
     for (const auto& [entity_key, operation] : snapshot.items) {
+        if ((output.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         std::string key = "overlay:" + entity_key;
         if (key.size() > diff_document::k_diff_document_max_entity_key_bytes)
             key = diff_key("overlay", stable_hash(entity_key));
@@ -2650,52 +3188,59 @@ bool append_overlay_diff_entities(const analysis::overlay_snapshot_t& snapshot,
         if (!append_diff_entity(output, limit, std::move(key),
                 diff_document::diff_domain_t::overlay,
                 operation.address.value, value.str()))
-            return false;
+            return diff_document::diff_source_result_t::limit_exceeded;
     }
-    return true;
+    return diff_document::diff_source_result_t::success;
 }
 
-std::shared_ptr<diff_materialization_t> build_diff_materialization(
+diff_document::diff_source_result_t build_diff_materialization(
     std::uint64_t generation,
     const diff_document::diff_scope_t& scope,
     std::size_t limit,
     const std::shared_ptr<const analysis::analysis_publication_t>& before_publication,
     const std::shared_ptr<const analysis::analysis_publication_t>& after_publication,
     const std::optional<analysis::overlay_snapshot_t>& before_overlay,
-    const std::optional<analysis::overlay_snapshot_t>& after_overlay)
+    const std::optional<analysis::overlay_snapshot_t>& after_overlay,
+    const diff_document::diff_cancellation_t* cancellation,
+    std::shared_ptr<diff_materialization_t>& result)
 {
-    auto result = std::make_shared<diff_materialization_t>();
+    result = std::make_shared<diff_materialization_t>();
     result->scope = scope;
     result->summary.snapshot_generation = generation;
     result->summary.scope = scope;
     diff_entity_map_t before;
     diff_entity_map_t after;
-    bool before_complete = false;
-    bool after_complete = false;
+    diff_document::diff_source_result_t before_result;
+    diff_document::diff_source_result_t after_result;
     if (scope.kind == diff_document::diff_kind_t::overlay) {
         if (!before_overlay || !after_overlay)
-            return {};
-        before_complete = append_overlay_diff_entities(*before_overlay, limit, before);
-        after_complete = append_overlay_diff_entities(*after_overlay, limit, after);
+            return diff_document::diff_source_result_t::not_found;
+        before_result = append_overlay_diff_entities(
+            *before_overlay, limit, cancellation, before);
+        if (before_result != diff_document::diff_source_result_t::success)
+            return before_result;
+        after_result = append_overlay_diff_entities(
+            *after_overlay, limit, cancellation, after);
     } else {
         if (!before_publication || !before_publication->snapshot ||
             !after_publication || !after_publication->snapshot)
-            return {};
-        before_complete = append_snapshot_diff_entities(
-            *before_publication->snapshot, limit, before);
-        after_complete = append_snapshot_diff_entities(
-            *after_publication->snapshot, limit, after);
+            return diff_document::diff_source_result_t::not_found;
+        before_result = append_snapshot_diff_entities(
+            *before_publication->snapshot, limit, cancellation, before);
+        if (before_result != diff_document::diff_source_result_t::success)
+            return before_result;
+        after_result = append_snapshot_diff_entities(
+            *after_publication->snapshot, limit, cancellation, after);
     }
-    if (!before_complete || !after_complete) {
-        result->exhausted = true;
-        result->summary.total_entries =
-            diff_document::k_diff_document_max_entries + 1U;
-        return result;
-    }
+    if (after_result != diff_document::diff_source_result_t::success)
+        return after_result;
 
     auto before_it = before.begin();
     auto after_it = after.begin();
     while (before_it != before.end() || after_it != after.end()) {
+        if ((result->entries.size() & 0xFFU) == 0U && cancellation &&
+            cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         diff_document::diff_entry_t entry;
         if (after_it == after.end() ||
             (before_it != before.end() && before_it->first < after_it->first)) {
@@ -2737,10 +3282,7 @@ std::shared_ptr<diff_materialization_t> build_diff_materialization(
         }
         if (result->entries.size() >= limit) {
             result->entries.clear();
-            result->exhausted = true;
-            result->summary.total_entries =
-                diff_document::k_diff_document_max_entries + 1U;
-            return result;
+            return diff_document::diff_source_result_t::limit_exceeded;
         }
         switch (entry.kind) {
             case diff_document::diff_entry_kind_t::added:
@@ -2759,7 +3301,9 @@ std::shared_ptr<diff_materialization_t> build_diff_materialization(
         result->entries.push_back(std::move(entry));
     }
     result->summary.total_entries = result->entries.size();
-    return result;
+    return cancellation && cancellation->cancelled()
+        ? diff_document::diff_source_result_t::cancelled
+        : diff_document::diff_source_result_t::success;
 }
 
 class production_diff_source_t final
@@ -2798,67 +3342,98 @@ public:
                kind == diff_document::diff_kind_t::workspace;
     }
 
-    bool scope_available(std::uint64_t generation,
-                         const diff_document::diff_scope_t& scope) const noexcept override
+    diff_document::diff_source_result_t scope_available(
+        std::uint64_t generation,
+        const diff_document::diff_scope_t& scope,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation) const noexcept override
     {
         try {
+            if (!diff_document::diff_source_limits_valid(limits))
+                return diff_document::diff_source_result_t::rejected;
+            if (cancellation && cancellation->cancelled())
+                return diff_document::diff_source_result_t::cancelled;
             endpoint_material_t before;
             endpoint_material_t after;
-            return resolve_scope(generation, scope, before, after);
+            return resolve_scope(generation, scope, cancellation,
+                                 before, after);
         } catch (...) {
-            return false;
+            return diff_document::diff_source_result_t::rejected;
         }
     }
 
-    std::uint64_t entry_count(
+    diff_document::diff_source_result_t entry_count(
         std::uint64_t generation,
-        const diff_document::diff_scope_t& scope) const noexcept override
+        const diff_document::diff_scope_t& scope,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation,
+        std::uint64_t& output) const noexcept override
     {
+        output = 0;
         try {
-            const auto materialization = materialize(generation, scope);
-            if (!materialization)
-                return diff_document::k_diff_document_max_entries + 1U;
-            return materialization->exhausted
-                ? diff_document::k_diff_document_max_entries + 1U
-                : static_cast<std::uint64_t>(materialization->entries.size());
+            std::shared_ptr<const diff_materialization_t> materialization;
+            const auto result = materialize(generation, scope, limits,
+                                            cancellation, materialization);
+            if (result != diff_document::diff_source_result_t::success)
+                return result;
+            output = materialization->entries.size();
+            return diff_document::diff_source_result_t::success;
         } catch (...) {
-            return diff_document::k_diff_document_max_entries + 1U;
+            output = 0;
+            return diff_document::diff_source_result_t::rejected;
         }
     }
 
-    bool entry_at(std::uint64_t generation,
-                  const diff_document::diff_scope_t& scope,
-                  std::uint64_t ordinal,
-                  diff_document::diff_entry_t& output) const noexcept override
+    diff_document::diff_source_result_t entry_at(
+        std::uint64_t generation,
+        const diff_document::diff_scope_t& scope,
+        std::uint64_t ordinal,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation,
+        diff_document::diff_entry_t& output) const noexcept override
     {
         output = {};
         try {
-            const auto materialization = materialize(generation, scope);
-            if (!materialization || materialization->exhausted ||
-                ordinal >= materialization->entries.size())
-                return false;
+            std::shared_ptr<const diff_materialization_t> materialization;
+            const auto result = materialize(generation, scope, limits,
+                                            cancellation, materialization);
+            if (result != diff_document::diff_source_result_t::success)
+                return result;
+            if (cancellation && cancellation->cancelled())
+                return diff_document::diff_source_result_t::cancelled;
+            if (ordinal >= materialization->entries.size())
+                return diff_document::diff_source_result_t::not_found;
             output = materialization->entries[static_cast<std::size_t>(ordinal)];
-            return generation_current(generation);
+            return generation_current(generation)
+                ? diff_document::diff_source_result_t::success
+                : diff_document::diff_source_result_t::rejected;
         } catch (...) {
             output = {};
-            return false;
+            return diff_document::diff_source_result_t::rejected;
         }
     }
 
-    bool summary(std::uint64_t generation,
-                 const diff_document::diff_scope_t& scope,
-                 diff_document::diff_summary_t& output) const noexcept override
+    diff_document::diff_source_result_t summary(
+        std::uint64_t generation,
+        const diff_document::diff_scope_t& scope,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation,
+        diff_document::diff_summary_t& output) const noexcept override
     {
         output = {};
         try {
-            const auto materialization = materialize(generation, scope);
-            if (!materialization)
-                return false;
+            std::shared_ptr<const diff_materialization_t> materialization;
+            const auto result = materialize(generation, scope, limits,
+                                            cancellation, materialization);
+            if (result != diff_document::diff_source_result_t::success)
+                return result;
             output = materialization->summary;
-            return generation_current(generation);
+            return generation_current(generation)
+                ? diff_document::diff_source_result_t::success
+                : diff_document::diff_source_result_t::rejected;
         } catch (...) {
             output = {};
-            return false;
+            return diff_document::diff_source_result_t::rejected;
         }
     }
 
@@ -2871,9 +3446,12 @@ private:
 
     bool resolve_endpoint(const diff_document::diff_endpoint_t& endpoint,
                           bool require_overlay,
+                          const diff_document::diff_cancellation_t* cancellation,
                           endpoint_material_t& output) const
     {
         output = {};
+        if (cancellation && cancellation->cancelled())
+            return false;
         output.source = catalog_ ? catalog_->find(endpoint.workspace_id) : nullptr;
         if (!output.source)
             return false;
@@ -2881,6 +3459,8 @@ private:
         if (!output.publication || !output.publication->snapshot)
             return false;
         if (require_overlay) {
+            if (cancellation && cancellation->cancelled())
+                return false;
             analysis::overlay_snapshot_t snapshot;
             if (!output.source->overlay_snapshot(
                     endpoint.generation, endpoint.overlay_revision, snapshot))
@@ -2890,69 +3470,106 @@ private:
         return true;
     }
 
-    bool resolve_scope(std::uint64_t generation,
-                       const diff_document::diff_scope_t& scope,
-                       endpoint_material_t& before,
-                       endpoint_material_t& after) const
+    diff_document::diff_source_result_t resolve_scope(
+        std::uint64_t generation,
+        const diff_document::diff_scope_t& scope,
+        const diff_document::diff_cancellation_t* cancellation,
+        endpoint_material_t& before,
+        endpoint_material_t& after) const
     {
+        if (cancellation && cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         if (!generation_current(generation) ||
             !diff_document::diff_scope_valid(scope) ||
             !supports_kind(scope.kind))
-            return false;
+            return diff_document::diff_source_result_t::rejected;
         const auto local_workspace = lease_.source->workspace().value;
         const bool local_before = scope.before.workspace_id == local_workspace &&
                                   scope.before.generation == generation;
         const bool local_after = scope.after.workspace_id == local_workspace &&
                                  scope.after.generation == generation;
         if (!local_before && !local_after)
-            return false;
+            return diff_document::diff_source_result_t::rejected;
         if (scope.kind == diff_document::diff_kind_t::generation &&
             (scope.before.workspace_id != local_workspace ||
              scope.after.workspace_id != local_workspace || !local_after))
-            return false;
+            return diff_document::diff_source_result_t::rejected;
         if (scope.kind == diff_document::diff_kind_t::overlay &&
             (scope.before.workspace_id != local_workspace ||
              scope.after.workspace_id != local_workspace ||
              scope.before.generation != generation || !local_after))
-            return false;
+            return diff_document::diff_source_result_t::rejected;
         const bool require_overlay =
             scope.kind == diff_document::diff_kind_t::overlay;
-        return resolve_endpoint(scope.before, require_overlay, before) &&
-               resolve_endpoint(scope.after, require_overlay, after) &&
-               generation_current(generation);
+        if (!resolve_endpoint(scope.before, require_overlay, cancellation, before) ||
+            !resolve_endpoint(scope.after, require_overlay, cancellation, after))
+            return cancellation && cancellation->cancelled()
+                ? diff_document::diff_source_result_t::cancelled
+                : diff_document::diff_source_result_t::not_found;
+        return generation_current(generation)
+            ? diff_document::diff_source_result_t::success
+            : diff_document::diff_source_result_t::rejected;
     }
 
-    std::shared_ptr<const diff_materialization_t> materialize(
+    diff_document::diff_source_result_t materialize(
         std::uint64_t generation,
-        const diff_document::diff_scope_t& scope) const
+        const diff_document::diff_scope_t& scope,
+        const diff_document::diff_source_limits_t& limits,
+        const diff_document::diff_cancellation_t* cancellation,
+        std::shared_ptr<const diff_materialization_t>& output) const
     {
+        output.reset();
+        if (!diff_document::diff_source_limits_valid(limits))
+            return diff_document::diff_source_result_t::rejected;
+        if (cancellation && cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             const auto found = std::find_if(
                 cache_.begin(), cache_.end(),
                 [&scope](const auto& item) { return item.first == scope; });
-            if (found != cache_.end())
-                return found->second;
+            if (found != cache_.end()) {
+                if (found->second->entries.size() > limits.max_entries)
+                    return diff_document::diff_source_result_t::limit_exceeded;
+                output = found->second;
+                return diff_document::diff_source_result_t::success;
+            }
         }
         endpoint_material_t before;
         endpoint_material_t after;
-        if (!resolve_scope(generation, scope, before, after))
-            return {};
-        auto built = build_diff_materialization(
-            generation, scope, entry_limit_, before.publication,
-            after.publication, before.overlay, after.overlay);
-        if (!built || !generation_current(generation))
-            return {};
+        const auto scope_result = resolve_scope(
+            generation, scope, cancellation, before, after);
+        if (scope_result != diff_document::diff_source_result_t::success)
+            return scope_result;
+        const auto effective_limit = static_cast<std::size_t>((std::min)(
+            static_cast<std::uint64_t>(entry_limit_), limits.max_entries));
+        if (effective_limit == 0)
+            return diff_document::diff_source_result_t::limit_exceeded;
+        std::shared_ptr<diff_materialization_t> built;
+        const auto build_result = build_diff_materialization(
+            generation, scope, effective_limit, before.publication,
+            after.publication, before.overlay, after.overlay, cancellation,
+            built);
+        if (build_result != diff_document::diff_source_result_t::success ||
+            !built)
+            return build_result;
+        if (cancellation && cancellation->cancelled())
+            return diff_document::diff_source_result_t::cancelled;
+        if (!generation_current(generation))
+            return diff_document::diff_source_result_t::rejected;
         std::lock_guard<std::mutex> lock(cache_mutex_);
         const auto existing = std::find_if(
             cache_.begin(), cache_.end(),
             [&scope](const auto& item) { return item.first == scope; });
-        if (existing != cache_.end())
-            return existing->second;
+        if (existing != cache_.end()) {
+            output = existing->second;
+            return diff_document::diff_source_result_t::success;
+        }
         cache_.emplace_back(scope, built);
-        while (cache_.size() > cache_limit_)
+        while (cache_.size() > (std::max<std::size_t>)(1U, cache_limit_))
             cache_.pop_front();
-        return built;
+        output = std::move(built);
+        return diff_document::diff_source_result_t::success;
     }
 
     analysis_document_lease_t lease_;
@@ -2970,6 +3587,9 @@ struct pseudocode_job_payload_t final {
     std::vector<analysis::decompiler_diagnostic_t> diagnostics;
 };
 
+constexpr std::size_t k_workbench_pseudocode_max_inflight = 8;
+constexpr std::uint32_t k_workbench_pseudocode_teardown_budget_ms = 250;
+
 analysis::decompiler_diagnostic_t pseudocode_terminal_diagnostic(
     analysis::decompiler_diagnostic_code_t code,
     std::string localization_key,
@@ -2980,7 +3600,35 @@ analysis::decompiler_diagnostic_t pseudocode_terminal_diagnostic(
     diagnostic.code = code;
     diagnostic.localization_key = std::move(localization_key);
     diagnostic.retryable = retryable;
+    diagnostic.ordinal = 1;
     return diagnostic;
+}
+
+std::vector<analysis::decompiler_diagnostic_t> pseudocode_diagnostics(
+    const analysis::decompiler_ui_result_t& result)
+{
+    std::vector<analysis::decompiler_diagnostic_t> diagnostics;
+    diagnostics.reserve(result.diagnostics.size());
+    std::uint32_t ordinal = 0;
+    for (const auto& source : result.diagnostics) {
+        analysis::decompiler_diagnostic_t diagnostic;
+        diagnostic.severity = source.severity;
+        diagnostic.code = source.code;
+        diagnostic.localization_key = source.localization_key.empty()
+            ? "workbench.pseudocode.decompiler_failure"
+            : source.localization_key;
+        diagnostic.localization_arguments = source.localization_arguments;
+        diagnostic.coordinate = source.coordinate;
+        diagnostic.confidence = source.confidence;
+        diagnostic.retryable = source.retryable;
+        diagnostic.ordinal = ++ordinal;
+        diagnostics.push_back(std::move(diagnostic));
+    }
+    if (diagnostics.empty())
+        diagnostics.push_back(pseudocode_terminal_diagnostic(
+            analysis::decompiler_diagnostic_code_t::provider_failure,
+            "workbench.pseudocode.decompiler_failure", true));
+    return diagnostics;
 }
 
 class production_pseudocode_source_t final
@@ -2988,42 +3636,84 @@ class production_pseudocode_source_t final
 public:
     explicit production_pseudocode_source_t(analysis_document_lease_t lease)
         : lease_(std::move(lease)),
-          policy_(analysis::default_decompiler_profile_policy())
+          policy_(analysis::default_decompiler_profile_policy()),
+          jobs_(std::make_shared<job_registry_t>())
     {
+        const auto workspace = lease_.source
+            ? lease_.source->analysis_workspace() : nullptr;
+        if (workspace) {
+            auto production = analysis::decompiler_ui_integration_t::
+                production_for_workspace(workspace);
+            if (production)
+                decompiler_ = production.take_value();
+        }
     }
 
     ~production_pseudocode_source_t() override
     {
-        std::vector<std::future<pseudocode_job_payload_t>> pending;
+        std::vector<std::uint64_t> task_ids;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            pending.reserve(jobs_.size());
-            for (auto& [job_id, job] : jobs_) {
+            std::lock_guard<std::mutex> lock(jobs_->mutex);
+            jobs_->shutting_down = true;
+            task_ids.reserve(jobs_->jobs.size());
+            for (auto& [job_id, job] : jobs_->jobs) {
                 static_cast<void>(job_id);
                 job.cancellation->request_cancel();
-                if (job.future.valid())
-                    pending.push_back(std::move(job.future));
-            }
-            jobs_.clear();
-        }
-        for (auto& future : pending) {
-            try {
-                future.wait();
-                static_cast<void>(future.get());
-            } catch (...) {
+                job.cancelled = true;
+                if (job.task_id != 0)
+                    task_ids.push_back(job.task_id);
             }
         }
+        for (const auto task_id : task_ids)
+            static_cast<void>(aida::infra::executor::cancel(task_id));
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(k_workbench_pseudocode_teardown_budget_ms);
+        for (const auto task_id : task_ids) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                break;
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline - now).count();
+            static_cast<void>(aida::infra::executor::wait_for(
+                task_id, static_cast<std::uint32_t>((std::max<std::int64_t>)(
+                    1, remaining))));
+        }
+        std::lock_guard<std::mutex> lock(jobs_->mutex);
+        jobs_->jobs.clear();
     }
 
     std::uint64_t current_generation() const noexcept override
     {
-        return lease_.publication ? lease_.publication->generation : 0;
+        return lease_.source ? lease_.source->current_generation() : 0;
     }
 
     bool generation_current(std::uint64_t generation) const noexcept override
     {
         try {
-            return lease_.current(generation);
+            return lease_.source && lease_.source->generation_current(generation);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool binding_current(
+        const std::optional<analysis::generation_bound_decompiler_entity_t>&
+            binding) const noexcept override
+    {
+        if (!binding)
+            return generation_current(current_generation());
+        try {
+            const auto workspace = lease_.source
+                ? lease_.source->analysis_workspace() : nullptr;
+            const auto publication = workspace
+                ? workspace->analysis_publication() : nullptr;
+            if (!workspace || !publication ||
+                workspace->overlay_revision() != binding->overlay_revision)
+                return false;
+            analysis::cancellation_source_t cancellation;
+            return analysis::validate_generation_bound_entity(
+                workspace->identity(), *publication, *binding,
+                cancellation.token()).has_value();
         } catch (...) {
             return false;
         }
@@ -3035,72 +3725,60 @@ public:
         std::uint64_t timeout_ms,
         pseudocode_document::pseudocode_request_t& output) const override
     {
+        analysis::decompiler_entity_locator_t locator;
+        locator.address = function_address;
+        return resolve_request(locator, profile, timeout_ms, output);
+    }
+
+    workbench_error_t resolve_request(
+        const analysis::decompiler_entity_locator_t& locator,
+        analysis::decompiler_profile_id_t profile,
+        std::uint64_t timeout_ms,
+        pseudocode_document::pseudocode_request_t& output) const override
+    {
         output = {};
         const auto budget = profile_budget(profile);
         const auto effective_timeout = (std::min)(
             timeout_ms, budget.max_wall_clock_ms);
-        const auto publication = lease_.publication;
         const auto workspace = lease_.source
             ? lease_.source->analysis_workspace()
             : nullptr;
-        if (function_address == 0 || timeout_ms == 0 ||
-            effective_timeout == 0 || !workspace ||
-            !publication || !publication->snapshot ||
-            !publication->snapshot->normalized_image ||
-            !generation_current(publication->generation) ||
+        const auto subject = locator.address.value_or(locator.token.value_or(0));
+        if (timeout_ms == 0 || effective_timeout == 0 || !workspace ||
+            !decompiler_ || (locator.address.has_value() == locator.token.has_value()) ||
             effective_timeout > static_cast<std::uint64_t>(
                 (std::chrono::milliseconds::max)().count()))
-            return shell_error(workbench_error_code_t::adapter_rejected,
-                               function_address);
+            return shell_error(workbench_error_code_t::adapter_rejected, subject);
 
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(
                 static_cast<std::chrono::milliseconds::rep>(effective_timeout));
         analysis::cancellation_source_t cancellation(deadline);
-        const auto language = analysis::ghidra_adapter::resolve_ghidra_language(
-            *publication->snapshot->normalized_image, cancellation.token());
-        if (!language)
-            return shell_error(workbench_error_code_t::adapter_rejected,
-                               function_address);
+        auto resolved = decompiler_->resolve_entity_at(locator, cancellation.token());
+        if (!resolved)
+            return shell_error(
+                resolved.error().code == analysis::workspace_error_code_t::target_ambiguous
+                    ? workbench_error_code_t::duplicate_identifier
+                    : workbench_error_code_t::invalid_document,
+                subject);
+        auto binding = resolved.take_value();
+        const auto publication = workspace->analysis_publication();
+        if (!publication ||
+            !lease_.source->generation_current(publication->generation) ||
+            publication->generation != binding.generation ||
+            publication->analysis_revision != binding.analysis_revision ||
+            publication->overlay_revision != binding.overlay_revision ||
+            workspace->overlay_revision() != binding.overlay_revision)
+            return shell_error(workbench_error_code_t::revision_mismatch,
+                               binding.generation);
+        auto validated = analysis::validate_generation_bound_entity(
+            workspace->identity(), *publication, binding, cancellation.token());
+        if (!validated)
+            return shell_error(workbench_error_code_t::revision_mismatch,
+                               binding.generation);
 
-        analysis::decompiler_ui_request_t identity_request;
-        identity_request.source =
-            analysis::decompiler_ui_invocation_source_t::keyboard_f5;
-        identity_request.function_address = function_address;
-        identity_request.language.language_id = language.value().language_id;
-        identity_request.language.language_version = "ghidra-staged-v1";
-        identity_request.language.compiler_spec_id =
-            language.value().compiler_spec_id;
-        identity_request.language.language_spec_hash =
-            analysis::stable_serialization_hash(
-                language.value().language_id + "|" +
-                language.value().compiler_spec_id);
-        identity_request.language.architecture =
-            publication->snapshot->normalized_image->architecture;
-        identity_request.language.mode =
-            publication->snapshot->normalized_image->architecture_mode;
-        identity_request.language.endian =
-            publication->snapshot->normalized_image->endian;
-        identity_request.worker_protocol_hash =
-            analysis::stable_serialization_hash(
-                "aida.workbench.pseudocode.identity.v1");
-        identity_request.metadata_revision = publication->analysis_revision;
-        identity_request.type_graph_revision = publication->analysis_revision;
-        identity_request.profile = profile;
-        identity_request.cache_mode =
-            analysis::decompiler_pipeline_cache_mode_t::read_write;
-        identity_request.deadline = deadline;
-
-        auto pipeline_request =
-            analysis::decompiler_ui_integration_t::build_pipeline_request(
-                identity_request, *workspace, 64ULL << 20, 65536,
-                cancellation.token());
-        if (!pipeline_request ||
-            !generation_current(publication->generation))
-            return shell_error(workbench_error_code_t::adapter_rejected,
-                               function_address);
-
-        output.entity = std::move(pipeline_request.value().entity);
+        output.entity = binding.entity;
+        output.binding = std::move(binding);
         output.profile = profile;
         output.workspace_generation = publication->generation;
         output.timeout_ms = effective_timeout;
@@ -3112,121 +3790,220 @@ public:
         std::uint64_t job_id) override
     {
         if (job_id == 0 || request.workspace_generation != current_generation() ||
-            !generation_current(request.workspace_generation))
+            !generation_current(request.workspace_generation) ||
+            request.timeout_ms == 0 ||
+            request.timeout_ms > static_cast<std::uint64_t>(
+                (std::chrono::milliseconds::max)().count()))
             return shell_error(workbench_error_code_t::revision_mismatch,
                                request.workspace_generation);
-        const auto* identity = std::get_if<analysis::native_decompiler_entity_identity_t>(
-            &request.entity.identity);
-        if (request.entity.kind != analysis::decompiler_entity_kind_t::native_function ||
-            !identity || identity->function_id == 0)
+        if (!request.binding || request.binding->entity != request.entity ||
+            request.binding->generation != request.workspace_generation ||
+            !analysis::validate_decompiler_entity_key(request.entity).valid())
             return shell_error(workbench_error_code_t::invalid_document, job_id);
-        const auto& functions = lease_.publication->snapshot->functions;
-        const auto function = std::find_if(
-            functions.begin(), functions.end(),
-            [identity](const analysis::function_record_t& candidate) {
-                return candidate.id == identity->function_id &&
-                       candidate.start == identity->entry;
-            });
-        if (function == functions.end())
-            return shell_error(workbench_error_code_t::invalid_document,
-                               identity->function_id);
-        const auto workspace = lease_.source->analysis_workspace();
-        const auto service = workspace ? workspace->decompiler() : nullptr;
-        if (!service)
+        const auto decompiler = decompiler_;
+        if (!decompiler)
             return shell_error(workbench_error_code_t::adapter_rejected, job_id);
+        const auto source = lease_.source;
+        const auto workspace = source ? source->analysis_workspace() : nullptr;
+        const auto publication = workspace ? workspace->analysis_publication() : nullptr;
+        if (!workspace || !publication || !source->publication_current(publication) ||
+            publication->generation != request.binding->generation ||
+            publication->analysis_revision != request.binding->analysis_revision ||
+            publication->overlay_revision != request.binding->overlay_revision ||
+            workspace->overlay_revision() != request.binding->overlay_revision)
+            return shell_error(workbench_error_code_t::revision_mismatch,
+                               request.binding->generation);
+        analysis::cancellation_source_t validation_cancellation;
+        auto validated = analysis::validate_generation_bound_entity(
+            workspace->identity(), *publication, *request.binding,
+            validation_cancellation.token());
+        if (!validated)
+            return shell_error(workbench_error_code_t::revision_mismatch,
+                               request.binding->generation);
 
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(request.timeout_ms);
         auto cancellation = std::make_shared<analysis::cancellation_source_t>(deadline);
-        const auto source = lease_.source;
-        const auto publication = lease_.publication;
         try {
-            std::lock_guard<std::mutex> lock(mutex_);
-            reap_cancelled_locked();
-            if (jobs_.find(job_id) != jobs_.end())
+            std::lock_guard<std::mutex> lock(jobs_->mutex);
+            reap_cancelled_locked(*jobs_);
+            if (jobs_->shutting_down)
+                return shell_error(workbench_error_code_t::adapter_rejected,
+                                   job_id);
+            if (jobs_->jobs.find(job_id) != jobs_->jobs.end())
                 return shell_error(workbench_error_code_t::duplicate_identifier,
                                    job_id);
-            if (jobs_.size() >=
-                pseudocode_document::k_pseudocode_document_max_cached_documents) {
+            if (jobs_->jobs.size() >= k_workbench_pseudocode_max_inflight) {
                 return shell_error(workbench_error_code_t::adapter_rejected,
-                                   static_cast<std::uint64_t>(jobs_.size()));
+                                   static_cast<std::uint64_t>(jobs_->jobs.size()));
             }
-            const auto inserted = jobs_.try_emplace(job_id);
+            const auto inserted = jobs_->jobs.try_emplace(job_id);
             if (!inserted.second)
                 return shell_error(workbench_error_code_t::duplicate_identifier,
                                    job_id);
             inserted.first->second.cancellation = cancellation;
-            try {
-                inserted.first->second.future = std::async(std::launch::async,
-                [service, source, publication, request, identity_value = *identity,
-                 cancellation]() mutable {
-                    pseudocode_job_payload_t payload;
-                    if (cancellation->token().stop_requested()) {
-                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
-                            analysis::decompiler_diagnostic_code_t::cancelled,
-                            "workbench.pseudocode.cancelled", true));
-                        return payload;
-                    }
-                    if (!source->publication_current(publication)) {
-                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
-                            analysis::decompiler_diagnostic_code_t::cache_key_rejected,
-                            "workbench.pseudocode.stale_generation", true));
-                        return payload;
-                    }
-                    analysis::decompiler_request_t service_request;
-                    service_request.deadline = cancellation->token().deadline();
-                    const auto result = service->decompile(
-                        identity_value.entry, std::move(service_request),
-                        cancellation->token());
-                    if (!result) {
-                        const auto cancelled = cancellation->token().stop_requested();
-                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
-                            cancelled
-                                ? analysis::decompiler_diagnostic_code_t::cancelled
-                                : analysis::decompiler_diagnostic_code_t::provider_failure,
-                            cancelled
-                                ? "workbench.pseudocode.cancelled"
-                                : "workbench.pseudocode.decompiler_failure",
-                            true));
-                        return payload;
-                    }
-                    if (cancellation->token().stop_requested()) {
-                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
-                            analysis::decompiler_diagnostic_code_t::cancelled,
-                            "workbench.pseudocode.cancelled", true));
-                        return payload;
-                    }
-                    if (!source->publication_current(publication) ||
-                        result.value().generation != request.workspace_generation) {
-                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
-                            analysis::decompiler_diagnostic_code_t::cache_key_rejected,
-                            "workbench.pseudocode.stale_generation", true));
-                        return payload;
-                    }
-                    payload.document = result.value().document;
-                    payload.document.entity = request.entity;
-                    payload.document.profile = request.profile;
-                    payload.succeeded = true;
-                    return payload;
-                });
-            } catch (...) {
-                jobs_.erase(inserted.first);
-                throw;
-            }
         } catch (...) {
             return shell_error(workbench_error_code_t::adapter_rejected, job_id);
+        }
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "workbench_pseudocode";
+        submission.label = "workbench.pseudocode.decompile";
+        submission.thread_class = "bounded_decompiler";
+        submission.domain = aida::infra::executor::domain_t::feature_worker;
+        submission.priority = request.profile ==
+                analysis::decompiler_profile_id_t::fast ? 4 : 3;
+        const auto now_ms = static_cast<std::uint64_t>(::GetTickCount64());
+        submission.deadline_ms = request.timeout_ms >
+                (std::numeric_limits<std::uint64_t>::max)() - now_ms
+            ? (std::numeric_limits<std::uint64_t>::max)()
+            : now_ms + request.timeout_ms;
+        submission.generation = request.workspace_generation;
+        submission.ui_access_policy = "forbidden";
+        submission.failure_policy = "typed_diagnostic";
+        submission.shutdown_policy = "cancel_replaceable";
+        submission.cancel_hook = [cancellation, registry = jobs_, job_id] {
+            cancellation->request_cancel();
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            const auto found = registry->jobs.find(job_id);
+            if (found == registry->jobs.end() || found->second.payload)
+                return;
+            pseudocode_job_payload_t payload;
+            const bool deadline = cancellation->token().deadline_exceeded();
+            payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                deadline
+                    ? analysis::decompiler_diagnostic_code_t::deadline_exceeded
+                    : analysis::decompiler_diagnostic_code_t::cancelled,
+                deadline
+                    ? "workbench.pseudocode.deadline_exceeded"
+                    : "workbench.pseudocode.cancelled",
+                !deadline));
+            found->second.payload = std::move(payload);
+        };
+        const auto registry = jobs_;
+        submission.body = [decompiler, source, publication, request,
+                           workspace, cancellation, registry, job_id]() mutable {
+            pseudocode_job_payload_t payload;
+            try {
+                if (cancellation->token().stop_requested()) {
+                    payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                        analysis::decompiler_diagnostic_code_t::cancelled,
+                        "workbench.pseudocode.cancelled", true));
+                } else if (!source->publication_current(publication) ||
+                           workspace->overlay_revision() !=
+                               request.binding->overlay_revision) {
+                    payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                        analysis::decompiler_diagnostic_code_t::cache_key_rejected,
+                        "workbench.pseudocode.stale_generation", true));
+                } else {
+                    const auto result = decompiler->decompile_entity(
+                        *request.binding,
+                        analysis::decompiler_ui_invocation_source_t::keyboard_f5,
+                        request.profile,
+                        analysis::decompiler_pipeline_cache_mode_t::read_write,
+                        cancellation->token());
+                    if (!result || !result.value().succeeded()) {
+                        const auto deadline =
+                            cancellation->token().deadline_exceeded();
+                        const auto cancelled =
+                            cancellation->token().cancellation_requested();
+                        if (deadline || cancelled) {
+                            payload.diagnostics.push_back(
+                                pseudocode_terminal_diagnostic(
+                                    deadline
+                                        ? analysis::decompiler_diagnostic_code_t::deadline_exceeded
+                                        : analysis::decompiler_diagnostic_code_t::cancelled,
+                                    deadline
+                                        ? "workbench.pseudocode.deadline_exceeded"
+                                        : "workbench.pseudocode.cancelled",
+                                    !deadline));
+                        } else if (result) {
+                            payload.diagnostics = pseudocode_diagnostics(result.value());
+                        } else {
+                            const auto error_code = result.error().code;
+                            const bool result_deadline = error_code ==
+                                analysis::workspace_error_code_t::deadline_exceeded;
+                            const bool result_cancelled = error_code ==
+                                analysis::workspace_error_code_t::cancelled;
+                            payload.diagnostics.push_back(
+                                pseudocode_terminal_diagnostic(
+                                    result_deadline
+                                        ? analysis::decompiler_diagnostic_code_t::deadline_exceeded
+                                        : result_cancelled
+                                            ? analysis::decompiler_diagnostic_code_t::cancelled
+                                            : analysis::decompiler_diagnostic_code_t::provider_failure,
+                                    result.error().stable_code(),
+                                    result_cancelled || result.error().code !=
+                                        analysis::workspace_error_code_t::integrity_failure));
+                        }
+                    } else if (!source->publication_current(publication) ||
+                               result.value().workspace_generation !=
+                                   request.binding->generation ||
+                               result.value().analysis_revision !=
+                                   request.binding->analysis_revision ||
+                               result.value().overlay_revision !=
+                                   request.binding->overlay_revision ||
+                               workspace->overlay_revision() !=
+                                   request.binding->overlay_revision ||
+                               result.value().document->entity != request.entity) {
+                        payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                            analysis::decompiler_diagnostic_code_t::cache_key_rejected,
+                            "workbench.pseudocode.stale_generation", true));
+                    } else {
+                        payload.document = *result.value().document;
+                        payload.succeeded = true;
+                    }
+                }
+            } catch (...) {
+                payload = {};
+                payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                    analysis::decompiler_diagnostic_code_t::provider_failure,
+                    "workbench.pseudocode.worker_exception", true));
+            }
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            const auto found = registry->jobs.find(job_id);
+            if (found == registry->jobs.end())
+                return;
+            if (found->second.payload)
+                return;
+            if (found->second.cancelled && payload.succeeded) {
+                payload = {};
+                payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                    analysis::decompiler_diagnostic_code_t::cancelled,
+                    "workbench.pseudocode.cancelled", true));
+            }
+            found->second.payload = std::move(payload);
+        };
+        const auto submitted = aida::infra::executor::submit(
+            std::move(submission));
+        if (!submitted.submitted) {
+            std::lock_guard<std::mutex> lock(jobs_->mutex);
+            jobs_->jobs.erase(job_id);
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               job_id);
+        }
+        {
+            std::lock_guard<std::mutex> lock(jobs_->mutex);
+            const auto found = jobs_->jobs.find(job_id);
+            if (found != jobs_->jobs.end())
+                found->second.task_id = submitted.task_id;
         }
         return {};
     }
 
     workbench_error_t cancel_decompilation(std::uint64_t job_id) override
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto found = jobs_.find(job_id);
-        if (found == jobs_.end())
-            return shell_error(workbench_error_code_t::adapter_rejected, job_id);
-        found->second.cancelled = true;
-        found->second.cancellation->request_cancel();
+        std::uint64_t task_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(jobs_->mutex);
+            const auto found = jobs_->jobs.find(job_id);
+            if (found == jobs_->jobs.end())
+                return shell_error(workbench_error_code_t::adapter_rejected, job_id);
+            found->second.cancelled = true;
+            found->second.cancellation->request_cancel();
+            task_id = found->second.task_id;
+        }
+        if (task_id != 0)
+            static_cast<void>(aida::infra::executor::cancel(task_id));
         return {};
     }
 
@@ -3234,13 +4011,13 @@ public:
                      analysis::decompiler_document_t& output) override
     {
         output = {};
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto found = jobs_.find(job_id);
-        if (found == jobs_.end() || !complete_locked(found->second) ||
+        std::lock_guard<std::mutex> lock(jobs_->mutex);
+        auto found = jobs_->jobs.find(job_id);
+        if (found == jobs_->jobs.end() || !found->second.payload ||
             !found->second.payload->succeeded)
             return false;
         output = std::move(found->second.payload->document);
-        jobs_.erase(found);
+        jobs_->jobs.erase(found);
         return true;
     }
 
@@ -3249,26 +4026,39 @@ public:
         std::vector<analysis::decompiler_diagnostic_t>& output) override
     {
         output.clear();
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto found = jobs_.find(job_id);
-        if (found == jobs_.end() || !complete_locked(found->second) ||
+        std::lock_guard<std::mutex> lock(jobs_->mutex);
+        auto found = jobs_->jobs.find(job_id);
+        if (found == jobs_->jobs.end() || !found->second.payload ||
             found->second.payload->succeeded)
             return false;
         output = std::move(found->second.payload->diagnostics);
-        jobs_.erase(found);
+        jobs_->jobs.erase(found);
         return true;
     }
 
     bool job_active(std::uint64_t job_id) const noexcept override
     {
         try {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const auto found = jobs_.find(job_id);
-            if (found == jobs_.end() || found->second.payload)
+            std::lock_guard<std::mutex> lock(jobs_->mutex);
+            auto found = jobs_->jobs.find(job_id);
+            if (found == jobs_->jobs.end() || found->second.payload)
                 return false;
-            return found->second.future.valid() &&
-                   found->second.future.wait_for(std::chrono::milliseconds(0)) !=
-                       std::future_status::ready;
+            if (found->second.cancellation &&
+                found->second.cancellation->token().stop_requested()) {
+                pseudocode_job_payload_t payload;
+                const bool deadline = found->second.cancellation->token().deadline_exceeded();
+                payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
+                    deadline
+                        ? analysis::decompiler_diagnostic_code_t::deadline_exceeded
+                        : analysis::decompiler_diagnostic_code_t::cancelled,
+                    deadline
+                        ? "workbench.pseudocode.deadline_exceeded"
+                        : "workbench.pseudocode.cancelled",
+                    !deadline));
+                found->second.payload = std::move(payload);
+                return false;
+            }
+            return true;
         } catch (...) {
             return false;
         }
@@ -3291,54 +4081,33 @@ public:
 private:
     struct job_state_t final {
         std::shared_ptr<analysis::cancellation_source_t> cancellation;
-        std::future<pseudocode_job_payload_t> future;
+        std::uint64_t task_id = 0;
         std::optional<pseudocode_job_payload_t> payload;
         bool cancelled = false;
     };
 
-    static bool complete_locked(job_state_t& job)
-    {
-        if (job.payload)
-            return true;
-        if (!job.future.valid() ||
-            job.future.wait_for(std::chrono::milliseconds(0)) !=
-                std::future_status::ready)
-            return false;
-        try {
-            job.payload = job.future.get();
-        } catch (...) {
-            pseudocode_job_payload_t payload;
-            payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
-                analysis::decompiler_diagnostic_code_t::provider_failure,
-                "workbench.pseudocode.worker_exception", true));
-            job.payload = std::move(payload);
-        }
-        if (job.cancelled && job.payload->succeeded) {
-            pseudocode_job_payload_t payload;
-            payload.diagnostics.push_back(pseudocode_terminal_diagnostic(
-                analysis::decompiler_diagnostic_code_t::cancelled,
-                "workbench.pseudocode.cancelled", true));
-            job.payload = std::move(payload);
-        }
-        return true;
-    }
+    struct job_registry_t final {
+        std::mutex mutex;
+        std::map<std::uint64_t, job_state_t> jobs;
+        bool shutting_down = false;
+    };
 
-    void reap_cancelled_locked()
+    static void reap_cancelled_locked(job_registry_t& registry)
     {
-        for (auto iterator = jobs_.begin(); iterator != jobs_.end();) {
-            if (!iterator->second.cancelled ||
-                !complete_locked(iterator->second)) {
+        for (auto iterator = registry.jobs.begin();
+             iterator != registry.jobs.end();) {
+            if (!iterator->second.cancelled || !iterator->second.payload) {
                 ++iterator;
                 continue;
             }
-            iterator = jobs_.erase(iterator);
+            iterator = registry.jobs.erase(iterator);
         }
     }
 
     analysis_document_lease_t lease_;
     analysis::decompiler_profile_policy_t policy_;
-    mutable std::mutex mutex_;
-    mutable std::map<std::uint64_t, job_state_t> jobs_;
+    std::shared_ptr<analysis::decompiler_ui_integration_t> decompiler_;
+    std::shared_ptr<job_registry_t> jobs_;
 };
 
 class production_pseudocode_navigation_t final
@@ -4040,6 +4809,30 @@ workbench_shell_integration_t::integrate_analysis_workspace(
     const auto rebuild_error = impl_->rebuild_documents(workspace_state, source);
     if (!rebuild_error)
         return rebuild_error;
+    if (impl_->state.config.integrate_navigator) {
+        const auto navigator_error = integrate_navigator(workspace, *source);
+        if (!navigator_error)
+            return navigator_error;
+    }
+    if (impl_->state.config.integrate_inspector) {
+        const auto publication = source->current_publication();
+        if (!publication)
+            return shell_error(workbench_error_code_t::adapter_rejected,
+                               workspace.value);
+        const auto context_revision = (std::max<std::uint64_t>)(
+            1U, publication->analysis_revision);
+        inspector::inspector_context_t context;
+        context.workspace = workspace;
+        context.workspace_generation = workspace_revision_t{context_revision};
+        context.document.workspace = workspace;
+        context.document.kind = document_kind_t::disassembly;
+        context.document.object_id = 1;
+        context.document.provider_key = "analysis";
+        context.selection_generation = context_revision;
+        const auto inspector_error = integrate_inspector(workspace, context);
+        if (!inspector_error)
+            return inspector_error;
+    }
     {
         std::lock_guard<std::mutex> lock(workspace_state->mutex);
         workspace_state->persistence_adapter = std::move(persistence);
@@ -4266,7 +5059,22 @@ workbench_shell_integration_t::dispatch_navigation(
     command.expected_revision = expected_revision;
     command.navigation = navigation;
     command.request_focus = navigation.request_focus;
-    return dispatch_command(command, {}, output);
+    const auto dispatched = dispatch_command(command, {}, output);
+    if (!dispatched || !output.snapshot ||
+        !impl_->state.config.integrate_inspector)
+        return dispatched;
+    inspector::inspector_context_t context;
+    context.workspace = workspace;
+    context.workspace_generation = output.snapshot->revision();
+    context.document = navigation.target.document;
+    context.selection = navigation.target.selection;
+    context.selection_generation = output.snapshot->revision().value;
+    const auto inspector_error = integrate_inspector(workspace, context);
+    if (!inspector_error) {
+        output.error = inspector_error;
+        return inspector_error;
+    }
+    return dispatched;
 }
 
 std::vector<workspace_id_t>
@@ -4552,6 +5360,26 @@ document_identity_t runtime_document_identity(
     return identity;
 }
 
+std::optional<document_identity_t> runtime_entity_document_identity(
+    workspace_id_t workspace,
+    document_kind_t kind,
+    std::string_view canonical_provider_key)
+{
+    if (kind != document_kind_t::pseudocode)
+        return std::nullopt;
+    const auto locator =
+        pseudocode_document::parse_pseudocode_entity_locator(
+            canonical_provider_key);
+    const auto canonical = locator
+        ? pseudocode_document::canonical_pseudocode_entity_locator(*locator)
+        : std::nullopt;
+    if (!canonical || *canonical != canonical_provider_key)
+        return std::nullopt;
+    auto identity = runtime_document_identity(workspace, kind, std::nullopt);
+    identity.provider_key = *canonical;
+    return identity;
+}
+
 }
 
 struct workbench_shell_runtime_t::impl_t {
@@ -4792,6 +5620,59 @@ workbench_error_t workbench_shell_runtime_t::activate_document(
     return {};
 }
 
+workbench_error_t workbench_shell_runtime_t::activate_entity_document(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_kind_t kind,
+    std::string_view canonical_provider_key,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    const auto identity = runtime_entity_document_identity(
+        binding->workspace, kind, canonical_provider_key);
+    if (!identity)
+        return shell_error(workbench_error_code_t::invalid_document,
+                           binding->workspace.value);
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto descriptor_error = publish_runtime_document(output, *identity);
+        if (!descriptor_error)
+            return descriptor_error;
+        if (const auto* active = active_document(output.persistence)) {
+            if (document_identity_equal(active->identity, *identity))
+                return {};
+        }
+        workbench_command_t command;
+        command.kind = workbench_command_kind_t::open_document;
+        command.workspace = binding->workspace;
+        command.expected_revision = output.persistence.revision;
+        command.document_identity = *identity;
+        command.request_focus = true;
+        workbench_command_result_t result;
+        const auto dispatched =
+            binding->shell->dispatch_command(command, {}, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current =
+            binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
 workbench_error_t workbench_shell_runtime_t::close_document(
     const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
     document_kind_t kind,
@@ -4815,6 +5696,59 @@ workbench_error_t workbench_shell_runtime_t::close_document(
             output.persistence.documents.end(),
             [&identity](const document_persistence_dto_t& document) {
                 return document_identity_equal(document.identity, identity);
+            });
+        if (found == output.persistence.documents.end())
+            return {};
+        workbench_command_t command;
+        command.kind = workbench_command_kind_t::close_document;
+        command.workspace = binding->workspace;
+        command.expected_revision = output.persistence.revision;
+        command.document = found->id;
+        workbench_command_result_t result;
+        const auto dispatched =
+            binding->shell->dispatch_command(command, {}, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current =
+            binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::close_entity_document(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_kind_t kind,
+    std::string_view canonical_provider_key,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    const auto identity = runtime_entity_document_identity(
+        binding->workspace, kind, canonical_provider_key);
+    if (!identity)
+        return shell_error(workbench_error_code_t::invalid_document,
+                           binding->workspace.value);
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto found = std::find_if(
+            output.persistence.documents.begin(),
+            output.persistence.documents.end(),
+            [&identity](const document_persistence_dto_t& document) {
+                return document_identity_equal(document.identity, *identity);
             });
         if (found == output.persistence.documents.end())
             return {};
@@ -4925,6 +5859,153 @@ workbench_error_t workbench_shell_runtime_t::navigate_document(
     if (changed_revision != 0)
         mark_runtime_dirty(binding, changed_revision);
     return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::navigate_entity_document(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_kind_t kind,
+    std::string_view canonical_provider_key,
+    const selection_context_t& selection,
+    const document_local_cursor_t& cursor,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    const auto target = runtime_entity_document_identity(
+        binding->workspace, kind, canonical_provider_key);
+    if (!target)
+        return shell_error(workbench_error_code_t::invalid_document,
+                           binding->workspace.value);
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto descriptor_error = publish_runtime_document(output, *target);
+        if (!descriptor_error)
+            return descriptor_error;
+        const auto focused_view = std::find_if(
+            output.persistence.views.begin(), output.persistence.views.end(),
+            [](const view_persistence_dto_t& view) { return view.focused; });
+        if (focused_view == output.persistence.views.end())
+            return shell_error(workbench_error_code_t::invalid_view,
+                               binding->workspace.value);
+        const auto source_document = std::find_if(
+            output.persistence.documents.begin(),
+            output.persistence.documents.end(),
+            [&focused_view](const document_persistence_dto_t& document) {
+                return document.id == focused_view->document;
+            });
+        if (source_document == output.persistence.documents.end())
+            return shell_error(workbench_error_code_t::invalid_document,
+                               focused_view->document.value);
+        document_navigation_bridge_request_t bridge_request;
+        auto event_id = binding->next_navigation_id.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (event_id == 0)
+            event_id = binding->next_navigation_id.fetch_add(
+                1, std::memory_order_acq_rel);
+        bridge_request.id = navigation_event_id_t{event_id};
+        bridge_request.sequence = event_id;
+        bridge_request.origin = navigation_origin_t::user;
+        bridge_request.source.workspace = binding->workspace;
+        bridge_request.source.document = source_document->id;
+        bridge_request.source.view = focused_view->id;
+        bridge_request.source.selection =
+            source_document->local_state.selection;
+        bridge_request.source.cursor = source_document->local_state.cursor;
+        bridge_request.source.synchronization_group =
+            focused_view->synchronization_group;
+        bridge_request.source.synchronization_policy =
+            focused_view->synchronization_policy;
+        bridge_request.target.document = *target;
+        bridge_request.target.selection = selection;
+        bridge_request.target.cursor = cursor;
+        bridge_request.request_focus = true;
+        navigation_event_t event;
+        const auto emitted = output.document_bridge->emit(
+            bridge_request, event);
+        if (!emitted)
+            return emitted;
+        workbench_command_result_t result;
+        const auto dispatched = binding->shell->dispatch_navigation(
+            binding->workspace, output.persistence.revision, event, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current =
+            binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::dispatch_host_command(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    document_host::document_host_dispatch_t dispatch,
+    workbench_command_result_t& result,
+    workbench_shell_workspace_context_t& output)
+{
+    result = {};
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        dispatch.workspace = binding->workspace;
+        dispatch.expected_revision = output.persistence.revision;
+        const auto dispatched = binding->shell->dispatch_host_command(
+            dispatch, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current =
+            binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
+std::vector<std::shared_ptr<analysis::analysis_workspace_t>>
+workbench_shell_runtime_t::analysis_workspaces() const
+{
+    if (!impl_)
+        return {};
+    std::vector<std::shared_ptr<analysis::analysis_workspace_t>> output;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    output.reserve(impl_->bindings.size());
+    for (const auto& [binary_id, binding] : impl_->bindings) {
+        static_cast<void>(binary_id);
+        if (!binding || !binding->analysis_workspace ||
+            binding->analysis_workspace->closing() ||
+            binding->analysis_workspace->closed())
+            continue;
+        output.push_back(binding->analysis_workspace);
+    }
+    std::sort(output.begin(), output.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs->identity().binary_id() < rhs->identity().binary_id();
+    });
+    return output;
 }
 
 workbench_error_t workbench_shell_runtime_t::close_analysis_workspace(

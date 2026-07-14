@@ -1,6 +1,7 @@
 #include "pseudocode_document.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <limits>
 #include <utility>
@@ -69,6 +70,29 @@ bool profile_valid(aida::analysis::decompiler_profile_id_t profile) noexcept
 {
     return profile >= aida::analysis::decompiler_profile_id_t::fast &&
            profile <= aida::analysis::decompiler_profile_id_t::thorough;
+}
+
+bool same_binding(
+    const std::optional<aida::analysis::generation_bound_decompiler_entity_t>& lhs,
+    const std::optional<aida::analysis::generation_bound_decompiler_entity_t>& rhs)
+    noexcept
+{
+    if (lhs.has_value() != rhs.has_value()) return false;
+    if (!lhs) return true;
+    return lhs->schema_version == rhs->schema_version &&
+           lhs->binary_id == rhs->binary_id &&
+           lhs->load_profile_hash == rhs->load_profile_hash &&
+           lhs->provider_hash == rhs->provider_hash &&
+           lhs->artifact_hash == rhs->artifact_hash &&
+           lhs->provider_size == rhs->provider_size &&
+           lhs->generation == rhs->generation &&
+           lhs->analysis_revision == rhs->analysis_revision &&
+           lhs->overlay_revision == rhs->overlay_revision &&
+           lhs->type_graph_revision == rhs->type_graph_revision &&
+           lhs->reader_schema_version == rhs->reader_schema_version &&
+           lhs->artifact_index == rhs->artifact_index &&
+           lhs->method_index == rhs->method_index &&
+           lhs->entity == rhs->entity;
 }
 
 std::string diagnostic_message(
@@ -246,9 +270,89 @@ bool pseudocode_selection_valid(const pseudocode_selection_t& selection) noexcep
 
 bool pseudocode_request_valid(const pseudocode_request_t& request)
 {
-    return request.timeout_ms != 0 && request.workspace_generation != 0 &&
-           profile_valid(request.profile) &&
-           aida::analysis::validate_decompiler_entity_key(request.entity).valid();
+    if (request.timeout_ms == 0 || request.workspace_generation == 0 ||
+        !profile_valid(request.profile) ||
+        !aida::analysis::validate_decompiler_entity_key(request.entity).valid())
+        return false;
+    if (!request.binding)
+        return true;
+    const auto& binding = *request.binding;
+    return binding.schema_version ==
+               aida::analysis::managed_entity_binding_schema_version &&
+           binding.generation == request.workspace_generation &&
+           binding.entity == request.entity &&
+           binding.analysis_revision != 0 && binding.provider_size != 0 &&
+           !binding.binary_id.empty() && !binding.provider_hash.empty() &&
+           !binding.artifact_hash.empty();
+}
+
+std::optional<aida::analysis::decompiler_entity_locator_t>
+parse_pseudocode_entity_locator(std::string_view value) noexcept
+{
+    const auto colon = value.find(':');
+    const auto at = value.find('@', colon == std::string_view::npos
+        ? 0 : colon + 1U);
+    if (colon == std::string_view::npos || at == std::string_view::npos ||
+        colon == 0 || at <= colon + 1U || at + 1U >= value.size() ||
+        value.find(':', colon + 1U) != std::string_view::npos ||
+        value.find('@', at + 1U) != std::string_view::npos)
+        return std::nullopt;
+    aida::analysis::decompiler_entity_kind_t kind;
+    const auto prefix = value.substr(0, colon);
+    if (prefix == "cli")
+        kind = aida::analysis::decompiler_entity_kind_t::cli_method;
+    else if (prefix == "jvm")
+        kind = aida::analysis::decompiler_entity_kind_t::jvm_method;
+    else if (prefix == "dalvik")
+        kind = aida::analysis::decompiler_entity_kind_t::dalvik_method;
+    else
+        return std::nullopt;
+    std::uint32_t token = 0;
+    std::uint32_t artifact = 0;
+    const auto token_text = value.substr(colon + 1U, at - colon - 1U);
+    const auto artifact_text = value.substr(at + 1U);
+    if ((token_text.size() > 1U && token_text.front() == '0') ||
+        (artifact_text.size() > 1U && artifact_text.front() == '0'))
+        return std::nullopt;
+    const auto token_result = std::from_chars(
+        token_text.data(), token_text.data() + token_text.size(), token, 10);
+    const auto artifact_result = std::from_chars(
+        artifact_text.data(), artifact_text.data() + artifact_text.size(),
+        artifact, 10);
+    if (token_result.ec != std::errc{} ||
+        token_result.ptr != token_text.data() + token_text.size() ||
+        artifact_result.ec != std::errc{} ||
+        artifact_result.ptr != artifact_text.data() + artifact_text.size())
+        return std::nullopt;
+    aida::analysis::decompiler_entity_locator_t locator;
+    locator.token = token;
+    locator.artifact_ordinal = artifact;
+    locator.expected_kind = kind;
+    return locator;
+}
+
+std::optional<std::string> canonical_pseudocode_entity_locator(
+    const aida::analysis::decompiler_entity_locator_t& locator)
+{
+    if (locator.address || !locator.token || !locator.artifact_ordinal ||
+        !locator.expected_kind)
+        return std::nullopt;
+    std::string prefix;
+    switch (*locator.expected_kind) {
+    case aida::analysis::decompiler_entity_kind_t::cli_method:
+        prefix = "cli";
+        break;
+    case aida::analysis::decompiler_entity_kind_t::jvm_method:
+        prefix = "jvm";
+        break;
+    case aida::analysis::decompiler_entity_kind_t::dalvik_method:
+        prefix = "dalvik";
+        break;
+    default:
+        return std::nullopt;
+    }
+    return prefix + ":" + std::to_string(*locator.token) + "@" +
+        std::to_string(*locator.artifact_ordinal);
 }
 
 pseudocode_error_t pseudocode_document_model_t::fail(
@@ -278,6 +382,14 @@ bool pseudocode_document_model_t::lease_current(
 {
     return generation == bound_generation_ &&
            source_->generation_current(bound_generation_);
+}
+
+bool pseudocode_document_model_t::entry_current(
+    const pseudocode_cached_document_t& entry) const noexcept
+{
+    return entry.workspace_generation == bound_generation_ &&
+           source_->generation_current(entry.workspace_generation) &&
+           source_->binding_current(entry.binding);
 }
 
 pseudocode_error_t pseudocode_document_model_t::validate_document(
@@ -331,8 +443,25 @@ pseudocode_error_t pseudocode_document_model_t::validate_document(
 pseudocode_cached_document_t* pseudocode_document_model_t::find_cached(
     const aida::analysis::decompiler_entity_key_t& entity)
 {
+    for (auto iterator = cache_.rbegin(); iterator != cache_.rend(); ++iterator) {
+        if (iterator->entity == entity && entry_current(*iterator))
+            return &(*iterator);
+    }
+    for (auto iterator = cache_.rbegin(); iterator != cache_.rend(); ++iterator) {
+        if (iterator->entity == entity)
+            return &(*iterator);
+    }
+    return nullptr;
+}
+
+pseudocode_cached_document_t* pseudocode_document_model_t::find_cached(
+    const pseudocode_request_t& request)
+{
     for (auto& entry : cache_) {
-        if (entry.entity == entity)
+        if (entry.entity == request.entity &&
+            entry.workspace_generation == request.workspace_generation &&
+            entry.profile_info.profile == request.profile &&
+            same_binding(entry.binding, request.binding))
             return &entry;
     }
     return nullptr;
@@ -341,8 +470,25 @@ pseudocode_cached_document_t* pseudocode_document_model_t::find_cached(
 const pseudocode_cached_document_t* pseudocode_document_model_t::find_cached(
     const aida::analysis::decompiler_entity_key_t& entity) const
 {
+    for (auto iterator = cache_.rbegin(); iterator != cache_.rend(); ++iterator) {
+        if (iterator->entity == entity && entry_current(*iterator))
+            return &(*iterator);
+    }
+    for (auto iterator = cache_.rbegin(); iterator != cache_.rend(); ++iterator) {
+        if (iterator->entity == entity)
+            return &(*iterator);
+    }
+    return nullptr;
+}
+
+const pseudocode_cached_document_t* pseudocode_document_model_t::find_cached(
+    const pseudocode_request_t& request) const
+{
     for (const auto& entry : cache_) {
-        if (entry.entity == entity)
+        if (entry.entity == request.entity &&
+            entry.workspace_generation == request.workspace_generation &&
+            entry.profile_info.profile == request.profile &&
+            same_binding(entry.binding, request.binding))
             return &entry;
     }
     return nullptr;
@@ -479,6 +625,27 @@ pseudocode_error_t pseudocode_document_model_t::resolve_request(
     return {};
 }
 
+pseudocode_error_t pseudocode_document_model_t::resolve_request(
+    const aida::analysis::decompiler_entity_locator_t& locator,
+    aida::analysis::decompiler_profile_id_t profile,
+    std::uint64_t timeout_ms,
+    pseudocode_request_t& output) const
+{
+    output = {};
+    if (timeout_ms == 0 || (locator.address.has_value() == locator.token.has_value()))
+        return fail(pseudocode_error_code_t::invalid_argument);
+    const auto resolved = source_->resolve_request(
+        locator, profile, timeout_ms, output);
+    if (!resolved)
+        return fail(pseudocode_error_code_t::adapter_rejected,
+                    static_cast<std::uint64_t>(resolved.code));
+    if (!pseudocode_request_valid(output)) {
+        output = {};
+        return fail(pseudocode_error_code_t::invalid_argument);
+    }
+    return {};
+}
+
 pseudocode_error_t pseudocode_document_model_t::request(
     const pseudocode_request_t& request)
 {
@@ -493,13 +660,25 @@ pseudocode_error_t pseudocode_document_model_t::request(
         return fail(pseudocode_error_code_t::invalid_argument);
     if (!lease_current(request.workspace_generation))
         return stale();
+    if (!source_->binding_current(request.binding))
+        return fail(pseudocode_error_code_t::stale_result,
+                    request.workspace_generation);
 
-    auto* existing = find_cached(request.entity);
+    for (auto& entry : cache_) {
+        if (entry.state != pseudocode_cache_state_t::requesting ||
+            entry_current(entry))
+            continue;
+        static_cast<void>(source_->cancel_decompilation(entry.job_id));
+        entry.state = pseudocode_cache_state_t::stale;
+        entry.document.reset();
+    }
+    auto* existing = find_cached(request);
     if (existing && existing->state == pseudocode_cache_state_t::requesting) {
         active_ = existing;
         line_views_.clear();
         selection_ = {};
-        if (!force_refresh && existing->workspace_generation == bound_generation_)
+        if (!force_refresh && entry_current(*existing) &&
+            same_binding(existing->binding, request.binding))
             return fail(pseudocode_error_code_t::request_in_progress, existing->job_id);
         const auto cancel_error = source_->cancel_decompilation(existing->job_id);
         if (!cancel_error)
@@ -509,8 +688,9 @@ pseudocode_error_t pseudocode_document_model_t::request(
     }
     if (!force_refresh && existing &&
         existing->state == pseudocode_cache_state_t::cached &&
-        existing->workspace_generation == bound_generation_ &&
-        existing->profile_info.profile == request.profile) {
+        entry_current(*existing) &&
+        existing->profile_info.profile == request.profile &&
+        same_binding(existing->binding, request.binding)) {
         active_ = existing;
         split_lines();
         rebuild_address_map();
@@ -535,7 +715,8 @@ pseudocode_error_t pseudocode_document_model_t::request(
     }
     const auto job_id = next_job_id_++;
     const auto adapter_error = source_->request_decompilation(request, job_id);
-    if (!source_->generation_current(bound_generation_)) {
+    if (!source_->generation_current(bound_generation_) ||
+        !source_->binding_current(request.binding)) {
         if (adapter_error) {
             const auto cancel_error = source_->cancel_decompilation(job_id);
             if (!cancel_error)
@@ -550,6 +731,7 @@ pseudocode_error_t pseudocode_document_model_t::request(
 
     pseudocode_cached_document_t entry;
     entry.entity = request.entity;
+    entry.binding = request.binding;
     entry.workspace_generation = bound_generation_;
     entry.state = pseudocode_cache_state_t::requesting;
     entry.job_id = job_id;
@@ -583,8 +765,32 @@ pseudocode_error_t pseudocode_document_model_t::activate(
     active_ = existing;
     if (changed)
         selection_ = {};
-    if (existing->workspace_generation != bound_generation_ ||
-        !source_->generation_current(existing->workspace_generation)) {
+    if (!entry_current(*existing)) {
+        line_views_.clear();
+        return stale();
+    }
+    if (existing->state == pseudocode_cache_state_t::cached) {
+        split_lines();
+        rebuild_address_map();
+    } else {
+        line_views_.clear();
+    }
+    return {};
+}
+
+pseudocode_error_t pseudocode_document_model_t::activate(
+    const pseudocode_request_t& request)
+{
+    if (!pseudocode_request_valid(request))
+        return fail(pseudocode_error_code_t::invalid_argument);
+    auto* existing = find_cached(request);
+    if (!existing)
+        return fail(pseudocode_error_code_t::cache_miss);
+    const bool changed = active_ != existing;
+    active_ = existing;
+    if (changed)
+        selection_ = {};
+    if (!entry_current(*existing)) {
         line_views_.clear();
         return stale();
     }
@@ -602,7 +808,6 @@ pseudocode_error_t pseudocode_document_model_t::cancel(std::uint64_t job_id)
     for (auto& entry : cache_) {
         if (entry.job_id != job_id)
             continue;
-        const bool entry_active = active_ == &entry;
         if (entry.state != pseudocode_cache_state_t::requesting)
             return fail(pseudocode_error_code_t::no_active_request, job_id);
         const auto adapter_error = source_->cancel_decompilation(job_id);
@@ -626,6 +831,7 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
             continue;
         if (entry.state != pseudocode_cache_state_t::requesting)
             return fail(pseudocode_error_code_t::no_active_request, job_id);
+        const bool entry_active = active_ == &entry;
         const auto reject_stale_result = [&]() {
             entry.state = pseudocode_cache_state_t::stale;
             entry.document.reset();
@@ -640,8 +846,7 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
             return fail(pseudocode_error_code_t::stale_result, job_id);
         };
         if (source_->job_active(job_id)) {
-            if (entry.workspace_generation != bound_generation_ ||
-                !source_->generation_current(entry.workspace_generation)) {
+            if (!entry_current(entry)) {
                 source_->cancel_decompilation(job_id);
                 return reject_stale_result();
             }
@@ -652,8 +857,7 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
         const auto has_result = source_->poll_result(job_id, document);
         std::vector<aida::analysis::decompiler_diagnostic_t> diagnostics;
         const auto has_failure = !has_result && source_->poll_failure(job_id, diagnostics);
-        if (entry.workspace_generation != bound_generation_ ||
-            !source_->generation_current(entry.workspace_generation)) {
+        if (!entry_current(entry)) {
             return reject_stale_result();
         }
 
@@ -680,7 +884,7 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
                 }
                 return error;
             }
-            if (!source_->generation_current(entry.workspace_generation)) {
+            if (!entry_current(entry)) {
                 return reject_stale_result();
             }
             entry.document = std::make_shared<aida::analysis::decompiler_document_t>(
@@ -692,7 +896,7 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
                 split_lines();
                 rebuild_address_map();
             }
-            if (!source_->generation_current(entry.workspace_generation))
+            if (!entry_current(entry))
                 return reject_stale_result();
             return {};
         }
@@ -715,7 +919,7 @@ pseudocode_error_t pseudocode_document_model_t::poll(std::uint64_t job_id)
                 "decompiler.worker.invalid_failure",
                 job_id));
         }
-        if (!source_->generation_current(entry.workspace_generation))
+        if (!entry_current(entry))
             return reject_stale_result();
         entry.failure_diagnostics = std::move(diagnostics);
         entry.document.reset();
@@ -744,13 +948,13 @@ pseudocode_error_t pseudocode_document_model_t::page(
         !active_->failure_diagnostics.empty() &&
         active_->failure_diagnostics.front().localization_key ==
             "decompiler.worker.stale_result";
-    if (!source_->generation_current(bound_generation_) && !retained_stale_result)
+    if (!entry_current(*active_) && !retained_stale_result)
         return stale();
 
     output.workspace_generation = active_->workspace_generation;
     output.cache_state = active_->state;
     if (active_->state == pseudocode_cache_state_t::requesting) {
-        if (!source_->generation_current(bound_generation_)) {
+        if (!entry_current(*active_)) {
             output = {};
             return stale();
         }
@@ -776,7 +980,7 @@ pseudocode_error_t pseudocode_document_model_t::page(
     output.first_line = request.first_line;
     if (request.first_line >= line_views_.size()) {
         output.diagnostics = diagnostics();
-        if (!source_->generation_current(bound_generation_)) {
+        if (!entry_current(*active_)) {
             output = {};
             return stale();
         }
@@ -824,7 +1028,7 @@ pseudocode_error_t pseudocode_document_model_t::page(
             output.source_maps.push_back(source_map_view(source_map, coordinate));
     }
     output.diagnostics = diagnostics();
-    if (!source_->generation_current(bound_generation_)) {
+    if (!entry_current(*active_)) {
         output = {};
         return stale();
     }
@@ -837,7 +1041,7 @@ pseudocode_error_t pseudocode_document_model_t::select(
     if (!pseudocode_selection_valid(selection))
         return fail(pseudocode_error_code_t::invalid_argument,
                     static_cast<std::uint64_t>(selection.kind));
-    if (!source_->generation_current(bound_generation_))
+    if (!lease_current(bound_generation_))
         return stale();
     if (selection.kind == selection_kind_t::none) {
         selection_ = {};
@@ -845,6 +1049,8 @@ pseudocode_error_t pseudocode_document_model_t::select(
     }
     if (!active_ || active_->state != pseudocode_cache_state_t::cached || !active_->document)
         return fail(pseudocode_error_code_t::cache_miss);
+    if (!entry_current(*active_))
+        return stale();
 
     pseudocode_selection_t canonical = selection;
     if (selection.kind == selection_kind_t::address) {
@@ -874,7 +1080,7 @@ pseudocode_error_t pseudocode_document_model_t::select(
         if (error && canonical.line_number == 0)
             canonical.line_number = mapping.line_number;
     }
-    if (!source_->generation_current(bound_generation_))
+    if (!entry_current(*active_))
         return stale();
     selection_ = canonical;
     return {};
@@ -890,15 +1096,17 @@ pseudocode_error_t pseudocode_document_model_t::resolve_address(
     pseudocode_address_map_entry_t& output) const
 {
     output = {};
-    if (!source_->generation_current(bound_generation_))
+    if (!lease_current(bound_generation_))
         return stale();
     if (!active_ || active_->state != pseudocode_cache_state_t::cached || !active_->document)
         return fail(pseudocode_error_code_t::cache_miss);
+    if (!entry_current(*active_))
+        return stale();
     if (navigation_) {
         pseudocode_address_map_entry_t candidate;
         const auto adapter_error = navigation_->resolve_address_to_token(
             address, *active_->document, candidate);
-        if (!source_->generation_current(bound_generation_))
+        if (!entry_current(*active_))
             return stale();
         if (adapter_error && candidate.extent != 0 && address >= candidate.address &&
             address - candidate.address < candidate.extent &&
@@ -920,7 +1128,7 @@ pseudocode_error_t pseudocode_document_model_t::resolve_address(
             (entry.address == best->address && entry.extent < best->extent))
             best = &entry;
     }
-    if (!source_->generation_current(bound_generation_))
+    if (!entry_current(*active_))
         return stale();
     if (!best)
         return fail(pseudocode_error_code_t::address_not_mapped, address);
@@ -933,17 +1141,19 @@ pseudocode_error_t pseudocode_document_model_t::resolve_token(
     pseudocode_address_map_entry_t& output) const
 {
     output = {};
-    if (!source_->generation_current(bound_generation_))
+    if (!lease_current(bound_generation_))
         return stale();
     if (!active_ || active_->state != pseudocode_cache_state_t::cached || !active_->document)
         return fail(pseudocode_error_code_t::cache_miss);
+    if (!entry_current(*active_))
+        return stale();
     if (token_begin >= active_->document->rendered_text.size())
         return fail(pseudocode_error_code_t::token_not_mapped, token_begin);
     if (navigation_) {
         pseudocode_address_map_entry_t candidate;
         const auto adapter_error = navigation_->resolve_token_to_address(
             token_begin, *active_->document, candidate);
-        if (!source_->generation_current(bound_generation_))
+        if (!entry_current(*active_))
             return stale();
         if (adapter_error && address_extent_valid(candidate.address, candidate.extent) &&
             token_range_valid(candidate.token_begin, candidate.token_end,
@@ -955,13 +1165,13 @@ pseudocode_error_t pseudocode_document_model_t::resolve_token(
     }
     for (const auto& entry : active_->address_map) {
         if (token_begin >= entry.token_begin && token_begin < entry.token_end) {
-            if (!source_->generation_current(bound_generation_))
+            if (!entry_current(*active_))
                 return stale();
             output = entry;
             return {};
         }
     }
-    if (!source_->generation_current(bound_generation_))
+    if (!entry_current(*active_))
         return stale();
     return fail(pseudocode_error_code_t::token_not_mapped, token_begin);
 }
@@ -969,15 +1179,14 @@ pseudocode_error_t pseudocode_document_model_t::resolve_token(
 void pseudocode_document_model_t::refresh() noexcept
 {
     const auto generation = source_->current_generation();
-    if (generation == bound_generation_)
-        return;
-    bound_generation_ = generation;
+    if (generation != bound_generation_)
+        bound_generation_ = generation;
     for (auto& entry : cache_) {
-        if (entry.workspace_generation != generation &&
+        if (!entry_current(entry) &&
             entry.state != pseudocode_cache_state_t::requesting)
             entry.state = pseudocode_cache_state_t::stale;
     }
-    if (active_ && active_->workspace_generation != generation) {
+    if (active_ && !entry_current(*active_)) {
         line_views_.clear();
         selection_ = {};
     }
@@ -1078,6 +1287,13 @@ pseudocode_document_model_t::cached_document(
     return find_cached(entity);
 }
 
+const pseudocode_cached_document_t*
+pseudocode_document_model_t::cached_document(
+    const pseudocode_request_t& request) const noexcept
+{
+    return find_cached(request);
+}
+
 std::uint64_t pseudocode_document_model_t::current_generation() const noexcept
 {
     return source_->current_generation();
@@ -1093,7 +1309,7 @@ bool pseudocode_document_model_t::is_stale() const noexcept
 {
     return !source_->generation_current(bound_generation_) ||
            (active_ && active_->state == pseudocode_cache_state_t::stale) ||
-           (active_ && active_->workspace_generation != bound_generation_);
+           (active_ && !entry_current(*active_));
 }
 
 bool pseudocode_document_model_t::has_pending_requests() const noexcept
@@ -1131,7 +1347,7 @@ pseudocode_document_model_t::diagnostics() const
         !active_->failure_diagnostics.empty() &&
         active_->failure_diagnostics.front().localization_key ==
             "decompiler.worker.stale_result";
-    if (!source_->generation_current(bound_generation_) && !retained_stale_result)
+    if (!entry_current(*active_) && !retained_stale_result)
         return result;
     const auto* source = &active_->failure_diagnostics;
     if (active_->state != pseudocode_cache_state_t::failed && active_->document)
@@ -1141,7 +1357,7 @@ pseudocode_document_model_t::diagnostics() const
     result.reserve(count);
     for (std::size_t index = 0; index < count; ++index)
         result.push_back(diagnostic_view((*source)[index]));
-    if (!source_->generation_current(bound_generation_) && !retained_stale_result)
+    if (!entry_current(*active_) && !retained_stale_result)
         result.clear();
     return result;
 }
@@ -1151,7 +1367,7 @@ pseudocode_document_model_t::source_maps() const
 {
     std::vector<pseudocode_source_map_view_t> result;
     if (!active_ || !active_->document ||
-        !source_->generation_current(bound_generation_) ||
+        !entry_current(*active_) ||
         active_->state != pseudocode_cache_state_t::cached)
         return result;
     result.reserve((std::min)(active_->document->source_maps.size(),
@@ -1160,13 +1376,13 @@ pseudocode_document_model_t::source_maps() const
         for (const auto& coordinate : source_map.coordinates) {
             result.push_back(source_map_view(source_map, coordinate));
             if (result.size() >= k_pseudocode_document_max_source_maps) {
-                if (!source_->generation_current(bound_generation_))
+                if (!entry_current(*active_))
                     result.clear();
                 return result;
             }
         }
     }
-    if (!source_->generation_current(bound_generation_))
+    if (!entry_current(*active_))
         result.clear();
     return result;
 }

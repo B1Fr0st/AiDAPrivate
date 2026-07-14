@@ -1,4 +1,5 @@
 #include "overlay_projection_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/overlay_projection.hpp"
 #include "../../src/core/analysis/incremental_reanalysis.hpp"
@@ -20,6 +21,7 @@ namespace {
 
 void require(bool condition, const char* message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -178,6 +180,13 @@ void verify_patch_comment_type_rename_fixtures()
     auto state = make_state();
     std::string image_bytes(0x4000, 0x41);
 
+    auto metadata = overlay_projection_t::prepare(state, 7);
+    require(metadata.ok() && metadata.projected_state.has_value(),
+            "metadata projection preparation must succeed");
+    require(metadata.projected_bytes.empty() &&
+            metadata.projected_size == image_bytes.size(),
+            "metadata projection preparation must not materialize image bytes");
+
     auto result = overlay_projection_t::project(state, image_bytes, 7);
     require(result.ok(), "project must succeed on valid state");
     require(result.new_generation == 7, "project generation must match current");
@@ -311,6 +320,14 @@ void verify_patch_comment_type_rename_fixtures()
         name_op(0x320, "projected_name"),
         type_app_op(0x330, "std::uint64_t"),
     };
+    auto prepared_txn = overlay_projection_t::prepare_transaction(
+        state, txn, 7);
+    require(prepared_txn.ok() && prepared_txn.publication_ready &&
+            prepared_txn.projected_state.has_value(),
+            "metadata transaction preparation must succeed");
+    require(prepared_txn.projected_bytes.empty() &&
+            prepared_txn.projected_size == image_bytes.size(),
+            "metadata transaction preparation must not materialize image bytes");
     auto txn_result = overlay_projection_t::project_transaction(state, txn, image_bytes, 7);
     require(txn_result.ok(), "non-conflicting project_transaction must succeed");
     require(txn_result.publication_ready && txn_result.projected_state.has_value(),
@@ -1240,7 +1257,7 @@ void verify_atomic_publication()
             "stale rejection must preserve the intervening state");
 
     auto overflow_state = make_state(
-        (std::numeric_limits<std::uint64_t>::max)());
+        (std::numeric_limits<std::uint64_t>::max)() - 1U);
     overlay_transaction_v9_t overflow_transaction;
     overflow_transaction.target = overflow_state.target;
     overflow_transaction.expected_revision = overflow_state.revision;
@@ -1281,6 +1298,7 @@ int main()
         std::cout << "overlay_projection_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& exception) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(exception.what());
         std::cerr << exception.what() << '\n';
         return 1;
     }

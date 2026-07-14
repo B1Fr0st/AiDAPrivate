@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -954,17 +955,96 @@ protocol::mcp_result_t routing_extensions_t::route_workspace_extension(
                            {"response_bytes", response.payload.size()}});
     }
 
+    protocol::json retained_backend_provenance = protocol::json::object();
+    std::size_t removed_provenance_nodes = 0;
+    std::size_t dropped_provenance_fields = 0;
+    std::size_t visited_nodes = 0;
+    std::function<bool(protocol::json&, std::size_t)> strip_nested_provenance;
+    strip_nested_provenance = [&](protocol::json& node, std::size_t depth) -> bool {
+        if (++visited_nodes > 131072U || depth > 64U)
+            return false;
+        if (node.is_object()) {
+            auto metadata = node.find("_meta");
+            if (metadata != node.end() && metadata->is_object()) {
+                auto aida = metadata->find("aida");
+                if (aida != metadata->end()) {
+                    if (removed_provenance_nodes == 0 && aida->is_object()) {
+                        for (auto field = aida->begin(); field != aida->end(); ++field) {
+                            const bool scalar = field->is_null() || field->is_boolean() ||
+                                field->is_number() ||
+                                (field->is_string() &&
+                                 field->get_ref<const std::string&>().size() <= 512U);
+                            if (retained_backend_provenance.size() < 32U &&
+                                field.key().size() <= 64U && scalar) {
+                                retained_backend_provenance[field.key()] = *field;
+                            } else {
+                                ++dropped_provenance_fields;
+                            }
+                        }
+                    }
+                    metadata->erase(aida);
+                    ++removed_provenance_nodes;
+                    if (metadata->empty())
+                        node.erase(metadata);
+                }
+            }
+            for (auto it = node.begin(); it != node.end(); ++it) {
+                if (!strip_nested_provenance(it.value(), depth + 1U))
+                    return false;
+            }
+        } else if (node.is_array()) {
+            for (auto& item : node) {
+                if (!strip_nested_provenance(item, depth + 1U))
+                    return false;
+            }
+        }
+        return true;
+    };
+    if (!strip_nested_provenance(structured, 0)) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Retained workspace extension output exceeds provenance normalization bounds.",
+            protocol::json{{"phase", "extension_provenance_normalization"},
+                           {"tool", std::string(name)},
+                           {"visited_nodes", visited_nodes}});
+    }
+
+    std::string normalized_payload;
+    try {
+        normalized_payload = structured.dump();
+    } catch (const std::exception&) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Retained workspace extension output cannot be normalized.",
+            protocol::json{{"phase", "extension_output_normalize"},
+                           {"tool", std::string(name)}});
+    }
+    if (normalized_payload.size() > limits_.max_response_bytes) {
+        return protocol::mcp_result_t::failure(
+            protocol::result_error_code_t::invalid_output,
+            "Retained workspace extension normalized output violates the output byte quota.",
+            exceeded_value(
+                "response_bytes",
+                static_cast<std::uint64_t>(limits_.max_response_bytes),
+                static_cast<std::uint64_t>(normalized_payload.size())));
+    }
+
     const std::size_t response_bytes = response.payload.size();
+    protocol::json result_metadata{
+        {"adapter_truncated", response.truncated},
+        {"adapter_response_bytes", response_bytes},
+        {"retained_extension", std::string(name)},
+        {"target_id", resolved.target().target_id},
+        {"target_generation", resolved.target().generation},
+        {"removed_nested_aida_provenance", removed_provenance_nodes},
+        {"dropped_backend_provenance_fields", dropped_provenance_fields},
+    };
+    if (!retained_backend_provenance.empty())
+        result_metadata["retained_backend_provenance"] = std::move(retained_backend_provenance);
     return protocol::mcp_result_t::success(
-        std::move(response.payload),
+        std::move(normalized_payload),
         std::move(structured),
-        protocol::json{
-            {"adapter_truncated", response.truncated},
-            {"adapter_response_bytes", response_bytes},
-            {"retained_extension", std::string(name)},
-            {"target_id", resolved.target().target_id},
-            {"target_generation", resolved.target().generation},
-        });
+        result_metadata);
 }
 
 protocol::mcp_result_t routing_extensions_t::handle_analyze_funcs(

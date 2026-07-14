@@ -1,4 +1,5 @@
 #include "search_query_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "analysis_memory_provider.hpp"
 #include "../../src/core/analysis/provider_snapshot.hpp"
@@ -8,6 +9,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <set>
@@ -77,13 +79,18 @@ private:
 };
 
 void require(bool condition, std::string_view message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(std::string(message));
 }
 
 template <typename T>
 T require_value(workspace_result_t<T> result, std::string_view message) {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ": " + result.error().stable_code());
     return result.take_value();
 }
@@ -91,7 +98,10 @@ T require_value(workspace_result_t<T> result, std::string_view message) {
 template <typename T>
 void require_error(workspace_result_t<T> result, workspace_error_code_t code,
     std::string_view message) {
-    if (result || result.error().code != code)
+	const bool accepted = !result && result.error().code == code;
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(
+		accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message));
 }
 
@@ -333,6 +343,93 @@ fixture_t make_fixture() {
             events->push_back(value);
         }), "fixture query index build failed");
     return fixture;
+}
+
+std::set<entity_id_t> entity_ids(const std::vector<search_hit_t>& hits);
+
+void verify_serialized_round_trip(fixture_t& fixture) {
+    const auto expected_size = require_value(fixture.search->serialized_size({}),
+        "serialized search size failed");
+    require(expected_size != 0 &&
+        expected_size <= static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)()),
+        "serialized search size is outside addressable memory");
+    std::vector<std::uint8_t> serialized;
+    serialized.reserve(static_cast<std::size_t>(expected_size));
+    auto serialized_result = fixture.search->serialize_to(
+        [&serialized](const std::uint8_t* data, std::size_t size) {
+            serialized.insert(serialized.end(), data, data + size);
+            return workspace_result_t<void>::success();
+        });
+    require(static_cast<bool>(serialized_result), "serialized search write failed");
+    require(serialized.size() == expected_size,
+        "serialized search size diverged from the streamed byte count");
+
+    auto restored = require_value(search_index_t::restore(
+        fixture.snapshot, data_candidates(), switches(), types(),
+        std::make_shared<analysis_metrics_t>(kGeneration), search_limits(),
+        serialized, {}), "serialized search restore failed");
+    require(restored->matches(fixture.snapshot) &&
+        restored->identity() == fixture.search->identity() &&
+        restored->record_count() == fixture.search->record_count() &&
+        restored->text_record_count() == fixture.search->text_record_count() &&
+        restored->data_candidates().size() == fixture.search->data_candidates().size() &&
+        restored->switches().size() == fixture.search->switches().size() &&
+        restored->types().size() == fixture.search->types().size(),
+        "restored search generation diverged from its immutable source index");
+
+    const auto original_page = require_value(
+        fixture.search->find_text("needle payload", 0, 16, {}),
+        "source packed-index comparison query failed");
+    const auto restored_page = require_value(
+        restored->find_text("needle payload", 0, 16, {}),
+        "restored packed-index comparison query failed");
+    require(original_page.total == restored_page.total &&
+        original_page.total_is_exact == restored_page.total_is_exact &&
+        original_page.truncated == restored_page.truncated &&
+        entity_ids(original_page.hits) == entity_ids(restored_page.hits),
+        "restored packed-index query results diverged");
+
+    auto restored_query = require_value(query_index_t::build(
+        restored, fixture.provider, fixture.limits),
+        "restored query-index construction failed");
+    const auto restored_query_page = require_value(restored_query->query(
+        search_query_t{literal_search_query_t{"Needle", true}}),
+        "restored production query failed");
+    require(restored_query_page.total == 5 &&
+        entity_ids(restored_query_page.hits) ==
+            std::set<entity_id_t>{102, 201, 202, 204, 401},
+        "restored production query results diverged");
+
+    cancellation_source_t cancelled;
+    cancelled.request_cancel();
+    require_error(fixture.search->serialized_size(cancelled.token()),
+        workspace_error_code_t::cancelled,
+        "cancelled serialized-size request succeeded");
+    require_error(fixture.search->serialize_to(
+        [](const std::uint8_t*, std::size_t) {
+            return workspace_result_t<void>::success();
+        }, cancelled.token()), workspace_error_code_t::cancelled,
+        "cancelled serialized write succeeded");
+    require_error(search_index_t::restore(
+        fixture.snapshot, data_candidates(), switches(), types(),
+        std::make_shared<analysis_metrics_t>(kGeneration), search_limits(),
+        serialized, cancelled.token()), workspace_error_code_t::cancelled,
+        "cancelled serialized restore succeeded");
+
+    auto corrupted = serialized;
+    corrupted.front() ^= 0x80U;
+    require_error(search_index_t::restore(
+        fixture.snapshot, data_candidates(), switches(), types(),
+        std::make_shared<analysis_metrics_t>(kGeneration), search_limits(),
+        corrupted, {}), workspace_error_code_t::integrity_failure,
+        "corrupted serialized search index restored");
+    auto truncated = serialized;
+    truncated.erase(truncated.begin() + 8);
+    require_error(search_index_t::restore(
+        fixture.snapshot, data_candidates(), switches(), types(),
+        std::make_shared<analysis_metrics_t>(kGeneration), search_limits(),
+        truncated, {}), workspace_error_code_t::integrity_failure,
+        "truncated serialized search index restored");
 }
 
 void verify_index_accounting(fixture_t& fixture) {
@@ -1028,6 +1125,7 @@ void verify_bounds(fixture_t& fixture) {
 bool run_search_query_harness(std::string& failure) {
     try {
         auto fixture = make_fixture();
+        verify_serialized_round_trip(fixture);
         verify_index_accounting(fixture);
         verify_literal_queries(fixture);
         verify_regex_queries(fixture);
@@ -1040,9 +1138,12 @@ bool run_search_query_harness(std::string& failure) {
         failure.clear();
         return true;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure = error.what();
         return false;
     } catch (...) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(
+			"search/query harness failed with a non-standard exception");
         failure = "search/query harness failed with a non-standard exception";
         return false;
     }

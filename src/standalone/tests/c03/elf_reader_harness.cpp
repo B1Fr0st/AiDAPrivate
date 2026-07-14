@@ -1,4 +1,5 @@
 #include "elf_reader_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/readers/elf_reader.hpp"
 #include "../../src/core/analysis/workspace/byte_provider.hpp"
@@ -52,13 +53,16 @@ constexpr std::size_t rich_symtab_offset = 0x4a0U;
 constexpr std::size_t rich_shstrtab_offset = 0x500U;
 
 void require(bool condition, const char* message) {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
 
 template <typename value_t>
 value_t require_value(workspace_result_t<value_t> result, const char* message) {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	assertion_telemetry::record_assertion(accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ":" + result.error().stable_code());
     return result.take_value();
 }
@@ -648,6 +652,7 @@ int main() {
         std::cout << "elf_reader_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

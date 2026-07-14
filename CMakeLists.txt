@@ -1464,6 +1464,7 @@ if(WIN32)
     if(BUILD_AIDA_STANDALONE)
         set(STANDALONE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/src/standalone/src")
         include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_dependencies.cmake")
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_package_integration.cmake")
         include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_c03_safe_headless_manifest.cmake")
 
         set(IMGUI_WRAPPER_DIR "${CMAKE_BINARY_DIR}/_imgui_wrapper/imgui")
@@ -2057,17 +2058,15 @@ if(WIN32)
             $<TARGET_OBJECTS:AiDAStandalone_asm>
             "${CMAKE_BINARY_DIR}/aida_embedded.rc"
         )
-        target_sources(AiDAStandalone PRIVATE
-            ${AIDA_C03_WAVE_B_STANDALONE_SOURCES}
-            ${AIDA_C03_WAVE_C_STANDALONE_SOURCES}
-            ${AIDA_C03_WAVE_D_SHARED_STANDALONE_SOURCES}
-        )
+        set(_aida_c03_production_sources ${AIDA_C03_PRODUCTION_STANDALONE_SOURCES})
+        list(REMOVE_ITEM _aida_c03_production_sources ${STANDALONE_SOURCES})
+        list(REMOVE_DUPLICATES _aida_c03_production_sources)
+        target_sources(AiDAStandalone PRIVATE ${_aida_c03_production_sources})
         if(NOT Z3_FOUND OR NOT Z3_INCLUDE_DIRS OR NOT Z3_LIBRARIES OR
            NOT IS_DIRECTORY "${Z3_INCLUDE_DIRS}" OR NOT EXISTS "${Z3_LIBRARIES}")
             message(FATAL_ERROR "AiDAStandalone requires the pinned local Z3 include and library dependencies")
         endif()
-        aida_c03_register_native_decompiler_worker_package(AiDAStandalone)
-        aida_c03_register_analysis_python_worker_package(AiDAStandalone)
+        aida_c03_register_worker_targets(AiDAStandalone)
 
         target_include_directories(AiDAStandalone PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -2155,84 +2154,13 @@ if(WIN32)
             /bigobj
         )
 
-        option(AIDA_BUILD_C03_SAFE_HEADLESS_HARNESSES "Build and register C03 safe-headless Wave B and Wave C harness targets" ON)
-        if(AIDA_BUILD_C03_SAFE_HEADLESS_HARNESSES)
-            enable_testing()
-            aida_c03_register_safe_headless_targets()
-        endif()
-
-        set(AIDA_WORKSPACE_HARNESS_SOURCES
-            workspace_core_harness
-            workspace_persistence_harness
-            workspace_multitarget_harness
-            workspace_mcp_harness
-            analysis_benchmark_harness
-        )
-        foreach(_aida_workspace_harness IN LISTS AIDA_WORKSPACE_HARNESS_SOURCES)
-            add_library(aida_${_aida_workspace_harness} OBJECT EXCLUDE_FROM_ALL
-                "${STANDALONE_ROOT}/../tests/analysis_workspace/${_aida_workspace_harness}.cpp")
-            target_include_directories(aida_${_aida_workspace_harness} PRIVATE
-                "${CMAKE_CURRENT_BINARY_DIR}/generated"
-                "${STANDALONE_ROOT}"
-                "${STANDALONE_ROOT}/core"
-                "${STANDALONE_ROOT}/core/analysis"
-                "${STANDALONE_ROOT}/core/analysis/workspace"
-                "${STANDALONE_ROOT}/core/disasm"
-                "${STANDALONE_ROOT}/core/infra"
-                "${STANDALONE_ROOT}/core/mcp"
-                "${STANDALONE_ROOT}/core/runtime"
-                "${STANDALONE_ROOT}/core/session"
-                "${STANDALONE_ROOT}/core/tools"
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs"
-                "${CMAKE_CURRENT_SOURCE_DIR}/libs/cpp-httplib"
-                "${CMAKE_CURRENT_SOURCE_DIR}/driver"
-                "${zydis_SOURCE_DIR}/include"
-                "${zycore_SOURCE_DIR}/include"
-                "${zydis_BINARY_DIR}"
-                "${zydis_BINARY_DIR}/zycore"
-                "${DEPS_DIR}/sqlite-amalgamation-3530300")
-            target_include_directories(aida_${_aida_workspace_harness} SYSTEM PRIVATE
-                "${DEPS_DIR}/taskflow")
-            target_compile_definitions(aida_${_aida_workspace_harness} PRIVATE
-                __NT__
-                _CRT_SECURE_NO_WARNINGS
-                CPPHTTPLIB_OPENSSL_SUPPORT
-                NOMINMAX
-                WIN32_LEAN_AND_MEAN
-                IMGUI_ENABLE_FREETYPE
-                IMGUI_ENABLE_STB_TRUETYPE
-                UNICODE
-                _UNICODE
-                SOL_ALL_SAFETIES_ON=1
-                GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
-                AIDA_DEEP_STEAL=1
-                AIDA_STANDALONE
-                ZYCORE_STATIC_BUILD
-                ZYDIS_STATIC_BUILD)
-            if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
-                target_compile_definitions(aida_${_aida_workspace_harness} PRIVATE
-                    AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
-            endif()
-            target_compile_options(aida_${_aida_workspace_harness} PRIVATE
-                /W3
-                /wd4005
-                /wd4099
-                /EHsc
-                /Zc:__cplusplus
-                /permissive-
-                /Zp8
-                /bigobj
-                /GS
-                /guard:cf
-                /guard:ehcont
-                /Qspectre
-                /sdl
-                /guard:xfg)
-            set_target_properties(aida_${_aida_workspace_harness} PROPERTIES
-                CXX_STANDARD 17
-                CXX_STANDARD_REQUIRED YES
-                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-        endforeach()
+        enable_testing()
+        aida_c03_register_safe_headless_targets(AiDAStandalone)
+        aida_c03_reject_forbidden_target_links(
+            aida_c03_safe_headless_runtime
+            aida_c03_b14_native_decompiler_worker
+            ${AIDA_C03_SAFE_HEADLESS_TARGETS}
+            ${AIDA_C03_SAFE_HEADLESS_DIRECT_TARGETS})
 
         aida_use_static_msvc_runtime(
             AiDAStandalone
@@ -2423,25 +2351,6 @@ if(WIN32)
             VERBATIM
         )
 
-        add_dependencies(AiDAStandalone ghidra_specs)
-        set(AIDA_GHIDRA_POST_BUILD_STAGE_COMMANDS
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs"
-                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs")
-        foreach(ghidra_staged_spec IN LISTS GHIDRA_STAGED_SPEC_OUTPUTS)
-            get_filename_component(ghidra_staged_name "${ghidra_staged_spec}" NAME)
-            list(APPEND AIDA_GHIDRA_POST_BUILD_STAGE_COMMANDS
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${ghidra_staged_spec}"
-                    "$<TARGET_FILE_DIR:AiDAStandalone>/ghidra_specs/${ghidra_staged_name}"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${ghidra_staged_spec}"
-                    "$<TARGET_FILE_DIR:AiDAStandalone>/deps/ghidra_specs/${ghidra_staged_name}")
-        endforeach()
-        add_custom_command(TARGET AiDAStandalone POST_BUILD
-            ${AIDA_GHIDRA_POST_BUILD_STAGE_COMMANDS}
-            VERBATIM
-        )
         if(TARGET encrypt_drivers)
             add_dependencies(AiDAStandalone encrypt_drivers)
         endif()
@@ -3358,53 +3267,27 @@ endif()
 
 # -- AiDA PE Protector (build tool) ----------------------------------
 option(BUILD_PROTECTOR "Build the AiDA PE Protector tool" ON)
-option(AIDA_PROTECTOR_LEGACY_STUB "Force legacy (pre-AsmJit) stub emitter for AiDAProtector" OFF)
-
 if(BUILD_PROTECTOR)
     set(_aida_asmjit_src "${CMAKE_SOURCE_DIR}/libs/asmjit")
-    if(NOT AIDA_PROTECTOR_LEGACY_STUB AND NOT EXISTS "${_aida_asmjit_src}/CMakeLists.txt")
-        find_package(Git QUIET)
-        if(GIT_FOUND)
-            message(STATUS "AiDAProtector: fetching AsmJit into ${_aida_asmjit_src}")
-            file(MAKE_DIRECTORY "${_aida_asmjit_src}")
-            execute_process(
-                COMMAND "${GIT_EXECUTABLE}" clone https://github.com/asmjit/asmjit.git "${_aida_asmjit_src}"
-                RESULT_VARIABLE _aida_asmjit_clone_res
-                OUTPUT_QUIET
-                ERROR_QUIET
-            )
-            if(_aida_asmjit_clone_res EQUAL 0)
-                execute_process(
-                    COMMAND "${GIT_EXECUTABLE}" -C "${_aida_asmjit_src}" checkout a465fe71ab3e5e91b8dea8a5c34b22dcfbe99a15
-                    RESULT_VARIABLE _aida_asmjit_co_res
-                    OUTPUT_QUIET
-                    ERROR_QUIET
-                )
-                if(NOT _aida_asmjit_co_res EQUAL 0)
-                    message(STATUS "AiDAProtector: pinned AsmJit commit checkout failed; using default HEAD")
-                endif()
-            else()
-                message(STATUS "AiDAProtector: AsmJit clone failed (network blocked?); LEGACY_STUB fallback will apply")
-                file(REMOVE_RECURSE "${_aida_asmjit_src}")
-            endif()
-        else()
-            message(STATUS "AiDAProtector: Git not found; cannot fetch AsmJit, LEGACY_STUB fallback will apply")
-        endif()
+    if(NOT EXISTS "${_aida_asmjit_src}/CMakeLists.txt")
+        message(FATAL_ERROR "AiDAProtector requires the pinned local AsmJit source tree at ${_aida_asmjit_src}")
     endif()
 
-    if(NOT AIDA_PROTECTOR_LEGACY_STUB AND EXISTS "${_aida_asmjit_src}/CMakeLists.txt")
-        set(ASMJIT_STATIC ON CACHE BOOL "Build asmjit as static library" FORCE)
-        set(ASMJIT_NO_INSTALL ON CACHE BOOL "Disable asmjit install rules" FORCE)
-        set(ASMJIT_NO_FOREIGN ON CACHE BOOL "Compile host backend only (drops AArch64 — AiDAProtector emits x86-64)" FORCE)
-        if(NOT TARGET asmjit)
-            add_subdirectory("${_aida_asmjit_src}" "${CMAKE_BINARY_DIR}/.deps/asmjit" EXCLUDE_FROM_ALL)
-        endif()
-        if(TARGET asmjit AND NOT TARGET asmjit::asmjit)
-            add_library(asmjit::asmjit ALIAS asmjit)
-        endif()
-        if(MSVC AND TARGET asmjit AND CMAKE_GENERATOR MATCHES "Ninja")
-            set_property(TARGET asmjit PROPERTY JOB_POOL_COMPILE aida_heavy_compile)
-        endif()
+    set(ASMJIT_STATIC ON CACHE BOOL "Build asmjit as static library" FORCE)
+    set(ASMJIT_NO_INSTALL ON CACHE BOOL "Disable asmjit install rules" FORCE)
+    set(ASMJIT_NO_FOREIGN ON CACHE BOOL "Compile only the x86-64 backend used by AiDAProtector" FORCE)
+    if(NOT TARGET asmjit)
+        add_subdirectory("${_aida_asmjit_src}" "${CMAKE_BINARY_DIR}/.deps/asmjit" EXCLUDE_FROM_ALL)
+    endif()
+    if(TARGET asmjit AND NOT TARGET asmjit::asmjit)
+        add_library(asmjit::asmjit ALIAS asmjit)
+    endif()
+    if(MSVC AND TARGET asmjit AND CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(TARGET asmjit PROPERTY JOB_POOL_COMPILE aida_heavy_compile)
+    endif()
+
+    if(NOT TARGET asmjit::asmjit)
+        message(FATAL_ERROR "AiDAProtector failed to register the pinned local AsmJit target")
     endif()
 
     add_executable(AiDAProtector
@@ -3427,13 +3310,8 @@ if(BUILD_PROTECTOR)
 
     target_link_libraries(AiDAProtector PRIVATE bcrypt advapi32)
 
-    if(TARGET asmjit AND NOT AIDA_PROTECTOR_LEGACY_STUB)
-        target_link_libraries(AiDAProtector PRIVATE asmjit)
-        target_include_directories(AiDAProtector PRIVATE "${_aida_asmjit_src}/src")
-    else()
-        target_compile_definitions(AiDAProtector PRIVATE AIDA_PROTECTOR_LEGACY_STUB=1)
-        message(STATUS "AiDAProtector: building with legacy stub emitter (AsmJit unavailable or disabled)")
-    endif()
+    target_link_libraries(AiDAProtector PRIVATE asmjit::asmjit)
+    target_include_directories(AiDAProtector PRIVATE "${_aida_asmjit_src}/src")
 
     set_target_properties(AiDAProtector PROPERTIES
         OUTPUT_NAME "aida_protector"

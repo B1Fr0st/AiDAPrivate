@@ -2,6 +2,7 @@
 
 #include "checked_range.hpp"
 #include "packed_page_codec.hpp"
+#include "../decompiler/managed_entity_binding.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -19,12 +20,13 @@
 #include <exception>
 #include <filesystem>
 #include <limits>
-#include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -44,6 +46,29 @@ constexpr std::uint32_t kPackedBaselineManifestMagic = 0x4d424941U;
 constexpr std::uint16_t kPackedBaselinePayloadVersion = 1;
 constexpr std::uint32_t kPackedBaselineRequiredDomains = 0x3ffffU;
 
+const std::array<std::uint32_t, 256>& managed_crc32c_table() noexcept {
+    static const auto table = [] {
+        std::array<std::uint32_t, 256> values{};
+        for (std::uint32_t index = 0; index < values.size(); ++index) {
+            std::uint32_t value = index;
+            for (unsigned bit = 0; bit < 8; ++bit)
+                value = (value >> 1U) ^
+                    ((value & 1U) ? 0x82F63B78U : 0U);
+            values[index] = value;
+        }
+        return values;
+    }();
+    return table;
+}
+
+std::uint32_t update_managed_crc32c(
+    std::uint32_t state, const std::uint8_t* data, std::size_t size) noexcept {
+    const auto& table = managed_crc32c_table();
+    for (std::size_t index = 0; index < size; ++index)
+        state = table[(state ^ data[index]) & 0xFFU] ^ (state >> 8U);
+    return state;
+}
+
 workspace_error_t packed_baseline_error(workspace_error_code_t code,
                                         std::string message) {
     return make_workspace_error(code, std::move(message),
@@ -62,8 +87,24 @@ workspace_error_t packed_baseline_cancelled(const cancellation_token_t& cancel) 
 
 class packed_payload_writer_t final {
 public:
+    using byte_sink_t = std::function<workspace_result_t<void>(
+        const std::uint8_t*, std::size_t)>;
+    using record_sink_t = std::function<workspace_result_t<void>(
+        const std::optional<address_t>&)>;
+
     explicit packed_payload_writer_t(const cancellation_token_t& cancel)
         : cancel_(cancel) {}
+
+    packed_payload_writer_t(const cancellation_token_t& cancel,
+                            std::uint64_t maximum_bytes)
+        : cancel_(cancel), maximum_bytes_(maximum_bytes) {}
+
+    packed_payload_writer_t(const cancellation_token_t& cancel,
+                            byte_sink_t byte_sink,
+                            record_sink_t record_sink,
+                            std::uint64_t maximum_bytes)
+        : cancel_(cancel), byte_sink_(std::move(byte_sink)),
+          record_sink_(std::move(record_sink)), maximum_bytes_(maximum_bytes) {}
 
     void u8(std::uint8_t value) { append(&value, sizeof(value)); }
 
@@ -102,6 +143,36 @@ public:
         append(data, size);
     }
 
+    workspace_result_t<void> append_external(
+        const std::uint8_t* data, std::size_t size) {
+        append(data, size);
+        if (error_)
+            return workspace_result_t<void>::failure(*error_);
+        return workspace_result_t<void>::success();
+    }
+
+    void begin_record(const std::optional<address_t>& address = std::nullopt) {
+        if (error_)
+            return;
+        poll();
+        if (error_)
+            return;
+        if (record_count_ == packed_generation_max_records) {
+            error_ = packed_baseline_error(
+                workspace_error_code_t::limit_exceeded,
+                "packed baseline record count exceeds its bounded limit");
+            return;
+        }
+        if (record_sink_) {
+            auto accepted = record_sink_(address);
+            if (!accepted) {
+                error_ = accepted.error();
+                return;
+            }
+        }
+        ++record_count_;
+    }
+
     template <std::size_t Size>
     void fixed_bytes(const std::array<std::uint8_t, Size>& bytes) {
         append(bytes.data(), bytes.size());
@@ -114,6 +185,9 @@ public:
     void count(std::size_t value) { u64(static_cast<std::uint64_t>(value)); }
 
     bool failed() const noexcept { return error_.has_value(); }
+    std::uint64_t size() const noexcept { return output_size_; }
+    std::uint64_t record_count() const noexcept { return record_count_; }
+    std::uint32_t checksum() const noexcept { return crc_state_ ^ 0xFFFFFFFFU; }
 
     workspace_result_t<std::vector<std::uint8_t>> finish() {
         if (!error_)
@@ -122,6 +196,14 @@ public:
             return workspace_result_t<std::vector<std::uint8_t>>::failure(*error_);
         return workspace_result_t<std::vector<std::uint8_t>>::success(
             std::move(output_));
+    }
+
+    workspace_result_t<void> finish_stream() {
+        if (!error_)
+            poll();
+        if (error_)
+            return workspace_result_t<void>::failure(*error_);
+        return workspace_result_t<void>::success();
     }
 
 private:
@@ -139,23 +221,41 @@ private:
                 "packed baseline encoder received a null byte range");
             return;
         }
-        if (size > packed_generation_max_payload_bytes - output_.size()) {
+        if (maximum_bytes_ > packed_generation_max_payload_bytes ||
+            output_size_ > maximum_bytes_ ||
+            size > maximum_bytes_ - output_size_) {
             error_ = packed_baseline_error(
                 workspace_error_code_t::limit_exceeded,
                 "packed baseline domain exceeds its bounded payload limit");
             return;
         }
+        crc_state_ = update_managed_crc32c(crc_state_, data, size);
         for (std::size_t offset = 0; offset < size;) {
             poll();
             if (error_)
                 return;
             const auto end = (std::min)(size, offset + kDatabaseBlobCopyChunk);
-            output_.insert(output_.end(), data + offset, data + end);
+            if (byte_sink_) {
+                auto accepted = byte_sink_(data + offset, end - offset);
+                if (!accepted) {
+                    error_ = accepted.error();
+                    return;
+                }
+            } else {
+                output_.insert(output_.end(), data + offset, data + end);
+            }
+            output_size_ += end - offset;
             offset = end;
         }
     }
 
     const cancellation_token_t& cancel_;
+    byte_sink_t byte_sink_;
+    record_sink_t record_sink_;
+    std::uint64_t maximum_bytes_ = packed_generation_max_payload_bytes;
+    std::uint64_t output_size_ = 0;
+    std::uint64_t record_count_ = 0;
+    std::uint32_t crc_state_ = 0xFFFFFFFFU;
     std::vector<std::uint8_t> output_;
     std::optional<workspace_error_t> error_;
 };
@@ -262,6 +362,23 @@ public:
         return std::string(reinterpret_cast<const char*>(value.data()), value.size());
     }
 
+    std::string bounded_string(std::uint64_t maximum_bytes) {
+        const auto size = u64();
+        if (failed())
+            return {};
+        if (size > maximum_bytes || size > remaining() ||
+            size > static_cast<std::uint64_t>(
+                       (std::numeric_limits<std::size_t>::max)())) {
+            fail("packed baseline string exceeds its bounded domain");
+            return {};
+        }
+        const auto* data = take(static_cast<std::size_t>(size));
+        return data
+            ? std::string(reinterpret_cast<const char*>(data),
+                          static_cast<std::size_t>(size))
+            : std::string{};
+    }
+
     std::size_t count() {
         const auto value = u64();
         if (failed())
@@ -277,6 +394,34 @@ public:
         if (aggregate_records_)
             *aggregate_records_ += value;
         return static_cast<std::size_t>(value);
+    }
+
+    std::uint64_t remaining_bytes() const noexcept {
+        return remaining();
+    }
+
+    std::size_t offset() const noexcept {
+        return offset_;
+    }
+
+    void skip_bytes(std::uint64_t size) {
+        if (failed())
+            return;
+        if (size > remaining() ||
+            size > static_cast<std::uint64_t>(
+                (std::numeric_limits<std::size_t>::max)())) {
+            fail("packed baseline byte range exceeds its domain boundary");
+            return;
+        }
+        std::uint64_t skipped = 0;
+        while (skipped < size) {
+            const auto count = static_cast<std::size_t>((std::min)(
+                size - skipped,
+                static_cast<std::uint64_t>(kDatabaseBlobCopyChunk)));
+            if (!take(count))
+                return;
+            skipped += count;
+        }
     }
 
     bool failed() const noexcept { return error_.has_value(); }
@@ -2190,6 +2335,34 @@ bool image_matches_identity(const workspace_image_t& image,
                                  *identity.normalized_member_path());
 }
 
+bool image_matches_persistence_identity(
+    const workspace_image_t& image,
+    const workspace_identity_t& identity,
+    std::uint64_t generation,
+    std::uint64_t overlay_revision) {
+    if (image_matches_identity(image, identity))
+        return true;
+    const auto validation = validate_workspace_image(image, {}, true);
+    if (!validation || identity.target_kind() != target_kind_t::static_file ||
+        generation <= 1 || overlay_revision == 0 ||
+        image.format != identity.format() ||
+        image.architecture != identity.architecture() ||
+        image.architecture_mode != identity.architecture_mode() ||
+        image.abi != identity.abi() || image.endian != identity.endian() ||
+        image.image_base != identity.image_base() ||
+        image.workspace_binary_id != identity.binary_id() ||
+        image.provider_content_hash.empty() || image.provider_size == 0 ||
+        (identity.normalized_member_path().has_value() != image.member.has_value()) ||
+        (image.member && image.member->normalized_member_path !=
+                             *identity.normalized_member_path()))
+        return false;
+    const std::string expected_source =
+        "overlay://" + identity.binary_id().to_hex() +
+        "/generation/" + std::to_string(generation) +
+        "/revision/" + std::to_string(overlay_revision);
+    return image.provider_source == expected_source;
+}
+
 struct commit_state_record_t {
     std::uint8_t active_slot = 0;
     std::string committed_token;
@@ -2633,9 +2806,30 @@ workspace_result_t<void> persist_extended_snapshot_rows(
         }, cancel, "workspace_database.persist.metadata_conflicts");
 }
 
+workspace_result_t<void> persist_complete_snapshot_impl(
+    sqlite3* database, const analysis_snapshot_t& snapshot,
+    const persisted_search_products_t& search_products,
+    const std::shared_ptr<const managed_artifact_publication_t>& managed_publication,
+    const workspace_database_options_t& options,
+    const std::string& settings_json, const std::string& metrics_json,
+    const std::string& candidate_token,
+    const cancellation_token_t& cancel,
+    persistence_commit_metrics_t* commit_metrics);
+
+workspace_result_t<void> stage_managed_publication_domain(
+    sqlite3* database,
+    const analysis_snapshot_t& snapshot,
+    const managed_artifact_publication_t& managed_publication,
+    const workspace_database_options_t& options,
+    const std::string& candidate_token,
+    std::uint64_t prior_records,
+    const cancellation_token_t& cancel,
+    persistence_commit_metrics_t* commit_metrics);
+
 workspace_result_t<void> persist_snapshot_impl(
     sqlite3* database, const analysis_snapshot_t& snapshot,
     const persisted_search_products_t* search_products,
+    const std::shared_ptr<const managed_artifact_publication_t>& managed_publication,
     const workspace_database_options_t& options,
     const std::string& settings_json, const std::string& metrics_json,
     const std::string& candidate_token,
@@ -2665,6 +2859,45 @@ workspace_result_t<void> persist_snapshot_impl(
             make_workspace_error(workspace_error_code_t::stale_generation,
                                  "search products do not match snapshot generation and revisions",
                                  "workspace_database.persist"));
+    }
+    if (managed_publication &&
+        (managed_publication->generation != snapshot.generation ||
+         managed_publication->analysis_revision != snapshot.analysis_revision ||
+         managed_publication->overlay_revision != snapshot.overlay_revision ||
+         managed_publication->binary_id != snapshot.binary_id ||
+         managed_publication->load_profile_hash != snapshot.load_profile_hash ||
+         !snapshot.normalized_image ||
+         managed_publication->provider_hash !=
+             snapshot.normalized_image->provider_content_hash ||
+         managed_publication->provider_source !=
+             snapshot.normalized_image->provider_source ||
+         managed_publication->provider_size !=
+             snapshot.normalized_image->provider_size)) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::stale_generation,
+                                 "managed publication does not match snapshot generation and identity",
+                                 "workspace_database.persist"));
+    }
+    const std::vector<data_candidate_record_t>* persisted_data_candidates = nullptr;
+    const std::vector<switch_record_t>* persisted_switches = nullptr;
+    const std::vector<type_candidate_record_t>* persisted_types = nullptr;
+    if (search_products) {
+        if (search_products->live_index) {
+            persisted_data_candidates =
+                &search_products->live_index->data_candidates();
+            persisted_switches = &search_products->live_index->switches();
+            persisted_types = &search_products->live_index->types();
+        } else {
+            persisted_data_candidates = &search_products->data_candidates;
+            persisted_switches = &search_products->switches;
+            persisted_types = &search_products->types;
+        }
+    }
+    if (search_products && snapshot.baseline_complete) {
+        return persist_complete_snapshot_impl(
+            database, snapshot, *search_products, managed_publication, options,
+            settings_json, metrics_json, candidate_token, cancel,
+            commit_metrics);
     }
     constexpr std::size_t json_limit = 16U << 20;
     if (settings_json.size() > json_limit || metrics_json.size() > json_limit ||
@@ -2712,15 +2945,15 @@ workspace_result_t<void> persist_snapshot_impl(
     }
     if (search_products) {
         if (search_products->search_index_blob.size() > workspace_search_blob_limit ||
-            !add_records(search_products->data_candidates.size()) ||
-            !add_records(search_products->switches.size()) ||
-            !add_records(search_products->types.size())) {
+            !add_records(persisted_data_candidates->size()) ||
+            !add_records(persisted_switches->size()) ||
+            !add_records(persisted_types->size())) {
             return workspace_result_t<void>::failure(make_workspace_error(
                 workspace_error_code_t::limit_exceeded,
                 "search products exceed the persistence budget",
                 "workspace_database.persist"));
         }
-        for (const auto& item : search_products->switches) {
+        for (const auto& item : *persisted_switches) {
             if (!add_records(item.case_targets.size())) {
                 return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::limit_exceeded,
@@ -2874,17 +3107,17 @@ workspace_result_t<void> persist_snapshot_impl(
             return accounted;
     }
     if (search_products) {
-        if (!add_vector_storage(search_products->data_candidates.size(),
+        if (!add_vector_storage(persisted_data_candidates->size(),
                                 sizeof(data_candidate_record_t)) ||
-            !add_vector_storage(search_products->switches.size(), sizeof(switch_record_t)) ||
-            !add_vector_storage(search_products->types.size(), sizeof(type_candidate_record_t)) ||
+            !add_vector_storage(persisted_switches->size(), sizeof(switch_record_t)) ||
+            !add_vector_storage(persisted_types->size(), sizeof(type_candidate_record_t)) ||
             !add_logical_bytes(search_products->search_index_blob.size())) {
             return workspace_result_t<void>::failure(make_workspace_error(
                 workspace_error_code_t::range_overflow,
                 "search-product logical payload size overflows",
                 "workspace_database.persist"));
         }
-        for (const auto& record : search_products->switches) {
+        for (const auto& record : *persisted_switches) {
             if (!add_vector_storage(record.case_targets.size(), sizeof(address_t))) {
                 return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::range_overflow,
@@ -2892,7 +3125,7 @@ workspace_result_t<void> persist_snapshot_impl(
                     "workspace_database.persist"));
             }
         }
-        for (const auto& record : search_products->types) {
+        for (const auto& record : *persisted_types) {
             if (!add_logical_bytes(record.display_name.size()) ||
                 !add_logical_bytes(record.canonical_type.size())) {
                 return workspace_result_t<void>::failure(make_workspace_error(
@@ -2939,13 +3172,18 @@ workspace_result_t<void> persist_snapshot_impl(
         rollback(database, "workspace_database.persist");
         return workspace_result_t<void>::failure(commit_state.error());
     }
-    if (commit_state.value().committed_generation > snapshot.generation ||
+    if (commit_state.value().candidate_ready ||
+        commit_state.value().committed_generation > snapshot.generation ||
         (commit_state.value().committed_generation == snapshot.generation &&
          commit_state.value().committed_analysis_revision > snapshot.analysis_revision)) {
         rollback(database, "workspace_database.persist");
         return workspace_result_t<void>::failure(make_workspace_error(
-            workspace_error_code_t::stale_generation,
-            "snapshot is older than the committed analysis state",
+            commit_state.value().candidate_ready
+                ? workspace_error_code_t::revision_conflict
+                : workspace_error_code_t::stale_generation,
+            commit_state.value().candidate_ready
+                ? "another snapshot candidate is already pending"
+                : "snapshot is older than the committed analysis state",
             "workspace_database.persist"));
     }
     const std::uint8_t target_slot =
@@ -3082,8 +3320,8 @@ workspace_result_t<void> persist_snapshot_impl(
     if (search_products) {
         result = insert_many(database,
             "INSERT INTO " + slot_table(target_slot, "data_candidates") + "(entity_id,address_space,address_value,address_arch,address_mode,size,kind,target_space,target_value,target_arch,target_mode,provenance,confidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            search_products->data_candidates.size(), [search_products](statement_t& statement, std::size_t index) {
-                const auto& record = search_products->data_candidates[index];
+            persisted_data_candidates->size(), [persisted_data_candidates](statement_t& statement, std::size_t index) {
+                const auto& record = (*persisted_data_candidates)[index];
                 auto current = statement.bind_uint(1, record.id); if (!current) return current;
                 current = bind_address(statement, 2, record.address); if (!current) return current;
                 current = statement.bind_uint(6, record.size); if (!current) return current;
@@ -3103,8 +3341,8 @@ workspace_result_t<void> persist_snapshot_impl(
 
         result = insert_many(database,
             "INSERT INTO " + slot_table(target_slot, "switches") + "(entity_id,function_id,dispatch_space,dispatch_value,dispatch_arch,dispatch_mode,table_space,table_value,table_arch,table_mode,default_space,default_value,default_arch,default_mode,entry_size,relative_entries,provenance,confidence) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-            search_products->switches.size(), [search_products](statement_t& statement, std::size_t index) {
-                const auto& record = search_products->switches[index];
+            persisted_switches->size(), [persisted_switches](statement_t& statement, std::size_t index) {
+                const auto& record = (*persisted_switches)[index];
                 auto current = statement.bind_uint(1, record.id); if (!current) return current;
                 current = statement.bind_uint(2, record.function_id); if (!current) return current;
                 current = bind_address(statement, 3, record.dispatch); if (!current) return current;
@@ -3125,7 +3363,7 @@ workspace_result_t<void> persist_snapshot_impl(
         if (!result) { rollback(database, "workspace_database.persist"); return result; }
 
         std::size_t switch_case_count = 0;
-        for (const auto& record : search_products->switches) {
+        for (const auto& record : *persisted_switches) {
             if (record.case_targets.size() > (std::numeric_limits<std::size_t>::max)() - switch_case_count) {
                 rollback(database, "workspace_database.persist");
                 return workspace_result_t<void>::failure(make_workspace_error(
@@ -3142,7 +3380,7 @@ workspace_result_t<void> persist_snapshot_impl(
             "workspace_database.persist.switch_cases");
         if (!result) { rollback(database, "workspace_database.persist"); return result; }
         std::size_t inserted_cases = 0;
-        for (const auto& record : search_products->switches) {
+        for (const auto& record : *persisted_switches) {
             for (std::size_t index = 0; index < record.case_targets.size(); ++index) {
                 if ((inserted_cases++ & 255U) == 0 && cancel.stop_requested()) {
                     rollback(database, "workspace_database.persist");
@@ -3167,8 +3405,8 @@ workspace_result_t<void> persist_snapshot_impl(
 
         result = insert_many(database,
             "INSERT INTO " + slot_table(target_slot, "type_candidates") + "(entity_id,address_space,address_value,address_arch,address_mode,kind,display_name,canonical_type,provenance,confidence,explicitly_unknown) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            search_products->types.size(), [search_products](statement_t& statement, std::size_t index) {
-                const auto& record = search_products->types[index];
+            persisted_types->size(), [persisted_types](statement_t& statement, std::size_t index) {
+                const auto& record = (*persisted_types)[index];
                 auto current = statement.bind_uint(1, record.id); if (!current) return current;
                 current = bind_address(statement, 2, record.address); if (!current) return current;
                 current = statement.bind_int(6, static_cast<std::int64_t>(record.kind)); if (!current) return current;
@@ -3378,7 +3616,7 @@ workspace_result_t<void> persist_snapshot_impl(
 
     statement_t candidate_statement;
     result = candidate_statement.prepare(database,
-        "UPDATE workspace_commit_state SET candidate_slot=?1,candidate_token=?2,candidate_generation=?3,candidate_analysis_revision=?4,candidate_overlay_revision=?5,candidate_ready=1,updated_utc_ms=?6 WHERE singleton=1 AND active_slot=?7",
+        "UPDATE workspace_commit_state SET candidate_slot=?1,candidate_token=?2,candidate_generation=?3,candidate_analysis_revision=?4,candidate_overlay_revision=?5,candidate_ready=1,updated_utc_ms=?6 WHERE singleton=1 AND active_slot=?7 AND candidate_ready=0",
         "workspace_database.persist.candidate");
     if (!result) { rollback(database, "workspace_database.persist"); return result; }
     result = candidate_statement.bind_uint(1, target_slot); if (!result) { rollback(database, "workspace_database.persist"); return result; }
@@ -3439,6 +3677,13 @@ workspace_result_t<void> persist_snapshot_impl(
         commit_metrics->elapsed_us = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - commit_started).count());
+    }
+    if (managed_publication) {
+        auto staged = stage_managed_publication_domain(
+            database, snapshot, *managed_publication, options,
+            candidate_token, fact_records, cancel, commit_metrics);
+        if (!staged)
+            return staged;
     }
     return workspace_result_t<void>::success();
 }
@@ -3532,286 +3777,1537 @@ struct workspace_database_t::connection_state_t {
     }
 };
 
-workspace_result_t<packed_baseline_domains_t> encode_packed_baseline_domains(
+namespace {
+
+struct managed_domain_strings_t final {
+    std::vector<std::string> values;
+    std::unordered_map<std::string, std::uint32_t> references;
+    std::vector<std::string> entities;
+};
+
+workspace_result_t<managed_domain_strings_t> collect_managed_domain_strings(
+    const managed_artifact_publication_t& publication,
+    const cancellation_token_t& cancel) {
+    managed_domain_strings_t result;
+    if (!publication.records || publication.artifacts().empty() ||
+        publication.artifacts().size() > managed_publication_max_artifacts ||
+        publication.methods().size() > managed_publication_max_methods) {
+        return workspace_result_t<managed_domain_strings_t>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed publication record count exceeds its bounded domain"));
+    }
+    try {
+        std::set<std::string> ordered_values;
+        result.entities.reserve(publication.methods().size());
+        ordered_values.insert(publication.provider_source);
+        std::uint64_t string_bytes = publication.provider_source.size();
+        for (std::size_t index = 0; index < publication.artifacts().size(); ++index) {
+            if ((index & 255U) == 0 && cancel.stop_requested())
+                return workspace_result_t<managed_domain_strings_t>::failure(
+                    packed_baseline_cancelled(cancel));
+            const auto& artifact = publication.artifacts()[index];
+            const std::array<const std::string*, 3> strings{
+                &artifact.assembly_identity, &artifact.module_name,
+                &artifact.version};
+            for (const auto* value : strings) {
+                if (value->size() > managed_publication_max_single_string_bytes ||
+                    !checked_add_u64(string_bytes, value->size(), string_bytes) ||
+                    string_bytes > managed_publication_max_string_bytes) {
+                    return workspace_result_t<managed_domain_strings_t>::failure(
+                        packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                              "managed publication strings exceed their bounded domain"));
+                }
+                ordered_values.insert(*value);
+            }
+        }
+        std::unordered_set<std::string> entity_identities;
+        entity_identities.reserve(publication.methods().size());
+        for (std::size_t index = 0; index < publication.methods().size(); ++index) {
+            if ((index & 255U) == 0 && cancel.stop_requested())
+                return workspace_result_t<managed_domain_strings_t>::failure(
+                    packed_baseline_cancelled(cancel));
+            const auto& method = publication.methods()[index];
+            if (!validate_decompiler_entity_key(method.entity).valid()) {
+                return workspace_result_t<managed_domain_strings_t>::failure(
+                    packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                          "managed publication contains an invalid entity key"));
+            }
+            auto encoded = serialize_decompiler_entity_key(method.entity);
+            if (encoded.empty() ||
+                encoded.size() > managed_publication_max_single_string_bytes ||
+                !entity_identities.insert(encoded).second ||
+                !checked_add_u64(string_bytes, encoded.size(), string_bytes) ||
+                string_bytes > managed_publication_max_string_bytes) {
+                return workspace_result_t<managed_domain_strings_t>::failure(
+                    packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                          "managed publication entity identities are noncanonical"));
+            }
+            ordered_values.insert(encoded);
+            result.entities.push_back(std::move(encoded));
+        }
+        if (ordered_values.empty() ||
+            ordered_values.size() > managed_publication_max_strings) {
+            return workspace_result_t<managed_domain_strings_t>::failure(
+                packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                      "managed publication string table exceeds its bounded domain"));
+        }
+        result.values.reserve(ordered_values.size());
+        result.references.reserve(ordered_values.size());
+        std::uint32_t index = 0;
+        for (const auto& value : ordered_values) {
+            if ((index & 255U) == 0 && cancel.stop_requested())
+                return workspace_result_t<managed_domain_strings_t>::failure(
+                    packed_baseline_cancelled(cancel));
+            result.references.emplace(value, index++);
+            result.values.push_back(value);
+        }
+        return workspace_result_t<managed_domain_strings_t>::success(
+            std::move(result));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<managed_domain_strings_t>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed publication string-table allocation failed"));
+    } catch (const std::exception&) {
+        return workspace_result_t<managed_domain_strings_t>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                  "managed publication entity serialization failed"));
+    }
+}
+
+void write_managed_reader_limits(
+    packed_payload_writer_t& writer,
+    const readers::managed::managed_reader_limits_t& limits) {
+    writer.u64(limits.max_metadata_bytes);
+    writer.u32(limits.max_types);
+    writer.u32(limits.max_methods);
+    writer.u32(limits.max_fields);
+    writer.u32(limits.max_member_references);
+    writer.u32(limits.max_annotations);
+    writer.u32(limits.max_resources);
+    writer.u32(limits.max_exception_regions);
+    writer.u32(limits.max_code_ranges);
+    writer.u64(limits.max_code_bytes);
+    writer.u64(limits.max_string_bytes);
+    writer.u32(limits.max_dex_files);
+    writer.u32(limits.max_constant_pool_entries);
+    writer.u32(limits.max_table_rows);
+    writer.u32(limits.max_generic_params);
+}
+
+bool managed_reader_limits_bounded(
+    const readers::managed::managed_reader_limits_t& limits) noexcept {
+    return limits.valid() &&
+        limits.max_metadata_bytes <= managed_publication_max_payload_bytes &&
+        limits.max_types <= managed_publication_max_methods &&
+        limits.max_methods <= managed_publication_max_methods &&
+        limits.max_fields <= managed_publication_max_methods &&
+        limits.max_member_references <= managed_publication_max_methods &&
+        limits.max_annotations <= managed_publication_max_methods &&
+        limits.max_resources <= managed_publication_max_methods &&
+        limits.max_exception_regions <= managed_publication_max_methods &&
+        limits.max_code_ranges <= managed_publication_max_methods &&
+        limits.max_code_bytes <= managed_publication_max_payload_bytes &&
+        limits.max_string_bytes <= managed_publication_max_string_bytes &&
+        limits.max_dex_files <= managed_publication_max_artifacts &&
+        limits.max_constant_pool_entries <= 65535U &&
+        limits.max_table_rows <= managed_publication_max_methods &&
+        limits.max_generic_params <= managed_publication_max_methods;
+}
+
+readers::managed::managed_reader_limits_t read_managed_reader_limits(
+    packed_payload_reader_t& reader) {
+    readers::managed::managed_reader_limits_t limits;
+    limits.max_metadata_bytes = reader.u64();
+    limits.max_types = reader.u32();
+    limits.max_methods = reader.u32();
+    limits.max_fields = reader.u32();
+    limits.max_member_references = reader.u32();
+    limits.max_annotations = reader.u32();
+    limits.max_resources = reader.u32();
+    limits.max_exception_regions = reader.u32();
+    limits.max_code_ranges = reader.u32();
+    limits.max_code_bytes = reader.u64();
+    limits.max_string_bytes = reader.u64();
+    limits.max_dex_files = reader.u32();
+    limits.max_constant_pool_entries = reader.u32();
+    limits.max_table_rows = reader.u32();
+    limits.max_generic_params = reader.u32();
+    if (!managed_reader_limits_bounded(limits))
+        reader.reject("managed publication reader limits are invalid");
+    return limits;
+}
+
+workspace_result_t<void> validate_managed_publication_for_encoding(
+    const managed_artifact_publication_t& publication,
+    const cancellation_token_t& cancel) {
+    if (publication.schema_version != managed_entity_binding_schema_version ||
+        publication.reader_schema_version !=
+            readers::managed::managed_reader_schema_version ||
+        !managed_reader_limits_bounded(publication.reader_limits) ||
+        publication.binary_id.empty() ||
+        publication.load_profile_hash.empty() || publication.provider_hash.empty() ||
+        publication.provider_source.empty() ||
+        publication.provider_source.size() >
+            managed_publication_max_single_string_bytes ||
+        publication.provider_size == 0 ||
+        publication.generation == 0 || publication.analysis_revision == 0 ||
+        !publication.records || publication.artifacts().empty() ||
+        publication.artifacts().size() > managed_publication_max_artifacts ||
+        publication.artifacts().size() >
+            static_cast<std::uint64_t>(
+                publication.reader_limits.max_dex_files) + 1ULL ||
+        publication.methods().size() > managed_publication_max_methods) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                  "managed publication identity is incomplete"));
+    }
+    std::uint64_t declared_method_limit = 0;
+    if (!checked_mul_u64(publication.reader_limits.max_methods,
+                         publication.reader_limits.max_dex_files,
+                         declared_method_limit) ||
+        publication.methods().size() > declared_method_limit) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed publication exceeds its reader method budget"));
+    }
+    std::uint64_t expected_method = 0;
+    std::unordered_set<std::uint32_t> artifact_ordinals;
+    try {
+        artifact_ordinals.reserve(publication.artifacts().size());
+        for (std::size_t index = 0;
+             index < publication.artifacts().size(); ++index) {
+            if ((index & 255U) == 0 && cancel.stop_requested())
+                return workspace_result_t<void>::failure(
+                    packed_baseline_cancelled(cancel));
+            const auto& artifact = publication.artifacts()[index];
+            const auto kind = static_cast<std::uint8_t>(artifact.kind);
+            if (kind > static_cast<std::uint8_t>(
+                           readers::managed::managed_artifact_kind_t::multidex_container) ||
+                artifact.artifact_hash.empty() || artifact.provider_size == 0 ||
+                artifact.provider_offset > publication.provider_size ||
+                artifact.provider_size >
+                    publication.provider_size - artifact.provider_offset ||
+                artifact.method_count > publication.reader_limits.max_methods ||
+                artifact.first_method != expected_method ||
+                !artifact_ordinals.insert(artifact.artifact_ordinal).second ||
+                !checked_add_u64(expected_method, artifact.method_count,
+                                 expected_method) ||
+                expected_method > publication.methods().size()) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "managed artifact records are noncanonical"));
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed artifact validation allocation failed"));
+    }
+    if (expected_method != publication.methods().size()) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                  "managed artifact method ranges are incomplete"));
+    }
+    for (std::size_t index = 0; index < publication.methods().size(); ++index) {
+        if ((index & 255U) == 0 && cancel.stop_requested())
+            return workspace_result_t<void>::failure(
+                packed_baseline_cancelled(cancel));
+        const auto& method = publication.methods()[index];
+        if (method.artifact_index >= publication.artifacts().size()) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                      "managed method references an invalid artifact"));
+        }
+        const auto& artifact = publication.artifacts()[method.artifact_index];
+        if (index < artifact.first_method ||
+            index >= static_cast<std::uint64_t>(artifact.first_method) +
+                         artifact.method_count ||
+            method.method_index >= artifact.method_count ||
+            method.provider_code_offset < artifact.provider_offset ||
+            method.provider_code_offset > artifact.provider_offset +
+                                              artifact.provider_size ||
+            method.code_size > artifact.provider_offset + artifact.provider_size -
+                                   method.provider_code_offset ||
+            method.has_body != (method.code_size != 0)) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                      "managed method records are inconsistent"));
+        }
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> write_managed_publication_domain_stream(
+    const managed_artifact_publication_t& publication,
+    packed_payload_writer_t& writer,
+    const cancellation_token_t& cancel) {
+    auto validated = validate_managed_publication_for_encoding(publication, cancel);
+    if (!validated)
+        return validated;
+    auto strings = collect_managed_domain_strings(publication, cancel);
+    if (!strings)
+        return workspace_result_t<void>::failure(strings.error());
+    const auto reference = [&](const std::string& value) {
+        const auto found = strings.value().references.find(value);
+        return found == strings.value().references.end()
+            ? (std::numeric_limits<std::uint32_t>::max)() : found->second;
+    };
+    write_domain_header(writer, packed_page_type_t::managed_publication);
+    writer.u32(managed_publication_domain_magic);
+    writer.u16(managed_publication_domain_version);
+    writer.u16(0);
+    writer.u32(publication.schema_version);
+    writer.u32(publication.reader_schema_version);
+    write_managed_reader_limits(writer, publication.reader_limits);
+    writer.fixed_bytes(publication.binary_id.bytes);
+    writer.fixed_bytes(publication.load_profile_hash.bytes);
+    writer.fixed_bytes(publication.provider_hash.bytes);
+    writer.u64(publication.provider_size);
+    writer.u64(publication.generation);
+    writer.u64(publication.analysis_revision);
+    writer.u64(publication.overlay_revision);
+    writer.u32(static_cast<std::uint32_t>(strings.value().values.size()));
+    for (const auto& value : strings.value().values) {
+        writer.begin_record();
+        writer.string(value);
+    }
+    writer.u32(reference(publication.provider_source));
+    writer.u32(static_cast<std::uint32_t>(publication.artifacts().size()));
+    writer.u32(static_cast<std::uint32_t>(publication.methods().size()));
+    for (const auto& value : publication.artifacts()) {
+        writer.begin_record();
+        writer.u8(static_cast<std::uint8_t>(value.kind));
+    }
+    for (const auto& value : publication.artifacts())
+        writer.fixed_bytes(value.artifact_hash.bytes);
+    for (const auto& value : publication.artifacts())
+        writer.u64(value.provider_offset);
+    for (const auto& value : publication.artifacts())
+        writer.u64(value.provider_size);
+    for (const auto& value : publication.artifacts())
+        writer.u32(value.artifact_ordinal);
+    for (const auto& value : publication.artifacts())
+        writer.u32(reference(value.assembly_identity));
+    for (const auto& value : publication.artifacts())
+        writer.u32(reference(value.module_name));
+    for (const auto& value : publication.artifacts())
+        writer.u32(reference(value.version));
+    for (const auto& value : publication.artifacts())
+        writer.u32(value.first_method);
+    for (const auto& value : publication.artifacts())
+        writer.u32(value.method_count);
+    for (const auto& value : publication.methods()) {
+        writer.begin_record();
+        writer.u32(value.artifact_index);
+    }
+    for (const auto& value : publication.methods())
+        writer.u32(value.entity_token);
+    for (const auto& value : publication.methods())
+        writer.u32(value.method_index);
+    for (const auto& value : publication.methods())
+        writer.u64(value.provider_code_offset);
+    for (const auto& value : publication.methods())
+        writer.u64(value.code_size);
+    for (std::size_t index = 0; index < publication.methods().size(); ++index)
+        writer.u32(reference(strings.value().entities[index]));
+    for (const auto& value : publication.methods())
+        writer.boolean(value.has_body);
+    const auto checksum = writer.checksum();
+    writer.u32(checksum);
+    return writer.finish_stream();
+}
+
+workspace_result_t<void> write_packed_baseline_domain_stream(
+    packed_page_type_t domain,
     const analysis_snapshot_t& snapshot,
     const persisted_search_products_t& search_products,
+    packed_payload_writer_t& writer,
     const cancellation_token_t& cancel) {
-    if (cancel.stop_requested())
-        return workspace_result_t<packed_baseline_domains_t>::failure(
-            packed_baseline_cancelled(cancel));
-    if (snapshot.generation == 0 ||
-        search_products.generation != snapshot.generation ||
-        search_products.analysis_revision != snapshot.analysis_revision ||
-        search_products.overlay_revision != snapshot.overlay_revision) {
-        return workspace_result_t<packed_baseline_domains_t>::failure(
-            packed_baseline_error(
-                workspace_error_code_t::stale_generation,
-                "packed baseline search products do not match the snapshot"));
-    }
-    auto validated = validate_analysis_snapshot(
-        snapshot, snapshot.baseline_complete, cancel);
-    if (!validated)
-        return workspace_result_t<packed_baseline_domains_t>::failure(
-            validated.error());
-
-    packed_baseline_domains_t domains;
-    domains.reserve(static_cast<std::size_t>(packed_page_last_data_type));
-    const auto append_domain = [&](packed_page_type_t domain,
-                                   packed_payload_writer_t& writer)
-        -> workspace_result_t<void> {
-        auto payload = writer.finish();
-        if (!payload)
-            return workspace_result_t<void>::failure(payload.error());
-        domains.emplace_back(domain, payload.take_value());
-        return workspace_result_t<void>::success();
+    write_domain_header(writer, domain);
+    const auto begin = [&](const std::optional<address_t>& address = std::nullopt) {
+        writer.begin_record(address);
     };
-
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::instructions);
+    switch (domain) {
+    case packed_page_type_t::instructions:
         writer.count(snapshot.instructions.size());
-        for (const auto& record : snapshot.instructions)
+        for (const auto& record : snapshot.instructions) {
+            begin(record.address);
             write_instruction(writer, record);
+        }
         writer.count(snapshot.delay_slot_counts.size());
-        for (const auto value : snapshot.delay_slot_counts)
+        for (const auto value : snapshot.delay_slot_counts) {
+            begin();
             writer.u8(value);
-        auto appended = append_domain(packed_page_type_t::instructions, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::operands);
+        }
+        break;
+    case packed_page_type_t::operands:
         writer.count(snapshot.operand_facts.size());
-        for (const auto& record : snapshot.operand_facts)
+        for (const auto& record : snapshot.operand_facts) {
+            begin();
             write_operand(writer, record);
-        auto appended = append_domain(packed_page_type_t::operands, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::target_facts);
+        }
+        break;
+    case packed_page_type_t::target_facts:
         writer.count(snapshot.target_facts.size());
-        for (const auto& record : snapshot.target_facts)
+        for (const auto& record : snapshot.target_facts) {
+            begin(record.target);
             write_target(writer, record);
-        auto appended = append_domain(packed_page_type_t::target_facts, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::edges);
+        }
+        break;
+    case packed_page_type_t::edges:
         writer.count(snapshot.edges.size());
-        for (const auto& record : snapshot.edges)
+        for (const auto& record : snapshot.edges) {
+            begin(record.source);
             write_edge(writer, record);
-        auto appended = append_domain(packed_page_type_t::edges, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::strings);
+        }
+        break;
+    case packed_page_type_t::strings:
         writer.count(snapshot.strings.size());
-        for (const auto& record : snapshot.strings)
+        for (const auto& record : snapshot.strings) {
+            begin(record.address);
             write_string_record(writer, record);
-        auto appended = append_domain(packed_page_type_t::strings, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::symbols);
+        }
+        break;
+    case packed_page_type_t::symbols:
         writer.count(snapshot.symbols.size());
-        for (const auto& record : snapshot.symbols)
+        for (const auto& record : snapshot.symbols) {
+            begin(record.address);
             write_symbol(writer, record);
-        auto appended = append_domain(packed_page_type_t::symbols, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::address_expressions);
+        }
+        break;
+    case packed_page_type_t::address_expressions:
         writer.count(0);
-        auto appended = append_domain(
-            packed_page_type_t::address_expressions, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::basic_blocks);
+        break;
+    case packed_page_type_t::basic_blocks:
         writer.count(snapshot.blocks.size());
-        for (const auto& record : snapshot.blocks)
+        for (const auto& record : snapshot.blocks) {
+            begin(record.start);
             write_block(writer, record);
-        auto appended = append_domain(packed_page_type_t::basic_blocks, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::functions);
+        }
+        break;
+    case packed_page_type_t::functions:
         writer.count(snapshot.functions.size());
-        for (const auto& record : snapshot.functions)
+        for (const auto& record : snapshot.functions) {
+            begin(record.start);
             write_function(writer, record);
-        auto appended = append_domain(packed_page_type_t::functions, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::function_chunks);
+        }
+        break;
+    case packed_page_type_t::function_chunks:
         writer.count(snapshot.function_chunks.size());
-        for (const auto& record : snapshot.function_chunks)
+        for (const auto& record : snapshot.function_chunks) {
+            begin(record.start);
             write_function_chunk(writer, record);
+        }
         writer.count(snapshot.function_block_memberships.size());
-        for (const auto& record : snapshot.function_block_memberships)
+        for (const auto& record : snapshot.function_block_memberships) {
+            begin();
             write_function_membership(writer, record);
-        auto appended = append_domain(packed_page_type_t::function_chunks, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::xrefs);
+        }
+        break;
+    case packed_page_type_t::xrefs:
         writer.count(snapshot.xrefs.size());
-        for (const auto& record : snapshot.xrefs)
+        for (const auto& record : snapshot.xrefs) {
+            begin(record.source);
             write_xref(writer, record);
-        auto appended = append_domain(packed_page_type_t::xrefs, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::coverage);
+        }
+        break;
+    case packed_page_type_t::coverage:
         writer.count(snapshot.coverage.size());
-        for (const auto& record : snapshot.coverage)
+        for (const auto& record : snapshot.coverage) {
+            begin(record.start);
             write_coverage(writer, record);
-        auto appended = append_domain(packed_page_type_t::coverage, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::search_index);
-        writer.count(search_products.data_candidates.size());
-        for (const auto& record : search_products.data_candidates)
+        }
+        break;
+    case packed_page_type_t::search_index: {
+        const auto& data_candidates = search_products.live_index
+            ? search_products.live_index->data_candidates()
+            : search_products.data_candidates;
+        const auto& switches = search_products.live_index
+            ? search_products.live_index->switches()
+            : search_products.switches;
+        const auto& types = search_products.live_index
+            ? search_products.live_index->types()
+            : search_products.types;
+        writer.count(data_candidates.size());
+        for (const auto& record : data_candidates) {
+            begin(record.address);
             write_data_candidate(writer, record);
-        writer.count(search_products.switches.size());
-        for (const auto& record : search_products.switches)
+        }
+        writer.count(switches.size());
+        for (const auto& record : switches) {
+            begin(record.dispatch);
             write_switch(writer, record);
-        writer.count(search_products.types.size());
-        for (const auto& record : search_products.types)
+        }
+        writer.count(types.size());
+        for (const auto& record : types) {
+            begin(record.address);
             write_search_type(writer, record);
-        writer.u32(search_products.search_index_blob_version);
-        writer.bytes(search_products.search_index_blob.data(),
-                     search_products.search_index_blob.size());
-        auto appended = append_domain(packed_page_type_t::search_index, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
+        }
+        if (search_products.live_index) {
+            auto serialized_size =
+                search_products.live_index->serialized_size(cancel);
+            if (!serialized_size)
+                return workspace_result_t<void>::failure(
+                    serialized_size.error());
+            writer.u32(search_index_t::serialized_version);
+            writer.u64(serialized_size.value());
+            std::uint64_t written = 0;
+            auto serialized = search_products.live_index->serialize_to(
+                [&](const std::uint8_t* data, std::size_t size) {
+                    auto appended = writer.append_external(data, size);
+                    if (!appended)
+                        return appended;
+                    std::uint64_t updated = 0;
+                    if (!checked_add_u64(written, size, updated) ||
+                        updated > serialized_size.value()) {
+                        return workspace_result_t<void>::failure(
+                            packed_baseline_error(
+                                workspace_error_code_t::integrity_failure,
+                                "serialized search stream exceeds its declared size"));
+                    }
+                    written = updated;
+                    return workspace_result_t<void>::success();
+                }, cancel);
+            if (!serialized)
+                return serialized;
+            if (written != serialized_size.value()) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "serialized search stream is shorter than its declared size"));
+            }
+        } else {
+            writer.u32(search_products.search_index_blob_version);
+            writer.bytes(search_products.search_index_blob.data(),
+                         search_products.search_index_blob.size());
+        }
+        break;
     }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::call_graph);
+    case packed_page_type_t::call_graph:
         writer.count(snapshot.call_graph.nodes.size());
-        for (const auto& record : snapshot.call_graph.nodes)
+        for (const auto& record : snapshot.call_graph.nodes) {
+            begin(record.address);
             write_call_node(writer, record);
+        }
         writer.count(snapshot.call_graph.call_sites.size());
-        for (const auto& record : snapshot.call_graph.call_sites)
+        for (const auto& record : snapshot.call_graph.call_sites) {
+            begin(record.address);
             write_call_site(writer, record);
+        }
         writer.count(snapshot.call_graph.candidates.size());
-        for (const auto& record : snapshot.call_graph.candidates)
+        for (const auto& record : snapshot.call_graph.candidates) {
+            begin(record.target);
             write_call_candidate(writer, record);
+        }
         writer.count(snapshot.call_graph.edges.size());
-        for (const auto& record : snapshot.call_graph.edges)
+        for (const auto& record : snapshot.call_graph.edges) {
+            begin(record.call_site);
             write_call_edge(writer, record);
+        }
         writer.count(snapshot.call_graph.conflicts.size());
-        for (const auto& record : snapshot.call_graph.conflicts)
+        for (const auto& record : snapshot.call_graph.conflicts) {
+            begin();
             write_call_conflict(writer, record);
+        }
         writer.u64(snapshot.call_graph.indirect_site_count);
         writer.u64(snapshot.call_graph.unresolved_site_count);
         writer.boolean(snapshot.call_graph.bounded);
-        auto appended = append_domain(packed_page_type_t::call_graph, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::pointer_facts);
+        break;
+    case packed_page_type_t::pointer_facts:
         writer.count(snapshot.rich_facts.data_candidates.size());
-        for (const auto& record : snapshot.rich_facts.data_candidates)
+        for (const auto& record : snapshot.rich_facts.data_candidates) {
+            begin(record.address);
             write_data_candidate(writer, record);
+        }
         writer.count(snapshot.rich_facts.data_pointer_facts.size());
-        for (const auto& record : snapshot.rich_facts.data_pointer_facts)
+        for (const auto& record : snapshot.rich_facts.data_pointer_facts) {
+            begin(record.slot);
             write_data_pointer(writer, record);
+        }
         writer.count(snapshot.rich_facts.data_conflicts.size());
-        for (const auto& record : snapshot.rich_facts.data_conflicts)
+        for (const auto& record : snapshot.rich_facts.data_conflicts) {
+            begin(record.address);
             write_data_conflict(writer, record);
-        auto appended = append_domain(packed_page_type_t::pointer_facts, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::type_references);
+        }
+        break;
+    case packed_page_type_t::type_references:
         writer.count(snapshot.rich_facts.type_references.size());
-        for (const auto& record : snapshot.rich_facts.type_references)
+        for (const auto& record : snapshot.rich_facts.type_references) {
+            begin(record.source);
             write_type_reference(writer, record);
-        auto appended = append_domain(
-            packed_page_type_t::type_references, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer, packed_page_type_t::metadata_conflicts);
+        }
+        break;
+    case packed_page_type_t::metadata_conflicts:
         writer.count(snapshot.rich_facts.metadata_conflicts.size());
-        for (const auto& record : snapshot.rich_facts.metadata_conflicts)
+        for (const auto& record : snapshot.rich_facts.metadata_conflicts) {
+            begin(record.address);
             write_metadata_conflict(writer, record);
-        auto appended = append_domain(
-            packed_page_type_t::metadata_conflicts, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
-    }
-    {
-        packed_payload_writer_t writer(cancel);
-        write_domain_header(writer,
-                            packed_page_type_t::symbol_type_candidates);
+        }
+        break;
+    case packed_page_type_t::symbol_type_candidates:
         writer.count(snapshot.rich_facts.type_candidates.size());
-        for (const auto& record : snapshot.rich_facts.type_candidates)
+        for (const auto& record : snapshot.rich_facts.type_candidates) {
+            begin(record.address);
             write_symbol_type_candidate(writer, record);
-        auto appended = append_domain(
-            packed_page_type_t::symbol_type_candidates, writer);
-        if (!appended)
-            return workspace_result_t<packed_baseline_domains_t>::failure(
-                appended.error());
+        }
+        break;
+    default:
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::invalid_argument,
+                                  "packed baseline domain is unsupported"));
     }
-    if (domains.size() !=
-        static_cast<std::size_t>(packed_page_last_data_type)) {
-        return workspace_result_t<packed_baseline_domains_t>::failure(
-            packed_baseline_error(
-                workspace_error_code_t::integrity_failure,
-                "packed baseline encoder omitted a required domain"));
+    return writer.finish_stream();
+}
+
+struct packed_baseline_stream_measurement_t {
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(packed_page_last_data_type) + 1U>
+        domain_bytes{};
+    std::array<std::uint64_t,
+               static_cast<std::size_t>(packed_page_last_data_type) + 1U>
+        domain_records{};
+    std::uint32_t page_count = 0;
+    std::uint64_t total_payload_bytes = 0;
+    std::uint64_t total_records = 0;
+};
+
+workspace_result_t<packed_baseline_stream_measurement_t>
+measure_packed_baseline_stream(
+    const analysis_snapshot_t& snapshot,
+    const persisted_search_products_t& search_products,
+    const std::shared_ptr<const managed_artifact_publication_t>& managed_publication,
+    const workspace_database_options_t& options,
+    const cancellation_token_t& cancel) {
+    if (options.packed_stream_page_size <
+            packed_page_header_size + packed_record_page_prefix_size + 16U ||
+        options.packed_stream_page_size >
+            packed_page_header_size + packed_page_max_payload ||
+        options.packed_generation_quota_bytes == 0 ||
+        options.packed_generation_quota_bytes > packed_generation_max_payload_bytes) {
+        return workspace_result_t<packed_baseline_stream_measurement_t>::failure(
+            packed_baseline_error(workspace_error_code_t::invalid_argument,
+                                  "packed stream options are invalid"));
     }
-    return workspace_result_t<packed_baseline_domains_t>::success(
-        std::move(domains));
+    const std::uint64_t content_capacity =
+        options.packed_stream_page_size - packed_page_header_size -
+        packed_record_page_prefix_size;
+    packed_baseline_stream_measurement_t measurement;
+    for (std::uint32_t encoded = 1;
+         encoded <= static_cast<std::uint32_t>(packed_page_baseline_last_data_type);
+         ++encoded) {
+        const auto domain = static_cast<packed_page_type_t>(encoded);
+        packed_payload_writer_t writer(
+            cancel,
+            [](const std::uint8_t*, std::size_t) {
+                return workspace_result_t<void>::success();
+            }, {}, options.packed_generation_quota_bytes);
+        auto written = write_packed_baseline_domain_stream(
+            domain, snapshot, search_products, writer, cancel);
+        if (!written)
+            return workspace_result_t<packed_baseline_stream_measurement_t>::failure(
+                written.error());
+        const auto bytes = writer.size();
+        const auto records = writer.record_count();
+        const std::uint64_t pages = bytes == 0 ? 1ULL :
+            1ULL + (bytes - 1ULL) / content_capacity;
+        std::uint64_t page_payload_bytes = 0;
+        std::uint64_t updated = 0;
+        if (pages > packed_generation_max_pages ||
+            !checked_mul_u64(pages, packed_record_page_prefix_size,
+                             page_payload_bytes) ||
+            !checked_add_u64(page_payload_bytes, bytes, page_payload_bytes) ||
+            !checked_add_u64(measurement.total_payload_bytes,
+                             page_payload_bytes, updated) ||
+            updated > options.packed_generation_quota_bytes ||
+            !checked_add_u64(measurement.total_records, records,
+                             measurement.total_records) ||
+            measurement.total_records > packed_generation_max_records ||
+            pages > packed_generation_max_pages - measurement.page_count) {
+            return workspace_result_t<packed_baseline_stream_measurement_t>::failure(
+                packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                      "packed baseline stream exceeds its page, record, or byte quota"));
+        }
+        measurement.total_payload_bytes = updated;
+        measurement.page_count += static_cast<std::uint32_t>(pages);
+        measurement.domain_bytes[encoded] = bytes;
+        measurement.domain_records[encoded] = records;
+    }
+    if (managed_publication) {
+        const auto encoded = static_cast<std::uint32_t>(
+            packed_page_type_t::managed_publication);
+        packed_payload_writer_t writer(
+            cancel,
+            [](const std::uint8_t*, std::size_t) {
+                return workspace_result_t<void>::success();
+            }, {}, managed_publication_max_payload_bytes);
+        auto written = write_managed_publication_domain_stream(
+            *managed_publication, writer, cancel);
+        if (!written)
+            return workspace_result_t<packed_baseline_stream_measurement_t>::failure(
+                written.error());
+        const auto bytes = writer.size();
+        const auto records = writer.record_count();
+        const std::uint64_t pages = bytes == 0 ? 1ULL :
+            1ULL + (bytes - 1ULL) / content_capacity;
+        std::uint64_t page_payload_bytes = 0;
+        std::uint64_t updated = 0;
+        if (pages > packed_generation_max_pages ||
+            !checked_mul_u64(pages, packed_record_page_prefix_size,
+                             page_payload_bytes) ||
+            !checked_add_u64(page_payload_bytes, bytes, page_payload_bytes) ||
+            !checked_add_u64(measurement.total_payload_bytes,
+                             page_payload_bytes, updated) ||
+            updated > options.packed_generation_quota_bytes ||
+            !checked_add_u64(measurement.total_records, records,
+                             measurement.total_records) ||
+            measurement.total_records > packed_generation_max_records ||
+            pages > packed_generation_max_pages - measurement.page_count) {
+            return workspace_result_t<packed_baseline_stream_measurement_t>::failure(
+                packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                      "managed publication exceeds the packed generation quota"));
+        }
+        measurement.total_payload_bytes = updated;
+        measurement.page_count += static_cast<std::uint32_t>(pages);
+        measurement.domain_bytes[encoded] = bytes;
+        measurement.domain_records[encoded] = records;
+    }
+    return workspace_result_t<packed_baseline_stream_measurement_t>::success(
+        measurement);
+}
+
+class packed_baseline_page_stream_t final {
+public:
+    packed_baseline_page_stream_t(
+        packed_page_type_t domain,
+        const packed_page_encode_options_t& options,
+        std::uint32_t global_page_count,
+        std::uint32_t& next_page_index,
+        const packed_page_stream_sink_t& sink,
+        const packed_publish_stop_predicate_t& stop_requested)
+        : domain_(domain), options_(options),
+          global_page_count_(global_page_count),
+          next_page_index_(next_page_index), sink_(sink),
+          stop_requested_(stop_requested),
+          content_capacity_(options.page_size - packed_page_header_size -
+                            packed_record_page_prefix_size) {
+        content_.reserve(content_capacity_);
+    }
+
+    workspace_result_t<void> append(const std::uint8_t* data,
+                                    std::size_t size) {
+        if (!data && size != 0)
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::invalid_argument,
+                                      "packed page stream received a null byte range"));
+        for (std::size_t offset = 0; offset < size;) {
+            if (stop_requested_ && stop_requested_())
+            {
+                auto error = packed_baseline_error(
+                    workspace_error_code_t::cancelled,
+                    "packed page stream was cancelled");
+                error.cancellation = true;
+                return workspace_result_t<void>::failure(std::move(error));
+            }
+            if (content_.size() == content_capacity_) {
+                auto flushed = flush();
+                if (!flushed)
+                    return flushed;
+            }
+            const auto count = (std::min)(
+                size - offset, content_capacity_ - content_.size());
+            content_.insert(content_.end(), data + offset,
+                            data + offset + count);
+            offset += count;
+        }
+        return workspace_result_t<void>::success();
+    }
+
+    workspace_result_t<void> begin_record(
+        const std::optional<address_t>& address) {
+        if (content_.size() == content_capacity_) {
+            auto flushed = flush();
+            if (!flushed)
+                return flushed;
+        }
+        if (page_record_count_ == (std::numeric_limits<std::uint32_t>::max)() ||
+            records_started_ == (std::numeric_limits<std::uint32_t>::max)()) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::range_overflow,
+                                      "packed page record ordinal overflows"));
+        }
+        ++page_record_count_;
+        ++records_started_;
+        if (address) {
+            if (!address_seen_) {
+                address_min_ = address->value;
+                address_max_ = address->value;
+                address_seen_ = true;
+            } else {
+                address_min_ = (std::min)(address_min_, address->value);
+                address_max_ = (std::max)(address_max_, address->value);
+            }
+        }
+        return workspace_result_t<void>::success();
+    }
+
+    workspace_result_t<void> finish() {
+        if (!content_.empty())
+            return flush();
+        return workspace_result_t<void>::success();
+    }
+
+private:
+    workspace_result_t<void> flush() {
+        if (content_.empty())
+            return workspace_result_t<void>::success();
+        if (next_page_index_ >= global_page_count_)
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                      "packed page stream emitted too many pages"));
+        packed_record_page_prefix_t prefix;
+        prefix.ordinal_begin = page_ordinal_begin_;
+        prefix.record_count = page_record_count_;
+        if (address_seen_) {
+            prefix.address_value_min = address_min_;
+            prefix.address_value_max = address_max_;
+        }
+        const auto encoded_prefix = prefix.encode();
+        packed_page_t page;
+        page.header.generation = options_.generation;
+        page.header.analysis_revision = options_.analysis_revision;
+        page.header.overlay_revision = options_.overlay_revision;
+        page.header.page_type = static_cast<std::uint32_t>(domain_);
+        page.header.page_index = next_page_index_;
+        page.header.page_count = global_page_count_;
+        page.payload.reserve(encoded_prefix.size() + content_.size());
+        page.payload.insert(page.payload.end(), encoded_prefix.begin(),
+                            encoded_prefix.end());
+        page.payload.insert(page.payload.end(), content_.begin(), content_.end());
+        auto sealed = packed_page_codec_t::seal_page(page, stop_requested_);
+        if (!sealed)
+            return sealed;
+        packed_page_row_t row;
+        row.generation = page.header.generation;
+        row.page_index = page.header.page_index;
+        row.page_count = page.header.page_count;
+        row.page_type = page.header.page_type;
+        row.payload_length = page.header.payload_length;
+        row.checksum = page.header.checksum;
+        row.payload = std::move(page.payload);
+        packed_page_index_row_t index;
+        index.generation = row.generation;
+        index.domain = static_cast<std::uint16_t>(domain_);
+        index.ordinal_begin = prefix.ordinal_begin;
+        index.count = prefix.record_count;
+        index.page_index = row.page_index;
+        index.address_value_min = prefix.address_value_min;
+        index.address_value_max = prefix.address_value_max;
+        auto accepted = sink_(std::move(row), std::move(index));
+        if (!accepted)
+            return accepted;
+        ++next_page_index_;
+        page_ordinal_begin_ = records_started_;
+        page_record_count_ = 0;
+        address_seen_ = false;
+        address_min_ = 0;
+        address_max_ = 0;
+        content_.clear();
+        return workspace_result_t<void>::success();
+    }
+
+    packed_page_type_t domain_;
+    packed_page_encode_options_t options_;
+    std::uint32_t global_page_count_ = 0;
+    std::uint32_t& next_page_index_;
+    const packed_page_stream_sink_t& sink_;
+    const packed_publish_stop_predicate_t& stop_requested_;
+    std::size_t content_capacity_ = 0;
+    std::vector<std::uint8_t> content_;
+    std::uint32_t page_ordinal_begin_ = 0;
+    std::uint32_t page_record_count_ = 0;
+    std::uint32_t records_started_ = 0;
+    bool address_seen_ = false;
+    std::uint64_t address_min_ = 0;
+    std::uint64_t address_max_ = 0;
+};
+
+workspace_result_t<void> stage_managed_publication_domain(
+    sqlite3* database,
+    const analysis_snapshot_t& snapshot,
+    const managed_artifact_publication_t& managed_publication,
+    const workspace_database_options_t& options,
+    const std::string& candidate_token,
+    std::uint64_t prior_records,
+    const cancellation_token_t& cancel,
+    persistence_commit_metrics_t* commit_metrics) {
+    if (options.packed_stream_page_size <
+            packed_page_header_size + packed_record_page_prefix_size + 16U ||
+        options.packed_stream_page_size >
+            packed_page_header_size + packed_page_max_payload ||
+        options.packed_generation_quota_bytes == 0 ||
+        options.packed_generation_quota_bytes >
+            packed_generation_max_payload_bytes) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::invalid_argument,
+                                  "managed packed stream options are invalid"));
+    }
+    const std::uint64_t content_capacity =
+        options.packed_stream_page_size - packed_page_header_size -
+        packed_record_page_prefix_size;
+    packed_payload_writer_t measurement_writer(
+        cancel,
+        [](const std::uint8_t*, std::size_t) {
+            return workspace_result_t<void>::success();
+        }, {}, managed_publication_max_payload_bytes);
+    auto measured = write_managed_publication_domain_stream(
+        managed_publication, measurement_writer, cancel);
+    if (!measured)
+        return measured;
+    const auto domain_bytes = measurement_writer.size();
+    const auto domain_records = measurement_writer.record_count();
+    const std::uint64_t pages = domain_bytes == 0 ? 1ULL :
+        1ULL + (domain_bytes - 1ULL) / content_capacity;
+    std::uint64_t total_payload_bytes = 0;
+    if (pages == 0 || pages > packed_generation_max_pages ||
+        !checked_mul_u64(pages, packed_record_page_prefix_size,
+                         total_payload_bytes) ||
+        !checked_add_u64(total_payload_bytes, domain_bytes,
+                         total_payload_bytes) ||
+        total_payload_bytes > options.packed_generation_quota_bytes ||
+        prior_records > options.max_persisted_fact_records ||
+        domain_records > options.max_persisted_fact_records - prior_records) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed publication exceeds its packed staging budget"));
+    }
+    auto manifest = encode_packed_baseline_manifest(
+        snapshot, candidate_token, cancel);
+    if (!manifest)
+        return workspace_result_t<void>::failure(manifest.error());
+    packed_generation_stream_descriptor_t descriptor;
+    descriptor.generation.generation = snapshot.generation;
+    descriptor.generation.analysis_revision = snapshot.analysis_revision;
+    descriptor.generation.overlay_revision = snapshot.overlay_revision;
+    descriptor.generation.shard_count = 1;
+    descriptor.generation.total_payload_bytes = total_payload_bytes;
+    descriptor.generation.total_records = domain_records;
+    descriptor.generation.created_utc_ms = utc_ms();
+    descriptor.generation.payload_blob = manifest.take_value();
+    descriptor.page_count = static_cast<std::uint32_t>(pages);
+    descriptor.payload_quota_bytes = options.packed_generation_quota_bytes;
+    packed_page_encode_options_t page_options;
+    page_options.page_size = options.packed_stream_page_size;
+    page_options.generation = snapshot.generation;
+    page_options.analysis_revision = snapshot.analysis_revision;
+    page_options.overlay_revision = snapshot.overlay_revision;
+    const auto started = std::chrono::steady_clock::now();
+    const packed_page_stream_producer_t producer =
+        [&](const packed_page_stream_sink_t& sink,
+            const packed_publish_stop_predicate_t& stop_requested)
+            -> workspace_result_t<void> {
+        std::uint32_t next_page_index = 0;
+        packed_baseline_page_stream_t pages_stream(
+            packed_page_type_t::managed_publication, page_options,
+            descriptor.page_count, next_page_index, sink, stop_requested);
+        packed_payload_writer_t writer(
+            cancel,
+            [&](const std::uint8_t* data, std::size_t size) {
+                return pages_stream.append(data, size);
+            },
+            [&](const std::optional<address_t>& address) {
+                return pages_stream.begin_record(address);
+            }, managed_publication_max_payload_bytes);
+        auto written = write_managed_publication_domain_stream(
+            managed_publication, writer, cancel);
+        if (!written)
+            return written;
+        if (writer.size() != domain_bytes ||
+            writer.record_count() != domain_records) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                      "managed publication changed during staging"));
+        }
+        auto finished = pages_stream.finish();
+        if (!finished)
+            return finished;
+        if (next_page_index != descriptor.page_count) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                      "managed publication page count changed during staging"));
+        }
+        return workspace_result_t<void>::success();
+    };
+    auto staged = stage_packed_generation_stream_atomic(
+        database, descriptor, candidate_token, producer,
+        [&cancel] { return cancel.stop_requested(); });
+    if (!staged)
+        return staged;
+    if (commit_metrics) {
+        std::uint64_t updated_bytes = 0;
+        std::uint64_t updated_rows = 0;
+        if (!checked_add_u64(commit_metrics->logical_bytes,
+                             descriptor.generation.total_payload_bytes +
+                                 descriptor.generation.payload_blob.size(),
+                             updated_bytes) ||
+            !checked_add_u64(commit_metrics->rows,
+                             static_cast<std::uint64_t>(descriptor.page_count) * 2ULL + 1ULL,
+                             updated_rows)) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(workspace_error_code_t::range_overflow,
+                                      "managed persistence metrics overflowed"));
+        }
+        commit_metrics->logical_bytes = updated_bytes;
+        commit_metrics->rows = updated_rows;
+        commit_metrics->elapsed_us += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count());
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> stage_complete_packed_baseline(
+    sqlite3* database,
+    const analysis_snapshot_t& snapshot,
+    const persisted_search_products_t& search_products,
+    const std::shared_ptr<const managed_artifact_publication_t>& managed_publication,
+    const workspace_database_options_t& options,
+    const std::string& candidate_token,
+    const cancellation_token_t& cancel,
+    persistence_commit_metrics_t* commit_metrics) {
+    auto measurement = measure_packed_baseline_stream(
+        snapshot, search_products, managed_publication, options, cancel);
+    if (!measurement)
+        return workspace_result_t<void>::failure(measurement.error());
+    if (measurement.value().total_records >
+        options.max_persisted_fact_records) {
+        return workspace_result_t<void>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "packed baseline exceeds the persisted fact-record budget"));
+    }
+    auto manifest = encode_packed_baseline_manifest(
+        snapshot, candidate_token, cancel);
+    if (!manifest)
+        return workspace_result_t<void>::failure(manifest.error());
+    packed_generation_stream_descriptor_t descriptor;
+    descriptor.generation.generation = snapshot.generation;
+    descriptor.generation.analysis_revision = snapshot.analysis_revision;
+    descriptor.generation.overlay_revision = snapshot.overlay_revision;
+    descriptor.generation.shard_count = static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(packed_page_baseline_last_data_type) +
+        (managed_publication ? 1U : 0U));
+    descriptor.generation.total_payload_bytes =
+        measurement.value().total_payload_bytes;
+    descriptor.generation.total_records = measurement.value().total_records;
+    descriptor.generation.created_utc_ms = utc_ms();
+    descriptor.generation.payload_blob = manifest.take_value();
+    descriptor.page_count = measurement.value().page_count;
+    descriptor.payload_quota_bytes = options.packed_generation_quota_bytes;
+    packed_page_encode_options_t page_options;
+    page_options.page_size = options.packed_stream_page_size;
+    page_options.generation = snapshot.generation;
+    page_options.analysis_revision = snapshot.analysis_revision;
+    page_options.overlay_revision = snapshot.overlay_revision;
+    const packed_page_stream_producer_t producer =
+        [&](const packed_page_stream_sink_t& sink,
+            const packed_publish_stop_predicate_t& stop_requested)
+            -> workspace_result_t<void> {
+        std::uint32_t next_page_index = 0;
+        for (std::uint32_t encoded = 1;
+             encoded <= static_cast<std::uint32_t>(packed_page_baseline_last_data_type);
+             ++encoded) {
+            const auto domain = static_cast<packed_page_type_t>(encoded);
+            packed_baseline_page_stream_t pages(
+                domain, page_options, descriptor.page_count,
+                next_page_index, sink, stop_requested);
+            packed_payload_writer_t writer(
+                cancel,
+                [&](const std::uint8_t* data, std::size_t size) {
+                    return pages.append(data, size);
+                },
+                [&](const std::optional<address_t>& address) {
+                    return pages.begin_record(address);
+                }, options.packed_generation_quota_bytes);
+            auto written = write_packed_baseline_domain_stream(
+                domain, snapshot, search_products, writer, cancel);
+            if (!written)
+                return written;
+            if (writer.size() != measurement.value().domain_bytes[encoded] ||
+                writer.record_count() !=
+                    measurement.value().domain_records[encoded]) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed baseline changed between sizing and streaming"));
+            }
+            auto finished = pages.finish();
+            if (!finished)
+                return finished;
+        }
+        if (managed_publication) {
+            const auto domain = packed_page_type_t::managed_publication;
+            const auto encoded = static_cast<std::uint32_t>(domain);
+            packed_baseline_page_stream_t pages(
+                domain, page_options, descriptor.page_count,
+                next_page_index, sink, stop_requested);
+            packed_payload_writer_t writer(
+                cancel,
+                [&](const std::uint8_t* data, std::size_t size) {
+                    return pages.append(data, size);
+                },
+                [&](const std::optional<address_t>& address) {
+                    return pages.begin_record(address);
+                }, managed_publication_max_payload_bytes);
+            auto written = write_managed_publication_domain_stream(
+                *managed_publication, writer, cancel);
+            if (!written)
+                return written;
+            if (writer.size() != measurement.value().domain_bytes[encoded] ||
+                writer.record_count() !=
+                    measurement.value().domain_records[encoded]) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "managed publication changed between sizing and streaming"));
+            }
+            auto finished = pages.finish();
+            if (!finished)
+                return finished;
+        }
+        if (next_page_index != descriptor.page_count) {
+            return workspace_result_t<void>::failure(
+                packed_baseline_error(
+                    workspace_error_code_t::integrity_failure,
+                    "packed baseline page count changed during streaming"));
+        }
+        return workspace_result_t<void>::success();
+    };
+    const auto started = std::chrono::steady_clock::now();
+    auto staged = stage_packed_generation_stream_atomic(
+        database, descriptor, candidate_token, producer,
+        [&cancel] { return cancel.stop_requested(); });
+    if (!staged)
+        return staged;
+    if (commit_metrics) {
+        commit_metrics->logical_bytes = descriptor.generation.total_payload_bytes +
+            descriptor.generation.payload_blob.size();
+        commit_metrics->rows = static_cast<std::uint64_t>(descriptor.page_count) * 2ULL + 1ULL;
+        commit_metrics->elapsed_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count());
+    }
+    return workspace_result_t<void>::success();
+}
+
+workspace_result_t<void> persist_complete_snapshot_impl(
+    sqlite3* database, const analysis_snapshot_t& snapshot,
+    const persisted_search_products_t& search_products,
+    const std::shared_ptr<const managed_artifact_publication_t>& managed_publication,
+    const workspace_database_options_t& options,
+    const std::string& settings_json, const std::string& metrics_json,
+    const std::string& candidate_token,
+    const cancellation_token_t& cancel,
+    persistence_commit_metrics_t* commit_metrics) {
+    constexpr std::size_t json_limit = 16U << 20;
+    if (!database || !snapshot.baseline_complete ||
+        !valid_candidate_token(candidate_token) ||
+        settings_json.size() > json_limit || metrics_json.size() > json_limit ||
+        nlohmann::json::parse(settings_json, nullptr, false).is_discarded() ||
+        nlohmann::json::parse(metrics_json, nullptr, false).is_discarded()) {
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "complete packed snapshot input is invalid",
+                                 "workspace_database.persist.packed"));
+    }
+    if (cancel.stop_requested())
+        return workspace_result_t<void>::failure(
+            packed_baseline_cancelled(cancel));
+    auto page_size = database_page_size(database);
+    if (!page_size)
+        return workspace_result_t<void>::failure(page_size.error());
+    int writes_before = 0;
+    int highwater = 0;
+    int status = sqlite3_db_status(database, SQLITE_DBSTATUS_CACHE_WRITE,
+                                   &writes_before, &highwater, 0);
+    if (status != SQLITE_OK) {
+        return workspace_result_t<void>::failure(database_error(
+            database, status, "unable to read packed persistence write counter",
+            "workspace_database.persist.packed"));
+    }
+    const auto started = std::chrono::steady_clock::now();
+    auto begun = begin_immediate(database, "workspace_database.persist.packed");
+    if (!begun)
+        return begun;
+    auto commit_state = read_commit_state(
+        database, "workspace_database.persist.packed");
+    if (!commit_state) {
+        rollback(database, "workspace_database.persist.packed");
+        return workspace_result_t<void>::failure(commit_state.error());
+    }
+    if (commit_state.value().candidate_ready ||
+        commit_state.value().committed_generation > snapshot.generation ||
+        (commit_state.value().committed_generation == snapshot.generation &&
+         commit_state.value().committed_analysis_revision >
+             snapshot.analysis_revision)) {
+        rollback(database, "workspace_database.persist.packed");
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::revision_conflict,
+                                 "packed snapshot conflicts with current persistence state",
+                                 "workspace_database.persist.packed"));
+    }
+    const auto target_slot = static_cast<std::uint8_t>(
+        1U - commit_state.value().active_slot);
+    auto result = clear_snapshot_slot(
+        database, target_slot, "workspace_database.persist.packed");
+    if (!result) {
+        rollback(database, "workspace_database.persist.packed");
+        return result;
+    }
+    statement_t state_statement;
+    const std::string state_sql = "INSERT INTO " +
+        slot_table(target_slot, "analysis_state") +
+        "(singleton,generation,analysis_revision,overlay_revision,baseline_complete,settings_json,metrics_json,updated_utc_ms,commit_token) VALUES(1,?1,?2,?3,1,?4,?5,?6,?7) "
+        "ON CONFLICT(singleton) DO UPDATE SET generation=excluded.generation,analysis_revision=excluded.analysis_revision,overlay_revision=excluded.overlay_revision,baseline_complete=1,settings_json=excluded.settings_json,metrics_json=excluded.metrics_json,updated_utc_ms=excluded.updated_utc_ms,commit_token=excluded.commit_token";
+    result = state_statement.prepare(database, state_sql.c_str(),
+                                     "workspace_database.persist.packed.state");
+    if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.bind_uint(1, snapshot.generation); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.bind_uint(2, snapshot.analysis_revision); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.bind_uint(3, snapshot.overlay_revision); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.bind_text(4, settings_json); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.bind_text(5, metrics_json); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.bind_uint(6, utc_ms()); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.bind_text(7, candidate_token); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = state_statement.step_done(); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    statement_t candidate_statement;
+    result = candidate_statement.prepare(database,
+        "UPDATE workspace_commit_state SET candidate_slot=?1,candidate_token=?2,candidate_generation=?3,candidate_analysis_revision=?4,candidate_overlay_revision=?5,candidate_ready=1,updated_utc_ms=?6 WHERE singleton=1 AND active_slot=?7 AND candidate_ready=0",
+        "workspace_database.persist.packed.candidate");
+    if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.bind_uint(1, target_slot); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.bind_text(2, candidate_token); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.bind_uint(3, snapshot.generation); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.bind_uint(4, snapshot.analysis_revision); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.bind_uint(5, snapshot.overlay_revision); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.bind_uint(6, utc_ms()); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.bind_uint(7, commit_state.value().active_slot); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    result = candidate_statement.step_done(); if (!result) { rollback(database, "workspace_database.persist.packed"); return result; }
+    if (sqlite3_changes(database) != 1) {
+        rollback(database, "workspace_database.persist.packed");
+        return workspace_result_t<void>::failure(
+            make_workspace_error(workspace_error_code_t::revision_conflict,
+                                 "packed snapshot candidate changed before staging",
+                                 "workspace_database.persist.packed"));
+    }
+    auto committed = commit(database, "workspace_database.persist.packed");
+    if (!committed) {
+        rollback(database, "workspace_database.persist.packed");
+        return committed;
+    }
+    auto staged = stage_complete_packed_baseline(
+        database, snapshot, search_products, managed_publication, options, candidate_token,
+        cancel, commit_metrics);
+    if (!staged)
+        return staged;
+    int writes_after = 0;
+    status = sqlite3_db_status(database, SQLITE_DBSTATUS_CACHE_WRITE,
+                               &writes_after, &highwater, 0);
+    if (status != SQLITE_OK) {
+        return workspace_result_t<void>::failure(database_error(
+            database, status, "unable to read packed persistence write counter",
+            "workspace_database.persist.packed"));
+    }
+    if (commit_metrics) {
+        const auto written_pages = writes_after >= writes_before
+            ? static_cast<std::uint64_t>(writes_after - writes_before)
+            : static_cast<std::uint64_t>(writes_after);
+        if (!checked_mul_u64(written_pages, page_size.value(),
+                             commit_metrics->page_write_bytes) ||
+            !checked_add_u64(commit_metrics->logical_bytes,
+                             settings_json.size() + metrics_json.size(),
+                             commit_metrics->logical_bytes) ||
+            !checked_add_u64(commit_metrics->rows, 2,
+                             commit_metrics->rows)) {
+            return workspace_result_t<void>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                                     "packed persistence metrics overflow",
+                                     "workspace_database.persist.packed"));
+        }
+        commit_metrics->elapsed_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count());
+    }
+    return workspace_result_t<void>::success();
+}
+
+}
+
+
+workspace_result_t<std::vector<std::uint8_t>>
+encode_managed_publication_domain(
+    const managed_artifact_publication_t& publication,
+    const cancellation_token_t& cancel) {
+    try {
+        packed_payload_writer_t writer(
+            cancel, managed_publication_max_payload_bytes);
+        auto written = write_managed_publication_domain_stream(
+            publication, writer, cancel);
+        if (!written)
+            return workspace_result_t<std::vector<std::uint8_t>>::failure(
+                written.error());
+        return writer.finish();
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed publication encoding allocation failed"));
+    } catch (const std::exception&) {
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                  "managed publication encoding failed"));
+    }
+}
+
+workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>
+decode_managed_publication_domain(
+    const std::vector<std::uint8_t>& payload,
+    const workspace_identity_t& identity,
+    const byte_provider_t& provider,
+    std::uint64_t expected_generation,
+    std::uint64_t expected_analysis_revision,
+    std::uint64_t expected_overlay_revision,
+    std::uint64_t maximum_payload_bytes,
+    const cancellation_token_t& cancel) {
+    if (payload.size() < 4U || payload.size() > maximum_payload_bytes ||
+        maximum_payload_bytes == 0 ||
+        maximum_payload_bytes > managed_publication_max_payload_bytes) {
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed publication domain exceeds its reopen budget"));
+    }
+    if (cancel.stop_requested())
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            packed_baseline_cancelled(cancel));
+    try {
+        const auto payload_size = payload.size() - 4U;
+        auto actual_checksum = crc32c_cancellable(
+            payload.data(), payload_size,
+            [&cancel] { return cancel.stop_requested(); });
+        if (!actual_checksum && cancel.stop_requested())
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                packed_baseline_cancelled(cancel));
+        if (!actual_checksum)
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                actual_checksum.error());
+        const auto expected_checksum =
+            static_cast<std::uint32_t>(payload[payload_size]) |
+            (static_cast<std::uint32_t>(payload[payload_size + 1U]) << 8U) |
+            (static_cast<std::uint32_t>(payload[payload_size + 2U]) << 16U) |
+            (static_cast<std::uint32_t>(payload[payload_size + 3U]) << 24U);
+        if (actual_checksum.value() != expected_checksum) {
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                      "managed publication domain checksum is invalid"));
+        }
+        packed_payload_reader_t reader(
+            payload, cancel, managed_publication_max_methods +
+                                 managed_publication_max_artifacts +
+                                 managed_publication_max_strings);
+        read_domain_header(reader, packed_page_type_t::managed_publication);
+        if (reader.u32() != managed_publication_domain_magic ||
+            reader.u16() != managed_publication_domain_version ||
+            reader.u16() != 0) {
+            reader.reject("managed publication domain header is invalid");
+        }
+        auto publication = std::make_shared<managed_artifact_publication_t>();
+        publication->schema_version = reader.u32();
+        publication->reader_schema_version = reader.u32();
+        publication->reader_limits = read_managed_reader_limits(reader);
+        publication->binary_id.bytes = reader.fixed_bytes<32>();
+        publication->load_profile_hash.bytes = reader.fixed_bytes<32>();
+        publication->provider_hash.bytes = reader.fixed_bytes<32>();
+        publication->provider_size = reader.u64();
+        publication->generation = reader.u64();
+        publication->analysis_revision = reader.u64();
+        publication->overlay_revision = reader.u64();
+        const auto string_count = reader.u32();
+        if (string_count == 0 ||
+            string_count > managed_publication_max_strings)
+            reader.reject("managed publication string count is invalid");
+        std::uint64_t minimum_string_bytes = 0;
+        if (!checked_mul_u64(string_count, sizeof(std::uint64_t),
+                             minimum_string_bytes) ||
+            !checked_add_u64(minimum_string_bytes, 16U,
+                             minimum_string_bytes) ||
+            minimum_string_bytes > reader.remaining_bytes())
+            reader.reject("managed publication string table is truncated");
+        if (reader.failed()) {
+            auto rejected = reader.finish();
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                rejected.error());
+        }
+        std::vector<std::string> strings;
+        strings.reserve((std::min<std::uint32_t>)(string_count, 1U << 20));
+        std::uint64_t string_bytes = 0;
+        for (std::uint32_t index = 0; index < string_count; ++index) {
+            auto value = reader.bounded_string(
+                managed_publication_max_single_string_bytes);
+            if (value.size() > managed_publication_max_single_string_bytes ||
+                !checked_add_u64(string_bytes, value.size(), string_bytes) ||
+                string_bytes > managed_publication_max_string_bytes ||
+                (index != 0 && !(strings.back() < value))) {
+                reader.reject("managed publication string table is noncanonical");
+            }
+            strings.push_back(std::move(value));
+        }
+        const auto string_at = [&](std::uint32_t reference)
+            -> const std::string* {
+            if (reference >= strings.size()) {
+                reader.reject("managed publication string reference is invalid");
+                return nullptr;
+            }
+            return &strings[reference];
+        };
+        const auto provider_source = string_at(reader.u32());
+        if (provider_source)
+            publication->provider_source = *provider_source;
+        const auto artifact_count = reader.u32();
+        const auto method_count = reader.u32();
+        std::uint64_t declared_method_limit = 0;
+        if (!checked_mul_u64(publication->reader_limits.max_methods,
+                             publication->reader_limits.max_dex_files,
+                             declared_method_limit))
+            reader.reject("managed publication reader method limit overflows");
+        if (artifact_count == 0 ||
+            artifact_count > managed_publication_max_artifacts ||
+            method_count > managed_publication_max_methods ||
+            artifact_count > publication->reader_limits.max_dex_files + 1ULL ||
+            method_count > declared_method_limit) {
+            reader.reject("managed publication record count is invalid");
+        }
+        std::uint64_t minimum_artifact_bytes = 0;
+        std::uint64_t minimum_method_bytes = 0;
+        std::uint64_t minimum_record_bytes = 4;
+        if (!checked_mul_u64(artifact_count, 73U,
+                             minimum_artifact_bytes) ||
+            !checked_mul_u64(method_count, 33U,
+                             minimum_method_bytes) ||
+            !checked_add_u64(minimum_record_bytes, minimum_artifact_bytes,
+                             minimum_record_bytes) ||
+            !checked_add_u64(minimum_record_bytes, minimum_method_bytes,
+                             minimum_record_bytes) ||
+            minimum_record_bytes > reader.remaining_bytes())
+            reader.reject("managed publication record columns are truncated");
+        if (reader.failed()) {
+            auto rejected = reader.finish();
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                rejected.error());
+        }
+        auto records = std::make_shared<managed_artifact_record_index_t>();
+        records->artifacts.resize(artifact_count);
+        records->methods.resize(method_count);
+        for (auto& value : records->artifacts)
+            value.kind = static_cast<readers::managed::managed_artifact_kind_t>(
+                reader.u8());
+        for (auto& value : records->artifacts)
+            value.artifact_hash.bytes = reader.fixed_bytes<32>();
+        for (auto& value : records->artifacts)
+            value.provider_offset = reader.u64();
+        for (auto& value : records->artifacts)
+            value.provider_size = reader.u64();
+        for (auto& value : records->artifacts)
+            value.artifact_ordinal = reader.u32();
+        for (auto& value : records->artifacts) {
+            const auto text = string_at(reader.u32());
+            if (text)
+                value.assembly_identity = *text;
+        }
+        for (auto& value : records->artifacts) {
+            const auto text = string_at(reader.u32());
+            if (text)
+                value.module_name = *text;
+        }
+        for (auto& value : records->artifacts) {
+            const auto text = string_at(reader.u32());
+            if (text)
+                value.version = *text;
+        }
+        for (auto& value : records->artifacts)
+            value.first_method = reader.u32();
+        for (auto& value : records->artifacts)
+            value.method_count = reader.u32();
+        for (auto& value : records->methods)
+            value.artifact_index = reader.u32();
+        for (auto& value : records->methods)
+            value.entity_token = reader.u32();
+        for (auto& value : records->methods)
+            value.method_index = reader.u32();
+        for (auto& value : records->methods)
+            value.provider_code_offset = reader.u64();
+        for (auto& value : records->methods)
+            value.code_size = reader.u64();
+        std::unordered_set<std::string> entity_identities;
+        entity_identities.reserve(method_count);
+        for (auto& value : records->methods) {
+            const auto text = string_at(reader.u32());
+            if (!text || !entity_identities.insert(*text).second) {
+                reader.reject("managed publication entity reference is noncanonical");
+                continue;
+            }
+            auto decoded = deserialize_decompiler_entity_key(*text);
+            if (!decoded.valid()) {
+                reader.reject("managed publication entity key is invalid");
+                continue;
+            }
+            value.entity = std::move(*decoded.value);
+        }
+        for (auto& value : records->methods)
+            value.has_body = reader.boolean();
+        if (reader.u32() != expected_checksum)
+            reader.reject("managed publication terminal checksum is inconsistent");
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                finished.error());
+        publication->records = std::static_pointer_cast<
+            const managed_artifact_record_index_t>(std::move(records));
+        auto validated = validate_managed_publication_for_encoding(
+            *publication, cancel);
+        if (!validated)
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                validated.error());
+        const auto& provider_identity = provider.identity();
+        if (publication->binary_id != identity.binary_id() ||
+            publication->load_profile_hash != identity.load_profile_hash() ||
+            publication->provider_source != provider_identity.normalized_source ||
+            publication->provider_size != provider.size() ||
+            provider_identity.size != provider.size() ||
+            (provider_identity.content_sha256 &&
+             publication->provider_hash != *provider_identity.content_sha256) ||
+            (!provider_identity.content_sha256 &&
+             (expected_overlay_revision != 0 ||
+              publication->provider_hash != identity.content_hash())) ||
+            publication->generation != expected_generation ||
+            publication->analysis_revision != expected_analysis_revision ||
+            publication->overlay_revision != expected_overlay_revision ||
+            !publication->coherent_with(
+                identity, provider, expected_generation,
+                expected_analysis_revision, expected_overlay_revision)) {
+            return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+                packed_baseline_error(workspace_error_code_t::target_conflict,
+                                      "managed publication does not match the reopened workspace"));
+        }
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::success(
+            std::static_pointer_cast<const managed_artifact_publication_t>(
+                std::move(publication)));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::limit_exceeded,
+                                  "managed publication reopen allocation failed"));
+    } catch (const std::exception&) {
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                  "managed publication reopen failed"));
+    }
 }
 
 workspace_result_t<std::vector<std::uint8_t>> encode_packed_baseline_manifest(
@@ -3838,6 +5334,30 @@ workspace_result_t<std::vector<std::uint8_t>> encode_packed_baseline_manifest(
     writer.u32(kPackedBaselineRequiredDomains);
     writer.string(candidate_token);
     return writer.finish();
+}
+
+workspace_result_t<std::shared_ptr<search_index_t>> restore_persisted_search_index(
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    persisted_search_products_t products,
+    std::shared_ptr<analysis_metrics_t> metrics,
+    const search_index_limits_t& limits,
+    const cancellation_token_t& cancel) {
+    if (!snapshot || products.live_index ||
+        products.generation != snapshot->generation ||
+        products.analysis_revision != snapshot->analysis_revision ||
+        products.overlay_revision != snapshot->overlay_revision ||
+        products.search_index_blob_version != search_index_t::serialized_version ||
+        products.search_index_blob.empty() ||
+        products.search_index_blob.size() > workspace_search_blob_limit) {
+        return workspace_result_t<std::shared_ptr<search_index_t>>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                                 "persisted search index identity or payload is invalid",
+                                 "workspace_database.restore_search"));
+    }
+    return search_index_t::restore(
+        std::move(snapshot), std::move(products.data_candidates),
+        std::move(products.switches), std::move(products.types),
+        std::move(metrics), limits, products.search_index_blob, cancel);
 }
 
 workspace_result_t<void> migrate_workspace_database_schema(
@@ -3914,148 +5434,171 @@ workspace_result_t<packed_baseline_manifest_t> decode_packed_baseline_manifest(
 
 struct decoded_packed_baseline_t {
     std::shared_ptr<analysis_snapshot_t> snapshot;
-    persisted_search_products_t search_products;
-    std::string candidate_token;
 };
 
-struct packed_baseline_envelope_t {
-    packed_baseline_manifest_t manifest;
-    std::map<packed_page_type_t, std::vector<std::uint8_t>> domains;
-};
+using packed_domain_loader_t = std::function<workspace_result_t<std::vector<std::uint8_t>>(
+    packed_page_type_t)>;
 
-workspace_result_t<packed_baseline_envelope_t> decode_packed_baseline_envelope(
-    const packed_generation_publication_t& publication,
-    const workspace_identity_t& identity,
-    const cancellation_token_t& cancel) {
-    auto manifest = decode_packed_baseline_manifest(
-        publication.generation.payload_blob, cancel);
-    if (!manifest)
-        return workspace_result_t<packed_baseline_envelope_t>::failure(
-            manifest.error());
-    if (manifest.value().generation != publication.generation.generation ||
-        manifest.value().analysis_revision !=
-            publication.generation.analysis_revision ||
-        manifest.value().overlay_revision !=
-            publication.generation.overlay_revision ||
-        !manifest.value().binary_id.constant_time_equal(identity.binary_id()) ||
-        !manifest.value().load_profile_hash.constant_time_equal(
-            identity.load_profile_hash())) {
-        return workspace_result_t<packed_baseline_envelope_t>::failure(
-            packed_baseline_error(
-                workspace_error_code_t::target_conflict,
-                "packed baseline manifest does not match the workspace identity"));
-    }
-
-    auto decoded_domains = packed_page_codec_t::decode_multi_domain_publication(
-        publication, [&cancel] { return cancel.stop_requested(); });
-    if (!decoded_domains)
-        return workspace_result_t<packed_baseline_envelope_t>::failure(
-            decoded_domains.error());
-    if (decoded_domains.value().size() !=
-        static_cast<std::size_t>(packed_page_last_data_type)) {
-        return workspace_result_t<packed_baseline_envelope_t>::failure(
-            packed_baseline_error(
-                workspace_error_code_t::integrity_failure,
-                "packed baseline publication omits required domains"));
-    }
-    packed_baseline_envelope_t envelope;
-    envelope.manifest = manifest.take_value();
-    std::uint32_t observed_domains = 0;
-    for (auto& [type, payload] : decoded_domains.value()) {
-        const auto encoded = static_cast<std::uint32_t>(type);
-        if (encoded == 0 ||
-            encoded > static_cast<std::uint32_t>(packed_page_last_data_type) ||
-            !envelope.domains.emplace(type, std::move(payload)).second) {
-            return workspace_result_t<packed_baseline_envelope_t>::failure(
-                packed_baseline_error(
-                    workspace_error_code_t::integrity_failure,
-                    "packed baseline domain inventory is invalid"));
-        }
-        observed_domains |= 1U << (encoded - 1U);
-    }
-    if (observed_domains != envelope.manifest.required_domains) {
-        return workspace_result_t<packed_baseline_envelope_t>::failure(
-            packed_baseline_error(
-                workspace_error_code_t::integrity_failure,
-                "packed baseline domain inventory does not match its manifest"));
-    }
-    return workspace_result_t<packed_baseline_envelope_t>::success(
-        std::move(envelope));
+workspace_result_t<std::vector<std::uint8_t>> read_packed_domain_payload(
+    sqlite3* database, std::uint64_t generation, packed_page_type_t domain,
+    std::uint64_t maximum_bytes, const cancellation_token_t& cancel) {
+    std::vector<std::uint8_t> payload;
+    std::uint64_t expected_ordinal = 0;
+    auto visited = visit_packed_domain_pages(
+        database, generation, domain,
+        [&](const packed_page_row_t& page,
+            const packed_page_index_row_t& index) -> workspace_result_t<void> {
+            if (cancel.stop_requested())
+                return workspace_result_t<void>::failure(
+                    packed_baseline_cancelled(cancel));
+            if (index.ordinal_begin != expected_ordinal ||
+                !checked_add_u64(expected_ordinal, index.count,
+                                 expected_ordinal)) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::integrity_failure,
+                        "packed domain record ordinals are not contiguous"));
+            }
+            const auto content_size =
+                page.payload.size() - packed_record_page_prefix_size;
+            std::uint64_t updated = 0;
+            if (!checked_add_u64(payload.size(), content_size, updated) ||
+                updated > maximum_bytes ||
+                updated > static_cast<std::uint64_t>(
+                    (std::numeric_limits<std::size_t>::max)())) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::limit_exceeded,
+                        "packed domain exceeds its bounded reopen budget"));
+            }
+            try {
+                payload.reserve(static_cast<std::size_t>(updated));
+                payload.insert(
+                    payload.end(),
+                    page.payload.begin() + packed_record_page_prefix_size,
+                    page.payload.end());
+            } catch (const std::bad_alloc&) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(
+                        workspace_error_code_t::limit_exceeded,
+                        "packed domain reopen allocation failed"));
+            }
+            return workspace_result_t<void>::success();
+        }, [&cancel] { return cancel.stop_requested(); });
+    if (!visited)
+        return workspace_result_t<std::vector<std::uint8_t>>::failure(
+            visited.error());
+    return workspace_result_t<std::vector<std::uint8_t>>::success(
+        std::move(payload));
 }
 
-workspace_result_t<persisted_search_products_t> decode_packed_search_products(
-    const packed_generation_publication_t& publication,
-    const workspace_identity_t& identity,
+workspace_result_t<persisted_search_products_t>
+decode_packed_search_products_payload(
+    const packed_baseline_manifest_t& manifest,
+    std::vector<std::uint8_t> payload,
     std::uint64_t maximum_records,
     const cancellation_token_t& cancel) {
-    auto envelope = decode_packed_baseline_envelope(
-        publication, identity, cancel);
-    if (!envelope)
-        return workspace_result_t<persisted_search_products_t>::failure(
-            envelope.error());
     persisted_search_products_t products;
-    products.generation = envelope.value().manifest.generation;
-    products.analysis_revision = envelope.value().manifest.analysis_revision;
-    products.overlay_revision = envelope.value().manifest.overlay_revision;
+    products.generation = manifest.generation;
+    products.analysis_revision = manifest.analysis_revision;
+    products.overlay_revision = manifest.overlay_revision;
     std::uint64_t decoded_records = 0;
-    packed_payload_reader_t reader(
-        envelope.value().domains.at(packed_page_type_t::search_index), cancel,
-        maximum_records, &decoded_records);
-    read_domain_header(reader, packed_page_type_t::search_index);
-    const auto data_count = reader.count();
-    products.data_candidates.reserve(data_count);
-    for (std::size_t index = 0; index < data_count; ++index)
-        products.data_candidates.push_back(read_data_candidate(reader));
-    const auto switch_count = reader.count();
-    products.switches.reserve(switch_count);
-    for (std::size_t index = 0; index < switch_count; ++index)
-        products.switches.push_back(read_switch(reader));
-    const auto type_count = reader.count();
-    products.types.reserve(type_count);
-    for (std::size_t index = 0; index < type_count; ++index)
-        products.types.push_back(read_search_type(reader));
-    products.search_index_blob_version = reader.u32();
-    products.search_index_blob = reader.bytes();
-    if (products.search_index_blob.size() > workspace_search_blob_limit)
-        reader.reject("packed search-index blob exceeds its bounded limit");
-    auto finished = reader.finish();
-    if (!finished)
+    std::size_t blob_offset = 0;
+    std::uint64_t blob_size = 0;
+    {
+        packed_payload_reader_t reader(payload, cancel, maximum_records,
+                                       &decoded_records);
+        read_domain_header(reader, packed_page_type_t::search_index);
+        const auto data_count = reader.count();
+        products.data_candidates.reserve(data_count);
+        for (std::size_t index = 0; index < data_count; ++index)
+            products.data_candidates.push_back(read_data_candidate(reader));
+        const auto switch_count = reader.count();
+        products.switches.reserve(switch_count);
+        for (std::size_t index = 0; index < switch_count; ++index)
+            products.switches.push_back(read_switch(reader));
+        const auto type_count = reader.count();
+        products.types.reserve(type_count);
+        for (std::size_t index = 0; index < type_count; ++index)
+            products.types.push_back(read_search_type(reader));
+        products.search_index_blob_version = reader.u32();
+        blob_size = reader.u64();
+        blob_offset = reader.offset();
+        if (products.search_index_blob_version != search_index_t::serialized_version ||
+            blob_size == 0 || blob_size > workspace_search_blob_limit ||
+            blob_size != reader.remaining_bytes()) {
+            reader.reject(
+                "packed search-index blob is absent or exceeds its bounded limit");
+        }
+        reader.skip_bytes(blob_size);
+        auto finished = reader.finish();
+        if (!finished)
+            return workspace_result_t<persisted_search_products_t>::failure(
+                finished.error());
+    }
+    if (blob_offset > payload.size() ||
+        blob_size != payload.size() - blob_offset) {
         return workspace_result_t<persisted_search_products_t>::failure(
-            finished.error());
+            packed_baseline_error(workspace_error_code_t::integrity_failure,
+                "packed search-index blob boundary changed during decode"));
+    }
+    payload.erase(payload.begin(), payload.begin() +
+        static_cast<std::ptrdiff_t>(blob_offset));
+    products.search_index_blob = std::move(payload);
     return workspace_result_t<persisted_search_products_t>::success(
         std::move(products));
 }
 
-workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
-    const packed_generation_publication_t& publication,
+
+
+workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_domains(
+    packed_baseline_manifest_t manifest,
+    packed_domain_loader_t load_domain,
     std::shared_ptr<const workspace_image_t> normalized_image,
     std::shared_ptr<const pe_image_t> pe_adapter,
     const workspace_identity_t& identity,
     std::uint64_t maximum_records,
     const cancellation_token_t& cancel) {
-    auto envelope = decode_packed_baseline_envelope(
-        publication, identity, cancel);
-    if (!envelope)
+    if (!load_domain || manifest.generation == 0 ||
+        !manifest.binary_id.constant_time_equal(identity.binary_id()) ||
+        !manifest.load_profile_hash.constant_time_equal(
+            identity.load_profile_hash()) ||
+        manifest.required_domains != kPackedBaselineRequiredDomains) {
         return workspace_result_t<decoded_packed_baseline_t>::failure(
-            envelope.error());
+            packed_baseline_error(
+                workspace_error_code_t::target_conflict,
+                "packed baseline manifest does not match the workspace identity"));
+    }
 
     auto snapshot = std::make_shared<analysis_snapshot_t>();
-    snapshot->binary_id = envelope.value().manifest.binary_id;
-    snapshot->load_profile_hash = envelope.value().manifest.load_profile_hash;
-    snapshot->generation = envelope.value().manifest.generation;
-    snapshot->analysis_revision = envelope.value().manifest.analysis_revision;
-    snapshot->overlay_revision = envelope.value().manifest.overlay_revision;
-    snapshot->baseline_complete = envelope.value().manifest.baseline_complete;
+    snapshot->binary_id = manifest.binary_id;
+    snapshot->load_profile_hash = manifest.load_profile_hash;
+    snapshot->generation = manifest.generation;
+    snapshot->analysis_revision = manifest.analysis_revision;
+    snapshot->overlay_revision = manifest.overlay_revision;
+    snapshot->baseline_complete = manifest.baseline_complete;
     snapshot->normalized_image = std::move(normalized_image);
     snapshot->image = std::move(pe_adapter);
-    persisted_search_products_t products;
-    products.generation = snapshot->generation;
-    products.analysis_revision = snapshot->analysis_revision;
-    products.overlay_revision = snapshot->overlay_revision;
     std::uint64_t decoded_records = 0;
+    std::vector<std::uint8_t> active_payload;
+    std::optional<workspace_error_t> domain_error;
     const auto payload_for = [&](packed_page_type_t domain)
         -> const std::vector<std::uint8_t>& {
-        return envelope.value().domains.at(domain);
+        active_payload.clear();
+        domain_error.reset();
+        auto loaded = load_domain(domain);
+        if (!loaded) {
+            domain_error = loaded.error();
+            return active_payload;
+        }
+        active_payload = loaded.take_value();
+        return active_payload;
+    };
+    const auto finish_domain = [&](packed_payload_reader_t& reader) {
+        auto finished = reader.finish();
+        if (domain_error)
+            return workspace_result_t<void>::failure(*domain_error);
+        return finished;
     };
 
     {
@@ -4070,7 +5613,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->delay_slot_counts.reserve(delay_count);
         for (std::size_t index = 0; index < delay_count; ++index)
             snapshot->delay_slot_counts.push_back(reader.u8());
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4083,7 +5626,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->operand_facts.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->operand_facts.push_back(read_operand(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4096,7 +5639,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->target_facts.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->target_facts.push_back(read_target(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4109,7 +5652,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->edges.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->edges.push_back(read_edge(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4122,7 +5665,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->strings.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->strings.push_back(read_string_record(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4135,7 +5678,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->symbols.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->symbols.push_back(read_symbol(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4147,7 +5690,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         read_domain_header(reader, packed_page_type_t::address_expressions);
         if (reader.count() != 0)
             reader.reject("packed address-expression compatibility domain is not empty");
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4160,7 +5703,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->blocks.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->blocks.push_back(read_block(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4173,7 +5716,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->functions.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->functions.push_back(read_function(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4192,7 +5735,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         for (std::size_t index = 0; index < membership_count; ++index)
             snapshot->function_block_memberships.push_back(
                 read_function_membership(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4205,7 +5748,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->xrefs.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->xrefs.push_back(read_xref(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4218,33 +5761,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->coverage.reserve(count);
         for (std::size_t index = 0; index < count; ++index)
             snapshot->coverage.push_back(read_coverage(reader));
-        auto finished = reader.finish();
-        if (!finished)
-            return workspace_result_t<decoded_packed_baseline_t>::failure(
-                finished.error());
-    }
-    {
-        packed_payload_reader_t reader(
-            payload_for(packed_page_type_t::search_index), cancel,
-            maximum_records, &decoded_records);
-        read_domain_header(reader, packed_page_type_t::search_index);
-        const auto data_count = reader.count();
-        products.data_candidates.reserve(data_count);
-        for (std::size_t index = 0; index < data_count; ++index)
-            products.data_candidates.push_back(read_data_candidate(reader));
-        const auto switch_count = reader.count();
-        products.switches.reserve(switch_count);
-        for (std::size_t index = 0; index < switch_count; ++index)
-            products.switches.push_back(read_switch(reader));
-        const auto type_count = reader.count();
-        products.types.reserve(type_count);
-        for (std::size_t index = 0; index < type_count; ++index)
-            products.types.push_back(read_search_type(reader));
-        products.search_index_blob_version = reader.u32();
-        products.search_index_blob = reader.bytes();
-        if (products.search_index_blob.size() > workspace_search_blob_limit)
-            reader.reject("packed search-index blob exceeds its bounded limit");
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4276,7 +5793,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         snapshot->call_graph.indirect_site_count = reader.u64();
         snapshot->call_graph.unresolved_site_count = reader.u64();
         snapshot->call_graph.bounded = reader.boolean();
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4301,7 +5818,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         for (std::size_t index = 0; index < conflict_count; ++index)
             snapshot->rich_facts.data_conflicts.push_back(
                 read_data_conflict(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4316,7 +5833,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         for (std::size_t index = 0; index < count; ++index)
             snapshot->rich_facts.type_references.push_back(
                 read_type_reference(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4331,7 +5848,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         for (std::size_t index = 0; index < count; ++index)
             snapshot->rich_facts.metadata_conflicts.push_back(
                 read_metadata_conflict(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4346,7 +5863,7 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
         for (std::size_t index = 0; index < count; ++index)
             snapshot->rich_facts.type_candidates.push_back(
                 read_symbol_type_candidate(reader));
-        auto finished = reader.finish();
+        auto finished = finish_domain(reader);
         if (!finished)
             return workspace_result_t<decoded_packed_baseline_t>::failure(
                 finished.error());
@@ -4359,11 +5876,51 @@ workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline(
             validated.error());
     decoded_packed_baseline_t decoded;
     decoded.snapshot = std::move(snapshot);
-    decoded.search_products = std::move(products);
-    decoded.candidate_token =
-        std::move(envelope.value().manifest.candidate_token);
     return workspace_result_t<decoded_packed_baseline_t>::success(
         std::move(decoded));
+}
+
+
+workspace_result_t<decoded_packed_baseline_t> decode_packed_baseline_streaming(
+    sqlite3* database,
+    const packed_generation_record_t& generation,
+    std::shared_ptr<const workspace_image_t> normalized_image,
+    std::shared_ptr<const pe_image_t> pe_adapter,
+    const workspace_identity_t& identity,
+    std::uint64_t maximum_records,
+    std::uint64_t maximum_domain_bytes,
+    const cancellation_token_t& cancel) {
+    auto decoded_manifest = decode_packed_baseline_manifest(
+        generation.payload_blob, cancel);
+    if (!decoded_manifest)
+        return workspace_result_t<decoded_packed_baseline_t>::failure(
+            decoded_manifest.error());
+    auto manifest = decoded_manifest.take_value();
+    if (manifest.generation != generation.generation ||
+        manifest.analysis_revision != generation.analysis_revision ||
+        manifest.overlay_revision != generation.overlay_revision ||
+        (generation.shard_count !=
+             static_cast<std::uint16_t>(packed_page_baseline_last_data_type) &&
+         generation.shard_count !=
+             static_cast<std::uint16_t>(packed_page_last_data_type)) ||
+        generation.total_records > maximum_records ||
+        generation.total_payload_bytes > maximum_domain_bytes) {
+        return workspace_result_t<decoded_packed_baseline_t>::failure(
+            packed_baseline_error(
+                workspace_error_code_t::integrity_failure,
+                "packed baseline generation metadata is inconsistent"));
+    }
+    packed_domain_loader_t loader =
+        [database, generation_id = generation.generation,
+         maximum_domain_bytes, &cancel](packed_page_type_t domain) {
+            return read_packed_domain_payload(
+                database, generation_id, domain, maximum_domain_bytes,
+                cancel);
+        };
+    return decode_packed_baseline_domains(
+        std::move(manifest), std::move(loader),
+        std::move(normalized_image), std::move(pe_adapter), identity,
+        maximum_records, cancel);
 }
 
 workspace_result_t<void> await_persistence_completion(
@@ -4499,7 +6056,13 @@ workspace_database_t::open(workspace_database_options_t options) {
         options.passive_checkpoint_pages == 0 ||
         options.instruction_chunk_records == 0 ||
         options.instruction_chunk_records > kMaximumInstructionChunkRecords ||
-        options.max_persisted_fact_records == 0) {
+        options.max_persisted_fact_records == 0 ||
+        options.packed_generation_quota_bytes == 0 ||
+        options.packed_generation_quota_bytes > packed_generation_max_payload_bytes ||
+        options.packed_stream_page_size <
+            packed_page_header_size + packed_record_page_prefix_size + 16U ||
+        options.packed_stream_page_size >
+            packed_page_header_size + packed_page_max_payload) {
         return workspace_result_t<std::shared_ptr<workspace_database_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "database identity, versions, checkpoint, and chunk limits are required",
@@ -4604,7 +6167,8 @@ std::shared_ptr<persistence_queue_t> workspace_database_t::queue() const noexcep
 
 persistence_ticket_t workspace_database_t::enqueue_write(std::string label,
                                                          writer_operation_t operation,
-                                                         cancellation_token_t cancel) {
+                                                         cancellation_token_t cancel,
+                                                         std::uint64_t reservation_bytes) {
     auto state = state_;
     return queue_->enqueue(std::move(label),
         [state, operation = std::move(operation)](const cancellation_token_t& token) mutable {
@@ -4631,11 +6195,24 @@ persistence_ticket_t workspace_database_t::enqueue_write(std::string label,
                 return workspace_result_t<void>::failure(std::move(error));
             }
             return result;
-        }, std::move(cancel));
+        }, std::move(cancel), reservation_bytes);
 }
 
 persistence_ticket_t workspace_database_t::persist_snapshot(
     std::shared_ptr<const analysis_snapshot_t> snapshot,
+    std::string analysis_settings_json,
+    std::string analysis_metrics_json,
+    cancellation_token_t cancel) {
+    return persist_snapshot(
+        std::move(snapshot),
+        std::shared_ptr<const managed_artifact_publication_t>{},
+        std::move(analysis_settings_json), std::move(analysis_metrics_json),
+        std::move(cancel));
+}
+
+persistence_ticket_t workspace_database_t::persist_snapshot(
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    std::shared_ptr<const managed_artifact_publication_t> managed_publication,
     std::string analysis_settings_json,
     std::string analysis_metrics_json,
     cancellation_token_t cancel) {
@@ -4658,7 +6235,9 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
             }, std::move(cancel));
     }
     const bool image_matches = snapshot->normalized_image
-        ? image_matches_identity(*snapshot->normalized_image, *options_.identity)
+        ? image_matches_persistence_identity(
+              *snapshot->normalized_image, *options_.identity,
+              snapshot->generation, snapshot->overlay_revision)
         : snapshot->image && image_matches_identity(*snapshot->image, *options_.identity);
     if (!image_matches) {
         return queue_->enqueue("analysis.persistence.identity_conflict",
@@ -4691,17 +6270,23 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
     const std::uint64_t analysis_revision = snapshot->analysis_revision;
     const std::uint64_t overlay_revision = snapshot->overlay_revision;
     const std::string candidate_token = candidate_token_result.take_value();
-    auto candidate = std::shared_ptr<const workspace_persistence_candidate_t>(
+    auto mutable_candidate = std::shared_ptr<workspace_persistence_candidate_t>(
         new workspace_persistence_candidate_t(weak_from_this(), candidate_token,
             generation, analysis_revision, overlay_revision));
+    mutable_candidate->packed_generation_required_.store(
+        snapshot->baseline_complete || static_cast<bool>(managed_publication),
+        std::memory_order_release);
+    auto candidate = std::shared_ptr<const workspace_persistence_candidate_t>(
+        std::move(mutable_candidate));
     auto commit_measurement = std::make_shared<persistence_commit_metrics_t>();
     auto ticket = enqueue_write("analysis.persistence.snapshot",
         [state, options = std::move(options), snapshot = std::move(snapshot),
+         managed = std::move(managed_publication),
          settings = std::move(analysis_settings_json), metrics = std::move(analysis_metrics_json),
          generation, analysis_revision, overlay_revision, candidate_token,
          commit_measurement]
         (sqlite3* database, const cancellation_token_t& token) mutable {
-            auto result = persist_snapshot_impl(database, *snapshot, nullptr, options,
+            auto result = persist_snapshot_impl(database, *snapshot, nullptr, managed, options,
                                                 settings, metrics, candidate_token, token,
                                                 commit_measurement.get());
             if (result) {
@@ -4712,7 +6297,8 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
                 publish_commit_metrics(*state, *commit_measurement);
             }
             return result;
-        }, std::move(cancel));
+        }, std::move(cancel),
+        static_cast<std::uint64_t>(options_.packed_stream_page_size) * 4ULL);
     ticket.commit_metrics = std::move(commit_measurement);
     ticket.snapshot_candidate = std::move(candidate);
     return ticket;
@@ -4721,6 +6307,20 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
 persistence_ticket_t workspace_database_t::persist_snapshot(
     std::shared_ptr<const analysis_snapshot_t> snapshot,
     persisted_search_products_t search_products,
+    std::string analysis_settings_json,
+    std::string analysis_metrics_json,
+    cancellation_token_t cancel) {
+    return persist_snapshot(
+        std::move(snapshot), std::move(search_products),
+        std::shared_ptr<const managed_artifact_publication_t>{},
+        std::move(analysis_settings_json), std::move(analysis_metrics_json),
+        std::move(cancel));
+}
+
+persistence_ticket_t workspace_database_t::persist_snapshot(
+    std::shared_ptr<const analysis_snapshot_t> snapshot,
+    persisted_search_products_t search_products,
+    std::shared_ptr<const managed_artifact_publication_t> managed_publication,
     std::string analysis_settings_json,
     std::string analysis_metrics_json,
     cancellation_token_t cancel) {
@@ -4734,7 +6334,9 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
             }, std::move(cancel));
     }
     const bool image_matches = snapshot->normalized_image
-        ? image_matches_identity(*snapshot->normalized_image, *options_.identity)
+        ? image_matches_persistence_identity(
+              *snapshot->normalized_image, *options_.identity,
+              snapshot->generation, snapshot->overlay_revision)
         : snapshot->image && image_matches_identity(*snapshot->image, *options_.identity);
     if (!image_matches) {
         return queue_->enqueue("analysis.persistence.identity_conflict",
@@ -4764,6 +6366,22 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
                                          "workspace_database.persist"));
             }, std::move(cancel));
     }
+    if ((snapshot->baseline_complete && !search_products.live_index) ||
+        (search_products.live_index &&
+         (!search_products.live_index->matches(snapshot) ||
+          !search_products.data_candidates.empty() ||
+          !search_products.switches.empty() ||
+          !search_products.types.empty() ||
+          search_products.search_index_blob_version != 0 ||
+          !search_products.search_index_blob.empty()))) {
+        return queue_->enqueue("analysis.persistence.invalid_packed_search",
+            [](const cancellation_token_t&) {
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::invalid_argument,
+                        "snapshot persistence received an ambiguous or mismatched live search index",
+                        "workspace_database.persist"));
+            }, std::move(cancel));
+    }
     auto candidate_token_result = generate_candidate_token();
     if (!candidate_token_result) {
         const auto error = candidate_token_result.error();
@@ -4778,17 +6396,23 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
     const std::uint64_t analysis_revision = snapshot->analysis_revision;
     const std::uint64_t overlay_revision = snapshot->overlay_revision;
     const std::string candidate_token = candidate_token_result.take_value();
-    auto candidate = std::shared_ptr<const workspace_persistence_candidate_t>(
+    auto mutable_candidate = std::shared_ptr<workspace_persistence_candidate_t>(
         new workspace_persistence_candidate_t(weak_from_this(), candidate_token,
             generation, analysis_revision, overlay_revision));
+    mutable_candidate->packed_generation_required_.store(
+        snapshot->baseline_complete || static_cast<bool>(managed_publication),
+        std::memory_order_release);
+    auto candidate = std::shared_ptr<const workspace_persistence_candidate_t>(
+        std::move(mutable_candidate));
     auto commit_measurement = std::make_shared<persistence_commit_metrics_t>();
     auto ticket = enqueue_write("analysis.persistence.snapshot_products",
         [state, options = std::move(options), snapshot = std::move(snapshot),
+         managed = std::move(managed_publication),
          products = std::move(search_products), settings = std::move(analysis_settings_json),
          metrics = std::move(analysis_metrics_json), generation, analysis_revision,
          overlay_revision, candidate_token, commit_measurement]
         (sqlite3* database, const cancellation_token_t& token) mutable {
-            auto result = persist_snapshot_impl(database, *snapshot, &products, options,
+            auto result = persist_snapshot_impl(database, *snapshot, &products, managed, options,
                                                 settings, metrics, candidate_token, token,
                                                 commit_measurement.get());
             if (result) {
@@ -4799,7 +6423,8 @@ persistence_ticket_t workspace_database_t::persist_snapshot(
                 publish_commit_metrics(*state, *commit_measurement);
             }
             return result;
-        }, std::move(cancel));
+        }, std::move(cancel),
+        static_cast<std::uint64_t>(options_.packed_stream_page_size) * 4ULL);
     ticket.commit_metrics = std::move(commit_measurement);
     ticket.snapshot_candidate = std::move(candidate);
     return ticket;
@@ -5028,6 +6653,19 @@ workspace_result_t<void> workspace_database_t::finalize_candidate(
                       "workspace_database.candidate.finalize"))
                 : workspace_result_t<void>::failure(manifest.error());
         }
+        const auto baseline_domains = static_cast<std::uint16_t>(
+            packed_page_baseline_last_data_type);
+        if ((manifest.value().baseline_complete &&
+             packed.value()->shard_count != baseline_domains &&
+             packed.value()->shard_count != baseline_domains + 1U) ||
+            (!manifest.value().baseline_complete &&
+             packed.value()->shard_count != 1U)) {
+            rollback(database, "workspace_database.candidate.finalize");
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "candidate packed domain set is inconsistent",
+                "workspace_database.candidate.finalize"));
+        }
         auto packed_published = aida::analysis::publish_packed_generation(
             database, candidate.generation_,
             [&cancel] { return cancel.stop_requested(); });
@@ -5216,37 +6854,62 @@ workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>
 workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> image,
                                     std::shared_ptr<const pe_image_t> pe_adapter,
                                     const cancellation_token_t& cancel) {
-    if ((image && !image_matches_identity(*image, *options_.identity)) ||
-        (pe_adapter && !image_matches_identity(*pe_adapter, *options_.identity))) {
-        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            make_workspace_error(workspace_error_code_t::target_conflict,
-                "requested image identity does not match the workspace database",
-                "workspace_database.load"));
-    }
     const auto committed_generation =
         state_->persisted_generation.load(std::memory_order_acquire);
     const auto committed_analysis_revision =
         state_->persisted_analysis_revision.load(std::memory_order_acquire);
     const auto committed_overlay_revision =
         state_->persisted_overlay_revision.load(std::memory_order_acquire);
+    if ((image && !image_matches_persistence_identity(
+                      *image, *options_.identity, committed_generation,
+                      committed_overlay_revision)) ||
+        (pe_adapter && !image_matches_identity(*pe_adapter, *options_.identity))) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
+            make_workspace_error(workspace_error_code_t::target_conflict,
+                "requested image identity does not match the workspace database",
+                "workspace_database.load"));
+    }
     if (committed_generation != 0) {
-        auto packed = load_packed_generation(committed_generation, cancel);
-        if (!packed) {
+        std::optional<decoded_packed_baseline_t> packed_decoded;
+        auto packed_read = with_reader(
+            [&](sqlite3* database) -> workspace_result_t<void> {
+                auto record = read_packed_generation(
+                    database, committed_generation, true,
+                    [&cancel] { return cancel.stop_requested(); });
+                if (!record)
+                    return workspace_result_t<void>::failure(record.error());
+                if (!record.value())
+                    return workspace_result_t<void>::success();
+                auto manifest = decode_packed_baseline_manifest(
+                    record.value()->payload_blob, cancel);
+                if (!manifest)
+                    return workspace_result_t<void>::failure(manifest.error());
+                if (!manifest.value().baseline_complete) {
+                    if (record.value()->shard_count != 1U)
+                        return workspace_result_t<void>::failure(
+                            packed_baseline_error(
+                                workspace_error_code_t::integrity_failure,
+                                "partial packed generation has an invalid domain count"));
+                    return workspace_result_t<void>::success();
+                }
+                auto decoded = decode_packed_baseline_streaming(
+                    database, *record.value(), image, pe_adapter,
+                    *options_.identity, options_.max_persisted_fact_records,
+                    options_.packed_generation_quota_bytes, cancel);
+                if (!decoded)
+                    return workspace_result_t<void>::failure(decoded.error());
+                packed_decoded = decoded.take_value();
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!packed_read) {
             return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-                packed.error());
+                packed_read.error());
         }
-        if (packed.value()) {
-            auto decoded = decode_packed_baseline(
-                *packed.value(), std::move(image), std::move(pe_adapter),
-                *options_.identity, options_.max_persisted_fact_records, cancel);
-            if (!decoded) {
-                return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-                    decoded.error());
-            }
-            if (decoded.value().snapshot->generation != committed_generation ||
-                decoded.value().snapshot->analysis_revision !=
+        if (packed_decoded) {
+            if (packed_decoded->snapshot->generation != committed_generation ||
+                packed_decoded->snapshot->analysis_revision !=
                     committed_analysis_revision ||
-                decoded.value().snapshot->overlay_revision !=
+                packed_decoded->snapshot->overlay_revision !=
                     committed_overlay_revision ||
                 state_->persisted_generation.load(std::memory_order_acquire) !=
                     committed_generation ||
@@ -5262,7 +6925,7 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
             }
             return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::success(
                 std::shared_ptr<const analysis_snapshot_t>(
-                    std::move(decoded.value().snapshot)));
+                    std::move(packed_decoded->snapshot)));
         }
     }
     auto loaded = std::make_shared<analysis_snapshot_t>();
@@ -5817,6 +7480,11 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
     state_->persisted_analysis_revision.store(loaded->analysis_revision, std::memory_order_release);
     state_->persisted_overlay_revision.store(loaded->overlay_revision, std::memory_order_release);
 
+    if (!loaded->baseline_complete) {
+        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::success(
+            std::shared_ptr<const analysis_snapshot_t>(std::move(loaded)));
+    }
+
     auto products = load_search_products(
         loaded->generation, loaded->analysis_revision, loaded->overlay_revision,
         cancel);
@@ -5824,64 +7492,151 @@ workspace_database_t::load_snapshot(std::shared_ptr<const workspace_image_t> ima
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
             products.error());
     }
-    auto domains = encode_packed_baseline_domains(*loaded, products.value(), cancel);
-    if (!domains) {
+    auto migration_products = products.take_value();
+    auto migration_index = search_index_t::build(
+        std::shared_ptr<const analysis_snapshot_t>(loaded),
+        std::move(migration_products.data_candidates),
+        std::move(migration_products.switches),
+        std::move(migration_products.types),
+        std::make_shared<analysis_metrics_t>(loaded->generation), {}, cancel);
+    if (!migration_index) {
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            domains.error());
+            migration_index.error());
     }
-    packed_page_encode_options_t encode_options;
-    encode_options.generation = loaded->generation;
-    encode_options.analysis_revision = loaded->analysis_revision;
-    encode_options.overlay_revision = loaded->overlay_revision;
-    auto batch = packed_page_codec_t::encode_multi_domain_batch(
-        domains.value(), encode_options,
-        [&cancel] { return cancel.stop_requested(); });
-    if (!batch) {
+    migration_products.search_index_blob_version = 0;
+    std::vector<std::uint8_t>().swap(
+        migration_products.search_index_blob);
+    migration_products.live_index = migration_index.take_value();
+    auto ticket = persist_snapshot(
+        std::shared_ptr<const analysis_snapshot_t>(loaded),
+        std::move(migration_products), "{}", "{}", cancel);
+    if (!ticket.accepted || !ticket.completion.valid() ||
+        !ticket.snapshot_candidate ||
+        !ticket.snapshot_candidate->packed_generation_required()) {
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            batch.error());
+            make_workspace_error(
+                workspace_error_code_t::persistence_failure,
+                "legacy baseline migration was not accepted as a packed candidate",
+                "workspace_database.load.migrate_packed"));
     }
-    auto manifest = encode_packed_baseline_manifest(*loaded, {}, cancel);
-    if (!manifest) {
-        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            manifest.error());
-    }
-    auto publication = packed_page_codec_t::build_publication(
-        batch.value(), manifest.take_value(),
-        [&cancel] { return cancel.stop_requested(); });
-    if (!publication) {
-        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            publication.error());
-    }
-    auto ticket = publish_packed_generation(
-        publication.take_value(), cancel);
     auto published = await_persistence_completion(
         ticket, cancel, "workspace_database.load.migrate_packed");
     if (!published) {
+        ticket.snapshot_candidate->discard();
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
             published.error());
     }
-    auto migrated = load_packed_generation(loaded->generation, cancel);
-    if (!migrated) {
+    auto finalized = ticket.snapshot_candidate->finalize(cancel);
+    if (!finalized) {
+        ticket.snapshot_candidate->discard();
         return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            migrated.error());
+            finalized.error());
     }
-    if (!migrated.value()) {
-        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            make_workspace_error(
-                workspace_error_code_t::integrity_failure,
-                "packed baseline migration did not publish a readable generation",
-                "workspace_database.load.migrate_packed"));
+    return load_snapshot(loaded->normalized_image, loaded->image, cancel);
+}
+
+workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>
+workspace_database_t::load_managed_publication(
+    std::shared_ptr<const byte_provider_t> provider,
+    std::uint64_t expected_generation,
+    std::uint64_t expected_analysis_revision,
+    std::uint64_t expected_overlay_revision,
+    const cancellation_token_t& cancel) const {
+    if (!provider || expected_generation == 0 ||
+        expected_analysis_revision == 0 ||
+        state_->persisted_generation.load(std::memory_order_acquire) !=
+            expected_generation ||
+        state_->persisted_analysis_revision.load(std::memory_order_acquire) !=
+            expected_analysis_revision ||
+        state_->persisted_overlay_revision.load(std::memory_order_acquire) !=
+            expected_overlay_revision) {
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            make_workspace_error(workspace_error_code_t::stale_generation,
+                                 "managed publication reopen identity is stale",
+                                 "workspace_database.load.managed"));
     }
-    auto decoded = decode_packed_baseline(
-        *migrated.value(), loaded->normalized_image, loaded->image,
-        *options_.identity, options_.max_persisted_fact_records, cancel);
-    if (!decoded) {
-        return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::failure(
-            decoded.error());
+    std::shared_ptr<const managed_artifact_publication_t> publication;
+    auto loaded = with_reader(
+        [&](sqlite3* database) -> workspace_result_t<void> {
+            auto generation = read_packed_generation(
+                database, expected_generation, true,
+                [&cancel] { return cancel.stop_requested(); });
+            if (!generation)
+                return workspace_result_t<void>::failure(generation.error());
+            if (!generation.value())
+                return workspace_result_t<void>::success();
+            auto manifest = decode_packed_baseline_manifest(
+                generation.value()->payload_blob, cancel);
+            if (!manifest)
+                return workspace_result_t<void>::failure(manifest.error());
+            if (manifest.value().generation != expected_generation ||
+                manifest.value().analysis_revision != expected_analysis_revision ||
+                manifest.value().overlay_revision != expected_overlay_revision ||
+                generation.value()->analysis_revision != expected_analysis_revision ||
+                generation.value()->overlay_revision != expected_overlay_revision) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(workspace_error_code_t::stale_generation,
+                                          "managed packed generation revision is stale"));
+            }
+            const auto baseline_domains = static_cast<std::uint16_t>(
+                packed_page_baseline_last_data_type);
+            bool managed_expected = false;
+            if (manifest.value().baseline_complete) {
+                if (generation.value()->shard_count == baseline_domains)
+                    return workspace_result_t<void>::success();
+                if (generation.value()->shard_count != baseline_domains + 1U) {
+                    return workspace_result_t<void>::failure(
+                        packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                              "complete packed generation has an invalid domain count"));
+                }
+                managed_expected = true;
+            } else {
+                if (generation.value()->shard_count != 1U) {
+                    return workspace_result_t<void>::failure(
+                        packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                              "partial managed generation has an invalid domain count"));
+                }
+                managed_expected = true;
+            }
+            if (!managed_expected)
+                return workspace_result_t<void>::success();
+            auto payload = read_packed_domain_payload(
+                database, expected_generation,
+                packed_page_type_t::managed_publication,
+                managed_publication_max_payload_bytes, cancel);
+            if (!payload)
+                return workspace_result_t<void>::failure(payload.error());
+            if (payload.value().empty()) {
+                return workspace_result_t<void>::failure(
+                    packed_baseline_error(workspace_error_code_t::integrity_failure,
+                                          "managed publication domain is empty"));
+            }
+            auto decoded = decode_managed_publication_domain(
+                payload.value(), *options_.identity, *provider,
+                expected_generation, expected_analysis_revision,
+                expected_overlay_revision,
+                managed_publication_max_payload_bytes, cancel);
+            if (!decoded)
+                return workspace_result_t<void>::failure(decoded.error());
+            publication = decoded.take_value();
+            return workspace_result_t<void>::success();
+        }, cancel);
+    if (!loaded)
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            loaded.error());
+    if (state_->persisted_generation.load(std::memory_order_acquire) !=
+            expected_generation ||
+        state_->persisted_analysis_revision.load(std::memory_order_acquire) !=
+            expected_analysis_revision ||
+        state_->persisted_overlay_revision.load(std::memory_order_acquire) !=
+            expected_overlay_revision) {
+        return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
+            make_workspace_error(workspace_error_code_t::stale_generation,
+                                 "managed publication changed during reopen",
+                                 "workspace_database.load.managed"));
     }
-    return workspace_result_t<std::shared_ptr<const analysis_snapshot_t>>::success(
-        std::shared_ptr<const analysis_snapshot_t>(
-            std::move(decoded.value().snapshot)));
+    return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::success(
+        std::move(publication));
 }
 
 workspace_result_t<persisted_search_products_t>
@@ -5903,32 +7658,65 @@ workspace_database_t::load_search_products(
                 "workspace_database.load_search.packed"));
     }
     if (expected_generation != 0) {
-        auto packed = load_packed_generation(expected_generation, cancel);
-        if (!packed)
+        std::optional<persisted_search_products_t> packed_products;
+        auto packed_read = with_reader(
+            [&](sqlite3* database) -> workspace_result_t<void> {
+                auto record = read_packed_generation(
+                    database, expected_generation, true,
+                    [&cancel] { return cancel.stop_requested(); });
+                if (!record)
+                    return workspace_result_t<void>::failure(record.error());
+                if (!record.value())
+                    return workspace_result_t<void>::success();
+                auto manifest = decode_packed_baseline_manifest(
+                    record.value()->payload_blob, cancel);
+                if (!manifest)
+                    return workspace_result_t<void>::failure(manifest.error());
+                if (manifest.value().generation != expected_generation ||
+                    manifest.value().analysis_revision != expected_analysis_revision ||
+                    manifest.value().overlay_revision != expected_overlay_revision ||
+                    !manifest.value().binary_id.constant_time_equal(
+                        options_.identity->binary_id()) ||
+                    !manifest.value().load_profile_hash.constant_time_equal(
+                        options_.identity->load_profile_hash())) {
+                    return workspace_result_t<void>::failure(
+                        make_workspace_error(workspace_error_code_t::target_conflict,
+                                             "packed search manifest identity is inconsistent",
+                                             "workspace_database.load_search.packed"));
+                }
+                if (!manifest.value().baseline_complete)
+                    return workspace_result_t<void>::success();
+                auto payload = read_packed_domain_payload(
+                    database, expected_generation,
+                    packed_page_type_t::search_index,
+                    options_.packed_generation_quota_bytes, cancel);
+                if (!payload)
+                    return workspace_result_t<void>::failure(payload.error());
+                auto decoded = decode_packed_search_products_payload(
+                    manifest.value(), payload.take_value(),
+                    options_.max_persisted_fact_records, cancel);
+                if (!decoded)
+                    return workspace_result_t<void>::failure(decoded.error());
+                packed_products = decoded.take_value();
+                return workspace_result_t<void>::success();
+            }, cancel);
+        if (!packed_read)
             return workspace_result_t<persisted_search_products_t>::failure(
-                packed.error());
-        if (packed.value()) {
-            auto decoded = decode_packed_search_products(
-                *packed.value(), *options_.identity,
-                options_.max_persisted_fact_records, cancel);
-            if (!decoded)
-                return decoded;
-            if (decoded.value().generation != expected_generation ||
-                decoded.value().analysis_revision != expected_analysis_revision ||
-                decoded.value().overlay_revision != expected_overlay_revision ||
-                state_->persisted_generation.load(std::memory_order_acquire) !=
+                packed_read.error());
+        if (packed_products) {
+            if (state_->persisted_generation.load(std::memory_order_acquire) !=
                     expected_generation ||
                 state_->persisted_analysis_revision.load(
                     std::memory_order_acquire) != expected_analysis_revision ||
                 state_->persisted_overlay_revision.load(
                     std::memory_order_acquire) != expected_overlay_revision) {
                 return workspace_result_t<persisted_search_products_t>::failure(
-                    make_workspace_error(
-                        workspace_error_code_t::stale_generation,
-                        "packed search products changed during reopen",
-                        "workspace_database.load_search.packed"));
+                    make_workspace_error(workspace_error_code_t::stale_generation,
+                                         "packed search products changed during reopen",
+                                         "workspace_database.load_search.packed"));
             }
-            return decoded;
+            return workspace_result_t<persisted_search_products_t>::success(
+                std::move(*packed_products));
         }
     }
     persisted_search_products_t products;
@@ -6315,189 +8103,6 @@ persistence_ticket_t workspace_database_t::invalidate_decompiler_cache(
         }, std::move(cancel));
 }
 
-persistence_ticket_t workspace_database_t::publish_packed_generation(
-    packed_generation_publication_t publication,
-    cancellation_token_t cancel) {
-    auto state = state_;
-    return enqueue_write("analysis.persistence.packed_generation.publish",
-        [state, publication = std::move(publication)](
-            sqlite3* database, const cancellation_token_t& token) {
-            return publish_packed_generation_atomic(database, publication,
-                [&state, &token] {
-                    return token.stop_requested() ||
-                           !state->open.load(std::memory_order_acquire);
-                });
-        }, std::move(cancel));
-}
-
-persistence_ticket_t workspace_database_t::publish_packed_generation(
-    packed_generation_publication_t publication,
-    std::shared_ptr<const workspace_persistence_candidate_t> candidate,
-    cancellation_token_t cancel) {
-    const auto reject = [&](workspace_error_t error) {
-        return queue_->enqueue(
-            "analysis.persistence.packed_generation.invalid_candidate",
-            [error = std::move(error)](const cancellation_token_t&) {
-                return workspace_result_t<void>::failure(error);
-            }, std::move(cancel));
-    };
-    if (!candidate || candidate->database_.lock().get() != this ||
-        publication.generation.generation != candidate->generation_ ||
-        publication.generation.analysis_revision != candidate->analysis_revision_ ||
-        publication.generation.overlay_revision != candidate->overlay_revision_ ||
-        publication.generation.committed) {
-        return reject(make_workspace_error(
-            workspace_error_code_t::revision_conflict,
-            "packed publication does not match its snapshot candidate",
-            "workspace_database.packed_generation.stage"));
-    }
-    auto manifest = decode_packed_baseline_manifest(
-        publication.generation.payload_blob, cancel);
-    if (!manifest)
-        return reject(manifest.error());
-    if (manifest.value().candidate_token != candidate->token_ ||
-        manifest.value().generation != candidate->generation_ ||
-        manifest.value().analysis_revision != candidate->analysis_revision_ ||
-        manifest.value().overlay_revision != candidate->overlay_revision_) {
-        return reject(make_workspace_error(
-            workspace_error_code_t::integrity_failure,
-            "packed baseline manifest is not bound to its snapshot candidate",
-            "workspace_database.packed_generation.stage"));
-    }
-
-    candidate->packed_generation_required_.store(true, std::memory_order_release);
-    auto state = state_;
-    auto measurement = std::make_shared<persistence_commit_metrics_t>();
-    const std::string candidate_token = candidate->token_;
-    auto ticket = enqueue_write(
-        "analysis.persistence.packed_generation.stage",
-        [state, publication = std::move(publication), candidate_token,
-         measurement](sqlite3* database, const cancellation_token_t& token) {
-            auto page_size = database_page_size(database);
-            if (!page_size)
-                return workspace_result_t<void>::failure(page_size.error());
-            int writes_before = 0;
-            int ignored_highwater = 0;
-            const int before_status = sqlite3_db_status(
-                database, SQLITE_DBSTATUS_CACHE_WRITE, &writes_before,
-                &ignored_highwater, 0);
-            if (before_status != SQLITE_OK) {
-                return workspace_result_t<void>::failure(database_error(
-                    database, before_status,
-                    "unable to query packed-generation cache-write counter",
-                    "workspace_database.packed_generation.stage"));
-            }
-            const auto started = std::chrono::steady_clock::now();
-            auto staged = stage_packed_generation_atomic(
-                database, publication, candidate_token,
-                [&state, &token] {
-                    return token.stop_requested() ||
-                           !state->open.load(std::memory_order_acquire);
-                });
-            if (!staged)
-                return staged;
-            int writes_after = 0;
-            const int after_status = sqlite3_db_status(
-                database, SQLITE_DBSTATUS_CACHE_WRITE, &writes_after,
-                &ignored_highwater, 0);
-            if (after_status != SQLITE_OK) {
-                return workspace_result_t<void>::failure(database_error(
-                    database, after_status,
-                    "unable to query packed-generation cache-write accounting",
-                    "workspace_database.packed_generation.stage"));
-            }
-            std::uint64_t logical_bytes = publication.generation.payload_blob.size();
-            std::uint64_t rows = 1;
-            for (const auto& page : publication.pages) {
-                if (!checked_add_u64(logical_bytes, page.payload.size(),
-                                     logical_bytes) ||
-                    !checked_add_u64(rows, 1, rows)) {
-                    return workspace_result_t<void>::failure(
-                        make_workspace_error(
-                            workspace_error_code_t::range_overflow,
-                            "packed-generation commit metrics overflowed",
-                            "workspace_database.packed_generation.stage"));
-                }
-            }
-            if (!checked_add_u64(rows, publication.index.size(), rows)) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::range_overflow,
-                    "packed-generation row metrics overflowed",
-                    "workspace_database.packed_generation.stage"));
-            }
-            const auto written_pages = writes_after >= writes_before
-                ? static_cast<std::uint64_t>(writes_after - writes_before)
-                : static_cast<std::uint64_t>(writes_after);
-            std::uint64_t page_write_bytes = 0;
-            if (!checked_mul_u64(written_pages, page_size.value(),
-                                 page_write_bytes)) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::range_overflow,
-                    "packed-generation page-write metrics overflowed",
-                    "workspace_database.packed_generation.stage"));
-            }
-            measurement->logical_bytes = logical_bytes;
-            measurement->rows = rows;
-            measurement->page_write_bytes = page_write_bytes;
-            measurement->elapsed_us = static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - started).count());
-            publish_commit_metrics(*state, *measurement);
-            return workspace_result_t<void>::success();
-        }, std::move(cancel));
-    ticket.commit_metrics = std::move(measurement);
-    return ticket;
-}
-
-workspace_result_t<std::optional<packed_generation_publication_t>>
-workspace_database_t::load_packed_generation(
-    std::uint64_t generation, const cancellation_token_t& cancel) const {
-    if (generation == 0) {
-        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
-            make_workspace_error(workspace_error_code_t::invalid_argument,
-                                 "packed generation must be non-zero",
-                                 "workspace_database.packed_generation.read"));
-    }
-    if (cancel.stop_requested()) {
-        auto error = make_workspace_error(
-            cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
-                                       : workspace_error_code_t::cancelled,
-            "packed generation read was cancelled",
-            "workspace_database.packed_generation.read");
-        error.deadline = cancel.deadline_exceeded();
-        error.cancellation = !error.deadline;
-        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
-            std::move(error));
-    }
-    std::optional<packed_generation_publication_t> publication;
-    auto result = with_reader([&](sqlite3* database) {
-        auto read = read_packed_generation_publication(database, generation,
-            [&] {
-                return cancel.stop_requested() ||
-                       !state_->open.load(std::memory_order_acquire);
-            });
-        if (!read)
-            return workspace_result_t<void>::failure(read.error());
-        publication = read.take_value();
-        return workspace_result_t<void>::success();
-    }, cancel);
-    if (!result)
-        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
-            result.error());
-    if (cancel.stop_requested()) {
-        auto error = make_workspace_error(
-            cancel.deadline_exceeded() ? workspace_error_code_t::deadline_exceeded
-                                       : workspace_error_code_t::cancelled,
-            "packed generation read was cancelled",
-            "workspace_database.packed_generation.read");
-        error.deadline = cancel.deadline_exceeded();
-        error.cancellation = !error.deadline;
-        return workspace_result_t<std::optional<packed_generation_publication_t>>::failure(
-            std::move(error));
-    }
-    return workspace_result_t<std::optional<packed_generation_publication_t>>::success(
-        std::move(publication));
-}
 
 persistence_ticket_t workspace_database_t::store_workbench_state(
     workbench_state_record_t record, cancellation_token_t cancel) {

@@ -2,14 +2,18 @@
 
 #include "isolated_worker_codec.hpp"
 #include "providers/dalvik_ssa.hpp"
+#include "providers/cli_provider.hpp"
 #include "providers/ghidra_ir_adapter.hpp"
 #include "providers/jvm_ssa.hpp"
+#include "../workspace/workspace_identity.hpp"
 
 #include "../../../../workers/native_decompiler/native_worker_protocol.hpp"
 
 #include <windows.h>
 #include <aclapi.h>
 #include <userenv.h>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +25,8 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #pragma comment(lib, "userenv.lib")
@@ -31,6 +37,8 @@ namespace {
 
 constexpr std::uint32_t k_manifest_max_string_bytes = 4096;
 constexpr std::uint32_t k_manifest_max_arguments = 32;
+constexpr std::size_t k_managed_runtime_max_files = 512;
+constexpr std::size_t k_managed_runtime_manifest_max_bytes = 512U * 1024U;
 
 class handle_t final {
 public:
@@ -228,7 +236,9 @@ bool safe_relative_path(const std::string& text) noexcept
 
 bool valid_manifest(const native_worker_manifest_t& manifest)
 {
-    if (manifest.schema_version != k_native_worker_manifest_schema_version || !safe_relative_path(manifest.worker_relative_path) ||
+    if ((manifest.schema_version != k_native_worker_manifest_schema_version &&
+         manifest.schema_version != k_managed_worker_manifest_schema_version) ||
+        !safe_relative_path(manifest.worker_relative_path) ||
         manifest.worker_relative_path.size() > k_manifest_max_string_bytes || manifest.worker_relative_path.find('\0') != std::string::npos ||
         manifest.worker_binary_hash.empty() || manifest.provider.provider_name.empty() || manifest.provider.provider_version.empty() ||
         manifest.provider.worker_build_id.empty() || manifest.provider.provider_binary_hash.empty() || manifest.provider.worker_build_hash.empty() ||
@@ -236,16 +246,45 @@ bool valid_manifest(const native_worker_manifest_t& manifest)
         manifest.worker_protocol_hash != wire::protocol_hash() || manifest.capabilities != k_native_worker_capability_decompile ||
         manifest.startup_arguments.size() > k_manifest_max_arguments)
         return false;
-    if (manifest.provider.provider != decompiler_provider_id_t::ghidra_native || manifest.provider.provider_name.size() > k_manifest_max_string_bytes ||
+    if (manifest.provider.provider_name.size() > k_manifest_max_string_bytes ||
         manifest.provider.provider_version.size() > k_manifest_max_string_bytes || manifest.provider.worker_build_id.size() > k_manifest_max_string_bytes ||
         manifest.provider.provider_name.find('\0') != std::string::npos || manifest.provider.provider_version.find('\0') != std::string::npos ||
-        manifest.provider.worker_build_id.find('\0') != std::string::npos || manifest.provider.provider_binary_hash != manifest.worker_binary_hash)
+        manifest.provider.worker_build_id.find('\0') != std::string::npos)
         return false;
+    if (manifest.provider.provider == decompiler_provider_id_t::ghidra_native) {
+        if (manifest.schema_version != k_native_worker_manifest_schema_version ||
+            !manifest.managed_runtime_manifest_hash.empty() ||
+            manifest.provider.provider_name != "aida-native-decompiler" ||
+            manifest.provider.provider_binary_hash != manifest.worker_binary_hash)
+            return false;
+    } else if (manifest.provider.provider == decompiler_provider_id_t::ilspy_cli) {
+        const auto expected_provider_hash = sha256_digest_t::from_hex(
+            "bebc24d573164da41b6f43f521d96362516d0f4b5b2715a9e7d877f4b2730345");
+        const auto expected_worker_build_hash = sha256_digest_t::from_hex(
+            "4dd8c0d095629437387a4b631fd9ac3c3cb8e840f6b7af277ccc2ad49d4bc3b7");
+        if (manifest.schema_version != k_managed_worker_manifest_schema_version ||
+            std::string_view(manifest.worker_relative_path) !=
+                k_managed_worker_binary_artifact_relative_path ||
+            manifest.managed_runtime_manifest_hash.empty() ||
+            !manifest.startup_arguments.empty() || !expected_provider_hash ||
+            !expected_worker_build_hash ||
+            manifest.provider.provider_name != "ICSharpCode.Decompiler" ||
+            manifest.provider.provider_version != "10.1.0.8386" ||
+            manifest.provider.provider_binary_hash != *expected_provider_hash ||
+            manifest.provider.worker_build_id !=
+                "aida-managed-decompiler-worker-v3" ||
+            manifest.provider.worker_build_hash != *expected_worker_build_hash)
+            return false;
+    } else {
+        return false;
+    }
     for (const auto& argument : manifest.startup_arguments) {
         if (argument.empty() || argument.size() > 1024 || argument.find('\0') != std::string::npos ||
             argument.rfind("--aida-native-decompiler-worker", 0) == 0 || argument.rfind("--read-handle", 0) == 0 ||
             argument.rfind("--write-handle", 0) == 0 || argument.rfind("--snapshot-handle", 0) == 0 ||
             argument.rfind("--snapshot-size", 0) == 0 || argument.rfind("--identity-handle", 0) == 0 ||
+            argument.rfind("--module-handle", 0) == 0 || argument.rfind("--module-size", 0) == 0 ||
+            argument.rfind("--runtime-manifest-hash", 0) == 0 ||
             !utf8_to_wide(argument))
             return false;
     }
@@ -278,12 +317,510 @@ bool read_locked_file(const std::filesystem::path& path, std::size_t maximum_byt
     return true;
 }
 
+bool has_reparse_component(const std::filesystem::path& path, DWORD& error)
+{
+    std::filesystem::path current = path.root_path();
+    for (const auto& component : path.relative_path()) {
+        current /= component;
+        const DWORD attributes = GetFileAttributesW(current.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            error = GetLastError();
+            return true;
+        }
+        if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            error = ERROR_REPARSE_TAG_INVALID;
+            return true;
+        }
+    }
+    error = ERROR_SUCCESS;
+    return false;
+}
+
+bool capture_regular_module_bytes(
+    const std::filesystem::path& input,
+    std::size_t maximum_bytes,
+    const cancellation_token_t& cancel,
+    std::vector<std::uint8_t>& output,
+    DWORD& error)
+{
+    std::error_code filesystem_error;
+    const auto normalized = std::filesystem::absolute(input, filesystem_error).lexically_normal();
+    if (filesystem_error || normalized.empty() ||
+        has_reparse_component(normalized, error)) {
+        if (filesystem_error)
+            error = ERROR_INVALID_NAME;
+        return false;
+    }
+    handle_t file(CreateFileW(normalized.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN |
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr));
+    if (!file) {
+        error = GetLastError();
+        return false;
+    }
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    BY_HANDLE_FILE_INFORMATION before{};
+    LARGE_INTEGER size{};
+    if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo, &tag, sizeof(tag)) ||
+        (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        !GetFileInformationByHandle(file.get(), &before) ||
+        !GetFileSizeEx(file.get(), &size) || size.QuadPart <= 0 ||
+        static_cast<std::uint64_t>(size.QuadPart) > maximum_bytes) {
+        error = size.QuadPart > static_cast<LONGLONG>(maximum_bytes)
+            ? ERROR_FILE_TOO_LARGE : ERROR_FILE_INVALID;
+        return false;
+    }
+    const auto resolved = final_path(file.get());
+    const auto expected = strip_extended_prefix(normalized.wstring());
+    if (!resolved || _wcsicmp(resolved->c_str(), expected.c_str()) != 0) {
+        error = ERROR_REPARSE_TAG_INVALID;
+        return false;
+    }
+    try {
+        output.resize(static_cast<std::size_t>(size.QuadPart));
+    } catch (...) {
+        error = ERROR_NOT_ENOUGH_MEMORY;
+        return false;
+    }
+    std::size_t offset = 0;
+    while (offset < output.size()) {
+        if (cancel.stop_requested()) {
+            SecureZeroMemory(output.data(), output.size());
+            output.clear();
+            error = cancel.deadline_exceeded() ? WAIT_TIMEOUT : ERROR_CANCELLED;
+            return false;
+        }
+        const DWORD requested = static_cast<DWORD>((std::min<std::size_t>)(
+            1U << 20, output.size() - offset));
+        DWORD received = 0;
+        if (!ReadFile(file.get(), output.data() + offset, requested, &received, nullptr) ||
+            received != requested) {
+            error = GetLastError();
+            if (error == ERROR_SUCCESS)
+                error = ERROR_HANDLE_EOF;
+            SecureZeroMemory(output.data(), output.size());
+            output.clear();
+            return false;
+        }
+        offset += received;
+    }
+    BY_HANDLE_FILE_INFORMATION after{};
+    LARGE_INTEGER final_size{};
+    if (!GetFileInformationByHandle(file.get(), &after) ||
+        !GetFileSizeEx(file.get(), &final_size) ||
+        final_size.QuadPart != size.QuadPart ||
+        before.dwVolumeSerialNumber != after.dwVolumeSerialNumber ||
+        before.nFileIndexHigh != after.nFileIndexHigh ||
+        before.nFileIndexLow != after.nFileIndexLow ||
+        before.ftLastWriteTime.dwHighDateTime != after.ftLastWriteTime.dwHighDateTime ||
+        before.ftLastWriteTime.dwLowDateTime != after.ftLastWriteTime.dwLowDateTime) {
+        SecureZeroMemory(output.data(), output.size());
+        output.clear();
+        error = ERROR_FILE_INVALID;
+        return false;
+    }
+    error = ERROR_SUCCESS;
+    return true;
+}
+
+struct managed_runtime_file_t {
+    std::string role;
+    std::string relative_path;
+    std::uint64_t size_bytes = 0;
+    sha256_digest_t hash;
+};
+
+struct managed_runtime_package_t {
+    sha256_digest_t manifest_hash;
+    std::wstring dotnet_root;
+    std::vector<handle_t> locked_files;
+};
+
+bool exact_fields(const nlohmann::json& value,
+                  std::initializer_list<std::string_view> names)
+{
+    if (!value.is_object() || value.size() != names.size())
+        return false;
+    return std::all_of(names.begin(), names.end(), [&value](const auto name) {
+        return value.contains(std::string(name));
+    });
+}
+
+std::optional<std::uint64_t> json_u64(const nlohmann::json& value,
+                                      const char* name)
+{
+    const auto found = value.find(name);
+    if (found == value.end() || !found->is_number_unsigned())
+        return std::nullopt;
+    return found->get<std::uint64_t>();
+}
+
+std::optional<std::string> json_string(const nlohmann::json& value,
+                                       const char* name,
+                                       std::size_t maximum = k_manifest_max_string_bytes)
+{
+    const auto found = value.find(name);
+    if (found == value.end() || !found->is_string())
+        return std::nullopt;
+    auto result = found->get<std::string>();
+    if (result.empty() || result.size() > maximum ||
+        result.find('\0') != std::string::npos)
+        return std::nullopt;
+    return result;
+}
+
+bool lowercase_digest_text(const std::string& value) noexcept
+{
+    return value.size() == 64 &&
+        std::all_of(value.begin(), value.end(), [](const unsigned char byte) {
+            return (byte >= '0' && byte <= '9') ||
+                   (byte >= 'a' && byte <= 'f');
+        });
+}
+
+std::string lowercase_path_key(std::string value)
+{
+    std::replace(value.begin(), value.end(), '\\', '/');
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](const unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+    return value;
+}
+
+bool parse_managed_runtime_file(const nlohmann::json& value,
+                                bool application,
+                                managed_runtime_file_t& result)
+{
+    if (!exact_fields(value, application
+            ? std::initializer_list<std::string_view>{"role", "relative_path", "size_bytes", "sha256"}
+            : std::initializer_list<std::string_view>{"relative_path", "size_bytes", "sha256"}))
+        return false;
+    if (application) {
+        const auto role = json_string(value, "role", 64);
+        if (!role)
+            return false;
+        result.role = *role;
+    }
+    const auto relative_path = json_string(value, "relative_path");
+    const auto size = json_u64(value, "size_bytes");
+    const auto hash_text = json_string(value, "sha256", 64);
+    if (!relative_path || !size || *size == 0 || !hash_text ||
+        !lowercase_digest_text(*hash_text) || !safe_relative_path(*relative_path))
+        return false;
+    const auto hash = sha256_digest_t::from_hex(*hash_text);
+    if (!hash || hash->empty())
+        return false;
+    result.relative_path = *relative_path;
+    std::replace(result.relative_path.begin(), result.relative_path.end(), '\\', '/');
+    result.size_bytes = *size;
+    result.hash = *hash;
+    return true;
+}
+
+sha256_digest_t canonical_runtime_inventory_hash(
+    std::vector<managed_runtime_file_t> files)
+{
+    std::sort(files.begin(), files.end(), [](const auto& left, const auto& right) {
+        return left.relative_path < right.relative_path;
+    });
+    std::string material;
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        if (index != 0)
+            material.push_back('\n');
+        material.append(files[index].relative_path);
+        material.push_back('|');
+        material.append(std::to_string(files[index].size_bytes));
+        material.push_back('|');
+        material.append(files[index].hash.to_hex());
+    }
+    return stable_serialization_hash(material);
+}
+
+std::optional<managed_runtime_package_t> verify_managed_runtime_package(
+    const std::filesystem::path& approved_root,
+    const std::wstring& approved_root_final,
+    const sha256_digest_t& expected_hash,
+    const sha256_digest_t& expected_provider_hash,
+    native_worker_execution_result_t& result)
+{
+    try {
+        const auto manifest_path = (approved_root / std::filesystem::path(
+            std::string(k_managed_runtime_manifest_artifact_relative_path))).lexically_normal();
+        const auto digest_path = (approved_root / std::filesystem::path(
+            std::string(k_managed_runtime_manifest_digest_relative_path))).lexically_normal();
+        DWORD error = ERROR_SUCCESS;
+        handle_t manifest_handle;
+        handle_t digest_handle;
+        std::vector<std::uint8_t> manifest_bytes;
+        std::vector<std::uint8_t> digest_bytes;
+        if (has_reparse_component(manifest_path, error) ||
+            has_reparse_component(digest_path, error) ||
+            !read_locked_file(manifest_path, k_managed_runtime_manifest_max_bytes,
+                manifest_handle, manifest_bytes, error) ||
+            !read_locked_file(digest_path, 128, digest_handle, digest_bytes, error)) {
+            append_diagnostic(result,
+                native_worker_diagnostic_code_t::runtime_manifest_unavailable,
+                "native_worker.managed_runtime.manifest",
+                "managed runtime manifest or digest is unavailable", error);
+            return std::nullopt;
+        }
+        const auto manifest_final = final_path(manifest_handle.get());
+        const auto digest_final = final_path(digest_handle.get());
+        if (!manifest_final || !digest_final ||
+            !path_within(approved_root_final, *manifest_final) ||
+            !path_within(approved_root_final, *digest_final)) {
+            append_diagnostic(result,
+                native_worker_diagnostic_code_t::runtime_manifest_unavailable,
+                "native_worker.managed_runtime.binding",
+                "managed runtime manifest escaped the approved package root",
+                ERROR_ACCESS_DENIED);
+            return std::nullopt;
+        }
+        sha256_digest_t actual_manifest_hash;
+        if (!wire::sha256(manifest_bytes.data(), manifest_bytes.size(),
+                actual_manifest_hash) || actual_manifest_hash != expected_hash) {
+            append_diagnostic(result,
+                native_worker_diagnostic_code_t::runtime_manifest_hash_mismatch,
+                "native_worker.managed_runtime.manifest_hash",
+                "managed runtime manifest hash does not match the worker identity",
+                ERROR_CRC);
+            return std::nullopt;
+        }
+        if (digest_bytes.size() != 65 || digest_bytes.back() != '\n') {
+            append_diagnostic(result,
+                native_worker_diagnostic_code_t::runtime_manifest_hash_mismatch,
+                "native_worker.managed_runtime.digest",
+                "managed runtime digest encoding is not canonical",
+                ERROR_INVALID_DATA);
+            return std::nullopt;
+        }
+        const std::string digest_text(
+            reinterpret_cast<const char*>(digest_bytes.data()), 64);
+        const auto parsed_digest = sha256_digest_t::from_hex(digest_text);
+        if (!lowercase_digest_text(digest_text) || !parsed_digest ||
+            *parsed_digest != actual_manifest_hash) {
+            append_diagnostic(result,
+                native_worker_diagnostic_code_t::runtime_manifest_hash_mismatch,
+                "native_worker.managed_runtime.digest",
+                "managed runtime digest does not match the manifest",
+                ERROR_CRC);
+            return std::nullopt;
+        }
+        const auto document = nlohmann::json::parse(manifest_bytes.begin(),
+            manifest_bytes.end(), nullptr, true, true);
+        SecureZeroMemory(manifest_bytes.data(), manifest_bytes.size());
+        if (!exact_fields(document, {"schema", "schema_version",
+                "source_contract_sha256", "target_framework", "runtime",
+                "application", "launch", "inventory"}) ||
+            document.at("schema") != "aida.c03.managed-runtime-manifest" ||
+            document.at("schema_version") != 1 ||
+            document.at("target_framework") != "net10.0")
+            throw std::invalid_argument("managed runtime manifest header");
+        const auto source_hash = json_string(document, "source_contract_sha256", 64);
+        const auto source_digest = sha256_digest_t::from_hex(
+            source_hash.value_or(std::string{}));
+        if (!source_hash || !lowercase_digest_text(*source_hash) ||
+            !source_digest || source_digest->empty())
+            throw std::invalid_argument("managed runtime source identity");
+        const auto& runtime = document.at("runtime");
+        const auto& application = document.at("application");
+        const auto& launch = document.at("launch");
+        const auto& inventory = document.at("inventory");
+        if (!exact_fields(runtime, {"framework", "version", "runtime_identifier",
+                "relative_root", "exact_inventory", "file_count",
+                "total_size_bytes", "canonical_inventory_sha256", "files"}) ||
+            runtime.at("framework") != "Microsoft.NETCore.App" ||
+            runtime.at("version") != "10.0.9" ||
+            runtime.at("runtime_identifier") != "win-x64" ||
+            runtime.at("relative_root") != "deps/dotnet" ||
+            runtime.at("exact_inventory") != true ||
+            !exact_fields(application, {"exact_inventory", "files"}) ||
+            application.at("exact_inventory") != true ||
+            !exact_fields(launch, {"executable_relative_path",
+                "hostfxr_relative_path", "dotnet_root_relative_path",
+                "multilevel_lookup", "roll_forward",
+                "roll_forward_to_prerelease", "machine_runtime_fallback"}) ||
+            launch.at("executable_relative_path") !=
+                "deps/AiDA_ManagedDecompilerWorker.exe" ||
+            launch.at("hostfxr_relative_path") !=
+                "deps/dotnet/host/fxr/10.0.9/hostfxr.dll" ||
+            launch.at("dotnet_root_relative_path") != "deps/dotnet" ||
+            launch.at("multilevel_lookup") != false ||
+            launch.at("roll_forward") != "Disable" ||
+            launch.at("roll_forward_to_prerelease") != false ||
+            launch.at("machine_runtime_fallback") != false ||
+            !exact_fields(inventory, {"file_count", "total_size_bytes",
+                "canonical_inventory_sha256"}) ||
+            !runtime.at("files").is_array() ||
+            !application.at("files").is_array())
+            throw std::invalid_argument("managed runtime manifest contract");
+        const auto runtime_count = json_u64(runtime, "file_count");
+        const auto runtime_total = json_u64(runtime, "total_size_bytes");
+        const auto runtime_inventory_text = json_string(runtime,
+            "canonical_inventory_sha256", 64);
+        const auto inventory_count = json_u64(inventory, "file_count");
+        const auto inventory_total = json_u64(inventory, "total_size_bytes");
+        const auto inventory_hash_text = json_string(inventory,
+            "canonical_inventory_sha256", 64);
+        if (!runtime_count || *runtime_count != 193 ||
+            *runtime_count > k_managed_runtime_max_files || !runtime_total ||
+            *runtime_total == 0 || !runtime_inventory_text ||
+            !lowercase_digest_text(*runtime_inventory_text) || !inventory_count ||
+            *inventory_count != 200 || !inventory_total || *inventory_total == 0 ||
+            !inventory_hash_text || !lowercase_digest_text(*inventory_hash_text) ||
+            runtime.at("files").size() != *runtime_count ||
+            application.at("files").size() != 7)
+            throw std::invalid_argument("managed runtime manifest inventory header");
+        std::vector<managed_runtime_file_t> runtime_files;
+        std::vector<managed_runtime_file_t> application_files;
+        runtime_files.reserve(runtime.at("files").size());
+        application_files.reserve(application.at("files").size());
+        std::unordered_set<std::string> path_keys;
+        std::uint64_t runtime_size = 0;
+        std::uint64_t application_size = 0;
+        for (const auto& encoded : runtime.at("files")) {
+            managed_runtime_file_t file;
+            if (!parse_managed_runtime_file(encoded, false, file) ||
+                file.relative_path.rfind("deps/dotnet/", 0) != 0 ||
+                !path_keys.insert(lowercase_path_key(file.relative_path)).second ||
+                file.size_bytes > (std::numeric_limits<std::uint64_t>::max)() - runtime_size)
+                throw std::invalid_argument("managed runtime file inventory");
+            runtime_size += file.size_bytes;
+            runtime_files.push_back(std::move(file));
+        }
+        const std::unordered_map<std::string, std::string> expected_application{
+            {"apphost", "deps/AiDA_ManagedDecompilerWorker.exe"},
+            {"assembly", "deps/AiDA_ManagedDecompilerWorker.dll"},
+            {"deps", "deps/AiDA_ManagedDecompilerWorker.deps.json"},
+            {"runtimeconfig", "deps/AiDA_ManagedDecompilerWorker.runtimeconfig.json"},
+            {"provider", "deps/ICSharpCode.Decompiler.dll"}};
+        std::unordered_map<std::string, std::size_t> roles;
+        std::unordered_set<std::string> direct_dependencies;
+        for (const auto& encoded : application.at("files")) {
+            managed_runtime_file_t file;
+            if (!parse_managed_runtime_file(encoded, true, file) ||
+                !path_keys.insert(lowercase_path_key(file.relative_path)).second ||
+                file.size_bytes > (std::numeric_limits<std::uint64_t>::max)() - application_size)
+                throw std::invalid_argument("managed application file inventory");
+            application_size += file.size_bytes;
+            ++roles[file.role];
+            if (file.role == "direct_dependency")
+                direct_dependencies.insert(file.relative_path);
+            else {
+                const auto expected = expected_application.find(file.role);
+                if (expected == expected_application.end() ||
+                    file.relative_path != expected->second)
+                    throw std::invalid_argument("managed application role identity");
+            }
+            if (file.role == "provider" && file.hash != expected_provider_hash)
+                throw std::invalid_argument("managed provider manifest identity");
+            application_files.push_back(std::move(file));
+        }
+        if (roles["apphost"] != 1 || roles["assembly"] != 1 ||
+            roles["deps"] != 1 || roles["runtimeconfig"] != 1 ||
+            roles["provider"] != 1 || roles["direct_dependency"] != 2 ||
+            roles.size() != 6 || direct_dependencies !=
+                std::unordered_set<std::string>{
+                    "deps/System.Collections.Immutable.dll",
+                    "deps/System.Reflection.Metadata.dll"} ||
+            application_size >
+                (std::numeric_limits<std::uint64_t>::max)() - runtime_size ||
+            runtime_size != *runtime_total ||
+            runtime_size + application_size != *inventory_total)
+            throw std::invalid_argument("managed application inventory identity");
+        const auto runtime_inventory_hash =
+            canonical_runtime_inventory_hash(runtime_files);
+        auto all_files = runtime_files;
+        all_files.insert(all_files.end(), application_files.begin(),
+            application_files.end());
+        const auto complete_inventory_hash =
+            canonical_runtime_inventory_hash(all_files);
+        if (runtime_inventory_hash.to_hex() !=
+                "8582bda52b66ad61651a2c9bc2c705cf10b038e374f87662045397c7966b02c9" ||
+            runtime_inventory_hash.to_hex() != *runtime_inventory_text ||
+            complete_inventory_hash.to_hex() != *inventory_hash_text)
+            throw std::invalid_argument("managed runtime canonical inventory");
+        managed_runtime_package_t package;
+        package.manifest_hash = actual_manifest_hash;
+        package.locked_files.reserve(all_files.size() + 2);
+        package.locked_files.push_back(std::move(manifest_handle));
+        package.locked_files.push_back(std::move(digest_handle));
+        std::unordered_set<std::string> expected_runtime_paths;
+        for (const auto& file : all_files) {
+            const auto absolute = (approved_root /
+                std::filesystem::path(file.relative_path)).lexically_normal();
+            if (has_reparse_component(absolute, error))
+                throw std::invalid_argument("managed runtime reparse path");
+            handle_t locked;
+            std::vector<std::uint8_t> bytes;
+            if (!read_locked_file(absolute,
+                    static_cast<std::size_t>((std::min<std::uint64_t>)(
+                        file.size_bytes, (std::numeric_limits<std::size_t>::max)())),
+                    locked, bytes, error) || bytes.size() != file.size_bytes)
+                throw std::invalid_argument("managed runtime file unavailable");
+            const auto resolved = final_path(locked.get());
+            sha256_digest_t actual;
+            const bool hashed = wire::sha256(bytes.data(), bytes.size(), actual);
+            SecureZeroMemory(bytes.data(), bytes.size());
+            if (!resolved || !path_within(approved_root_final, *resolved) ||
+                !hashed || actual != file.hash)
+                throw std::invalid_argument("managed runtime file identity");
+            if (file.relative_path.rfind("deps/dotnet/", 0) == 0)
+                expected_runtime_paths.insert(lowercase_path_key(file.relative_path));
+            package.locked_files.push_back(std::move(locked));
+        }
+        const auto dotnet_root = (approved_root / std::filesystem::path(
+            std::string(k_managed_dotnet_root_relative_path))).lexically_normal();
+        if (has_reparse_component(dotnet_root, error))
+            throw std::invalid_argument("managed runtime root reparse point");
+        handle_t dotnet_root_handle(CreateFileW(dotnet_root.c_str(),
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        const auto dotnet_root_final = dotnet_root_handle
+            ? final_path(dotnet_root_handle.get()) : std::nullopt;
+        if (!dotnet_root_final ||
+            !path_within(approved_root_final, *dotnet_root_final))
+            throw std::invalid_argument("managed runtime root identity");
+        std::error_code iteration_error;
+        std::size_t observed_runtime_files = 0;
+        for (std::filesystem::recursive_directory_iterator iterator(dotnet_root,
+                 std::filesystem::directory_options::none, iteration_error), end;
+             !iteration_error && iterator != end; iterator.increment(iteration_error)) {
+            const DWORD attributes = GetFileAttributesW(iterator->path().c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES ||
+                (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                throw std::invalid_argument("managed runtime tree reparse point");
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                continue;
+            const auto relative = std::filesystem::relative(iterator->path(),
+                approved_root, iteration_error).generic_string();
+            if (iteration_error ||
+                expected_runtime_paths.erase(lowercase_path_key(relative)) != 1)
+                throw std::invalid_argument("managed runtime unlisted file");
+            ++observed_runtime_files;
+        }
+        if (iteration_error || observed_runtime_files != runtime_files.size() ||
+            !expected_runtime_paths.empty())
+            throw std::invalid_argument("managed runtime exact inventory");
+        package.dotnet_root = *dotnet_root_final;
+        return package;
+    } catch (...) {
+        append_diagnostic(result,
+            native_worker_diagnostic_code_t::runtime_inventory_mismatch,
+            "native_worker.managed_runtime.inventory",
+            "managed runtime package violates its exact app-local identity",
+            ERROR_INVALID_DATA);
+        return std::nullopt;
+    }
+}
+
 struct verified_worker_t {
     native_worker_manifest_t manifest;
     sha256_digest_t manifest_hash;
     std::wstring root_path;
     std::wstring worker_path;
     handle_t worker_file;
+    std::optional<managed_runtime_package_t> managed_runtime;
 };
 
 std::optional<verified_worker_t> verify_worker(const native_worker_launch_contract_t& contract,
@@ -386,6 +923,13 @@ std::optional<verified_worker_t> verify_worker(const native_worker_launch_contra
         append_diagnostic(result, native_worker_diagnostic_code_t::worker_hash_mismatch, "native_worker.worker_hash", "worker hash does not match manifest", ERROR_CRC);
         return std::nullopt;
     }
+    if (verified.manifest.provider.provider == decompiler_provider_id_t::ilspy_cli) {
+        verified.managed_runtime = verify_managed_runtime_package(root,
+            verified.root_path, verified.manifest.managed_runtime_manifest_hash,
+            verified.manifest.provider.provider_binary_hash, result);
+        if (!verified.managed_runtime)
+            return std::nullopt;
+    }
     verified.worker_path = *worker_final_path;
     result.manifest_hash = manifest_hash;
     return verified;
@@ -413,23 +957,40 @@ std::wstring quote_argument(const std::wstring& value)
     return result;
 }
 
-std::optional<std::vector<wchar_t>> minimal_environment()
+std::optional<std::vector<wchar_t>> minimal_environment(
+    const std::optional<std::wstring>& dotnet_root)
 {
-    const DWORD required = GetEnvironmentVariableW(L"SystemRoot", nullptr, 0);
-    if (required <= 1)
+    std::wstring system_root(32768, L'\0');
+    const UINT written = GetWindowsDirectoryW(system_root.data(),
+        static_cast<UINT>(system_root.size()));
+    if (written == 0 || written >= static_cast<UINT>(system_root.size()))
         return std::nullopt;
-    std::wstring system_root(required - 1, L'\0');
-    if (GetEnvironmentVariableW(L"SystemRoot", system_root.data(), required) != required - 1)
+    system_root.resize(written);
+    if (dotnet_root && (dotnet_root->empty() ||
+        dotnet_root->find(L'=') != std::wstring::npos))
         return std::nullopt;
-    std::wstring block = L"SystemRoot=" + system_root;
-    block.push_back(L'\0');
-    block.append(L"WINDIR=");
-    block.append(system_root);
-    block.push_back(L'\0');
-    block.append(L"PATH=");
-    block.append(system_root);
-    block.append(L"\\System32");
-    block.push_back(L'\0');
+    std::vector<std::wstring> entries{
+        L"COMPlus_EnableDiagnostics=0",
+        L"DOTNET_CLI_TELEMETRY_OPTOUT=1",
+        L"DOTNET_EnableDiagnostics=0",
+        L"DOTNET_MULTILEVEL_LOOKUP=0",
+        L"DOTNET_NOLOGO=1",
+        L"DOTNET_ROLL_FORWARD=Disable",
+        L"DOTNET_ROLL_FORWARD_TO_PRERELEASE=0",
+        L"DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1",
+        L"PATH=" + system_root + L"\\System32",
+        L"SystemRoot=" + system_root,
+        L"WINDIR=" + system_root};
+    if (dotnet_root)
+        entries.push_back(L"DOTNET_ROOT=" + *dotnet_root);
+    std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+        return _wcsicmp(left.c_str(), right.c_str()) < 0;
+    });
+    std::wstring block;
+    for (const auto& entry : entries) {
+        block.append(entry);
+        block.push_back(L'\0');
+    }
     block.push_back(L'\0');
     return std::vector<wchar_t>(block.begin(), block.end());
 }
@@ -606,7 +1167,10 @@ bool create_snapshot_mapping(const native_worker_snapshot_t& snapshot, handle_t&
         return false;
     }
     std::memcpy(view, snapshot.bytes->data(), snapshot.bytes->size());
-    UnmapViewOfFile(view);
+    if (!UnmapViewOfFile(view)) {
+        error = GetLastError();
+        return false;
+    }
     HANDLE raw_child_mapping = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), mapping.get(), GetCurrentProcess(), &raw_child_mapping, FILE_MAP_READ, TRUE, 0)) {
         error = GetLastError();
@@ -639,6 +1203,7 @@ struct worker_instance_t {
     handle_t process;
     handle_t request_pipe;
     handle_t response_pipe;
+    std::vector<handle_t> runtime_identity_locks;
     wire::session_material_t session;
     wire::frame_reader_t reader;
     std::uint64_t next_host_sequence = 1;
@@ -674,7 +1239,7 @@ bool create_pipe_pair(handle_t& child_end, handle_t& parent_end, bool child_read
     return true;
 }
 
-bool launch_worker(const verified_worker_t& verified, const native_worker_execution_request_t& request,
+bool launch_worker(verified_worker_t& verified, const native_worker_execution_request_t& request,
                    const native_worker_host_limits_t& host_limits, worker_instance_t& worker,
                    native_worker_execution_result_t& result)
 {
@@ -711,6 +1276,8 @@ bool launch_worker(const verified_worker_t& verified, const native_worker_execut
         append_diagnostic(result, native_worker_diagnostic_code_t::bootstrap_failed, "native_worker.session", "session entropy could not be acquired", ERROR_CRC);
         return false;
     }
+    const bool managed = verified.manifest.provider.provider ==
+        decompiler_provider_id_t::ilspy_cli;
     std::array<HANDLE, 4> inherited_handles{child_read.get(), child_write.get(), child_snapshot.get(), child_identity.get()};
     std::uint64_t mitigation_policy = PROCESS_CREATION_MITIGATION_POLICY_DEP_ENABLE |
         PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE |
@@ -720,8 +1287,9 @@ bool launch_worker(const verified_worker_t& verified, const native_worker_execut
         PROCESS_CREATION_MITIGATION_POLICY_STRICT_HANDLE_CHECKS_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON |
         PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON |
-        PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON |
-        PROCESS_CREATION_MITIGATION_POLICY_PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
+        PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_ON;
+    if (!managed)
+        mitigation_policy |= PROCESS_CREATION_MITIGATION_POLICY_PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
     DWORD child_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
     HANDLE job_list[] = {worker.job.get()};
     SECURITY_CAPABILITIES capabilities{};
@@ -756,8 +1324,26 @@ bool launch_worker(const verified_worker_t& verified, const native_worker_execut
         append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected, "native_worker.attributes", "process security attributes were rejected", error);
         return false;
     }
+    if (managed) {
+        if (!request.managed_request || !verified.managed_runtime ||
+            verified.managed_runtime->locked_files.size() != 202 ||
+            verified.managed_runtime->manifest_hash !=
+                verified.manifest.managed_runtime_manifest_hash ||
+            request.managed_request->worker.runtime_manifest_hash !=
+                verified.manifest.managed_runtime_manifest_hash) {
+            DeleteProcThreadAttributeList(attribute_list);
+            SecureZeroMemory(attributes.data(), attributes.size());
+            append_diagnostic(result, native_worker_diagnostic_code_t::launch_policy_rejected,
+                "native_worker.managed_request",
+                "managed worker request is not bound to the verified app-local runtime",
+                ERROR_INVALID_DATA);
+            return false;
+        }
+    }
     std::wstring command_line = quote_argument(verified.worker_path);
-    command_line.append(L" --aida-native-decompiler-worker");
+    command_line.append(managed
+        ? L" --aida-managed-decompiler-worker"
+        : L" --aida-native-decompiler-worker");
     command_line.append(L" --provider=");
     command_line.append(std::to_wstring(
         static_cast<std::uint32_t>(request.cache_key.provider.provider)));
@@ -765,12 +1351,17 @@ bool launch_worker(const verified_worker_t& verified, const native_worker_execut
     command_line.append(std::to_wstring(reinterpret_cast<std::uintptr_t>(child_read.get())));
     command_line.append(L" --write-handle=");
     command_line.append(std::to_wstring(reinterpret_cast<std::uintptr_t>(child_write.get())));
-    command_line.append(L" --snapshot-handle=");
+    command_line.append(managed ? L" --module-handle=" : L" --snapshot-handle=");
     command_line.append(std::to_wstring(reinterpret_cast<std::uintptr_t>(child_snapshot.get())));
-    command_line.append(L" --snapshot-size=");
+    command_line.append(managed ? L" --module-size=" : L" --snapshot-size=");
     command_line.append(std::to_wstring(request.snapshot.bytes->size()));
     command_line.append(L" --identity-handle=");
     command_line.append(std::to_wstring(reinterpret_cast<std::uintptr_t>(child_identity.get())));
+    if (managed) {
+        command_line.append(L" --runtime-manifest-hash=");
+        command_line.append(utf8_to_wide(
+            verified.manifest.managed_runtime_manifest_hash.to_hex()).value());
+    }
     for (const auto& argument : verified.manifest.startup_arguments) {
         const auto wide = utf8_to_wide(argument);
         if (!wide) {
@@ -782,7 +1373,9 @@ bool launch_worker(const verified_worker_t& verified, const native_worker_execut
         command_line.push_back(L' ');
         command_line.append(quote_argument(*wide));
     }
-    const auto environment = minimal_environment();
+    const auto environment = minimal_environment(managed
+        ? std::optional<std::wstring>{verified.managed_runtime->dotnet_root}
+        : std::nullopt);
     if (!environment) {
         DeleteProcThreadAttributeList(attribute_list);
         SecureZeroMemory(attributes.data(), attributes.size());
@@ -821,6 +1414,8 @@ bool launch_worker(const verified_worker_t& verified, const native_worker_execut
         TerminateJobObject(worker.job.get(), ERROR_CANCELLED);
         return false;
     }
+    if (verified.managed_runtime)
+        worker.runtime_identity_locks = std::move(verified.managed_runtime->locked_files);
     return true;
 }
 
@@ -846,13 +1441,28 @@ bool same_provider(const decompiler_provider_identity_t& lhs, const decompiler_p
         lhs.worker_build_hash == rhs.worker_build_hash;
 }
 
+bool same_profile(const decompiler_profile_budget_t& lhs,
+                  const decompiler_profile_budget_t& rhs) noexcept
+{
+    return lhs.schema_version == rhs.schema_version &&
+        lhs.profile == rhs.profile &&
+        lhs.max_wall_clock_ms == rhs.max_wall_clock_ms &&
+        lhs.max_cpu_ms == rhs.max_cpu_ms &&
+        lhs.max_memory_bytes == rhs.max_memory_bytes &&
+        lhs.max_provider_ir_nodes == rhs.max_provider_ir_nodes &&
+        lhs.max_hir_nodes == rhs.max_hir_nodes &&
+        lhs.max_ast_nodes == rhs.max_ast_nodes &&
+        lhs.max_semantic_queries == rhs.max_semantic_queries &&
+        lhs.semantic_proofs_enabled == rhs.semantic_proofs_enabled;
+}
+
 const char* isolated_provider_name(const decompiler_provider_id_t provider) noexcept
 {
     switch (provider) {
     case decompiler_provider_id_t::ghidra_native: return "aida-native-decompiler";
     case decompiler_provider_id_t::jvm_ssa: return "aida-jvm-ssa";
     case decompiler_provider_id_t::dalvik_ssa: return "aida-dalvik-ssa";
-    case decompiler_provider_id_t::ilspy_cli: return nullptr;
+    case decompiler_provider_id_t::ilspy_cli: return "ICSharpCode.Decompiler";
     }
     return nullptr;
 }
@@ -874,6 +1484,10 @@ bool compatible_worker_provider(
 {
     const auto* expected_name = isolated_provider_name(route.provider);
     return expected_name && route.provider_name == expected_name &&
+        ((route.provider == decompiler_provider_id_t::ilspy_cli &&
+          manifest.provider == decompiler_provider_id_t::ilspy_cli) ||
+         (route.provider != decompiler_provider_id_t::ilspy_cli &&
+          manifest.provider == decompiler_provider_id_t::ghidra_native)) &&
         route.provider_version == manifest.provider_version &&
         route.provider_binary_hash == manifest.provider_binary_hash &&
         route.worker_build_id == manifest.worker_build_id &&
@@ -992,6 +1606,86 @@ bool validate_envelope(const decompiler_worker_message_t& message, const wire::f
     }, message);
 }
 
+bool validate_managed_hello(
+    const wire::frame_t& frame,
+    const wire::session_material_t& session,
+    const verified_worker_t& verified)
+{
+    try {
+        if (frame.kind != wire::frame_kind_t::decompiler_contract)
+            return false;
+        const auto value = nlohmann::json::parse(frame.payload.begin(), frame.payload.end(),
+            nullptr, true, true);
+        if (!value.is_object() || value.size() != 11 ||
+            value.at("schema") != "aida.c03.managed-cli.transport" ||
+            value.at("schemaVersion") != 3 || value.at("kind") != "hello" ||
+            value.at("sequence") != frame.sequence ||
+            value.at("sessionNonceHash") != session.nonce_hash.to_hex() ||
+            value.at("manifestHash") != verified.manifest_hash.to_hex() ||
+            value.at("runtimeManifestHash") !=
+                verified.manifest.managed_runtime_manifest_hash.to_hex() ||
+            value.at("workerBinaryHash") != verified.manifest.worker_binary_hash.to_hex() ||
+            value.at("providerBinaryHash") != verified.manifest.provider.provider_binary_hash.to_hex() ||
+            value.at("workerBuildId") != verified.manifest.provider.worker_build_id ||
+            value.at("workerBuildHash") != verified.manifest.provider.worker_build_hash.to_hex())
+            return false;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool send_managed_payload(
+    worker_instance_t& worker,
+    const std::string& payload,
+    const native_worker_host_limits_t& limits,
+    DWORD& error)
+{
+    return !payload.empty() && wire::send_frame(worker.request_pipe.get(), worker.session,
+        wire::frame_kind_t::decompiler_contract, worker.next_host_sequence++,
+        reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size(),
+        limits.max_frame_bytes, error);
+}
+
+bool valid_managed_terminal_payload(
+    const wire::frame_t& frame,
+    const managed_cli::request_t& request)
+{
+    try {
+        if (frame.kind != wire::frame_kind_t::decompiler_contract)
+            return false;
+        const auto value = nlohmann::json::parse(frame.payload.begin(), frame.payload.end(),
+            nullptr, true, true);
+        const auto& source = value.at("moduleSource");
+        if (!value.is_object() || value.at("schema") != "aida.c03.managed-cli.worker" ||
+            value.at("schemaVersion") != managed_cli::k_managed_cli_worker_protocol_version ||
+            value.at("sequence") != request.sequence ||
+            value.at("requestId") != request.request_id || !source.is_object() ||
+            source.size() != 4 ||
+            source.at("logicalIdentity") != request.module_source.logical_identity ||
+            source.at("moduleHash") != request.module_source.module_hash.to_hex() ||
+            source.at("moduleSize") != request.module_source.module_size ||
+            value.at("entityHash") != request.entity_hash.to_hex() ||
+            value.at("workspaceGeneration") != request.workspace_generation ||
+            value.at("typeGraphRevision") != request.type_graph_revision ||
+            value.at("runtimeManifestHash") !=
+                request.worker.runtime_manifest_hash.to_hex() ||
+            value.at("contractHash") != request.contract_hash.to_hex() ||
+            value.at("cacheIdentity") != request.cache_identity.to_hex() ||
+            value.at("requestBindingHash") != request.request_binding_hash.to_hex())
+            return false;
+        const auto expected_source_kind = request.module_source.kind ==
+            managed_cli::module_source_kind_t::regular_file
+            ? "regular_file" : "embedded_member";
+        if (source.at("kind") != expected_source_kind)
+            return false;
+        const auto kind = value.at("kind").get<std::string>();
+        return kind == "result" || kind == "failure";
+    } catch (...) {
+        return false;
+    }
+}
+
 std::chrono::steady_clock::time_point effective_deadline(const native_worker_execution_request_t& request)
 {
     const auto profile_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(request.profile.max_wall_clock_ms);
@@ -1039,6 +1733,8 @@ std::string serialize_native_worker_manifest(const native_worker_manifest_t& val
     writer.u32(static_cast<std::uint32_t>(value.startup_arguments.size()));
     for (const auto& argument : value.startup_arguments)
         writer.string(argument);
+    if (value.schema_version == k_managed_worker_manifest_schema_version)
+        writer.digest(value.managed_runtime_manifest_hash);
     return writer.take();
 }
 
@@ -1075,6 +1771,11 @@ native_worker_manifest_decode_t deserialize_native_worker_manifest(const std::st
         }
         manifest.startup_arguments.push_back(std::move(argument));
     }
+    if (manifest.schema_version == k_managed_worker_manifest_schema_version &&
+        !reader.digest(manifest.managed_runtime_manifest_hash)) {
+        result.error = "managed worker manifest runtime identity is truncated";
+        return result;
+    }
     if (!reader.exhausted() || !valid_manifest(manifest)) {
         result.error = "native worker manifest fields violate the launch contract";
         return result;
@@ -1101,6 +1802,114 @@ std::optional<native_worker_snapshot_t> make_native_worker_snapshot(std::vector<
     if (!wire::sha256(result.bytes->data(), result.bytes->size(), result.hash))
         return std::nullopt;
     return result;
+}
+
+workspace_result_t<managed_worker_snapshot_binding_t> capture_managed_worker_snapshot(
+    const std::shared_ptr<const managed_cli::request_t>& request,
+    std::size_t maximum_bytes,
+    const cancellation_token_t& cancel)
+{
+    const auto failure = [](workspace_error_code_t code, std::string message,
+                            std::string phase, DWORD win32_error = ERROR_SUCCESS) {
+        auto error = make_workspace_error(code, std::move(message), std::move(phase));
+        if (win32_error != ERROR_SUCCESS)
+            error.win32_status = win32_error;
+        return workspace_result_t<managed_worker_snapshot_binding_t>::failure(
+            std::move(error));
+    };
+    if (!request || maximum_bytes == 0 ||
+        maximum_bytes > managed_cli::k_managed_cli_maximum_module_bytes)
+        return failure(workspace_error_code_t::invalid_argument,
+            "managed CLI snapshot capture contract is invalid",
+            "native_worker.managed_snapshot");
+    if (cancel.stop_requested())
+        return failure(cancel.deadline_exceeded()
+                ? workspace_error_code_t::deadline_exceeded
+                : workspace_error_code_t::cancelled,
+            "managed CLI snapshot capture was cancelled",
+            "native_worker.managed_snapshot");
+    const auto bounded_maximum = static_cast<std::size_t>((std::min<std::uint64_t>)(
+        maximum_bytes, request->profile.max_memory_bytes / 2U));
+    if (bounded_maximum == 0)
+        return failure(workspace_error_code_t::limit_exceeded,
+            "managed CLI snapshot has no available memory budget",
+            "native_worker.managed_snapshot");
+
+    std::shared_ptr<const managed_cli::request_t> bound_request;
+    if (request->module_source.kind == managed_cli::module_source_kind_t::regular_file) {
+        const auto module_path = utf8_to_wide(request->module_source.filesystem_path);
+        if (!module_path)
+            return failure(workspace_error_code_t::invalid_argument,
+                "managed CLI module path is not valid UTF-8",
+                "native_worker.managed_snapshot.path", ERROR_INVALID_NAME);
+        std::vector<std::uint8_t> bytes;
+        DWORD capture_error = ERROR_SUCCESS;
+        if (!capture_regular_module_bytes(*module_path, bounded_maximum, cancel,
+                bytes, capture_error)) {
+            const auto code = capture_error == ERROR_CANCELLED
+                ? workspace_error_code_t::cancelled
+                : capture_error == WAIT_TIMEOUT
+                    ? workspace_error_code_t::deadline_exceeded
+                    : capture_error == ERROR_FILE_TOO_LARGE
+                        ? workspace_error_code_t::limit_exceeded
+                        : workspace_error_code_t::integrity_failure;
+            return failure(code,
+                "managed CLI regular module could not be captured immutably",
+                "native_worker.managed_snapshot.capture", capture_error);
+        }
+        auto bound = managed_cli::bind_module_snapshot(*request, std::move(bytes), cancel);
+        if (!bound)
+            return workspace_result_t<managed_worker_snapshot_binding_t>::failure(
+                bound.error());
+        try {
+            bound_request = std::make_shared<const managed_cli::request_t>(
+                bound.take_value());
+        } catch (...) {
+            return failure(workspace_error_code_t::limit_exceeded,
+                "managed CLI bound request allocation failed",
+                "native_worker.managed_snapshot.binding");
+        }
+    } else if (request->module_source.kind ==
+               managed_cli::module_source_kind_t::embedded_member) {
+        if (!request->module_snapshot || request->module_snapshot->empty() ||
+            request->module_snapshot->size() > bounded_maximum)
+            return failure(workspace_error_code_t::limit_exceeded,
+                "managed CLI embedded module violates the snapshot budget",
+                "native_worker.managed_snapshot.embedded");
+        const auto validated = managed_cli::serialize_request(*request);
+        if (!validated)
+            return workspace_result_t<managed_worker_snapshot_binding_t>::failure(
+                validated.error());
+        bound_request = request;
+    } else {
+        return failure(workspace_error_code_t::invalid_argument,
+            "managed CLI module source kind is invalid",
+            "native_worker.managed_snapshot.source");
+    }
+
+    native_worker_snapshot_t snapshot;
+    snapshot.bytes = bound_request->module_snapshot;
+    snapshot.hash = bound_request->module_source.module_hash;
+    if (!snapshot.bytes)
+        return failure(workspace_error_code_t::integrity_failure,
+            "managed CLI captured snapshot has no immutable bytes",
+            "native_worker.managed_snapshot.verify");
+    const auto verified_hash = sha256_bytes(
+        snapshot.bytes->data(), snapshot.bytes->size(), cancel);
+    if (!verified_hash)
+        return workspace_result_t<managed_worker_snapshot_binding_t>::failure(
+            verified_hash.error());
+    if (!snapshot.valid() || snapshot.bytes->size() !=
+            bound_request->module_source.module_size ||
+        verified_hash.value() != snapshot.hash)
+        return failure(workspace_error_code_t::integrity_failure,
+            "managed CLI captured snapshot failed final verification",
+            "native_worker.managed_snapshot.verify", ERROR_CRC);
+    managed_worker_snapshot_binding_t result;
+    result.snapshot = std::move(snapshot);
+    result.request = std::move(bound_request);
+    return workspace_result_t<managed_worker_snapshot_binding_t>::success(
+        std::move(result));
 }
 
 workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_worker_runtime(
@@ -1187,12 +1996,15 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
 
         std::string digest_text(
             reinterpret_cast<const char*>(digest_bytes.data()), digest_bytes.size());
-        while (!digest_text.empty() &&
-               std::isspace(static_cast<unsigned char>(digest_text.back())) != 0)
-            digest_text.pop_back();
         const auto digest_hex_size = sha256_digest_t{}.bytes.size() * 2U;
-        if (digest_text.size() != digest_hex_size ||
-            !std::all_of(digest_text.begin(), digest_text.end(), [](const unsigned char value) {
+        if (digest_text.size() != digest_hex_size + 1U ||
+            digest_text.back() != '\n') {
+            return failure(workspace_error_code_t::integrity_failure,
+                "native decompiler worker manifest digest is malformed",
+                "native_worker.runtime.digest");
+        }
+        digest_text.pop_back();
+        if (!std::all_of(digest_text.begin(), digest_text.end(), [](const unsigned char value) {
                 return (value >= '0' && value <= '9') ||
                        (value >= 'a' && value <= 'f');
             })) {
@@ -1217,6 +2029,7 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
             reinterpret_cast<const char*>(manifest_bytes.data()), manifest_bytes.size()));
         SecureZeroMemory(manifest_bytes.data(), manifest_bytes.size());
         if (!decoded.valid() || !decoded.value || !valid_manifest(*decoded.value) ||
+            decoded.value->provider.provider != decompiler_provider_id_t::ghidra_native ||
             std::string_view(decoded.value->worker_relative_path) !=
                 k_native_worker_binary_artifact_relative_path ||
             decoded.value->worker_protocol_hash != native_worker_protocol_hash()) {
@@ -1225,20 +2038,118 @@ workspace_result_t<packaged_native_worker_runtime_t> create_packaged_native_work
                 "native_worker.runtime.manifest_contract");
         }
 
+        const auto managed_manifest_path = (runtime_root /
+            std::filesystem::path(std::string(k_managed_worker_manifest_artifact_relative_path))).lexically_normal();
+        const auto managed_digest_path = (runtime_root /
+            std::filesystem::path(std::string(k_managed_worker_manifest_digest_relative_path))).lexically_normal();
+        const DWORD managed_manifest_attributes = GetFileAttributesW(managed_manifest_path.c_str());
+        const DWORD managed_digest_attributes = GetFileAttributesW(managed_digest_path.c_str());
+        if (managed_manifest_attributes == INVALID_FILE_ATTRIBUTES ||
+            managed_digest_attributes == INVALID_FILE_ATTRIBUTES ||
+            (managed_manifest_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+            (managed_digest_attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+            return failure(workspace_error_code_t::provider_unavailable,
+                "managed decompiler worker manifest package is unavailable",
+                "native_worker.runtime.managed_package", GetLastError());
+        }
+        handle_t managed_manifest_file;
+        handle_t managed_digest_file;
+        std::vector<std::uint8_t> managed_manifest_bytes;
+        std::vector<std::uint8_t> managed_digest_bytes;
+        if (!read_locked_file(managed_manifest_path, 64U * 1024U,
+                managed_manifest_file, managed_manifest_bytes, error) ||
+            !read_locked_file(managed_digest_path, 4096U,
+                managed_digest_file, managed_digest_bytes, error)) {
+            return failure(workspace_error_code_t::provider_unavailable,
+                "managed decompiler worker manifest package could not be read",
+                "native_worker.runtime.managed_manifest", error);
+        }
+        const auto managed_manifest_final = final_path(managed_manifest_file.get());
+        const auto managed_digest_final = final_path(managed_digest_file.get());
+        if (!managed_manifest_final || !managed_digest_final ||
+            !path_within(normalized_root, *managed_manifest_final) ||
+            !path_within(normalized_root, *managed_digest_final)) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "managed decompiler worker package escaped the approved runtime root",
+                "native_worker.runtime.managed_binding", ERROR_ACCESS_DENIED);
+        }
+        std::string managed_digest_text(
+            reinterpret_cast<const char*>(managed_digest_bytes.data()),
+            managed_digest_bytes.size());
+        if (managed_digest_text.size() != digest_hex_size + 1U ||
+            managed_digest_text.back() != '\n') {
+            return failure(workspace_error_code_t::integrity_failure,
+                "managed decompiler worker manifest digest is malformed",
+                "native_worker.runtime.managed_digest");
+        }
+        managed_digest_text.pop_back();
+        if (!std::all_of(managed_digest_text.begin(), managed_digest_text.end(),
+                [](const unsigned char value) {
+                    return (value >= '0' && value <= '9') ||
+                           (value >= 'a' && value <= 'f');
+                })) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "managed decompiler worker manifest digest is malformed",
+                "native_worker.runtime.managed_digest");
+        }
+        const auto expected_managed_manifest_hash =
+            sha256_digest_t::from_hex(managed_digest_text);
+        sha256_digest_t managed_manifest_hash;
+        if (!expected_managed_manifest_hash ||
+            !wire::sha256(managed_manifest_bytes.data(), managed_manifest_bytes.size(),
+                managed_manifest_hash) ||
+            managed_manifest_hash != *expected_managed_manifest_hash) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "managed decompiler worker manifest digest does not match the package",
+                "native_worker.runtime.managed_manifest_hash", ERROR_CRC);
+        }
+        const auto managed_decoded = deserialize_native_worker_manifest(std::string(
+            reinterpret_cast<const char*>(managed_manifest_bytes.data()),
+            managed_manifest_bytes.size()));
+        SecureZeroMemory(managed_manifest_bytes.data(), managed_manifest_bytes.size());
+        if (!managed_decoded.valid() || !managed_decoded.value ||
+            !valid_manifest(*managed_decoded.value) ||
+            managed_decoded.value->provider.provider != decompiler_provider_id_t::ilspy_cli ||
+            std::string_view(managed_decoded.value->worker_relative_path) !=
+                k_managed_worker_binary_artifact_relative_path ||
+            managed_decoded.value->worker_protocol_hash != native_worker_protocol_hash()) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "managed decompiler worker manifest violates the production launch contract",
+                "native_worker.runtime.managed_manifest_contract");
+        }
+
         native_worker_launch_contract_t launch_contract;
         launch_contract.approved_root = runtime_root;
         launch_contract.manifest_path = manifest_path;
         launch_contract.expected_manifest_hash = manifest_hash;
         auto host = std::make_shared<native_worker_host_t>(std::move(launch_contract));
+        native_worker_launch_contract_t managed_launch_contract;
+        managed_launch_contract.approved_root = runtime_root;
+        managed_launch_contract.manifest_path = managed_manifest_path;
+        managed_launch_contract.expected_manifest_hash = managed_manifest_hash;
+        native_worker_execution_result_t managed_runtime_verification;
+        if (!verify_worker(managed_launch_contract, managed_runtime_verification)) {
+            return failure(workspace_error_code_t::integrity_failure,
+                "managed decompiler app-local runtime failed package verification",
+                "native_worker.runtime.managed_runtime", ERROR_CRC);
+        }
+        auto managed_host = std::make_shared<native_worker_host_t>(
+            std::move(managed_launch_contract));
         packaged_native_worker_runtime_t result;
-        result.provider_host = std::make_shared<native_worker_provider_host_t>(std::move(host));
+        result.native_host = host;
+        result.provider_host = std::make_shared<native_worker_provider_host_t>(
+            host, std::move(managed_host));
         result.provider = decoded.value->provider;
+        result.cli_provider = managed_decoded.value->provider;
         result.jvm_provider = isolated_provider_identity(
             decoded.value->provider, decompiler_provider_id_t::jvm_ssa);
         result.dalvik_provider = isolated_provider_identity(
             decoded.value->provider, decompiler_provider_id_t::dalvik_ssa);
         result.worker_protocol_hash = decoded.value->worker_protocol_hash;
         result.manifest_hash = manifest_hash;
+        result.managed_manifest_hash = managed_manifest_hash;
+        result.managed_runtime_manifest_hash =
+            managed_decoded.value->managed_runtime_manifest_hash;
         result.worker_protocol_version = decoded.value->worker_protocol_version;
         return workspace_result_t<packaged_native_worker_runtime_t>::success(std::move(result));
     } catch (const std::bad_alloc&) {
@@ -1267,21 +2178,66 @@ native_worker_host_t::~native_worker_host_t()
     stop();
 }
 
-native_worker_execution_result_t native_worker_host_t::execute(const native_worker_execution_request_t& request)
+native_worker_execution_result_t native_worker_host_t::execute(const native_worker_execution_request_t& input)
 {
-    std::lock_guard lock(mutex_);
     native_worker_execution_result_t result;
-    if (stopped_) {
+    if (stopped_.load(std::memory_order_acquire)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::host_stopped, "native_worker.execute", "worker host is stopped");
         return result;
     }
-    if (limits_.max_frame_bytes == 0 || limits_.max_snapshot_bytes == 0 || limits_.startup_timeout.count() <= 0 ||
-        limits_.cancellation_grace.count() < 0 || limits_.poll_interval.count() <= 0 || request.job_id == 0 ||
-        !request.snapshot.valid() || request.snapshot.bytes->size() > limits_.max_snapshot_bytes ||
-        request.snapshot.bytes->size() > request.profile.max_memory_bytes) {
+    if (limits_.max_frame_bytes == 0 ||
+        limits_.max_frame_bytes > k_decompiler_worker_result_frame_max_bytes ||
+        limits_.max_snapshot_bytes == 0 ||
+        limits_.max_concurrent_workers == 0 || limits_.startup_timeout.count() <= 0 ||
+        limits_.cancellation_grace.count() < 0 || limits_.poll_interval.count() <= 0 || input.job_id == 0 ||
+        !input.snapshot.valid() || input.snapshot.bytes->size() > limits_.max_snapshot_bytes ||
+        input.snapshot.bytes->size() > input.profile.max_memory_bytes) {
         append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request, "native_worker.request", "worker request or host limits are invalid");
         return result;
     }
+    const auto queue_deadline = effective_deadline(input);
+    {
+        std::unique_lock lock(state_mutex_);
+        while (!stopped_.load(std::memory_order_acquire) &&
+               active_workers_ >= limits_.max_concurrent_workers) {
+            if ((input.cancellation_requested && input.cancellation_requested()) ||
+                std::chrono::steady_clock::now() >= queue_deadline) {
+                result.status = std::chrono::steady_clock::now() >= queue_deadline
+                    ? native_worker_execution_status_t::deadline_exceeded
+                    : native_worker_execution_status_t::cancelled;
+                append_diagnostic(result,
+                    result.status == native_worker_execution_status_t::deadline_exceeded
+                        ? native_worker_diagnostic_code_t::deadline_exceeded
+                        : native_worker_diagnostic_code_t::cancelled,
+                    "native_worker.queue", "worker admission was cancelled before launch");
+                return result;
+            }
+            const auto poll_deadline = std::min(
+                queue_deadline,
+                std::chrono::steady_clock::now() + limits_.poll_interval);
+            state_wake_.wait_until(lock, poll_deadline);
+        }
+        if (stopped_.load(std::memory_order_acquire)) {
+            append_diagnostic(result, native_worker_diagnostic_code_t::host_stopped,
+                "native_worker.queue", "worker host stopped before admission");
+            return result;
+        }
+        ++active_workers_;
+    }
+    struct active_worker_guard_t final {
+        std::function<void()> release;
+        ~active_worker_guard_t() { release(); }
+    } active_guard{[this] {
+        std::lock_guard lock(state_mutex_);
+        --active_workers_;
+        state_wake_.notify_all();
+    }};
+    native_worker_execution_request_t request = input;
+    const auto external_cancel = input.cancellation_requested;
+    request.cancellation_requested = [this, external_cancel] {
+        return stopped_.load(std::memory_order_acquire) ||
+               (external_cancel && external_cancel());
+    };
     sha256_digest_t verified_snapshot_hash;
     if (!wire::sha256(request.snapshot.bytes->data(), request.snapshot.bytes->size(), verified_snapshot_hash) || verified_snapshot_hash != request.snapshot.hash) {
         append_diagnostic(result, native_worker_diagnostic_code_t::snapshot_invalid, "native_worker.snapshot", "snapshot hash is invalid", ERROR_CRC);
@@ -1304,6 +2260,52 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request, "native_worker.contract", "cache key and profile do not form a valid bound request", ERROR_INVALID_DATA);
         return result;
     }
+    const bool managed_route = request.cache_key.provider.provider ==
+        decompiler_provider_id_t::ilspy_cli;
+    if (request.request_printc_evidence &&
+        request.cache_key.provider.provider != decompiler_provider_id_t::ghidra_native) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request,
+            "native_worker.printc_contract",
+            "PrintC evidence is restricted to the native Ghidra provider", ERROR_INVALID_DATA);
+        return result;
+    }
+    if (managed_route) {
+        if (!request.managed_request) {
+            append_diagnostic(result,
+                native_worker_diagnostic_code_t::invalid_request,
+                "native_worker.managed_contract",
+                "managed request is absent", ERROR_INVALID_DATA);
+            return result;
+        }
+        const auto serialized = managed_cli::serialize_request(
+            *request.managed_request);
+        if (!serialized ||
+            request.managed_request->entity != request.cache_key.entity ||
+            request.managed_request->workspace_generation !=
+                request.cache_key.workspace_generation ||
+            request.managed_request->type_graph_revision !=
+                request.cache_key.type_graph_revision ||
+            !same_profile(request.managed_request->profile, request.profile) ||
+            request.managed_request->module_source.module_size !=
+                request.snapshot.bytes->size() ||
+            request.managed_request->module_source.module_hash !=
+                request.snapshot.hash ||
+            request.managed_request->module_snapshot != request.snapshot.bytes ||
+            request.managed_request->contract_hash !=
+                managed_cli::managed_cli_contract_hash()) {
+            append_diagnostic(result,
+                native_worker_diagnostic_code_t::invalid_request,
+                "native_worker.managed_contract",
+                "managed request is not bound to the immutable snapshot and cache key",
+                ERROR_INVALID_DATA);
+            return result;
+        }
+    } else if (request.managed_request) {
+        append_diagnostic(result, native_worker_diagnostic_code_t::invalid_request,
+            "native_worker.managed_contract",
+            "native route cannot carry a managed request", ERROR_INVALID_DATA);
+        return result;
+    }
     auto verified = verify_worker(contract_, result);
     if (!verified)
         return result;
@@ -1314,7 +2316,7 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             ERROR_CRC, true);
         return result;
     }
-    result.worker_generation = ++worker_generation_;
+    result.worker_generation = worker_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     worker_instance_t worker;
     if (!launch_worker(*verified, request, limits_, worker, result)) {
         result.worker_process_id = worker.process_id;
@@ -1340,6 +2342,84 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
         terminate_worker(worker, ERROR_CANCELLED, result, true);
         return result;
     }
+    if (verified->manifest.provider.provider == decompiler_provider_id_t::ilspy_cli) {
+        if (!request.managed_request ||
+            !validate_managed_hello(frame, worker.session, *verified)) {
+            append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed,
+                "native_worker.managed_hello",
+                "managed worker hello violates the authenticated identity contract",
+                ERROR_INVALID_DATA, true);
+            terminate_worker(worker, ERROR_CRC, result, true);
+            return result;
+        }
+        const auto serialized_request = managed_cli::serialize_request(*request.managed_request);
+        if (!serialized_request || !send_managed_payload(
+                worker, serialized_request.value(), limits_, error)) {
+            append_diagnostic(result, native_worker_diagnostic_code_t::bootstrap_failed,
+                "native_worker.managed_job",
+                "managed worker request could not be validated or written",
+                error == ERROR_SUCCESS ? ERROR_INVALID_DATA : error, true);
+            terminate_worker(worker, ERROR_CANCELLED, result, true);
+            return result;
+        }
+        const auto deadline = effective_deadline(request);
+        while (true) {
+            const auto terminal = wait_for_message(worker, request, limits_, deadline, frame, error);
+            if (terminal == terminal_wait_t::cancelled || terminal == terminal_wait_t::deadline) {
+                const bool is_deadline = terminal == terminal_wait_t::deadline;
+                const auto cancellation = managed_cli::serialize_cancellation(
+                    *request.managed_request, request.managed_request->sequence + 1,
+                    is_deadline ? "deadline_exceeded" : "cancelled");
+                if (cancellation)
+                    send_managed_payload(worker, cancellation.value(), limits_, error);
+                const auto grace_deadline = std::chrono::steady_clock::now() + limits_.cancellation_grace;
+                wire::frame_t ignored;
+                wait_for_message(worker, native_worker_execution_request_t{}, limits_,
+                    grace_deadline, ignored, error);
+                result.status = is_deadline
+                    ? native_worker_execution_status_t::deadline_exceeded
+                    : native_worker_execution_status_t::cancelled;
+                append_diagnostic(result,
+                    is_deadline ? native_worker_diagnostic_code_t::deadline_exceeded
+                                : native_worker_diagnostic_code_t::cancelled,
+                    "native_worker.managed_cancel",
+                    is_deadline ? "managed worker exceeded its deadline"
+                                : "managed worker cancellation was requested",
+                    ERROR_CANCELLED, true);
+                terminate_worker(worker, ERROR_CANCELLED, result, true);
+                return result;
+            }
+            if (terminal == terminal_wait_t::exited) {
+                DWORD exit_code = 0;
+                GetExitCodeProcess(worker.process.get(), &exit_code);
+                append_diagnostic(result, native_worker_diagnostic_code_t::worker_crashed,
+                    "native_worker.managed_wait",
+                    "managed worker exited before a terminal result", exit_code, true);
+                terminate_worker(worker, exit_code, result, true);
+                return result;
+            }
+            if (terminal == terminal_wait_t::protocol_failure) {
+                append_protocol_failure(result, worker.reader.failure(),
+                    "native_worker.managed_response", error);
+                terminate_worker(worker, ERROR_CRC, result, true);
+                return result;
+            }
+            if (!valid_managed_terminal_payload(frame, *request.managed_request)) {
+                append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed,
+                    "native_worker.managed_response",
+                    "managed worker response is not bound to the active request",
+                    ERROR_INVALID_DATA, true);
+                terminate_worker(worker, ERROR_CRC, result, true);
+                return result;
+            }
+            result.provider_artifacts.assign(
+                reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size());
+            result.provider_artifacts_hash = stable_serialization_hash(result.provider_artifacts);
+            result.status = native_worker_execution_status_t::completed;
+            terminate_worker(worker, ERROR_SUCCESS, result, false);
+            return result;
+        }
+    }
     const auto decoded_hello = deserialize_decompiler_worker_message(
         std::string(reinterpret_cast<const char*>(frame.payload.data()), frame.payload.size()));
     if (!decoded_hello.valid() || !decoded_hello.value || !validate_envelope(*decoded_hello.value, frame, worker.session) ||
@@ -1364,6 +2444,7 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
     job.cache_key = request.cache_key;
     job.profile = request.profile;
     job.snapshot_hash = request.snapshot.hash;
+    job.request_printc_evidence = request.request_printc_evidence;
     if (!send_contract(worker, decompiler_worker_message_t{std::move(job)}, limits_, error)) {
         append_diagnostic(result, native_worker_diagnostic_code_t::bootstrap_failed, "native_worker.job", "job request could not be written", error, true);
         terminate_worker(worker, ERROR_CANCELLED, result, true);
@@ -1444,7 +2525,14 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             if (document.job_id != request.job_id || !document_validation.valid() || !(document.document.entity == request.cache_key.entity) ||
                 document.document.profile != request.profile.profile ||
                 document.provider_artifacts.empty() || document.provider_artifacts_hash.empty() ||
-                stable_serialization_hash(document.provider_artifacts) != document.provider_artifacts_hash) {
+                document.provider_artifacts.size() > k_decompiler_worker_provider_artifacts_max_bytes ||
+                stable_serialization_hash(document.provider_artifacts) != document.provider_artifacts_hash ||
+                document.printc_evidence.has_value() != request.request_printc_evidence ||
+                (document.printc_evidence &&
+                    (document.printc_evidence->empty() ||
+                     document.printc_evidence->size() > k_decompiler_worker_printc_evidence_max_bytes ||
+                     document.printc_evidence_hash.empty() ||
+                     stable_serialization_hash(*document.printc_evidence) != document.printc_evidence_hash))) {
                 append_diagnostic(result, native_worker_diagnostic_code_t::protocol_malformed, "native_worker.document", "worker document is not bound to the requested entity and profile", ERROR_INVALID_DATA, true);
                 terminate_worker(worker, ERROR_CRC, result, true);
                 return result;
@@ -1452,6 +2540,8 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
             result.document = document.document;
             result.provider_artifacts = document.provider_artifacts;
             result.provider_artifacts_hash = document.provider_artifacts_hash;
+            result.printc_evidence = document.printc_evidence;
+            result.printc_evidence_hash = document.printc_evidence_hash;
             result.status = native_worker_execution_status_t::completed;
             terminate_worker(worker, ERROR_SUCCESS, result, false);
             return result;
@@ -1464,36 +2554,38 @@ native_worker_execution_result_t native_worker_host_t::execute(const native_work
 
 void native_worker_host_t::stop() noexcept
 {
-    std::lock_guard lock(mutex_);
-    stopped_ = true;
+    stopped_.store(true, std::memory_order_release);
+    state_wake_.notify_all();
+    std::unique_lock lock(state_mutex_);
+    state_wake_.wait(lock, [this] { return active_workers_ == 0; });
 }
 
 std::uint64_t native_worker_host_t::worker_generation() const noexcept
 {
-    std::lock_guard lock(mutex_);
-    return worker_generation_;
+    return worker_generation_.load(std::memory_order_acquire);
 }
 
 native_worker_provider_host_t::native_worker_provider_host_t(
-    std::shared_ptr<native_worker_host_t> host)
-    : host_(std::move(host))
+    std::shared_ptr<native_worker_host_t> host,
+    std::shared_ptr<native_worker_host_t> managed_host)
+    : host_(std::move(host)), managed_host_(std::move(managed_host))
 {
 }
 
 bool native_worker_provider_host_t::supports(
     const decompiler_provider_descriptor_t& descriptor) const noexcept
 {
-    if (!host_ || !descriptor.isolated)
+    if (!descriptor.isolated)
         return false;
     switch (descriptor.identity.provider) {
     case decompiler_provider_id_t::ghidra_native:
-        return descriptor.entity_kind == decompiler_entity_kind_t::native_function;
+        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::native_function;
     case decompiler_provider_id_t::jvm_ssa:
-        return descriptor.entity_kind == decompiler_entity_kind_t::jvm_method;
+        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::jvm_method;
     case decompiler_provider_id_t::dalvik_ssa:
-        return descriptor.entity_kind == decompiler_entity_kind_t::dalvik_method;
+        return host_ && descriptor.entity_kind == decompiler_entity_kind_t::dalvik_method;
     case decompiler_provider_id_t::ilspy_cli:
-        return false;
+        return managed_host_ && descriptor.entity_kind == decompiler_entity_kind_t::cli_method;
     }
     return false;
 }
@@ -1542,6 +2634,7 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
     }
 
     std::optional<native_worker_snapshot_t> snapshot;
+    std::shared_ptr<const managed_cli::request_t> bound_managed_request;
     try {
         std::vector<std::uint8_t> bytes;
         switch (route.descriptor.identity.provider) {
@@ -1584,7 +2677,40 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
             break;
         }
         case decompiler_provider_id_t::ilspy_cli:
+        {
+            const auto context = std::dynamic_pointer_cast<const managed_cli_provider_context_t>(request.context);
+            if (!context || !context->request() ||
+                context->request()->entity != request.cache_key.entity ||
+                context->request()->workspace_generation != request.cache_key.workspace_generation ||
+                context->request()->type_graph_revision != request.cache_key.type_graph_revision ||
+                !same_profile(context->request()->profile,
+                    request.cache_key.profile) ||
+                context->request()->worker.provider_version != route.descriptor.identity.provider_version ||
+                context->request()->worker.decompiler_assembly_hash !=
+                    route.descriptor.identity.provider_binary_hash ||
+                context->request()->worker.worker_build_id != route.descriptor.identity.worker_build_id ||
+                context->request()->worker.worker_build_hash != route.descriptor.identity.worker_build_hash)
+                break;
+            const auto maximum_module_bytes = static_cast<std::size_t>((std::min<std::uint64_t>)(
+                managed_cli::k_managed_cli_maximum_module_bytes,
+                request.cache_key.profile.max_memory_bytes / 2));
+            const auto captured = capture_managed_worker_snapshot(
+                context->request(), maximum_module_bytes, cancel);
+            if (!captured)
+                break;
+            if (captured.value().request->entity != request.cache_key.entity ||
+                captured.value().request->workspace_generation !=
+                    request.cache_key.workspace_generation ||
+                captured.value().request->type_graph_revision !=
+                    request.cache_key.type_graph_revision ||
+                !same_profile(captured.value().request->profile,
+                    request.cache_key.profile)) {
+                break;
+            }
+            snapshot = captured.value().snapshot;
+            bound_managed_request = captured.value().request;
             break;
+        }
         }
     } catch (...) {
         snapshot.reset();
@@ -1611,7 +2737,12 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
     worker_request.cancellation_requested = [cancel] {
         return cancel.stop_requested();
     };
-    auto worker_result = host_->execute(worker_request);
+    if (route.descriptor.identity.provider == decompiler_provider_id_t::ilspy_cli) {
+        worker_request.managed_request = std::move(bound_managed_request);
+    }
+    auto worker_result = route.descriptor.identity.provider == decompiler_provider_id_t::ilspy_cli
+        ? managed_host_->execute(worker_request)
+        : host_->execute(worker_request);
     result.diagnostics.insert(result.diagnostics.end(),
         worker_result.worker_diagnostics.begin(), worker_result.worker_diagnostics.end());
     for (const auto& source : worker_result.diagnostics) {
@@ -1634,11 +2765,14 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
     }
     switch (worker_result.status) {
     case native_worker_execution_status_t::completed:
-        if (worker_result.document && !worker_result.provider_artifacts.empty() &&
+        if ((worker_result.document ||
+                route.descriptor.identity.provider == decompiler_provider_id_t::ilspy_cli) &&
+            !worker_result.provider_artifacts.empty() &&
             worker_result.provider_artifacts_hash ==
                 stable_serialization_hash(worker_result.provider_artifacts)) {
             try {
                 decompiler_provider_artifacts_t provider_artifacts;
+                bool managed_failure = false;
                 std::vector<decompiler_diagnostic_t> decode_diagnostics;
                 switch (route.descriptor.identity.provider) {
                 case decompiler_provider_id_t::ghidra_native: {
@@ -1676,36 +2810,86 @@ decompiler_provider_result_t native_worker_provider_host_t::execute(
                     break;
                 }
                 case decompiler_provider_id_t::ilspy_cli:
+                {
+                    if (!worker_request.managed_request)
+                        break;
+                    auto decoded = managed_cli::deserialize_response(
+                        *worker_request.managed_request,
+                        worker_result.provider_artifacts, cancel);
+                    if (!decoded) {
+                        decompiler_diagnostic_t diagnostic;
+                        diagnostic.severity = decompiler_diagnostic_severity_t::error;
+                        diagnostic.code = decompiler_diagnostic_code_t::malformed_serialization;
+                        diagnostic.localization_key = "decompiler.managed_host.response_decode";
+                        diagnostic.localization_arguments = {decoded.error().stable_code()};
+                        diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1);
+                        result.diagnostics.push_back(std::move(diagnostic));
+                    } else if (decoded.value().failure) {
+                        result.diagnostics.insert(result.diagnostics.end(),
+                            decoded.value().failure->diagnostics.begin(),
+                            decoded.value().failure->diagnostics.end());
+                        managed_failure = true;
+                    } else if (decoded.value().analysis) {
+                        provider_artifacts.provider_ir =
+                            std::move(decoded.value().analysis->provider_ir);
+                        provider_artifacts.type_graph =
+                            std::move(decoded.value().analysis->type_graph);
+                        provider_artifacts.return_type_id =
+                            decoded.value().analysis->return_type_id;
+                    }
                     break;
+                }
                 }
                 result.diagnostics.insert(result.diagnostics.end(),
                     decode_diagnostics.begin(), decode_diagnostics.end());
+                if (managed_failure) {
+                    result.status = decompiler_provider_execution_status_t::failed;
+                    result.artifacts.reset();
+                    break;
+                }
                 if (!validate_provider_ir(provider_artifacts.provider_ir).valid() ||
-                    !provider_artifacts.hir ||
-                    !validate_hir_function(*provider_artifacts.hir).valid() ||
                     !validate_type_graph(provider_artifacts.type_graph).valid() ||
                     provider_artifacts.provider_ir.entity != request.cache_key.entity ||
-                    provider_artifacts.hir->entity != request.cache_key.entity ||
                     provider_artifacts.type_graph.entity != request.cache_key.entity ||
                     !same_provider(provider_artifacts.provider_ir.provider, route.descriptor.identity) ||
                     !same_language(provider_artifacts.provider_ir.language, request.cache_key.language) ||
-                    provider_artifacts.hir->provider_ir_hash !=
-                        stable_serialization_hash(provider_artifacts.provider_ir) ||
-                    provider_artifacts.hir->type_graph_revision != request.cache_key.type_graph_revision ||
+                    (provider_artifacts.hir &&
+                        (!validate_hir_function(*provider_artifacts.hir).valid() ||
+                         provider_artifacts.hir->entity != request.cache_key.entity ||
+                         provider_artifacts.hir->provider_ir_hash !=
+                             stable_serialization_hash(provider_artifacts.provider_ir) ||
+                         provider_artifacts.hir->type_graph_revision !=
+                             request.cache_key.type_graph_revision)) ||
+                    (route.descriptor.identity.provider != decompiler_provider_id_t::ilspy_cli &&
+                        !provider_artifacts.hir) ||
                     provider_artifacts.type_graph.revision != request.cache_key.type_graph_revision ||
                     provider_artifacts.return_type_id == 0)
                     throw std::invalid_argument("isolated provider artifacts failed binding");
                 result.artifacts = std::move(provider_artifacts);
-                result.attested_document = std::move(worker_result.document);
+                if (worker_result.document)
+                    result.attested_document = std::move(worker_result.document);
+                result.authenticated_artifacts = true;
                 result.status = decompiler_provider_execution_status_t::completed;
-            } catch (...) {
+            } catch (const std::bad_alloc&) {
                 result.status = decompiler_provider_execution_status_t::failed;
                 result.artifacts.reset();
                 result.attested_document.reset();
+                result.authenticated_artifacts = false;
                 decompiler_diagnostic_t diagnostic;
                 diagnostic.severity = decompiler_diagnostic_severity_t::error;
                 diagnostic.code = decompiler_diagnostic_code_t::resource_limit;
                 diagnostic.localization_key = "decompiler.native_host.result_allocation";
+                diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
+                result.diagnostics.push_back(std::move(diagnostic));
+            } catch (...) {
+                result.status = decompiler_provider_execution_status_t::failed;
+                result.artifacts.reset();
+                result.attested_document.reset();
+                result.authenticated_artifacts = false;
+                decompiler_diagnostic_t diagnostic;
+                diagnostic.severity = decompiler_diagnostic_severity_t::error;
+                diagnostic.code = decompiler_diagnostic_code_t::malformed_serialization;
+                diagnostic.localization_key = "decompiler.native_host.result_invalid";
                 diagnostic.ordinal = static_cast<std::uint32_t>(result.diagnostics.size() + 1U);
                 result.diagnostics.push_back(std::move(diagnostic));
             }

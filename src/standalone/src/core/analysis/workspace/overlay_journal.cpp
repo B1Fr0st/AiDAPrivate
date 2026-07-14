@@ -2,9 +2,11 @@
 
 #include "../incremental_reanalysis.hpp"
 #include "../overlay_projection.hpp"
+#include "../provider_snapshot.hpp"
 #include "../spill_provider.hpp"
 #include "checked_range.hpp"
 #include "decompiler_service.hpp"
+#include "../decompiler/managed_entity_binding.hpp"
 
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
@@ -20,6 +22,7 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -82,6 +85,17 @@ public:
             return workspace_result_t<void>::failure(error(SQLITE_TOOBIG, "overlay text exceeds SQLite limit"));
         return bind(sqlite3_bind_text(statement_, index, value.data(),
                                       static_cast<int>(value.size()), SQLITE_TRANSIENT));
+    }
+
+    workspace_result_t<void> bind_blob(int index, const void* value,
+                                       std::size_t size) {
+        if ((!value && size != 0) ||
+            size > static_cast<std::size_t>(
+                       (std::numeric_limits<int>::max)()))
+            return workspace_result_t<void>::failure(
+                error(SQLITE_TOOBIG, "overlay blob exceeds SQLite limit"));
+        return bind(sqlite3_bind_blob(statement_, index, value,
+                                      static_cast<int>(size), SQLITE_TRANSIENT));
     }
 
     workspace_result_t<void> bind_null(int index) {
@@ -231,6 +245,28 @@ std::string hex_encode(const std::vector<std::uint8_t>& bytes) {
     return result;
 }
 
+template <std::size_t Size>
+std::string fixed_hex_encode(const std::array<std::uint8_t, Size>& bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result(Size * 2, '0');
+    for (std::size_t index = 0; index < Size; ++index) {
+        result[index * 2] = digits[bytes[index] >> 4];
+        result[index * 2 + 1] = digits[bytes[index] & 15];
+    }
+    return result;
+}
+
+std::string string_hex_encode(const std::string& bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result(bytes.size() * 2, '0');
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(bytes[index]);
+        result[index * 2] = digits[byte >> 4];
+        result[index * 2 + 1] = digits[byte & 15];
+    }
+    return result;
+}
+
 workspace_result_t<std::vector<std::uint8_t>> hex_decode(const std::string& text) {
     if ((text.size() & 1U) != 0) {
         return workspace_result_t<std::vector<std::uint8_t>>::failure(make_workspace_error(
@@ -259,6 +295,104 @@ workspace_result_t<std::vector<std::uint8_t>> hex_decode(const std::string& text
     return workspace_result_t<std::vector<std::uint8_t>>::success(std::move(result));
 }
 
+template <std::size_t Size>
+bool fixed_hex_decode(const std::string& text,
+                      std::array<std::uint8_t, Size>& result) noexcept {
+    if (text.size() != Size * 2)
+        return false;
+    const auto value = [](char character) noexcept -> int {
+        if (character >= '0' && character <= '9') return character - '0';
+        if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+        return -1;
+    };
+    for (std::size_t index = 0; index < Size; ++index) {
+        const int high = value(text[index * 2]);
+        const int low = value(text[index * 2 + 1]);
+        if (high < 0 || low < 0)
+            return false;
+        result[index] = static_cast<std::uint8_t>((high << 4) | low);
+    }
+    return true;
+}
+
+bool string_hex_decode(const std::string& text, std::string& result) {
+    if ((text.size() & 1U) != 0)
+        return false;
+    const auto value = [](char character) noexcept -> int {
+        if (character >= '0' && character <= '9') return character - '0';
+        if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+        return -1;
+    };
+    result.resize(text.size() / 2);
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        const int high = value(text[index * 2]);
+        const int low = value(text[index * 2 + 1]);
+        if (high < 0 || low < 0)
+            return false;
+        result[index] = static_cast<char>((high << 4) | low);
+    }
+    return true;
+}
+
+json managed_locator_json(
+    const overlay_managed_entity_locator_v9_t& locator) {
+    return json{{"artifact_hash", fixed_hex_encode(locator.artifact_hash)},
+                {"entity_hash", fixed_hex_encode(locator.entity_hash)},
+                {"generation", std::to_string(locator.generation)},
+                {"provider_hash", fixed_hex_encode(locator.provider_hash)},
+                {"provider_size", std::to_string(locator.provider_size)},
+                {"serialized_entity", string_hex_encode(locator.serialized_entity)},
+                {"workspace_id", fixed_hex_encode(locator.workspace_id)}};
+}
+
+std::optional<overlay_managed_entity_locator_v9_t> parse_managed_locator_json(
+    const json& value) noexcept {
+    try {
+        static constexpr std::array<const char*, 7> fields{{
+            "artifact_hash", "entity_hash", "generation", "provider_hash",
+            "provider_size", "serialized_entity", "workspace_id"}};
+        if (!value.is_object() || value.size() != fields.size() ||
+            !std::all_of(fields.begin(), fields.end(),
+                [&](const char* field) {
+                    return value.contains(field) && value[field].is_string();
+                }))
+            return std::nullopt;
+        overlay_managed_entity_locator_v9_t locator;
+        const auto parse_uint = [](const std::string& text,
+                                   std::uint64_t& output) noexcept {
+            const auto parsed = std::from_chars(
+                text.data(), text.data() + text.size(), output, 10);
+            return !text.empty() && parsed.ec == std::errc{} &&
+                parsed.ptr == text.data() + text.size();
+        };
+        const auto& serialized_entity =
+            value["serialized_entity"].get_ref<const std::string&>();
+        if (serialized_entity.empty() ||
+            serialized_entity.size() >
+                k_overlay_managed_entity_serialization_limit * 2U ||
+            (serialized_entity.size() & 1U) != 0)
+            return std::nullopt;
+        if (!fixed_hex_decode(value["workspace_id"].get_ref<const std::string&>(),
+                              locator.workspace_id) ||
+            !fixed_hex_decode(value["provider_hash"].get_ref<const std::string&>(),
+                              locator.provider_hash) ||
+            !fixed_hex_decode(value["artifact_hash"].get_ref<const std::string&>(),
+                              locator.artifact_hash) ||
+            !fixed_hex_decode(value["entity_hash"].get_ref<const std::string&>(),
+                              locator.entity_hash) ||
+            !parse_uint(value["provider_size"].get_ref<const std::string&>(),
+                        locator.provider_size) ||
+            !parse_uint(value["generation"].get_ref<const std::string&>(),
+                        locator.generation) ||
+            !string_hex_decode(serialized_entity, locator.serialized_entity) ||
+            !locator.valid())
+            return std::nullopt;
+        return locator;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 json operation_json(const overlay_operation_t& operation,
                     const overlay_target_identity_v9_t* target = nullptr) {
     json result{{"address", address_json(operation.address)},
@@ -279,6 +413,16 @@ json operation_json(const overlay_operation_t& operation,
     if (target) {
         result["schema"] = k_overlay_journal_v9_schema;
         result["target"] = json::parse(serialize_overlay_target_identity_v9(*target));
+    }
+    if (operation.target_discriminator ==
+            overlay_target_discriminator_v9_t::managed_entity &&
+        operation.managed_locator) {
+        result.erase("address");
+        result.erase("end");
+        result["target_discriminator"] = static_cast<std::uint8_t>(
+            operation.target_discriminator);
+        result["managed_locator"] = managed_locator_json(
+            *operation.managed_locator);
     }
     return result;
 }
@@ -309,7 +453,7 @@ workspace_result_t<overlay_operation_t> parse_operation(
             workspace_error_code_t::integrity_failure,
             "overlay operation JSON is malformed", "overlay_journal.recovery"));
     }
-    const std::array<const char*, 12> fields{{"address", "assembly", "bytes", "integer_type",
+    const std::array<const char*, 11> fields{{"assembly", "bytes", "integer_type",
         "integer_value", "kind", "name", "signature", "stack_offset", "text", "type", "variable"}};
     for (const char* field : fields) {
         if (!value.contains(field)) {
@@ -321,7 +465,9 @@ workspace_result_t<overlay_operation_t> parse_operation(
     }
     const bool versioned = value.contains("schema");
     if (versioned) {
-        if (value.size() != 17 || !value.contains("end") ||
+        const bool managed = value.contains("target_discriminator") ||
+            value.contains("managed_locator");
+        if (value.size() != 17U ||
             !value["schema"].is_number_unsigned() ||
             value["schema"].get<std::uint32_t>() != k_overlay_journal_v9_schema ||
             !value.contains("target") || !value.contains("reanalysis_flags") ||
@@ -339,15 +485,62 @@ workspace_result_t<overlay_operation_t> parse_operation(
                 "overlay operation target identity does not match the workspace",
                 "overlay_journal.recovery"));
         }
+        if (managed) {
+            if (!value.contains("target_discriminator") ||
+                !value["target_discriminator"].is_number_unsigned() ||
+                value["target_discriminator"].get<unsigned>() !=
+                    static_cast<unsigned>(
+                        overlay_target_discriminator_v9_t::managed_entity) ||
+                !value.contains("managed_locator")) {
+                return workspace_result_t<overlay_operation_t>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "managed overlay target discriminator is invalid",
+                        "overlay_journal.recovery"));
+            }
+            if (value.contains("address") || value.contains("end")) {
+                return workspace_result_t<overlay_operation_t>::failure(
+                    make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "managed overlay record contains an address locator",
+                        "overlay_journal.recovery"));
+            }
+        } else if (!value.contains("address") || !value.contains("end")) {
+            return workspace_result_t<overlay_operation_t>::failure(
+                make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "native overlay record omits its address locator",
+                    "overlay_journal.recovery"));
+        }
     }
     overlay_operation_t operation;
-    auto address = parse_address(value["address"]);
-    if (!address) return workspace_result_t<overlay_operation_t>::failure(address.error());
-    operation.address = address.take_value();
-    if (value.contains("end") && !value["end"].is_null()) {
-        auto end = parse_address(value["end"]);
-        if (!end) return workspace_result_t<overlay_operation_t>::failure(end.error());
-        operation.end = end.take_value();
+    if (versioned && value.contains("managed_locator")) {
+        auto locator = parse_managed_locator_json(value["managed_locator"]);
+        if (!locator) {
+            return workspace_result_t<overlay_operation_t>::failure(
+                make_workspace_error(
+                    workspace_error_code_t::integrity_failure,
+                    "managed overlay locator is malformed or noncanonical",
+                    "overlay_journal.recovery"));
+        }
+        operation.target_discriminator =
+            overlay_target_discriminator_v9_t::managed_entity;
+        operation.managed_locator = std::move(*locator);
+    }
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::native_address) {
+        auto address = parse_address(value["address"]);
+        if (!address)
+            return workspace_result_t<overlay_operation_t>::failure(
+                address.error());
+        operation.address = address.take_value();
+        if (value.contains("end") && !value["end"].is_null()) {
+            auto end = parse_address(value["end"]);
+            if (!end)
+                return workspace_result_t<overlay_operation_t>::failure(
+                    end.error());
+            operation.end = end.take_value();
+        }
     }
     try {
         if (!value["kind"].is_number_unsigned())
@@ -395,6 +588,41 @@ std::string address_key(const address_t& address) {
 }
 
 std::string entity_key(const overlay_operation_t& operation) {
+    if (operation.target_discriminator ==
+            overlay_target_discriminator_v9_t::managed_entity &&
+        operation.managed_locator) {
+        std::string domain;
+        switch (operation.kind) {
+        case overlay_operation_kind_t::comment:
+        case overlay_operation_kind_t::comment_update:
+            domain = "comment";
+            break;
+        case overlay_operation_kind_t::name:
+            domain = "name";
+            break;
+        case overlay_operation_kind_t::type_application:
+        case overlay_operation_kind_t::type_update:
+            domain = "type_application";
+            break;
+        default:
+            domain = "invalid";
+            break;
+        }
+        const auto& locator = *operation.managed_locator;
+        const std::string qualifier =
+            operation.kind == overlay_operation_kind_t::type_application ||
+                    operation.kind == overlay_operation_kind_t::type_update
+                ? (operation.variable.empty() ? operation.name
+                                              : operation.variable)
+                : std::string{};
+        return "managed:" + domain + ":" +
+            fixed_hex_encode(locator.workspace_id) + ":" +
+            fixed_hex_encode(locator.provider_hash) + ":" +
+            std::to_string(locator.provider_size) + ":" +
+            fixed_hex_encode(locator.artifact_hash) + ":" +
+            fixed_hex_encode(locator.entity_hash) + ":" +
+            string_hex_encode(locator.serialized_entity) + ":" + qualifier;
+    }
     std::string prefix;
     switch (operation.kind) {
     case overlay_operation_kind_t::comment:
@@ -454,6 +682,29 @@ overlay_operation_t materialized_operation(overlay_operation_t operation) {
 
 bool contains_nul(const std::string& value) {
     return value.find('\0') != std::string::npos;
+}
+
+bool canonical_managed_payload(const overlay_operation_t& operation) noexcept {
+    if (!operation.signature.empty() || !operation.bytes.empty() ||
+        !operation.assembly.empty() || !operation.integer_type.empty() ||
+        !operation.integer_value.empty() || operation.reanalysis_flags != 0 ||
+        operation.stack_offset != 0)
+        return false;
+    switch (operation.kind) {
+    case overlay_operation_kind_t::comment:
+    case overlay_operation_kind_t::comment_update:
+        return operation.name.empty() && operation.type.empty() &&
+            operation.variable.empty();
+    case overlay_operation_kind_t::name:
+        return operation.text.empty() && operation.type.empty() &&
+            operation.variable.empty();
+    case overlay_operation_kind_t::type_application:
+    case overlay_operation_kind_t::type_update:
+        return operation.text.empty() &&
+            (operation.name.empty() != operation.variable.empty());
+    default:
+        return false;
+    }
 }
 
 bool valid_integer_type(const std::string& value, std::size_t& byte_size) {
@@ -813,6 +1064,8 @@ workspace_result_t<overlay_operation_v9_t> operation_to_v9(
     }
     overlay_operation_v9_t result;
     result.kind = *kind;
+    result.target_discriminator = operation.target_discriminator;
+    result.managed_locator = operation.managed_locator;
     result.payload.name = operation.name;
     result.payload.text = operation.text;
     result.payload.type = operation.type;
@@ -825,6 +1078,10 @@ workspace_result_t<overlay_operation_v9_t> operation_to_v9(
     result.payload.reanalysis_flags = operation.reanalysis_flags;
     result.payload.stack_offset = operation.stack_offset;
     result.remove = removes_value(operation);
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity)
+        return workspace_result_t<overlay_operation_v9_t>::success(
+            std::move(result));
     if (*kind == overlay_operation_kind_v9_t::type_declaration ||
         *kind == overlay_operation_kind_v9_t::enum_definition)
         return workspace_result_t<overlay_operation_v9_t>::success(std::move(result));
@@ -864,6 +1121,8 @@ workspace_result_t<overlay_operation_t> operation_from_v9(
     }
     overlay_operation_t result;
     result.kind = static_cast<overlay_operation_kind_t>(ordinal);
+    result.target_discriminator = operation.target_discriminator;
+    result.managed_locator = operation.managed_locator;
     result.name = operation.payload.name;
     result.text = operation.payload.text;
     result.type = operation.payload.type;
@@ -876,6 +1135,19 @@ workspace_result_t<overlay_operation_t> operation_from_v9(
     result.reanalysis_flags = operation.payload.reanalysis_flags;
     result.stack_offset = operation.payload.stack_offset;
     result.remove = operation.remove;
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity) {
+        if (operation.range.offset != 0 || operation.range.size != 0 ||
+            !operation.managed_locator) {
+            return workspace_result_t<overlay_operation_t>::failure(
+                make_workspace_error(
+                    workspace_error_code_t::invalid_argument,
+                    "managed overlay v9 operation contains an address range",
+                    "overlay_journal.adapter"));
+        }
+        return workspace_result_t<overlay_operation_t>::success(
+            std::move(result));
+    }
     result.address.space = address_space_id_t::relative_virtual;
     result.address.architecture = workspace.identity().architecture();
     result.address.mode = workspace.identity().architecture_mode();
@@ -977,9 +1249,51 @@ workspace_result_t<overlay_static_state_v9_t> make_v9_preflight_state(
     return workspace_result_t<overlay_static_state_v9_t>::success(std::move(state));
 }
 
+bool current_managed_locator_matches_workspace(
+    const overlay_managed_entity_locator_v9_t& locator,
+    const analysis_workspace_t& workspace) noexcept {
+    try {
+        const auto publication = workspace.analysis_publication();
+        if (!publication || !publication->coherent_with(workspace.identity()) ||
+            !publication->managed_artifacts ||
+            publication->generation != workspace.generation() ||
+            publication->analysis_revision != workspace.analysis_revision() ||
+            publication->overlay_revision != workspace.overlay_revision() ||
+            publication->managed_artifacts->binary_id.bytes !=
+                locator.workspace_id ||
+            publication->managed_artifacts->load_profile_hash !=
+                workspace.identity().load_profile_hash() ||
+            publication->managed_artifacts->provider_size !=
+                locator.provider_size)
+            return false;
+        const auto decoded = deserialize_decompiler_entity_key(
+            locator.serialized_entity);
+        if (!decoded.valid() || !decoded.value)
+            return false;
+        bool matched = false;
+        for (const auto& method : publication->managed_artifacts->methods()) {
+            if (!method.has_body || method.entity != *decoded.value ||
+                method.artifact_index >=
+                    publication->managed_artifacts->artifacts().size())
+                continue;
+            const auto& artifact = publication->managed_artifacts->artifacts()[
+                method.artifact_index];
+            if (artifact.artifact_hash.bytes != locator.artifact_hash)
+                continue;
+            if (matched)
+                return false;
+            matched = true;
+        }
+        return matched;
+    } catch (...) {
+        return false;
+    }
+}
+
 workspace_result_t<void> validate_operation(
     const overlay_operation_t& operation, const overlay_limits_t& limits,
-    const analysis_workspace_t& workspace, std::size_t& total_patch_bytes) {
+    const analysis_workspace_t& workspace, std::size_t& total_patch_bytes,
+    bool allow_historical_generation = false) {
     const unsigned kind_value = static_cast<unsigned>(operation.kind);
     if (kind_value > static_cast<unsigned>(overlay_operation_kind_t::reanalysis)) {
         return workspace_result_t<void>::failure(make_workspace_error(
@@ -1007,14 +1321,62 @@ workspace_result_t<void> validate_operation(
             workspace_error_code_t::limit_exceeded,
             "overlay text exceeds configured limit", "overlay_journal.validate"));
     }
-    if (operation.kind != overlay_operation_kind_t::type_declaration &&
+    const bool managed = operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::managed_entity;
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::native_address) {
+        if (operation.managed_locator) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "native overlay operation contains a managed locator",
+                "overlay_journal.validate"));
+        }
+    } else if (managed) {
+        const auto managed_kind = managed_overlay_operation_kind_v9(
+            static_cast<overlay_operation_kind_v9_t>(kind_value));
+        if (!operation.managed_locator || !operation.managed_locator->valid() ||
+            operation.managed_locator->workspace_id !=
+                workspace.identity().binary_id().bytes ||
+            operation.managed_locator->provider_hash !=
+                workspace.identity().content_hash().bytes ||
+            operation.managed_locator->provider_size != workspace.provider().size() ||
+            operation.managed_locator->generation == 0 ||
+            (allow_historical_generation
+                 ? operation.managed_locator->generation > workspace.generation()
+                 : operation.managed_locator->generation != workspace.generation()) ||
+            (!allow_historical_generation &&
+             !current_managed_locator_matches_workspace(
+                 *operation.managed_locator, workspace)) ||
+            workspace.target_kind() != target_kind_t::static_file ||
+            !managed_kind || !canonical_managed_payload(operation) ||
+            operation.end) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::invalid_argument,
+                "managed overlay locator, generation, operation, or payload is invalid",
+                "overlay_journal.validate"));
+        }
+        if (operation.managed_locator->serialized_entity.size() >
+            limits.max_managed_entity_bytes) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "managed overlay entity exceeds configured limit",
+                "overlay_journal.validate"));
+        }
+    } else {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "overlay target discriminator is invalid",
+            "overlay_journal.validate"));
+    }
+    if (!managed &&
+        operation.kind != overlay_operation_kind_t::type_declaration &&
         operation.kind != overlay_operation_kind_t::enum_definition) {
         auto address_result = validate_workspace_address(
             operation.address, workspace, "overlay_journal.validate");
         if (!address_result)
             return address_result;
     }
-    if (operation.end) {
+    if (!managed && operation.end) {
         if (operation.end->space != operation.address.space ||
             operation.end->architecture != operation.address.architecture ||
             operation.end->mode != operation.address.mode ||
@@ -1151,6 +1513,139 @@ workspace_result_t<void> bind_operation_address(overlay_statement_t& statement, 
     return statement.bind_int(first + 3, static_cast<std::int64_t>(address.mode));
 }
 
+workspace_result_t<void> bind_operation_target(
+    overlay_statement_t& statement, int first,
+    const overlay_operation_t& operation) {
+    auto result = statement.bind_int(
+        first, static_cast<std::int64_t>(operation.target_discriminator));
+    if (!result)
+        return result;
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::native_address) {
+        result = bind_operation_address(statement, first + 1, operation.address);
+        if (!result)
+            return result;
+        for (int index = first + 5; index <= first + 11; ++index) {
+            result = statement.bind_null(index);
+            if (!result)
+                return result;
+        }
+        return result;
+    }
+    if (operation.target_discriminator !=
+            overlay_target_discriminator_v9_t::managed_entity ||
+        !operation.managed_locator) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "overlay operation target cannot be persisted",
+            "overlay_journal.persistence"));
+    }
+    for (int index = first + 1; index <= first + 4; ++index) {
+        result = statement.bind_null(index);
+        if (!result)
+            return result;
+    }
+    const auto& locator = *operation.managed_locator;
+    result = statement.bind_blob(first + 5, locator.workspace_id.data(),
+                                 locator.workspace_id.size());
+    if (!result) return result;
+    result = statement.bind_blob(first + 6, locator.provider_hash.data(),
+                                 locator.provider_hash.size());
+    if (!result) return result;
+    result = statement.bind_uint(first + 7, locator.provider_size);
+    if (!result) return result;
+    result = statement.bind_blob(first + 8, locator.artifact_hash.data(),
+                                 locator.artifact_hash.size());
+    if (!result) return result;
+    result = statement.bind_uint(first + 9, locator.generation);
+    if (!result) return result;
+    result = statement.bind_blob(first + 10, locator.entity_hash.data(),
+                                 locator.entity_hash.size());
+    if (!result) return result;
+    return statement.bind_blob(first + 11, locator.serialized_entity.data(),
+                               locator.serialized_entity.size());
+}
+
+bool overlay_blob_equals(sqlite3_stmt* statement, int column,
+                         const void* expected, std::size_t expected_size) noexcept {
+    if (sqlite3_column_type(statement, column) != SQLITE_BLOB ||
+        sqlite3_column_bytes(statement, column) !=
+            static_cast<int>(expected_size))
+        return false;
+    const void* value = sqlite3_column_blob(statement, column);
+    return value && std::memcmp(value, expected, expected_size) == 0;
+}
+
+bool operation_target_matches_columns(
+    sqlite3_stmt* statement, int first,
+    const overlay_operation_t& operation,
+    std::uint64_t maximum_managed_generation,
+    bool allow_managed_generation_mismatch = false) noexcept {
+    if (sqlite3_column_type(statement, first) != SQLITE_INTEGER ||
+        sqlite3_column_int(statement, first) !=
+            static_cast<int>(operation.target_discriminator))
+        return false;
+    if (operation.target_discriminator ==
+        overlay_target_discriminator_v9_t::native_address) {
+        if (operation.managed_locator ||
+            sqlite3_column_type(statement, first + 1) != SQLITE_INTEGER ||
+            sqlite3_column_type(statement, first + 2) != SQLITE_INTEGER ||
+            sqlite3_column_type(statement, first + 3) != SQLITE_INTEGER ||
+            sqlite3_column_type(statement, first + 4) != SQLITE_INTEGER ||
+            sqlite3_column_int(statement, first + 1) !=
+                static_cast<int>(operation.address.space) ||
+            static_cast<std::uint64_t>(sqlite3_column_int64(
+                statement, first + 2)) != operation.address.value ||
+            sqlite3_column_int(statement, first + 3) !=
+                static_cast<int>(operation.address.architecture) ||
+            sqlite3_column_int(statement, first + 4) !=
+                static_cast<int>(operation.address.mode))
+            return false;
+        for (int index = first + 5; index <= first + 11; ++index) {
+            if (sqlite3_column_type(statement, index) != SQLITE_NULL)
+                return false;
+        }
+        return true;
+    }
+    if (operation.target_discriminator !=
+            overlay_target_discriminator_v9_t::managed_entity ||
+        !operation.managed_locator)
+        return false;
+    for (int index = first + 1; index <= first + 4; ++index) {
+        if (sqlite3_column_type(statement, index) != SQLITE_NULL)
+            return false;
+    }
+    const auto& locator = *operation.managed_locator;
+    if (sqlite3_column_type(statement, first + 7) != SQLITE_INTEGER ||
+        sqlite3_column_type(statement, first + 9) != SQLITE_INTEGER)
+        return false;
+    const auto provider_size = static_cast<std::uint64_t>(
+        sqlite3_column_int64(statement, first + 7));
+    const auto generation = static_cast<std::uint64_t>(
+        sqlite3_column_int64(statement, first + 9));
+    if (provider_size == 0 || provider_size != locator.provider_size ||
+        generation == 0 || generation > maximum_managed_generation ||
+        (allow_managed_generation_mismatch
+             ? generation < locator.generation
+             : generation != locator.generation))
+        return false;
+    return overlay_blob_equals(statement, first + 5,
+                               locator.workspace_id.data(),
+                               locator.workspace_id.size()) &&
+        overlay_blob_equals(statement, first + 6,
+                            locator.provider_hash.data(),
+                            locator.provider_hash.size()) &&
+        overlay_blob_equals(statement, first + 8,
+                            locator.artifact_hash.data(),
+                            locator.artifact_hash.size()) &&
+        overlay_blob_equals(statement, first + 10,
+                            locator.entity_hash.data(),
+                            locator.entity_hash.size()) &&
+        overlay_blob_equals(statement, first + 11,
+                            locator.serialized_entity.data(),
+                            locator.serialized_entity.size());
+}
+
 std::string overlay_column_text(sqlite3_stmt* statement, int column) {
     const auto* text = sqlite3_column_text(statement, column);
     const int bytes = sqlite3_column_bytes(statement, column);
@@ -1215,22 +1710,224 @@ workspace_result_t<overlay_transaction_result_t> parse_transaction_result(
 
 workspace_result_t<void> wait_ticket(const persistence_ticket_t& ticket,
                                      const cancellation_token_t& cancel) {
-    if (!ticket.completion.valid()) {
+    if (!ticket.accepted || !ticket.completion.valid()) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::persistence_failure,
             "persistence queue returned an invalid completion ticket",
             "overlay_journal"));
     }
+    std::optional<std::chrono::steady_clock::time_point> resolution_deadline;
     for (;;) {
         if (ticket.completion.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready) {
-            const auto& result = ticket.completion.get();
-            if (result)
-                return workspace_result_t<void>::success();
-            return workspace_result_t<void>::failure(result.error());
+            try {
+                const auto& result = ticket.completion.get();
+                if (result)
+                    return workspace_result_t<void>::success();
+                return workspace_result_t<void>::failure(result.error());
+            } catch (...) {
+                return workspace_result_t<void>::failure(make_workspace_error(
+                    workspace_error_code_t::persistence_failure,
+                    "persistence completion raised an exception",
+                    "overlay_journal"));
+            }
         }
-        if (cancel.stop_requested())
-            continue;
+        if (cancel.stop_requested() && !resolution_deadline)
+            resolution_deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(2);
+        if (resolution_deadline &&
+            std::chrono::steady_clock::now() >= *resolution_deadline) {
+            auto error = make_workspace_error(
+                cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "persistence cancellation did not reach a terminal commit state within the resolution bound",
+                "overlay_journal");
+            error.deadline = cancel.deadline_exceeded();
+            error.cancellation = !error.deadline;
+            error.details.emplace_back("commit_state", "unresolved");
+            error.details.emplace_back("resolution_timeout_ms", "2000");
+            return workspace_result_t<void>::failure(std::move(error));
+        }
     }
+}
+
+workspace_result_t<std::shared_ptr<const workspace_persistence_candidate_t>>
+stage_projected_candidate(
+    const std::shared_ptr<workspace_database_t>& database,
+    const std::shared_ptr<const analysis_snapshot_t>& snapshot,
+    const std::shared_ptr<search_index_t>& index,
+    const std::shared_ptr<const managed_artifact_publication_t>& managed_publication,
+    const cancellation_token_t& cancel) {
+    if (!database || !snapshot)
+        return workspace_result_t<std::shared_ptr<const workspace_persistence_candidate_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "projected persistence candidate is incomplete",
+                                 "overlay_journal.persistence"));
+    const auto& versions = database->options().versions;
+    const std::string settings = json{
+        {"analysis_settings_hash", versions.analysis_settings_hash},
+        {"engine_version", versions.engine_version},
+        {"specification_version", versions.specification_version},
+        {"source", "overlay_projection"}}.dump();
+    persistence_ticket_t ticket;
+    if (index) {
+        persisted_search_products_t products;
+        products.generation = snapshot->generation;
+        products.analysis_revision = snapshot->analysis_revision;
+        products.overlay_revision = snapshot->overlay_revision;
+        products.live_index = index;
+        ticket = database->persist_snapshot(
+            snapshot, std::move(products), managed_publication,
+            settings, "{}", cancel);
+    } else {
+        ticket = database->persist_snapshot(
+            snapshot, managed_publication, settings, "{}", cancel);
+    }
+    auto waited = wait_ticket(ticket, cancel);
+    if (!waited) {
+        if (ticket.snapshot_candidate) {
+            auto discarded = ticket.snapshot_candidate->discard();
+            if (!discarded) {
+                auto error = waited.error();
+                error.details.emplace_back(
+                    "candidate_discard_error", discarded.error().stable_code());
+                return workspace_result_t<std::shared_ptr<const workspace_persistence_candidate_t>>::failure(
+                    std::move(error));
+            }
+        }
+        return workspace_result_t<std::shared_ptr<const workspace_persistence_candidate_t>>::failure(
+            waited.error());
+    }
+    if (!ticket.snapshot_candidate ||
+        ticket.snapshot_candidate->generation() != snapshot->generation ||
+        ticket.snapshot_candidate->analysis_revision() != snapshot->analysis_revision ||
+        ticket.snapshot_candidate->overlay_revision() != snapshot->overlay_revision) {
+        auto error = make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "projected persistence candidate identity is inconsistent",
+            "overlay_journal.persistence");
+        if (ticket.snapshot_candidate) {
+            auto discarded = ticket.snapshot_candidate->discard();
+            if (!discarded)
+                error.details.emplace_back(
+                    "candidate_discard_error", discarded.error().stable_code());
+        }
+        return workspace_result_t<std::shared_ptr<const workspace_persistence_candidate_t>>::failure(
+            std::move(error));
+    }
+    return workspace_result_t<std::shared_ptr<const workspace_persistence_candidate_t>>::success(
+        ticket.snapshot_candidate);
+}
+
+workspace_result_t<void> promote_projected_candidate(
+    sqlite3* writer,
+    const workspace_persistence_candidate_t& candidate,
+    const analysis_snapshot_t& snapshot,
+    const cancellation_token_t& token,
+    const char* phase) {
+    overlay_statement_t state;
+    auto current = state.prepare(writer,
+        "SELECT active_slot,candidate_slot,candidate_token,candidate_generation,candidate_analysis_revision,candidate_overlay_revision,candidate_ready FROM workspace_commit_state WHERE singleton=1",
+        phase);
+    if (!current)
+        return current;
+    const int status = sqlite3_step(state.get());
+    if (status != SQLITE_ROW || sqlite3_column_type(state.get(), 1) == SQLITE_NULL ||
+        sqlite3_column_type(state.get(), 2) == SQLITE_NULL ||
+        sqlite3_column_type(state.get(), 3) == SQLITE_NULL ||
+        sqlite3_column_type(state.get(), 4) == SQLITE_NULL ||
+        sqlite3_column_type(state.get(), 5) == SQLITE_NULL ||
+        sqlite3_column_int(state.get(), 6) != 1) {
+        auto error = make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "projected persistence candidate is no longer pending", phase);
+        error.sqlite_status = status;
+        return workspace_result_t<void>::failure(std::move(error));
+    }
+    const auto active_slot = sqlite3_column_int(state.get(), 0);
+    const auto candidate_slot = sqlite3_column_int(state.get(), 1);
+    if ((active_slot != 0 && active_slot != 1) ||
+        (candidate_slot != 0 && candidate_slot != 1) ||
+        active_slot == candidate_slot ||
+        overlay_column_text(state.get(), 2) != candidate.token() ||
+        static_cast<std::uint64_t>(sqlite3_column_int64(state.get(), 3)) !=
+            candidate.generation() ||
+        static_cast<std::uint64_t>(sqlite3_column_int64(state.get(), 4)) !=
+            candidate.analysis_revision() ||
+        static_cast<std::uint64_t>(sqlite3_column_int64(state.get(), 5)) !=
+            candidate.overlay_revision())
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "projected persistence candidate changed before overlay commit",
+            phase));
+    const std::string state_table = candidate_slot == 0
+        ? "analysis_state" : "alternate_analysis_state";
+    overlay_statement_t candidate_state;
+    const auto candidate_sql =
+        "SELECT generation,analysis_revision,overlay_revision,commit_token FROM " +
+        state_table + " WHERE singleton=1";
+    current = candidate_state.prepare(writer, candidate_sql.c_str(), phase);
+    if (!current)
+        return current;
+    const int candidate_status = sqlite3_step(candidate_state.get());
+    if (candidate_status != SQLITE_ROW ||
+        static_cast<std::uint64_t>(sqlite3_column_int64(candidate_state.get(), 0)) !=
+            candidate.generation() ||
+        static_cast<std::uint64_t>(sqlite3_column_int64(candidate_state.get(), 1)) !=
+            candidate.analysis_revision() ||
+        static_cast<std::uint64_t>(sqlite3_column_int64(candidate_state.get(), 2)) !=
+            candidate.overlay_revision() ||
+        overlay_column_text(candidate_state.get(), 3) != candidate.token())
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "projected candidate fact slot is inconsistent", phase));
+    if (candidate.packed_generation_required()) {
+        auto packed = read_packed_generation(
+            writer, candidate.generation(), false,
+            [&token] { return token.stop_requested(); });
+        if (!packed)
+            return workspace_result_t<void>::failure(packed.error());
+        auto expected_manifest = encode_packed_baseline_manifest(
+            snapshot, candidate.token(), token);
+        if (!expected_manifest)
+            return workspace_result_t<void>::failure(
+                expected_manifest.error());
+        if (!packed.value() || packed.value()->committed ||
+            packed.value()->analysis_revision !=
+                candidate.analysis_revision() ||
+            packed.value()->overlay_revision != candidate.overlay_revision() ||
+            packed.value()->payload_blob != expected_manifest.value())
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::integrity_failure,
+                "projected packed candidate identity is inconsistent",
+                phase));
+        auto published = publish_packed_generation(
+            writer, candidate.generation(),
+            [&token] { return token.stop_requested(); });
+        if (!published)
+            return published;
+    }
+    overlay_statement_t promote;
+    current = promote.prepare(writer,
+        "UPDATE workspace_commit_state SET active_slot=?1,committed_token=?2,committed_generation=?3,committed_analysis_revision=?4,committed_overlay_revision=?5,candidate_slot=NULL,candidate_token=NULL,candidate_generation=NULL,candidate_analysis_revision=NULL,candidate_overlay_revision=NULL,candidate_ready=0,updated_utc_ms=?6 WHERE singleton=1 AND active_slot=?7 AND candidate_slot=?1 AND candidate_ready=1 AND candidate_token=?2",
+        phase);
+    if (!current)
+        return current;
+    current = promote.bind_int(1, candidate_slot); if (!current) return current;
+    current = promote.bind_text(2, candidate.token()); if (!current) return current;
+    current = promote.bind_uint(3, candidate.generation()); if (!current) return current;
+    current = promote.bind_uint(4, candidate.analysis_revision()); if (!current) return current;
+    current = promote.bind_uint(5, candidate.overlay_revision()); if (!current) return current;
+    current = promote.bind_uint(6, overlay_utc_ms()); if (!current) return current;
+    current = promote.bind_int(7, active_slot); if (!current) return current;
+    current = promote.step_done();
+    if (!current)
+        return current;
+    if (sqlite3_changes(writer) != 1)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "projected persistence candidate was not promoted", phase));
+    return workspace_result_t<void>::success();
 }
 
 overlay_apply_limits_v9_t projection_limits(const overlay_limits_t& limits) {
@@ -1241,6 +1938,7 @@ overlay_apply_limits_v9_t projection_limits(const overlay_limits_t& limits) {
     result.max_type_bytes = limits.max_type_bytes;
     result.max_patch_bytes_per_operation = limits.max_patch_bytes_per_item;
     result.max_patch_bytes_per_transaction = limits.max_patch_bytes_per_transaction;
+    result.max_managed_entity_bytes = limits.max_managed_entity_bytes;
     return result;
 }
 
@@ -1303,140 +2001,6 @@ workspace_error_t projection_finalize_error(
     return error;
 }
 
-workspace_result_t<std::vector<std::uint8_t>> materialize_static_image(
-    const analysis_workspace_t& workspace,
-    const overlay_target_identity_v9_t& target,
-    const cancellation_token_t& cancel) {
-    if (target.kind != overlay_target_kind_v9_t::static_image ||
-        target.image_size == 0 ||
-        target.image_size >
-            static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())) {
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            make_workspace_error(workspace_error_code_t::limit_exceeded,
-                                 "static overlay image cannot be materialized",
-                                 "overlay_journal.projection"));
-    }
-    if (cancel.stop_requested()) {
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            make_workspace_error(
-                cancel.deadline_exceeded()
-                    ? workspace_error_code_t::deadline_exceeded
-                    : workspace_error_code_t::cancelled,
-                "static overlay projection was cancelled",
-                "overlay_journal.projection"));
-    }
-    auto binding = workspace.verify_provider_binding();
-    if (!binding)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            binding.error());
-    std::vector<std::uint8_t> bytes;
-    try {
-        bytes.resize(static_cast<std::size_t>(target.image_size));
-    } catch (...) {
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            make_workspace_error(workspace_error_code_t::limit_exceeded,
-                                 "static overlay image allocation failed",
-                                 "overlay_journal.projection"));
-    }
-    const auto image = workspace.image();
-    if (image) {
-        if (image->image_size() != target.image_size ||
-            image->headers_size() > workspace.source_provider().size() ||
-            image->headers_size() > target.image_size) {
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                make_workspace_error(workspace_error_code_t::target_conflict,
-                                     "PE image layout differs from overlay target",
-                                     "overlay_journal.projection"));
-        }
-        if (image->headers_size() != 0) {
-            auto read = workspace.source_provider().read_exact(
-                0, bytes.data(), image->headers_size(), cancel);
-            if (!read)
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    read.error());
-        }
-    }
-    const auto normalized = workspace.normalized_image();
-    bool copied_mapping = false;
-    if (normalized) {
-        if (normalized->image_size != target.image_size) {
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                make_workspace_error(workspace_error_code_t::target_conflict,
-                                     "normalized image size differs from overlay target",
-                                     "overlay_journal.projection"));
-        }
-        for (const auto& mapping : normalized->address_mappings) {
-            if (mapping.source_space != address_space_id_t::file_offset ||
-                mapping.target_space != address_space_id_t::relative_virtual ||
-                mapping.size == 0)
-                continue;
-            if (mapping.source_start > workspace.source_provider().size() ||
-                mapping.size > workspace.source_provider().size() - mapping.source_start ||
-                mapping.target_start > target.image_size ||
-                mapping.size > target.image_size - mapping.target_start) {
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                                         "normalized overlay mapping exceeds image bounds",
-                                         "overlay_journal.projection"));
-            }
-            auto read = workspace.source_provider().read_exact(
-                mapping.source_start,
-                bytes.data() + static_cast<std::size_t>(mapping.target_start),
-                mapping.size, cancel);
-            if (!read)
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    read.error());
-            copied_mapping = true;
-        }
-    }
-    if (!copied_mapping && image) {
-        for (const auto& section : image->sections()) {
-            if (section.raw_size == 0)
-                continue;
-            const auto source = static_cast<std::uint64_t>(section.raw_offset);
-            const auto destination =
-                static_cast<std::uint64_t>(section.virtual_address);
-            const auto size = static_cast<std::uint64_t>(section.raw_size);
-            if (source > workspace.source_provider().size() ||
-                size > workspace.source_provider().size() - source ||
-                destination > target.image_size ||
-                size > target.image_size - destination) {
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    make_workspace_error(workspace_error_code_t::integrity_failure,
-                                         "PE overlay section exceeds image bounds",
-                                         "overlay_journal.projection"));
-            }
-            auto read = workspace.source_provider().read_exact(
-                source,
-                bytes.data() + static_cast<std::size_t>(destination),
-                size, cancel);
-            if (!read)
-                return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                    read.error());
-        }
-        copied_mapping = true;
-    }
-    if (!copied_mapping) {
-        if (workspace.source_provider().size() < target.image_size) {
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                make_workspace_error(workspace_error_code_t::provider_unavailable,
-                                     "overlay target exceeds the immutable provider",
-                                     "overlay_journal.projection"));
-        }
-        auto read = workspace.source_provider().read_exact(
-            0, bytes.data(), target.image_size, cancel);
-        if (!read)
-            return workspace_result_t<std::vector<std::uint8_t>>::failure(
-                read.error());
-    }
-    binding = workspace.verify_provider_binding();
-    if (!binding)
-        return workspace_result_t<std::vector<std::uint8_t>>::failure(
-            binding.error());
-    return workspace_result_t<std::vector<std::uint8_t>>::success(
-        std::move(bytes));
-}
-
 struct overlay_provider_mapping_t final {
     std::uint64_t source_start = 0;
     std::uint64_t target_start = 0;
@@ -1446,10 +2010,12 @@ struct overlay_provider_mapping_t final {
 class overlay_generation_provider_t final : public byte_provider_t {
 public:
     overlay_generation_provider_t(
-        std::shared_ptr<const spill_provider_t> storage,
-        std::optional<provider_member_metadata_t> member)
+        std::shared_ptr<const byte_provider_t> storage,
+        std::optional<provider_member_metadata_t> member,
+        std::string normalized_source)
         : storage_(std::move(storage)), identity_(storage_->identity()) {
         identity_.member = std::move(member);
+        identity_.normalized_source = std::move(normalized_source);
     }
 
     const byte_provider_identity_t& identity() const noexcept override {
@@ -1472,9 +2038,17 @@ public:
     }
 
 private:
-    std::shared_ptr<const spill_provider_t> storage_;
+    std::shared_ptr<const byte_provider_t> storage_;
     byte_provider_identity_t identity_;
 };
+
+std::string overlay_provider_source(
+    const analysis_workspace_t& workspace,
+    const projection_result_t& prepared) {
+    return "overlay://" + workspace.identity().binary_id().to_hex() +
+        "/generation/" + std::to_string(prepared.new_generation) +
+        "/revision/" + std::to_string(prepared.revision);
+}
 
 workspace_result_t<std::vector<overlay_provider_mapping_t>>
 overlay_provider_mappings(
@@ -1605,8 +2179,13 @@ materialize_projected_provider(
     if (!binding)
         return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
             binding.error());
+    if (!prepared.projected_state || prepared.projected_size == 0)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "projected overlay metadata is unavailable",
+                                 "overlay_journal.provider"));
     auto mappings = overlay_provider_mappings(
-        workspace, prepared.projected_bytes.size());
+        workspace, prepared.projected_size);
     if (!mappings)
         return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
             mappings.error());
@@ -1616,7 +2195,14 @@ materialize_projected_provider(
             return std::tie(lhs.target_start, lhs.source_start, lhs.size) <
                    std::tie(rhs.target_start, rhs.source_start, rhs.size);
         });
-    for (const auto& item : prepared.projected_state.items) {
+    struct patch_segment_t final {
+        std::uint64_t source_offset = 0;
+        std::uint64_t size = 0;
+        const std::vector<std::uint8_t>* bytes = nullptr;
+        std::uint64_t payload_offset = 0;
+    };
+    std::vector<patch_segment_t> patches;
+    for (const auto& item : prepared.projected_state->items) {
         const auto kind = overlay_operation_kind_for_item_v9(
             item.first, item.second);
         if (!kind)
@@ -1624,13 +2210,54 @@ materialize_projected_provider(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                                      "projected overlay item has no operation kind",
                                      "overlay_journal.provider"));
-        if (*kind != overlay_operation_kind_v9_t::patch)
+        if (*kind != overlay_operation_kind_v9_t::byte_patch &&
+            *kind != overlay_operation_kind_v9_t::assembly_patch &&
+            *kind != overlay_operation_kind_v9_t::integer_patch)
             continue;
-        if (item.first.range.size != item.second.bytes.size() ||
-            !overlay_range_is_provider_backed(item.first.range, target_order))
+        const overlay_static_range_v9_t patch_range{
+            item.first.range.offset,
+            static_cast<std::uint64_t>(item.second.bytes.size())};
+        if (!overlay_range_is_provider_backed(patch_range, target_order))
             return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
                 make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
                                      "projected patch is not fully provider-backed",
+                                     "overlay_journal.provider"));
+        std::uint64_t target_cursor = patch_range.offset;
+        const auto target_end = patch_range.offset + patch_range.size;
+        for (const auto& mapping : target_order) {
+            const auto mapping_end = mapping.target_start + mapping.size;
+            if (mapping_end <= target_cursor)
+                continue;
+            if (mapping.target_start > target_cursor)
+                break;
+            const auto segment_end = (std::min)(target_end, mapping_end);
+            patches.push_back({
+                mapping.source_start + target_cursor - mapping.target_start,
+                segment_end - target_cursor,
+                &item.second.bytes,
+                target_cursor - patch_range.offset});
+            target_cursor = segment_end;
+            if (target_cursor == target_end)
+                break;
+        }
+        if (target_cursor != target_end)
+            return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+                make_workspace_error(workspace_error_code_t::provider_binding_mismatch,
+                                     "projected patch mapping is incomplete",
+                                     "overlay_journal.provider"));
+    }
+    std::sort(patches.begin(), patches.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return std::tie(lhs.source_offset, lhs.size, lhs.payload_offset) <
+                   std::tie(rhs.source_offset, rhs.size, rhs.payload_offset);
+        });
+    for (std::size_t index = 1; index < patches.size(); ++index) {
+        const auto previous_end = patches[index - 1].source_offset +
+            patches[index - 1].size;
+        if (patches[index].source_offset < previous_end)
+            return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+                make_workspace_error(workspace_error_code_t::revision_conflict,
+                                     "projected provider patches overlap",
                                      "overlay_journal.provider"));
     }
 
@@ -1640,16 +2267,51 @@ materialize_projected_provider(
             make_workspace_error(workspace_error_code_t::provider_unavailable,
                                  "immutable overlay source provider is unavailable",
                                  "overlay_journal.provider"));
+    if (patches.empty()) {
+        auto snapshot = provider_snapshot_t::capture(
+            source, prepared.new_generation, cancel);
+        if (!snapshot)
+            return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+                snapshot.error());
+        try {
+            auto provider = std::make_shared<overlay_generation_provider_t>(
+                std::static_pointer_cast<const byte_provider_t>(
+                    snapshot.take_value()),
+                source->member_metadata(),
+                source->identity().normalized_source);
+            return workspace_result_t<std::shared_ptr<const byte_provider_t>>::success(
+                std::static_pointer_cast<const byte_provider_t>(
+                    std::move(provider)));
+        } catch (const std::bad_alloc&) {
+            return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "overlay generation provider allocation failed",
+                                     "overlay_journal.provider"));
+        }
+    }
+    constexpr std::uint64_t workspace_overlay_spill_limit =
+        1ULL * 1024ULL * 1024ULL * 1024ULL;
+    if (source->size() > workspace_overlay_spill_limit)
+        return workspace_result_t<std::shared_ptr<const byte_provider_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "projected provider exceeds the workspace spill budget",
+                                 "overlay_journal.provider"));
     spill_provider_options_t options;
     options.max_spill_bytes = source->size();
+    options.write_chunk_bytes = 1ULL * 1024ULL * 1024ULL;
+    options.mapped_window_cache.window_bytes = 4ULL * 1024ULL * 1024ULL;
+    options.mapped_window_cache.max_lease_bytes = 4ULL * 1024ULL * 1024ULL;
+    options.mapped_window_cache.max_cached_window_bytes =
+        256ULL * 1024ULL * 1024ULL;
+    options.mapped_window_cache.max_global_mapped_window_bytes =
+        2ULL * 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t cursor = 0;
     const auto label = workspace.identity().binary_id().to_hex() +
         "-overlay-g" + std::to_string(prepared.new_generation) +
         "-r" + std::to_string(prepared.revision);
     auto storage = spill_provider_t::from_stream(
         label,
-        [source, mappings = mappings.take_value(),
-         &projected_bytes = prepared.projected_bytes,
+        [source, patches = std::move(patches),
          cursor](std::uint8_t* destination, std::size_t capacity,
                  const cancellation_token_t& token) mutable
             -> workspace_result_t<std::size_t> {
@@ -1661,19 +2323,18 @@ materialize_projected_provider(
             if (!read)
                 return workspace_result_t<std::size_t>::failure(read.error());
             const auto chunk_end = cursor + amount;
-            for (const auto& mapping : mappings) {
-                const auto mapping_end = mapping.source_start + mapping.size;
-                if (mapping_end <= cursor)
+            for (const auto& patch : patches) {
+                const auto patch_end = patch.source_offset + patch.size;
+                if (patch_end <= cursor)
                     continue;
-                if (mapping.source_start >= chunk_end)
+                if (patch.source_offset >= chunk_end)
                     break;
-                const auto overlap_start = (std::max)(cursor, mapping.source_start);
-                const auto overlap_end = (std::min)(chunk_end, mapping_end);
-                const auto target = mapping.target_start +
-                    (overlap_start - mapping.source_start);
+                const auto overlap_start = (std::max)(cursor, patch.source_offset);
+                const auto overlap_end = (std::min)(chunk_end, patch_end);
                 std::memcpy(
                     destination + static_cast<std::size_t>(overlap_start - cursor),
-                    projected_bytes.data() + static_cast<std::size_t>(target),
+                    patch.bytes->data() + static_cast<std::size_t>(
+                        patch.payload_offset + overlap_start - patch.source_offset),
                     static_cast<std::size_t>(overlap_end - overlap_start));
             }
             cursor = chunk_end;
@@ -1690,7 +2351,8 @@ materialize_projected_provider(
             binding.error());
     try {
         auto provider = std::make_shared<overlay_generation_provider_t>(
-            storage.take_value(), source->member_metadata());
+            storage.take_value(), source->member_metadata(),
+            overlay_provider_source(workspace, prepared));
         return workspace_result_t<std::shared_ptr<const byte_provider_t>>::success(
             std::static_pointer_cast<const byte_provider_t>(std::move(provider)));
     } catch (const std::bad_alloc&) {
@@ -1767,8 +2429,11 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
             affected_functions.emplace_back(function.start, rva.value());
         }
     }
-    const bool invalidate_all = request.invalidate_workspace ||
-        request.affected_ranges.empty() || affected_functions.empty();
+    const bool invalidate_all = request.invalidate_workspace;
+    if (!invalidate_all && affected_functions.empty()) {
+        result.succeeded = true;
+        return result;
+    }
     auto service = workspace->decompiler();
     if (service) {
         const auto before = service->snapshot().memory_cache_entries;
@@ -1820,7 +2485,11 @@ projection_finalize_result_t publish_projected_overlay(
     const std::shared_ptr<analysis_workspace_t>& workspace,
     const std::shared_ptr<workspace_database_t>& database,
     const std::shared_ptr<const byte_provider_t>& projected_provider,
-    std::function<workspace_result_t<void>()> persistence_finalizer,
+    std::function<workspace_result_t<void>(
+        const std::shared_ptr<const analysis_snapshot_t>&,
+        const std::shared_ptr<search_index_t>&,
+        const std::shared_ptr<const managed_artifact_publication_t>&)>
+        persistence_finalizer,
     const cancellation_token_t& cancel) {
     try {
         projection_invalidation_hooks_t hooks;
@@ -1833,10 +2502,7 @@ projection_finalize_result_t publish_projected_overlay(
         hooks.packed_index =
             [workspace, projected_provider,
              target_overlay_revision = prepared.revision,
-             preserve_analysis =
-                 prepared.invalidation.invalidated_stages ==
-                     projection_stage_flag_t::none &&
-                 prepared.invalidation.affected_ranges.empty(),
+             invalidation = prepared.invalidation,
              persistence_finalizer = std::move(persistence_finalizer)](
                 const packed_index_invalidation_request_t& request) {
                 projection_invalidation_hook_result_t result;
@@ -1852,14 +2518,37 @@ projection_finalize_result_t publish_projected_overlay(
                         "workspace generation changed before packed-index publication";
                     return result;
                 }
+                std::shared_ptr<const managed_artifact_publication_t>
+                    projected_managed;
+                if (source->managed_artifacts) {
+                    auto rebound = rebind_managed_artifact_publication(
+                        *source->managed_artifacts, workspace->identity(),
+                        *projected_provider, source->snapshot->image,
+                        request.target_generation,
+                        source->snapshot->analysis_revision,
+                        target_overlay_revision,
+                        workspace->cancellation_token());
+                    if (!rebound) {
+                        result.detail = rebound.error().message;
+                        return result;
+                    }
+                    projected_managed = rebound.take_value();
+                }
+                auto persisted =
+                    [persistence_finalizer, projected_managed](
+                        const std::shared_ptr<const analysis_snapshot_t>& snapshot,
+                        const std::shared_ptr<search_index_t>& index) {
+                    return persistence_finalizer(
+                        snapshot, index, projected_managed);
+                };
                 auto published = workspace->publish_projected_generation(
                     request.source_generation,
                     source->snapshot->analysis_revision,
                     request.target_generation,
                     target_overlay_revision,
                     projected_provider,
-                    preserve_analysis,
-                    persistence_finalizer);
+                    invalidation,
+                    std::move(persisted));
                 if (!published) {
                     result.detail = published.error().message;
                     return result;
@@ -1890,11 +2579,10 @@ projection_finalize_result_t publish_projected_overlay(
     }
 }
 
-workspace_result_t<void> apply_item(sqlite3* database, const std::string& entity,
-                                    overlay_operation_kind_t kind,
-                                    const address_t& address,
-                                    const std::string& payload,
-                                    std::uint64_t revision) {
+workspace_result_t<void> apply_item(
+    sqlite3* database, const std::string& entity,
+    const std::string& payload, std::uint64_t revision,
+    const overlay_target_identity_v9_t& target) {
     auto parsed = json::parse(payload, nullptr, false);
     if (parsed.is_discarded()) {
         return workspace_result_t<void>::failure(make_workspace_error(
@@ -1909,16 +2597,19 @@ workspace_result_t<void> apply_item(sqlite3* database, const std::string& entity
         result = remove.bind_text(1, entity); if (!result) return result;
         return remove.step_done();
     }
+    auto operation = parse_operation(payload, target);
+    if (!operation)
+        return workspace_result_t<void>::failure(operation.error());
+    if (entity_key(operation.value()) != entity) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "overlay materialized entity key does not match its payload",
+            "overlay_journal.apply"));
+    }
+    auto materialized = materialized_operation(operation.take_value());
     std::string materialized_payload;
     try {
-        if (kind == overlay_operation_kind_t::comment_update) {
-            kind = overlay_operation_kind_t::comment;
-            parsed["kind"] = static_cast<unsigned>(kind);
-        } else if (kind == overlay_operation_kind_t::type_update) {
-            kind = overlay_operation_kind_t::type_application;
-            parsed["kind"] = static_cast<unsigned>(kind);
-        }
-        materialized_payload = parsed.dump();
+        materialized_payload = operation_json(materialized, &target).dump();
     } catch (...) {
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
@@ -1927,14 +2618,14 @@ workspace_result_t<void> apply_item(sqlite3* database, const std::string& entity
     }
     overlay_statement_t upsert;
     auto result = upsert.prepare(database,
-        "INSERT INTO overlay_items(entity_key,kind,address_space,address_value,address_arch,address_mode,payload_json,updated_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(entity_key) DO UPDATE SET kind=excluded.kind,address_space=excluded.address_space,address_value=excluded.address_value,address_arch=excluded.address_arch,address_mode=excluded.address_mode,payload_json=excluded.payload_json,updated_revision=excluded.updated_revision",
+        "INSERT INTO overlay_items(entity_key,kind,target_discriminator,address_space,address_value,address_arch,address_mode,managed_workspace_id,managed_provider_hash,managed_provider_size,managed_artifact_hash,managed_generation,managed_entity_hash,managed_entity_key,payload_json,updated_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) ON CONFLICT(entity_key) DO UPDATE SET kind=excluded.kind,target_discriminator=excluded.target_discriminator,address_space=excluded.address_space,address_value=excluded.address_value,address_arch=excluded.address_arch,address_mode=excluded.address_mode,managed_workspace_id=excluded.managed_workspace_id,managed_provider_hash=excluded.managed_provider_hash,managed_provider_size=excluded.managed_provider_size,managed_artifact_hash=excluded.managed_artifact_hash,managed_generation=excluded.managed_generation,managed_entity_hash=excluded.managed_entity_hash,managed_entity_key=excluded.managed_entity_key,payload_json=excluded.payload_json,updated_revision=excluded.updated_revision",
         "overlay_journal.apply");
     if (!result) return result;
     result = upsert.bind_text(1, entity); if (!result) return result;
-    result = upsert.bind_int(2, static_cast<std::int64_t>(kind)); if (!result) return result;
-    result = bind_operation_address(upsert, 3, address); if (!result) return result;
-    result = upsert.bind_text(7, materialized_payload); if (!result) return result;
-    result = upsert.bind_uint(8, revision); if (!result) return result;
+    result = upsert.bind_int(2, static_cast<std::int64_t>(materialized.kind)); if (!result) return result;
+    result = bind_operation_target(upsert, 3, materialized); if (!result) return result;
+    result = upsert.bind_text(15, materialized_payload); if (!result) return result;
+    result = upsert.bind_uint(16, revision); if (!result) return result;
     return upsert.step_done();
 }
 
@@ -2065,6 +2756,79 @@ workspace_result_t<overlay_db_state_t> read_overlay_state(sqlite3* database,
 
 }
 
+workspace_result_t<overlay_managed_entity_locator_v9_t>
+bind_managed_overlay_entity_v9(
+    const analysis_workspace_t& workspace,
+    const generation_bound_decompiler_entity_t& binding) {
+    if (workspace.target_kind() != target_kind_t::static_file ||
+        binding.schema_version != managed_entity_binding_schema_version ||
+        binding.reader_schema_version !=
+            readers::managed::managed_reader_schema_version ||
+        binding.binary_id != workspace.identity().binary_id() ||
+        binding.load_profile_hash != workspace.identity().load_profile_hash() ||
+        binding.provider_size != workspace.provider().size() ||
+        binding.generation != workspace.generation() ||
+        binding.analysis_revision != workspace.analysis_revision() ||
+        binding.overlay_revision != workspace.overlay_revision() ||
+        binding.type_graph_revision != workspace.analysis_revision() ||
+        binding.generation == 0 || binding.artifact_hash.empty() ||
+        binding.entity.kind == decompiler_entity_kind_t::native_function) {
+        return workspace_result_t<overlay_managed_entity_locator_v9_t>::failure(
+            make_workspace_error(
+                workspace_error_code_t::provider_binding_mismatch,
+                "managed overlay binding does not match the current workspace provider and generation",
+                "overlay_journal.managed_binding"));
+    }
+    const auto publication = workspace.analysis_publication();
+    if (!publication) {
+        return workspace_result_t<overlay_managed_entity_locator_v9_t>::failure(
+            make_workspace_error(
+                workspace_error_code_t::target_not_found,
+                "managed overlay binding has no current analysis publication",
+                "overlay_journal.managed_binding"));
+    }
+    auto validated = validate_generation_bound_entity(
+        workspace.identity(), *publication, binding);
+    if (!validated)
+        return workspace_result_t<overlay_managed_entity_locator_v9_t>::failure(
+            validated.error());
+    if (binding.generation != workspace.generation() ||
+        binding.analysis_revision != workspace.analysis_revision() ||
+        binding.overlay_revision != workspace.overlay_revision()) {
+        return workspace_result_t<overlay_managed_entity_locator_v9_t>::failure(
+            make_workspace_error(
+                workspace_error_code_t::target_stale,
+                "managed overlay binding changed during validation",
+                "overlay_journal.managed_binding"));
+    }
+    try {
+        overlay_managed_entity_locator_v9_t locator;
+        locator.workspace_id = binding.binary_id.bytes;
+        locator.provider_hash = workspace.identity().content_hash().bytes;
+        locator.artifact_hash = binding.artifact_hash.bytes;
+        locator.provider_size = binding.provider_size;
+        locator.generation = binding.generation;
+        locator.serialized_entity = serialize_decompiler_entity_key(binding.entity);
+        locator.entity_hash = stable_serialization_hash(
+            locator.serialized_entity).bytes;
+        if (!locator.valid()) {
+            return workspace_result_t<overlay_managed_entity_locator_v9_t>::failure(
+                make_workspace_error(
+                    workspace_error_code_t::invalid_argument,
+                    "managed overlay entity key is invalid or does not match its artifact",
+                    "overlay_journal.managed_binding"));
+        }
+        return workspace_result_t<overlay_managed_entity_locator_v9_t>::success(
+            std::move(locator));
+    } catch (...) {
+        return workspace_result_t<overlay_managed_entity_locator_v9_t>::failure(
+            make_workspace_error(
+                workspace_error_code_t::limit_exceeded,
+                "managed overlay entity serialization failed",
+                "overlay_journal.managed_binding"));
+    }
+}
+
 overlay_journal_t::overlay_journal_t(std::shared_ptr<analysis_workspace_t> workspace,
                                      std::shared_ptr<workspace_database_t> database,
                                      overlay_limits_t limits,
@@ -2141,7 +2905,10 @@ workspace_result_t<std::shared_ptr<overlay_journal_t>> overlay_journal_t::open(
     overlay_limits_t limits) {
     if (!workspace || !database || limits.max_operations == 0 ||
         limits.max_patch_bytes_per_item == 0 ||
-        limits.max_patch_bytes_per_transaction < limits.max_patch_bytes_per_item) {
+        limits.max_patch_bytes_per_transaction < limits.max_patch_bytes_per_item ||
+        limits.max_managed_entity_bytes == 0 ||
+        limits.max_managed_entity_bytes >
+            k_overlay_managed_entity_serialization_limit) {
         return workspace_result_t<std::shared_ptr<overlay_journal_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "overlay journal requires a workspace, database, and valid limits",
@@ -2196,21 +2963,17 @@ workspace_result_t<std::shared_ptr<overlay_journal_t>> overlay_journal_t::open(
                                  "overlay_journal.open"));
     }
     std::shared_ptr<const byte_provider_t> recovered_provider;
-    if (journal->revision_ > current_revision) {
+    const bool requires_projection_restore =
+        journal->revision_ > current_revision ||
+        !journal->patch_operations().empty();
+    if (requires_projection_restore) {
         const auto target = journal->fixed_target();
-        auto immutable_image = materialize_static_image(
-            *owner, target, journal->cancellation_.token());
-        if (!immutable_image)
-            return attach_failure(immutable_image.error());
         auto state = make_v9_preflight_state(
             journal->snapshot(), *owner, target);
         if (!state)
             return attach_failure(state.error());
-        const std::string_view immutable_bytes(
-            reinterpret_cast<const char*>(immutable_image.value().data()),
-            immutable_image.value().size());
-        auto projected = overlay_projection_t::project(
-            state.value(), immutable_bytes, target.generation);
+        auto projected = overlay_projection_t::prepare(
+            state.value(), target.generation);
         if (!projected)
             return attach_failure(
                 projection_error(projected, "overlay_journal.open"));
@@ -2232,7 +2995,14 @@ workspace_result_t<std::shared_ptr<overlay_journal_t>> overlay_journal_t::open(
     if (journal->revision_ > current_revision) {
         const auto restored = owner->restore_overlay_revision(current_revision,
                                                               journal->revision_,
+                                                              journal->fixed_target_.generation,
                                                               recovered_provider);
+        if (!restored)
+            return attach_failure(restored.error());
+    } else if (recovered_provider) {
+        auto restored = owner->restore_projected_provider(
+            owner->generation(), owner->analysis_revision(),
+            owner->overlay_revision(), recovered_provider);
         if (!restored)
             return attach_failure(restored.error());
     }
@@ -2281,7 +3051,7 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
             if (!cleared) { overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery"); return cleared; }
             overlay_statement_t statement;
             auto result = statement.prepare(writer,
-                "SELECT o.entity_key,o.kind,o.address_space,o.address_value,o.address_arch,o.address_mode,o.after_json,t.revision FROM overlay_operations o JOIN overlay_transactions t ON t.transaction_id=o.transaction_id WHERE t.applied=1 AND t.abandoned=0 ORDER BY t.transaction_id,o.operation_index",
+                "SELECT o.entity_key,o.before_json,o.after_json,t.revision,o.target_discriminator,o.address_space,o.address_value,o.address_arch,o.address_mode,o.managed_workspace_id,o.managed_provider_hash,o.managed_provider_size,o.managed_artifact_hash,o.managed_generation,o.managed_entity_hash,o.managed_entity_key FROM overlay_operations o JOIN overlay_transactions t ON t.transaction_id=o.transaction_id WHERE t.applied=1 AND t.abandoned=0 ORDER BY t.transaction_id,o.operation_index",
                 "overlay_journal.recovery");
             if (!result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery"); return result; }
             for (;;) {
@@ -2296,15 +3066,38 @@ workspace_result_t<void> overlay_journal_t::recover_and_load(
                     error.sqlite_status = status;
                     return workspace_result_t<void>::failure(std::move(error));
                 }
-                address_t address;
-                address.space = static_cast<address_space_id_t>(sqlite3_column_int(statement.get(), 2));
-                address.value = static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 3));
-                address.architecture = static_cast<architecture_id_t>(sqlite3_column_int(statement.get(), 4));
-                address.mode = static_cast<architecture_mode_t>(sqlite3_column_int(statement.get(), 5));
-                result = apply_item(writer, overlay_column_text(statement.get(), 0),
-                                    static_cast<overlay_operation_kind_t>(sqlite3_column_int(statement.get(), 1)),
-                                    address, overlay_column_text(statement.get(), 6),
-                                    static_cast<std::uint64_t>(sqlite3_column_int64(statement.get(), 7)));
+                const std::string before =
+                    sqlite3_column_type(statement.get(), 1) == SQLITE_NULL
+                        ? std::string("null")
+                        : overlay_column_text(statement.get(), 1);
+                const std::string after = overlay_column_text(statement.get(), 2);
+                const bool removal = after == "null";
+                const std::string& source = removal ? before : after;
+                if (source == "null") {
+                    overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery");
+                    return workspace_result_t<void>::failure(make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "overlay journal operation has no replay identity",
+                        "overlay_journal.recovery"));
+                }
+                auto parsed = parse_operation(source, target);
+                if (!parsed ||
+                    entity_key(parsed.value()) !=
+                        overlay_column_text(statement.get(), 0) ||
+                    !operation_target_matches_columns(
+                        statement.get(), 4, parsed.value(),
+                        target.generation, removal)) {
+                    overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery");
+                    return workspace_result_t<void>::failure(make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "overlay journal storage identity is inconsistent",
+                        "overlay_journal.recovery"));
+                }
+                result = apply_item(
+                    writer, overlay_column_text(statement.get(), 0), after,
+                    static_cast<std::uint64_t>(
+                        sqlite3_column_int64(statement.get(), 3)),
+                    target);
                 if (!result) { overlay_exec(writer, "ROLLBACK", "overlay_journal.recovery"); return result; }
             }
             auto committed = overlay_exec(writer, "COMMIT", "overlay_journal.recovery");
@@ -2328,7 +3121,7 @@ workspace_result_t<void> overlay_journal_t::reload_items() {
         state = state_result.take_value();
         overlay_statement_t statement;
         auto prepared = statement.prepare(reader,
-            "SELECT entity_key,payload_json FROM overlay_items ORDER BY entity_key",
+            "SELECT entity_key,payload_json,target_discriminator,address_space,address_value,address_arch,address_mode,managed_workspace_id,managed_provider_hash,managed_provider_size,managed_artifact_hash,managed_generation,managed_entity_hash,managed_entity_key FROM overlay_items ORDER BY entity_key",
             "overlay_journal.load");
         if (!prepared) return prepared;
         for (;;) {
@@ -2355,10 +3148,13 @@ workspace_result_t<void> overlay_journal_t::reload_items() {
             }
             std::size_t patch_bytes = 0;
             auto validated = validate_operation(operation.value(), limits_, *owner,
-                                                patch_bytes);
+                                                patch_bytes, true);
             if (!validated)
                 return validated;
             if (key != entity_key(operation.value()) ||
+                !operation_target_matches_columns(
+                    statement.get(), 2, operation.value(),
+                    fixed_target_.generation) ||
                 items.find(key) != items.end()) {
                 return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::integrity_failure,
@@ -2468,7 +3264,9 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     v9_operations.reserve(request.operations.size());
     std::unordered_map<std::string, std::pair<std::uint64_t, std::uint64_t>> patch_ranges;
     for (const auto& operation : request.operations) {
-        auto validated = validate_operation(operation, limits_, *workspace, total_patch_bytes);
+        auto validated = validate_operation(
+            operation, limits_, *workspace, total_patch_bytes,
+            request.idempotency_key.has_value());
         if (!validated)
             return workspace_result_t<overlay_transaction_result_t>::failure(validated.error());
         const std::string key = entity_key(operation);
@@ -2518,8 +3316,15 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
         request_json["idempotency_key"] = request.idempotency_key
             ? json(*request.idempotency_key) : json(nullptr);
         request_json["operations"] = json::array();
-        for (const auto& operation : request.operations)
-            request_json["operations"].push_back(operation_json(operation, &hash_target));
+        for (const auto& operation : request.operations) {
+            auto canonical = operation;
+            if (canonical.target_discriminator ==
+                    overlay_target_discriminator_v9_t::managed_entity &&
+                canonical.managed_locator)
+                canonical.managed_locator->generation = hash_target.generation;
+            request_json["operations"].push_back(
+                operation_json(canonical, &hash_target));
+        }
         auto request_hash_result = sha256_text(request_json.dump(), cancel);
         if (!request_hash_result)
             return workspace_result_t<overlay_transaction_result_t>::failure(
@@ -2528,7 +3333,10 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
         const bool legacy_compatible = request.idempotency_key &&
             std::all_of(request.operations.begin(), request.operations.end(),
                 [](const overlay_operation_t& operation) {
-                    return static_cast<unsigned>(operation.kind) <=
+                    return operation.target_discriminator ==
+                               overlay_target_discriminator_v9_t::native_address &&
+                        !operation.managed_locator &&
+                        static_cast<unsigned>(operation.kind) <=
                                static_cast<unsigned>(overlay_operation_kind_t::integer_patch) &&
                         operation.reanalysis_flags == 0 && !operation.remove;
                 });
@@ -2593,6 +3401,14 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
         if (replay)
             return workspace_result_t<overlay_transaction_result_t>::success(
                 std::move(*replay));
+        std::size_t current_patch_bytes = 0;
+        for (const auto& operation : request.operations) {
+            auto validated = validate_operation(
+                operation, limits_, *workspace, current_patch_bytes);
+            if (!validated)
+                return workspace_result_t<overlay_transaction_result_t>::failure(
+                    validated.error());
+        }
     }
 
     std::unordered_map<std::string, std::pair<std::uint64_t, std::uint64_t>> existing_patch_ranges;
@@ -2650,10 +3466,6 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             "overlay expected revision does not match current revision",
             "overlay_journal.transact"));
     }
-    auto immutable_image = materialize_static_image(*workspace, target, cancel);
-    if (!immutable_image)
-        return workspace_result_t<overlay_transaction_result_t>::failure(
-            immutable_image.error());
     auto preflight_state = make_v9_preflight_state(
         local_snapshot, *workspace, target);
     if (!preflight_state)
@@ -2663,11 +3475,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     transaction.target = target;
     transaction.expected_revision = local_revision;
     transaction.operations = v9_operations;
-    const std::string_view immutable_bytes(
-        reinterpret_cast<const char*>(immutable_image.value().data()),
-        immutable_image.value().size());
-    auto prepared = overlay_projection_t::project_transaction(
-        preflight_state.value(), transaction, immutable_bytes,
+    auto prepared = overlay_projection_t::prepare_transaction(
+        preflight_state.value(), transaction,
         target.generation, projection_limits(limits_));
     if (!prepared)
         return workspace_result_t<overlay_transaction_result_t>::failure(
@@ -2736,20 +3545,29 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
          request_hash, legacy_request_hash,
          request_expected = request.expected_revision, target, next_target,
          local_revision, next_items, result_holder, committed_state,
-         cancel]() -> workspace_result_t<void> {
+         cancel](const std::shared_ptr<const analysis_snapshot_t>& snapshot,
+                 const std::shared_ptr<search_index_t>& index,
+                 const std::shared_ptr<const managed_artifact_publication_t>&
+                     managed_publication)
+            -> workspace_result_t<void> {
         {
             std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
             if (revision_ != local_revision || fixed_target_ != target) {
                 return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::revision_conflict,
                     "overlay journal changed before atomic publication",
-                    "overlay_journal.commit"));
+                "overlay_journal.commit"));
             }
         }
+        auto staged = stage_projected_candidate(
+            database, snapshot, index, managed_publication, cancel);
+        if (!staged)
+            return workspace_result_t<void>::failure(staged.error());
+        const auto candidate = staged.take_value();
         auto ticket = database->enqueue_write("analysis.overlay.commit",
         [operations, keys, idempotency, request_hash, legacy_request_hash,
          request_expected, target = next_target, local_revision,
-         result_holder, committed_state](sqlite3* writer,
+         result_holder, committed_state, candidate, snapshot](sqlite3* writer,
                         const cancellation_token_t& token) -> workspace_result_t<void> {
             if (token.stop_requested())
                 return workspace_result_t<void>::failure(make_workspace_error(
@@ -2861,7 +3679,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
             overlay_statement_t operation_statement;
             current = operation_statement.prepare(writer,
-                "INSERT INTO overlay_operations(transaction_id,operation_index,kind,entity_key,address_space,address_value,address_arch,address_mode,before_json,after_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                "INSERT INTO overlay_operations(transaction_id,operation_index,kind,entity_key,target_discriminator,address_space,address_value,address_arch,address_mode,managed_workspace_id,managed_provider_hash,managed_provider_size,managed_artifact_hash,managed_generation,managed_entity_hash,managed_entity_key,before_json,after_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 "overlay_journal.commit");
             if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
             for (std::size_t index = 0; index < operations.size(); ++index) {
@@ -2884,13 +3702,13 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 current = operation_statement.bind_uint(2, index); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = operation_statement.bind_int(3, static_cast<std::int64_t>(operations[index].kind)); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = operation_statement.bind_text(4, keys[index]); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
-                current = bind_operation_address(operation_statement, 5, operations[index].address); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
-                if (before) current = operation_statement.bind_text(9, *before); else current = operation_statement.bind_null(9); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
-                current = operation_statement.bind_text(10, after); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
+                current = bind_operation_target(operation_statement, 5, operations[index]); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
+                if (before) current = operation_statement.bind_text(17, *before); else current = operation_statement.bind_null(17); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
+                current = operation_statement.bind_text(18, after); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = operation_statement.step_done(); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = operation_statement.reset(); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
-                current = apply_item(writer, keys[index], operations[index].kind,
-                                     operations[index].address, after, new_revision);
+                current = apply_item(writer, keys[index], after, new_revision,
+                                     target);
                 if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
             }
 
@@ -2923,6 +3741,10 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 current = idempotency_statement.bind_uint(5, overlay_utc_ms()); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
                 current = idempotency_statement.step_done(); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
             }
+            current = promote_projected_candidate(
+                writer, *candidate, *snapshot, token,
+                "overlay_journal.commit");
+            if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.commit"); return current; }
             state.revision = new_revision;
             state.cursor = transaction_id;
             state.next_transaction = transaction_id + 1;
@@ -2933,8 +3755,13 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             return workspace_result_t<void>::success();
         }, cancel);
         auto waited = wait_ticket(ticket, cancel);
-        if (!waited)
+        if (!waited) {
+            static_cast<void>(candidate->discard());
             return waited;
+        }
+        auto acknowledged = candidate->finalize();
+        if (!acknowledged)
+            return acknowledged;
         publication_epoch_.fetch_add(1, std::memory_order_acq_rel);
         {
             std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
@@ -3080,8 +3907,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                 overlay_statement_t operations;
                 current = operations.prepare(reader,
                     redo
-                        ? "SELECT entity_key,before_json,after_json,operation_index FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index"
-                        : "SELECT entity_key,before_json,after_json,operation_index FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index DESC",
+                        ? "SELECT entity_key,before_json,after_json,operation_index,target_discriminator,address_space,address_value,address_arch,address_mode,managed_workspace_id,managed_provider_hash,managed_provider_size,managed_artifact_hash,managed_generation,managed_entity_hash,managed_entity_key FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index"
+                        : "SELECT entity_key,before_json,after_json,operation_index,target_discriminator,address_space,address_value,address_arch,address_mode,managed_workspace_id,managed_provider_hash,managed_provider_size,managed_artifact_hash,managed_generation,managed_entity_hash,managed_entity_key FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index DESC",
                     "overlay_journal.history");
                 if (!current)
                     return current;
@@ -3120,6 +3947,9 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                     parsed.value().remove = desired == "null";
                     const std::string key = overlay_column_text(operations.get(), 0);
                     if (entity_key(parsed.value()) != key ||
+                        !operation_target_matches_columns(
+                            operations.get(), 4, parsed.value(),
+                            target.generation, true) ||
                         sqlite3_column_int64(operations.get(), 3) < 0)
                         return workspace_result_t<void>::failure(make_workspace_error(
                             workspace_error_code_t::integrity_failure,
@@ -3147,23 +3977,35 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
     std::size_t total_patch_bytes = 0;
     std::vector<overlay_operation_v9_t> v9_operations;
     v9_operations.reserve(projection_operations.size());
-    for (const auto& item : projection_operations) {
+    for (auto& item : projection_operations) {
+        auto projection_operation = item.operation;
+        if (projection_operation.target_discriminator ==
+                overlay_target_discriminator_v9_t::managed_entity &&
+            projection_operation.managed_locator) {
+            std::size_t historical_patch_bytes = 0;
+            auto historical = validate_operation(
+                projection_operation, limits_, *workspace,
+                historical_patch_bytes,
+                true);
+            if (!historical)
+                return workspace_result_t<overlay_transaction_result_t>::failure(
+                    historical.error());
+            projection_operation.managed_locator->generation =
+                target.generation;
+        }
         auto validated = validate_operation(
-            item.operation, limits_, *workspace, total_patch_bytes);
+            projection_operation, limits_, *workspace, total_patch_bytes);
         if (!validated)
             return workspace_result_t<overlay_transaction_result_t>::failure(
                 validated.error());
         auto adapted = operation_to_v9(
-            item.operation, *workspace, target, "overlay_journal.history");
+            projection_operation, *workspace, target,
+            "overlay_journal.history");
         if (!adapted)
             return workspace_result_t<overlay_transaction_result_t>::failure(
                 adapted.error());
         v9_operations.push_back(adapted.take_value());
     }
-    auto immutable_image = materialize_static_image(*workspace, target, cancel);
-    if (!immutable_image)
-        return workspace_result_t<overlay_transaction_result_t>::failure(
-            immutable_image.error());
     auto preflight_state = make_v9_preflight_state(
         local_snapshot, *workspace, target);
     if (!preflight_state)
@@ -3173,11 +4015,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
     transaction.target = target;
     transaction.expected_revision = local_snapshot.revision;
     transaction.operations = std::move(v9_operations);
-    const std::string_view immutable_bytes(
-        reinterpret_cast<const char*>(immutable_image.value().data()),
-        immutable_image.value().size());
-    auto prepared = overlay_projection_t::project_transaction(
-        preflight_state.value(), transaction, immutable_bytes,
+    auto prepared = overlay_projection_t::prepare_transaction(
+        preflight_state.value(), transaction,
         target.generation, projection_limits(limits_));
     if (!prepared)
         return workspace_result_t<overlay_transaction_result_t>::failure(
@@ -3233,20 +4072,30 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
          selected_transaction_id, target, next_target,
          local_revision = local_snapshot.revision, next_items,
          result_holder, committed_state,
-         cancel]() -> workspace_result_t<void> {
+         cancel](const std::shared_ptr<const analysis_snapshot_t>& snapshot,
+                 const std::shared_ptr<search_index_t>& index,
+                 const std::shared_ptr<const managed_artifact_publication_t>&
+                     managed_publication)
+            -> workspace_result_t<void> {
         {
             std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
             if (revision_ != local_revision || fixed_target_ != target) {
                 return workspace_result_t<void>::failure(make_workspace_error(
                     workspace_error_code_t::revision_conflict,
                     "overlay journal changed before atomic history publication",
-                    "overlay_journal.history"));
+                "overlay_journal.history"));
             }
         }
+        auto staged = stage_projected_candidate(
+            database, snapshot, index, managed_publication, cancel);
+        if (!staged)
+            return workspace_result_t<void>::failure(staged.error());
+        const auto candidate = staged.take_value();
         auto ticket = database->enqueue_write(
         redo ? "analysis.overlay.redo" : "analysis.overlay.undo",
         [redo, expected_revision, selected_transaction_id, local_revision,
-         target = next_target, result_holder, committed_state](sqlite3* writer,
+         target = next_target, result_holder, committed_state,
+         candidate, snapshot](sqlite3* writer,
                                                  const cancellation_token_t& token) {
             if (token.stop_requested())
                 return workspace_result_t<void>::failure(make_workspace_error(
@@ -3316,8 +4165,8 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
             overlay_statement_t operation_statement;
             current = operation_statement.prepare(writer,
                 redo
-                    ? "SELECT entity_key,kind,address_space,address_value,address_arch,address_mode,after_json,operation_index FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index"
-                    : "SELECT entity_key,kind,address_space,address_value,address_arch,address_mode,before_json,operation_index FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index DESC",
+                    ? "SELECT entity_key,before_json,after_json,operation_index,target_discriminator,address_space,address_value,address_arch,address_mode,managed_workspace_id,managed_provider_hash,managed_provider_size,managed_artifact_hash,managed_generation,managed_entity_hash,managed_entity_key FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index"
+                    : "SELECT entity_key,before_json,after_json,operation_index,target_discriminator,address_space,address_value,address_arch,address_mode,managed_workspace_id,managed_provider_hash,managed_provider_size,managed_artifact_hash,managed_generation,managed_entity_hash,managed_entity_key FROM overlay_operations WHERE transaction_id=?1 ORDER BY operation_index DESC",
                 "overlay_journal.history");
             if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
             current = operation_statement.bind_uint(1, transaction_id); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
@@ -3337,18 +4186,38 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                     return workspace_result_t<void>::failure(std::move(error));
                 }
                 const std::string key = overlay_column_text(operation_statement.get(), 0);
-                const auto kind = static_cast<overlay_operation_kind_t>(sqlite3_column_int(operation_statement.get(), 1));
-                address_t address;
-                address.space = static_cast<address_space_id_t>(sqlite3_column_int(operation_statement.get(), 2));
-                address.value = static_cast<std::uint64_t>(sqlite3_column_int64(operation_statement.get(), 3));
-                address.architecture = static_cast<architecture_id_t>(sqlite3_column_int(operation_statement.get(), 4));
-                address.mode = static_cast<architecture_mode_t>(sqlite3_column_int(operation_statement.get(), 5));
-                const std::string payload = sqlite3_column_type(operation_statement.get(), 6) == SQLITE_NULL
-                    ? std::string("null") : overlay_column_text(operation_statement.get(), 6);
-                current = apply_item(writer, key, kind, address, payload, new_revision);
+                const std::string payload = sqlite3_column_type(
+                    operation_statement.get(), redo ? 2 : 1) == SQLITE_NULL
+                    ? std::string("null")
+                    : overlay_column_text(operation_statement.get(),
+                                          redo ? 2 : 1);
+                const std::string inverse = sqlite3_column_type(
+                    operation_statement.get(), redo ? 1 : 2) == SQLITE_NULL
+                    ? std::string("null")
+                    : overlay_column_text(operation_statement.get(),
+                                          redo ? 1 : 2);
+                const std::string& source = payload == "null" ? inverse : payload;
+                auto parsed = source == "null"
+                    ? workspace_result_t<overlay_operation_t>::failure(
+                          make_workspace_error(
+                              workspace_error_code_t::integrity_failure,
+                              "overlay history operation has no storage identity",
+                              "overlay_journal.history"))
+                    : parse_operation(source, target);
+                if (!parsed || entity_key(parsed.value()) != key ||
+                    !operation_target_matches_columns(
+                        operation_statement.get(), 4, parsed.value(),
+                        target.generation, true)) {
+                    overlay_exec(writer, "ROLLBACK", "overlay_journal.history");
+                    return workspace_result_t<void>::failure(make_workspace_error(
+                        workspace_error_code_t::integrity_failure,
+                        "overlay history storage identity is inconsistent",
+                        "overlay_journal.history"));
+                }
+                current = apply_item(writer, key, payload, new_revision, target);
                 if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
                 action_result.operations.push_back({
-                    static_cast<std::size_t>(sqlite3_column_int64(operation_statement.get(), 7)),
+                    static_cast<std::size_t>(sqlite3_column_int64(operation_statement.get(), 3)),
                     key, payload == "null"});
             }
 
@@ -3406,6 +4275,10 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
             current = event_statement.bind_uint(5, cursor); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
             current = event_statement.bind_uint(6, overlay_utc_ms()); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
             current = event_statement.step_done(); if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
+            current = promote_projected_candidate(
+                writer, *candidate, *snapshot, token,
+                "overlay_journal.history");
+            if (!current) { overlay_exec(writer, "ROLLBACK", "overlay_journal.history"); return current; }
             state.revision = new_revision;
             state.cursor = cursor;
             *committed_state = state;
@@ -3415,8 +4288,13 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
             return workspace_result_t<void>::success();
         }, cancel);
         auto waited = wait_ticket(ticket, cancel);
-        if (!waited)
+        if (!waited) {
+            static_cast<void>(candidate->discard());
             return waited;
+        }
+        auto acknowledged = candidate->finalize();
+        if (!acknowledged)
+            return acknowledged;
         publication_epoch_.fetch_add(1, std::memory_order_acq_rel);
         {
             std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
@@ -3453,84 +4331,69 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::redo(
 }
 
 std::uint64_t overlay_journal_t::wait_for_publication() const noexcept {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(250);
     for (;;) {
         const auto epoch = publication_epoch_.load(std::memory_order_acquire);
         if ((epoch & 1U) == 0)
             return epoch;
-        std::this_thread::yield();
+        if (std::chrono::steady_clock::now() >= deadline)
+            return epoch;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
 overlay_snapshot_t overlay_journal_t::snapshot() const {
-    for (;;) {
-        const auto epoch = wait_for_publication();
-        overlay_snapshot_t result;
-        {
-            std::shared_lock<std::shared_mutex> lock(state_mutex_);
-            result.revision = revision_;
-            result.history_cursor = history_cursor_;
-            result.history_epoch = history_epoch_;
-            result.items.reserve(items_.size());
-            for (const auto& item : items_)
-                result.items.push_back(item);
-        }
-        std::sort(result.items.begin(), result.items.end(),
-            [](const auto& lhs, const auto& rhs) {
-                return lhs.first < rhs.first;
-            });
-        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
-            return result;
+    static_cast<void>(wait_for_publication());
+    overlay_snapshot_t result;
+    {
+        std::shared_lock<std::shared_mutex> lock(state_mutex_);
+        result.revision = revision_;
+        result.history_cursor = history_cursor_;
+        result.history_epoch = history_epoch_;
+        result.items.reserve(items_.size());
+        for (const auto& item : items_)
+            result.items.push_back(item);
     }
+    std::sort(result.items.begin(), result.items.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return lhs.first < rhs.first;
+        });
+    return result;
 }
 
 overlay_target_identity_v9_t overlay_journal_t::fixed_target() const {
-    for (;;) {
-        const auto epoch = wait_for_publication();
-        overlay_target_identity_v9_t result;
-        {
-            std::shared_lock<std::shared_mutex> lock(state_mutex_);
-            result = fixed_target_;
-        }
-        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
-            return result;
-    }
+    static_cast<void>(wait_for_publication());
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    return fixed_target_;
 }
 
 std::optional<overlay_operation_t> overlay_journal_t::find(
     const std::string& entity) const {
-    for (;;) {
-        const auto epoch = wait_for_publication();
-        std::optional<overlay_operation_t> result;
-        {
-            std::shared_lock<std::shared_mutex> lock(state_mutex_);
-            auto found = items_.find(entity);
-            if (found != items_.end())
-                result = found->second;
-        }
-        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
-            return result;
-    }
+    static_cast<void>(wait_for_publication());
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    const auto found = items_.find(entity);
+    if (found == items_.end())
+        return std::nullopt;
+    return found->second;
 }
 
 std::vector<overlay_operation_t> overlay_journal_t::patch_operations() const {
-    for (;;) {
-        const auto epoch = wait_for_publication();
-        std::vector<overlay_operation_t> result;
-        {
-            std::shared_lock<std::shared_mutex> lock(state_mutex_);
-            for (const auto& item : items_) {
-                if (item.second.kind == overlay_operation_kind_t::byte_patch ||
-                    item.second.kind == overlay_operation_kind_t::assembly_patch ||
-                    item.second.kind == overlay_operation_kind_t::integer_patch)
-                    result.push_back(item.second);
-            }
+    static_cast<void>(wait_for_publication());
+    std::vector<overlay_operation_t> result;
+    {
+        std::shared_lock<std::shared_mutex> lock(state_mutex_);
+        for (const auto& item : items_) {
+            if (item.second.kind == overlay_operation_kind_t::byte_patch ||
+                item.second.kind == overlay_operation_kind_t::assembly_patch ||
+                item.second.kind == overlay_operation_kind_t::integer_patch)
+                result.push_back(item.second);
         }
-        std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs.address < rhs.address;
-        });
-        if (publication_epoch_.load(std::memory_order_acquire) == epoch)
-            return result;
     }
+    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.address < rhs.address;
+    });
+    return result;
 }
 
 void overlay_journal_t::request_cancel() noexcept {

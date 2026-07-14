@@ -1,6 +1,8 @@
 #include "signature_handlers_harness.h"
+#include "../c03/assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/mcp/compat/handlers/signatures.h"
+#include "../../src/core/mcp/compat/handlers/signature_operand_mask.hpp"
 #include "../../src/core/mcp/compat/ida_contracts_generated.hpp"
 #include "../../src/core/mcp/protocol/mcp_tool_contract.hpp"
 
@@ -31,6 +33,7 @@ using protocol::cancellation_token_t;
 using protocol::json;
 
 void require(bool condition, std::string_view message) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(std::string(message));
     }
@@ -38,6 +41,7 @@ void require(bool condition, std::string_view message) {
 
 void require_fixture(bool condition, std::string_view tool, std::string_view category,
                      std::string_view detail) {
+	aida::analysis::c03_test::assertion_telemetry::record_assertion(condition, detail, __FILE__, __LINE__);
     if (!condition) {
         throw std::runtime_error(
             std::string(tool) + " " + std::string(category) + " fixture: " +
@@ -113,6 +117,7 @@ public:
         insn.architecture = it->second.architecture;
         insn.bytes = it->second.bytes;
         insn.stable_mask = it->second.stable_mask;
+        insn.stable_mask_authoritative = true;
         return insn;
     }
 
@@ -1207,6 +1212,95 @@ void verify_deterministic_formatting_fixtures(protocol::schema_runtime_t& schema
     }
 }
 
+void verify_operand_mask_matrix(std::size_t& completed) {
+    struct mask_fixture_t {
+        const char* name;
+        signature_architecture_t architecture;
+        signature_mode_t mode;
+        signature_endian_t endian;
+        std::uint64_t address;
+        std::vector<std::uint8_t> bytes;
+    };
+    const std::vector<mask_fixture_t> fixtures{
+        {"x86_16", signature_architecture_t::x86, signature_mode_t::x86_16,
+         signature_endian_t::little, 0x0800, {0xE8, 0x01, 0x00}},
+        {"x86", signature_architecture_t::x86, signature_mode_t::x86_32,
+         signature_endian_t::little, 0x1000, {0xE8, 0x01, 0x00, 0x00, 0x00}},
+        {"x64", signature_architecture_t::x64, signature_mode_t::x86_64,
+         signature_endian_t::little, 0x2000,
+         {0x48, 0x8B, 0x05, 0x78, 0x56, 0x34, 0x12}},
+        {"arm", signature_architecture_t::arm, signature_mode_t::arm_a32,
+         signature_endian_t::little, 0x3000, {0x01, 0x00, 0xA0, 0xE3}},
+        {"thumb", signature_architecture_t::thumb, signature_mode_t::arm_thumb,
+         signature_endian_t::little, 0x4000, {0x01, 0x20}},
+        {"aarch64", signature_architecture_t::aarch64, signature_mode_t::aarch64,
+         signature_endian_t::little, 0x5000, {0x20, 0x00, 0x80, 0xD2}},
+        {"mips", signature_architecture_t::mips, signature_mode_t::mips32,
+         signature_endian_t::big, 0x6000, {0x27, 0xBD, 0xFF, 0xE0}},
+        {"mips64", signature_architecture_t::mips, signature_mode_t::mips64,
+         signature_endian_t::big, 0x6100, {0x67, 0xBD, 0xFF, 0xE0}},
+        {"ppc", signature_architecture_t::ppc, signature_mode_t::ppc32,
+         signature_endian_t::big, 0x7000, {0x38, 0x63, 0x00, 0x01}},
+        {"ppc64", signature_architecture_t::ppc, signature_mode_t::ppc64,
+         signature_endian_t::big, 0x7100, {0x38, 0x63, 0x00, 0x01}},
+        {"riscv32", signature_architecture_t::riscv, signature_mode_t::riscv32,
+         signature_endian_t::little, 0x7F00, {0x93, 0x00, 0x10, 0x00}},
+        {"riscv", signature_architecture_t::riscv, signature_mode_t::riscv64,
+         signature_endian_t::little, 0x8000, {0x93, 0x00, 0x10, 0x00}},
+        {"jvm", signature_architecture_t::jvm, signature_mode_t::jvm,
+         signature_endian_t::big, 0x9000, {0x10, 0x2A}},
+        {"dalvik", signature_architecture_t::dalvik, signature_mode_t::dalvik,
+         signature_endian_t::little, 0xA000, {0x12, 0x10}},
+    };
+    for (const auto& fixture : fixtures) {
+        signature_instruction_t instruction;
+        instruction.address = fixture.address;
+        instruction.architecture = fixture.architecture;
+        instruction.mode = fixture.mode;
+        instruction.endian = fixture.endian;
+        instruction.bytes = fixture.bytes;
+        instruction.stable_mask.assign(instruction.bytes.size(), 0xFFU);
+        const auto result = build_signature_operand_mask(instruction);
+        require_fixture(result.success, "signature_operand_mask", fixture.name,
+                        result.error.empty() ? "mask generation failed" : result.error);
+        require_fixture(result.stable_mask.size() == instruction.bytes.size(),
+                        "signature_operand_mask", fixture.name, "mask size mismatch");
+        require_fixture(result.dynamic_byte_count != 0,
+                        "signature_operand_mask", fixture.name,
+                        "operand-bearing instruction was marked entirely stable");
+        require_fixture(result.dynamic_byte_count <= instruction.bytes.size(),
+                        "signature_operand_mask", fixture.name,
+                        "dynamic-byte count escaped the instruction");
+        ++completed;
+    }
+
+    signature_instruction_t relocation;
+    relocation.address = 0xB000;
+    relocation.architecture = signature_architecture_t::x64;
+    relocation.mode = signature_mode_t::x86_64;
+    relocation.bytes = {0x90};
+    relocation.stable_mask = {0xFF};
+    relocation.relocation_ranges.push_back({0, 1});
+    const auto relocation_result = build_signature_operand_mask(relocation);
+    require_fixture(relocation_result.success &&
+                    relocation_result.relocation_byte_count == 1 &&
+                    relocation_result.stable_mask == std::vector<std::uint8_t>{0},
+                    "signature_operand_mask", "relocation",
+                    "relocation fact was not projected into the wildcard mask");
+    ++completed;
+
+    signature_instruction_t unknown;
+    unknown.address = 0xC000;
+    unknown.bytes = {0x00};
+    unknown.stable_mask = {0xFF};
+    const auto unknown_result = build_signature_operand_mask(unknown);
+    require_fixture(!unknown_result.success && unknown_result.stable_mask.empty() &&
+                    !unknown_result.error.empty(),
+                    "signature_operand_mask", "unsupported",
+                    "unsupported decoder path silently marked bytes stable");
+    ++completed;
+}
+
 }
 
 bool run_signature_handlers_harness(std::string& failure) {
@@ -1223,10 +1317,12 @@ bool run_signature_handlers_harness(std::string& failure) {
         verify_bounds_fixtures(schemas, completed);
         verify_failure_and_xref_policy_fixtures(schemas, completed);
         verify_deterministic_formatting_fixtures(schemas, completed);
+        verify_operand_mask_matrix(completed);
 
-        require(completed == 38,
-                "signature handler harness did not execute all thirty-eight fixture families");
+        require(completed == 54,
+                "signature handler harness did not execute all fifty-four fixture families");
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         failure.assign(error.what());
         return false;
     }

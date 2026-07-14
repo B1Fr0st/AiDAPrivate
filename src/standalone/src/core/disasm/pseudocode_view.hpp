@@ -1,9 +1,11 @@
 #pragma once
 
 #include "disasm_view.hpp"
+#include "../analysis/decompiler/managed_entity_binding.hpp"
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct DisasmFile;
@@ -14,6 +16,7 @@ struct tab_info_t {
     std::uint64_t addr = 0;
     std::string label;
     std::string function_name;
+    std::string entity_locator;
     bool loaded = false;
     bool decompiling = false;
     bool is_error = false;
@@ -27,6 +30,11 @@ void render(float pos_x, float pos_y, float width, float height,
 
 void request_decompile(const disasm_view::workspace_context_t& context,
                        std::uint64_t address, bool force_refresh = false);
+void request_decompile(
+    const disasm_view::workspace_context_t& context,
+    const aida::analysis::decompiler_entity_locator_t& locator,
+    std::string_view canonical_locator,
+    bool force_refresh = false);
 void request_decompile(std::uint64_t address, const DisasmFile* file,
                        bool force_refresh = false);
 
@@ -34,8 +42,12 @@ void close_active_tab(const disasm_view::workspace_context_t& context);
 void close_all_tabs(const disasm_view::workspace_context_t& context);
 void close_tab_by_addr(const disasm_view::workspace_context_t& context,
                        std::uint64_t address);
+void close_tab_by_entity(const disasm_view::workspace_context_t& context,
+                         std::string_view canonical_locator);
 void activate_tab_by_addr(const disasm_view::workspace_context_t& context,
                           std::uint64_t address);
+void activate_tab_by_entity(const disasm_view::workspace_context_t& context,
+                            std::string_view canonical_locator);
 void cancel_active_decompile(const disasm_view::workspace_context_t& context);
 void refresh_active_tab(const disasm_view::workspace_context_t& context);
 void refresh_all_tabs(const disasm_view::workspace_context_t& context);

@@ -1,9 +1,14 @@
 #include "managed_reader_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/readers/managed/managed_reader_contracts.hpp"
 #include "../../src/core/analysis/readers/managed/cli_metadata_reader.hpp"
 #include "../../src/core/analysis/readers/managed/classfile_reader.hpp"
 #include "../../src/core/analysis/readers/managed/dex_reader.hpp"
+#include "../../src/core/analysis/decompiler/managed_entity_binding.hpp"
+#include "../../src/core/analysis/decompiler/providers/dalvik_ssa.hpp"
+#include "../../src/core/analysis/decompiler/providers/jvm_ssa.hpp"
+#include "../../src/core/analysis/workspace/analysis_workspace.hpp"
 #include "../../src/core/analysis/workspace/byte_provider.hpp"
 
 #include <algorithm>
@@ -35,13 +40,16 @@ using ::aida::analysis::workspace_error_code_t;
 using ::aida::analysis::workspace_result_t;
 
 void require(bool condition, const char* message) {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
 
 template <typename value_t>
 value_t require_value(workspace_result_t<value_t> result, const char* message) {
-    if (!result)
+	const bool accepted = static_cast<bool>(result);
+	assertion_telemetry::record_assertion(accepted, message, __FILE__, __LINE__);
+    if (!accepted)
         throw std::runtime_error(std::string(message) + ": " + result.error().stable_code());
     return result.take_value();
 }
@@ -109,6 +117,96 @@ private:
 };
 
 std::uint64_t temp_fixture_t::counter_ = 0;
+
+std::shared_ptr<const workspace_identity_t> make_fixture_identity(
+    const std::shared_ptr<mapped_file_provider_t>& provider,
+    format_id_t format,
+    architecture_id_t architecture,
+    architecture_mode_t mode,
+    abi_id_t abi,
+    endian_t endian,
+    const std::string& profile) {
+    auto content_hash = provider->compute_content_sha256();
+    auto profile_hash = sha256_text(profile);
+    require(content_hash.has_value() && profile_hash.has_value(),
+            "fixture hashes were not created");
+    workspace_identity_input_t input;
+    input.bin_name = std::filesystem::path(
+        provider->identity().normalized_source).filename().u8string();
+    input.source_path = provider->identity().normalized_source;
+    input.content_hash = content_hash.take_value();
+    input.load_profile_hash = profile_hash.take_value();
+    input.target_kind = target_kind_t::static_file;
+    input.format = format;
+    input.architecture = architecture;
+    input.architecture_mode = mode;
+    input.abi = abi;
+    input.endian = endian;
+    auto identity = make_workspace_identity(std::move(input));
+    if (!identity)
+        throw std::runtime_error(
+            std::string("fixture identity creation failed: ") +
+            identity.error().stable_code());
+    return identity.take_value();
+}
+
+std::shared_ptr<const analysis_publication_t> make_fixture_publication(
+    const std::shared_ptr<const workspace_identity_t>& identity,
+    const std::shared_ptr<mapped_file_provider_t>& provider,
+    const std::shared_ptr<const managed_artifact_publication_t>& managed) {
+    auto snapshot = std::make_shared<analysis_snapshot_t>();
+    snapshot->binary_id = identity->binary_id();
+    snapshot->load_profile_hash = identity->load_profile_hash();
+    snapshot->generation = managed->generation;
+    snapshot->analysis_revision = managed->analysis_revision;
+    snapshot->overlay_revision = managed->overlay_revision;
+    auto publication = std::make_shared<analysis_publication_t>(
+        std::static_pointer_cast<const analysis_snapshot_t>(snapshot),
+        std::static_pointer_cast<const byte_provider_t>(provider), nullptr,
+        workspace_readiness_t::provider_ready, managed);
+    require(publication->coherent_with(*identity),
+            "fixture analysis publication is incoherent");
+    return publication;
+}
+
+std::shared_ptr<analysis_workspace_t> open_fixture_workspace(
+    const std::shared_ptr<const workspace_identity_t>& identity,
+    const std::shared_ptr<mapped_file_provider_t>& provider) {
+    auto image = std::make_shared<workspace_image_t>();
+    image->format = identity->format();
+    image->architecture = identity->architecture();
+    image->architecture_mode = identity->architecture_mode();
+    image->abi = identity->abi();
+    image->endian = identity->endian();
+    image->address_width_bits = 32;
+    image->image_base = identity->image_base();
+    image->image_size = provider->size();
+    image->header_size = (std::min<std::uint64_t>)(provider->size(), 112);
+    image->format_name = "c03-managed-fixture";
+    image->provider_size = provider->size();
+    auto workspace = analysis_workspace_t::create_normalized(
+        identity, std::static_pointer_cast<const byte_provider_t>(provider),
+        std::static_pointer_cast<const workspace_image_t>(image));
+    if (!workspace)
+        throw std::runtime_error(
+            std::string("fixture workspace creation failed: ") +
+            workspace.error().stable_code());
+    return workspace.take_value();
+}
+
+decompiler_provider_identity_t make_fixture_provider(
+    decompiler_provider_id_t provider, const std::string& name) {
+    decompiler_provider_identity_t identity;
+    identity.provider = provider;
+    identity.provider_name = name;
+    identity.provider_version = "c03-fixture-v1";
+    identity.provider_binary_hash = require_value(
+        sha256_text(name + "|binary"), "fixture provider hash failed");
+    identity.worker_build_id = name + "-worker";
+    identity.worker_build_hash = require_value(
+        sha256_text(name + "|worker"), "fixture worker hash failed");
+    return identity;
+}
 
 std::vector<std::uint8_t> make_minimal_classfile() {
     std::vector<std::uint8_t> bytes(256, 0);
@@ -361,7 +459,7 @@ std::vector<std::uint8_t> make_minimal_dex() {
     const std::uint32_t class_data_offset = string_data_4 + 6;
     const std::uint32_t code_item_offset = class_data_offset + 16;
     const std::uint32_t map_offset = code_item_offset + 24;
-    const std::uint32_t file_size = map_offset + 4 + 8 * 8;
+    const std::uint32_t file_size = map_offset + 4 + 8 * 12;
 
     std::vector<std::uint8_t> bytes(file_size, 0);
 
@@ -437,19 +535,13 @@ std::vector<std::uint8_t> make_minimal_dex() {
     bytes[class_data_offset] = 0;
     bytes[class_data_offset + 1] = 0;
     bytes[class_data_offset + 2] = 1;
-    bytes[class_data_offset + 3] = 0x19;
+    bytes[class_data_offset + 3] = 0;
     bytes[class_data_offset + 4] = 0;
-    bytes[class_data_offset + 5] = 0;
-    bytes[class_data_offset + 6] = 1;
-    bytes[class_data_offset + 7] = 0x01;
-    bytes[class_data_offset + 8] = 0;
-    bytes[class_data_offset + 9] = 0;
-    bytes[class_data_offset + 10] = 1;
-    bytes[class_data_offset + 11] = 0x09;
-    bytes[class_data_offset + 12] = code_item_offset & 0x7F;
-    bytes[class_data_offset + 13] = (code_item_offset >> 7) & 0x7F;
-    bytes[class_data_offset + 14] = 0;
-    bytes[class_data_offset + 15] = 0;
+    bytes[class_data_offset + 5] = 1;
+    bytes[class_data_offset + 6] =
+        static_cast<std::uint8_t>((code_item_offset & 0x7FU) | 0x80U);
+    bytes[class_data_offset + 7] =
+        static_cast<std::uint8_t>(code_item_offset >> 7U);
 
     write_le16(bytes, code_item_offset, 2);
     write_le16(bytes, code_item_offset + 2, 1);
@@ -457,7 +549,7 @@ std::vector<std::uint8_t> make_minimal_dex() {
     write_le16(bytes, code_item_offset + 6, 0);
     write_le32(bytes, code_item_offset + 8, 0);
     write_le32(bytes, code_item_offset + 12, 2);
-    write_le16(bytes, code_item_offset + 16, 0x0E00);
+    write_le16(bytes, code_item_offset + 16, 0x000E);
     write_le16(bytes, code_item_offset + 18, 0x0000);
 
     write_le32(bytes, map_offset, 8);
@@ -480,6 +572,34 @@ std::vector<std::uint8_t> make_minimal_dex() {
     return bytes;
 }
 
+std::vector<std::uint8_t> make_runtime_container(
+    bool vdex, std::uint32_t dex_count) {
+    require(dex_count != 0, "runtime container requires a DEX member");
+    const auto dex = make_minimal_dex();
+    std::vector<std::uint8_t> bytes(64 + dex.size() * dex_count, 0);
+    if (vdex) {
+        bytes[0] = 'v';
+        bytes[1] = 'd';
+        bytes[2] = 'e';
+        bytes[3] = 'x';
+        bytes[4] = '0';
+        bytes[5] = '1';
+        bytes[6] = '9';
+    } else {
+        bytes[0] = 'o';
+        bytes[1] = 'a';
+        bytes[2] = 't';
+        bytes[3] = '\n';
+        bytes[4] = '0';
+        bytes[5] = '7';
+        bytes[6] = '9';
+    }
+    for (std::uint32_t index = 0; index < dex_count; ++index)
+        std::copy(dex.begin(), dex.end(),
+            bytes.begin() + 64 + dex.size() * index);
+    return bytes;
+}
+
 void test_classfile_reader() {
     std::cout << "  [classfile] Building synthetic classfile fixture..." << std::endl;
     auto classfile_bytes = make_minimal_classfile();
@@ -492,6 +612,16 @@ void test_classfile_reader() {
 
     require(artifact.kind == mr::managed_artifact_kind_t::java_classfile,
             "classfile artifact kind mismatch");
+    require(artifact.schema_version == mr::managed_reader_schema_version &&
+            artifact.valid(), "classfile artifact schema is invalid");
+    require(artifact.module_identity.artifact_offset == 0 &&
+            artifact.module_identity.artifact_size == provider->size() &&
+            artifact.module_identity.artifact_ordinal == 0,
+            "classfile artifact provider range is invalid");
+    require(artifact.module_identity.artifact_hash ==
+            require_value(provider->compute_content_sha256(),
+                "classfile provider hash failed"),
+            "classfile artifact hash does not bind the provider");
     require(!artifact.module_identity.assembly_name.empty(),
             "classfile module identity assembly_name is empty");
     require(artifact.module_identity.assembly_name == "Hello",
@@ -551,6 +681,8 @@ void test_classfile_reader() {
             "JVM entity key format mismatch");
     require(jvm_key.architecture == architecture_id_t::jvm_bytecode,
             "JVM entity key architecture mismatch");
+    require(jvm_key.mode == architecture_mode_t::jvm,
+            "JVM entity key mode mismatch");
 
     std::cout << "  [classfile] PASS" << std::endl;
 }
@@ -567,6 +699,16 @@ void test_dex_reader() {
 
     require(artifact.kind == mr::managed_artifact_kind_t::dex,
             "DEX artifact kind mismatch");
+    require(artifact.schema_version == mr::managed_reader_schema_version &&
+            artifact.valid(), "DEX artifact schema is invalid");
+    require(artifact.module_identity.artifact_offset == 0 &&
+            artifact.module_identity.artifact_size == provider->size() &&
+            artifact.module_identity.artifact_ordinal == 0,
+            "DEX artifact provider range is invalid");
+    require(artifact.module_identity.artifact_hash ==
+            require_value(provider->compute_content_sha256(),
+                "DEX provider hash failed"),
+            "DEX artifact hash does not bind the provider");
     require(!artifact.module_identity.assembly_name.empty(),
             "DEX module identity version is empty");
     require(artifact.module_identity.version == "035",
@@ -597,6 +739,8 @@ void test_dex_reader() {
             "Dalvik entity key format mismatch");
     require(dalvik_key.architecture == architecture_id_t::dalvik_bytecode,
             "Dalvik entity key architecture mismatch");
+    require(dalvik_key.mode == architecture_mode_t::dalvik,
+            "Dalvik entity key mode mismatch");
 
     std::cout << "  [dex] PASS" << std::endl;
 }
@@ -776,6 +920,13 @@ void test_cancellation() {
             result.error().code == workspace_error_code_t::deadline_exceeded,
             "cancelled read should produce cancellation error");
 
+    mr::managed_reader_limits_t invalid_limits;
+    invalid_limits.max_methods = 0;
+    auto invalid = mr::read_classfile(*cf_provider, invalid_limits);
+    require(!invalid &&
+            invalid.error().code == workspace_error_code_t::invalid_argument,
+            "invalid managed reader limits should fail before parsing");
+
     std::cout << "  [cancel] PASS" << std::endl;
 }
 
@@ -854,7 +1005,362 @@ void test_multidex_container() {
     require(multidex_result.value().artifacts[0].kind == mr::managed_artifact_kind_t::dex,
             "multidex single DEX artifact kind mismatch");
 
+    const auto oat_bytes = make_runtime_container(false, 2);
+    temp_fixture_t oat_fixture(oat_bytes, ".oat");
+    auto oat_provider = oat_fixture.open_provider();
+    auto oat = require_value(mr::read_multidex_container(*oat_provider),
+        "OAT multidex read failed");
+    require(oat.container_kind == mr::managed_artifact_kind_t::oat,
+            "OAT container kind mismatch");
+    require(oat.artifacts.size() == 2 && oat.embedded_offsets.size() == 2,
+            "OAT container did not publish every DEX member");
+    const auto dex_size = dex_bytes.size();
+    for (std::uint32_t index = 0; index < oat.artifacts.size(); ++index) {
+        const auto& artifact = oat.artifacts[index];
+        require(artifact.kind == mr::managed_artifact_kind_t::oat &&
+                artifact.module_identity.kind == mr::managed_artifact_kind_t::oat,
+                "OAT member kind mismatch");
+        require(artifact.module_identity.artifact_ordinal == index &&
+                artifact.module_identity.artifact_offset ==
+                    64 + dex_size * index &&
+                artifact.module_identity.artifact_size == dex_size,
+                "OAT member identity range mismatch");
+        require(!artifact.module_identity.artifact_hash.empty(),
+                "OAT member hash is empty");
+        const auto identity = mr::build_dalvik_entity_identity(artifact, 0);
+        require(identity.dex_ordinal == index &&
+                identity.dex_hash == artifact.module_identity.artifact_hash,
+                "OAT member decompiler identity is not artifact-bound");
+        require(mr::build_dalvik_entity_key(artifact, 0).format ==
+                format_id_t::oat,
+                "OAT member decompiler key lost its container format");
+    }
+    auto ambiguous = mr::read_dex(*oat_provider);
+    require(!ambiguous &&
+            ambiguous.error().code == workspace_error_code_t::target_ambiguous,
+            "single-artifact OAT API did not reject multiple members");
+    auto detected = mr::read_managed_artifact(*oat_provider);
+    require(!detected &&
+            detected.error().code == workspace_error_code_t::target_ambiguous,
+            "managed dispatcher did not reject ambiguous OAT members");
+    mr::managed_reader_limits_t one_member_limit;
+    one_member_limit.max_dex_files = 1;
+    auto limited = mr::read_multidex_container(
+        *oat_provider, one_member_limit);
+    require(!limited &&
+            limited.error().code == workspace_error_code_t::limit_exceeded,
+            "OAT DEX member limit did not fail closed");
+
+    const auto vdex_bytes = make_runtime_container(true, 1);
+    temp_fixture_t vdex_fixture(vdex_bytes, ".vdex");
+    auto vdex_provider = vdex_fixture.open_provider();
+    auto vdex = require_value(mr::read_multidex_container(*vdex_provider),
+        "VDEX member read failed");
+    require(vdex.container_kind == mr::managed_artifact_kind_t::vdex &&
+            vdex.artifacts.size() == 1 &&
+            vdex.artifacts[0].kind == mr::managed_artifact_kind_t::vdex &&
+            vdex.artifacts[0].module_identity.artifact_offset == 64,
+            "VDEX member publication mismatch");
+
     std::cout << "  [multidex] PASS" << std::endl;
+}
+
+void test_managed_entity_publication() {
+    std::cout << "  [binding] Testing generation-bound entity publication..." << std::endl;
+
+    const auto classfile_bytes = make_minimal_classfile();
+    temp_fixture_t classfile_fixture(classfile_bytes, ".class");
+    auto classfile_provider = classfile_fixture.open_provider();
+    auto classfile_identity = make_fixture_identity(
+        classfile_provider, format_id_t::classfile,
+        architecture_id_t::jvm_bytecode, architecture_mode_t::jvm,
+        abi_id_t::jvm, endian_t::big, "c03-managed-binding-classfile");
+    auto classfile_workspace = open_fixture_workspace(
+        classfile_identity, classfile_provider);
+    auto classfile_managed = require_value(
+        build_managed_artifact_publication(
+            *classfile_identity, *classfile_provider, {},
+            classfile_workspace->generation(),
+            classfile_workspace->analysis_revision(),
+            classfile_workspace->overlay_revision()),
+        "classfile managed publication failed");
+    require(classfile_managed && classfile_managed->artifacts().size() == 1 &&
+            classfile_managed->methods().size() >= 2,
+            "classfile managed publication is incomplete");
+    auto published = classfile_workspace->publish_managed_artifacts(
+        classfile_workspace->generation(),
+        classfile_workspace->analysis_revision(), classfile_managed, true);
+    require(published.has_value(),
+            "classfile managed publication was not atomically installed");
+    auto classfile_publication = classfile_workspace->analysis_publication();
+    require(classfile_publication &&
+            classfile_publication->analysis_revision == 1 &&
+            classfile_publication->managed_artifacts &&
+            classfile_publication->managed_artifacts->analysis_revision == 1 &&
+            classfile_publication->managed_artifacts->reader_schema_version ==
+                mr::managed_reader_schema_version &&
+            classfile_publication->managed_artifacts->reader_limits.max_methods ==
+                mr::managed_reader_limits_t{}.max_methods &&
+            classfile_publication->managed_artifacts->records ==
+                classfile_managed->records &&
+            classfile_publication->coherent_with(*classfile_identity),
+            "classfile managed publication revision was not rebound");
+    const auto classfile_body = std::find_if(
+        classfile_publication->managed_artifacts->methods().begin(),
+        classfile_publication->managed_artifacts->methods().end(),
+        [](const managed_method_binding_record_t& method) {
+            return method.has_body;
+        });
+    require(classfile_body !=
+            classfile_publication->managed_artifacts->methods().end(),
+            "classfile publication has no method body");
+    decompiler_entity_locator_t classfile_token;
+    classfile_token.token = classfile_body->entity_token;
+    classfile_token.artifact_ordinal = 0;
+    classfile_token.expected_kind = decompiler_entity_kind_t::jvm_method;
+    auto classfile_binding = require_value(
+        resolve_generation_bound_entity(
+            *classfile_identity, *classfile_publication, classfile_token),
+        "classfile token resolution failed");
+    require(classfile_binding.entity == classfile_body->entity &&
+            classfile_binding.generation == classfile_publication->generation &&
+            classfile_binding.analysis_revision ==
+                classfile_publication->analysis_revision &&
+            classfile_binding.artifact_hash ==
+                classfile_publication->managed_artifacts->artifacts()[0].artifact_hash,
+            "classfile entity binding is not revision and artifact bound");
+    require(validate_generation_bound_entity(
+        *classfile_identity, *classfile_publication,
+        classfile_binding).has_value(),
+        "classfile entity binding validation failed");
+    decompiler_entity_locator_t classfile_address;
+    classfile_address.address = classfile_body->provider_code_offset;
+    classfile_address.expected_kind = decompiler_entity_kind_t::jvm_method;
+    auto address_binding = require_value(
+        resolve_generation_bound_entity(
+            *classfile_identity, *classfile_publication, classfile_address),
+        "classfile address resolution failed");
+    require(address_binding.entity == classfile_binding.entity,
+            "classfile token and address resolution disagree");
+    const auto jvm_provider = make_fixture_provider(
+        decompiler_provider_id_t::jvm_ssa, "aida-jvm-ssa");
+    auto jvm_capture = require_value(capture_jvm_entity_input(
+        *classfile_publication, classfile_binding, jvm_provider),
+        "JVM entity capture failed");
+    require(jvm_capture->entity == classfile_binding.entity &&
+            jvm_capture->workspace_generation == classfile_binding.generation &&
+            !jvm_capture->context.class_internal_name.empty() &&
+            !jvm_capture->context.method_name.empty() &&
+            !jvm_capture->context.code.empty(),
+            "JVM capture did not preserve entity and method input");
+    auto classfile_snapshot = require_value(capture_managed_artifact_snapshot(
+        *classfile_publication, classfile_binding,
+        classfile_provider->size()),
+        "classfile artifact snapshot capture failed");
+    require(classfile_snapshot->size() == classfile_bytes.size() &&
+            (*classfile_snapshot)[0] == 0xCA &&
+            (*classfile_snapshot)[1] == 0xFE &&
+            (*classfile_snapshot)[2] == 0xBA &&
+            (*classfile_snapshot)[3] == 0xBE,
+            "classfile artifact snapshot did not preserve exact bytes");
+    auto snapshot_limited = capture_managed_artifact_snapshot(
+        *classfile_publication, classfile_binding,
+        classfile_provider->size() - 1);
+    require(!snapshot_limited &&
+            snapshot_limited.error().code == workspace_error_code_t::limit_exceeded,
+            "managed artifact snapshot budget did not fail closed");
+    auto invalid_capture_binding = classfile_binding;
+    invalid_capture_binding.artifact_index =
+        (std::numeric_limits<std::uint32_t>::max)();
+    auto invalid_capture = capture_jvm_entity_input(
+        *classfile_publication, invalid_capture_binding, jvm_provider);
+    require(!invalid_capture &&
+            invalid_capture.error().code == workspace_error_code_t::invalid_argument,
+            "JVM capture did not reject an invalid artifact index");
+
+    auto stale_binding = classfile_binding;
+    ++stale_binding.analysis_revision;
+    auto stale = validate_generation_bound_entity(
+        *classfile_identity, *classfile_publication, stale_binding);
+    require(!stale && stale.error().code == workspace_error_code_t::target_stale,
+            "stale classfile binding did not fail closed");
+    auto cross_architecture_binding = classfile_binding;
+    cross_architecture_binding.entity.architecture = architecture_id_t::x86_64;
+    cross_architecture_binding.entity.mode = architecture_mode_t::x86_64;
+    auto cross_architecture = validate_generation_bound_entity(
+        *classfile_identity, *classfile_publication,
+        cross_architecture_binding);
+    require(!cross_architecture &&
+            cross_architecture.error().code == workspace_error_code_t::target_stale,
+            "cross-architecture classfile binding did not fail closed");
+    decompiler_entity_locator_t invalid_locator;
+    invalid_locator.token = classfile_body->entity_token;
+    invalid_locator.address = classfile_body->provider_code_offset;
+    auto invalid = resolve_generation_bound_entity(
+        *classfile_identity, *classfile_publication, invalid_locator);
+    require(!invalid &&
+            invalid.error().code == workspace_error_code_t::invalid_argument,
+            "mixed token/address locator was not rejected");
+    decompiler_entity_locator_t wrong_artifact = classfile_token;
+    wrong_artifact.artifact_ordinal = 99;
+    auto absent = resolve_generation_bound_entity(
+        *classfile_identity, *classfile_publication, wrong_artifact);
+    require(!absent &&
+            absent.error().code == workspace_error_code_t::target_not_found,
+            "missing artifact selector did not return deterministic not-found");
+
+    auto ambiguous_managed = std::make_shared<managed_artifact_publication_t>(
+        *classfile_publication->managed_artifacts);
+    auto ambiguous_records = std::make_shared<managed_artifact_record_index_t>(
+        *ambiguous_managed->records);
+    ambiguous_records->methods[1].entity_token =
+        ambiguous_records->methods[0].entity_token;
+    ambiguous_managed->records = std::static_pointer_cast<
+        const managed_artifact_record_index_t>(ambiguous_records);
+    auto ambiguous_publication = make_fixture_publication(
+        classfile_identity, classfile_provider,
+        std::static_pointer_cast<const managed_artifact_publication_t>(
+            ambiguous_managed));
+    decompiler_entity_locator_t ambiguous_locator;
+    ambiguous_locator.token = ambiguous_managed->methods()[0].entity_token;
+    ambiguous_locator.expected_kind = decompiler_entity_kind_t::jvm_method;
+    auto ambiguous = resolve_generation_bound_entity(
+        *classfile_identity, *ambiguous_publication, ambiguous_locator);
+    require(!ambiguous &&
+            ambiguous.error().code == workspace_error_code_t::target_ambiguous,
+            "duplicate managed token did not report ambiguity");
+
+    mr::managed_reader_limits_t method_limit;
+    method_limit.max_methods = 1;
+    auto limited = build_managed_artifact_publication(
+        *classfile_identity, *classfile_provider, {}, 1, 0, 0,
+        method_limit);
+    require(!limited &&
+            limited.error().code == workspace_error_code_t::limit_exceeded,
+            "managed entity method budget did not fail closed");
+    cancellation_source_t cancelled_source;
+    cancelled_source.request_cancel();
+    auto cancelled = build_managed_artifact_publication(
+        *classfile_identity, *classfile_provider, {}, 1, 0, 0, {},
+        cancelled_source.token());
+    require(!cancelled &&
+            cancelled.error().code == workspace_error_code_t::cancelled,
+            "managed entity admission did not honor cancellation");
+    const auto next_generation = require_value(
+        classfile_workspace->begin_new_generation(),
+        "classfile generation advance failed");
+    auto next_publication = classfile_workspace->analysis_publication();
+    require(next_generation == 2 && next_publication &&
+            next_publication->generation == next_generation &&
+            next_publication->analysis_revision == 0 &&
+            next_publication->managed_artifacts &&
+            next_publication->managed_artifacts->records ==
+                classfile_publication->managed_artifacts->records &&
+            next_publication->managed_artifacts->generation == next_generation &&
+            next_publication->managed_artifacts->analysis_revision == 0 &&
+            next_publication->coherent_with(*classfile_identity),
+            "managed record index was not immutably rebound to the new generation");
+    auto retired_binding = validate_generation_bound_entity(
+        *classfile_identity, *next_publication, classfile_binding);
+    require(!retired_binding &&
+            retired_binding.error().code == workspace_error_code_t::target_stale,
+            "retired generation binding remained valid after generation advance");
+
+    const auto dex_bytes = make_minimal_dex();
+    temp_fixture_t dex_fixture(dex_bytes, ".dex");
+    auto dex_provider = dex_fixture.open_provider();
+    auto dex_identity = make_fixture_identity(
+        dex_provider, format_id_t::dex,
+        architecture_id_t::dalvik_bytecode, architecture_mode_t::dalvik,
+        abi_id_t::dalvik, endian_t::little, "c03-managed-binding-dex");
+    auto dex_workspace = open_fixture_workspace(dex_identity, dex_provider);
+    auto dex_managed = require_value(build_managed_artifact_publication(
+        *dex_identity, *dex_provider, {}, dex_workspace->generation(),
+        dex_workspace->analysis_revision(), dex_workspace->overlay_revision()),
+        "DEX managed publication failed");
+    require(dex_managed && !dex_managed->methods().empty(),
+            "DEX managed publication is empty");
+    published = dex_workspace->publish_managed_artifacts(
+        dex_workspace->generation(), dex_workspace->analysis_revision(),
+        dex_managed, true);
+    require(published.has_value(),
+            "DEX managed publication was not atomically installed");
+    auto dex_publication = dex_workspace->analysis_publication();
+    const auto dex_body = std::find_if(
+        dex_publication->managed_artifacts->methods().begin(),
+        dex_publication->managed_artifacts->methods().end(),
+        [](const managed_method_binding_record_t& method) {
+            return method.has_body;
+        });
+    require(dex_body != dex_publication->managed_artifacts->methods().end(),
+            "DEX publication has no method body");
+    decompiler_entity_locator_t dex_locator;
+    dex_locator.token = dex_body->entity_token;
+    dex_locator.artifact_ordinal = 0;
+    dex_locator.expected_kind = decompiler_entity_kind_t::dalvik_method;
+    auto dex_binding = require_value(resolve_generation_bound_entity(
+        *dex_identity, *dex_publication, dex_locator),
+        "DEX token resolution failed");
+    const auto dalvik_provider = make_fixture_provider(
+        decompiler_provider_id_t::dalvik_ssa, "aida-dalvik-ssa");
+    auto dalvik_capture = require_value(capture_dalvik_entity_input(
+        *dex_publication, dex_binding, dalvik_provider),
+        "Dalvik entity capture failed");
+    require(dalvik_capture->request.entity == dex_binding.entity &&
+            dalvik_capture->request.workspace_generation ==
+                dex_binding.generation &&
+            !dalvik_capture->code_units.empty() &&
+            !dalvik_capture->class_descriptor.empty() &&
+            !dalvik_capture->method_name.empty(),
+            "Dalvik capture did not preserve entity and code input");
+
+    const auto oat_bytes = make_runtime_container(false, 2);
+    temp_fixture_t oat_fixture(oat_bytes, ".oat");
+    auto oat_provider = oat_fixture.open_provider();
+    auto oat_identity = make_fixture_identity(
+        oat_provider, format_id_t::oat,
+        architecture_id_t::dalvik_bytecode, architecture_mode_t::dalvik,
+        abi_id_t::dalvik, endian_t::little, "c03-managed-binding-oat");
+    auto oat_managed = require_value(build_managed_artifact_publication(
+        *oat_identity, *oat_provider, {}, 1, 1, 0),
+        "OAT managed publication failed");
+    require(oat_managed && oat_managed->artifacts().size() == 2,
+            "OAT managed publication omitted a DEX member");
+    auto oat_snapshot = std::make_shared<analysis_snapshot_t>();
+    oat_snapshot->binary_id = oat_identity->binary_id();
+    oat_snapshot->load_profile_hash = oat_identity->load_profile_hash();
+    oat_snapshot->generation = 1;
+    oat_snapshot->analysis_revision = 1;
+    auto oat_publication = std::make_shared<analysis_publication_t>(
+        std::static_pointer_cast<const analysis_snapshot_t>(oat_snapshot),
+        std::static_pointer_cast<const byte_provider_t>(oat_provider), nullptr,
+        workspace_readiness_t::provider_ready, oat_managed);
+    require(oat_publication->coherent_with(*oat_identity),
+            "OAT managed publication is incoherent");
+    decompiler_entity_locator_t oat_ambiguous_locator;
+    oat_ambiguous_locator.token = oat_managed->methods().front().entity_token;
+    oat_ambiguous_locator.expected_kind =
+        decompiler_entity_kind_t::dalvik_method;
+    auto oat_ambiguous = resolve_generation_bound_entity(
+        *oat_identity, *oat_publication, oat_ambiguous_locator);
+    require(!oat_ambiguous &&
+            oat_ambiguous.error().code == workspace_error_code_t::target_ambiguous,
+            "OAT cross-member token ambiguity was not reported");
+    oat_ambiguous_locator.artifact_ordinal = 1;
+    auto oat_binding = require_value(resolve_generation_bound_entity(
+        *oat_identity, *oat_publication, oat_ambiguous_locator),
+        "OAT artifact-qualified token resolution failed");
+    require(oat_binding.artifact_index == 1 &&
+            oat_binding.artifact_hash == oat_managed->artifacts()[1].artifact_hash,
+            "OAT entity did not bind the selected artifact");
+    auto oat_capture = require_value(capture_dalvik_entity_input(
+        *oat_publication, oat_binding, dalvik_provider),
+        "OAT Dalvik entity capture failed");
+    require(!oat_capture->code_units.empty() &&
+            oat_capture->request.entity == oat_binding.entity,
+            "OAT Dalvik capture did not use the selected artifact");
+
+    std::cout << "  [binding] PASS" << std::endl;
 }
 
 void test_artifact_name_functions() {
@@ -890,32 +1396,35 @@ void test_artifact_name_functions() {
 void run_managed_reader_harness() {
     std::cout << "=== C03-B11 Managed Artifact Reader Harness ===" << std::endl;
 
-    std::cout << "[1/9] Classfile reader test..." << std::endl;
+    std::cout << "[1/10] Classfile reader test..." << std::endl;
     test_classfile_reader();
 
-    std::cout << "[2/9] DEX reader test..." << std::endl;
+    std::cout << "[2/10] DEX reader test..." << std::endl;
     test_dex_reader();
 
-    std::cout << "[3/9] CLI metadata identity builder test..." << std::endl;
+    std::cout << "[3/10] CLI metadata identity builder test..." << std::endl;
     test_cli_metadata_identity_builders();
 
-    std::cout << "[4/9] Malformed index handling test..." << std::endl;
+    std::cout << "[4/10] Malformed index handling test..." << std::endl;
     test_malformed_index_handling();
 
-    std::cout << "[5/9] Duplicate identity detection test..." << std::endl;
+    std::cout << "[5/10] Duplicate identity detection test..." << std::endl;
     test_duplicate_identity_detection();
 
-    std::cout << "[6/9] Cancellation test..." << std::endl;
+    std::cout << "[6/10] Cancellation test..." << std::endl;
     test_cancellation();
 
-    std::cout << "[7/9] OAT/VDEX version detection test..." << std::endl;
+    std::cout << "[7/10] OAT/VDEX version detection test..." << std::endl;
     test_oat_vdex_version_detection();
 
-    std::cout << "[8/9] Managed artifact auto-detection test..." << std::endl;
+    std::cout << "[8/10] Managed artifact auto-detection test..." << std::endl;
     test_managed_artifact_dispatch();
 
-    std::cout << "[9/9] Multidex container test..." << std::endl;
+    std::cout << "[9/10] Multidex container test..." << std::endl;
     test_multidex_container();
+
+    std::cout << "[10/10] Managed entity publication test..." << std::endl;
+    test_managed_entity_publication();
 
     test_artifact_name_functions();
 

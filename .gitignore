@@ -28,6 +28,15 @@
 /packaging/*
 !/packaging/c03_worker_manifest.schema.json
 !/packaging/c03_worker_manifest.lock.json
+!/packaging/c03_native_worker_manifest.json
+!/packaging/c03_native_worker_manifest.schema.json
+!/packaging/c03_native_worker_manifest.py
+!/packaging/c03_distribution_manifest.schema.json
+!/packaging/c03_distribution_manifest.ps1
+!/packaging/c03_distribution_manifest_spec.json
+!/packaging/c03_worker_runtime/
+!/packaging/c03_worker_runtime/**
+!/packaging/c03_camoufox_reverse_mcp_build.lock.json
 
 # ==========================================
 # 2. EXCLUSIONS (These override the allows)

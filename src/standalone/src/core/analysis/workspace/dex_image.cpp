@@ -13,9 +13,21 @@ namespace {
 
 constexpr std::uint32_t kDexHeaderSize = 112;
 constexpr std::uint32_t kCompactDexFeatureFlagsOffset = kDexHeaderSize;
-constexpr std::uint32_t kCompactDexInspectionSize =
-    kCompactDexFeatureFlagsOffset + sizeof(std::uint32_t);
+constexpr std::uint32_t kCompactDexDebugInfoOffsetsPositionOffset = 116;
+constexpr std::uint32_t kCompactDexDebugInfoOffsetsTableOffset = 120;
+constexpr std::uint32_t kCompactDexDebugInfoBaseOffset = 124;
+constexpr std::uint32_t kCompactDexOwnedDataBeginOffset = 128;
+constexpr std::uint32_t kCompactDexOwnedDataEndOffset = 132;
+constexpr std::uint32_t kCompactDexHeaderSize = 136;
+constexpr std::uint32_t kCompactDexInspectionSize = kCompactDexHeaderSize;
 constexpr std::uint32_t kCompactDexDefaultMethodsFeature = 0x1U;
+constexpr std::uint32_t kCompactDexElementsPerDebugOffsetBlock = 16;
+constexpr std::uint16_t kCompactDexPreHeaderRegistersFlag = 1U << 0U;
+constexpr std::uint16_t kCompactDexPreHeaderInsFlag = 1U << 1U;
+constexpr std::uint16_t kCompactDexPreHeaderOutsFlag = 1U << 2U;
+constexpr std::uint16_t kCompactDexPreHeaderTriesFlag = 1U << 3U;
+constexpr std::uint16_t kCompactDexPreHeaderInstructionCountFlag = 1U << 4U;
+constexpr std::uint32_t kCompactDexInstructionCountShift = 5U;
 constexpr std::uint32_t kDexEndianConstant = 0x12345678U;
 constexpr std::uint32_t kNoIndex = 0xffffffffU;
 constexpr std::uint16_t kMapHeaderItem = 0x0000U;
@@ -25,6 +37,8 @@ constexpr std::uint16_t kMapProtoIdItem = 0x0003U;
 constexpr std::uint16_t kMapFieldIdItem = 0x0004U;
 constexpr std::uint16_t kMapMethodIdItem = 0x0005U;
 constexpr std::uint16_t kMapClassDefItem = 0x0006U;
+constexpr std::uint16_t kMapCallSiteIdItem = 0x0007U;
+constexpr std::uint16_t kMapMethodHandleItem = 0x0008U;
 constexpr std::uint16_t kMapMapList = 0x1000U;
 constexpr std::uint16_t kMapTypeList = 0x1001U;
 constexpr std::uint16_t kMapClassDataItem = 0x2000U;
@@ -115,16 +129,6 @@ bool is_compact_dex_magic(const std::uint8_t* data, std::size_t size) noexcept {
            is_decimal_version(data + 4);
 }
 
-std::string format_u32_hex(std::uint32_t value) {
-    static constexpr char digits[] = "0123456789abcdef";
-    std::string formatted = "0x00000000";
-    for (std::size_t index = 0; index < 8; ++index) {
-        const auto shift = static_cast<unsigned>((7U - static_cast<unsigned>(index)) * 4U);
-        formatted[2 + index] = digits[(value >> shift) & 0x0fU];
-    }
-    return formatted;
-}
-
 std::optional<std::uint64_t> fixed_map_item_size(std::uint16_t type) noexcept {
     switch (type) {
         case kMapHeaderItem:
@@ -139,9 +143,17 @@ std::optional<std::uint64_t> fixed_map_item_size(std::uint16_t type) noexcept {
             return 8;
         case kMapClassDefItem:
             return 32;
+        case kMapCallSiteIdItem:
+            return 4;
+        case kMapMethodHandleItem:
+            return 8;
         default:
             return std::nullopt;
     }
+}
+
+bool map_item_uses_main_section(std::uint16_t type) noexcept {
+    return type <= kMapMethodHandleItem;
 }
 
 bool is_index_reference_opcode(std::uint8_t opcode, dalvik_reference_kind_t& kind) noexcept {
@@ -265,6 +277,59 @@ private:
         return true;
     }
 
+    bool require_main(std::uint64_t offset, std::uint64_t size, const char* phase) {
+        if (!span_within(offset, size, main_section_size_))
+            return fail(workspace_error_code_t::out_of_range,
+                        "DEX main-section record extends beyond its declared size", phase,
+                        offset, size);
+        return true;
+    }
+
+    bool resolve_data_offset(std::uint32_t offset, std::uint32_t& absolute,
+                             const char* phase, bool allow_zero = true) {
+        if (offset == 0 && allow_zero) {
+            absolute = 0;
+            return true;
+        }
+        if (compact_) {
+            if (offset > data_section_size_ ||
+                data_base_offset_ > (std::numeric_limits<std::uint32_t>::max)() - offset)
+                return fail(workspace_error_code_t::out_of_range,
+                            "compact DEX data-relative offset is outside its shared data section",
+                            phase, data_base_offset_, offset);
+            absolute = data_base_offset_ + offset;
+        } else {
+            absolute = offset;
+        }
+        if (!require(absolute, 1, phase))
+            return false;
+        return true;
+    }
+
+    bool require_data(std::uint32_t offset, std::uint64_t size, const char* phase,
+                      std::uint32_t& absolute) {
+        if (compact_) {
+            if (!span_within(offset, size, data_section_size_) ||
+                data_base_offset_ > (std::numeric_limits<std::uint32_t>::max)() - offset)
+                return fail(workspace_error_code_t::out_of_range,
+                            "compact DEX data record extends beyond its shared data section",
+                            phase, data_base_offset_, size);
+            absolute = data_base_offset_ + offset;
+        } else {
+            absolute = offset;
+        }
+        return require(absolute, size, phase);
+    }
+
+    bool map_absolute_offset(std::uint16_t type, std::uint32_t raw_offset,
+                             std::uint32_t& absolute, const char* phase) {
+        if (!compact_ || map_item_uses_main_section(type)) {
+            absolute = raw_offset;
+            return require_main(absolute, 1, phase);
+        }
+        return resolve_data_offset(raw_offset, absolute, phase, false);
+    }
+
     bool u16(std::uint64_t offset, std::uint16_t& value, const char* phase) {
         if (!require(offset, 2, phase))
             return false;
@@ -353,15 +418,20 @@ private:
             return fail(workspace_error_code_t::malformed_image,
                         "DEX identifier table is not four-byte aligned", phase, offset, 0);
         const auto size = static_cast<std::uint64_t>(count) * element_size;
-        return require(offset, size, phase);
+        return require_main(offset, size, phase);
     }
 
     bool parse_header() {
-        if (!require(0, kDexHeaderSize, "dex.header"))
+        compact_ = is_compact_dex_magic(data_.data(), data_.size());
+        const auto expected_header_size = compact_ ? kCompactDexHeaderSize : kDexHeaderSize;
+        if (!require(0, expected_header_size, "dex.header"))
             return false;
-        if (!is_dex_magic(data_.data(), data_.size()))
+        if (!compact_ && !is_dex_magic(data_.data(), data_.size()))
             return fail(workspace_error_code_t::unsupported_format,
-                        "input is not a standard DEX file", "dex.header", 0, 8);
+                        "input is not a DEX file", "dex.header", 0, 8);
+        if (compact_ && make_version(data_.data() + 4, 3) != "001")
+            return fail(workspace_error_code_t::unsupported_format,
+                        "compact DEX version is unsupported", "dex.compact.header", 4, 4);
         std::copy_n(data_.data(), image_.header.magic.size(), image_.header.magic.begin());
         if (!u32(8, image_.header.checksum, "dex.header") ||
             !require(12, image_.header.signature.size(), "dex.header"))
@@ -388,10 +458,14 @@ private:
             !u32(104, image_.header.data_size, "dex.header") ||
             !u32(108, image_.header.data_offset, "dex.header"))
             return false;
-        if (image_.header.file_size != data_.size())
+        if (image_.header.file_size < expected_header_size ||
+            image_.header.file_size > data_.size())
+            return fail(workspace_error_code_t::malformed_image,
+                        "DEX main-section size is invalid", "dex.header", 32, 4);
+        if (!compact_ && image_.header.file_size != data_.size())
             return fail(workspace_error_code_t::malformed_image,
                         "DEX header file size does not match the bounded payload", "dex.header", 32, 4);
-        if (image_.header.header_size != kDexHeaderSize)
+        if (image_.header.header_size != expected_header_size)
             return fail(workspace_error_code_t::malformed_image,
                         "DEX header size is invalid", "dex.header", 36, 4);
         if (image_.header.endian_tag != kDexEndianConstant)
@@ -400,6 +474,49 @@ private:
         if (image_.header.map_offset == 0 || (image_.header.map_offset & 3U) != 0)
             return fail(workspace_error_code_t::malformed_image,
                         "DEX map offset is absent or misaligned", "dex.header", 52, 4);
+        main_section_size_ = image_.header.file_size;
+        if (compact_) {
+            data_base_offset_ = image_.header.data_offset;
+            data_section_size_ = image_.header.data_size;
+            if (image_.header.data_size == 0 ||
+                (image_.header.data_offset & 3U) != 0 ||
+                image_.header.data_offset < image_.header.file_size ||
+                !span_within(image_.header.data_offset, image_.header.data_size, data_.size()))
+                return fail(workspace_error_code_t::malformed_image,
+                            "compact DEX shared data section is invalid", "dex.compact.header", 104, 8);
+            dex_compact_dex_features_t features;
+            features.declared_header_size = image_.header.header_size;
+            if (!u32(kCompactDexFeatureFlagsOffset, features.feature_flags, "dex.compact.header") ||
+                !u32(kCompactDexDebugInfoOffsetsPositionOffset,
+                     features.debug_info_offsets_position, "dex.compact.header") ||
+                !u32(kCompactDexDebugInfoOffsetsTableOffset,
+                     features.debug_info_offsets_table_offset, "dex.compact.header") ||
+                !u32(kCompactDexDebugInfoBaseOffset, features.debug_info_base,
+                     "dex.compact.header") ||
+                !u32(kCompactDexOwnedDataBeginOffset, features.owned_data_begin,
+                     "dex.compact.header") ||
+                !u32(kCompactDexOwnedDataEndOffset, features.owned_data_end,
+                     "dex.compact.header"))
+                return false;
+            features.default_methods =
+                (features.feature_flags & kCompactDexDefaultMethodsFeature) != 0;
+            features.unknown_feature_flags =
+                features.feature_flags & ~kCompactDexDefaultMethodsFeature;
+            if (features.unknown_feature_flags != 0)
+                return fail(workspace_error_code_t::unsupported_format,
+                            "compact DEX uses unsupported feature flags",
+                            "dex.compact.header", kCompactDexFeatureFlagsOffset, 4);
+            if (!features.valid(image_.header.method_ids_size, image_.header.data_size))
+                return fail(workspace_error_code_t::malformed_image,
+                            "compact DEX extension fields are invalid",
+                            "dex.compact.header", kCompactDexFeatureFlagsOffset,
+                            kCompactDexHeaderSize - kCompactDexFeatureFlagsOffset);
+            container_.header_size = kCompactDexHeaderSize;
+            container_.compact_features = features;
+        } else {
+            data_base_offset_ = 0;
+            data_section_size_ = static_cast<std::uint32_t>(data_.size());
+        }
         if (!table_range(image_.header.string_ids_offset, image_.header.string_ids_size, 4,
                          "dex.string_ids") ||
             !table_range(image_.header.type_ids_offset, image_.header.type_ids_size, 4,
@@ -421,13 +538,24 @@ private:
             !count_within(image_.header.class_defs_size, limits_.max_class_defs, "class definition count", 96))
             return false;
         if (image_.header.link_size != 0 &&
-            !require(image_.header.link_offset, image_.header.link_size, "dex.link"))
+            compact_) {
+            std::uint32_t link_absolute = 0;
+            if (!require_data(image_.header.link_offset, image_.header.link_size,
+                              "dex.link", link_absolute))
+                return false;
+        } else if (image_.header.link_size != 0 &&
+                   !require(image_.header.link_offset, image_.header.link_size, "dex.link")) {
             return false;
-        if (image_.header.data_size == 0 || (image_.header.data_offset & 3U) != 0 ||
-            !require(image_.header.data_offset, image_.header.data_size, "dex.data"))
+        }
+        if (!compact_ &&
+            (image_.header.data_size == 0 || (image_.header.data_offset & 3U) != 0 ||
+             !require(image_.header.data_offset, image_.header.data_size, "dex.data")))
             return fail(workspace_error_code_t::malformed_image,
                         "DEX data section is invalid", "dex.header", 104, 8);
         image_.dex_offset = provider_offset_;
+        image_.payload_size = compact_
+            ? static_cast<std::uint64_t>(image_.header.data_offset) + image_.header.data_size
+            : image_.header.file_size;
         image_.container = container_;
         image_.managed_identity.container_kind = container_.kind;
         image_.managed_identity.version = make_version(data_.data() + 4, 3);
@@ -438,22 +566,34 @@ private:
     }
 
     bool parse_map() {
-        std::uint32_t item_count = 0;
-        if (!u32(image_.header.map_offset, item_count, "dex.map"))
+        std::uint32_t map_offset = 0;
+        if (!require_data(image_.header.map_offset, 4, "dex.map", map_offset))
             return false;
-        if (!count_within(item_count, limits_.max_map_items, "map item count", image_.header.map_offset))
+        std::uint32_t item_count = 0;
+        if (!u32(map_offset, item_count, "dex.map"))
+            return false;
+        if (!count_within(item_count, limits_.max_map_items, "map item count", map_offset))
             return false;
         const auto bytes = static_cast<std::uint64_t>(item_count) * 12U;
-        if (!require(static_cast<std::uint64_t>(image_.header.map_offset) + 4U, bytes, "dex.map"))
+        if (!require(static_cast<std::uint64_t>(map_offset) + 4U, bytes, "dex.map"))
             return false;
+        if (compact_ &&
+            !span_within(static_cast<std::uint64_t>(image_.header.map_offset) + 4U,
+                         bytes, data_section_size_))
+            return fail(workspace_error_code_t::out_of_range,
+                        "compact DEX map extends beyond its shared data section",
+                        "dex.map", map_offset, bytes + 4U);
         image_.map_items.reserve(item_count);
         std::unordered_set<std::uint16_t> seen_types;
         std::unordered_map<std::uint16_t, dex_map_item_t> mapped_items;
-        std::uint32_t previous_offset = 0;
+        std::uint32_t previous_main_offset = 0;
+        std::uint32_t previous_data_offset = 0;
+        bool have_main_offset = false;
+        bool have_data_offset = false;
         for (std::uint32_t index = 0; index < item_count; ++index) {
             if ((index & 255U) == 0 && !poll("dex.map"))
                 return false;
-            const std::uint64_t offset = static_cast<std::uint64_t>(image_.header.map_offset) + 4U +
+            const std::uint64_t offset = static_cast<std::uint64_t>(map_offset) + 4U +
                                          static_cast<std::uint64_t>(index) * 12U;
             dex_map_item_t item;
             std::uint16_t unused = 0;
@@ -466,18 +606,34 @@ private:
             if (!seen_types.insert(item.type).second)
                 return fail(workspace_error_code_t::malformed_image,
                             "DEX map contains a duplicate item type", "dex.map", offset, 12);
-            if (index != 0 && item.offset < previous_offset)
+            const auto main_section_item = !compact_ || map_item_uses_main_section(item.type);
+            auto& previous_offset = main_section_item ? previous_main_offset : previous_data_offset;
+            auto& have_previous = main_section_item ? have_main_offset : have_data_offset;
+            if (have_previous && item.offset < previous_offset)
                 return fail(workspace_error_code_t::malformed_image,
                             "DEX map item offsets are not ordered", "dex.map", offset + 8, 4);
             previous_offset = item.offset;
-            if (item.size != 0 && item.offset >= data_.size())
-                return fail(workspace_error_code_t::out_of_range,
-                            "DEX map item offset is outside the file", "dex.map", offset + 8, 4);
+            have_previous = true;
+            std::uint32_t item_absolute = 0;
+            if (item.size != 0 &&
+                !map_absolute_offset(item.type, item.offset, item_absolute, "dex.map"))
+                return false;
             if (const auto size = fixed_map_item_size(item.type)) {
-                if (item.size != 0 && !require(item.offset,
-                                                static_cast<std::uint64_t>(item.size) * *size,
-                                                "dex.map"))
-                    return false;
+                const auto element_size = item.type == kMapHeaderItem && compact_
+                    ? static_cast<std::uint64_t>(kCompactDexHeaderSize)
+                    : *size;
+                if (item.size != 0) {
+                    const auto item_bytes =
+                        static_cast<std::uint64_t>(item.size) * element_size;
+                    if (main_section_item) {
+                        if (!require_main(item_absolute, item_bytes, "dex.map"))
+                            return false;
+                    } else if (!span_within(item.offset, item_bytes, data_section_size_)) {
+                        return fail(workspace_error_code_t::out_of_range,
+                                    "compact DEX map item extends beyond its shared data section",
+                                    "dex.map", item_absolute, item_bytes);
+                    }
+                }
             }
             image_.map_items.push_back(item);
             mapped_items.emplace(item.type, item);
@@ -628,8 +784,9 @@ private:
             const auto id_offset = static_cast<std::uint64_t>(image_.header.string_ids_offset) + index * 4ULL;
             dex_string_t string;
             string.index = index;
-            if (!u32(id_offset, string.data_offset, "dex.string_ids") ||
-                !require(string.data_offset, 1, "dex.string"))
+            std::uint32_t raw_data_offset = 0;
+            if (!u32(id_offset, raw_data_offset, "dex.string_ids") ||
+                !resolve_data_offset(raw_data_offset, string.data_offset, "dex.string", false))
                 return false;
             if (!decode_string(string.data_offset, string))
                 return false;
@@ -705,9 +862,12 @@ private:
             const auto offset = static_cast<std::uint64_t>(image_.header.proto_ids_offset) + index * 12ULL;
             dex_proto_t proto;
             proto.index = index;
+            std::uint32_t raw_parameters_offset = 0;
             if (!u32(offset, proto.shorty_string_index, "dex.proto_ids") ||
                 !u32(offset + 4, proto.return_type_index, "dex.proto_ids") ||
-                !u32(offset + 8, proto.parameters_offset, "dex.proto_ids"))
+                !u32(offset + 8, raw_parameters_offset, "dex.proto_ids") ||
+                !resolve_data_offset(raw_parameters_offset, proto.parameters_offset,
+                                     "dex.proto_parameters"))
                 return false;
             if (proto.shorty_string_index >= image_.strings.size() ||
                 proto.return_type_index >= image_.types.size())
@@ -1013,24 +1173,218 @@ private:
         }
     }
 
-    bool parse_code_item(std::uint32_t offset, std::shared_ptr<const dex_code_item_t>& result) {
-        auto cached = code_cache_.find(offset);
+    bool compact_debug_info_offset(std::uint32_t method_index,
+                                   std::uint32_t& absolute_offset) {
+        absolute_offset = 0;
+        if (!compact_)
+            return true;
+        if (!container_.compact_features || method_index >= image_.header.method_ids_size)
+            return fail(workspace_error_code_t::malformed_image,
+                        "compact DEX debug-info lookup has an invalid method index",
+                        "dex.compact.debug", method_index, 0);
+        const auto& features = *container_.compact_features;
+        const auto block_count =
+            (static_cast<std::uint64_t>(image_.header.method_ids_size) +
+             kCompactDexElementsPerDebugOffsetBlock - 1U) /
+            kCompactDexElementsPerDebugOffsetBlock;
+        const auto table_bytes = block_count * sizeof(std::uint32_t);
+        if (!span_within(features.debug_info_offsets_position,
+                         static_cast<std::uint64_t>(features.debug_info_offsets_table_offset) +
+                             table_bytes,
+                         data_section_size_))
+            return fail(workspace_error_code_t::out_of_range,
+                        "compact DEX debug-info offset table exceeds shared data",
+                        "dex.compact.debug", data_base_offset_ +
+                            features.debug_info_offsets_position,
+                        static_cast<std::uint64_t>(features.debug_info_offsets_table_offset) +
+                            table_bytes);
+        const auto blocks_start = data_base_offset_ + features.debug_info_offsets_position;
+        const auto table_start = blocks_start + features.debug_info_offsets_table_offset;
+        const auto block_index = method_index /
+            kCompactDexElementsPerDebugOffsetBlock;
+        std::uint32_t block_offset = 0;
+        if (!u32(static_cast<std::uint64_t>(table_start) +
+                     static_cast<std::uint64_t>(block_index) * sizeof(std::uint32_t),
+                 block_offset, "dex.compact.debug"))
+            return false;
+        std::uint32_t block_limit = features.debug_info_offsets_table_offset;
+        if (static_cast<std::uint64_t>(block_index) + 1U < block_count &&
+            !u32(static_cast<std::uint64_t>(table_start) +
+                     static_cast<std::uint64_t>(block_index + 1U) *
+                         sizeof(std::uint32_t),
+                 block_limit, "dex.compact.debug"))
+            return false;
+        if (block_offset > block_limit ||
+            block_limit > features.debug_info_offsets_table_offset ||
+            block_limit - block_offset < 2U)
+            return fail(workspace_error_code_t::malformed_image,
+                        "compact DEX debug-info block offset is invalid",
+                        "dex.compact.debug", table_start, 4);
+        const auto block_start = blocks_start + block_offset;
+        const auto block_end = blocks_start + block_limit;
+        if (!require(block_start, block_end - block_start,
+                     "dex.compact.debug"))
+            return false;
+        const auto bit_mask = static_cast<std::uint16_t>(
+            (static_cast<std::uint16_t>(data_[block_start]) << 8U) |
+            data_[block_start + 1U]);
+        const auto block_method_count = (std::min<std::uint32_t>)(
+            kCompactDexElementsPerDebugOffsetBlock,
+            image_.header.method_ids_size -
+                block_index * kCompactDexElementsPerDebugOffsetBlock);
+        const auto valid_mask = block_method_count ==
+                kCompactDexElementsPerDebugOffsetBlock
+            ? 0xffffU
+            : (1U << block_method_count) - 1U;
+        if ((bit_mask & ~valid_mask) != 0)
+            return fail(workspace_error_code_t::malformed_image,
+                        "compact DEX debug-info block references absent methods",
+                        "dex.compact.debug", block_start, 2);
+        const auto bit_index = method_index % kCompactDexElementsPerDebugOffsetBlock;
+        if ((bit_mask & (1U << bit_index)) == 0)
+            return true;
+        std::uint32_t cursor = block_start + 2U;
+        std::uint32_t current_offset = features.debug_info_base;
+        for (std::uint32_t index = 0; index <= bit_index; ++index) {
+            if ((bit_mask & (1U << index)) == 0)
+                continue;
+            std::uint64_t delta = 0;
+            bool terminated = false;
+            for (std::uint32_t byte_index = 0; byte_index < 5U; ++byte_index) {
+                if (cursor >= block_end)
+                    return fail(workspace_error_code_t::out_of_range,
+                                "compact DEX debug-info delta crosses its block boundary",
+                                "dex.compact.debug", cursor, 1);
+                const auto byte = data_[cursor++];
+                delta |= static_cast<std::uint64_t>(byte & 0x7fU) <<
+                    (byte_index * 7U);
+                if ((byte & 0x80U) == 0) {
+                    terminated = true;
+                    break;
+                }
+            }
+            if (!terminated ||
+                delta > (std::numeric_limits<std::uint32_t>::max)() - current_offset)
+                return fail(workspace_error_code_t::malformed_image,
+                            "compact DEX debug-info delta is invalid",
+                            "dex.compact.debug", cursor, 0);
+            current_offset += static_cast<std::uint32_t>(delta);
+        }
+        if (current_offset == 0)
+            return fail(workspace_error_code_t::malformed_image,
+                        "compact DEX debug-info table encodes a null offset as present",
+                        "dex.compact.debug", block_start, cursor - block_start);
+        if (!resolve_data_offset(current_offset, absolute_offset,
+                                 "dex.compact.debug", false))
+            return false;
+        return true;
+    }
+
+    bool decode_compact_code_header(std::uint32_t offset,
+                                    dex_code_item_t& code,
+                                    std::uint32_t& instructions_offset) {
+        if ((offset & 1U) != 0 || offset < data_base_offset_ ||
+            !require(offset, 4, "dex.compact.code"))
+            return fail(workspace_error_code_t::malformed_image,
+                        "compact DEX code item is absent, truncated, or misaligned",
+                        "dex.compact.code", offset, 4);
+        std::uint16_t fields = 0;
+        std::uint16_t count_and_flags = 0;
+        if (!u16(offset, fields, "dex.compact.code") ||
+            !u16(offset + 2U, count_and_flags, "dex.compact.code"))
+            return false;
+        std::uint32_t instruction_count = count_and_flags >>
+            kCompactDexInstructionCountShift;
+        std::uint32_t registers_size = (fields >> 12U) & 0x0fU;
+        std::uint32_t ins_size = (fields >> 8U) & 0x0fU;
+        std::uint32_t outs_size = (fields >> 4U) & 0x0fU;
+        std::uint32_t tries_size = fields & 0x0fU;
+        std::uint32_t preheader = offset;
+        auto take_preheader = [&](std::uint16_t& value) -> bool {
+            if (preheader < data_base_offset_ + 2U)
+                return false;
+            preheader -= 2U;
+            return u16(preheader, value, "dex.compact.code");
+        };
+        if ((count_and_flags & kCompactDexPreHeaderInstructionCountFlag) != 0) {
+            std::uint16_t low = 0;
+            std::uint16_t high = 0;
+            if (!take_preheader(low) || !take_preheader(high))
+                return fail(workspace_error_code_t::out_of_range,
+                            "compact DEX instruction-count preheader is truncated",
+                            "dex.compact.code", offset, 4);
+            const auto extension = static_cast<std::uint32_t>(low) |
+                (static_cast<std::uint32_t>(high) << 16U);
+            if (extension > (std::numeric_limits<std::uint32_t>::max)() -
+                    instruction_count)
+                return fail(workspace_error_code_t::malformed_image,
+                            "compact DEX instruction count overflows",
+                            "dex.compact.code", preheader, 4);
+            instruction_count += extension;
+        }
+        auto extend_field = [&](std::uint16_t flag,
+                                std::uint32_t& value) -> bool {
+            if ((count_and_flags & flag) == 0)
+                return true;
+            std::uint16_t extension = 0;
+            if (!take_preheader(extension))
+                return false;
+            value += extension;
+            return value <= (std::numeric_limits<std::uint16_t>::max)();
+        };
+        if (!extend_field(kCompactDexPreHeaderRegistersFlag, registers_size) ||
+            !extend_field(kCompactDexPreHeaderInsFlag, ins_size) ||
+            !extend_field(kCompactDexPreHeaderOutsFlag, outs_size) ||
+            !extend_field(kCompactDexPreHeaderTriesFlag, tries_size) ||
+            registers_size > (std::numeric_limits<std::uint16_t>::max)() - ins_size)
+            return fail(workspace_error_code_t::malformed_image,
+                        "compact DEX code-item preheader fields are invalid",
+                        "dex.compact.code", preheader, offset - preheader);
+        registers_size += ins_size;
+        code.registers_size = static_cast<std::uint16_t>(registers_size);
+        code.ins_size = static_cast<std::uint16_t>(ins_size);
+        code.outs_size = static_cast<std::uint16_t>(outs_size);
+        code.tries_size = static_cast<std::uint16_t>(tries_size);
+        code.instruction_count = instruction_count;
+        instructions_offset = offset + 4U;
+        return true;
+    }
+
+    bool parse_code_item(std::uint32_t offset, std::uint32_t method_index,
+                         std::shared_ptr<const dex_code_item_t>& result) {
+        std::uint32_t compact_debug_offset = 0;
+        if (compact_ &&
+            !compact_debug_info_offset(method_index, compact_debug_offset))
+            return false;
+        const auto cache_key =
+            (static_cast<std::uint64_t>(offset) << 32U) |
+            compact_debug_offset;
+        auto cached = code_cache_.find(cache_key);
         if (cached != code_cache_.end()) {
             result = cached->second;
             return true;
         }
-        if ((offset & 3U) != 0 || !require(offset, 16, "dex.code"))
+        if (!compact_ && ((offset & 3U) != 0 || !require(offset, 16, "dex.code")))
             return fail(workspace_error_code_t::malformed_image,
                         "DEX code item is absent, truncated, or misaligned", "dex.code", offset, 16);
         auto code = std::make_shared<dex_code_item_t>();
         code->offset = offset;
-        if (!u16(offset, code->registers_size, "dex.code") ||
-            !u16(offset + 2, code->ins_size, "dex.code") ||
-            !u16(offset + 4, code->outs_size, "dex.code") ||
-            !u16(offset + 6, code->tries_size, "dex.code") ||
-            !u32(offset + 8, code->debug_info_offset, "dex.code") ||
-            !u32(offset + 12, code->instruction_count, "dex.code"))
-            return false;
+        std::uint32_t insns_offset = 0;
+        if (compact_) {
+            if (!decode_compact_code_header(offset, *code, insns_offset))
+                return false;
+            code->debug_info_offset = compact_debug_offset;
+        } else {
+            if (!u16(offset, code->registers_size, "dex.code") ||
+                !u16(offset + 2, code->ins_size, "dex.code") ||
+                !u16(offset + 4, code->outs_size, "dex.code") ||
+                !u16(offset + 6, code->tries_size, "dex.code") ||
+                !u32(offset + 8, code->debug_info_offset, "dex.code") ||
+                !u32(offset + 12, code->instruction_count, "dex.code"))
+                return false;
+            insns_offset = offset + 16U;
+        }
+        code->instructions_offset = insns_offset;
         if (!count_within(code->instruction_count, limits_.max_code_units_per_method,
                           "code units per method", offset + 12) ||
             !count_within(code->tries_size, limits_.max_try_items_per_method,
@@ -1040,7 +1394,6 @@ private:
             return fail(workspace_error_code_t::limit_exceeded,
                         "DEX cumulative code unit limit exceeded", "dex.code", offset + 12, 4);
         total_code_units_ += code->instruction_count;
-        const auto insns_offset = offset + 16U;
         const auto insns_bytes = static_cast<std::uint64_t>(code->instruction_count) * 2U;
         if (!require(insns_offset, insns_bytes, "dex.code"))
             return false;
@@ -1097,10 +1450,11 @@ private:
                             insns_offset + static_cast<std::uint64_t>(instruction.code_unit_offset) * 2U, 2);
         }
         std::uint64_t tail = static_cast<std::uint64_t>(insns_offset) + insns_bytes;
-        if (code->tries_size != 0 && (code->instruction_count & 1U) != 0) {
-            if (!require(tail, 2, "dex.code"))
+        if (code->tries_size != 0) {
+            const auto aligned_tail = (tail + 3U) & ~3ULL;
+            if (!require(tail, aligned_tail - tail, "dex.code"))
                 return false;
-            tail += 2;
+            tail = aligned_tail;
         }
         const auto tries_bytes = static_cast<std::uint64_t>(code->tries_size) * 8U;
         if (!require(tail, tries_bytes, "dex.code"))
@@ -1186,7 +1540,7 @@ private:
             code->debug_info = std::move(info);
         }
         result = code;
-        code_cache_.emplace(offset, std::move(code));
+        code_cache_.emplace(cache_key, std::move(code));
         return true;
     }
 
@@ -1244,8 +1598,13 @@ private:
                             "DEX encoded method does not belong to its class", "dex.class_data", cursor, 0);
             method.method_index = current_index;
             method.is_direct = is_direct;
-            if (method.code_offset != 0 && !parse_code_item(method.code_offset, method.code))
-                return false;
+            if (method.code_offset != 0) {
+                const auto raw_code_offset = method.code_offset;
+                if (!resolve_data_offset(raw_code_offset, method.code_offset,
+                                         "dex.code", false) ||
+                    !parse_code_item(method.code_offset, current_index, method.code))
+                    return false;
+            }
             destination.push_back(std::move(method));
         }
         return true;
@@ -1285,14 +1644,26 @@ private:
             const auto offset = static_cast<std::uint64_t>(image_.header.class_defs_offset) + index * 32ULL;
             dex_class_def_t definition;
             definition.index = index;
+            std::uint32_t raw_interfaces_offset = 0;
+            std::uint32_t raw_annotations_offset = 0;
+            std::uint32_t raw_class_data_offset = 0;
+            std::uint32_t raw_static_values_offset = 0;
             if (!u32(offset, definition.class_type_index, "dex.class_defs") ||
                 !u32(offset + 4, definition.access_flags, "dex.class_defs") ||
                 !u32(offset + 8, definition.superclass_type_index, "dex.class_defs") ||
-                !u32(offset + 12, definition.interfaces_offset, "dex.class_defs") ||
+                !u32(offset + 12, raw_interfaces_offset, "dex.class_defs") ||
                 !u32(offset + 16, definition.source_file_string_index, "dex.class_defs") ||
-                !u32(offset + 20, definition.annotations_offset, "dex.class_defs") ||
-                !u32(offset + 24, definition.class_data_offset, "dex.class_defs") ||
-                !u32(offset + 28, definition.static_values_offset, "dex.class_defs"))
+                !u32(offset + 20, raw_annotations_offset, "dex.class_defs") ||
+                !u32(offset + 24, raw_class_data_offset, "dex.class_defs") ||
+                !u32(offset + 28, raw_static_values_offset, "dex.class_defs") ||
+                !resolve_data_offset(raw_interfaces_offset, definition.interfaces_offset,
+                                     "dex.class_interfaces") ||
+                !resolve_data_offset(raw_annotations_offset, definition.annotations_offset,
+                                     "dex.annotations") ||
+                !resolve_data_offset(raw_class_data_offset, definition.class_data_offset,
+                                     "dex.class_data") ||
+                !resolve_data_offset(raw_static_values_offset, definition.static_values_offset,
+                                     "dex.static_values"))
                 return false;
             if (definition.class_type_index >= image_.types.size() ||
                 (index != 0 && definition.class_type_index <= previous_type_index))
@@ -1370,7 +1741,8 @@ private:
             symbol.name.append("->");
             symbol.name.append(method.name);
             symbol.name.append(method.descriptor);
-            symbol.address = address_t{address_space_id_t::relative_virtual, encoded.code_offset,
+            symbol.address = address_t{address_space_id_t::relative_virtual,
+                                       encoded.code->instructions_offset,
                                        architecture_id_t::dalvik_bytecode, architecture_mode_t::dalvik};
             symbol.size = static_cast<std::uint64_t>(encoded.code->instruction_count) * 2U;
             symbol.kind = image_symbol_kind_t::function;
@@ -1393,7 +1765,7 @@ private:
         normalized.endian = endian_t::little;
         normalized.address_width_bits = 32;
         normalized.image_base = 0;
-        normalized.image_size = image_.header.file_size;
+        normalized.image_size = image_.payload_size;
         normalized.header_size = image_.header.header_size;
         normalized.format_name = std::string(dex_container_kind_name(container_.kind));
         normalized.format_name.push_back(':');
@@ -1405,15 +1777,15 @@ private:
         segment.index = 0;
         segment.name = "dex";
         segment.virtual_address = 0;
-        segment.virtual_size = image_.header.file_size;
+        segment.virtual_size = image_.payload_size;
         segment.file_offset = provider_offset_;
-        segment.file_size = image_.header.file_size;
+        segment.file_size = image_.payload_size;
         segment.permissions = image_permission_read | image_permission_execute;
         normalized.segments.push_back(std::move(segment));
         image_address_mapping_t mapping;
         mapping.source_start = provider_offset_;
         mapping.target_start = 0;
-        mapping.size = image_.header.file_size;
+        mapping.size = image_.payload_size;
         mapping.permissions = image_permission_read | image_permission_execute;
         normalized.address_mappings.push_back(mapping);
         if (!add_section(0, "header", 0, image_.header.header_size, image_permission_read) ||
@@ -1470,12 +1842,16 @@ private:
     dex_image_t image_;
     workspace_error_t error_;
     bool failed_ = false;
+    bool compact_ = false;
+    std::uint32_t main_section_size_ = 0;
+    std::uint32_t data_base_offset_ = 0;
+    std::uint32_t data_section_size_ = 0;
     std::uint64_t total_string_bytes_ = 0;
     std::uint64_t total_code_units_ = 0;
     std::uint64_t total_instruction_records_ = 0;
     std::uint64_t total_debug_positions_ = 0;
     std::unordered_map<std::uint32_t, std::vector<std::uint16_t>> type_list_cache_;
-    std::unordered_map<std::uint32_t, std::shared_ptr<const dex_code_item_t>> code_cache_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const dex_code_item_t>> code_cache_;
 };
 
 workspace_result_t<std::vector<std::uint8_t>> read_prefix(const byte_provider_t& provider,
@@ -1511,31 +1887,6 @@ workspace_result_t<dex_container_info_t> detect_from_prefix(const std::vector<st
     return workspace_result_t<dex_container_info_t>::success(std::move(info));
 }
 
-workspace_error_t compact_dex_unsupported_error(const dex_container_info_t& info,
-                                                std::uint64_t offset) {
-    auto error = dex_error(workspace_error_code_t::unsupported_format,
-                           "compact DEX is unsupported by the local parser",
-                           "dex.compact.unsupported", offset, 8);
-    error.details.emplace_back("container_kind", "compact-dex");
-    error.details.emplace_back("version", info.version);
-    error.details.emplace_back("indexing", "refused-before-indexing");
-    if (!info.compact_features) {
-        error.details.emplace_back("feature_layout", "unknown-for-version");
-        return error;
-    }
-    const auto& features = *info.compact_features;
-    error.details.emplace_back("feature_layout", "cdex-001");
-    error.details.emplace_back("declared_header_size", std::to_string(features.declared_header_size));
-    error.details.emplace_back("feature_flags", format_u32_hex(features.feature_flags));
-    error.details.emplace_back("default_methods", features.default_methods ? "true" : "false");
-    error.details.emplace_back("unknown_feature_flags", format_u32_hex(features.unknown_feature_flags));
-    error.details.emplace_back("code_item_encoding",
-                               features.compact_code_items ? "compact-preheader" : "unavailable");
-    error.details.emplace_back("debug_info_encoding",
-                               features.debug_info_offset_table ? "offset-table" : "unavailable");
-    return error;
-}
-
 workspace_result_t<dex_container_info_t> inspect_compact_dex_at(const byte_provider_t& provider,
                                                                   std::uint64_t offset,
                                                                   const cancellation_token_t& cancel) {
@@ -1569,7 +1920,7 @@ workspace_result_t<dex_container_info_t> inspect_compact_dex_at(const byte_provi
         return workspace_result_t<dex_container_info_t>::failure(header_result.error());
     const auto& header = header_result.value();
     const auto declared_header_size = read_u32_le(header.data() + 36);
-    if (declared_header_size < kCompactDexInspectionSize ||
+    if (declared_header_size != kCompactDexHeaderSize ||
         !span_within(offset, declared_header_size, provider.size()))
         return workspace_result_t<dex_container_info_t>::failure(dex_error(
             workspace_error_code_t::malformed_image, "compact DEX declared header size is invalid",
@@ -1580,6 +1931,29 @@ workspace_result_t<dex_container_info_t> inspect_compact_dex_at(const byte_provi
     features.feature_flags = feature_flags;
     features.default_methods = (feature_flags & kCompactDexDefaultMethodsFeature) != 0;
     features.unknown_feature_flags = feature_flags & ~kCompactDexDefaultMethodsFeature;
+    features.debug_info_offsets_position =
+        read_u32_le(header.data() + kCompactDexDebugInfoOffsetsPositionOffset);
+    features.debug_info_offsets_table_offset =
+        read_u32_le(header.data() + kCompactDexDebugInfoOffsetsTableOffset);
+    features.debug_info_base =
+        read_u32_le(header.data() + kCompactDexDebugInfoBaseOffset);
+    features.owned_data_begin =
+        read_u32_le(header.data() + kCompactDexOwnedDataBeginOffset);
+    features.owned_data_end =
+        read_u32_le(header.data() + kCompactDexOwnedDataEndOffset);
+    if (features.unknown_feature_flags != 0)
+        return workspace_result_t<dex_container_info_t>::failure(dex_error(
+            workspace_error_code_t::unsupported_format,
+            "compact DEX uses unsupported feature flags",
+            "dex.compact.header", offset + kCompactDexFeatureFlagsOffset, 4));
+    const auto method_count = read_u32_le(header.data() + 88);
+    const auto data_size = read_u32_le(header.data() + 104);
+    if (!features.valid(method_count, data_size))
+        return workspace_result_t<dex_container_info_t>::failure(dex_error(
+            workspace_error_code_t::malformed_image,
+            "compact DEX extension fields are invalid", "dex.compact.header",
+            offset + kCompactDexFeatureFlagsOffset,
+            kCompactDexHeaderSize - kCompactDexFeatureFlagsOffset));
     info.header_size = declared_header_size;
     info.compact_features = features;
     return workspace_result_t<dex_container_info_t>::success(std::move(info));
@@ -1591,24 +1965,52 @@ workspace_result_t<dex_image_t> parse_dex_at(const byte_provider_t& provider, st
                                               const cancellation_token_t& cancel) {
     if (cancel.stop_requested())
         return workspace_result_t<dex_image_t>::failure(dex_stop_error(cancel, "dex.read"));
-    if (!span_within(offset, kDexHeaderSize, provider.size()))
+    if (!span_within(offset, 8, provider.size()))
         return workspace_result_t<dex_image_t>::failure(dex_error(
-            workspace_error_code_t::out_of_range, "DEX header is truncated", "dex.read", offset, kDexHeaderSize));
-    auto header_result = provider.read_vector(offset, kDexHeaderSize, kDexHeaderSize, cancel);
+            workspace_error_code_t::out_of_range, "DEX magic is truncated", "dex.read", offset, 8));
+    auto magic_result = provider.read_vector(offset, 8, 8, cancel);
+    if (!magic_result)
+        return workspace_result_t<dex_image_t>::failure(magic_result.error());
+    const auto compact = is_compact_dex_magic(magic_result.value().data(), magic_result.value().size());
+    if (!compact && !is_dex_magic(magic_result.value().data(), magic_result.value().size()))
+        return workspace_result_t<dex_image_t>::failure(dex_error(
+            workspace_error_code_t::unsupported_format, "DEX payload magic is invalid", "dex.read", offset, 8));
+    const auto expected_header_size = compact ? kCompactDexHeaderSize : kDexHeaderSize;
+    if (!span_within(offset, expected_header_size, provider.size()))
+        return workspace_result_t<dex_image_t>::failure(dex_error(
+            workspace_error_code_t::out_of_range, "DEX header is truncated", "dex.read",
+            offset, expected_header_size));
+    auto header_result = provider.read_vector(offset, expected_header_size,
+                                              expected_header_size, cancel);
     if (!header_result)
         return workspace_result_t<dex_image_t>::failure(header_result.error());
     const auto& header = header_result.value();
-    if (!is_dex_magic(header.data(), header.size()))
-        return workspace_result_t<dex_image_t>::failure(dex_error(
-            workspace_error_code_t::unsupported_format, "DEX payload magic is invalid", "dex.read", offset, 8));
     const auto file_size = read_u32_le(header.data() + 32);
-    if (file_size < kDexHeaderSize || file_size > limits.max_file_size ||
-        !span_within(offset, file_size, provider.size()))
+    const auto data_size = read_u32_le(header.data() + 104);
+    const auto data_offset = read_u32_le(header.data() + 108);
+    std::uint64_t payload_size = file_size;
+    if (compact) {
+        if (make_version(header.data() + 4, 3) != "001")
+            return workspace_result_t<dex_image_t>::failure(dex_error(
+                workspace_error_code_t::unsupported_format,
+                "compact DEX version is unsupported",
+                "dex.compact.read", offset + 4U, 4));
+        if (data_offset >
+            (std::numeric_limits<std::uint32_t>::max)() - data_size)
+            return workspace_result_t<dex_image_t>::failure(dex_error(
+                workspace_error_code_t::malformed_image,
+                "compact DEX shared-data span overflows",
+                "dex.compact.read", offset + 104U, 8));
+        payload_size = static_cast<std::uint64_t>(data_offset) + data_size;
+    }
+    if (file_size < expected_header_size || payload_size < file_size ||
+        payload_size > limits.max_file_size ||
+        !span_within(offset, payload_size, provider.size()))
         return workspace_result_t<dex_image_t>::failure(dex_error(
-            file_size > limits.max_file_size ? workspace_error_code_t::limit_exceeded
-                                              : workspace_error_code_t::out_of_range,
+            payload_size > limits.max_file_size ? workspace_error_code_t::limit_exceeded
+                                                 : workspace_error_code_t::out_of_range,
             "DEX payload size is invalid or exceeds the parser limit", "dex.read", offset + 32, 4));
-    auto data_result = provider.read_vector(offset, file_size, limits.max_file_size, cancel);
+    auto data_result = provider.read_vector(offset, payload_size, limits.max_file_size, cancel);
     if (!data_result)
         return workspace_result_t<dex_image_t>::failure(data_result.error());
     dex_parser_t parser(data_result.value(), offset, provider.size(), provider.identity(),
@@ -1667,9 +2069,17 @@ workspace_result_t<bool> collect_container_dex_candidates(
             auto compact = inspect_compact_dex_at(provider, offset, cancel);
             if (!compact)
                 return workspace_result_t<bool>::failure(compact.error());
-            auto error = compact_dex_unsupported_error(compact.value(), offset);
-            error.details.emplace_back("enclosing_container", dex_container_kind_name(container.kind));
-            return workspace_result_t<bool>::failure(std::move(error));
+            if (compact.value().version != "001")
+                return workspace_result_t<bool>::failure(dex_error(
+                    workspace_error_code_t::unsupported_format,
+                    "embedded compact DEX version is unsupported",
+                    "dex.container", offset, 8));
+            if (container.embedded_dex_offsets.size() >= limits.max_embedded_dex_files)
+                return workspace_result_t<bool>::failure(dex_error(
+                    workspace_error_code_t::limit_exceeded,
+                    "embedded DEX candidate limit exceeded", "dex.container", offset, 8));
+            container.embedded_dex_offsets.push_back(offset);
+            continue;
         }
         if (!is_dex_magic(scan.data() + offset, remaining))
             continue;
@@ -1716,6 +2126,28 @@ workspace_result_t<dex_image_t> parse_container(const byte_provider_t& provider,
     return workspace_result_t<dex_image_t>::success(std::move(image));
 }
 
+}
+
+bool dex_compact_dex_features_t::valid(std::uint32_t method_count,
+                                       std::uint32_t data_size) const noexcept {
+    if (declared_header_size != kCompactDexHeaderSize ||
+        unknown_feature_flags != 0 || owned_data_begin > owned_data_end ||
+        owned_data_end > data_size ||
+        (debug_info_offsets_position & 3U) != 0 ||
+        (debug_info_offsets_table_offset & 3U) != 0 ||
+        debug_info_offsets_position > data_size ||
+        debug_info_offsets_table_offset > data_size - debug_info_offsets_position)
+        return false;
+    const auto block_count =
+        (static_cast<std::uint64_t>(method_count) +
+         kCompactDexElementsPerDebugOffsetBlock - 1U) /
+        kCompactDexElementsPerDebugOffsetBlock;
+    const auto table_start = static_cast<std::uint64_t>(debug_info_offsets_position) +
+        debug_info_offsets_table_offset;
+    return block_count <= ((std::numeric_limits<std::uint64_t>::max)() / 4U) &&
+        span_within(table_start, block_count * 4U, data_size) &&
+        (debug_info_base < data_size ||
+         debug_info_base == (std::numeric_limits<std::uint32_t>::max)());
 }
 
 const char* dex_container_kind_name(dex_container_kind_t kind) noexcept {
@@ -1860,11 +2292,30 @@ parse_dex_image(const byte_provider_t& provider, const dex_parse_limits_t& limit
                 const cancellation_token_t& cancel) {
     try {
         if (limits.max_file_size < kDexHeaderSize || limits.max_container_scan_bytes < 8 ||
-            limits.max_embedded_dex_files == 0 || limits.max_string_ids == 0 || limits.max_type_ids == 0 ||
-            limits.max_proto_ids == 0 || limits.max_field_ids == 0 || limits.max_method_ids == 0 ||
-            limits.max_class_defs == 0 || limits.max_instruction_records_per_method == 0 ||
-            limits.max_total_instruction_records == 0 || limits.max_string_bytes == 0 ||
-            limits.max_single_string_bytes == 0)
+            limits.max_embedded_dex_files == 0 || limits.max_map_items == 0 ||
+            limits.max_string_ids == 0 || limits.max_type_ids == 0 ||
+            limits.max_proto_ids == 0 || limits.max_field_ids == 0 ||
+            limits.max_method_ids == 0 || limits.max_class_defs == 0 ||
+            limits.max_parameters_per_proto == 0 ||
+            limits.max_class_data_items == 0 ||
+            limits.max_code_units_per_method == 0 ||
+            limits.max_total_code_units == 0 ||
+            limits.max_instruction_records_per_method == 0 ||
+            limits.max_total_instruction_records == 0 ||
+            limits.max_try_items_per_method == 0 ||
+            limits.max_catch_handlers_per_method == 0 ||
+            limits.max_catch_pairs_per_handler == 0 ||
+            limits.max_debug_parameters == 0 ||
+            limits.max_debug_positions_per_method == 0 ||
+            limits.max_total_debug_positions == 0 ||
+            limits.max_string_bytes == 0 ||
+            limits.max_single_string_bytes == 0 ||
+            limits.max_single_string_bytes > limits.max_string_bytes ||
+            limits.max_code_units_per_method > limits.max_total_code_units ||
+            limits.max_instruction_records_per_method >
+                limits.max_total_instruction_records ||
+            limits.max_debug_positions_per_method >
+                limits.max_total_debug_positions)
             return workspace_result_t<dex_image_t>::failure(dex_error(
                 workspace_error_code_t::invalid_argument, "DEX parser limits are invalid", "dex.limits"));
         auto detected = detect_dex_container(provider, cancel);
@@ -1872,13 +2323,11 @@ parse_dex_image(const byte_provider_t& provider, const dex_parse_limits_t& limit
             return workspace_result_t<dex_image_t>::failure(detected.error());
         switch (detected.value().kind) {
             case dex_container_kind_t::dex:
+            case dex_container_kind_t::compact_dex:
                 return parse_dex_at(provider, 0, detected.take_value(), limits, cancel);
             case dex_container_kind_t::oat:
             case dex_container_kind_t::vdex:
                 return parse_container(provider, detected.take_value(), limits, cancel);
-            case dex_container_kind_t::compact_dex:
-                return workspace_result_t<dex_image_t>::failure(
-                    compact_dex_unsupported_error(detected.value(), 0));
             case dex_container_kind_t::unknown:
                 return workspace_result_t<dex_image_t>::failure(dex_error(
                     workspace_error_code_t::unsupported_format, "input is not DEX, OAT, or VDEX", "dex.detect"));

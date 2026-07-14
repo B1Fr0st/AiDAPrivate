@@ -2,6 +2,9 @@
 
 #include "legacy_document_adapter.hpp"
 #include "native_worker_host.hpp"
+#include "providers/cli_provider.hpp"
+#include "providers/dalvik_ssa.hpp"
+#include "providers/jvm_ssa.hpp"
 
 #include "decompiler_contracts.hpp"
 #include "pseudocode_renderer_v2.hpp"
@@ -13,13 +16,43 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <utility>
+#include <variant>
 
 namespace aida::analysis {
 namespace {
+
+using managed_capture_value_t = std::variant<
+    std::shared_ptr<const managed_cli::request_t>,
+    std::shared_ptr<const jvm_ssa::jvm_method_input_t>,
+    std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t>>;
+
+struct managed_capture_cache_entry_t final {
+    managed_capture_value_t value;
+    std::uint64_t generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
+    sha256_digest_t provider_hash;
+    std::uint64_t byte_size = 0;
+    std::uint64_t touch = 0;
+};
+
+struct managed_module_snapshot_cache_entry_t final {
+    managed_cli::immutable_module_snapshot_t snapshot;
+    sha256_digest_t artifact_hash;
+    sha256_digest_t provider_hash;
+    std::uint64_t provider_offset = 0;
+    std::uint64_t provider_size = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t analysis_revision = 0;
+    std::uint64_t overlay_revision = 0;
+    std::uint64_t touch = 0;
+};
 
 struct ui_state_t final {
     ui_state_t(std::shared_ptr<analysis_workspace_t> workspace_value,
@@ -38,11 +71,97 @@ struct ui_state_t final {
     decompiler_ui_integration_metrics_t metrics;
     std::atomic<std::uint64_t> request_counter{0};
     std::optional<decompiler_provider_identity_t> native_provider;
+    std::optional<decompiler_provider_identity_t> cli_provider;
+    std::optional<decompiler_provider_identity_t> jvm_provider;
+    std::optional<decompiler_provider_identity_t> dalvik_provider;
     sha256_digest_t native_worker_protocol_hash;
     sha256_digest_t native_manifest_hash;
+    sha256_digest_t managed_manifest_hash;
+    sha256_digest_t managed_runtime_manifest_hash;
     std::uint32_t native_worker_protocol_version = 0;
-    std::shared_ptr<std::mutex> native_capture_mutex;
+    mutable std::mutex managed_capture_mutex;
+    std::unordered_map<std::string, managed_capture_cache_entry_t>
+        managed_capture_cache;
+    std::unordered_map<std::string, managed_module_snapshot_cache_entry_t>
+        managed_module_snapshot_cache;
+    std::unordered_map<std::string, std::uint64_t>
+        managed_module_snapshot_inflight;
+    std::condition_variable managed_capture_condition;
+    std::uint64_t managed_capture_cache_bytes = 0;
+    std::uint64_t managed_module_snapshot_cache_bytes = 0;
+    std::uint64_t managed_module_snapshot_reserved_bytes = 0;
+    std::uint64_t managed_capture_clock = 0;
+    std::uint64_t managed_cache_epoch = 0;
 };
+
+struct production_cache_entry_t {
+    std::shared_ptr<analysis_workspace_t> workspace;
+    std::shared_ptr<decompiler_ui_integration_t> integration;
+    std::uint64_t touch = 0;
+};
+
+std::mutex production_cache_mutex;
+std::unordered_map<const analysis_workspace_t*, production_cache_entry_t> production_cache;
+std::uint64_t production_cache_clock = 0;
+constexpr std::size_t maximum_cached_production_integrations = 32;
+
+const decompiler_profile_budget_t& profile_budget(
+    const decompiler_profile_policy_t& policy,
+    decompiler_profile_id_t profile) noexcept {
+    switch (profile) {
+    case decompiler_profile_id_t::fast:
+        return policy.fast;
+    case decompiler_profile_id_t::thorough:
+        return policy.thorough;
+    case decompiler_profile_id_t::balanced:
+    default:
+        return policy.balanced;
+    }
+}
+
+std::string managed_capture_key(
+    const generation_bound_decompiler_entity_t& binding) {
+    return binding.binary_id.to_hex() + "|" +
+        binding.load_profile_hash.to_hex() + "|" +
+        binding.provider_hash.to_hex() + "|" +
+        binding.artifact_hash.to_hex() + "|" +
+        std::to_string(binding.generation) + "|" +
+        std::to_string(binding.analysis_revision) + "|" +
+        std::to_string(binding.overlay_revision) + "|" +
+        std::to_string(binding.type_graph_revision) + "|" +
+        stable_serialization_hash(binding.entity).to_hex();
+}
+
+std::string managed_module_snapshot_key(
+    const generation_bound_decompiler_entity_t& binding,
+    const managed_artifact_binding_record_t& artifact) {
+    return binding.binary_id.to_hex() + "|" +
+        binding.provider_hash.to_hex() + "|" +
+        artifact.artifact_hash.to_hex() + "|" +
+        std::to_string(artifact.provider_offset) + "|" +
+        std::to_string(artifact.provider_size) + "|" +
+        std::to_string(binding.generation);
+}
+
+std::string managed_embedded_logical_identity(
+    const analysis_publication_t& publication,
+    const managed_artifact_binding_record_t& artifact) {
+    std::string container = publication.provider->identity().normalized_source;
+    const auto member_separator = container.find("!/");
+    if (member_separator != std::string::npos)
+        container.resize(member_separator);
+    const auto embedded_separator = container.find("#member:");
+    if (embedded_separator != std::string::npos)
+        container.resize(embedded_separator);
+    std::string member;
+    if (publication.provider->member_metadata()) {
+        member = publication.provider->member_metadata()->normalized_member_path;
+    } else {
+        member = "artifact/" + std::to_string(artifact.artifact_ordinal) +
+            "/" + artifact.artifact_hash.to_hex() + ".managed-pe";
+    }
+    return container + "#member:" + member;
+}
 
 workspace_error_t ui_request_error(
     const workspace_error_code_t code,
@@ -50,6 +169,318 @@ workspace_error_t ui_request_error(
     std::string phase)
 {
     return make_workspace_error(code, std::move(message), std::move(phase));
+}
+
+workspace_result_t<void> validate_managed_cli_preflight(
+    const managed_cli::request_t& request,
+    const cancellation_token_t& cancel) {
+    if (request.module_source.kind ==
+        managed_cli::module_source_kind_t::embedded_member) {
+        const auto serialized = managed_cli::serialize_request(request);
+        if (!serialized)
+            return workspace_result_t<void>::failure(serialized.error());
+        return workspace_result_t<void>::success();
+    }
+    if (request.module_source.kind !=
+        managed_cli::module_source_kind_t::regular_file) {
+        return workspace_result_t<void>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "managed CLI module source kind is invalid",
+                "decompiler_ui.cli.preflight.source"));
+    }
+    if (request.module_snapshot || request.module_source.module_size != 0 ||
+        request.module_source.filesystem_path.empty() ||
+        request.module_source.logical_identity !=
+            request.module_source.filesystem_path ||
+        request.module_source.module_hash.empty() || request.entity_hash.empty() ||
+        request.worker.runtime_manifest_hash.empty() || request.contract_hash.empty() ||
+        !request.cache_identity.empty() ||
+        !request.request_binding_hash.empty()) {
+        return workspace_result_t<void>::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "managed CLI regular-file request is not an unbound canonical request",
+                "decompiler_ui.cli.preflight.regular"));
+    }
+    auto canonical = managed_cli::make_request(
+        request.sequence, request.request_id,
+        request.module_source.filesystem_path, request.entity,
+        request.workspace_generation, request.type_graph_revision,
+        request.profile, request.worker, cancel);
+    if (!canonical)
+        return workspace_result_t<void>::failure(canonical.error());
+    const auto& expected = canonical.value();
+    if (expected.module_snapshot || expected.module_source.module_size != 0 ||
+        expected.module_source.kind != request.module_source.kind ||
+        expected.module_source.logical_identity !=
+            request.module_source.logical_identity ||
+        expected.module_source.filesystem_path !=
+            request.module_source.filesystem_path ||
+        expected.module_source.module_hash != request.module_source.module_hash ||
+        expected.entity_hash != request.entity_hash ||
+        expected.worker.runtime_manifest_hash !=
+            request.worker.runtime_manifest_hash ||
+        expected.contract_hash != request.contract_hash ||
+        !expected.cache_identity.empty() ||
+        !expected.request_binding_hash.empty()) {
+        return workspace_result_t<void>::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "managed CLI regular-file request does not match its canonical contract",
+                "decompiler_ui.cli.preflight.regular"));
+    }
+    return workspace_result_t<void>::success();
+}
+
+void erase_managed_captures_for_snapshot_locked(
+    ui_state_t& state,
+    const std::shared_ptr<const std::vector<std::uint8_t>>& bytes) {
+    for (auto iterator = state.managed_capture_cache.begin();
+         iterator != state.managed_capture_cache.end();) {
+        const auto* request = std::get_if<
+            std::shared_ptr<const managed_cli::request_t>>(
+                &iterator->second.value);
+        if (request && *request && (*request)->module_snapshot == bytes) {
+            state.managed_capture_cache_bytes -= iterator->second.byte_size;
+            iterator = state.managed_capture_cache.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+}
+
+void erase_managed_module_snapshot_locked(
+    ui_state_t& state,
+    const std::string& key) {
+    const auto found = state.managed_module_snapshot_cache.find(key);
+    if (found == state.managed_module_snapshot_cache.end())
+        return;
+    erase_managed_captures_for_snapshot_locked(
+        state, found->second.snapshot.bytes);
+    state.managed_module_snapshot_cache_bytes -= found->second.provider_size;
+    state.managed_module_snapshot_cache.erase(found);
+}
+
+bool erase_oldest_managed_capture_locked(ui_state_t& state) {
+    if (state.managed_capture_cache.empty())
+        return false;
+    const auto oldest = std::min_element(
+        state.managed_capture_cache.begin(),
+        state.managed_capture_cache.end(),
+        [](const auto& left, const auto& right) {
+            return left.second.touch < right.second.touch;
+        });
+    state.managed_capture_cache_bytes -= oldest->second.byte_size;
+    state.managed_capture_cache.erase(oldest);
+    return true;
+}
+
+bool erase_oldest_managed_module_snapshot_locked(ui_state_t& state) {
+    if (state.managed_module_snapshot_cache.empty())
+        return false;
+    const auto oldest = std::min_element(
+        state.managed_module_snapshot_cache.begin(),
+        state.managed_module_snapshot_cache.end(),
+        [](const auto& left, const auto& right) {
+            return left.second.touch < right.second.touch;
+        });
+    const auto key = oldest->first;
+    erase_managed_module_snapshot_locked(state, key);
+    return true;
+}
+
+workspace_result_t<managed_cli::immutable_module_snapshot_t>
+acquire_managed_cli_snapshot(
+    ui_state_t& state,
+    const std::shared_ptr<const analysis_publication_t>& publication,
+    const generation_bound_decompiler_entity_t& binding,
+    const managed_artifact_binding_record_t& artifact,
+    const cancellation_token_t& cancel) {
+    const auto key = managed_module_snapshot_key(binding, artifact);
+    std::uint64_t reservation_epoch = 0;
+    for (;;) {
+        if (cancel.stop_requested())
+            return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+                ui_request_error(cancel.deadline_exceeded()
+                        ? workspace_error_code_t::deadline_exceeded
+                        : workspace_error_code_t::cancelled,
+                    "managed CLI snapshot acquisition was cancelled",
+                    "decompiler_ui.entity.capture.cli.snapshot"));
+        std::unique_lock lock(state.managed_capture_mutex);
+        for (auto iterator = state.managed_module_snapshot_cache.begin();
+             iterator != state.managed_module_snapshot_cache.end();) {
+            const auto stale =
+                iterator->second.generation != publication->generation ||
+                iterator->second.analysis_revision != publication->analysis_revision ||
+                iterator->second.overlay_revision != publication->overlay_revision ||
+                iterator->second.provider_hash != binding.provider_hash;
+            if (!stale) {
+                ++iterator;
+                continue;
+            }
+            const auto stale_key = iterator->first;
+            ++iterator;
+            erase_managed_module_snapshot_locked(state, stale_key);
+        }
+        const auto found = state.managed_module_snapshot_cache.find(key);
+        if (found != state.managed_module_snapshot_cache.end()) {
+            if (found->second.artifact_hash != artifact.artifact_hash ||
+                found->second.provider_offset != artifact.provider_offset ||
+                found->second.provider_size != artifact.provider_size)
+                return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+                    ui_request_error(workspace_error_code_t::integrity_failure,
+                        "managed CLI snapshot cache identity collided",
+                        "decompiler_ui.entity.capture.cli.snapshot"));
+            found->second.touch = ++state.managed_capture_clock;
+            return workspace_result_t<managed_cli::immutable_module_snapshot_t>::success(
+                found->second.snapshot);
+        }
+        if (state.managed_module_snapshot_inflight.find(key) !=
+            state.managed_module_snapshot_inflight.end()) {
+            state.managed_capture_condition.wait_for(
+                lock, std::chrono::milliseconds(10));
+            continue;
+        }
+        const auto maximum_bytes = state.config.max_managed_capture_bytes;
+        const auto entry_limit = state.config.max_managed_capture_cache_entries;
+        if (artifact.provider_size == 0 ||
+            artifact.provider_size > maximum_bytes ||
+            artifact.provider_size > managed_cli::k_managed_cli_maximum_module_bytes)
+            return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+                ui_request_error(workspace_error_code_t::limit_exceeded,
+                    "managed CLI artifact exceeds the immutable snapshot budget",
+                    "decompiler_ui.entity.capture.cli.snapshot"));
+        const auto has_capacity = [&]() {
+            const auto entry_count = state.managed_module_snapshot_cache.size() +
+                state.managed_module_snapshot_inflight.size();
+            const auto used_bytes = state.managed_capture_cache_bytes +
+                state.managed_module_snapshot_cache_bytes +
+                state.managed_module_snapshot_reserved_bytes;
+            return entry_count < entry_limit && used_bytes <= maximum_bytes &&
+                artifact.provider_size <= maximum_bytes - used_bytes;
+        };
+        while (!has_capacity()) {
+            bool evicted = false;
+            if (state.managed_module_snapshot_cache.size() +
+                    state.managed_module_snapshot_inflight.size() >= entry_limit)
+                evicted = erase_oldest_managed_module_snapshot_locked(state);
+            if (!evicted && state.managed_capture_cache_bytes != 0)
+                evicted = erase_oldest_managed_capture_locked(state);
+            if (!evicted)
+                evicted = erase_oldest_managed_module_snapshot_locked(state);
+            if (evicted)
+                continue;
+            if (!state.managed_module_snapshot_inflight.empty()) {
+                state.managed_capture_condition.wait_for(
+                    lock, std::chrono::milliseconds(10));
+                if (cancel.stop_requested())
+                    break;
+                continue;
+            }
+            return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+                ui_request_error(workspace_error_code_t::limit_exceeded,
+                    "managed CLI snapshot cache cannot satisfy its memory budget",
+                    "decompiler_ui.entity.capture.cli.snapshot"));
+        }
+        if (cancel.stop_requested())
+            continue;
+        state.managed_module_snapshot_inflight.emplace(key, artifact.provider_size);
+        state.managed_module_snapshot_reserved_bytes += artifact.provider_size;
+        reservation_epoch = state.managed_cache_epoch;
+        break;
+    }
+
+    const auto release_reservation = [&]() {
+        std::lock_guard lock(state.managed_capture_mutex);
+        const auto inflight = state.managed_module_snapshot_inflight.find(key);
+        if (inflight != state.managed_module_snapshot_inflight.end()) {
+            state.managed_module_snapshot_reserved_bytes -= inflight->second;
+            state.managed_module_snapshot_inflight.erase(inflight);
+        }
+        state.managed_capture_condition.notify_all();
+    };
+
+    auto captured = capture_managed_artifact_snapshot(
+        *publication, binding, artifact.provider_size, cancel);
+    if (!captured) {
+        release_reservation();
+        return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+            captured.error());
+    }
+    workspace_result_t<managed_cli::immutable_module_snapshot_t> snapshot =
+        workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "managed CLI snapshot allocation failed",
+                "decompiler_ui.entity.capture.cli.snapshot"));
+    try {
+        auto captured_bytes = captured.take_value();
+        std::vector<std::uint8_t> bytes(
+            captured_bytes->begin(), captured_bytes->end());
+        captured_bytes.reset();
+        snapshot = managed_cli::make_immutable_module_snapshot(
+            std::move(bytes), cancel);
+    } catch (const std::bad_alloc&) {
+        release_reservation();
+        return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "managed CLI snapshot allocation failed",
+                "decompiler_ui.entity.capture.cli.snapshot"));
+    }
+    if (!snapshot) {
+        release_reservation();
+        return snapshot;
+    }
+    if (snapshot.value().hash != artifact.artifact_hash) {
+        release_reservation();
+        return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "managed CLI snapshot hash changed during capture",
+                "decompiler_ui.entity.capture.cli.snapshot"));
+    }
+
+    std::unique_lock lock(state.managed_capture_mutex);
+    const auto inflight = state.managed_module_snapshot_inflight.find(key);
+    if (inflight != state.managed_module_snapshot_inflight.end()) {
+        state.managed_module_snapshot_reserved_bytes -= inflight->second;
+        state.managed_module_snapshot_inflight.erase(inflight);
+    }
+    if (state.managed_cache_epoch != reservation_epoch ||
+        state.workspace->analysis_publication() != publication) {
+        lock.unlock();
+        state.managed_capture_condition.notify_all();
+        return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+            ui_request_error(workspace_error_code_t::target_stale,
+                "workspace changed during managed CLI snapshot capture",
+                "decompiler_ui.entity.capture.cli.snapshot"));
+    }
+    managed_module_snapshot_cache_entry_t entry;
+    entry.snapshot = snapshot.value();
+    entry.artifact_hash = artifact.artifact_hash;
+    entry.provider_hash = binding.provider_hash;
+    entry.provider_offset = artifact.provider_offset;
+    entry.provider_size = artifact.provider_size;
+    entry.generation = binding.generation;
+    entry.analysis_revision = binding.analysis_revision;
+    entry.overlay_revision = binding.overlay_revision;
+    entry.touch = ++state.managed_capture_clock;
+    try {
+        const auto insertion = state.managed_module_snapshot_cache.emplace(
+            key, std::move(entry));
+        if (insertion.second) {
+            state.managed_module_snapshot_cache_bytes += artifact.provider_size;
+        } else {
+            snapshot = workspace_result_t<managed_cli::immutable_module_snapshot_t>::success(
+                insertion.first->second.snapshot);
+        }
+    } catch (const std::bad_alloc&) {
+        lock.unlock();
+        state.managed_capture_condition.notify_all();
+        return workspace_result_t<managed_cli::immutable_module_snapshot_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "managed CLI snapshot cache allocation failed",
+                "decompiler_ui.entity.capture.cli.snapshot"));
+    }
+    lock.unlock();
+    state.managed_capture_condition.notify_all();
+    return snapshot;
 }
 
 bool checked_add(const std::uint64_t left, const std::uint64_t right, std::uint64_t& output) noexcept
@@ -142,6 +573,167 @@ std::string resolve_function_symbol(
             return symbol->name;
     }
     return "function_" + std::to_string(function.id);
+}
+
+decompiler_fact_provenance_t decompiler_provenance(
+    const metadata_provenance_t value) noexcept
+{
+    switch (value) {
+    case metadata_provenance_t::debug_metadata:
+        return decompiler_fact_provenance_t::debug_metadata;
+    case metadata_provenance_t::rtti:
+    case metadata_provenance_t::vtable_validation:
+        return decompiler_fact_provenance_t::rtti;
+    case metadata_provenance_t::objective_c_metadata:
+        return decompiler_fact_provenance_t::objc_metadata;
+    case metadata_provenance_t::swift_metadata:
+        return decompiler_fact_provenance_t::swift_metadata;
+    case metadata_provenance_t::managed_metadata:
+        return decompiler_fact_provenance_t::loader_metadata;
+    case metadata_provenance_t::decoded:
+    case metadata_provenance_t::relocation:
+    case metadata_provenance_t::loader_symbol:
+    case metadata_provenance_t::import_metadata:
+    case metadata_provenance_t::export_metadata:
+        return decompiler_fact_provenance_t::loader_metadata;
+    case metadata_provenance_t::unknown:
+        return decompiler_fact_provenance_t::unknown;
+    }
+    return decompiler_fact_provenance_t::unknown;
+}
+
+decompiler_type_kind_t decompiler_type_kind(
+    const symbol_type_candidate_record_t& value) noexcept
+{
+    if (value.explicitly_unknown)
+        return decompiler_type_kind_t::unknown;
+    switch (value.kind) {
+    case symbol_type_candidate_kind_t::function_prototype:
+    case symbol_type_candidate_kind_t::import_prototype:
+    case symbol_type_candidate_kind_t::managed_method:
+        return decompiler_type_kind_t::function;
+    case symbol_type_candidate_kind_t::pointer_object:
+    case symbol_type_candidate_kind_t::virtual_table:
+        return decompiler_type_kind_t::pointer;
+    case symbol_type_candidate_kind_t::rtti_type:
+    case symbol_type_candidate_kind_t::type_information:
+    case symbol_type_candidate_kind_t::objective_c_class:
+    case symbol_type_candidate_kind_t::swift_type:
+    case symbol_type_candidate_kind_t::managed_type:
+        return decompiler_type_kind_t::class_type;
+    case symbol_type_candidate_kind_t::objective_c_protocol:
+    case symbol_type_candidate_kind_t::swift_protocol:
+        return decompiler_type_kind_t::interface_type;
+    case symbol_type_candidate_kind_t::global_object:
+    case symbol_type_candidate_kind_t::managed_field:
+    case symbol_type_candidate_kind_t::debug_type:
+    case symbol_type_candidate_kind_t::metadata_region:
+    case symbol_type_candidate_kind_t::objective_c_selector:
+        return decompiler_type_kind_t::unknown;
+    }
+    return decompiler_type_kind_t::unknown;
+}
+
+decompiler_type_edge_kind_t decompiler_edge_kind(
+    const type_reference_kind_t value) noexcept
+{
+    switch (value) {
+    case type_reference_kind_t::inheritance:
+        return decompiler_type_edge_kind_t::base;
+    case type_reference_kind_t::virtual_table_slot:
+        return decompiler_type_edge_kind_t::member;
+    case type_reference_kind_t::protocol_conformance:
+        return decompiler_type_edge_kind_t::constraint;
+    case type_reference_kind_t::definition:
+    case type_reference_kind_t::metadata_reference:
+    case type_reference_kind_t::managed_reference:
+        return decompiler_type_edge_kind_t::alias;
+    }
+    return decompiler_type_edge_kind_t::alias;
+}
+
+std::optional<source_coordinate_t> type_coordinate(
+    const std::optional<address_t>& address,
+    const decompiler_entity_key_t& entity,
+    const std::uint64_t generation)
+{
+    if (!address || address->value == (std::numeric_limits<std::uint64_t>::max)())
+        return std::nullopt;
+    source_coordinate_t coordinate;
+    coordinate.layer = decompiler_coordinate_layer_t::provider_ir;
+    coordinate.workspace_generation = generation;
+    coordinate.entity = entity;
+    auto end = *address;
+    ++end.value;
+    coordinate.address_range = decompiler_address_range_t{*address, end};
+    return coordinate;
+}
+
+type_graph::type_seed_batch_t workspace_type_evidence(
+    const analysis_snapshot_t& snapshot,
+    const decompiler_entity_key_t& entity,
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans,
+    const std::uint64_t image_base)
+{
+    constexpr std::size_t maximum_candidates = 4096;
+    constexpr std::size_t maximum_references = 16384;
+    const auto in_function = [&](const std::optional<address_t>& address) {
+        if (!address)
+            return false;
+        const auto relative = relative_value(*address, image_base);
+        if (!relative)
+            return false;
+        return std::any_of(spans.begin(), spans.end(), [&](const auto& span) {
+            return *relative >= span.first && *relative < span.second;
+        });
+    };
+    type_graph::type_seed_batch_t batch;
+    batch.source = decompiler_fact_provenance_t::loader_metadata;
+    batch.source_label = "workspace_rich_type_facts";
+    std::unordered_map<entity_id_t, std::size_t> selected;
+    selected.reserve((std::min)(snapshot.rich_facts.type_candidates.size(), maximum_candidates));
+    for (const auto& source : snapshot.rich_facts.type_candidates) {
+        if (!in_function(source.address) && !in_function(source.related_address))
+            continue;
+        if (batch.candidates.size() >= maximum_candidates)
+            break;
+        type_graph::type_candidate_t candidate;
+        candidate.kind = decompiler_type_kind(source);
+        candidate.canonical_name = source.canonical_type.empty()
+            ? "unknown." + source.display_name + "." + std::to_string(source.id)
+            : source.canonical_type;
+        candidate.display_name = source.display_name;
+        candidate.confidence = source.confidence;
+        candidate.provenance = decompiler_provenance(source.provenance);
+        candidate.source_detail = source.source_key;
+        if (const auto coordinate = type_coordinate(
+                source.address ? source.address : source.related_address,
+                entity, snapshot.generation))
+            candidate.coordinate = *coordinate;
+        selected.emplace(source.id, batch.candidates.size());
+        batch.candidates.push_back(std::move(candidate));
+    }
+    std::size_t reference_count = 0;
+    for (const auto& reference : snapshot.rich_facts.type_references) {
+        if (reference_count >= maximum_references)
+            break;
+        const auto source = selected.find(reference.source_entity);
+        const auto target = selected.find(reference.target_entity);
+        if (source == selected.end() || target == selected.end() || source == target)
+            continue;
+        type_graph::type_edge_candidate_t edge;
+        edge.kind = decompiler_edge_kind(reference.kind);
+        edge.target_canonical_name = batch.candidates[target->second].canonical_name;
+        edge.stable_name = reference.source_key;
+        edge.local_ordinal = static_cast<std::uint32_t>(
+            batch.candidates[source->second].edges.size() + 1);
+        edge.confidence = reference.confidence;
+        edge.provenance = decompiler_provenance(reference.provenance);
+        edge.source_detail = reference.source_key;
+        batch.candidates[source->second].edges.push_back(std::move(edge));
+        ++reference_count;
+    }
+    return batch;
 }
 
 workspace_result_t<std::vector<std::pair<std::uint64_t, std::uint64_t>>> function_spans(
@@ -291,23 +883,6 @@ decompiler_language_identity_t native_language_identity(
     return result;
 }
 
-decompiler_provider_identity_t packaged_provider_identity(
-    const decompiler_provider_id_t provider,
-    std::string provider_name,
-    std::string worker_build_id)
-{
-    decompiler_provider_identity_t result;
-    result.provider = provider;
-    result.provider_name = std::move(provider_name);
-    result.provider_version = "1";
-    result.provider_binary_hash = stable_serialization_hash(
-        result.provider_name + "|provider|" + result.provider_version);
-    result.worker_build_id = std::move(worker_build_id);
-    result.worker_build_hash = stable_serialization_hash(
-        result.worker_build_id + "|build|" + result.provider_version);
-    return result;
-}
-
 bool publication_matches_request(
     const analysis_workspace_t& workspace,
     const decompiler_pipeline_request_t& request) noexcept
@@ -391,19 +966,53 @@ capture_native_provider_context(
                 "native decompiler function identity changed before snapshot capture",
                 "decompiler_ui.native_capture.function"));
     }
-    constexpr std::uint64_t maximum_virtual_image_bytes =
-        256ULL * 1024ULL * 1024ULL - 64ULL;
-    if (image->image_size == 0 || image->image_size > maximum_virtual_image_bytes ||
-        image->image_size > (std::numeric_limits<std::size_t>::max)()) {
+    if (image->image_size == 0) {
         return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
             ui_request_error(workspace_error_code_t::limit_exceeded,
-                "native decompiler virtual image exceeds the isolated worker snapshot limit",
+                "native decompiler image has no addressable extent",
                 "decompiler_ui.native_capture.image_limit"));
+    }
+    auto function_ranges = function_spans(
+        *publication->snapshot, *function, image->image_base, 65536);
+    if (!function_ranges)
+        return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+            function_ranges.error());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> requested_ranges;
+    requested_ranges.reserve(function_ranges.value().size() + 1);
+    requested_ranges.emplace_back(0, (std::min<std::uint64_t>)(image->image_size, 1ULL << 20));
+    requested_ranges.insert(requested_ranges.end(),
+        function_ranges.value().begin(), function_ranges.value().end());
+    std::sort(requested_ranges.begin(), requested_ranges.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged_ranges;
+    merged_ranges.reserve(requested_ranges.size());
+    for (const auto& range : requested_ranges) {
+        if (range.first >= range.second || range.second > image->image_size)
+            continue;
+        if (!merged_ranges.empty() && range.first <= merged_ranges.back().second) {
+            merged_ranges.back().second = (std::max)(merged_ranges.back().second, range.second);
+        } else {
+            merged_ranges.push_back(range);
+        }
+    }
+    constexpr std::uint64_t absolute_snapshot_limit = 192ULL << 20;
+    const auto profile_snapshot_limit = request.cache_key.profile.max_memory_bytes / 2;
+    const auto snapshot_limit = (std::min)(absolute_snapshot_limit, profile_snapshot_limit);
+    std::uint64_t requested_bytes = 0;
+    for (const auto& range : merged_ranges) {
+        const auto size = range.second - range.first;
+        if (!checked_add(requested_bytes, size, requested_bytes) || requested_bytes > snapshot_limit) {
+            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                ui_request_error(workspace_error_code_t::limit_exceeded,
+                    "native decompiler function snapshot exceeds its profile memory bound",
+                    "decompiler_ui.native_capture.image_limit"));
+        }
     }
     native_worker::native_provider_snapshot_t snapshot;
     snapshot.image_base = image->image_base;
-    snapshot.virtual_image.resize(static_cast<std::size_t>(image->image_size), 0);
-    for (const auto& range : load_image.value()->mapped_ranges()) {
+    snapshot.image_size = image->image_size;
+    snapshot.ranges.reserve(merged_ranges.size());
+    constexpr std::uint64_t read_quantum = 4ULL << 20;
+    for (const auto& range : merged_ranges) {
         if (cancel.stop_requested() || std::chrono::steady_clock::now() >= request.deadline) {
             return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
                 ui_request_error(cancel.deadline_exceeded() ||
@@ -413,25 +1022,37 @@ capture_native_provider_context(
                     "native decompiler snapshot capture was cancelled",
                     "decompiler_ui.native_capture.read"));
         }
-        const auto rva = relative_value(range.start, image->image_base);
-        if (!rva || *rva > image->image_size || range.size > image->image_size - *rva) {
-            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                ui_request_error(workspace_error_code_t::integrity_failure,
-                    "native decompiler mapped range is outside the normalized image",
-                    "decompiler_ui.native_capture.mapping"));
+        native_worker::native_provider_snapshot_range_t captured;
+        captured.relative_virtual_address = range.first;
+        captured.bytes.reserve(static_cast<std::size_t>(range.second - range.first));
+        for (auto cursor = range.first; cursor < range.second;) {
+            if (cancel.stop_requested() || std::chrono::steady_clock::now() >= request.deadline) {
+                return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                    ui_request_error(cancel.deadline_exceeded() ||
+                            std::chrono::steady_clock::now() >= request.deadline
+                            ? workspace_error_code_t::deadline_exceeded
+                            : workspace_error_code_t::cancelled,
+                        "native decompiler snapshot capture was cancelled",
+                        "decompiler_ui.native_capture.read"));
+            }
+            const auto amount = (std::min)(read_quantum, range.second - cursor);
+            address_t start{address_space_id_t::relative_virtual, cursor,
+                image->architecture, image->architecture_mode};
+            auto read = load_image.value()->read(start, amount, cancel);
+            if (!read)
+                return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                    read.error());
+            if (read.value().bytes.size() != amount) {
+                return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
+                    ui_request_error(workspace_error_code_t::integrity_failure,
+                        "native decompiler range snapshot is truncated",
+                        "decompiler_ui.native_capture.read"));
+            }
+            captured.bytes.insert(captured.bytes.end(),
+                read.value().bytes.begin(), read.value().bytes.end());
+            cursor += amount;
         }
-        auto read = load_image.value()->read(range.start, range.size, cancel);
-        if (!read)
-            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                read.error());
-        if (read.value().bytes.size() != range.size) {
-            return workspace_result_t<std::shared_ptr<const decompiler_provider_context_t>>::failure(
-                ui_request_error(workspace_error_code_t::integrity_failure,
-                    "native decompiler mapped range snapshot is truncated",
-                    "decompiler_ui.native_capture.read"));
-        }
-        std::copy(read.value().bytes.begin(), read.value().bytes.end(),
-            snapshot.virtual_image.begin() + static_cast<std::size_t>(*rva));
+        snapshot.ranges.push_back(std::move(captured));
     }
     const auto serialized = native_worker::serialize_native_provider_snapshot(snapshot);
     if (serialized.empty()) {
@@ -536,6 +1157,87 @@ bool result_has_complete_source_map(const decompiler_pipeline_result_t& result) 
     return expected == document.rendered_text.size();
 }
 
+workspace_result_t<decompiler_pipeline_request_t> build_managed_pipeline_request(
+    const analysis_workspace_t& workspace,
+    decompiler_entity_key_t entity,
+    decompiler_language_identity_t language,
+    std::shared_ptr<const decompiler_provider_context_t> context,
+    std::string registration_id,
+    const decompiler_ui_invocation_source_t source,
+    const decompiler_profile_id_t profile,
+    std::optional<decompiler_profile_budget_t> budget,
+    const decompiler_pipeline_cache_mode_t cache_mode,
+    const sha256_digest_t& worker_protocol_hash,
+    const sha256_digest_t& artifact_hash,
+    const std::uint64_t type_graph_revision,
+    std::vector<decompiler_dependency_version_t> dependencies,
+    const cancellation_token_t& cancel)
+{
+    if (source == decompiler_ui_invocation_source_t::baseline_hook || !context ||
+        registration_id.empty() || worker_protocol_hash.empty() || artifact_hash.empty() ||
+        type_graph_revision == 0 || dependencies.empty() ||
+        !validate_decompiler_entity_key(entity).valid()) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "managed decompiler request violates the explicit typed contract",
+                "decompiler_ui.managed.identity"));
+    }
+    if (cancel.stop_requested()) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(cancel.deadline_exceeded()
+                    ? workspace_error_code_t::deadline_exceeded
+                    : workspace_error_code_t::cancelled,
+                "managed decompiler request was cancelled before capture",
+                "decompiler_ui.managed.cancel"));
+    }
+    const auto publication = workspace.analysis_publication();
+    if (!publication || !publication->coherent_with(workspace.identity()) ||
+        !publication->snapshot || publication->generation == 0 ||
+        publication->analysis_revision == 0 || publication->load_profile_hash.empty()) {
+        return workspace_result_t<decompiler_pipeline_request_t>::failure(
+            ui_request_error(workspace_error_code_t::analysis_in_progress,
+                "managed decompiler requires a coherent analyzed workspace revision",
+                "decompiler_ui.managed.revision"));
+    }
+    std::sort(dependencies.begin(), dependencies.end(),
+        [](const decompiler_dependency_version_t& left,
+           const decompiler_dependency_version_t& right) {
+            return left.name < right.name;
+        });
+    for (std::size_t index = 0; index < dependencies.size(); ++index) {
+        if (dependencies[index].name.empty() || dependencies[index].version.empty() ||
+            dependencies[index].content_hash.empty() ||
+            (index != 0 && dependencies[index - 1].name == dependencies[index].name)) {
+            return workspace_result_t<decompiler_pipeline_request_t>::failure(
+                ui_request_error(workspace_error_code_t::invalid_argument,
+                    "managed decompiler dependency identity is invalid",
+                    "decompiler_ui.managed.dependencies"));
+        }
+    }
+
+    decompiler_pipeline_request_t request;
+    request.invocation = decompiler_ui_integration_t::map_invocation_source(source);
+    request.cache_mode = cache_mode;
+    request.workspace_id = workspace.identity().binary_id().to_hex();
+    request.workspace_generation = publication->generation;
+    request.analysis_revision = publication->analysis_revision;
+    request.entity = std::move(entity);
+    request.language = std::move(language);
+    request.profile = profile;
+    request.budget = std::move(budget);
+    request.provider_registration_id = std::move(registration_id);
+    request.provider_context = std::move(context);
+    request.cache_identity.worker_protocol_hash = worker_protocol_hash;
+    request.cache_identity.loader_layout_hash = publication->load_profile_hash;
+    request.cache_identity.function_bytes_hash = artifact_hash;
+    request.cache_identity.metadata_revision = publication->analysis_revision;
+    request.cache_identity.type_graph_revision = type_graph_revision;
+    request.cache_identity.overlay_revision = publication->snapshot->overlay_revision;
+    request.cache_identity.dependencies = std::move(dependencies);
+    request.deadline = cancel.deadline();
+    return workspace_result_t<decompiler_pipeline_request_t>::success(std::move(request));
+}
+
 }
 
 struct decompiler_ui_integration_t::impl_t {
@@ -576,7 +1278,11 @@ decompiler_ui_integration_t::create(
                 "decompiler UI integration requires a pipeline service",
                 "decompiler_ui_integration"));
     }
-    if (config.max_function_bytes == 0 || config.max_function_chunks == 0) {
+    if (config.max_function_bytes == 0 || config.max_function_chunks == 0 ||
+        config.max_managed_capture_cache_entries == 0 ||
+        config.max_managed_capture_bytes == 0 ||
+        config.max_managed_capture_bytes > (256ULL << 20) ||
+        !config.managed_reader_limits.valid()) {
         return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                 "decompiler UI integration identity limits are invalid",
@@ -611,9 +1317,7 @@ decompiler_ui_integration_t::create_production(
         decompiler_builtin_provider_config_t builtin;
         builtin.native.identity = runtime.value().provider;
         builtin.native.isolated = true;
-        builtin.cli.identity = packaged_provider_identity(
-            decompiler_provider_id_t::ilspy_cli,
-            "aida-managed-cli", "aida-managed-cli-offline-worker-v2");
+        builtin.cli.identity = runtime.value().cli_provider;
         builtin.cli.isolated = true;
         builtin.jvm.identity = runtime.value().jvm_provider;
         builtin.jvm.isolated = true;
@@ -640,12 +1344,18 @@ decompiler_ui_integration_t::create_production(
         if (!integration)
             return integration;
         integration.value()->impl_->state.native_provider = runtime.value().provider;
+        integration.value()->impl_->state.cli_provider = runtime.value().cli_provider;
+        integration.value()->impl_->state.jvm_provider = runtime.value().jvm_provider;
+        integration.value()->impl_->state.dalvik_provider = runtime.value().dalvik_provider;
         integration.value()->impl_->state.native_worker_protocol_hash =
             runtime.value().worker_protocol_hash;
         integration.value()->impl_->state.native_manifest_hash = runtime.value().manifest_hash;
+        integration.value()->impl_->state.managed_manifest_hash =
+            runtime.value().managed_manifest_hash;
+        integration.value()->impl_->state.managed_runtime_manifest_hash =
+            runtime.value().managed_runtime_manifest_hash;
         integration.value()->impl_->state.native_worker_protocol_version =
             runtime.value().worker_protocol_version;
-        integration.value()->impl_->state.native_capture_mutex = std::make_shared<std::mutex>();
         return integration;
     } catch (const std::bad_alloc&) {
         return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
@@ -658,6 +1368,61 @@ decompiler_ui_integration_t::create_production(
                 "production decompiler integration initialization failed",
                 "decompiler_ui.production"));
     }
+}
+
+workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>
+decompiler_ui_integration_t::production_for_workspace(
+    std::shared_ptr<analysis_workspace_t> workspace)
+{
+    if (!workspace) {
+        return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "production decompiler integration requires a workspace",
+                "decompiler_ui.production_cache"));
+    }
+    const auto* key = workspace.get();
+    {
+        std::lock_guard lock(production_cache_mutex);
+        const auto found = production_cache.find(key);
+        if (found != production_cache.end() && found->second.workspace == workspace &&
+            found->second.integration) {
+            found->second.touch = ++production_cache_clock;
+            return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::success(
+                found->second.integration);
+        }
+    }
+    auto created = create_production(workspace);
+    if (!created)
+        return created;
+    std::shared_ptr<decompiler_ui_integration_t> evicted;
+    {
+        std::lock_guard lock(production_cache_mutex);
+        const auto found = production_cache.find(key);
+        if (found != production_cache.end() && found->second.workspace == workspace &&
+            found->second.integration) {
+            found->second.touch = ++production_cache_clock;
+            return workspace_result_t<std::shared_ptr<decompiler_ui_integration_t>>::success(
+                found->second.integration);
+        }
+        if (production_cache.size() >= maximum_cached_production_integrations) {
+            const auto oldest = std::min_element(
+                production_cache.begin(), production_cache.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.touch < right.second.touch;
+                });
+            if (oldest != production_cache.end()) {
+                evicted = std::move(oldest->second.integration);
+                production_cache.erase(oldest);
+            }
+        }
+        production_cache_entry_t entry;
+        entry.workspace = std::move(workspace);
+        entry.integration = created.value();
+        entry.touch = ++production_cache_clock;
+        production_cache.insert_or_assign(key, std::move(entry));
+    }
+    evicted.reset();
+    return created;
 }
 
 decompiler_pipeline_invocation_t
@@ -878,6 +1643,10 @@ decompiler_ui_integration_t::build_pipeline_request(
     pipeline_request.cache_identity.type_graph_revision = request.type_graph_revision;
     pipeline_request.cache_identity.overlay_revision = snapshot->overlay_revision;
     pipeline_request.cache_identity.dependencies = std::move(dependencies);
+    auto type_evidence = workspace_type_evidence(
+        *snapshot, pipeline_request.entity, spans, image->image_base);
+    if (!type_evidence.candidates.empty())
+        pipeline_request.type_evidence.push_back(std::move(type_evidence));
     pipeline_request.deadline = request.deadline;
     return workspace_result_t<decompiler_pipeline_request_t>::success(
         std::move(pipeline_request));
@@ -900,6 +1669,10 @@ decompiler_ui_integration_t::map_pipeline_result(
     ui_result.status = result.status;
     ui_result.elapsed_ms = result.elapsed_wall_clock_ms;
     ui_result.cache_hit_stage = result.cache_hit_stage;
+    ui_result.provider = result.provider;
+    ui_result.readability = result.readability;
+    ui_result.provider_stage = result.provider_stage;
+    ui_result.normalized_stage = result.normalized_stage;
     if (result.rendered_stage) {
         const auto& document = result.rendered_stage->document;
         ui_result.document = std::shared_ptr<const decompiler_document_t>(
@@ -924,24 +1697,21 @@ decompiler_ui_integration_t::map_pipeline_result(
 }
 
 workspace_result_t<decompiler_ui_result_t>
-decompiler_ui_integration_t::decompile(
-    const decompiler_ui_request_t& request,
-    const cancellation_token_t& cancel) {
+decompiler_ui_integration_t::execute_pipeline(
+    decompiler_pipeline_request_t pipeline_request,
+    const decompiler_ui_invocation_source_t source,
+    const bool require_complete_source_map,
+    const cancellation_token_t& cancel)
+{
     if (!impl_ || !impl_->state.workspace || !impl_->state.service) {
         return workspace_result_t<decompiler_ui_result_t>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
                 "decompiler UI integration is not initialized",
-                "decompile"));
-    }
-    if (request.function_address == 0) {
-        return workspace_result_t<decompiler_ui_result_t>::failure(
-            make_workspace_error(workspace_error_code_t::invalid_argument,
-                "decompiler UI request requires a non-zero function address",
-                "decompile"));
+                "decompiler_ui.execute"));
     }
     impl_->state.request_counter.fetch_add(1, std::memory_order_acq_rel);
     impl_->increment_metric(&decompiler_ui_integration_metrics_t::total_requests);
-    switch (request.source) {
+    switch (source) {
     case decompiler_ui_invocation_source_t::keyboard_f5:
     case decompiler_ui_invocation_source_t::keyboard_shift_f5:
         impl_->increment_metric(&decompiler_ui_integration_metrics_t::f5_requests);
@@ -955,18 +1725,6 @@ decompiler_ui_integration_t::decompile(
     default:
         break;
     }
-    if (request.provider_context && request.provider_context_factory) {
-        return workspace_result_t<decompiler_ui_result_t>::failure(
-            make_workspace_error(workspace_error_code_t::invalid_argument,
-                "decompiler UI request cannot provide both a context and a context factory",
-                "decompile"));
-    }
-    auto built_request = build_pipeline_request(request, *impl_->state.workspace,
-        impl_->state.config.max_function_bytes,
-        impl_->state.config.max_function_chunks, cancel);
-    if (!built_request)
-        return workspace_result_t<decompiler_ui_result_t>::failure(built_request.error());
-    auto pipeline_request = std::move(built_request.value());
     auto pipeline_result = impl_->state.service->decompile(pipeline_request, cancel);
     if (!publication_matches_request(*impl_->state.workspace, pipeline_request)) {
         decompiler_ui_result_t ui_result;
@@ -992,12 +1750,12 @@ decompiler_ui_integration_t::decompile(
             decompiler_ui_result_t ui_result;
             ui_result.status = decompiler_pipeline_status_t::normalization_failed;
             ui_result.elapsed_ms = pipeline_result.elapsed_wall_clock_ms;
-            decompiler_ui_diagnostic_t diag;
-            diag.severity = decompiler_diagnostic_severity_t::error;
-            diag.code = decompiler_diagnostic_code_t::malformed_ast;
-            diag.message = "decompiler returned a null AST: rejected by integration policy";
-            diag.retryable = true;
-            ui_result.diagnostics.push_back(std::move(diag));
+            decompiler_ui_diagnostic_t diagnostic;
+            diagnostic.severity = decompiler_diagnostic_severity_t::error;
+            diagnostic.code = decompiler_diagnostic_code_t::malformed_ast;
+            diagnostic.message = "decompiler returned a null AST: rejected by integration policy";
+            diagnostic.retryable = true;
+            ui_result.diagnostics.push_back(std::move(diagnostic));
             return workspace_result_t<decompiler_ui_result_t>::success(std::move(ui_result));
         }
         if (impl_->state.config.reject_guessed_body && result_has_guessed_body(pipeline_result)) {
@@ -1005,25 +1763,24 @@ decompiler_ui_integration_t::decompile(
             decompiler_ui_result_t ui_result;
             ui_result.status = decompiler_pipeline_status_t::normalization_failed;
             ui_result.elapsed_ms = pipeline_result.elapsed_wall_clock_ms;
-            decompiler_ui_diagnostic_t diag;
-            diag.severity = decompiler_diagnostic_severity_t::error;
-            diag.code = decompiler_diagnostic_code_t::malformed_ast;
-            diag.message = "decompiler returned a body without typed proof: rejected by integration policy";
-            diag.retryable = true;
-            ui_result.diagnostics.push_back(std::move(diag));
+            decompiler_ui_diagnostic_t diagnostic;
+            diagnostic.severity = decompiler_diagnostic_severity_t::error;
+            diagnostic.code = decompiler_diagnostic_code_t::malformed_ast;
+            diagnostic.message = "decompiler returned a body without typed proof: rejected by integration policy";
+            diagnostic.retryable = true;
+            ui_result.diagnostics.push_back(std::move(diagnostic));
             return workspace_result_t<decompiler_ui_result_t>::success(std::move(ui_result));
         }
-        if (request.require_complete_source_map &&
-            !result_has_complete_source_map(pipeline_result)) {
+        if (require_complete_source_map && !result_has_complete_source_map(pipeline_result)) {
             decompiler_ui_result_t ui_result;
             ui_result.status = decompiler_pipeline_status_t::rendering_failed;
             ui_result.elapsed_ms = pipeline_result.elapsed_wall_clock_ms;
-            decompiler_ui_diagnostic_t diag;
-            diag.severity = decompiler_diagnostic_severity_t::error;
-            diag.code = decompiler_diagnostic_code_t::source_map_rejected;
-            diag.message = "decompiler returned an incomplete source map: rejected by request policy";
-            diag.retryable = true;
-            ui_result.diagnostics.push_back(std::move(diag));
+            decompiler_ui_diagnostic_t diagnostic;
+            diagnostic.severity = decompiler_diagnostic_severity_t::error;
+            diagnostic.code = decompiler_diagnostic_code_t::source_map_rejected;
+            diagnostic.message = "decompiler returned an incomplete source map: rejected by request policy";
+            diagnostic.retryable = true;
+            ui_result.diagnostics.push_back(std::move(diagnostic));
             return workspace_result_t<decompiler_ui_result_t>::success(std::move(ui_result));
         }
         impl_->increment_metric(&decompiler_ui_integration_metrics_t::completed);
@@ -1046,7 +1803,42 @@ decompiler_ui_integration_t::decompile(
         }
     }
     auto ui_result = map_pipeline_result(pipeline_result);
+    ui_result.language_id = pipeline_request.language.language_id;
+    ui_result.workspace_generation = pipeline_request.workspace_generation;
+    ui_result.analysis_revision = pipeline_request.analysis_revision;
+    ui_result.overlay_revision = pipeline_request.cache_identity.overlay_revision;
     return workspace_result_t<decompiler_ui_result_t>::success(std::move(ui_result));
+}
+
+workspace_result_t<decompiler_ui_result_t>
+decompiler_ui_integration_t::decompile(
+    const decompiler_ui_request_t& request,
+    const cancellation_token_t& cancel) {
+    if (!impl_ || !impl_->state.workspace || !impl_->state.service) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::integrity_failure,
+                "decompiler UI integration is not initialized",
+                "decompile"));
+    }
+    if (request.function_address == 0) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                "decompiler UI request requires a non-zero function address",
+                "decompile"));
+    }
+    if (request.provider_context && request.provider_context_factory) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                "decompiler UI request cannot provide both a context and a context factory",
+                "decompile"));
+    }
+    auto built_request = build_pipeline_request(request, *impl_->state.workspace,
+        impl_->state.config.max_function_bytes,
+        impl_->state.config.max_function_chunks, cancel);
+    if (!built_request)
+        return workspace_result_t<decompiler_ui_result_t>::failure(built_request.error());
+    return execute_pipeline(std::move(built_request.value()), request.source,
+        request.require_complete_source_map, cancel);
 }
 
 workspace_result_t<decompiler_ui_result_t>
@@ -1058,7 +1850,6 @@ decompiler_ui_integration_t::decompile_native(
     const cancellation_token_t& cancel)
 {
     if (!impl_ || !impl_->state.workspace || !impl_->state.native_provider ||
-        !impl_->state.native_capture_mutex ||
         impl_->state.native_worker_protocol_hash.empty() ||
         impl_->state.native_manifest_hash.empty() ||
         impl_->state.native_worker_protocol_version != k_decompiler_worker_protocol_version) {
@@ -1118,14 +1909,689 @@ decompiler_ui_integration_t::decompile_native(
         {"ghidra.language",
             request.language.language_version + "|" + request.language.compiler_spec_id,
             request.language.language_spec_hash}};
-    const auto capture_mutex = impl_->state.native_capture_mutex;
-    request.provider_context_factory = [workspace, capture_mutex](
+    request.provider_context_factory = [workspace](
         const decompiler_provider_request_t& provider_request,
         const cancellation_token_t& provider_cancel) {
-        std::lock_guard<std::mutex> lock(*capture_mutex);
         return capture_native_provider_context(workspace, provider_request, provider_cancel);
     };
     return decompile(request, cancel);
+}
+
+workspace_result_t<decompiler_ui_result_t>
+decompiler_ui_integration_t::decompile_cli(
+    std::shared_ptr<const managed_cli::request_t> request,
+    const decompiler_ui_invocation_source_t source,
+    const decompiler_pipeline_cache_mode_t cache_mode,
+    const cancellation_token_t& cancel)
+{
+    if (!impl_ || !impl_->state.workspace || !impl_->state.cli_provider ||
+        impl_->state.native_worker_protocol_hash.empty() ||
+        impl_->state.managed_manifest_hash.empty() ||
+        impl_->state.managed_runtime_manifest_hash.empty() ||
+        impl_->state.native_worker_protocol_version != k_decompiler_worker_protocol_version ||
+        !request || request->sequence != 1 || request->type_graph_revision == 0 ||
+        request->worker.runtime_manifest_hash !=
+            impl_->state.managed_runtime_manifest_hash ||
+        !equal_provider_identity(*impl_->state.cli_provider,
+            decompiler_provider_identity_t{
+                decompiler_provider_id_t::ilspy_cli,
+                "ICSharpCode.Decompiler",
+                request->worker.provider_version,
+                request->worker.decompiler_assembly_hash,
+                request->worker.worker_build_id,
+                request->worker.worker_build_hash})) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::provider_unavailable,
+                "production CLI decompiler runtime or request identity is unavailable",
+                "decompiler_ui.cli"));
+    }
+    const auto publication = impl_->state.workspace->analysis_publication();
+    if (!publication || !publication->snapshot ||
+        !publication->coherent_with(impl_->state.workspace->identity()) ||
+        request->workspace_generation != publication->generation ||
+        request->type_graph_revision != publication->analysis_revision) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::target_stale,
+                "CLI decompiler request is not bound to the current workspace revision",
+                "decompiler_ui.cli.revision"));
+    }
+    const auto preflight = validate_managed_cli_preflight(*request, cancel);
+    if (!preflight)
+        return workspace_result_t<decompiler_ui_result_t>::failure(preflight.error());
+    const auto* identity = std::get_if<cli_decompiler_entity_identity_t>(
+        &request->entity.identity);
+    if (!identity || identity->module_hash.empty()) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "CLI decompiler entity has no immutable module identity",
+                "decompiler_ui.cli.entity"));
+    }
+    decompiler_language_identity_t language;
+    language.language_id = "cli-il";
+    language.language_version = "ecma-335";
+    language.compiler_spec_id = "managed-cli";
+    language.language_spec_hash = stable_serialization_hash(
+        std::string("cli-il|ecma-335|") + request->worker.provider_version);
+    std::shared_ptr<const decompiler_provider_context_t> context;
+    try {
+        context = std::make_shared<managed_cli_provider_context_t>(request);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "CLI decompiler context allocation failed",
+                "decompiler_ui.cli.context"));
+    }
+    std::vector<decompiler_dependency_version_t> dependencies{
+        {"aida.managed.provider",
+            impl_->state.cli_provider->provider_version + "|" +
+                impl_->state.cli_provider->worker_build_id,
+            impl_->state.cli_provider->provider_binary_hash},
+        {"aida.managed.worker.manifest",
+            std::to_string(native_worker::k_managed_worker_manifest_schema_version),
+            impl_->state.managed_manifest_hash},
+        {"aida.managed.worker.protocol",
+            std::to_string(impl_->state.native_worker_protocol_version),
+            impl_->state.native_worker_protocol_hash},
+        {"aida.managed.runtime", "net10.0|Microsoft.NETCore.App|10.0.9|win-x64",
+            request->worker.runtime_manifest_hash}};
+    auto pipeline = build_managed_pipeline_request(
+        *impl_->state.workspace, request->entity, std::move(language), std::move(context),
+        "aida.decompiler.managed.cli", source, request->profile.profile,
+        request->profile, cache_mode, impl_->state.native_worker_protocol_hash,
+        identity->module_hash, request->type_graph_revision,
+        std::move(dependencies), cancel);
+    if (!pipeline)
+        return workspace_result_t<decompiler_ui_result_t>::failure(pipeline.error());
+    return execute_pipeline(std::move(pipeline.value()), source, true, cancel);
+}
+
+workspace_result_t<decompiler_ui_result_t>
+decompiler_ui_integration_t::decompile_jvm(
+    std::shared_ptr<const jvm_ssa::jvm_method_input_t> input,
+    const decompiler_ui_invocation_source_t source,
+    const decompiler_profile_id_t profile,
+    const decompiler_pipeline_cache_mode_t cache_mode,
+    const cancellation_token_t& cancel)
+{
+    if (!impl_ || !impl_->state.workspace || !impl_->state.jvm_provider ||
+        impl_->state.native_worker_protocol_hash.empty() ||
+        impl_->state.native_manifest_hash.empty() || !input ||
+        !equal_provider_identity(input->provider, *impl_->state.jvm_provider)) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::provider_unavailable,
+                "production JVM decompiler runtime or request identity is unavailable",
+                "decompiler_ui.jvm"));
+    }
+    const auto publication = impl_->state.workspace->analysis_publication();
+    const auto* identity = std::get_if<jvm_decompiler_entity_identity_t>(
+        &input->entity.identity);
+    if (!publication || !publication->snapshot ||
+        !publication->coherent_with(impl_->state.workspace->identity()) ||
+        input->workspace_generation != publication->generation ||
+        input->type_graph_revision != publication->analysis_revision ||
+        !identity || identity->class_artifact_hash.empty() ||
+        input->language.architecture != architecture_id_t::jvm_bytecode ||
+        input->language.mode != architecture_mode_t::jvm) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::target_stale,
+                "JVM decompiler input is not bound to the current workspace revision",
+                "decompiler_ui.jvm.revision"));
+    }
+    const auto serialized = jvm_ssa::serialize_jvm_method_input(*input);
+    if (serialized.empty()) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "JVM decompiler input failed canonical serialization",
+                "decompiler_ui.jvm.input"));
+    }
+    std::shared_ptr<const decompiler_provider_context_t> context;
+    try {
+        context = std::make_shared<jvm_ssa_provider_context_t>(input);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "JVM decompiler context allocation failed",
+                "decompiler_ui.jvm.context"));
+    }
+    std::vector<decompiler_dependency_version_t> dependencies{
+        {"aida.jvm.provider",
+            impl_->state.jvm_provider->provider_version + "|" +
+                impl_->state.jvm_provider->worker_build_id,
+            impl_->state.jvm_provider->provider_binary_hash},
+        {"aida.native.worker.manifest",
+            std::to_string(native_worker::k_native_worker_manifest_schema_version),
+            impl_->state.native_manifest_hash},
+        {"aida.native.worker.protocol",
+            std::to_string(impl_->state.native_worker_protocol_version),
+            impl_->state.native_worker_protocol_hash},
+        {"jvm.language",
+            input->language.language_version + "|" + input->language.compiler_spec_id,
+            input->language.language_spec_hash}};
+    auto pipeline = build_managed_pipeline_request(
+        *impl_->state.workspace, input->entity, input->language, std::move(context),
+        "aida.decompiler.jvm.ssa", source, profile, {}, cache_mode,
+        impl_->state.native_worker_protocol_hash, identity->class_artifact_hash,
+        input->type_graph_revision, std::move(dependencies), cancel);
+    if (!pipeline)
+        return workspace_result_t<decompiler_ui_result_t>::failure(pipeline.error());
+    return execute_pipeline(std::move(pipeline.value()), source, true, cancel);
+}
+
+workspace_result_t<decompiler_ui_result_t>
+decompiler_ui_integration_t::decompile_dalvik(
+    std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t> capture,
+    const decompiler_ui_invocation_source_t source,
+    const decompiler_profile_id_t profile,
+    const decompiler_pipeline_cache_mode_t cache_mode,
+    const cancellation_token_t& cancel)
+{
+    if (!impl_ || !impl_->state.workspace || !impl_->state.dalvik_provider ||
+        impl_->state.native_worker_protocol_hash.empty() ||
+        impl_->state.native_manifest_hash.empty() || !capture ||
+        !equal_provider_identity(capture->request.provider,
+            *impl_->state.dalvik_provider)) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::provider_unavailable,
+                "production Dalvik decompiler runtime or request identity is unavailable",
+                "decompiler_ui.dalvik"));
+    }
+    const auto publication = impl_->state.workspace->analysis_publication();
+    const auto* identity = std::get_if<dalvik_decompiler_entity_identity_t>(
+        &capture->request.entity.identity);
+    if (!publication || !publication->snapshot ||
+        !publication->coherent_with(impl_->state.workspace->identity()) ||
+        capture->request.workspace_generation != publication->generation ||
+        capture->request.type_graph_revision != publication->analysis_revision ||
+        !identity || identity->dex_hash.empty() ||
+        capture->request.language.architecture != architecture_id_t::dalvik_bytecode ||
+        capture->request.language.mode != architecture_mode_t::dalvik) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::target_stale,
+                "Dalvik decompiler capture is not bound to the current workspace revision",
+                "decompiler_ui.dalvik.revision"));
+    }
+    const auto serialized = dalvik_ssa::serialize_capture(*capture);
+    if (serialized.empty()) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::invalid_argument,
+                "Dalvik decompiler capture failed canonical serialization",
+                "decompiler_ui.dalvik.input"));
+    }
+    std::shared_ptr<const decompiler_provider_context_t> context;
+    try {
+        context = std::make_shared<dalvik_ssa_provider_context_t>(capture);
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "Dalvik decompiler context allocation failed",
+                "decompiler_ui.dalvik.context"));
+    }
+    std::vector<decompiler_dependency_version_t> dependencies{
+        {"aida.dalvik.provider",
+            impl_->state.dalvik_provider->provider_version + "|" +
+                impl_->state.dalvik_provider->worker_build_id,
+            impl_->state.dalvik_provider->provider_binary_hash},
+        {"aida.native.worker.manifest",
+            std::to_string(native_worker::k_native_worker_manifest_schema_version),
+            impl_->state.native_manifest_hash},
+        {"aida.native.worker.protocol",
+            std::to_string(impl_->state.native_worker_protocol_version),
+            impl_->state.native_worker_protocol_hash},
+        {"dalvik.language",
+            capture->request.language.language_version + "|" +
+                capture->request.language.compiler_spec_id,
+            capture->request.language.language_spec_hash}};
+    auto pipeline = build_managed_pipeline_request(
+        *impl_->state.workspace, capture->request.entity, capture->request.language,
+        std::move(context), "aida.decompiler.dalvik.ssa", source, profile, {},
+        cache_mode, impl_->state.native_worker_protocol_hash, identity->dex_hash,
+        capture->request.type_graph_revision, std::move(dependencies), cancel);
+    if (!pipeline)
+        return workspace_result_t<decompiler_ui_result_t>::failure(pipeline.error());
+    return execute_pipeline(std::move(pipeline.value()), source, true, cancel);
+}
+
+workspace_result_t<generation_bound_decompiler_entity_t>
+decompiler_ui_integration_t::resolve_entity_at(
+    const decompiler_entity_locator_t& locator,
+    const cancellation_token_t& cancel) {
+    if (!impl_ || !impl_->state.workspace)
+        return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "decompiler entity producer is not initialized",
+                "decompiler_ui.entity.resolve"));
+    const auto workspace = impl_->state.workspace;
+    if (workspace->target_kind() != target_kind_t::static_file &&
+        (locator.token || (locator.expected_kind &&
+            *locator.expected_kind !=
+                decompiler_entity_kind_t::native_function)))
+        return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+            ui_request_error(
+                workspace_error_code_t::live_target_bulk_analysis_unsupported,
+                "managed entity resolution is unavailable for live workspaces",
+                "decompiler_ui.entity.resolve"));
+    for (std::uint32_t attempt = 0; attempt != 2; ++attempt) {
+        if (cancel.stop_requested())
+            return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                ui_request_error(cancel.deadline_exceeded()
+                        ? workspace_error_code_t::deadline_exceeded
+                        : workspace_error_code_t::cancelled,
+                    "decompiler entity resolution was cancelled",
+                    "decompiler_ui.entity.resolve"));
+        auto publication = workspace->analysis_publication();
+        if (!publication || !publication->snapshot || !publication->provider)
+            return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                ui_request_error(workspace_error_code_t::target_stale,
+                    "workspace publication is unavailable",
+                    "decompiler_ui.entity.resolve"));
+        const auto format = workspace->identity().format();
+        const bool managed_candidate =
+            format == format_id_t::pe32 || format == format_id_t::pe32_plus ||
+            format == format_id_t::classfile || format == format_id_t::dex ||
+            format == format_id_t::oat || format == format_id_t::vdex;
+        if (!publication->managed_artifacts && managed_candidate &&
+            workspace->target_kind() == target_kind_t::static_file) {
+            const auto target_revision = publication->analysis_revision == 0
+                ? 1ULL : publication->analysis_revision;
+            auto admitted = build_managed_artifact_publication(
+                workspace->identity(), *publication->provider,
+                publication->snapshot->image, publication->generation,
+                target_revision, publication->overlay_revision,
+                impl_->state.config.managed_reader_limits, cancel);
+            if (!admitted) {
+                impl_->increment_metric(
+                    &decompiler_ui_integration_metrics_t::entity_resolution_failures);
+                return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                    admitted.error());
+            }
+            if (admitted.value()) {
+                auto published = workspace->publish_managed_artifacts(
+                    publication->generation, publication->analysis_revision,
+                    admitted.take_value(), true);
+                if (!published) {
+                    if (published.error().code == workspace_error_code_t::revision_conflict ||
+                        published.error().code == workspace_error_code_t::stale_generation)
+                        continue;
+                    impl_->increment_metric(
+                        &decompiler_ui_integration_metrics_t::entity_resolution_failures);
+                    return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                        published.error());
+                }
+                publication = workspace->analysis_publication();
+                if (!publication)
+                    continue;
+            }
+        }
+        auto resolved = resolve_generation_bound_entity(
+            workspace->identity(), *publication, locator, cancel);
+        if (!resolved) {
+            impl_->increment_metric(
+                &decompiler_ui_integration_metrics_t::entity_resolution_failures);
+            return resolved;
+        }
+        auto binding = resolved.take_value();
+        if (binding.entity.kind == decompiler_entity_kind_t::native_function) {
+            if (!impl_->state.native_provider ||
+                impl_->state.native_worker_protocol_hash.empty() ||
+                !publication->snapshot->normalized_image)
+                return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                    ui_request_error(workspace_error_code_t::provider_unavailable,
+                        "native entity identity runtime is unavailable",
+                        "decompiler_ui.entity.resolve.native"));
+            const auto* native = std::get_if<native_decompiler_entity_identity_t>(
+                &binding.entity.identity);
+            if (!native)
+                return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                    ui_request_error(workspace_error_code_t::integrity_failure,
+                        "native entity identity is invalid",
+                        "decompiler_ui.entity.resolve.native"));
+            auto language = ghidra_adapter::resolve_ghidra_language(
+                *publication->snapshot->normalized_image, cancel);
+            if (!language)
+                return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                    language.error());
+            std::uint64_t address = native->entry.value;
+            if (native->entry.space == address_space_id_t::relative_virtual) {
+                if (!checked_add(
+                        publication->snapshot->normalized_image->image_base,
+                        native->entry.value, address))
+                    return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                        ui_request_error(workspace_error_code_t::range_overflow,
+                            "native entity address overflowed",
+                            "decompiler_ui.entity.resolve.native"));
+            }
+            decompiler_ui_request_t identity_request;
+            identity_request.source = decompiler_ui_invocation_source_t::api_call;
+            identity_request.function_address = address;
+            identity_request.language = native_language_identity(
+                language.value(), *publication->snapshot->normalized_image);
+            identity_request.worker_protocol_hash =
+                impl_->state.native_worker_protocol_hash;
+            identity_request.metadata_revision = publication->analysis_revision;
+            identity_request.type_graph_revision = publication->analysis_revision;
+            auto identity = build_pipeline_request(
+                identity_request, *workspace,
+                impl_->state.config.max_function_bytes,
+                impl_->state.config.max_function_chunks, cancel);
+            if (!identity)
+                return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                    identity.error());
+            binding.entity = identity.value().entity;
+            const auto* complete_native =
+                std::get_if<native_decompiler_entity_identity_t>(
+                    &binding.entity.identity);
+            if (!complete_native)
+                return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                    ui_request_error(workspace_error_code_t::integrity_failure,
+                        "native entity identity construction failed",
+                        "decompiler_ui.entity.resolve.native"));
+            binding.artifact_hash = complete_native->function_bytes_hash;
+        }
+        auto current = workspace->analysis_publication();
+        if (current != publication)
+            continue;
+        auto validated = validate_generation_bound_entity(
+            workspace->identity(), *current, binding, cancel);
+        if (!validated) {
+            impl_->increment_metric(
+                &decompiler_ui_integration_metrics_t::entity_resolution_failures);
+            return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+                validated.error());
+        }
+        impl_->increment_metric(
+            &decompiler_ui_integration_metrics_t::entity_resolutions);
+        return workspace_result_t<generation_bound_decompiler_entity_t>::success(
+            std::move(binding));
+    }
+    impl_->increment_metric(
+        &decompiler_ui_integration_metrics_t::entity_resolution_failures);
+    return workspace_result_t<generation_bound_decompiler_entity_t>::failure(
+        ui_request_error(workspace_error_code_t::revision_conflict,
+            "workspace changed repeatedly during entity resolution",
+            "decompiler_ui.entity.resolve"));
+}
+
+workspace_result_t<decompiler_ui_result_t>
+decompiler_ui_integration_t::decompile_entity(
+    const generation_bound_decompiler_entity_t& binding,
+    decompiler_ui_invocation_source_t source,
+    decompiler_profile_id_t profile,
+    decompiler_pipeline_cache_mode_t cache_mode,
+    const cancellation_token_t& cancel) {
+    try {
+    if (!impl_ || !impl_->state.workspace)
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::integrity_failure,
+                "decompiler entity producer is not initialized",
+                "decompiler_ui.entity.decompile"));
+    const auto workspace = impl_->state.workspace;
+    auto publication = workspace->analysis_publication();
+    if (!publication)
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::target_stale,
+                "workspace publication is unavailable",
+                "decompiler_ui.entity.decompile"));
+    auto validation = validate_generation_bound_entity(
+        workspace->identity(), *publication, binding, cancel);
+    if (!validation)
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            validation.error());
+    workspace_result_t<decompiler_ui_result_t> result =
+        workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::unsupported_format,
+                "decompiler entity kind is unsupported",
+                "decompiler_ui.entity.decompile"));
+    if (binding.entity.kind == decompiler_entity_kind_t::native_function) {
+        const auto* native = std::get_if<native_decompiler_entity_identity_t>(
+            &binding.entity.identity);
+        if (!native || !publication->snapshot->normalized_image)
+            return workspace_result_t<decompiler_ui_result_t>::failure(
+                ui_request_error(workspace_error_code_t::integrity_failure,
+                    "native entity binding is invalid",
+                    "decompiler_ui.entity.decompile.native"));
+        std::uint64_t address = native->entry.value;
+        if (native->entry.space == address_space_id_t::relative_virtual &&
+            !checked_add(publication->snapshot->normalized_image->image_base,
+                native->entry.value, address))
+            return workspace_result_t<decompiler_ui_result_t>::failure(
+                ui_request_error(workspace_error_code_t::range_overflow,
+                    "native entity address overflowed",
+                    "decompiler_ui.entity.decompile.native"));
+        result = decompile_native(address, source, profile, cache_mode, cancel);
+    } else {
+        if (!binding.artifact_index || !publication->managed_artifacts ||
+            *binding.artifact_index >=
+                publication->managed_artifacts->artifacts().size())
+            return workspace_result_t<decompiler_ui_result_t>::failure(
+                ui_request_error(workspace_error_code_t::target_stale,
+                    "managed entity artifact is unavailable",
+                    "decompiler_ui.entity.decompile.managed"));
+        const auto& artifact = publication->managed_artifacts->artifacts()[
+            *binding.artifact_index];
+        if (artifact.provider_size > impl_->state.config.max_managed_capture_bytes)
+            return workspace_result_t<decompiler_ui_result_t>::failure(
+                ui_request_error(workspace_error_code_t::limit_exceeded,
+                    "managed entity artifact exceeds the capture budget",
+                    "decompiler_ui.entity.decompile.managed"));
+        const auto key = managed_capture_key(binding) + "|" +
+            std::to_string(static_cast<std::uint32_t>(profile));
+        std::optional<managed_capture_value_t> captured;
+        {
+            std::lock_guard lock(impl_->state.managed_capture_mutex);
+            for (auto iterator = impl_->state.managed_capture_cache.begin();
+                 iterator != impl_->state.managed_capture_cache.end();) {
+                if (iterator->second.generation != publication->generation ||
+                    iterator->second.analysis_revision !=
+                        publication->analysis_revision ||
+                    iterator->second.overlay_revision !=
+                        publication->overlay_revision ||
+                    iterator->second.provider_hash != binding.provider_hash) {
+                    impl_->state.managed_capture_cache_bytes -=
+                        iterator->second.byte_size;
+                    iterator = impl_->state.managed_capture_cache.erase(iterator);
+                }
+                else
+                    ++iterator;
+            }
+            for (auto iterator =
+                     impl_->state.managed_module_snapshot_cache.begin();
+                 iterator != impl_->state.managed_module_snapshot_cache.end();) {
+                const auto stale =
+                    iterator->second.generation != publication->generation ||
+                    iterator->second.analysis_revision !=
+                        publication->analysis_revision ||
+                    iterator->second.overlay_revision !=
+                        publication->overlay_revision ||
+                    iterator->second.provider_hash != binding.provider_hash;
+                if (!stale) {
+                    ++iterator;
+                    continue;
+                }
+                const auto stale_key = iterator->first;
+                ++iterator;
+                erase_managed_module_snapshot_locked(
+                    impl_->state, stale_key);
+            }
+            const auto found = impl_->state.managed_capture_cache.find(key);
+            if (found != impl_->state.managed_capture_cache.end()) {
+                found->second.touch = ++impl_->state.managed_capture_clock;
+                captured = found->second.value;
+            }
+        }
+        if (captured)
+            impl_->increment_metric(
+                &decompiler_ui_integration_metrics_t::managed_capture_cache_hits);
+        if (!captured) {
+            if (binding.entity.kind == decompiler_entity_kind_t::cli_method) {
+                if (!impl_->state.cli_provider ||
+                    impl_->state.managed_runtime_manifest_hash.empty())
+                    return workspace_result_t<decompiler_ui_result_t>::failure(
+                        ui_request_error(workspace_error_code_t::provider_unavailable,
+                            "verified app-local CLI runtime identity is unavailable",
+                            "decompiler_ui.entity.capture.cli"));
+                managed_cli::worker_identity_t worker;
+                worker.provider_version =
+                    impl_->state.cli_provider->provider_version;
+                worker.decompiler_assembly_hash =
+                    impl_->state.cli_provider->provider_binary_hash;
+                worker.worker_build_id =
+                    impl_->state.cli_provider->worker_build_id;
+                worker.worker_build_hash =
+                    impl_->state.cli_provider->worker_build_hash;
+                worker.runtime_manifest_hash =
+                    impl_->state.managed_runtime_manifest_hash;
+                const auto& budget = profile_budget(
+                    impl_->state.config.service_config.profiles, profile);
+                const auto request_id = "entity-" +
+                    stable_serialization_hash(binding.entity).to_hex();
+                const auto whole_mapped_file =
+                    artifact.provider_offset == 0 &&
+                    artifact.provider_size == publication->provider->size() &&
+                    !publication->provider->member_metadata() &&
+                    std::dynamic_pointer_cast<const mapped_file_provider_t>(
+                        publication->provider) != nullptr;
+                auto request = [&]() -> workspace_result_t<managed_cli::request_t> {
+                    if (whole_mapped_file)
+                        return managed_cli::make_request(
+                            1, request_id,
+                            publication->provider->identity().normalized_source,
+                            binding.entity, binding.generation,
+                            binding.type_graph_revision, budget, worker,
+                            cancel);
+                    auto snapshot = acquire_managed_cli_snapshot(
+                        impl_->state, publication, binding, artifact, cancel);
+                    if (!snapshot)
+                        return workspace_result_t<managed_cli::request_t>::failure(
+                            snapshot.error());
+                    return managed_cli::make_embedded_request(
+                        1, request_id,
+                        managed_embedded_logical_identity(*publication, artifact),
+                        snapshot.take_value(), binding.entity,
+                        binding.generation, binding.type_graph_revision,
+                        budget, worker, cancel);
+                }();
+                if (!request)
+                    return workspace_result_t<decompiler_ui_result_t>::failure(
+                        request.error());
+                captured = managed_capture_value_t{
+                    std::make_shared<const managed_cli::request_t>(
+                        request.take_value())};
+            } else if (binding.entity.kind ==
+                       decompiler_entity_kind_t::jvm_method) {
+                if (!impl_->state.jvm_provider)
+                    return workspace_result_t<decompiler_ui_result_t>::failure(
+                        ui_request_error(workspace_error_code_t::provider_unavailable,
+                            "verified JVM provider identity is unavailable",
+                            "decompiler_ui.entity.capture.jvm"));
+                auto input = capture_jvm_entity_input(
+                    *publication, binding, *impl_->state.jvm_provider, cancel);
+                if (!input)
+                    return workspace_result_t<decompiler_ui_result_t>::failure(
+                        input.error());
+                captured = managed_capture_value_t{input.take_value()};
+            } else if (binding.entity.kind ==
+                       decompiler_entity_kind_t::dalvik_method) {
+                if (!impl_->state.dalvik_provider)
+                    return workspace_result_t<decompiler_ui_result_t>::failure(
+                        ui_request_error(workspace_error_code_t::provider_unavailable,
+                            "verified Dalvik provider identity is unavailable",
+                            "decompiler_ui.entity.capture.dalvik"));
+                auto input = capture_dalvik_entity_input(
+                    *publication, binding, *impl_->state.dalvik_provider, cancel);
+                if (!input)
+                    return workspace_result_t<decompiler_ui_result_t>::failure(
+                        input.error());
+                captured = managed_capture_value_t{input.take_value()};
+            }
+            if (!captured)
+                return workspace_result_t<decompiler_ui_result_t>::failure(
+                    ui_request_error(workspace_error_code_t::unsupported_format,
+                        "managed entity kind has no capture provider",
+                        "decompiler_ui.entity.capture"));
+            if (workspace->analysis_publication() != publication)
+                return workspace_result_t<decompiler_ui_result_t>::failure(
+                    ui_request_error(workspace_error_code_t::target_stale,
+                        "workspace changed during managed entity capture",
+                        "decompiler_ui.entity.capture"));
+            {
+                std::lock_guard lock(impl_->state.managed_capture_mutex);
+                const auto capture_byte_size =
+                    binding.entity.kind == decompiler_entity_kind_t::cli_method
+                        ? 0ULL
+                        : artifact.provider_size;
+                const auto existing =
+                    impl_->state.managed_capture_cache.find(key);
+                if (existing != impl_->state.managed_capture_cache.end()) {
+                    impl_->state.managed_capture_cache_bytes -=
+                        existing->second.byte_size;
+                    impl_->state.managed_capture_cache.erase(existing);
+                }
+                const auto has_capacity = [&]() {
+                    const auto used_bytes =
+                        impl_->state.managed_capture_cache_bytes +
+                        impl_->state.managed_module_snapshot_cache_bytes +
+                        impl_->state.managed_module_snapshot_reserved_bytes;
+                    return impl_->state.managed_capture_cache.size() <
+                            impl_->state.config.max_managed_capture_cache_entries &&
+                        used_bytes <= impl_->state.config.max_managed_capture_bytes &&
+                        capture_byte_size <=
+                            impl_->state.config.max_managed_capture_bytes - used_bytes;
+                };
+                while (!has_capacity()) {
+                    if (erase_oldest_managed_capture_locked(impl_->state))
+                        continue;
+                    if (erase_oldest_managed_module_snapshot_locked(
+                            impl_->state))
+                        continue;
+                    return workspace_result_t<decompiler_ui_result_t>::failure(
+                        ui_request_error(workspace_error_code_t::limit_exceeded,
+                            "managed capture cache cannot satisfy its memory budget",
+                            "decompiler_ui.entity.capture.cache"));
+                }
+                managed_capture_cache_entry_t entry;
+                entry.value = *captured;
+                entry.generation = binding.generation;
+                entry.analysis_revision = binding.analysis_revision;
+                entry.overlay_revision = binding.overlay_revision;
+                entry.provider_hash = binding.provider_hash;
+                entry.byte_size = capture_byte_size;
+                entry.touch = ++impl_->state.managed_capture_clock;
+                impl_->state.managed_capture_cache.insert_or_assign(
+                    key, std::move(entry));
+                impl_->state.managed_capture_cache_bytes +=
+                    capture_byte_size;
+            }
+        }
+        if (const auto* request = std::get_if<
+                std::shared_ptr<const managed_cli::request_t>>(&*captured))
+            result = decompile_cli(*request, source, cache_mode, cancel);
+        else if (const auto* input = std::get_if<
+                     std::shared_ptr<const jvm_ssa::jvm_method_input_t>>(
+                         &*captured))
+            result = decompile_jvm(*input, source, profile, cache_mode, cancel);
+        else if (const auto* input = std::get_if<
+                     std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t>>(
+                         &*captured))
+            result = decompile_dalvik(*input, source, profile, cache_mode, cancel);
+    }
+    const auto after = workspace->analysis_publication();
+    if (after != publication)
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::target_stale,
+                "workspace changed during decompilation",
+                "decompiler_ui.entity.decompile"));
+    auto after_validation = validate_generation_bound_entity(
+        workspace->identity(), *after, binding, cancel);
+    if (!after_validation)
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            after_validation.error());
+    return result;
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<decompiler_ui_result_t>::failure(
+            ui_request_error(workspace_error_code_t::limit_exceeded,
+                "decompiler entity capture allocation failed",
+                "decompiler_ui.entity.decompile"));
+    }
 }
 
 workspace_result_t<void>
@@ -1136,9 +2602,20 @@ decompiler_ui_integration_t::invalidate_workspace() {
                 "decompiler UI integration is not initialized",
                 "invalidate_workspace"));
     }
-    return impl_->state.service->invalidate_workspace(
+    auto result = impl_->state.service->invalidate_workspace(
         impl_->state.workspace->identity().binary_id().to_hex(),
         impl_->state.workspace->generation());
+    {
+        std::lock_guard lock(impl_->state.managed_capture_mutex);
+        ++impl_->state.managed_cache_epoch;
+        impl_->state.managed_capture_cache.clear();
+        impl_->state.managed_module_snapshot_cache.clear();
+        impl_->state.managed_capture_cache_bytes = 0;
+        impl_->state.managed_module_snapshot_cache_bytes = 0;
+        impl_->state.managed_capture_clock = 0;
+        impl_->state.managed_capture_condition.notify_all();
+    }
+    return result;
 }
 
 decompiler_ui_integration_metrics_t

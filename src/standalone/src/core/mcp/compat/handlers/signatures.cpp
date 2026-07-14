@@ -1,4 +1,5 @@
 #include "signatures.h"
+#include "signature_operand_mask.hpp"
 
 #include "../ida_contracts_generated.hpp"
 
@@ -365,18 +366,27 @@ struct generation_result_t {
     std::string error;
 };
 
-void append_instruction_bytes(generation_result_t& result,
+bool append_instruction_bytes(generation_result_t& result,
                               const signature_instruction_t& insn,
                               std::size_t count, bool wildcard_operands) {
+    signature_operand_mask_result_t resolved_mask;
+    if (wildcard_operands) {
+        resolved_mask = build_signature_operand_mask(insn);
+        if (!resolved_mask.success || resolved_mask.stable_mask.size() != insn.bytes.size()) {
+            result.error = resolved_mask.error.empty()
+                ? "operand_mask_unavailable" : resolved_mask.error;
+            return false;
+        }
+    }
     for (std::size_t i = 0; i < count && i < insn.bytes.size(); ++i) {
         result.bytes.push_back(insn.bytes[i]);
         if (wildcard_operands) {
-            result.mask.push_back(normalize_mask_byte(
-                i < insn.stable_mask.size() ? insn.stable_mask[i] : 0x00));
+            result.mask.push_back(normalize_mask_byte(resolved_mask.stable_mask[i]));
         } else {
             result.mask.push_back(0xFF);
         }
     }
+    return true;
 }
 
 generation_result_t generate_signature_at(
@@ -410,7 +420,8 @@ generation_result_t generate_signature_at(
 
         std::size_t remaining = max_length - result.bytes.size();
         std::size_t to_copy = (std::min)(insn->bytes.size(), remaining);
-        append_instruction_bytes(result, *insn, to_copy, wildcard_operands);
+        if (!append_instruction_bytes(result, *insn, to_copy, wildcard_operands))
+            return result;
 
         if (to_copy < insn->bytes.size()) {
             break;
@@ -947,12 +958,24 @@ mcp_result_t make_signature_for_range(
                             json{{"source_queries", 3},
                                  {"range_bytes", range_size}});
                     }
+                    const auto resolved_mask = build_signature_operand_mask(*insn);
+                    if (!resolved_mask.success ||
+                        resolved_mask.stable_mask.size() != insn->bytes.size()) {
+                        result["addr"] = format_address(*start_resolved);
+                        result["signature"] = nullptr;
+                        result["format"] = format;
+                        result["error"] = resolved_mask.error.empty()
+                            ? "operand_mask_unavailable" : resolved_mask.error;
+                        return mcp_result_t::success(
+                            result.dump(), result,
+                            json{{"source_queries", 3},
+                                 {"range_bytes", range_size},
+                                 {"mask_failure", result["error"]}});
+                    }
                     for (std::size_t i = 0;
                          i < insn->bytes.size() && current < *end_resolved; ++i) {
                         std::size_t offset = static_cast<std::size_t>(current - *start_resolved);
-                        range_mask[offset] = (i < insn->stable_mask.size())
-                            ? normalize_mask_byte(insn->stable_mask[i])
-                            : 0xFF;
+                        range_mask[offset] = normalize_mask_byte(resolved_mask.stable_mask[i]);
                         ++current;
                     }
                 }

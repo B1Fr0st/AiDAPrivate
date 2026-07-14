@@ -18,6 +18,8 @@
 
 namespace aida::analysis {
 
+struct generation_bound_decompiler_entity_t;
+
 enum class overlay_operation_kind_t : std::uint8_t {
     comment = 0,
     name = 1,
@@ -60,8 +62,11 @@ static_assert(static_cast<std::uint8_t>(overlay_operation_kind_t::reanalysis) ==
 
 struct overlay_operation_t {
     overlay_operation_kind_t kind = overlay_operation_kind_t::comment;
+    overlay_target_discriminator_v9_t target_discriminator =
+        overlay_target_discriminator_v9_t::native_address;
     address_t address;
     std::optional<address_t> end;
+    std::optional<overlay_managed_entity_locator_v9_t> managed_locator;
     std::string name;
     std::string text;
     std::string type;
@@ -108,7 +113,14 @@ struct overlay_limits_t {
     std::size_t max_type_bytes = 64U << 10;
     std::size_t max_comment_bytes = 256U << 10;
     std::size_t max_idempotency_key_bytes = 256;
+    std::size_t max_managed_entity_bytes =
+        k_overlay_managed_entity_serialization_limit;
 };
+
+workspace_result_t<overlay_managed_entity_locator_v9_t>
+bind_managed_overlay_entity_v9(
+    const analysis_workspace_t& workspace,
+    const generation_bound_decompiler_entity_t& binding);
 
 struct overlay_snapshot_t {
     std::uint64_t revision = 0;

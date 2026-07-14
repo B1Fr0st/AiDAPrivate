@@ -1,4 +1,5 @@
 #include "ghidra_ir_adapter_harness.hpp"
+#include "assertion_telemetry/assertion_telemetry.hpp"
 
 #include "../../src/core/analysis/decompiler/providers/ghidra_ir_adapter.hpp"
 
@@ -28,6 +29,7 @@ constexpr std::uint16_t k_pcode_int_add = 19;
 
 void require(const bool condition, const std::string& message)
 {
+	assertion_telemetry::record_assertion(condition, message, __FILE__, __LINE__);
     if (!condition)
         throw std::runtime_error(message);
 }
@@ -215,6 +217,7 @@ int main()
         std::cout << "ghidra_ir_adapter_harness source contract satisfied\n";
         return 0;
     } catch (const std::exception& error) {
+		aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());
         std::cerr << error.what() << '\n';
         return 1;
     }

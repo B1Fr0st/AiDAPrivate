@@ -1,17 +1,16 @@
 #pragma once
 #include <string>
+#include <string_view>
 #include <atomic>
 #include <mutex>
 #include <cstdint>
 #include <cstddef>
-#include <functional>
-#include <vector>
 #include <map>
 #include <memory>
 
 #include <nlohmann/json.hpp>
 #include <optional>
-#include "../analysis/workspace/workspace_types.hpp"
+#include "registry/tool_registry.hpp"
 
 namespace aida::analysis
 {
@@ -31,87 +30,6 @@ namespace mcp_standalone
     static constexpr const char* PROTOCOL_VERSION = "2025-06-18";
     static constexpr const char* SERVER_NAME      = "aida-pro-mcp";
     static constexpr const char* SERVER_VERSION   = "1.0.0";
-
-    struct tool_result_t
-    {
-        bool        success = true;
-        std::string text;
-        json        data;
-        std::string error_code;
-        json        error_details;
-        json        meta = json::object();
-
-        static tool_result_t ok(const char* t) { return {true, std::string(t), {}, {}, {}, {}}; }
-        static tool_result_t ok(const std::string& t) { return {true, t, {}, {}, {}, {}}; }
-        static tool_result_t ok(const json& j) { return {true, j.dump(2), j, {}, {}, {}}; }
-        static tool_result_t ok(const std::string& t, const json& d) { return {true, t, d, {}, {}, {}}; }
-        static tool_result_t error(const std::string& e) { return {false, e, {}, {}, {}, {}}; }
-        static tool_result_t error(const std::string& e, const json& d) { return {false, e, d, {}, {}, {}}; }
-        static tool_result_t error(const std::string& e, const std::string& code, const json& d = json::object()) { return {false, e, d, code, d, {}}; }
-    };
-
-    struct tool_param_t
-    {
-        std::string name;
-        std::string type;
-        std::string description;
-        bool        required = false;
-    };
-
-    enum class tool_visibility_t : int
-    {
-        external_visible = 0,
-        internal_only    = 1,
-        ide_chat_only    = 2
-    };
-
-    using cancel_token_ptr_t = std::shared_ptr<std::atomic<bool>>;
-
-    cancel_token_ptr_t make_call_cancel_token(bool cancelled = false);
-    void signal_call_cancel_token(const cancel_token_ptr_t& token) noexcept;
-    std::atomic<bool>* current_cancel_token() noexcept;
-    bool current_call_cancelled() noexcept;
-    const char* current_call_diag_id() noexcept;
-    const char* current_call_request_id() noexcept;
-    const char* current_call_tool_name() noexcept;
-    std::uint64_t current_call_deadline_ms() noexcept;
-
-    class scoped_call_cancel_t
-    {
-    public:
-        scoped_call_cancel_t() = default;
-        explicit scoped_call_cancel_t(cancel_token_ptr_t token);
-        ~scoped_call_cancel_t();
-        scoped_call_cancel_t(const scoped_call_cancel_t&) = delete;
-        scoped_call_cancel_t& operator=(const scoped_call_cancel_t&) = delete;
-        scoped_call_cancel_t(scoped_call_cancel_t&& other) noexcept;
-        scoped_call_cancel_t& operator=(scoped_call_cancel_t&& other) noexcept;
-        void cancel() noexcept;
-        cancel_token_ptr_t token() const noexcept { return _token; }
-
-    private:
-        void release() noexcept;
-        cancel_token_ptr_t _token;
-        std::atomic<bool>* _previous = nullptr;
-        bool _active = false;
-    };
-
-    class scoped_call_metadata_t
-    {
-    public:
-        scoped_call_metadata_t(const std::string& diag_id, const std::string& tool_name, std::uint64_t deadline_ms);
-        scoped_call_metadata_t(const std::string& diag_id, const std::string& request_id, const std::string& tool_name, std::uint64_t deadline_ms);
-        ~scoped_call_metadata_t();
-        scoped_call_metadata_t(const scoped_call_metadata_t&) = delete;
-        scoped_call_metadata_t& operator=(const scoped_call_metadata_t&) = delete;
-
-    private:
-        std::string _prev_diag;
-        std::string _prev_request;
-        std::string _prev_tool;
-        std::uint64_t _prev_deadline = 0;
-        bool _active = false;
-    };
 
     void set_ide_lifecycle_ready(bool ready) noexcept;
     bool lifecycle_authorized(std::string* reason = nullptr);
@@ -137,46 +55,49 @@ namespace mcp_standalone
 
     json active_session_policy_debug_snapshot();
 
-    struct workspace_request_context_t
+    enum class local_request_auth_status_t : std::uint8_t
     {
-        std::shared_ptr<aida::analysis::analysis_workspace_t> workspace;
-        aida::analysis::target_kind_t kind = aida::analysis::target_kind_t::static_file;
-        aida::analysis::binary_id_t binary_id;
-        std::optional<std::uint32_t> pid;
-        std::uint64_t analysis_revision = 0;
-        std::uint64_t overlay_revision = 0;
-        std::atomic<bool>* cancellation = nullptr;
-        std::uint64_t deadline_ms = 0;
-        std::string diagnostic_id;
-        std::string request_id;
-        std::string tool_name;
-
-        bool cancellation_requested() const noexcept
-        {
-            return cancellation && cancellation->load(std::memory_order_acquire);
-        }
+        allowed = 0,
+        health_read_only,
+        invalid_remote,
+        invalid_host,
+        browser_origin_forbidden,
+        capability_missing,
+        capability_rejected,
+        run_binding_missing,
+        run_binding_rejected
     };
 
-    struct tool_def_t
+    struct local_request_auth_input_t
     {
-        std::string name;
-        std::string description;
-        std::vector<tool_param_t> params;
-        bool read_only = true;
-        std::function<tool_result_t(const json& params)> handler;
-        tool_visibility_t visibility = tool_visibility_t::external_visible;
-        std::function<tool_result_t(
-            const json& params,
-            const workspace_request_context_t& context)> workspace_handler;
-        json input_schema;
-        json output_schema;
-        json annotations;
-        bool target_independent = false;
+        std::string method;
+        std::string path;
+        std::string remote_address;
+        std::string host;
+        std::string origin;
+        std::string authorization;
+        std::string run_binding;
+        int bound_port = 0;
     };
 
-    using tool_validation_hook_t = std::function<tool_result_t(const tool_def_t&, const json&)>;
+    struct local_request_auth_result_t
+    {
+        local_request_auth_status_t status = local_request_auth_status_t::capability_rejected;
+        bool allowed = false;
+        bool capability_authenticated = false;
+    };
 
-    void set_pre_dispatch_validation_hook(tool_validation_hook_t hook);
+    local_request_auth_result_t authorize_local_request(
+        const local_request_auth_input_t& input,
+        std::string_view expected_capability,
+        std::string_view expected_run_binding) noexcept;
+
+    bool verify_local_route_capability(
+        std::string_view authorization,
+        std::string_view run_binding,
+        std::string_view origin,
+        std::string_view expected_capability,
+        std::string_view expected_run_binding) noexcept;
 
     class server_t
     {
@@ -202,7 +123,11 @@ namespace mcp_standalone
         tool_result_t call_registered_tool(const std::string& name, const json& arguments, bool external_visible_only);
         tool_result_t describe_tools(const json& params);
         void write_client_configs() const;
-        const std::vector<tool_def_t>& get_tools() const { return _tools; }
+        const std::vector<tool_def_t>& get_tools() const noexcept {
+            return _registry.tools_view();
+        }
+        tool_registry_t& registry() noexcept { return _registry; }
+        const tool_registry_t& registry() const noexcept { return _registry; }
 
     private:
         friend std::string handle_body(server_t*, const std::string&, const std::function<bool()>&);
@@ -219,18 +144,26 @@ namespace mcp_standalone
         json make_result(const json& id, const json& result);
         json make_error(const json& id, int code, const std::string& msg);
         json tool_schema(const tool_def_t& tool, bool compact) const;
-        std::vector<tool_def_t> _tools;
-        std::mutex _tools_mtx;
+        bool rotate_local_capability() noexcept;
+        void clear_local_capability() noexcept;
+        bool snapshot_local_capability(std::string& capability,
+                                       std::string& run_binding) const;
+        tool_registry_t _registry;
         std::atomic<bool> _server_done{true};
         std::atomic<bool> _running{false};
         std::atomic<bool> _stop_requested{false};
         void* _active_server = nullptr;
         std::mutex _server_mtx;
         std::atomic<std::uint32_t> _server_worker_tid{0};
+        mutable std::mutex _local_capability_mtx;
+        std::string _local_capability;
+        std::string _local_run_binding;
         int _port = 0;
     };
 
     void register_standalone_tools(server_t& server);
+    void register_c03_compatibility_tools(server_t& server);
+    void register_c03_compatibility_tools(tool_registry_t& registry);
     std::string handle_body(server_t* self, const std::string& body, const std::function<bool()>& connection_closed = {});
 
     struct target_scope_t

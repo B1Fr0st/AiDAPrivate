@@ -1,10 +1,10 @@
 {
   "version": 1,
   "dependencies": {
-    "net8.0": {
+    "net10.0": {
       "ICSharpCode.Decompiler": {
         "type": "Direct",
-        "requested": "[10.1.0.8386, )",
+        "requested": "[10.1.0.8386]",
         "resolved": "10.1.0.8386",
         "contentHash": "qqv9CICyxyZPZFhA7v/ctpQ664EOVL1vcohzpF1lqBsODHZPao1BF1bePWEKcaAoCxCpjTRO8kDL5XDpV+7kzw==",
         "dependencies": {
@@ -14,13 +14,13 @@
       },
       "System.Collections.Immutable": {
         "type": "Direct",
-        "requested": "[9.0.0, )",
+        "requested": "[9.0.0]",
         "resolved": "9.0.0",
         "contentHash": "z/Oo7nxWmZ0Y578vj8EUVrFJZ3DX6OMuUGlgeYgeeUZOFGT89XfaM8fDFMvJy6+mOIqW6ux5NdNzEnlTnQGJ7A=="
       },
       "System.Reflection.Metadata": {
         "type": "Direct",
-        "requested": "[9.0.0, )",
+        "requested": "[9.0.0]",
         "resolved": "9.0.0",
         "contentHash": "jz+Y2m/CpdPvdjCNRigiWJYKFusdkfJlxDx4V5cWX2TubAMaz5CZpODBD/P2+20SpWvmZG6J3UYjl+R2Yg7yFw==",
         "dependencies": {

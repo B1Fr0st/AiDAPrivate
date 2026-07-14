@@ -179,6 +179,7 @@ static const char* center_view_name(center_view_t v) {
     case center_view_t::graph_view: return "graph_view";
     case center_view_t::image_view: return "image_view";
     case center_view_t::test_lab: return "test_lab";
+    case center_view_t::workbench: return "workbench";
     }
     return "";
 }
@@ -1070,12 +1071,12 @@ static void test_command_palette_and_center_views(HANDLE hf, std::atomic<int>& p
         center_view_t::symbolic_view, center_view_t::taint_view, center_view_t::deobfuscation_view,
         center_view_t::stealth_view, center_view_t::scan_hub, center_view_t::types_hub,
         center_view_t::analysis_hub, center_view_t::binary_map, center_view_t::graph_view,
-        center_view_t::image_view, center_view_t::test_lab
+        center_view_t::image_view, center_view_t::test_lab, center_view_t::workbench
     };
 
     check_accum_t ck;
-    ck.require(static_cast<int>(center_view_t::test_lab) + 1 == static_cast<int>(std::size(views)), "center_view enum contiguous count");
-    ck.require(std::size(views) == 29, "center_view inventory count");
+    ck.require(static_cast<int>(center_view_t::workbench) + 1 == static_cast<int>(std::size(views)), "center_view enum contiguous count");
+    ck.require(std::size(views) == 30, "center_view inventory count");
 
     bool all_roundtrip = true;
     for (center_view_t v : views) {

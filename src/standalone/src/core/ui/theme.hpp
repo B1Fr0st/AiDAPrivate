@@ -5,6 +5,7 @@
 #include "motion.hpp"
 #include "clock.hpp"
 #include "transition.hpp"
+#include "metrics.hpp"
 #include <cstdint>
 #include <string>
 #include <atomic>
@@ -85,14 +86,14 @@ namespace aida::ui {
 
 	struct shell_metrics_t {
 		float scale = 1.f;
-		float pad = 6.f;
+		float pad = 8.f;
 		float gap = 4.f;
-		float title_h = 38.f;
-		float menu_h = 34.f;
+		float title_h = 40.f;
+		float menu_h = 32.f;
 		float splitter_w = 5.f;
-		float corner_radius = 8.f;
+		float corner_radius = 6.f;
 		float panel_radius = 6.f;
-		float control_radius = 6.f;
+		float control_radius = 4.f;
 		float title_logo = 22.f;
 		float title_control = 28.f;
 		float title_font = 16.f;
@@ -100,11 +101,11 @@ namespace aida::ui {
 		float menu_font = 17.f;
 		float menu_pad_x = 12.f;
 		float menu_item_pad_x = 12.f;
-		float activity_bar_w = 56.f;
-		float activity_icon = 36.f;
-		float activity_footer_h = 52.f;
-		float bottom_tab_h = 30.f;
-		float bottom_action_h = 26.f;
+		float activity_bar_w = 52.f;
+		float activity_icon = 32.f;
+		float activity_footer_h = 48.f;
+		float bottom_tab_h = 28.f;
+		float bottom_action_h = 28.f;
 		float min_panel_w = 96.f;
 	};
 
@@ -112,14 +113,14 @@ namespace aida::ui {
 		const float s = ui_scale_for_dpi(dpi_scale);
 		shell_metrics_t m;
 		m.scale = s;
-		m.pad = scale_px(6.f, s);
+		m.pad = scale_px(8.f, s);
 		m.gap = scale_px(4.f, s);
-		m.title_h = scale_px(38.f, s);
-		m.menu_h = scale_px(34.f, s);
+		m.title_h = scale_px(40.f, s);
+		m.menu_h = scale_px(32.f, s);
 		m.splitter_w = scale_px(5.f, s);
-		m.corner_radius = scale_px(8.f, s);
+		m.corner_radius = scale_px(6.f, s);
 		m.panel_radius = scale_px(6.f, s);
-		m.control_radius = scale_px(6.f, s);
+		m.control_radius = scale_px(4.f, s);
 		m.title_logo = scale_px(22.f, s);
 		m.title_control = scale_px(28.f, s);
 		m.title_font = scale_px(16.f, s);
@@ -127,11 +128,11 @@ namespace aida::ui {
 		m.menu_font = scale_px(17.f, s);
 		m.menu_pad_x = scale_px(12.f, s);
 		m.menu_item_pad_x = scale_px(12.f, s);
-		m.activity_bar_w = scale_px(56.f, s);
-		m.activity_icon = scale_px(36.f, s);
-		m.activity_footer_h = scale_px(52.f, s);
-		m.bottom_tab_h = scale_px(30.f, s);
-		m.bottom_action_h = scale_px(26.f, s);
+		m.activity_bar_w = scale_px(52.f, s);
+		m.activity_icon = scale_px(32.f, s);
+		m.activity_footer_h = scale_px(48.f, s);
+		m.bottom_tab_h = scale_px(28.f, s);
+		m.bottom_action_h = scale_px(28.f, s);
 		m.min_panel_w = scale_px(96.f, s);
 		return m;
 	}
@@ -145,58 +146,58 @@ namespace aida::ui {
 			t.name = "AiDA Dark";
 			t.is_dark = true;
 
-			t.bg_base       = IM_COL32(10, 14, 26, 255);
-			t.bg_elevated   = IM_COL32(16, 22, 40, 255);
-			t.bg_overlay    = IM_COL32(24, 32, 56, 255);
-			t.panel_bg      = IM_COL32(15, 21, 38, 214);
-			t.panel_header  = IM_COL32(26, 35, 60, 232);
-			t.glass_tint    = IM_COL32(22, 40, 86, 64);
-			t.title_bar     = IM_COL32(12, 17, 31, 232);
-			t.acrylic_color = (uint32_t)((10) | (17 << 8) | (44 << 16) | (0x7A << 24));
+			t.bg_base       = IM_COL32(10, 12, 16, 255);
+			t.bg_elevated   = IM_COL32(14, 17, 22, 255);
+			t.bg_overlay    = IM_COL32(21, 25, 32, 255);
+			t.panel_bg      = IM_COL32(16, 19, 25, 255);
+			t.panel_header  = IM_COL32(21, 25, 32, 255);
+			t.glass_tint    = IM_COL32(31, 45, 68, 48);
+			t.title_bar     = IM_COL32(12, 15, 20, 255);
+			t.acrylic_color = (uint32_t)((10) | (12 << 8) | (16 << 16) | (0xF2 << 24));
 
-			t.border_subtle = IM_COL32(138, 170, 255, 16);
-			t.border_strong = IM_COL32(138, 170, 255, 40);
-			t.border_focus  = IM_COL32(56, 134, 240, 205);
+			t.border_subtle = IM_COL32(86, 101, 124, 92);
+			t.border_strong = IM_COL32(107, 124, 151, 142);
+			t.border_focus  = IM_COL32(69, 139, 232, 235);
 
-			t.text_primary   = IM_COL32(226, 234, 250, 242);
-			t.text_secondary = IM_COL32(158, 174, 206, 206);
-			t.text_dim       = IM_COL32(108, 124, 160, 182);
-			t.text_address   = IM_COL32(99, 158, 236, 224);
-			t.text_lineno    = IM_COL32(72, 88, 126, 165);
+			t.text_primary   = IM_COL32(229, 234, 242, 255);
+			t.text_secondary = IM_COL32(163, 174, 191, 255);
+			t.text_dim       = IM_COL32(106, 118, 136, 255);
+			t.text_address   = IM_COL32(103, 166, 245, 255);
+			t.text_lineno    = IM_COL32(91, 102, 119, 255);
 
-			t.hover_wash       = IM_COL32(120, 166, 255, 20);
-			t.selection        = IM_COL32(56, 134, 240, 74);
-			t.selection_strong = IM_COL32(56, 134, 240, 134);
-			t.disabled_alpha   = 0.42f;
+			t.hover_wash       = IM_COL32(66, 92, 130, 88);
+			t.selection        = IM_COL32(45, 92, 156, 148);
+			t.selection_strong = IM_COL32(55, 112, 198, 196);
+			t.disabled_alpha   = 0.46f;
 
-			t.accent          = ImVec4(56.f/255.f, 134.f/255.f, 240.f/255.f, 1.f);
-			t.accent_u32      = IM_COL32(56, 134, 240, 255);
-			t.accent_hover    = IM_COL32(95, 165, 255, 255);
-			t.accent_dim      = IM_COL32(56, 134, 240, 130);
-			t.accent_glow     = IM_COL32(56, 134, 240, 54);
-			t.accent_grad_top = IM_COL32(92, 168, 255, 255);
-			t.accent_grad_bot = IM_COL32(36, 98, 214, 255);
+			t.accent          = ImVec4(69.f/255.f, 139.f/255.f, 232.f/255.f, 1.f);
+			t.accent_u32      = IM_COL32(69, 139, 232, 255);
+			t.accent_hover    = IM_COL32(99, 163, 246, 255);
+			t.accent_dim      = IM_COL32(50, 106, 181, 210);
+			t.accent_glow     = IM_COL32(69, 139, 232, 72);
+			t.accent_grad_top = IM_COL32(82, 151, 239, 255);
+			t.accent_grad_bot = IM_COL32(52, 113, 203, 255);
 
-			t.success      = IM_COL32(74, 206, 156, 255);
-			t.success_soft = IM_COL32(74, 206, 156, 30);
-			t.warning      = IM_COL32(238, 190, 96, 255);
-			t.warning_soft = IM_COL32(238, 190, 96, 30);
-			t.error        = IM_COL32(255, 104, 122, 255);
-			t.error_soft   = IM_COL32(255, 104, 122, 30);
-			t.info         = IM_COL32(74, 152, 236, 255);
-			t.info_soft    = IM_COL32(74, 152, 236, 30);
+			t.success      = IM_COL32(91, 194, 139, 255);
+			t.success_soft = IM_COL32(40, 92, 68, 150);
+			t.warning      = IM_COL32(222, 177, 91, 255);
+			t.warning_soft = IM_COL32(104, 76, 31, 150);
+			t.error        = IM_COL32(235, 103, 116, 255);
+			t.error_soft   = IM_COL32(105, 42, 51, 150);
+			t.info         = IM_COL32(94, 158, 235, 255);
+			t.info_soft    = IM_COL32(41, 73, 111, 150);
 
-			t.syn_keyword      = IM_COL32(167, 150, 238, 255);
-			t.syn_type         = IM_COL32(102, 198, 220, 255);
-			t.syn_string       = IM_COL32(150, 206, 156, 255);
-			t.syn_number       = IM_COL32(226, 174, 132, 255);
-			t.syn_comment      = IM_COL32(98, 110, 142, 255);
-			t.syn_function     = IM_COL32(96, 168, 252, 255);
-			t.syn_identifier   = IM_COL32(206, 214, 230, 255);
-			t.syn_register     = IM_COL32(230, 150, 158, 255);
-			t.syn_address      = IM_COL32(99, 158, 236, 255);
-			t.syn_preprocessor = IM_COL32(167, 150, 238, 255);
-			t.syn_operator     = IM_COL32(150, 166, 196, 255);
+			t.syn_keyword      = IM_COL32(198, 151, 255, 255);
+			t.syn_type         = IM_COL32(103, 205, 214, 255);
+			t.syn_string       = IM_COL32(157, 208, 137, 255);
+			t.syn_number       = IM_COL32(224, 164, 106, 255);
+			t.syn_comment      = IM_COL32(107, 122, 139, 255);
+			t.syn_function     = IM_COL32(111, 174, 255, 255);
+			t.syn_identifier   = IM_COL32(216, 222, 232, 255);
+			t.syn_register     = IM_COL32(240, 137, 154, 255);
+			t.syn_address      = IM_COL32(103, 166, 245, 255);
+			t.syn_preprocessor = IM_COL32(193, 145, 246, 255);
+			t.syn_operator     = IM_COL32(168, 181, 199, 255);
 			return t;
 		}
 
@@ -545,25 +546,25 @@ namespace aida::ui {
 		s = ImGuiStyle();
 		const float ds = detail::s_style_dpi_scale;
 
-		s.WindowPadding     = ImVec2(scale_px(12.f, ds), scale_px(10.f, ds));
-		s.FramePadding      = ImVec2(scale_px(9.f, ds), scale_px(5.f, ds));
+		s.WindowPadding     = ImVec2(scale_px(12.f, ds), scale_px(12.f, ds));
+		s.FramePadding      = ImVec2(scale_px(8.f, ds), scale_px(4.f, ds));
 		s.CellPadding       = ImVec2(scale_px(8.f, ds), scale_px(4.f, ds));
-		s.ItemSpacing       = ImVec2(scale_px(8.f, ds), scale_px(6.f, ds));
-		s.ItemInnerSpacing  = ImVec2(scale_px(6.f, ds), scale_px(4.f, ds));
-		s.IndentSpacing     = scale_px(18.f, ds);
-		s.ScrollbarSize     = scale_px(10.f, ds);
+		s.ItemSpacing       = ImVec2(scale_px(8.f, ds), scale_px(8.f, ds));
+		s.ItemInnerSpacing  = ImVec2(scale_px(8.f, ds), scale_px(4.f, ds));
+		s.IndentSpacing     = scale_px(16.f, ds);
+		s.ScrollbarSize     = scale_px(8.f, ds);
 		s.GrabMinSize       = scale_px(12.f, ds);
-		s.WindowRounding    = scale_px(8.f, ds);
+		s.WindowRounding    = scale_px(6.f, ds);
 		s.ChildRounding     = scale_px(6.f, ds);
-		s.FrameRounding     = scale_px(6.f, ds);
-		s.PopupRounding     = scale_px(8.f, ds);
-		s.ScrollbarRounding = scale_px(8.f, ds);
-		s.GrabRounding      = scale_px(5.f, ds);
-		s.TabRounding       = scale_px(6.f, ds);
+		s.FrameRounding     = scale_px(4.f, ds);
+		s.PopupRounding     = scale_px(6.f, ds);
+		s.ScrollbarRounding = scale_px(4.f, ds);
+		s.GrabRounding      = scale_px(4.f, ds);
+		s.TabRounding       = scale_px(4.f, ds);
 		s.WindowBorderSize  = 0.f;
 		s.ChildBorderSize   = 0.f;
-		s.PopupBorderSize   = 0.f;
-		s.FrameBorderSize   = 0.f;
+		s.PopupBorderSize   = 1.f;
+		s.FrameBorderSize   = 1.f;
 		s.TabBorderSize     = 0.f;
 		s.WindowMenuButtonPosition = ImGuiDir_None;
 
@@ -579,7 +580,7 @@ namespace aida::ui {
 		c[ImGuiCol_Text]                 = to_v4(t.text_primary);
 		c[ImGuiCol_TextDisabled]         = to_v4(t.text_dim);
 		c[ImGuiCol_WindowBg]             = to_v4(t.bg_base);
-		c[ImGuiCol_ChildBg]              = ImVec4(0,0,0,0);
+		c[ImGuiCol_ChildBg]              = to_v4(t.panel_bg);
 		c[ImGuiCol_PopupBg]              = to_v4(t.bg_overlay);
 		c[ImGuiCol_Border]               = to_v4(t.border_subtle);
 		c[ImGuiCol_BorderShadow]         = ImVec4(0,0,0,0);
@@ -591,9 +592,9 @@ namespace aida::ui {
 		c[ImGuiCol_TitleBgCollapsed]     = to_v4(t.title_bar);
 		c[ImGuiCol_MenuBarBg]            = to_v4(t.panel_header);
 		c[ImGuiCol_ScrollbarBg]          = ImVec4(0,0,0,0);
-		c[ImGuiCol_ScrollbarGrab]        = to_v4(t.accent_dim);
-		c[ImGuiCol_ScrollbarGrabHovered] = to_v4(t.accent_hover);
-		c[ImGuiCol_ScrollbarGrabActive]  = t.accent;
+		c[ImGuiCol_ScrollbarGrab]        = to_v4(t.border_strong);
+		c[ImGuiCol_ScrollbarGrabHovered] = to_v4(t.accent_dim);
+		c[ImGuiCol_ScrollbarGrabActive]  = to_v4(t.accent_hover);
 		c[ImGuiCol_CheckMark]            = t.accent;
 		c[ImGuiCol_SliderGrab]           = t.accent;
 		c[ImGuiCol_SliderGrabActive]     = to_v4(t.accent_hover);
@@ -609,9 +610,9 @@ namespace aida::ui {
 		c[ImGuiCol_ResizeGrip]           = to_v4(t.accent_dim);
 		c[ImGuiCol_ResizeGripHovered]    = to_v4(t.accent_hover);
 		c[ImGuiCol_ResizeGripActive]     = t.accent;
-		c[ImGuiCol_Tab]                  = to_v4(t.panel_header);
+		c[ImGuiCol_Tab]                  = to_v4(t.bg_elevated);
 		c[ImGuiCol_TabHovered]           = to_v4(t.hover_wash);
-		c[ImGuiCol_TabActive]            = to_v4(t.accent_dim);
+		c[ImGuiCol_TabActive]            = to_v4(t.panel_header);
 		c[ImGuiCol_TabUnfocused]         = to_v4(t.title_bar);
 		c[ImGuiCol_TabUnfocusedActive]   = to_v4(t.panel_header);
 		c[ImGuiCol_DockingPreview]       = to_v4(t.accent_glow);
@@ -624,19 +625,19 @@ namespace aida::ui {
 		c[ImGuiCol_TableBorderStrong]    = to_v4(t.border_strong);
 		c[ImGuiCol_TableBorderLight]     = to_v4(t.border_subtle);
 		c[ImGuiCol_TableRowBg]           = ImVec4(0,0,0,0);
-		c[ImGuiCol_TableRowBgAlt]        = to_v4(IM_COL32(255, 255, 255, 6));
+		c[ImGuiCol_TableRowBgAlt]        = to_v4(t.bg_elevated);
 		c[ImGuiCol_TextSelectedBg]       = to_v4(t.selection_strong);
 		c[ImGuiCol_DragDropTarget]       = to_v4(t.accent_glow);
 		c[ImGuiCol_NavHighlight]         = to_v4(t.border_focus);
 		c[ImGuiCol_NavWindowingHighlight]= ImVec4(1, 1, 1, 0.7f);
-		c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0, 0, 0, 0.0f);
-		c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, 0.0f);
+		c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0, 0, 0, 0.30f);
+		c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0, 0, 0, 0.56f);
 	}
 
 	inline void apply(const theme_t& t) {
 		detail::s_target = t;
 		detail::s_source = detail::s_resolved;
-		detail::s_swap_anim.start(0.240f, aida::motion::ease::in_out_cubic);
+		detail::s_swap_anim.start(aida::ui::metrics::motion::theme, aida::motion::ease::in_out_cubic);
 		detail::s_swap_pending = true;
 		detail::s_theme_generation.fetch_add(1u, std::memory_order_release);
 	}

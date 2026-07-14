@@ -3,6 +3,8 @@
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../infra/taskflow_runtime.hpp"
+#include "../ui/components.hpp"
+#include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
 #include "../../helpers/globals.h"
 #include "standalone_driver.hpp"
@@ -737,7 +739,9 @@ void render(float, float, float width, float height,
             const disasm_view::workspace_context_t& context) {
     if (!context) {
         ImGui::BeginChild("##workspace_hex_empty", ImVec2(width, height), false);
-        ImGui::TextUnformatted("No analysis workspace is selected.");
+        aida::ui::empty_state("hex_workspace_empty", "No workspace selected",
+            "Open or attach to a target to inspect its bytes.", nullptr,
+            ImVec2(0.0f, (std::max)(152.0f, height - aida::ui::metrics::spacing::lg)));
         ImGui::EndChild();
         return;
     }
@@ -756,19 +760,40 @@ void render(float, float, float width, float height,
     ImGui::BeginChild("##workspace_hex", ImVec2(width, height), false);
     const auto& theme = aida::ui::resolved();
     ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(theme.text_primary, alpha));
-    if (ImGui::Button("Go to")) {
+
+    std::string current_source_name;
+    bool live_source_header = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        current_source_name = state->ui.source_name.empty()
+            ? context.workspace->identity().bin_name() : state->ui.source_name;
+        live_source_header = state->source_kind == source_kind_t::live_memory;
+    }
+    const auto header = aida::ui::view_header("Hex Editor", current_source_name.c_str(),
+        "Search", "Go to", live_source_header ? aida::ui::status_kind_t::accent
+                                                : aida::ui::status_kind_t::success);
+    if (header.secondary_clicked) {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->ui.goto_visible = true;
         state->ui.goto_buf[0] = '\0';
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Search")) {
+    if (header.primary_clicked) {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->ui.search_visible = !state->ui.search_visible;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Copy selection"))
+
+    aida::ui::begin_toolbar("##hex_toolbar",
+        aida::ui::metrics::control::toolbar_h +
+        aida::ui::metrics::toolbar::padding_y * 2.0f + 2.0f);
+    if (aida::ui::toolbar_button("copy_selection", "Copy selection", false, false,
+            "Copy the selected byte range"))
         copy_selection(context, state);
+    ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+    aida::ui::status_badge(live_source_header ? "Live memory" : "Workspace image",
+        live_source_header ? aida::ui::status_kind_t::accent
+                           : aida::ui::status_kind_t::neutral);
+    aida::ui::end_toolbar();
+
     bool goto_visible = false;
     bool search_visible = false;
     {
@@ -777,12 +802,24 @@ void render(float, float, float width, float height,
         search_visible = state->ui.search_visible;
     }
     if (goto_visible) {
-        ImGui::SetNextItemWidth(220.0f);
-        const bool enter = ImGui::InputTextWithHint("##hex_goto", "File offset or VA",
-            state->ui.goto_buf, sizeof(state->ui.goto_buf),
-            ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        if (enter || ImGui::Button("Go")) {
+        aida::ui::begin_toolbar("##hex_goto_toolbar",
+            aida::ui::metrics::control::toolbar_h +
+            aida::ui::metrics::toolbar::padding_y * 2.0f + 2.0f);
+        ImGui::PushID("hex_goto");
+        const ImGuiID goto_input = ImGui::GetID("##input");
+        ImGui::PopID();
+        static_cast<void>(aida::ui::search_field("hex_goto", state->ui.goto_buf,
+            sizeof(state->ui.goto_buf), "File offset or virtual address", 300.0f));
+        const bool enter = ImGui::GetActiveID() == goto_input &&
+            ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+        const bool submit_goto = aida::ui::toolbar_button("goto_submit", "Go", false, false,
+            "Navigate to this offset or address") || enter;
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        const bool close_goto = aida::ui::toolbar_button("goto_close", "Close", false,
+            false, "Close address search");
+        aida::ui::end_toolbar();
+        if (submit_goto) {
             if (auto value = parse_u64(state->ui.goto_buf)) {
                 std::uint64_t offset = *value;
                 bool live_source = false;
@@ -811,54 +848,80 @@ void render(float, float, float width, float height,
             }
             std::lock_guard<std::mutex> lock(state->mutex);
             state->ui.goto_visible = false;
+        } else if (close_goto) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->ui.goto_visible = false;
         }
     }
     if (search_visible) {
-        ImGui::SetNextItemWidth(300.0f);
-        const bool enter = ImGui::InputTextWithHint("##hex_search", "Bytes or text",
-            state->ui.search_buf, sizeof(state->ui.search_buf),
-            ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
+        bool search_hex = false;
+        std::int64_t match_index = -1;
+        std::size_t match_count = 0;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
-            ImGui::Checkbox("Hex", &state->ui.search_hex);
+            search_hex = state->ui.search_hex;
+            match_index = state->ui.search_match_idx;
+            match_count = state->ui.search_matches.size();
         }
-        ImGui::SameLine();
-        if (enter || ImGui::Button("Find"))
+        const bool searching = state->searching.load(std::memory_order_acquire);
+        aida::ui::begin_toolbar("##hex_search_toolbar",
+            aida::ui::metrics::control::toolbar_h +
+            aida::ui::metrics::toolbar::padding_y * 2.0f + 2.0f);
+        ImGui::PushID("hex_search");
+        const ImGuiID search_input = ImGui::GetID("##input");
+        ImGui::PopID();
+        const float search_width = (std::max)(160.0f,
+            (std::min)(320.0f, ImGui::GetContentRegionAvail().x - 390.0f));
+        static_cast<void>(aida::ui::search_field("hex_search", state->ui.search_buf,
+            sizeof(state->ui.search_buf), "Bytes or text", search_width));
+        const bool enter = ImGui::GetActiveID() == search_input &&
+            ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+        if (ImGui::Checkbox("Hex", &search_hex)) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->ui.search_hex = search_hex;
+        }
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+        if ((aida::ui::toolbar_button("find", "Find", false, searching,
+                "Search from the current source") || enter) && !searching)
             start_search(context, state);
-        ImGui::SameLine();
-        if (state->searching.load(std::memory_order_acquire)) {
-            ImGui::TextUnformatted("Searching...");
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel search")) {
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        if (searching) {
+            if (aida::ui::toolbar_button("cancel_search", "Cancel", false, false,
+                    "Cancel the active search")) {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 if (state->search_cancellation)
                     state->search_cancellation->request_cancel();
             }
         }
-        ImGui::SameLine();
-        if (ImGui::Button("<"))
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        if (aida::ui::toolbar_button("previous_match", "Previous", false,
+                match_count == 0, "Select the previous match"))
             step_search_result(state, -1);
-        ImGui::SameLine();
-        if (ImGui::Button(">"))
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        if (aida::ui::toolbar_button("next_match", "Next", false,
+                match_count == 0, "Select the next match"))
             step_search_result(state, 1);
-        std::int64_t match_index = -1;
-        std::size_t match_count = 0;
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            match_index = state->ui.search_match_idx;
-            match_count = state->ui.search_matches.size();
-        }
-        ImGui::SameLine();
-        if (match_count == 0)
-            ImGui::TextUnformatted("0 matches");
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+        char match_label[48]{};
+        if (searching)
+            std::snprintf(match_label, sizeof(match_label), "Searching");
+        else if (match_count == 0)
+            std::snprintf(match_label, sizeof(match_label), "No matches");
         else
-            ImGui::Text("%lld/%zu", static_cast<long long>(match_index + 1), match_count);
-        ImGui::SameLine();
-        if (ImGui::Button("Close")) {
+            std::snprintf(match_label, sizeof(match_label), "%lld / %zu",
+                static_cast<long long>(match_index + 1), match_count);
+        aida::ui::status_badge(match_label,
+            searching ? aida::ui::status_kind_t::info
+                      : match_count == 0 ? aida::ui::status_kind_t::neutral
+                                         : aida::ui::status_kind_t::success);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
+        if (aida::ui::toolbar_button("close_search", "Close", false, false,
+                "Close byte search")) {
             std::lock_guard<std::mutex> lock(state->mutex);
             state->ui.search_visible = false;
         }
+        aida::ui::end_toolbar();
     }
     std::string error;
     {
@@ -866,8 +929,24 @@ void render(float, float, float width, float height,
         error = state->error;
     }
     if (!error.empty())
-        ImGui::TextWrapped("%s", error.c_str());
-    ImGui::Separator();
+        aida::ui::inline_notice("hex_error", "Hex view unavailable", error.c_str(),
+            aida::ui::status_kind_t::error);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImGui::ColorConvertU32ToFloat4(theme.panel_header));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+        ImVec2(aida::ui::metrics::table::cell_pad_x,
+            aida::ui::metrics::table::cell_pad_y));
+    ImGui::BeginChild("##hex_header", ImVec2(0.0f, aida::ui::metrics::table::header_h),
+        true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::TextDisabled("Address");
+    ImGui::SameLine(170.0f);
+    ImGui::TextDisabled("Bytes");
+    ImGui::SameLine(650.0f);
+    ImGui::TextDisabled("ASCII");
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
     ImGui::BeginChild("##hex_rows", ImVec2(0.0f, 0.0f), false,
         ImGuiWindowFlags_HorizontalScrollbar);
     std::uint64_t byte_count = 0;
@@ -879,6 +958,17 @@ void render(float, float, float width, float height,
         live_base = state->live_base;
         byte_count = live_source ? static_cast<std::uint64_t>(state->live_bytes.size()) :
             context.workspace->provider().size();
+    }
+    if (byte_count == 0) {
+        aida::ui::empty_state("hex_source_empty", "No bytes available",
+            live_source ? "The selected memory snapshot does not contain readable bytes."
+                        : "The workspace provider has not published readable bytes.",
+            nullptr, ImVec2(0.0f, 152.0f));
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::EndChild();
+        ImGui::PopID();
+        return;
     }
     const std::uint64_t row_count64 = (byte_count + 15) / 16;
     const int row_count = row_count64 > static_cast<std::uint64_t>((std::numeric_limits<int>::max)())
@@ -896,7 +986,8 @@ void render(float, float, float width, float height,
         }
     }
     ImGuiListClipper clipper;
-    const float row_height = ImGui::GetTextLineHeightWithSpacing();
+    const float row_height = (std::max)(aida::ui::metrics::table::compact_row_h,
+        ImGui::GetTextLineHeightWithSpacing());
     clipper.Begin(row_count, row_height);
     while (clipper.Step()) {
         const std::uint64_t begin = static_cast<std::uint64_t>(clipper.DisplayStart) * 16;

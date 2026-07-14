@@ -4,8 +4,10 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_set>
 
 namespace aida::analysis::type_graph {
@@ -304,8 +306,7 @@ void type_graph_builder_t::detect_recursive_types(std::unordered_map<std::string
             if (it == merged_nodes.end())
                 return false;
             for (const auto& edge : it->second.edges) {
-                if (edge.kind == decompiler_type_edge_kind_t::pointer ||
-                    edge.kind == decompiler_type_edge_kind_t::reference ||
+                if (edge.kind == decompiler_type_edge_kind_t::pointee ||
                     edge.kind == decompiler_type_edge_kind_t::member ||
                     edge.kind == decompiler_type_edge_kind_t::base ||
                     edge.kind == decompiler_type_edge_kind_t::element) {
@@ -737,6 +738,124 @@ type_graph_t type_graph_builder_t::build()
     emit_diagnostics(graph, diagnostic_ordinal);
 
     return graph;
+}
+
+workspace_result_t<type_graph_t> merge_type_evidence(
+    type_graph_t provider_graph,
+    std::vector<type_seed_batch_t> evidence,
+    const type_graph_builder_config_t& config)
+{
+    const auto invalid = [](std::string message) {
+        return workspace_result_t<type_graph_t>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure, std::move(message),
+            "decompiler.type_graph.merge"));
+    };
+    if (!validate_type_graph(provider_graph).valid())
+        return invalid("provider type graph is invalid");
+    if (evidence.empty())
+        return workspace_result_t<type_graph_t>::success(std::move(provider_graph));
+    try {
+        std::unordered_map<std::uint64_t, const decompiler_type_node_t*> source_nodes;
+        source_nodes.reserve(provider_graph.nodes.size());
+        for (const auto& node : provider_graph.nodes)
+            source_nodes.emplace(node.id, &node);
+        type_seed_batch_t provider_seed;
+        provider_seed.source = decompiler_fact_provenance_t::provider_semantics;
+        provider_seed.source_label = "provider_type_graph";
+        provider_seed.candidates.reserve(provider_graph.nodes.size());
+        for (const auto& node : provider_graph.nodes) {
+            type_candidate_t candidate;
+            candidate.kind = node.kind;
+            candidate.canonical_name = node.canonical_name;
+            candidate.display_name = node.display_name;
+            candidate.byte_size = node.byte_size;
+            candidate.alignment = node.alignment;
+            candidate.is_signed = node.is_signed;
+            candidate.confidence = node.confidence;
+            candidate.provenance = node.provenance;
+            candidate.source_detail = "provider_type_graph";
+            if (!node.coordinates.empty())
+                candidate.coordinate = node.coordinates.front();
+            for (const auto& edge : provider_graph.edges) {
+                if (edge.source_type_id != node.id)
+                    continue;
+                const auto target = source_nodes.find(edge.target_type_id);
+                if (target == source_nodes.end())
+                    return invalid("provider type graph edge target is absent");
+                type_edge_candidate_t converted;
+                converted.kind = edge.kind;
+                converted.target_canonical_name = target->second->canonical_name;
+                converted.stable_name = edge.stable_name;
+                converted.byte_offset = edge.byte_offset;
+                converted.local_ordinal = edge.ordinal;
+                converted.confidence = edge.confidence;
+                converted.provenance = edge.provenance;
+                converted.source_detail = "provider_type_graph";
+                candidate.edges.push_back(std::move(converted));
+            }
+            provider_seed.candidates.push_back(std::move(candidate));
+        }
+        type_graph_builder_t builder(provider_graph.entity, config);
+        builder.add_seed_batch(std::move(provider_seed));
+        for (auto& batch : evidence)
+            builder.add_seed_batch(std::move(batch));
+        auto merged = builder.build();
+        if (!validate_type_graph(merged).valid())
+            return invalid("merged evidence graph is invalid");
+
+        std::unordered_map<std::string, std::uint64_t> retained_ids;
+        retained_ids.reserve(provider_graph.nodes.size());
+        std::uint64_t next_id = 1;
+        for (const auto& node : provider_graph.nodes) {
+            if (!retained_ids.emplace(node.canonical_name, node.id).second)
+                return invalid("provider type graph contains duplicate canonical identities");
+            if (node.id == (std::numeric_limits<std::uint64_t>::max)())
+                return invalid("provider type graph exhausted the type identifier space");
+            next_id = (std::max)(next_id, node.id + 1);
+        }
+        std::unordered_map<std::uint64_t, std::uint64_t> remap;
+        remap.reserve(merged.nodes.size());
+        for (auto& node : merged.nodes) {
+            const auto retained = retained_ids.find(node.canonical_name);
+            std::uint64_t id = 0;
+            if (retained == retained_ids.end()) {
+                if (next_id == 0 || next_id == (std::numeric_limits<std::uint64_t>::max)())
+                    return invalid("merged type graph exhausted the type identifier space");
+                id = next_id++;
+            } else {
+                id = retained->second;
+            }
+            remap.emplace(node.id, id);
+            node.id = id;
+        }
+        for (auto& edge : merged.edges) {
+            const auto source = remap.find(edge.source_type_id);
+            const auto target = remap.find(edge.target_type_id);
+            if (source == remap.end() || target == remap.end())
+                return invalid("merged evidence edge cannot be remapped");
+            edge.source_type_id = source->second;
+            edge.target_type_id = target->second;
+        }
+        std::sort(merged.nodes.begin(), merged.nodes.end(), [](const auto& left, const auto& right) {
+            return left.id < right.id;
+        });
+        std::sort(merged.edges.begin(), merged.edges.end(), [](const auto& left, const auto& right) {
+            return std::tie(left.ordinal, left.source_type_id, left.target_type_id,
+                       left.kind, left.stable_name) <
+                   std::tie(right.ordinal, right.source_type_id, right.target_type_id,
+                       right.kind, right.stable_name);
+        });
+        merged.revision = provider_graph.revision;
+        if (!validate_type_graph(merged).valid())
+            return invalid("remapped evidence graph is invalid");
+        return workspace_result_t<type_graph_t>::success(std::move(merged));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<type_graph_t>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "type evidence merge allocation failed", "decompiler.type_graph.merge"));
+    } catch (...) {
+        return invalid("type evidence merge failed");
+    }
 }
 
 }

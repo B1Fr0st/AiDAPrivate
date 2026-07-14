@@ -72,6 +72,7 @@ constexpr size_t   kCacheMaxEntries = 256;
 constexpr uint32_t BL_MATCH_HASH      = 0x1u;
 constexpr uint32_t BL_MATCH_WATERMARK = 0x2u;
 constexpr uint32_t BL_MATCH_NAME      = 0x4u;
+constexpr uint32_t BL_MATCH_ALL       = BL_MATCH_HASH | BL_MATCH_WATERMARK | BL_MATCH_NAME;
 
 #pragma pack(push, 1)
 struct sg_packed_header_t {
@@ -637,39 +638,49 @@ inline bool resolve_address_to_module(uint64_t address,
     return false;
 }
 
+inline bool blocklist_entry_matches(const aida_blocklist_entry_t& entry,
+    const std::string& name, const uint8_t* image_hash,
+    const uint8_t* watermark, uint32_t now) {
+    if ((entry.flags & BL_MATCH_ALL) == 0 || (entry.flags & ~BL_MATCH_ALL) != 0)
+        return false;
+
+    if (entry.expires_at != 0) {
+        const uint64_t valid_until = static_cast<uint64_t>(entry.expires_at)
+            + static_cast<uint64_t>(kSevenDaysSeconds);
+        if (static_cast<uint64_t>(now) > valid_until)
+            return false;
+    }
+
+    bool hash_matched = false;
+    bool watermark_matched = false;
+    bool name_matched = false;
+
+    if ((entry.flags & BL_MATCH_HASH) != 0 && image_hash != nullptr)
+        hash_matched = constant_time_compare(image_hash, entry.image_hash, 32);
+
+    if ((entry.flags & BL_MATCH_WATERMARK) != 0 && watermark != nullptr)
+        watermark_matched = constant_time_compare(watermark, entry.watermark, 16);
+
+    if ((entry.flags & BL_MATCH_NAME) != 0 && !name.empty()) {
+        const size_t pattern_length = strnlen_s(entry.name_pattern,
+            sizeof(entry.name_pattern));
+        if (pattern_length != 0 && pattern_length < sizeof(entry.name_pattern)) {
+            const std::string lower_name = to_lower_str(name);
+            const std::string lower_pattern = to_lower_str(
+                std::string(entry.name_pattern, pattern_length));
+            name_matched = lower_name.find(lower_pattern) != std::string::npos;
+        }
+    }
+
+    return hash_matched || watermark_matched || name_matched;
+}
+
 inline bool blocklist_matches(const std::string& name,
     const uint8_t* image_hash, const uint8_t* watermark) {
     std::shared_lock<std::shared_mutex> lk(blocklist_mutex());
-    uint32_t now = unix_time_now();
+    const uint32_t now = unix_time_now();
     for (const auto& entry : blocklist()) {
-        if (entry.expires_at != 0) {
-            if (now > entry.expires_at + kSevenDaysSeconds) continue;
-        }
-        bool hash_matched = false;
-        bool watermark_matched = false;
-        bool name_matched = false;
-
-        if (entry.flags & BL_MATCH_HASH) {
-            if (image_hash && constant_time_compare(image_hash, entry.image_hash, 32))
-                hash_matched = true;
-        }
-        if (entry.flags & BL_MATCH_WATERMARK) {
-            if (watermark && constant_time_compare(watermark, entry.watermark, 16))
-                watermark_matched = true;
-        }
-        if (entry.flags & BL_MATCH_NAME) {
-            if (!name.empty()) {
-                std::string lower_name = to_lower_str(name);
-                std::string lower_pattern = to_lower_str(std::string(entry.name_pattern));
-                if (!lower_pattern.empty() &&
-                    lower_name.find(lower_pattern) != std::string::npos)
-                    name_matched = true;
-            }
-        }
-
-        if (hash_matched || watermark_matched)
-            return true;
-        if (name_matched && (hash_matched || watermark_matched))
+        if (blocklist_entry_matches(entry, name, image_hash, watermark, now))
             return true;
     }
     return false;
@@ -689,7 +700,7 @@ inline bool validate_blocklist_entry(const aida_blocklist_entry_t& entry) {
         if (entry.name_pattern[i] != 0) { has_name = true; break; }
     }
     if (!has_nonzero_hash && !has_nonzero_wm && !has_name) return false;
-    if (entry.flags == 0) return false;
+    if (entry.flags == 0 || (entry.flags & ~BL_MATCH_ALL) != 0) return false;
     if (entry.flags & BL_MATCH_HASH) {
         if (!has_nonzero_hash) return false;
     }
@@ -697,7 +708,9 @@ inline bool validate_blocklist_entry(const aida_blocklist_entry_t& entry) {
         if (!has_nonzero_wm) return false;
     }
     if (entry.flags & BL_MATCH_NAME) {
-        if (!has_name) return false;
+        if (!has_name || strnlen_s(entry.name_pattern,
+                sizeof(entry.name_pattern)) == sizeof(entry.name_pattern))
+            return false;
     }
     return true;
 }
