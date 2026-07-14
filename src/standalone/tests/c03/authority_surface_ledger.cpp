@@ -20,13 +20,13 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -393,6 +393,71 @@ std::string sha256_sorted_unique_lines(std::vector<std::string> lines) {
     return sha256_lines(lines);
 }
 
+std::size_t utf8_sequence_length(std::string_view source, std::size_t offset) {
+    require(offset < source.size(), "UTF-8 offset is outside source text");
+    const auto lead = static_cast<unsigned char>(source[offset]);
+    if (lead <= 0x7FU)
+        return 1U;
+    std::size_t length = 0;
+    std::uint32_t code_point = 0;
+    std::uint32_t minimum = 0;
+    if ((lead & 0xE0U) == 0xC0U) {
+        length = 2U;
+        code_point = lead & 0x1FU;
+        minimum = 0x80U;
+    } else if ((lead & 0xF0U) == 0xE0U) {
+        length = 3U;
+        code_point = lead & 0x0FU;
+        minimum = 0x800U;
+    } else if ((lead & 0xF8U) == 0xF0U) {
+        length = 4U;
+        code_point = lead & 0x07U;
+        minimum = 0x10000U;
+    } else {
+        reject("invalid UTF-8 leading byte at byte offset " + std::to_string(offset));
+    }
+    require(length <= source.size() - offset,
+            "truncated UTF-8 sequence at byte offset " + std::to_string(offset));
+    for (std::size_t index = 1U; index < length; ++index) {
+        const auto continuation = static_cast<unsigned char>(source[offset + index]);
+        require((continuation & 0xC0U) == 0x80U,
+                "invalid UTF-8 continuation byte at byte offset " +
+                    std::to_string(offset + index));
+        code_point = (code_point << 6U) | (continuation & 0x3FU);
+    }
+    require(code_point >= minimum && code_point <= 0x10FFFFU &&
+                !(code_point >= 0xD800U && code_point <= 0xDFFFU),
+            "invalid UTF-8 scalar at byte offset " + std::to_string(offset));
+    return length;
+}
+
+std::size_t utf8_character_offset(std::string_view source,
+                                  std::size_t byte_offset) {
+    require(byte_offset <= source.size(), "UTF-8 byte offset is outside source text");
+    std::size_t characters = 0;
+    for (std::size_t offset = 0; offset < byte_offset;) {
+        const auto length = utf8_sequence_length(source, offset);
+        require(length <= byte_offset - offset,
+                "UTF-8 byte offset divides a scalar value");
+        offset += length;
+        ++characters;
+    }
+    return characters;
+}
+
+std::size_t utf8_byte_offset(std::string_view source,
+                             std::size_t character_offset) {
+    std::size_t characters = 0;
+    std::size_t offset = 0;
+    while (offset < source.size() && characters < character_offset) {
+        offset += utf8_sequence_length(source, offset);
+        ++characters;
+    }
+    require(characters == character_offset,
+            "UTF-8 character offset is outside source text");
+    return offset;
+}
+
 std::size_t source_line(std::string_view source, std::size_t offset) {
     require(offset <= source.size(), "source offset is outside its source file");
     return static_cast<std::size_t>(std::count(
@@ -418,7 +483,50 @@ std::size_t matching_index(std::string_view text, std::size_t start,
     reject("unterminated C++ balanced range at offset " + std::to_string(start));
 }
 
-std::string cpp_code_mask(std::string_view source) {
+bool cpp_digit_separator(std::string_view source, std::size_t index) {
+    if (index == 0U || index + 1U >= source.size() || source[index] != '\'')
+        return false;
+    auto start = index;
+    while (start != 0U) {
+        const auto character = static_cast<unsigned char>(source[start - 1U]);
+        if (std::isalnum(character) == 0 && character != '_' &&
+            character != '\'' && character != '.')
+            break;
+        --start;
+    }
+    const auto prefix = std::string(source.substr(start, index - start));
+    const auto previous = static_cast<unsigned char>(source[index - 1U]);
+    const auto following = static_cast<unsigned char>(source[index + 1U]);
+    const auto hexadecimal = [](unsigned char character) {
+        return (character >= '0' && character <= '9') ||
+               (character >= 'A' && character <= 'F') ||
+               (character >= 'a' && character <= 'f');
+    };
+    static const std::regex hexadecimal_prefix(
+        R"(^0[xX][0-9A-Fa-f.pP']*$)");
+    if (std::regex_match(prefix, hexadecimal_prefix))
+        return hexadecimal(previous) && hexadecimal(following);
+    static const std::regex binary_prefix(R"(^0[bB][01']*$)");
+    if (std::regex_match(prefix, binary_prefix))
+        return (previous == '0' || previous == '1') &&
+               (following == '0' || following == '1');
+    static const std::regex decimal_prefix(R"(^[0-9][0-9.eE']*$)");
+    return std::regex_match(prefix, decimal_prefix) &&
+           previous >= '0' && previous <= '9' &&
+           following >= '0' && following <= '9';
+}
+
+std::string cpp_mask_error_context(std::string_view source, std::size_t byte_offset,
+                                   std::string_view label) {
+    const auto bounded = std::min(byte_offset, source.size());
+    return "source='" + std::string(label) + "' line=" +
+           std::to_string(source_line(source, bounded)) +
+           " character_offset=" +
+           std::to_string(utf8_character_offset(source, bounded)) +
+           " byte_offset=" + std::to_string(bounded);
+}
+
+std::string cpp_code_mask(std::string_view source, std::string_view label) {
     std::string masked(source);
     std::size_t index = 0;
     while (index < source.size()) {
@@ -430,6 +538,7 @@ std::string cpp_code_mask(std::string_view source) {
             continue;
         }
         if (current == '/' && following == '*') {
+            const auto comment_start = index;
             masked[index++] = ' ';
             masked[index++] = ' ';
             bool closed = false;
@@ -445,10 +554,12 @@ std::string cpp_code_mask(std::string_view source) {
                     masked[index] = ' ';
                 ++index;
             }
-            require(closed, "unterminated C++ block comment in reachability source");
+            require(closed, "unterminated C++ block comment " +
+                                cpp_mask_error_context(source, comment_start, label));
             continue;
         }
         if (current == 'R' && following == '"') {
+            const auto raw_start = index;
             const auto delimiter_start = index + 2U;
             const auto opening = source.find('(', delimiter_start);
             if (opening != std::string_view::npos && opening >= delimiter_start &&
@@ -463,7 +574,8 @@ std::string cpp_code_mask(std::string_view source) {
                     const auto terminator = ")" + std::string(delimiter) + "\"";
                     const auto closing = source.find(terminator, opening + 1U);
                     require(closing != std::string_view::npos,
-                            "unterminated C++ raw string in reachability source");
+                            "unterminated C++ raw string " +
+                                cpp_mask_error_context(source, raw_start, label));
                     const auto end = closing + terminator.size();
                     while (index < end) {
                         if (source[index] != '\r' && source[index] != '\n')
@@ -474,7 +586,13 @@ std::string cpp_code_mask(std::string_view source) {
                 }
             }
         }
+        if (current == '\'' && cpp_digit_separator(source, index)) {
+            masked[index] = ' ';
+            ++index;
+            continue;
+        }
         if (current == '"' || current == '\'') {
+            const auto literal_start = index;
             const auto quote = current;
             masked[index++] = ' ';
             bool closed = false;
@@ -497,7 +615,8 @@ std::string cpp_code_mask(std::string_view source) {
                     break;
                 }
             }
-            require(closed, "unterminated C++ quoted literal in reachability source");
+            require(closed, "unterminated C++ quoted literal " +
+                                cpp_mask_error_context(source, literal_start, label));
             continue;
         }
         ++index;
@@ -619,6 +738,37 @@ std::size_t top_level_argument_count(std::string_view expression) {
     return count;
 }
 
+bool cpp_registrar_declaration(std::string_view mask, std::size_t start,
+                               std::size_t closing) {
+    auto after = closing + 1U;
+    while (after < mask.size() &&
+           std::isspace(static_cast<unsigned char>(mask[after])) != 0)
+        ++after;
+    if (after >= mask.size() || mask[after] != ';')
+        return false;
+    auto boundary = start;
+    while (boundary != 0U) {
+        const auto previous = mask[boundary - 1U];
+        if (previous == ';' || previous == '{' || previous == '}' ||
+            previous == '\r' || previous == '\n')
+            break;
+        --boundary;
+    }
+    auto prefix = std::string(mask.substr(boundary, start - boundary));
+    const auto first = prefix.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return false;
+    const auto last = prefix.find_last_not_of(" \t\r\n");
+    prefix = prefix.substr(first, last - first + 1U);
+    static const std::regex control_pattern(
+        R"(^(?:return|co_return|co_await|throw)\b)");
+    if (std::regex_search(prefix, control_pattern))
+        return false;
+    static const std::regex declaration_pattern(
+        R"(^(?:(?:extern|static|inline|constexpr|consteval|constinit|friend|virtual|explicit|typename|const|volatile)\s+)*(?:(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*(?:\s*<[^;{}()]*>)?(?:\s*[*&]+)?)(?:\s+(?:(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*(?:\s*<[^;{}()]*>)?(?:\s*[*&]+)?))*$)");
+    return std::regex_match(prefix, declaration_pattern);
+}
+
 std::vector<cpp_registrar_t> cpp_registrar_definitions(
     const std::string& relative, const std::string& source,
     const std::string& mask) {
@@ -680,7 +830,8 @@ std::vector<cpp_registrar_t> cpp_registrar_definitions(
 
 cpp_reachability_sources_t load_cpp_reachability_sources(
     const std::filesystem::path& root) {
-    constexpr std::size_t maximum_files = 8192;
+    constexpr std::size_t maximum_files = 4096;
+    constexpr std::uintmax_t maximum_file_bytes = 32ULL * 1024ULL * 1024ULL;
     constexpr std::uintmax_t maximum_total_bytes = 512ULL * 1024ULL * 1024ULL;
     const auto source_root = root / "src/standalone/src/core";
     std::vector<std::filesystem::path> paths;
@@ -698,7 +849,7 @@ cpp_reachability_sources_t load_cpp_reachability_sources(
         require(paths.size() <= maximum_files,
                 "C++ reachability source count exceeds policy");
         const auto bytes = it->file_size(ec);
-        require(!ec && bytes <= k_maximum_source_bytes &&
+        require(!ec && bytes <= maximum_file_bytes &&
                     total_bytes <= maximum_total_bytes - bytes,
                 "C++ reachability sources exceed bounded size policy");
         total_bytes += bytes;
@@ -712,10 +863,11 @@ cpp_reachability_sources_t load_cpp_reachability_sources(
         require(!ec && !relative.empty(),
                 "C++ reachability source path is not repository relative");
         const auto source = read_bounded(repository_file(root, relative),
-                                         k_maximum_source_bytes);
+                                         maximum_file_bytes);
+        utf8_character_offset(source, source.size());
         if (source.find("register_") == std::string::npos)
             continue;
-        auto unit = cpp_source_t{source, cpp_code_mask(source)};
+        auto unit = cpp_source_t{source, cpp_code_mask(source, relative)};
         auto definitions = cpp_registrar_definitions(
             relative, unit.source, unit.mask);
         result.definitions.insert(
@@ -786,18 +938,16 @@ const cpp_registrar_t& resolve_cpp_registrar_target(
 json cpp_registrar_calls(
     const cpp_registrar_t& caller, const cpp_source_t& unit,
     const std::vector<cpp_registrar_t>& definitions,
-    const names_t& terminal_offsets) {
-    static const std::regex pattern(
-        R"(((?:[A-Za-z_]\w*::)*register_[A-Za-z0-9_]+)\s*\()");
+    const names_t& terminal_offsets,
+    const std::map<std::string, json>& explicit_edges) {
+    static const std::regex registrar_pattern(
+        R"(((?:[A-Za-z_]\w*::)*(?:register|replace)_[A-Za-z0-9_]+)\s*\()");
     const auto body_start = caller.body_start + 1U;
     const auto body = unit.mask.substr(body_start, caller.body_end - body_start);
     json calls = json::array();
-    for (std::sregex_iterator it(body.begin(), body.end(), pattern), end;
+    for (std::sregex_iterator it(body.begin(), body.end(), registrar_pattern), end;
          it != end; ++it) {
         const auto callee = (*it)[1].str();
-        const auto separator = callee.rfind("::");
-        const auto bare = callee.substr(
-            separator == std::string::npos ? 0U : separator + 2U);
         const auto absolute = body_start + static_cast<std::size_t>(it->position(1));
         const auto terminal_key = caller.file + ":" + std::to_string(absolute);
         const auto previous_terminal_key = absolute == 0U
@@ -806,19 +956,46 @@ json cpp_registrar_calls(
         if (terminal_offsets.count(terminal_key) != 0U ||
             terminal_offsets.count(previous_terminal_key) != 0U)
             continue;
-        if (bare == "register_c03_compatibility_tools")
-            continue;
-        if (absolute != 0U) {
-            const auto previous = static_cast<unsigned char>(unit.mask[absolute - 1U]);
-            require(previous != '.' && previous != '>',
-                    "indirect registrar edge is not source-resolvable from " + caller.id);
-            if (std::isalnum(previous) != 0 || previous == '_')
-                continue;
-        }
         const auto opening = unit.mask.find('(', absolute + callee.size());
         require(opening != std::string::npos,
                 "registrar call opening delimiter is unavailable");
         const auto closing = matching_index(unit.mask, opening, '(', ')');
+        require(!cpp_registrar_declaration(unit.mask, absolute, closing),
+                "registrar declaration is forbidden in reachable code: " + callee +
+                    " from " + caller.id);
+        if (const auto explicit_it = explicit_edges.find(terminal_key);
+            explicit_it != explicit_edges.end()) {
+            const auto& edge = explicit_it->second;
+            require(string_member(edge, "caller_id", "explicit registrar edge") == caller.id,
+                    "explicit registrar edge has the wrong enclosing owner at " +
+                        terminal_key);
+            calls.push_back({
+                {"caller_id", caller.id},
+                {"callee_id", string_member(edge, "callee_id", "explicit registrar edge")},
+                {"callee_symbol", string_member(edge, "callee_symbol", "explicit registrar edge")},
+                {"file", caller.file},
+                {"line", source_line(unit.source, absolute)},
+                {"character_offset", utf8_character_offset(unit.source, absolute)},
+                {"expression", string_member(edge, "expression", "explicit registrar edge")}
+            });
+            continue;
+        }
+        if (absolute != 0U) {
+            const auto immediate = static_cast<unsigned char>(
+                unit.mask[absolute - 1U]);
+            if (std::isalnum(immediate) != 0 || immediate == '_')
+                continue;
+            auto predecessor = absolute;
+            while (predecessor != 0U &&
+                   std::isspace(static_cast<unsigned char>(
+                       unit.mask[predecessor - 1U])) != 0)
+                --predecessor;
+            const auto previous = predecessor == 0U
+                ? static_cast<unsigned char>(0)
+                : static_cast<unsigned char>(unit.mask[predecessor - 1U]);
+            require(previous != '.' && previous != '>' && previous != ':',
+                    "indirect registrar edge is not source-resolvable from " + caller.id);
+        }
         const auto argument_count = top_level_argument_count(
             std::string_view(unit.mask).substr(
                 opening + 1U, closing - opening - 1U));
@@ -830,7 +1007,7 @@ json cpp_registrar_calls(
             {"callee_symbol", target.symbol},
             {"file", caller.file},
             {"line", source_line(unit.source, absolute)},
-            {"character_offset", absolute},
+            {"character_offset", utf8_character_offset(unit.source, absolute)},
             {"expression", normalized_expression(
                 std::string_view(unit.source).substr(absolute, closing - absolute + 1U))}
         });
@@ -847,7 +1024,6 @@ struct derived_reachability_t {
 };
 
 derived_reachability_t derive_reachability(
-    const std::filesystem::path& root,
     const cpp_reachability_sources_t& sources,
     const names_t& terminal_offsets) {
     std::vector<const cpp_registrar_t*> roots;
@@ -892,7 +1068,8 @@ derived_reachability_t derive_reachability(
     result.production_entry = {
         {"file", entry_file},
         {"line", source_line(entry_it->second.source, entry_offset)},
-        {"character_offset", entry_offset},
+        {"character_offset", utf8_character_offset(
+            entry_it->second.source, entry_offset)},
         {"expression", normalized_expression(
             std::string_view(entry_it->second.source).substr(
                 entry_offset, entry_closing - entry_offset + 1U))},
@@ -916,7 +1093,8 @@ derived_reachability_t derive_reachability(
         require(source_it != sources.sources.end(),
                 "reachable registrar source cache is unavailable: " + caller->file);
         const auto calls = cpp_registrar_calls(
-            *caller, source_it->second, sources.definitions, terminal_offsets);
+            *caller, source_it->second, sources.definitions, terminal_offsets,
+            {});
         names_t local_targets;
         for (const auto& edge : calls) {
             const auto target_id = string_member(edge, "callee_id", "derived registrar edge");
@@ -947,20 +1125,409 @@ derived_reachability_t derive_reachability(
             {"symbol", definition->symbol},
             {"file", definition->file},
             {"line", definition->line},
-            {"body_start", definition->body_start},
-            {"body_end", definition->body_end},
+            {"body_start", utf8_character_offset(
+                sources.sources.at(definition->file).source, definition->body_start)},
+            {"body_end", utf8_character_offset(
+                sources.sources.at(definition->file).source, definition->body_end)},
             {"parent_id", parent},
             {"chain", result.chains.at(identifier)}
         });
     }
     std::vector<json> sorted_edges(edges.begin(), edges.end());
     std::sort(sorted_edges.begin(), sorted_edges.end(), [](const auto& left, const auto& right) {
-        return std::tie(left.at("caller_id"), left.at("callee_id"),
-                        left.at("file"), left.at("line")) <
-               std::tie(right.at("caller_id"), right.at("callee_id"),
-                        right.at("file"), right.at("line"));
+        return std::tuple{
+                   left.at("caller_id").get<std::string>(),
+                   left.at("callee_id").get<std::string>(),
+                   left.at("file").get<std::string>(),
+                   left.at("line").get<std::size_t>()} <
+               std::tuple{
+                   right.at("caller_id").get<std::string>(),
+                   right.at("callee_id").get<std::string>(),
+                   right.at("file").get<std::string>(),
+                   right.at("line").get<std::size_t>()};
     });
-    result.edges = sorted_edges;
+    result.edges = json::array();
+    for (auto& edge : sorted_edges)
+        result.edges.push_back(std::move(edge));
+    return result;
+}
+
+const cpp_registrar_t& select_unique_definition(
+    const cpp_reachability_sources_t& sources, std::string_view file,
+    std::string_view bare_name, const std::regex& parameter_pattern,
+    std::string_view identity) {
+    std::vector<const cpp_registrar_t*> matches;
+    for (const auto& definition : sources.definitions) {
+        if (definition.file == file && definition.bare_name == bare_name &&
+            std::regex_search(definition.parameters, parameter_pattern)) {
+            matches.push_back(&definition);
+        }
+    }
+    require(matches.size() == 1U,
+            std::string(identity) + " definition count is " +
+                std::to_string(matches.size()) + ", expected one");
+    return *matches.front();
+}
+
+json unique_owned_code_call(
+    const cpp_reachability_sources_t& sources, std::string_view file,
+    const std::regex& pattern, std::string_view identity,
+    const cpp_registrar_t& expected_caller) {
+    const auto unit_it = sources.sources.find(std::string(file));
+    require(unit_it != sources.sources.end(),
+            std::string(identity) + " source is unavailable");
+    const auto& unit = unit_it->second;
+    std::vector<std::smatch> matches;
+    for (std::sregex_iterator it(unit.mask.begin(), unit.mask.end(), pattern), end;
+         it != end; ++it) {
+        matches.push_back(*it);
+    }
+    require(matches.size() == 1U,
+            std::string(identity) + " must have exactly one code occurrence, observed " +
+                std::to_string(matches.size()));
+    const auto expression_offset = static_cast<std::size_t>(matches.front().position(0));
+    const auto opening = unit.mask.find('(', expression_offset);
+    require(opening != std::string::npos,
+            std::string(identity) + " call opening delimiter is unavailable");
+    const auto closing = matching_index(unit.mask, opening, '(', ')');
+    const auto expression_mask = unit.mask.substr(
+        expression_offset, closing - expression_offset + 1U);
+    static const std::regex registrar_pattern(
+        R"(\b(?:register|replace)_[A-Za-z0-9_]+\s*\()");
+    std::smatch registrar_match;
+    require(std::regex_search(expression_mask, registrar_match, registrar_pattern),
+            std::string(identity) + " does not contain a registrar-like call");
+    const auto registrar_offset = expression_offset +
+        static_cast<std::size_t>(registrar_match.position(0));
+    std::vector<const cpp_registrar_t*> owners;
+    for (const auto& definition : sources.definitions) {
+        if (definition.file == file && definition.body_start < expression_offset &&
+            expression_offset < definition.body_end) {
+            owners.push_back(&definition);
+        }
+    }
+    require(owners.size() == 1U && owners.front()->id == expected_caller.id,
+            std::string(identity) + " has an invalid enclosing definition");
+    return {
+        {"file", file},
+        {"line", source_line(unit.source, expression_offset)},
+        {"character_offset", utf8_character_offset(unit.source, registrar_offset)},
+        {"expression", normalized_expression(
+            std::string_view(unit.source).substr(
+                expression_offset, closing - expression_offset + 1U))},
+        {"caller_id", expected_caller.id},
+        {"caller_symbol", expected_caller.symbol}
+    };
+}
+
+struct generated_route_t {
+    json route;
+    std::unordered_map<std::string, json> bindings_by_name;
+};
+
+generated_route_t derive_generated_route(
+    const cpp_reachability_sources_t& sources,
+    const cpp_registrar_t& root_registrar,
+    const json& compatibility_rows,
+    const json& direct_edges,
+    const names_t& registration_terminal_offsets) {
+    const std::string standalone_tools =
+        "src/standalone/src/core/mcp/mcp_standalone_tools.cpp";
+    const std::string server_file =
+        "src/standalone/src/core/mcp/mcp_standalone.cpp";
+    const std::string registration_file =
+        "src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp";
+    const std::string integration_file =
+        "src/standalone/src/core/mcp/compat/mcp_server_integration.cpp";
+
+    const auto& server_bridge = select_unique_definition(
+        sources, server_file, "register_c03_compatibility_tools",
+        std::regex(R"(server_t\s*&)") , "C03 server bridge");
+    const auto& config_bridge = select_unique_definition(
+        sources, registration_file, "register_c03_compatibility_tools",
+        std::regex(R"(tool_registry_t\s*&.*c03_compatibility_runtime_config_t)"),
+        "C03 runtime-config bridge");
+    const auto& wave_registrar = select_unique_definition(
+        sources, registration_file, "register_wave_c_compatibility_tools",
+        std::regex(R"(tool_registry_t\s*&.*c03_compatibility_runtime_config_t)"),
+        "C03 Wave C registrar");
+    const auto& generated_registrar = select_unique_definition(
+        sources, integration_file, "register_generated_tools",
+        std::regex(R"(^$)"), "C03 generated registrar");
+    const auto& extension_registrar = select_unique_definition(
+        sources, integration_file, "register_extension_tools",
+        std::regex(R"(^$)"), "C03 extension registrar");
+    const auto& entry_registrar = select_unique_definition(
+        sources, integration_file, "register_entry",
+        std::regex(R"(shared_ptr<mcp_server_integration_t>.*std::string\s*&)") ,
+        "C03 per-name registrar");
+
+    struct route_specification_t {
+        std::string file;
+        std::regex pattern;
+        std::string identity;
+        const cpp_registrar_t* caller;
+        const cpp_registrar_t* callee;
+    };
+    const std::vector<route_specification_t> specifications = {
+        {standalone_tools,
+         std::regex(R"(\bregister_c03_compatibility_tools\s*\(\s*srv\s*\))"),
+         "C03 compatibility root registrar edge", &root_registrar, &server_bridge},
+        {server_file,
+         std::regex(R"(\bregister_c03_compatibility_tools\s*\(\s*server\.registry\s*\(\s*\)\s*,\s*make_application_c03_compatibility_runtime_config\s*\(\s*\)\s*\))"),
+         "C03 compatibility server bridge edge", &server_bridge, &config_bridge},
+        {registration_file,
+         std::regex(R"(\bregister_wave_c_compatibility_tools\s*\(\s*registry\s*,\s*std::move\s*\(\s*config\s*\)\s*\))"),
+         "C03 compatibility wave registrar edge", &config_bridge, &wave_registrar},
+        {registration_file,
+         std::regex(R"(\bintegration\s*->\s*register_generated_tools\s*\(\s*\))"),
+         "C03 generated compatibility registrar edge", &wave_registrar, &generated_registrar},
+        {registration_file,
+         std::regex(R"(\bintegration\s*->\s*register_extension_tools\s*\(\s*\))"),
+         "C03 extension registrar edge", &wave_registrar, &extension_registrar},
+        {integration_file,
+         std::regex(R"(\bimpl_\s*->\s*register_entry\s*\(\s*owner\s*,\s*name\s*\))"),
+         "C03 generated per-name registrar edge", &generated_registrar, &entry_registrar},
+        {integration_file,
+         std::regex(R"(\bimpl_\s*->\s*register_entry\s*\(\s*owner\s*,\s*std::string\s*\(\s*name\s*\)\s*\))"),
+         "C03 extension per-name registrar edge", &extension_registrar, &entry_registrar}
+    };
+
+    json edges = json::array();
+    for (const auto& specification : specifications) {
+        auto call = unique_owned_code_call(
+            sources, specification.file, specification.pattern,
+            specification.identity, *specification.caller);
+        call["callee_id"] = specification.callee->id;
+        call["callee_symbol"] = specification.callee->symbol;
+        edges.push_back(std::move(call));
+    }
+
+    const auto terminal_call = [&](const std::regex& pattern,
+                                   std::string_view identity) {
+        return unique_owned_code_call(
+            sources, integration_file, pattern, identity, entry_registrar);
+    };
+    json terminal_operations = json::array({
+        terminal_call(
+            std::regex(R"(\bstate\.registry\s*->\s*replace_tool\s*\(\s*std::move\s*\(\s*tool\s*\)\s*\))"),
+            "C03 replacement terminal registration"),
+        terminal_call(
+            std::regex(R"(\bstate\.registry\s*->\s*register_tool\s*\(\s*std::move\s*\(\s*tool\s*\)\s*\))"),
+            "C03 insertion terminal registration")
+    });
+
+    std::map<std::string, json> explicit_edges;
+    for (const auto& edge : edges) {
+        const auto file = string_member(edge, "file", "generated route edge");
+        const auto unit_it = sources.sources.find(file);
+        require(unit_it != sources.sources.end(),
+                "generated route edge source is unavailable");
+        const auto character_offset = size_member(
+            edge, "character_offset", "generated route edge");
+        const auto byte_offset = utf8_byte_offset(
+            unit_it->second.source, character_offset);
+        require(explicit_edges.emplace(
+                    file + ":" + std::to_string(byte_offset), edge).second,
+                "generated route contains a duplicate explicit registrar offset");
+    }
+    auto route_terminal_offsets = registration_terminal_offsets;
+    for (const auto& operation : terminal_operations) {
+        const auto file = string_member(
+            operation, "file", "generated terminal operation");
+        const auto unit_it = sources.sources.find(file);
+        require(unit_it != sources.sources.end(),
+                "generated terminal operation source is unavailable");
+        const auto character_offset = size_member(
+            operation, "character_offset", "generated terminal operation");
+        route_terminal_offsets.insert(
+            file + ":" + std::to_string(utf8_byte_offset(
+                unit_it->second.source, character_offset)));
+    }
+
+    const std::array<const cpp_registrar_t*, 7> node_definitions = {
+        &root_registrar, &server_bridge, &config_bridge, &wave_registrar,
+        &generated_registrar, &extension_registrar, &entry_registrar
+    };
+    for (const auto* definition : node_definitions) {
+        const auto unit_it = sources.sources.find(definition->file);
+        require(unit_it != sources.sources.end(),
+                "generated route registrar source is unavailable: " +
+                    definition->file);
+        const auto observed = cpp_registrar_calls(
+            *definition, unit_it->second, sources.definitions,
+            route_terminal_offsets, explicit_edges);
+        std::vector<std::string> observed_lines;
+        for (const auto& edge : observed) {
+            observed_lines.push_back(
+                string_member(edge, "caller_id", "observed route edge") + "\t" +
+                string_member(edge, "callee_id", "observed route edge") + "\t" +
+                string_member(edge, "file", "observed route edge") + "\t" +
+                std::to_string(size_member(
+                    edge, "character_offset", "observed route edge")));
+        }
+        std::vector<std::string> expected_lines;
+        for (const auto& edge : edges) {
+            if (string_member(edge, "caller_id", "generated route edge") ==
+                definition->id) {
+                expected_lines.push_back(
+                    definition->id + "\t" +
+                    string_member(edge, "callee_id", "generated route edge") + "\t" +
+                    string_member(edge, "file", "generated route edge") + "\t" +
+                    std::to_string(size_member(
+                        edge, "character_offset", "generated route edge")));
+            }
+        }
+        if (definition->id == root_registrar.id) {
+            for (const auto& edge : direct_edges) {
+                if (string_member(edge, "caller_id", "direct registrar edge") ==
+                    definition->id) {
+                    expected_lines.push_back(
+                        definition->id + "\t" +
+                        string_member(edge, "callee_id", "direct registrar edge") + "\t" +
+                        string_member(edge, "file", "direct registrar edge") + "\t" +
+                        std::to_string(size_member(
+                            edge, "character_offset", "direct registrar edge")));
+                }
+            }
+        }
+        std::sort(observed_lines.begin(), observed_lines.end());
+        std::sort(expected_lines.begin(), expected_lines.end());
+        require(observed_lines == expected_lines,
+                "generated registrar body has an unclassified or missing edge: " +
+                    definition->id);
+    }
+
+    std::map<std::string, names_t> route_parents;
+    for (const auto& edge : edges) {
+        route_parents[string_member(edge, "callee_id", "generated route edge")].insert(
+            string_member(edge, "caller_id", "generated route edge"));
+    }
+    const names_t shared_parents = {
+        generated_registrar.id, extension_registrar.id
+    };
+    for (const auto* definition : node_definitions) {
+        const auto parents = route_parents[definition->id];
+        if (definition->id == root_registrar.id) {
+            require(parents.empty(), "generated route root has a production parent");
+        } else if (definition->id == entry_registrar.id) {
+            require(parents == shared_parents,
+                    "generated route shared terminal has invalid parents");
+        } else {
+            require(parents.size() == 1U,
+                    "generated route has a cycle, missing parent, or multiple parent");
+        }
+    }
+
+    json nodes = json::array();
+    for (const auto* definition : node_definitions) {
+        nodes.push_back({
+            {"id", definition->id},
+            {"symbol", definition->symbol},
+            {"file", definition->file},
+            {"line", definition->line},
+            {"body_start", utf8_character_offset(
+                sources.sources.at(definition->file).source, definition->body_start)},
+            {"body_end", utf8_character_offset(
+                sources.sources.at(definition->file).source, definition->body_end)},
+            {"parameters", definition->parameters}
+        });
+    }
+
+    const std::vector<std::string> base_chain = {
+        root_registrar.id, server_bridge.id, config_bridge.id, wave_registrar.id
+    };
+    auto compatibility_chain = base_chain;
+    compatibility_chain.push_back(generated_registrar.id);
+    compatibility_chain.push_back(entry_registrar.id);
+    auto extension_chain = base_chain;
+    extension_chain.push_back(extension_registrar.id);
+    extension_chain.push_back(entry_registrar.id);
+
+    generated_route_t result;
+    json bindings = json::array();
+    names_t binding_names;
+    std::vector<std::string> binding_lines;
+    require(compatibility_rows.is_array() && compatibility_rows.size() == 92U,
+            "generated compatibility binding source must contain 92 rows");
+    for (const auto& row : compatibility_rows) {
+        const auto name = string_member(row, "name", "generated compatibility binding");
+        require(binding_names.insert(name).second,
+                "generated compatibility binding is duplicated: " + name);
+        const auto descriptor = string_member(
+            row, "descriptor_source", "generated compatibility binding");
+        const bool extension = descriptor.find("#wave_c_extension_binding") !=
+                               std::string::npos;
+        const auto& chain = extension ? extension_chain : compatibility_chain;
+        json binding = {
+            {"name", name},
+            {"branch", extension ? "extension" : "generated_compatibility"},
+            {"registrar_id", entry_registrar.id},
+            {"registrar_symbol", entry_registrar.symbol},
+            {"chain", chain},
+            {"chain_sha256", sha256_lines(chain)}
+        };
+        result.bindings_by_name.emplace(name, binding);
+        binding_lines.push_back(
+            name + "\t" + string_member(binding, "branch", name) + "\t" +
+            entry_registrar.id + "\t" + string_member(binding, "chain_sha256", name));
+        bindings.push_back(std::move(binding));
+    }
+    std::sort(bindings.begin(), bindings.end(), [](const auto& left, const auto& right) {
+        return left.at("name").get_ref<const std::string&>() <
+               right.at("name").get_ref<const std::string&>();
+    });
+    require(std::count_if(bindings.begin(), bindings.end(), [](const auto& binding) {
+                return binding.at("branch") == "generated_compatibility";
+            }) == 88 &&
+                std::count_if(bindings.begin(), bindings.end(), [](const auto& binding) {
+                    return binding.at("branch") == "extension";
+                }) == 4,
+            "generated compatibility reachability partition is invalid");
+
+    std::vector<std::string> route_lines;
+    for (const auto& node : nodes) {
+        route_lines.push_back(
+            "R\t" + string_member(node, "id", "generated route node") + "\t" +
+            string_member(node, "symbol", "generated route node") + "\t" +
+            string_member(node, "file", "generated route node") + "\t" +
+            std::to_string(size_member(node, "line", "generated route node")));
+    }
+    for (const auto& edge : edges) {
+        route_lines.push_back(
+            "E\t" + string_member(edge, "caller_id", "generated route edge") + "\t" +
+            string_member(edge, "callee_id", "generated route edge") + "\t" +
+            string_member(edge, "file", "generated route edge") + "\t" +
+            std::to_string(size_member(edge, "line", "generated route edge")) + "\t" +
+            std::to_string(size_member(edge, "character_offset", "generated route edge")) + "\t" +
+            string_member(edge, "expression", "generated route edge"));
+    }
+    for (const auto& operation : terminal_operations) {
+        route_lines.push_back(
+            "T\t" + string_member(operation, "caller_id", "generated terminal operation") + "\t" +
+            string_member(operation, "file", "generated terminal operation") + "\t" +
+            std::to_string(size_member(operation, "line", "generated terminal operation")) + "\t" +
+            std::to_string(size_member(operation, "character_offset", "generated terminal operation")) + "\t" +
+            string_member(operation, "expression", "generated terminal operation"));
+    }
+    std::sort(binding_lines.begin(), binding_lines.end());
+    result.route = {
+        {"node_count", nodes.size()},
+        {"edge_count", edges.size()},
+        {"terminal_operation_count", terminal_operations.size()},
+        {"binding_count", bindings.size()},
+        {"generated_compatibility_count", 88},
+        {"extension_count", 4},
+        {"shared_terminal_definition_id", entry_registrar.id},
+        {"shared_terminal_parent_ids", std::vector<std::string>(
+            shared_parents.begin(), shared_parents.end())},
+        {"nodes", nodes},
+        {"edges", edges},
+        {"terminal_operations", terminal_operations},
+        {"bindings", bindings},
+        {"route_sha256", sha256_sorted_unique_lines(route_lines)},
+        {"binding_sha256", sha256_sorted_unique_lines(binding_lines)}
+    };
     return result;
 }
 
@@ -1354,6 +1921,335 @@ void verify_legacy_preservation(const json& baseline, const json& current) {
             "resolved helper provenance or concrete alias coverage mismatch");
 }
 
+void verify_mcp_production_reachability(
+    const json& ledger, const json& current,
+    const authority_contract_t& authority,
+    const json& compatibility_rows,
+    const std::filesystem::path& root) {
+    const auto& current_contract = object_member(
+        object_member(ledger, "current_surface_contract", "authority ledger"),
+        "mcp", "current surface contract");
+    const auto& reachability_authority = object_member(
+        current_contract, "production_reachability", "current surface MCP");
+    require(reachability_authority.is_object() && reachability_authority.size() == 17U,
+            "MCP production reachability authority field inventory is invalid");
+    const auto& current_mcp = object_member(current, "mcp", "current manifest");
+    const auto& policy = object_member(
+        current_mcp, "production_reachability", "current MCP");
+    require(policy.is_object() && policy.size() == 13U &&
+                size_member(policy, "schema_version", "MCP production reachability") == 1U,
+            "MCP production reachability schema is invalid");
+
+    const auto& registrations = object_member(current_mcp, "registrations", "current MCP");
+    require(registrations.is_array() && registrations.size() == 331U,
+            "MCP production reachability requires 331 concrete registrations");
+    const auto sources = load_cpp_reachability_sources(root);
+    names_t terminal_offsets;
+    for (const auto& row : registrations) {
+        const auto name = string_member(row, "name", "MCP reachability registration");
+        const auto& source = object_member(row, "source", name);
+        const auto offset = signed_member(source, "character_offset", name + " source");
+        if (offset >= 0) {
+            const auto file = string_member(source, "file", name + " source");
+            const auto unit_it = sources.sources.find(file);
+            require(unit_it != sources.sources.end(),
+                    "MCP registration source is outside the registrar source inventory: " +
+                        name);
+            terminal_offsets.insert(
+                file + ":" + std::to_string(utf8_byte_offset(
+                    unit_it->second.source, static_cast<std::size_t>(offset))));
+        }
+    }
+
+    std::vector<const cpp_registrar_t*> roots;
+    for (const auto& definition : sources.definitions) {
+        if (definition.symbol == "mcp_standalone::register_standalone_tools")
+            roots.push_back(&definition);
+    }
+    require(roots.size() == 1U,
+            "production MCP root registrar definition count is not exactly one");
+    const auto route_entry = unique_owned_code_call(
+        sources, "src/standalone/src/core/mcp/mcp_standalone_tools.cpp",
+        std::regex(R"(\bregister_c03_compatibility_tools\s*\(\s*srv\s*\))"),
+        "C03 compatibility root registrar edge", *roots.front());
+    auto direct_terminal_offsets = terminal_offsets;
+    const auto route_entry_file = string_member(
+        route_entry, "file", "C03 compatibility root registrar edge");
+    const auto route_entry_unit = sources.sources.find(route_entry_file);
+    require(route_entry_unit != sources.sources.end(),
+            "C03 compatibility root registrar source is unavailable");
+    direct_terminal_offsets.insert(
+        route_entry_file + ":" + std::to_string(utf8_byte_offset(
+            route_entry_unit->second.source,
+            size_member(route_entry, "character_offset",
+                        "C03 compatibility root registrar edge"))));
+    const auto derived = derive_reachability(
+        sources, direct_terminal_offsets);
+    require(object_member(policy, "production_entry", "MCP production reachability") ==
+                derived.production_entry,
+            "MCP production entry differs from independently derived code evidence");
+    require(object_member(policy, "registrars", "MCP production reachability") ==
+                derived.registrars &&
+                object_member(policy, "edges", "MCP production reachability") == derived.edges,
+            "MCP registrar graph differs from independently derived code reachability");
+
+    std::vector<std::string> graph_lines;
+    for (const auto& registrar : derived.registrars) {
+        const auto& parent = object_member(registrar, "parent_id", "derived registrar");
+        const auto parent_id = parent.is_null() ? std::string() : parent.get<std::string>();
+        graph_lines.push_back(
+            "R\t" + string_member(registrar, "id", "derived registrar") + "\t" +
+            string_member(registrar, "symbol", "derived registrar") + "\t" +
+            string_member(registrar, "file", "derived registrar") + "\t" +
+            std::to_string(size_member(registrar, "line", "derived registrar")) + "\t" +
+            parent_id);
+    }
+    for (const auto& edge : derived.edges) {
+        graph_lines.push_back(
+            "E\t" + string_member(edge, "caller_id", "derived edge") + "\t" +
+            string_member(edge, "callee_id", "derived edge") + "\t" +
+            string_member(edge, "file", "derived edge") + "\t" +
+            std::to_string(size_member(edge, "line", "derived edge")) + "\t" +
+            std::to_string(size_member(edge, "character_offset", "derived edge")) + "\t" +
+            string_member(edge, "expression", "derived edge"));
+    }
+    const auto graph_hash = sha256_sorted_unique_lines(graph_lines);
+    require(size_member(policy, "reachable_registrar_count", "MCP production reachability") ==
+                derived.registrars.size() &&
+                size_member(policy, "registrar_edge_count", "MCP production reachability") ==
+                    derived.edges.size() &&
+                string_member(policy, "registrar_graph_sha256",
+                              "MCP production reachability") == graph_hash,
+            "MCP registrar graph cardinality or fingerprint is invalid");
+
+    const auto root_id = string_member(
+        derived.production_entry, "root_registrar_id", "derived production entry");
+    const auto root_definition = derived.definitions_by_id.find(root_id);
+    require(root_definition != derived.definitions_by_id.end(),
+            "derived production root definition is unavailable");
+    const auto generated = derive_generated_route(
+        sources, *root_definition->second, compatibility_rows,
+        derived.edges, terminal_offsets);
+    require(object_member(policy, "generated_route", "MCP production reachability") ==
+                generated.route,
+            "generated MCP route differs from independently derived enclosing definitions");
+
+    names_t reachable_ids;
+    for (const auto& registrar : derived.registrars) {
+        require(reachable_ids.insert(
+                    string_member(registrar, "id", "derived registrar")).second,
+                "derived registrar identity is duplicated");
+    }
+    std::vector<std::string> row_lines;
+    names_t registration_names;
+    names_t projected_names;
+    std::size_t direct_count = 0;
+    std::size_t projection_count = 0;
+    for (const auto& row : registrations) {
+        const auto name = string_member(row, "name", "MCP reachability registration");
+        require(registration_names.insert(name).second,
+                "MCP reachability registration name is duplicated: " + name);
+        const auto& source = object_member(row, "source", name);
+        const auto file = string_member(source, "file", name + " source");
+        const auto line = size_member(source, "line", name + " source");
+        const auto offset = signed_member(source, "character_offset", name + " source");
+        const auto& binding = object_member(
+            row, "production_reachability", name + " registration");
+        if (offset >= 0) {
+            const auto unit_it = sources.sources.find(file);
+            require(unit_it != sources.sources.end(),
+                    "MCP registration source is outside the registrar graph: " + name);
+            const auto& unit = unit_it->second;
+            const auto absolute = utf8_byte_offset(
+                unit.source, static_cast<std::size_t>(offset));
+            require(absolute < unit.mask.size() && source_line(unit.source, absolute) == line,
+                    "MCP registration source offset or line is invalid: " + name);
+            const std::array<std::string_view, 4> syntaxes = {
+                ".register_tool", "register_tool",
+                "register_direct_alias", "register_dispatch_alias"
+            };
+            require(std::any_of(syntaxes.begin(), syntaxes.end(), [&](auto syntax) {
+                        if (unit.mask.compare(absolute, syntax.size(), syntax) != 0)
+                            return false;
+                        auto cursor = absolute + syntax.size();
+                        while (cursor < unit.mask.size() &&
+                               std::isspace(static_cast<unsigned char>(
+                                   unit.mask[cursor])) != 0) {
+                            ++cursor;
+                        }
+                        return cursor < unit.mask.size() && unit.mask[cursor] == '(';
+                    }),
+                    "MCP registration offset is not code registration syntax: " + name);
+            const auto opening = unit.mask.find('(', absolute);
+            require(opening != std::string::npos,
+                    "MCP registration call opening delimiter is unavailable: " + name);
+            const auto closing = matching_index(unit.mask, opening, '(', ')');
+            const auto evidence = string_member(source, "evidence", name + " source");
+            if (evidence != "assigned_tool_definition") {
+                const auto call = std::string_view(unit.source).substr(
+                    absolute, closing - absolute + 1U);
+                require(call.find("\"" + name + "\"") != std::string_view::npos,
+                        "MCP registration call lacks its concrete name: " + name);
+            }
+            std::vector<const cpp_registrar_t*> owners;
+            for (const auto& definition : sources.definitions) {
+                if (definition.file == file && definition.body_start < absolute &&
+                    absolute < definition.body_end) {
+                    owners.push_back(&definition);
+                }
+            }
+            require(owners.size() == 1U,
+                    "MCP registration does not have exactly one enclosing registrar: " + name);
+            const auto* registrar = owners.front();
+            require(reachable_ids.count(registrar->id) == 1U &&
+                        derived.chains.count(registrar->id) == 1U,
+                    "MCP registration is in an unreachable registrar: " + name);
+            const auto& chain = derived.chains.at(registrar->id);
+            const json expected = {
+                {"mode", "direct_registration"},
+                {"registrar_id", registrar->id},
+                {"registrar_symbol", registrar->symbol},
+                {"chain", chain},
+                {"chain_sha256", sha256_lines(chain)}
+            };
+            require(binding == expected,
+                    "MCP direct registration has an invalid registrar binding: " + name);
+            ++direct_count;
+        } else {
+            require(offset == -1,
+                    "MCP generated projection uses an invalid negative source offset: " + name);
+            const auto generated_it = generated.bindings_by_name.find(name);
+            require(generated_it != generated.bindings_by_name.end(),
+                    "MCP generated projection lacks a per-name route: " + name);
+            const auto& generated_binding = generated_it->second;
+            const json expected = {
+                {"mode", "generated_compatibility_projection"},
+                {"generated_branch", string_member(
+                    generated_binding, "branch", name + " generated binding")},
+                {"registrar_id", string_member(
+                    generated_binding, "registrar_id", name + " generated binding")},
+                {"registrar_symbol", string_member(
+                    generated_binding, "registrar_symbol", name + " generated binding")},
+                {"chain", object_member(
+                    generated_binding, "chain", name + " generated binding")},
+                {"chain_sha256", string_member(
+                    generated_binding, "chain_sha256", name + " generated binding")}
+            };
+            require(binding == expected,
+                    "MCP generated projection has an invalid per-name route: " + name);
+            projected_names.insert(name);
+            ++projection_count;
+        }
+        row_lines.push_back(
+            name + "\t" + string_member(binding, "mode", name + " binding") + "\t" +
+            string_member(binding, "registrar_id", name + " binding") + "\t" +
+            string_member(binding, "chain_sha256", name + " binding"));
+    }
+    std::sort(row_lines.begin(), row_lines.end());
+    const auto row_hash = sha256_lines(row_lines);
+    require(direct_count + projection_count == 331U &&
+                direct_count == 281U && projection_count == 50U &&
+                size_member(policy, "concrete_registration_count",
+                            "MCP production reachability") == 331U &&
+                size_member(policy, "direct_registration_count",
+                            "MCP production reachability") == direct_count &&
+                size_member(policy, "generated_projection_count",
+                            "MCP production reachability") == projection_count &&
+                string_member(policy, "row_binding_sha256",
+                              "MCP production reachability") == row_hash,
+            "MCP registration reachability cardinality or fingerprint is invalid");
+    require_exact_names(
+        projected_names,
+        names_from(object_member(current_mcp, "generated_only_names", "current MCP"),
+                   "current generated-only registrations"),
+        "MCP generated-only production projection");
+
+    names_t generated_names;
+    for (const auto& row : compatibility_rows) {
+        const auto name = string_member(row, "name", "canonical generated registration");
+        require(generated_names.insert(name).second,
+                "canonical generated registration is duplicated: " + name);
+        const auto binding_it = generated.bindings_by_name.find(name);
+        require(binding_it != generated.bindings_by_name.end() &&
+                    object_member(row, "production_reachability",
+                                  name + " canonical registration") == binding_it->second,
+                "canonical generated registration lacks exact per-name reachability: " + name);
+    }
+    require_exact_names(generated_names, authority.union_names,
+                        "canonical generated production reachability");
+
+    const auto generated_route_hash = string_member(
+        generated.route, "route_sha256", "derived generated route");
+    const auto generated_binding_hash = string_member(
+        generated.route, "binding_sha256", "derived generated route");
+    const std::map<std::string, json> expected_authority = {
+        {"schema_version", 1},
+        {"concrete_registration_count", 331},
+        {"direct_registration_count", direct_count},
+        {"generated_projection_count", projection_count},
+        {"reachable_registrar_count", derived.registrars.size()},
+        {"registrar_edge_count", derived.edges.size()},
+        {"row_binding_sha256", row_hash},
+        {"registrar_graph_sha256", graph_hash},
+        {"generated_route_node_count", 7},
+        {"generated_route_edge_count", 7},
+        {"generated_terminal_operation_count", 2},
+        {"generated_binding_count", 92},
+        {"generated_compatibility_count", 88},
+        {"generated_extension_count", 4},
+        {"generated_route_sha256", generated_route_hash},
+        {"generated_binding_sha256", generated_binding_hash}
+    };
+    for (const auto& [field, expected] : expected_authority) {
+        require(reachability_authority.contains(field) &&
+                    reachability_authority.at(field) == expected,
+                "MCP production reachability differs from authority at " + field);
+    }
+    const auto& entry_authority = object_member(
+        reachability_authority, "production_entry", "reachability authority");
+    const json expected_entry_authority = {
+        {"file", string_member(derived.production_entry, "file", "derived entry")},
+        {"expression", string_member(
+            derived.production_entry, "expression", "derived entry")},
+        {"root_registrar_symbol", string_member(
+            derived.production_entry, "root_registrar_symbol", "derived entry")}
+    };
+    require(entry_authority == expected_entry_authority,
+            "MCP production entry authority is invalid");
+
+    const auto source_files = names_from(
+        object_member(policy, "source_files", "MCP production reachability"),
+        "MCP production reachability source files");
+    names_t expected_source_files;
+    for (const auto& registrar : derived.registrars)
+        expected_source_files.insert(string_member(registrar, "file", "derived registrar"));
+    expected_source_files.insert("src/standalone/src/core/ai/standalone_chat.cpp");
+    expected_source_files.insert("src/standalone/src/core/mcp/mcp_standalone.cpp");
+    expected_source_files.insert(
+        "src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp");
+    expected_source_files.insert(
+        "src/standalone/src/core/mcp/compat/mcp_server_integration.cpp");
+    require_exact_names(source_files, expected_source_files,
+                        "MCP production reachability source files");
+
+    std::unordered_map<std::string, std::string> evidence_hashes;
+    const auto& evidence = object_member(current, "evidence_source_hashes", "current manifest");
+    require(evidence.is_array(), "current source hash evidence must be an array");
+    for (const auto& row : evidence) {
+        const auto file = string_member(row, "file", "source hash evidence");
+        const auto hash = string_member(row, "sha256", "source hash evidence");
+        require(evidence_hashes.emplace(file, hash).second,
+                "source hash evidence contains a duplicate file: " + file);
+    }
+    for (const auto& file : source_files) {
+        const auto found = evidence_hashes.find(file);
+        require(found != evidence_hashes.end() &&
+                    found->second == sha256_text(read_bounded(
+                        repository_file(root, file), k_maximum_source_bytes)),
+                "MCP reachability source hash is missing or stale: " + file);
+    }
+}
+
 void verify_runtime_and_final_contract(
     const json& ledger, const json& current, const authority_contract_t& authority,
     const descriptor_evidence_t& descriptors, const std::filesystem::path& root) {
@@ -1451,10 +2347,10 @@ void verify_runtime_and_final_contract(
     require(size_member(legacy_projection, "registration_count", "legacy schema projection") == 42U,
             "legacy IDA schema projection must preserve 42 registrations");
 
-    const std::array<std::string_view, 13> required_row_keys = {
+    const std::array<std::string_view, 14> required_row_keys = {
         "name", "descriptor_source", "adapter_symbol", "effect", "lock",
         "target_dependent", "accepts_pid", "accepts_bin_name", "read_only", "unsafe",
-        "production_handler", "functional_fixture", "domain"
+        "production_handler", "functional_fixture", "domain", "production_reachability"
     };
     names_t expected_row_keys;
     for (const auto key : required_row_keys)
@@ -1500,6 +2396,8 @@ void verify_runtime_and_final_contract(
             result.insert(name);
         return result;
     }(), authority.union_names, "canonical compatibility rows");
+    verify_mcp_production_reachability(
+        ledger, current, authority, rows, root);
 
     const auto& ledger_domains = object_member(current_contract, "domains", "current surface MCP");
     const auto& final_domains = object_member(compatibility, "domains", "IDA compatibility");
@@ -1858,6 +2756,98 @@ void verify_public_surfaces(const json& ledger, const json& current,
     require_exact_names(evidenced_replacements, replacements, "evidenced replacement paths");
 }
 
+void verify_authority_cmake_integration(const std::filesystem::path& root) {
+    const auto cmake = read_bounded(repository_file(
+        root, "cmake/aida_c03_safe_headless_manifest.cmake"),
+        k_maximum_source_bytes);
+    const auto count_in = [](std::string_view text, std::string_view token) {
+        require(!token.empty(), "CMake identity token is empty");
+        std::size_t observed = 0;
+        for (auto offset = text.find(token); offset != std::string_view::npos;
+             offset = text.find(token, offset + token.size()))
+            ++observed;
+        return observed;
+    };
+    require(count_in(cmake, "aida_c03_register_manifest_entry(") == 57U &&
+                count_in(cmake, "aida_c03_register_direct_test(") == 13U &&
+                count_in(cmake, "add_test(NAME") == 3U &&
+                count_in(cmake,
+                    "add_test(NAME aida_c03_authority_surface_reproduction") == 1U &&
+                count_in(cmake,
+                    "set_tests_properties(aida_c03_authority_surface_reproduction PROPERTIES") == 1U &&
+                cmake.find("aida_c03_mcp_contract_generator_reproduction") ==
+                    std::string::npos,
+            "authority CTest inventory is not the exact 15-test combined contract");
+    const auto slice = [&](std::string_view begin_token, std::string_view end_token,
+                           std::string_view identity) {
+        const auto begin = cmake.find(begin_token);
+        const auto end = begin == std::string::npos
+            ? std::string::npos
+            : cmake.find(end_token, begin + begin_token.size());
+        require(begin != std::string::npos && end != std::string::npos && end > begin,
+                std::string(identity) + " has stable source boundaries");
+        return std::string_view(cmake).substr(begin, end - begin);
+    };
+    const auto authority_test = slice(
+        "add_test(NAME aida_c03_authority_surface_reproduction",
+        "get_property(_aida_compiler_harness_inputs", "authority CTest");
+    for (const auto token : std::array<std::string_view, 10>{
+             "COMMAND \"${Python3_EXECUTABLE}\"",
+             "\"${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py\"",
+             "--repository-root \"${CMAKE_SOURCE_DIR}\"",
+             "--ledger \"${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json\"",
+             "--archive \"${_aida_authority_archive}\"",
+             "--powershell \"${_aida_system_powershell}\"",
+             "WORKING_DIRECTORY \"${CMAKE_CURRENT_SOURCE_DIR}\"",
+             "TIMEOUT 600",
+             "LABELS \"c03;c03_safe_headless;safe-headless;authority;surface;contract-reproduction\"",
+             "RESOURCE_LOCK \"aida_c03_authority_surface_reproduction\""}) {
+        require(authority_test.find(token) != std::string_view::npos,
+                "authority CTest command or property is missing: " + std::string(token));
+    }
+    const std::array<std::string_view, 11> authority_inputs = {
+        "tools/c03_authority/verify_authority_surface_ledger.py",
+        "tools/c03_authority/authority_surface_ledger.json",
+        "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py",
+        "src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1",
+        "src/standalone/tests/analysis_workspace/standalone_surface_baseline.json",
+        "src/standalone/tests/analysis_workspace/standalone_surface_final.json",
+        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json",
+        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json",
+        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json",
+        "src/standalone/src/core/mcp/compat/ida_contracts_generated.hpp",
+        "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
+    };
+    const auto repository_inputs = slice(
+        "set(_aida_authority_repository_files",
+        "aida_c03_require_sources(\"authority and surface reproduction\"",
+        "authority repository inputs");
+    const auto policy_inputs = slice(
+        "set(_aida_policy_runtime",
+        "foreach(_aida_relative IN LISTS _aida_policy_runtime)",
+        "authority source-policy runtime inputs");
+    for (const auto input : authority_inputs) {
+        require(count_in(repository_inputs, input) == 1U &&
+                    count_in(policy_inputs, input) == 1U,
+                "authority input is missing or duplicated in CMake: " +
+                    std::string(input));
+    }
+    for (const auto token : std::array<std::string_view, 13>{
+             "if(NOT Python3_Interpreter_FOUND OR NOT Python3_EXECUTABLE)",
+             "_aida_python_sha256", "_aida_system_powershell_sha256",
+             "${_aida_system_root}/System32/WindowsPowerShell/v1.0/powershell.exe",
+             "set(_aida_authority_archive \"C:/Users/ruar1337/ida-pro-mcp.zip\")",
+             "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7",
+             "CMAKE_CONFIGURE_DEPENDS", "${_aida_python_executable}",
+             "${_aida_system_powershell}", "${_aida_authority_archive}",
+             "foreach(_aida_authority_file IN LISTS _aida_authority_repository_files)",
+             "file(SHA256 \"${_aida_authority_file}\" _aida_authority_file_sha256)",
+             "string(SHA256 _aida_authority_identity"}) {
+        require(cmake.find(token) != std::string::npos,
+                "authority configure/hash binding is missing: " + std::string(token));
+    }
+}
+
 }
 
 authority_surface_ledger_result_t run_authority_surface_ledger_harness() {
@@ -1883,6 +2873,7 @@ authority_surface_ledger_result_t run_authority_surface_ledger_harness() {
         const auto archive_manifest = read_json(repository_file(root, artifacts.at(2).get<std::string>()));
         const auto descriptors = verify_generated_descriptors(
             contracts_artifact, effects_artifact, archive_manifest, authority);
+        verify_authority_cmake_integration(root);
         verify_legacy_preservation(baseline, current);
         verify_runtime_and_final_contract(ledger, current, authority, descriptors, root);
         verify_public_surfaces(ledger, current, root);

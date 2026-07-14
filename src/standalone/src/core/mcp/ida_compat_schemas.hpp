@@ -716,18 +716,6 @@ namespace mcp_standalone::ida_compat
                 "additionalProperties": false
             })");
 
-            s["py_exec_file"] = json::parse(R"({
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "minLength": 1, "maxLength": 4096},
-                    "approve_unsafe": {"type": "boolean"},
-                    "bin_name": {"type": "string", "minLength": 1, "maxLength": 32768},
-                    "pid": {"type": "integer", "minimum": 1, "maximum": 4294967295}
-                },
-                "required": ["file_path", "approve_unsafe"],
-                "additionalProperties": false
-            })");
-
             const json calculator_integer_value = {
                 {"oneOf", json::array({
                     json{{"type", "integer"}},

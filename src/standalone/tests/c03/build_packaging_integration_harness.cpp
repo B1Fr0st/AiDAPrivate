@@ -886,6 +886,98 @@ package_verification_request_t request_for(const fixture_t& fixture,
     return request;
 }
 
+void verify_allowed_customer_path_neighbors(fixture_t& fixture,
+                                            build_worker_packaging_integration_t& integration) {
+    constexpr std::string_view allowed_paths[]{
+        "resources/runtime-policy.json",
+        "resources/runtime-policy.sha256",
+        "resources/LICENSE.txt",
+        "resources/NOTICE.md",
+        "resources/binary-layout.dat",
+        "resources/runtime.manifest"
+    };
+    auto candidate = fixture.manifest();
+    std::size_t index = 0;
+    for (const auto path : allowed_paths) {
+        const auto absolute = fixture.package() / std::filesystem::u8path(path);
+        write_text(absolute, std::string(path) + "\n");
+        candidate["artifacts"].push_back({
+            {"id", "allowed-neighbor-" + std::to_string(index++)}, {"kind", "resource"},
+            {"relative_path", std::string(path)}, {"size_bytes", file_size(absolute)},
+            {"sha256", file_hash(absolute)}, {"owner", "fixture"},
+            {"license_ids", json::array()}});
+    }
+    const auto digest = fixture.publish_manifest(candidate, "allowed-neighbors.json");
+    const auto verified = integration.verify_distribution_package(request_for(fixture, digest));
+    require(static_cast<bool>(verified),
+            verified ? "" : "legitimate customer resource neighbor was rejected");
+    for (const auto path : allowed_paths)
+        std::filesystem::remove(fixture.package() / std::filesystem::u8path(path));
+    fixture.publish_manifest(fixture.manifest());
+}
+
+void verify_forbidden_customer_path_policy(fixture_t& fixture,
+                                           build_worker_packaging_integration_t& integration) {
+    constexpr std::string_view forbidden_extensions[]{
+        ".a", ".asm", ".bash", ".bat", ".c", ".c++", ".cc", ".cmake", ".cmd", ".cpp",
+        ".cppm", ".cs", ".csproj", ".cxx", ".def", ".exp", ".fs", ".fsproj", ".go",
+        ".gradle", ".h", ".hh", ".hpp", ".hxx", ".ilk", ".in", ".inc", ".inl", ".ipp",
+        ".ixx", ".java", ".kt", ".kts", ".lib", ".m", ".make", ".map", ".mk", ".mm",
+        ".natvis", ".nupkg", ".nuspec", ".obj", ".pdb", ".props", ".ps1", ".psd1",
+        ".psm1", ".pth", ".py", ".pyc", ".pyo", ".pyz", ".rc", ".rc2", ".rs", ".s",
+        ".sh", ".sln", ".snupkg", ".spec", ".swift", ".targets", ".tpp", ".vb",
+        ".vbproj", ".vcxproj", ".vcxproj.filters", ".whl", ".zig", ".zsh"
+    };
+    constexpr std::string_view forbidden_paths[]{
+        "nested/BUILD",
+        "nested/BUILD.BAZEL",
+        "nested/CMakeLists.TXT",
+        "nested/GNUMakefile",
+        "nested/Makefile",
+        "nested/MESON.BUILD",
+        "nested/WORKSPACE",
+        "nested/WORKSPACE.BAZEL",
+        "nested/C03-SAFE-HEADLESS/bin/harness.exe",
+        "nested/camoufox-reverse-mcp/source.txt",
+        "nested/CAMOUFOX_REVERSE_MCP/source.txt",
+        "nested/LIBRARY-PACKS/runtime.dll",
+        "nested/METADATA/runtime.dll",
+        "nested/PACKS/runtime.dll",
+        "nested/SDK/runtime.dll",
+        "nested/TEMPLATES/runtime.dll",
+        "nested/provider.DIST-INFO/runtime.dll",
+        "nested/provider.EGG-INFO/runtime.dll",
+        "nested/payload.CpP",
+        "nested/payload.PS1.backup",
+        "nested/payload.HPP_copy",
+        "nested/payload.CMAKE-old",
+        "nested/chrome.EXE",
+        "nested/MSEDGE.exe",
+        "nested/STOCK-FIREFOX.EXE"
+    };
+    std::size_t case_index = 0;
+    const auto reject = [&](std::string relative_path) {
+        auto candidate = fixture.manifest();
+        json artifact{
+            {"id", "forbidden-path-" + std::to_string(case_index)}, {"kind", "resource"},
+            {"relative_path", std::move(relative_path)}, {"size_bytes", 1},
+            {"sha256", std::string(64, 'a')}, {"owner", "fixture"},
+            {"license_ids", json::array()}};
+        candidate["artifacts"].insert(candidate["artifacts"].begin(), std::move(artifact));
+        const auto digest = fixture.publish_manifest(
+            candidate, "forbidden-path-" + std::to_string(case_index++) + ".json");
+        const auto rejected = integration.verify_distribution_package(request_for(fixture, digest));
+        require(!rejected && rejected.error().code ==
+                    build_worker_error_code_t::package_policy_violation,
+                "forbidden customer source, script, build, or developer payload was accepted");
+    };
+    for (const auto extension : forbidden_extensions)
+        reject("nested/source/payload" + std::string(extension));
+    for (const auto path : forbidden_paths)
+        reject(std::string(path));
+    reject(std::string(32769, 'x'));
+}
+
 void verify_deny_link_policy() {
     build_worker_packaging_integration_t integration;
     deny_link_check_request_t clean{"AiDAStandalone", {"imgui", "z3"},
@@ -927,6 +1019,9 @@ void verify_real_distribution() {
             "verified package evidence counters or policy results are incomplete");
     require(integration.package_verifications_completed() == 1,
             "package success counter did not advance exactly once");
+    verify_allowed_customer_path_neighbors(fixture, integration);
+    require(integration.package_verifications_completed() == 2,
+            "allowed customer resource neighbors did not reach the production verifier");
 
     auto widened_budget = request_for(fixture, manifest_hash);
     widened_budget.maximum_total_artifact_bytes = k_default_package_total_limit + 1;
@@ -1030,6 +1125,17 @@ void verify_real_distribution() {
     require(!missing_standalone_rejected && missing_standalone_rejected.error().code ==
                 build_worker_error_code_t::artifact_inventory_mismatch,
             "unbound protected standalone was accepted");
+
+    const auto leaked_safe_headless_source = fixture.package() /
+        "c03-safe-headless/nested/HARNESS.CPP";
+    write_text(leaked_safe_headless_source, "source leak\n");
+    fixture.publish_manifest(fixture.manifest(), "safe-headless-source-leak.json");
+    const auto safe_headless_source_rejected = integration.verify_distribution_package(
+        request_for(fixture, file_hash(fixture.manifest_path())));
+    require(!safe_headless_source_rejected && safe_headless_source_rejected.error().code ==
+                build_worker_error_code_t::package_policy_violation,
+            "unlisted developer safe-headless source payload was accepted");
+    std::filesystem::remove_all(fixture.package() / "c03-safe-headless");
 
     write_text(fixture.package() / "unlisted.bin", "unlisted\n");
     fixture.publish_manifest(fixture.manifest(), "unlisted.json");
@@ -1172,6 +1278,7 @@ void verify_real_distribution() {
     require(!camoufox_rejected && camoufox_rejected.error().code ==
                 build_worker_error_code_t::artifact_inventory_mismatch,
             "incomplete Camoufox bundle was accepted");
+    verify_forbidden_customer_path_policy(fixture, integration);
 }
 
 }

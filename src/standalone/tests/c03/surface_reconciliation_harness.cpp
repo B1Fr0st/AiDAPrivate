@@ -50,6 +50,17 @@ surface_entry_t retired(surface_entry_t entry, std::string replacement) {
     return entry;
 }
 
+surface_entry_t inactive(surface_entry_t entry) {
+    entry.is_active = false;
+    entry.is_replaced = false;
+    entry.replaced_by.clear();
+    if (entry.kind == surface_entry_kind_t::security_guard &&
+        entry.security_note.empty()) {
+        entry.security_note = "guard disabled in adverse fixture";
+    }
+    return entry;
+}
+
 std::size_t finding_count(
     const surface_reconciliation_result_t& result,
     surface_error_code_t code, std::string_view identifier = {}) {
@@ -90,6 +101,11 @@ void require_contains(
     require(finding.detail.find(expected) != std::string::npos,
             "reconciliation finding detail token is absent");
 }
+
+void require_replacement_reason(
+    const surface_reconciliation_result_t& result,
+    std::string_view collection, std::string_view identifier,
+    std::string_view target, std::string_view reason);
 
 bool equal_results(
     const surface_reconciliation_result_t& left,
@@ -344,6 +360,433 @@ void verify_lawful_migrations() {
             "explicit source, stale, alias, or schema migration was rejected");
 }
 
+void verify_inactive_actual_proof_closure() {
+    {
+        surface_reconciliation_t reconciliation;
+
+        auto actual_dead = retired(make_entry(
+            "actual_dead", "surface/actual_dead.cpp",
+            surface_entry_kind_t::source_file), "actual_dead_target");
+        reconciliation.register_actual_entry(actual_dead);
+        reconciliation.register_actual_entry(make_entry(
+            "actual_dead_target", "surface/actual_dead_target.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.mark_dead_replaced_path(
+            "actual_dead", "actual_dead_target");
+
+        auto matched_dead = retired(make_entry(
+            "matched_dead", "surface/matched_dead.cpp",
+            surface_entry_kind_t::test_harness), "matched_dead_target");
+        reconciliation.register_baseline_entry(matched_dead);
+        reconciliation.register_actual_entry(matched_dead);
+        reconciliation.register_actual_entry(make_entry(
+            "matched_dead_target", "surface/matched_dead_target.cpp",
+            surface_entry_kind_t::test_harness));
+        reconciliation.mark_dead_replaced_path(
+            "matched_dead", "matched_dead_target");
+
+        auto actual_alias = retired(make_entry(
+            "actual_alias", "surface/actual_alias.cpp",
+            surface_entry_kind_t::alias_mapping), "actual_alias_target");
+        reconciliation.register_actual_entry(actual_alias);
+        reconciliation.register_actual_entry(make_entry(
+            "actual_alias_target", "surface/actual_alias_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_unsupported_alias(
+            "actual_alias", "actual_alias_target");
+
+        auto matched_alias = retired(make_entry(
+            "matched_alias", "surface/matched_alias.cpp",
+            surface_entry_kind_t::alias_mapping), "matched_alias_target");
+        reconciliation.register_baseline_entry(matched_alias);
+        reconciliation.register_actual_entry(matched_alias);
+        reconciliation.register_actual_entry(make_entry(
+            "matched_alias_target", "surface/matched_alias_target.cpp",
+            surface_entry_kind_t::tool_registration));
+        reconciliation.mark_unsupported_alias(
+            "matched_alias", "matched_alias_target");
+
+        auto actual_stale = inactive(make_entry(
+            "actual_stale", "surface/actual_stale.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.register_actual_entry(actual_stale);
+        reconciliation.mark_stale_registration("actual_stale");
+
+        auto matched_stale = inactive(make_entry(
+            "matched_stale", "surface/matched_stale.cpp",
+            surface_entry_kind_t::tool_registration));
+        reconciliation.register_baseline_entry(matched_stale);
+        reconciliation.register_actual_entry(matched_stale);
+        reconciliation.mark_stale_registration("matched_stale");
+
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(first.clean && first.findings.empty() &&
+                    first.unexplained_removals == 0,
+                "lawful inactive actual proofs did not reconcile cleanly");
+        require(equal_results(first, second),
+                "lawful inactive actual proof reconciliation is nondeterministic");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto entry = inactive(make_entry(
+            "actual_unproved", "surface/actual_unproved.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.register_actual_entry(entry);
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        const auto& finding = require_finding(
+            first, surface_error_code_t::unexplained_removal_detected,
+            "actual_unproved");
+        require_detail(
+            finding,
+            "inactive actual entry has no exact lawful retirement proof");
+        require(finding.canonical_path == entry.canonical_path &&
+                    finding.kind == entry.kind && finding.severity == 800 &&
+                    first.unexplained_removals == 1 && !first.clean,
+                "actual-only inactive proof failure lost exact evidence");
+        require(equal_results(first, second),
+                "actual-only inactive proof failure is nondeterministic");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto entry = inactive(make_entry(
+            "matched_unproved", "surface/matched_unproved.cpp",
+            surface_entry_kind_t::tool_registration));
+        reconciliation.register_baseline_entry(entry);
+        reconciliation.register_actual_entry(entry);
+        const auto result = reconciliation.reconcile();
+        require_detail(require_finding(
+                           result,
+                           surface_error_code_t::unexplained_removal_detected,
+                           "matched_unproved"),
+                       "inactive actual registration has no exact stale proof");
+        require_no_finding(
+            result, surface_error_code_t::baseline_mismatch,
+            "matched_unproved");
+        require(result.unexplained_removals == 1 && !result.clean,
+                "matching inactive registration bypassed proof closure");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto entry = retired(make_entry(
+            "replacement_without_marker",
+            "surface/replacement_without_marker.cpp",
+            surface_entry_kind_t::source_file), "unbound_replacement_target");
+        reconciliation.register_actual_entry(entry);
+        const auto result = reconciliation.reconcile();
+        require_detail(require_finding(
+                           result,
+                           surface_error_code_t::unexplained_removal_detected,
+                           "replacement_without_marker"),
+                       "inactive actual entry replacement has no exact lawful proof; target=unbound_replacement_target");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(inactive(make_entry(
+            "dead_marker_without_replacement",
+            "surface/dead_marker_without_replacement.cpp",
+            surface_entry_kind_t::source_file)));
+        reconciliation.register_actual_entry(make_entry(
+            "dead_marker_target", "surface/dead_marker_target.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.mark_dead_replaced_path(
+            "dead_marker_without_replacement", "dead_marker_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "dead_marker_without_replacement",
+            "dead_marker_target", "inactive_source_without_replacement_state");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "dead_marker_without_replacement");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(retired(make_entry(
+            "stale_marker_with_replacement",
+            "surface/stale_marker_with_replacement.cpp",
+            surface_entry_kind_t::handler_registration),
+            "stale_marker_target"));
+        reconciliation.mark_stale_registration("stale_marker_with_replacement");
+        const auto result = reconciliation.reconcile();
+        require_contains(require_finding(
+                             result, surface_error_code_t::invalid_surface_marker,
+                             "stale_marker_with_replacement"),
+                         "collection=stale_registrations, reason=stale_source_has_replacement");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "stale_marker_with_replacement");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto baseline = make_entry(
+            "stale_source_identity", "surface/stale_source_baseline.cpp",
+            surface_entry_kind_t::tool_registration);
+        auto actual = inactive(baseline);
+        actual.canonical_path = "surface/stale_source_actual.cpp";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.mark_stale_registration("stale_source_identity");
+        const auto result = reconciliation.reconcile();
+        require_contains(require_finding(
+                             result, surface_error_code_t::invalid_surface_marker,
+                             "stale_source_identity"),
+                         "collection=stale_registrations, reason=conflicting_source_identity");
+        require_finding(
+            result, surface_error_code_t::baseline_mismatch,
+            "stale_source_identity");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "stale_source_identity");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto source = retired(make_entry(
+            "mismatched_replacement", "surface/mismatched_replacement.cpp",
+            surface_entry_kind_t::source_file), "declared_target");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "declared_target", "surface/declared_target.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.register_actual_entry(make_entry(
+            "marker_target", "surface/marker_target.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.mark_dead_replaced_path(
+            "mismatched_replacement", "marker_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "mismatched_replacement",
+            "marker_target", "source_replacement_target_mismatch");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "mismatched_replacement");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto source = retired(make_entry(
+            "missing_replacement_target",
+            "surface/missing_replacement_target.cpp",
+            surface_entry_kind_t::source_file), "missing_target");
+        reconciliation.register_actual_entry(source);
+        reconciliation.mark_dead_replaced_path(
+            "missing_replacement_target", "missing_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "missing_replacement_target",
+            "missing_target", "missing_actual_target");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "missing_replacement_target");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto source = retired(make_entry(
+            "inactive_replacement_source",
+            "surface/inactive_replacement_source.cpp",
+            surface_entry_kind_t::source_file), "inactive_replacement_target");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(inactive(make_entry(
+            "inactive_replacement_target",
+            "surface/inactive_replacement_target.cpp",
+            surface_entry_kind_t::source_file)));
+        reconciliation.mark_dead_replaced_path(
+            "inactive_replacement_source", "inactive_replacement_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "inactive_replacement_source",
+            "inactive_replacement_target", "inactive_actual_target");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "inactive_replacement_source");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "inactive_replacement_target");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto source = retired(make_entry(
+            "duplicate_replacement_source",
+            "surface/duplicate_replacement_source.cpp",
+            surface_entry_kind_t::source_file), "duplicate_replacement_target");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "duplicate_replacement_target",
+            "surface/duplicate_replacement_target_a.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.register_actual_entry(make_entry(
+            "duplicate_replacement_target",
+            "surface/duplicate_replacement_target_b.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.mark_dead_replaced_path(
+            "duplicate_replacement_source", "duplicate_replacement_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "duplicate_replacement_source",
+            "duplicate_replacement_target", "ambiguous_actual_target");
+        require_finding(
+            result, surface_error_code_t::duplicate_actual_identifier_detected,
+            "duplicate_replacement_target");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "duplicate_replacement_source");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto source = retired(make_entry(
+            "wrong_kind_replacement", "surface/wrong_kind_replacement.cpp",
+            surface_entry_kind_t::source_file), "wrong_kind_target");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "wrong_kind_target", "surface/wrong_kind_target.cpp",
+            surface_entry_kind_t::test_harness));
+        reconciliation.mark_dead_replaced_path(
+            "wrong_kind_replacement", "wrong_kind_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "wrong_kind_replacement",
+            "wrong_kind_target", "incompatible_actual_target_kind");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "wrong_kind_replacement");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(inactive(make_entry(
+            "self_proof", "surface/self_proof.cpp",
+            surface_entry_kind_t::source_file)));
+        reconciliation.mark_dead_replaced_path("self_proof", "self_proof");
+        const auto result = reconciliation.reconcile();
+        require_contains(require_finding(
+                             result, surface_error_code_t::invalid_surface_marker,
+                             "self_proof"),
+                         "reason=self_replacement");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "self_proof");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(retired(make_entry(
+            "inactive_cycle_a", "surface/inactive_cycle_a.cpp",
+            surface_entry_kind_t::source_file), "inactive_cycle_b"));
+        reconciliation.register_actual_entry(retired(make_entry(
+            "inactive_cycle_b", "surface/inactive_cycle_b.cpp",
+            surface_entry_kind_t::source_file), "inactive_cycle_a"));
+        reconciliation.mark_dead_replaced_path(
+            "inactive_cycle_a", "inactive_cycle_b");
+        reconciliation.mark_dead_replaced_path(
+            "inactive_cycle_b", "inactive_cycle_a");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "inactive_cycle_a",
+            "inactive_cycle_b", "cyclic_replacement_graph");
+        require_replacement_reason(
+            result, "dead_replaced_paths", "inactive_cycle_b",
+            "inactive_cycle_a", "cyclic_replacement_graph");
+        require(finding_count(
+                    result, surface_error_code_t::unexplained_removal_detected) == 2,
+                "inactive replacement cycle did not fail every unproved entry");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(retired(make_entry(
+            "conflicting_proofs", "surface/conflicting_proofs.cpp",
+            surface_entry_kind_t::handler_registration),
+            "conflicting_proofs_target"));
+        reconciliation.register_actual_entry(make_entry(
+            "conflicting_proofs_target",
+            "surface/conflicting_proofs_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_dead_replaced_path(
+            "conflicting_proofs", "conflicting_proofs_target");
+        reconciliation.mark_stale_registration("conflicting_proofs");
+        const auto result = reconciliation.reconcile();
+        require_detail(require_finding(
+                           result, surface_error_code_t::invalid_surface_marker,
+                           "conflicting_proofs"),
+                       "surface marker rejected; collection=inactive_entry_proofs, reason=conflicting_proof_markers");
+        require(result.attempted_auxiliary_markers == 2 &&
+                    result.rejected_auxiliary_markers == 2 &&
+                    result.malformed_markers == 2,
+                "conflicting inactive proofs lost per-marker accounting");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "conflicting_proofs");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto baseline = make_entry(
+            "inexact_source", "surface/inexact_source_baseline.cpp",
+            surface_entry_kind_t::source_file);
+        auto actual = retired(baseline, "inexact_source_target");
+        actual.canonical_path = "surface/inexact_source_actual.cpp";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.register_actual_entry(make_entry(
+            "inexact_source_target", "surface/inexact_source_target.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.mark_dead_replaced_path(
+            "inexact_source", "inexact_source_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "inexact_source",
+            "inexact_source_target", "conflicting_source_identity");
+        require_finding(
+            result, surface_error_code_t::baseline_mismatch,
+            "inexact_source");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "inexact_source");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto guard = make_entry(
+            "inactive_protected_guard", "surface/inactive_protected_guard.cpp",
+            surface_entry_kind_t::security_guard, false);
+        reconciliation.register_actual_entry(guard);
+        reconciliation.register_actual_entry(make_entry(
+            "guard_replacement_target", "surface/guard_replacement_target.cpp",
+            surface_entry_kind_t::security_guard));
+        reconciliation.mark_dead_replaced_path(
+            "inactive_protected_guard", "guard_replacement_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", "inactive_protected_guard",
+            "guard_replacement_target", "security_guard_replacement_forbidden");
+        const auto& finding = require_finding(
+            result, surface_error_code_t::security_regression_detected,
+            "inactive_protected_guard");
+        require(finding.canonical_path == guard.canonical_path &&
+                    finding.kind == surface_entry_kind_t::security_guard &&
+                    finding.severity == 900,
+                "inactive security proof failure lost strongest exact evidence");
+        require_no_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "inactive_protected_guard");
+    }
+    {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_findings = 2;
+        surface_reconciliation_t reconciliation(limits);
+        for (int index = 0; index < 6; ++index) {
+            reconciliation.register_actual_entry(inactive(make_entry(
+                "bounded_inactive_" + std::to_string(index),
+                "surface/bounded_inactive_" + std::to_string(index) + ".cpp",
+                surface_entry_kind_t::source_file)));
+        }
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(first.finding_cap_exceeded && first.findings.size() == 2 &&
+                    first.unexplained_removals == 6 && !first.clean,
+                "inactive proof findings escaped the bounded finding contract");
+        require_finding(
+            first, surface_error_code_t::finding_cap_exceeded,
+            "surface_findings");
+        require(equal_results(first, second),
+                "bounded inactive proof reconciliation is nondeterministic");
+    }
+}
+
 void verify_schema_migration_predicate() {
     surface_reconciliation_t reconciliation;
     auto baseline = make_entry(
@@ -377,8 +820,17 @@ void verify_stale_registration_proofs() {
             kind);
         missing.register_baseline_entry(baseline);
         missing.mark_stale_registration(baseline.identifier);
-        require(missing.reconcile().clean,
-                "lawful missing registration retirement was rejected");
+        const auto missing_result = missing.reconcile();
+        require(!missing_result.clean && missing_result.unexplained_removals == 1,
+                "baseline-only registration retirement reconciled cleanly");
+        require_contains(require_finding(
+                             missing_result,
+                             surface_error_code_t::invalid_surface_marker,
+                             baseline.identifier),
+                         "collection=stale_registrations, reason=missing_actual_source_identity");
+        require_finding(
+            missing_result, surface_error_code_t::unexplained_removal_detected,
+            baseline.identifier);
 
         surface_reconciliation_t inactive;
         inactive.register_baseline_entry(baseline);
@@ -425,6 +877,7 @@ void verify_stale_registration_proofs() {
             identifier, "surface/forbidden_" + std::to_string(index) + ".cpp",
             forbidden[index]);
         reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(inactive(baseline));
         reconciliation.mark_stale_registration(identifier);
         const auto result = reconciliation.reconcile();
         const auto reason = forbidden[index] == surface_entry_kind_t::security_guard
@@ -454,7 +907,7 @@ void verify_stale_registration_proofs() {
         require_detail(require_finding(
                            result, surface_error_code_t::invalid_surface_marker,
                            "missing_stale_identity"),
-                       "surface marker rejected; collection=stale_registrations, reason=missing_source_identity");
+                       "surface marker rejected; collection=stale_registrations, reason=missing_actual_source_identity");
         require(!result.clean, "missing stale source identity reconciled cleanly");
     }
     {
@@ -511,6 +964,21 @@ void require_replacement_reason(
             "replacement proof failure metadata is incorrect");
 }
 
+void require_marker_reason(
+    const surface_reconciliation_result_t& result,
+    std::string_view collection, std::string_view identifier,
+    std::string_view reason) {
+    const auto expected =
+        "surface marker rejected; collection=" + std::string(collection) +
+        ", reason=" + std::string(reason);
+    const auto& finding = require_finding(
+        result, surface_error_code_t::invalid_surface_marker, identifier);
+    require_detail(finding, expected);
+    require(finding.kind == surface_entry_kind_t::contract_registration &&
+                finding.severity == 950,
+            "surface proof failure metadata is incorrect");
+}
+
 void verify_replacement_target_graph() {
     {
         surface_reconciliation_t reconciliation;
@@ -520,7 +988,7 @@ void verify_replacement_target_graph() {
         reconciliation.mark_dead_replaced_path("orphan_source", "orphan_target");
         const auto result = reconciliation.reconcile();
         require_replacement_reason(result, "dead_replaced_paths", "orphan_source",
-                                   "orphan_target", "missing_source_identity");
+                                   "orphan_target", "missing_actual_source_identity");
     }
     {
         surface_reconciliation_t reconciliation;
@@ -601,6 +1069,7 @@ void verify_replacement_target_graph() {
             "missing_target_source", "surface/missing_target.cpp",
             surface_entry_kind_t::source_file);
         reconciliation.register_baseline_entry(source);
+        reconciliation.register_actual_entry(retired(source, "absent_target"));
         reconciliation.mark_dead_replaced_path(
             "missing_target_source", "absent_target");
         const auto result = reconciliation.reconcile();
@@ -612,9 +1081,9 @@ void verify_replacement_target_graph() {
     }
     {
         surface_reconciliation_t reconciliation;
-        reconciliation.register_actual_entry(make_entry(
+        reconciliation.register_actual_entry(retired(make_entry(
             "ambiguous_target_source", "surface/ambiguous_target_source.cpp",
-            surface_entry_kind_t::source_file));
+            surface_entry_kind_t::source_file), "duplicated_target"));
         reconciliation.register_actual_entry(make_entry(
             "duplicated_target", "surface/duplicated_target_a.cpp",
             surface_entry_kind_t::source_file));
@@ -630,9 +1099,9 @@ void verify_replacement_target_graph() {
     }
     {
         surface_reconciliation_t reconciliation;
-        reconciliation.register_actual_entry(make_entry(
+        reconciliation.register_actual_entry(retired(make_entry(
             "inactive_target_source", "surface/inactive_target_source.cpp",
-            surface_entry_kind_t::source_file));
+            surface_entry_kind_t::source_file), "inactive_target"));
         reconciliation.register_actual_entry(make_entry(
             "inactive_target", "surface/inactive_target.cpp",
             surface_entry_kind_t::source_file, false));
@@ -644,9 +1113,9 @@ void verify_replacement_target_graph() {
     }
     {
         surface_reconciliation_t reconciliation;
-        reconciliation.register_actual_entry(make_entry(
+        reconciliation.register_actual_entry(retired(make_entry(
             "wrong_target_source", "surface/wrong_target_source.cpp",
-            surface_entry_kind_t::source_file));
+            surface_entry_kind_t::source_file), "wrong_target"));
         reconciliation.register_actual_entry(make_entry(
             "wrong_target", "surface/wrong_target.cpp",
             surface_entry_kind_t::test_harness));
@@ -674,6 +1143,1192 @@ void verify_replacement_target_graph() {
                                    "cycle_a", "cyclic_replacement_graph");
         require_replacement_reason(result, "dead_replaced_paths", "cycle_predecessor",
                                    "cycle_a", "cyclic_replacement_graph");
+    }
+}
+
+void verify_baseline_only_retirement_rejection() {
+    {
+        surface_reconciliation_t reconciliation;
+        const auto baseline = make_entry(
+            "baseline_only_dead", "surface/baseline_only_dead.cpp",
+            surface_entry_kind_t::source_file);
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(make_entry(
+            "baseline_only_dead_target", "surface/baseline_only_dead_target.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.mark_dead_replaced_path(
+            baseline.identifier, "baseline_only_dead_target");
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require_replacement_reason(
+            first, "dead_replaced_paths", baseline.identifier,
+            "baseline_only_dead_target", "missing_actual_source_identity");
+        require_finding(
+            first, surface_error_code_t::unexplained_removal_detected,
+            baseline.identifier);
+        require(first.unexplained_removals == 1 && equal_results(first, second),
+                "baseline-only dead proof was accepted or nondeterministic");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto baseline = make_entry(
+            "baseline_only_alias", "surface/baseline_only_alias.cpp",
+            surface_entry_kind_t::alias_mapping);
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(make_entry(
+            "baseline_only_alias_target", "surface/baseline_only_alias_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_unsupported_alias(
+            baseline.identifier, "baseline_only_alias_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "unsupported_aliases", baseline.identifier,
+            "baseline_only_alias_target", "missing_actual_source_identity");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            baseline.identifier);
+        require(result.unexplained_removals == 1,
+                "baseline-only alias proof hid a removed public entry");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto baseline = make_entry(
+            "baseline_only_stale", "surface/baseline_only_stale.cpp",
+            surface_entry_kind_t::tool_registration);
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.mark_stale_registration(baseline.identifier);
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "stale_registrations", baseline.identifier,
+            "missing_actual_source_identity");
+        require_finding(
+            result, surface_error_code_t::stale_registration_detected,
+            baseline.identifier);
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            baseline.identifier);
+        require(result.unexplained_removals == 1,
+                "baseline-only stale proof hid a removed registration");
+    }
+}
+
+void verify_schema_identity_and_proof_matrix() {
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(make_entry(
+            "schema_new_actual", "surface/schema_new_actual.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9"));
+        require(reconciliation.reconcile().clean,
+                "new actual-only schema writer with explicit identity was rejected");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto schema = make_entry(
+            "schema_matching", "surface/schema_matching.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9");
+        reconciliation.register_baseline_entry(schema);
+        reconciliation.register_actual_entry(schema);
+        require(reconciliation.reconcile().clean,
+                "matching schema identities did not reconcile cleanly");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(make_entry(
+            "schema_actual_only", "surface/schema_actual_only.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9"));
+        reconciliation.mark_old_schema_v8_writer(
+            "schema_actual_only", "surface/schema_actual_only.cpp");
+        require_marker_reason(
+            reconciliation.reconcile(), "old_schema_v8_writers",
+            "schema_actual_only", "missing_baseline_schema_writer");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_baseline_entry(make_entry(
+            "schema_baseline_only", "surface/schema_baseline_only.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8"));
+        reconciliation.mark_old_schema_v8_writer(
+            "schema_baseline_only", "surface/schema_baseline_only.cpp");
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "old_schema_v8_writers", "schema_baseline_only",
+            "missing_actual_schema_writer");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "schema_baseline_only");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.mark_old_schema_v8_writer(
+            "schema_missing", "surface/schema_missing.cpp");
+        require_marker_reason(
+            reconciliation.reconcile(), "old_schema_v8_writers",
+            "schema_missing", "missing_baseline_schema_writer");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto baseline = make_entry(
+            "schema_wrong_kind", "surface/schema_wrong_kind.cpp",
+            surface_entry_kind_t::source_file);
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(baseline);
+        reconciliation.mark_old_schema_v8_writer(
+            baseline.identifier, baseline.canonical_path);
+        require_marker_reason(
+            reconciliation.reconcile(), "old_schema_v8_writers",
+            baseline.identifier, "schema_marker_on_incompatible_source_kind");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "schema_wrong_old", "surface/schema_wrong_old.cpp",
+            surface_entry_kind_t::schema_writer, true, "v7");
+        auto actual = baseline;
+        actual.schema_version = "v9";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.mark_old_schema_v8_writer(
+            baseline.identifier, baseline.canonical_path);
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "old_schema_v8_writers", baseline.identifier,
+            "wrong_old_schema_version");
+        require_finding(result, surface_error_code_t::baseline_mismatch,
+                        baseline.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "schema_wrong_current", "surface/schema_wrong_current.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8");
+        auto actual = baseline;
+        actual.schema_version = "v10";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.mark_old_schema_v8_writer(
+            baseline.identifier, baseline.canonical_path);
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "old_schema_v8_writers", baseline.identifier,
+            "wrong_current_schema_version");
+        require_finding(result, surface_error_code_t::baseline_mismatch,
+                        baseline.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "schema_wrong_path", "surface/schema_wrong_path.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8");
+        auto actual = baseline;
+        actual.schema_version = "v9";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.mark_old_schema_v8_writer(
+            baseline.identifier, "surface/schema_unrelated.cpp");
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "old_schema_v8_writers", baseline.identifier,
+            "schema_marker_path_mismatch");
+        require_finding(result, surface_error_code_t::baseline_mismatch,
+                        baseline.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "schema_still_v8", "surface/schema_still_v8.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8");
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(baseline);
+        reconciliation.mark_old_schema_v8_writer(
+            baseline.identifier, baseline.canonical_path);
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "old_schema_v8_writers", baseline.identifier,
+            "wrong_current_schema_version");
+        require_finding(
+            result, surface_error_code_t::old_schema_v8_writer_detected,
+            baseline.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "schema_inactive_current", "surface/schema_inactive_current.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8");
+        auto actual = inactive(baseline);
+        actual.schema_version = "v9";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.mark_old_schema_v8_writer(
+            baseline.identifier, baseline.canonical_path);
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "old_schema_v8_writers", baseline.identifier,
+            "schema_writer_not_active_canonical_state");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            baseline.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto invalid_baseline = make_entry(
+            "schema_empty_baseline", "surface/schema_empty_baseline.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8");
+        invalid_baseline.schema_version.clear();
+        auto invalid_actual = make_entry(
+            "schema_empty_actual", "surface/schema_empty_actual.cpp",
+            surface_entry_kind_t::schema_writer, false, "v9");
+        invalid_actual.schema_version.clear();
+        reconciliation.register_baseline_entry(invalid_baseline);
+        reconciliation.register_actual_entry(invalid_actual);
+        const auto result = reconciliation.reconcile();
+        require(result.malformed_entries == 2 &&
+                    result.rejected_baseline_entries == 1 &&
+                    result.rejected_actual_entries == 1,
+                "empty active or inactive schema identity was accepted");
+        require_finding(
+            result, surface_error_code_t::invalid_surface_entry,
+            "schema_empty_baseline");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto unknown_baseline = make_entry(
+            "schema_unknown_baseline", "surface/schema_unknown_baseline.cpp",
+            surface_entry_kind_t::schema_writer, true, "UNKNOWN");
+        auto unknown_actual = make_entry(
+            "schema_unknown_actual", "surface/schema_unknown_actual.cpp",
+            surface_entry_kind_t::schema_writer, false, "unspecified");
+        reconciliation.register_baseline_entry(unknown_baseline);
+        reconciliation.register_actual_entry(unknown_actual);
+        const auto result = reconciliation.reconcile();
+        require(result.malformed_entries == 2 &&
+                    result.rejected_baseline_entries == 1 &&
+                    result.rejected_actual_entries == 1,
+                "unknown schema identity was accepted");
+        const auto& finding = require_finding(
+            result, surface_error_code_t::invalid_surface_entry,
+            unknown_baseline.identifier);
+        require_contains(finding, "reason=unknown_schema_version");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "schema_dead_lawful", "surface/schema_dead_lawful.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9");
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(retired(
+            baseline, "schema_dead_lawful_target"));
+        reconciliation.register_actual_entry(make_entry(
+            "schema_dead_lawful_target",
+            "surface/schema_dead_lawful_target.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9"));
+        reconciliation.mark_dead_replaced_path(
+            baseline.identifier, "schema_dead_lawful_target");
+        const auto result = reconciliation.reconcile();
+        require(result.clean && result.findings.empty(),
+                "schema-writer replacement with bound identity was rejected");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = make_entry(
+            "schema_target_mismatch", "surface/schema_target_mismatch.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9");
+        reconciliation.register_baseline_entry(source);
+        reconciliation.register_actual_entry(retired(
+            source, "schema_target_mismatch_target"));
+        reconciliation.register_actual_entry(make_entry(
+            "schema_target_mismatch_target",
+            "surface/schema_target_mismatch_target.cpp",
+            surface_entry_kind_t::schema_writer, true, "v10"));
+        reconciliation.mark_dead_replaced_path(
+            source.identifier, "schema_target_mismatch_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", source.identifier,
+            "schema_target_mismatch_target",
+            "replacement_target_schema_mismatch");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            source.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = make_entry(
+            "schema_target_empty", "surface/schema_target_empty.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9");
+        reconciliation.register_baseline_entry(source);
+        reconciliation.register_actual_entry(retired(
+            source, "schema_target_empty_value"));
+        auto target = make_entry(
+            "schema_target_empty_value", "surface/schema_target_empty_value.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9");
+        target.schema_version.clear();
+        reconciliation.register_actual_entry(target);
+        reconciliation.mark_dead_replaced_path(
+            source.identifier, target.identifier);
+        const auto result = reconciliation.reconcile();
+        require_finding(
+            result, surface_error_code_t::invalid_surface_entry,
+            target.identifier);
+        require_replacement_reason(
+            result, "dead_replaced_paths", source.identifier, target.identifier,
+            "missing_actual_target");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            source.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "schema_source_drift", "surface/schema_source_drift.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8");
+        auto actual = retired(baseline, "schema_source_drift_target");
+        actual.schema_version = "v9";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.register_actual_entry(make_entry(
+            "schema_source_drift_target",
+            "surface/schema_source_drift_target.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9"));
+        reconciliation.mark_dead_replaced_path(
+            baseline.identifier, "schema_source_drift_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "dead_replaced_paths", baseline.identifier,
+            "schema_source_drift_target", "conflicting_source_schema");
+        require_finding(result, surface_error_code_t::baseline_mismatch,
+                        baseline.identifier);
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            baseline.identifier);
+    }
+}
+
+void verify_alias_proof_matrix() {
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = inactive(make_entry(
+            "alias_without_state", "surface/alias_without_state.cpp",
+            surface_entry_kind_t::alias_mapping));
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "alias_without_state_target", "surface/alias_without_state_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_unsupported_alias(
+            source.identifier, "alias_without_state_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "unsupported_aliases", source.identifier,
+            "alias_without_state_target",
+            "inactive_source_without_replacement_state");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            source.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = retired(make_entry(
+            "alias_target_drift", "surface/alias_target_drift.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_declared_target");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "alias_declared_target", "surface/alias_declared_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.register_actual_entry(make_entry(
+            "alias_marker_target", "surface/alias_marker_target.cpp",
+            surface_entry_kind_t::tool_registration));
+        reconciliation.mark_unsupported_alias(
+            source.identifier, "alias_marker_target");
+        require_replacement_reason(
+            reconciliation.reconcile(), "unsupported_aliases", source.identifier,
+            "alias_marker_target", "source_replacement_target_mismatch");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = retired(make_entry(
+            "alias_missing_target", "surface/alias_missing_target.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_missing_target_value");
+        reconciliation.register_actual_entry(source);
+        reconciliation.mark_unsupported_alias(
+            source.identifier, "alias_missing_target_value");
+        require_replacement_reason(
+            reconciliation.reconcile(), "unsupported_aliases", source.identifier,
+            "alias_missing_target_value", "missing_actual_target");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = retired(make_entry(
+            "alias_duplicate_target", "surface/alias_duplicate_target.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_duplicate_target_value");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "alias_duplicate_target_value", "surface/alias_duplicate_target_a.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.register_actual_entry(make_entry(
+            "alias_duplicate_target_value", "surface/alias_duplicate_target_b.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_unsupported_alias(
+            source.identifier, "alias_duplicate_target_value");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "unsupported_aliases", source.identifier,
+            "alias_duplicate_target_value", "ambiguous_actual_target");
+        require_finding(
+            result, surface_error_code_t::duplicate_actual_identifier_detected,
+            "alias_duplicate_target_value");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = retired(make_entry(
+            "alias_inactive_target", "surface/alias_inactive_target.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_inactive_target_value");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(inactive(make_entry(
+            "alias_inactive_target_value", "surface/alias_inactive_target_value.cpp",
+            surface_entry_kind_t::tool_registration)));
+        reconciliation.mark_unsupported_alias(
+            source.identifier, "alias_inactive_target_value");
+        require_replacement_reason(
+            reconciliation.reconcile(), "unsupported_aliases", source.identifier,
+            "alias_inactive_target_value", "inactive_actual_target");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = retired(make_entry(
+            "alias_wrong_kind_target", "surface/alias_wrong_kind_target.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_wrong_kind_target_value");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "alias_wrong_kind_target_value",
+            "surface/alias_wrong_kind_target_value.cpp",
+            surface_entry_kind_t::source_file));
+        reconciliation.mark_unsupported_alias(
+            source.identifier, "alias_wrong_kind_target_value");
+        require_replacement_reason(
+            reconciliation.reconcile(), "unsupported_aliases", source.identifier,
+            "alias_wrong_kind_target_value",
+            "incompatible_actual_target_kind");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(inactive(make_entry(
+            "alias_self", "surface/alias_self.cpp",
+            surface_entry_kind_t::alias_mapping)));
+        reconciliation.mark_unsupported_alias("alias_self", "alias_self");
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "unsupported_aliases", "alias_self", "self_replacement");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "alias_self");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        reconciliation.register_actual_entry(retired(make_entry(
+            "alias_cycle_a", "surface/alias_cycle_a.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_cycle_b"));
+        reconciliation.register_actual_entry(retired(make_entry(
+            "alias_cycle_b", "surface/alias_cycle_b.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_cycle_a"));
+        reconciliation.register_actual_entry(retired(make_entry(
+            "alias_cycle_predecessor", "surface/alias_cycle_predecessor.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_cycle_a"));
+        reconciliation.mark_unsupported_alias("alias_cycle_a", "alias_cycle_b");
+        reconciliation.mark_unsupported_alias("alias_cycle_b", "alias_cycle_a");
+        reconciliation.mark_unsupported_alias(
+            "alias_cycle_predecessor", "alias_cycle_a");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "unsupported_aliases", "alias_cycle_a", "alias_cycle_b",
+            "cyclic_replacement_graph");
+        require_replacement_reason(
+            result, "unsupported_aliases", "alias_cycle_b", "alias_cycle_a",
+            "cyclic_replacement_graph");
+        require_replacement_reason(
+            result, "unsupported_aliases", "alias_cycle_predecessor",
+            "alias_cycle_a", "cyclic_replacement_graph");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "alias_path_drift", "surface/alias_path_baseline.cpp",
+            surface_entry_kind_t::alias_mapping);
+        auto actual = retired(baseline, "alias_path_target");
+        actual.canonical_path = "surface/alias_path_actual.cpp";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.register_actual_entry(make_entry(
+            "alias_path_target", "surface/alias_path_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_unsupported_alias(
+            baseline.identifier, "alias_path_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "unsupported_aliases", baseline.identifier,
+            "alias_path_target", "conflicting_source_identity");
+        require_finding(result, surface_error_code_t::baseline_mismatch,
+                        baseline.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "alias_kind_drift", "surface/alias_kind_drift.cpp",
+            surface_entry_kind_t::alias_mapping);
+        auto actual = retired(make_entry(
+            baseline.identifier, baseline.canonical_path,
+            surface_entry_kind_t::handler_registration), "alias_kind_target");
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.register_actual_entry(make_entry(
+            "alias_kind_target", "surface/alias_kind_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_unsupported_alias(
+            baseline.identifier, "alias_kind_target");
+        const auto result = reconciliation.reconcile();
+        require_replacement_reason(
+            result, "unsupported_aliases", baseline.identifier,
+            "alias_kind_target", "conflicting_source_kind");
+        require_finding(result, surface_error_code_t::baseline_mismatch,
+                        baseline.identifier);
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto source = retired(make_entry(
+            "alias_actual_lawful", "surface/alias_actual_lawful.cpp",
+            surface_entry_kind_t::alias_mapping), "alias_actual_lawful_target");
+        reconciliation.register_actual_entry(source);
+        reconciliation.register_actual_entry(make_entry(
+            "alias_actual_lawful_target",
+            "surface/alias_actual_lawful_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        reconciliation.mark_unsupported_alias(
+            source.identifier, "alias_actual_lawful_target");
+        require(reconciliation.reconcile().clean,
+                "actual-only exact alias tombstone was rejected");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "alias_matching_lawful", "surface/alias_matching_lawful.cpp",
+            surface_entry_kind_t::alias_mapping);
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(retired(
+            baseline, "alias_matching_lawful_target"));
+        reconciliation.register_actual_entry(make_entry(
+            "alias_matching_lawful_target",
+            "surface/alias_matching_lawful_target.cpp",
+            surface_entry_kind_t::tool_registration));
+        reconciliation.mark_unsupported_alias(
+            baseline.identifier, "alias_matching_lawful_target");
+        require(reconciliation.reconcile().clean,
+                "matching exact alias tombstone was rejected");
+    }
+}
+
+void verify_cross_proof_exclusion_matrix() {
+    constexpr std::array<std::uint8_t, 11> masks = {
+        0x3, 0x5, 0x9, 0x6, 0xa, 0xc,
+        0x7, 0xb, 0xd, 0xe, 0xf
+    };
+    for (const bool include_baseline : {false, true}) {
+        for (std::size_t index = 0; index < masks.size(); ++index) {
+            surface_reconciliation_t reconciliation;
+            const auto identifier =
+                "cross_proof_" + std::to_string(include_baseline ? 1 : 0) +
+                "_" + std::to_string(index);
+            const auto target = identifier + "_target";
+            auto source = retired(make_entry(
+                identifier, "surface/" + identifier + ".cpp",
+                surface_entry_kind_t::alias_mapping), target);
+            if (include_baseline)
+                reconciliation.register_baseline_entry(source);
+            reconciliation.register_actual_entry(source);
+            reconciliation.register_actual_entry(make_entry(
+                target, "surface/" + target + ".cpp",
+                surface_entry_kind_t::handler_registration));
+            std::uint64_t proof_count = 0;
+            if ((masks[index] & 0x1U) != 0) {
+                reconciliation.mark_dead_replaced_path(identifier, target);
+                ++proof_count;
+            }
+            if ((masks[index] & 0x2U) != 0) {
+                reconciliation.mark_unsupported_alias(identifier, target);
+                ++proof_count;
+            }
+            if ((masks[index] & 0x4U) != 0) {
+                reconciliation.mark_stale_registration(identifier);
+                ++proof_count;
+            }
+            if ((masks[index] & 0x8U) != 0) {
+                reconciliation.mark_old_schema_v8_writer(
+                    identifier, source.canonical_path);
+                ++proof_count;
+            }
+            const auto first = reconciliation.reconcile();
+            const auto second = reconciliation.reconcile();
+            require_marker_reason(
+                first, "inactive_entry_proofs", identifier,
+                "conflicting_proof_markers");
+            require(first.rejected_auxiliary_markers == proof_count &&
+                        first.malformed_markers == proof_count &&
+                        first.unexplained_removals == 1,
+                    "cross-proof conflict lost exact marker accounting");
+            require_finding(
+                first, surface_error_code_t::unexplained_removal_detected,
+                identifier);
+            require(equal_results(first, second),
+                    "cross-proof exclusion is nondeterministic");
+        }
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        const auto guard = make_entry(
+            "cross_proof_security", "surface/cross_proof_security.cpp",
+            surface_entry_kind_t::security_guard);
+        reconciliation.register_baseline_entry(guard);
+        reconciliation.mark_dead_replaced_path(
+            guard.identifier, "cross_proof_security_target");
+        reconciliation.mark_old_schema_v8_writer(
+            guard.identifier, guard.canonical_path);
+        reconciliation.mark_security_regression(
+            guard.identifier, "explicit lower-priority marker");
+        const auto result = reconciliation.reconcile();
+        require_marker_reason(
+            result, "inactive_entry_proofs", guard.identifier,
+            "conflicting_proof_markers");
+        const auto& security = require_finding(
+            result, surface_error_code_t::security_regression_detected,
+            guard.identifier);
+        require(security.severity == 1000 &&
+                    security.canonical_path == guard.canonical_path,
+                "cross-proof finding suppressed strongest security evidence");
+        require_detail(
+            security,
+            "baseline security guard is missing or inactive in actual surface");
+    }
+}
+
+void verify_same_key_conflict_invalidation() {
+    for (const bool include_baseline : {false, true}) {
+        const auto exercise_dead = [include_baseline](bool reverse) {
+            surface_reconciliation_t reconciliation;
+            const auto identifier = std::string("same_key_dead_") +
+                (include_baseline ? "both" : "actual");
+            const auto correct_target = identifier + "_correct";
+            const auto wrong_target = identifier + "_wrong";
+            const auto source = make_entry(
+                identifier, "surface/" + identifier + ".cpp",
+                surface_entry_kind_t::source_file);
+            if (include_baseline)
+                reconciliation.register_baseline_entry(source);
+            reconciliation.register_actual_entry(retired(source, correct_target));
+            reconciliation.register_actual_entry(make_entry(
+                correct_target, "surface/" + correct_target + ".cpp",
+                surface_entry_kind_t::source_file));
+            reconciliation.register_actual_entry(make_entry(
+                wrong_target, "surface/" + wrong_target + ".cpp",
+                surface_entry_kind_t::source_file));
+            const auto add = [&](std::string_view target) {
+                reconciliation.mark_dead_replaced_path(identifier, target);
+            };
+            if (reverse) {
+                add(wrong_target);
+                add(correct_target);
+                add(wrong_target);
+                add(correct_target);
+            } else {
+                add(correct_target);
+                add(wrong_target);
+                add(correct_target);
+                add(wrong_target);
+            }
+            return reconciliation.reconcile();
+        };
+        const auto forward = exercise_dead(false);
+        const auto reverse = exercise_dead(true);
+        require_detail(
+            require_finding(
+                forward, surface_error_code_t::invalid_surface_marker,
+                include_baseline
+                    ? "same_key_dead_both" : "same_key_dead_actual"),
+            "surface marker rejected; collection=dead_replaced_paths, reason=conflicting_duplicate_marker, malformed=1");
+        require(forward.attempted_auxiliary_markers == 4 &&
+                    forward.rejected_auxiliary_markers == 1 &&
+                    forward.malformed_markers == 1 &&
+                    forward.unexplained_removals == 1,
+                "same-key dead proof conflict accounting is incorrect");
+        require_finding(
+            forward, surface_error_code_t::unexplained_removal_detected,
+            include_baseline ? "same_key_dead_both" : "same_key_dead_actual");
+        if (include_baseline) {
+            require_finding(
+                forward, surface_error_code_t::baseline_mismatch,
+                "same_key_dead_both");
+        }
+        require(equal_results(forward, reverse),
+                "same-key dead conflict depends on marker order");
+
+        const auto exercise_alias = [include_baseline](bool reverse_order) {
+            surface_reconciliation_t reconciliation;
+            const auto identifier = std::string("same_key_alias_") +
+                (include_baseline ? "both" : "actual");
+            const auto correct_target = identifier + "_correct";
+            const auto wrong_target = identifier + "_wrong";
+            const auto source = make_entry(
+                identifier, "surface/" + identifier + ".cpp",
+                surface_entry_kind_t::alias_mapping);
+            if (include_baseline)
+                reconciliation.register_baseline_entry(source);
+            reconciliation.register_actual_entry(retired(source, correct_target));
+            reconciliation.register_actual_entry(make_entry(
+                correct_target, "surface/" + correct_target + ".cpp",
+                surface_entry_kind_t::handler_registration));
+            reconciliation.register_actual_entry(make_entry(
+                wrong_target, "surface/" + wrong_target + ".cpp",
+                surface_entry_kind_t::tool_registration));
+            const auto add = [&](std::string_view target) {
+                reconciliation.mark_unsupported_alias(identifier, target);
+            };
+            if (reverse_order) {
+                add(wrong_target);
+                add(correct_target);
+                add(wrong_target);
+                add(correct_target);
+            } else {
+                add(correct_target);
+                add(wrong_target);
+                add(correct_target);
+                add(wrong_target);
+            }
+            return reconciliation.reconcile();
+        };
+        const auto alias_forward = exercise_alias(false);
+        const auto alias_reverse = exercise_alias(true);
+        const auto alias_identifier = include_baseline
+            ? "same_key_alias_both" : "same_key_alias_actual";
+        require_detail(
+            require_finding(
+                alias_forward, surface_error_code_t::invalid_surface_marker,
+                alias_identifier),
+            "surface marker rejected; collection=unsupported_aliases, reason=conflicting_duplicate_marker, malformed=1");
+        require(alias_forward.attempted_auxiliary_markers == 4 &&
+                    alias_forward.rejected_auxiliary_markers == 1 &&
+                    alias_forward.malformed_markers == 1 &&
+                    alias_forward.unexplained_removals == 1,
+                "same-key alias proof conflict accounting is incorrect");
+        require_finding(
+            alias_forward, surface_error_code_t::unexplained_removal_detected,
+            alias_identifier);
+        if (include_baseline) {
+            require_finding(
+                alias_forward, surface_error_code_t::baseline_mismatch,
+                alias_identifier);
+        }
+        require(equal_results(alias_forward, alias_reverse),
+                "same-key alias conflict depends on marker order");
+
+        surface_reconciliation_t stale;
+        const auto stale_identifier = std::string("same_key_stale_") +
+            (include_baseline ? "both" : "actual");
+        const auto stale_entry = make_entry(
+            stale_identifier, "surface/" + stale_identifier + ".cpp",
+            surface_entry_kind_t::handler_registration);
+        if (include_baseline)
+            stale.register_baseline_entry(stale_entry);
+        stale.register_actual_entry(inactive(stale_entry));
+        for (int repeat = 0; repeat < 4; ++repeat)
+            stale.mark_stale_registration(stale_identifier);
+        const auto stale_result = stale.reconcile();
+        require(stale_result.clean &&
+                    stale_result.attempted_auxiliary_markers == 4 &&
+                    stale_result.rejected_auxiliary_markers == 0 &&
+                    stale_result.malformed_markers == 0,
+                "identical stale proof repetition was not idempotent");
+    }
+
+    const auto exercise_schema = [](bool reverse) {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "same_key_schema", "surface/same_key_schema.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8");
+        auto actual = baseline;
+        actual.schema_version = "v9";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        const auto add = [&](std::string_view path) {
+            reconciliation.mark_old_schema_v8_writer(
+                baseline.identifier, path);
+        };
+        if (reverse) {
+            add("surface/same_key_schema_wrong.cpp");
+            add(baseline.canonical_path);
+            add("surface/same_key_schema_wrong.cpp");
+            add(baseline.canonical_path);
+        } else {
+            add(baseline.canonical_path);
+            add("surface/same_key_schema_wrong.cpp");
+            add(baseline.canonical_path);
+            add("surface/same_key_schema_wrong.cpp");
+        }
+        return reconciliation.reconcile();
+    };
+    const auto schema_forward = exercise_schema(false);
+    const auto schema_reverse = exercise_schema(true);
+    require_detail(
+        require_finding(
+            schema_forward, surface_error_code_t::invalid_surface_marker,
+            "same_key_schema"),
+        "surface marker rejected; collection=old_schema_v8_writers, reason=conflicting_duplicate_marker, malformed=1");
+    require_finding(
+        schema_forward, surface_error_code_t::baseline_mismatch,
+        "same_key_schema");
+    require(schema_forward.attempted_auxiliary_markers == 4 &&
+                schema_forward.rejected_auxiliary_markers == 1 &&
+                schema_forward.malformed_markers == 1 &&
+                equal_results(schema_forward, schema_reverse),
+            "same-key schema conflict was eligible or order-dependent");
+
+    const auto exercise_duplicate = [](bool reverse) {
+        surface_reconciliation_t reconciliation;
+        const auto add = [&](std::string_view path) {
+            reconciliation.mark_duplicate_store("same_key_store", path);
+        };
+        if (reverse) {
+            add("surface/same_key_store_b.cpp");
+            add("surface/same_key_store_a.cpp");
+            add("surface/same_key_store_b.cpp");
+            add("surface/same_key_store_a.cpp");
+        } else {
+            add("surface/same_key_store_a.cpp");
+            add("surface/same_key_store_b.cpp");
+            add("surface/same_key_store_a.cpp");
+            add("surface/same_key_store_b.cpp");
+        }
+        return reconciliation.reconcile();
+    };
+    const auto store_forward = exercise_duplicate(false);
+    const auto store_reverse = exercise_duplicate(true);
+    require_detail(
+        require_finding(
+            store_forward, surface_error_code_t::invalid_surface_marker,
+            "same_key_store"),
+        "surface marker rejected; collection=duplicate_stores, reason=conflicting_duplicate_marker, malformed=1");
+    require_no_finding(
+        store_forward, surface_error_code_t::duplicate_store_detected,
+        "same_key_store");
+    require(store_forward.rejected_auxiliary_markers == 1 &&
+                store_forward.malformed_markers == 1 &&
+                equal_results(store_forward, store_reverse),
+            "same-key duplicate-store conflict remained order-dependent");
+}
+
+void verify_security_evidence_deduplication() {
+    surface_reconciliation_result_t forward;
+    surface_reconciliation_result_t reverse;
+    for (const bool marker_first : {false, true}) {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "security_missing_guard", "surface/security_missing_guard.cpp",
+            surface_entry_kind_t::security_guard);
+        baseline.security_note = "strict baseline guard";
+        auto actual = inactive(baseline);
+        actual.security_note = "disabled actual guard";
+        if (marker_first)
+            reconciliation.mark_security_regression(
+                baseline.identifier, "explicit lower-priority marker");
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        if (!marker_first)
+            reconciliation.mark_security_regression(
+                baseline.identifier, "explicit lower-priority marker");
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(finding_count(
+                    first, surface_error_code_t::security_regression_detected,
+                    baseline.identifier) == 1,
+                "security evidence was not canonically deduplicated");
+        const auto& finding = require_finding(
+            first, surface_error_code_t::security_regression_detected,
+            baseline.identifier);
+        require(finding.severity == 1000 &&
+                    finding.canonical_path == baseline.canonical_path &&
+                    finding.kind == surface_entry_kind_t::security_guard,
+                "missing guard did not retain strongest security disposition");
+        require_detail(
+            finding,
+            "baseline security guard is missing or inactive in actual surface");
+        require(equal_results(first, second),
+                "security evidence deduplication is nondeterministic");
+        if (marker_first)
+            reverse = first;
+        else
+            forward = first;
+    }
+    require(equal_results(forward, reverse),
+            "security marker insertion order changed canonical evidence");
+
+    {
+        surface_reconciliation_t reconciliation;
+        auto actual = inactive(make_entry(
+            "security_equal_tie", "surface/security_equal_tie.cpp",
+            surface_entry_kind_t::security_guard));
+        actual.security_note = "inactive exact guard evidence";
+        reconciliation.mark_security_regression(
+            actual.identifier, "equal-severity marker evidence");
+        reconciliation.register_actual_entry(actual);
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        const auto& finding = require_finding(
+            first, surface_error_code_t::security_regression_detected,
+            actual.identifier);
+        require(finding.severity == 900 &&
+                    finding.canonical_path == actual.canonical_path,
+                "equal-severity security tie discarded path-bound evidence");
+        require_contains(finding, "security guard is inactive in actual surface");
+        require(equal_results(first, second),
+                "equal-severity security tie is nondeterministic");
+    }
+    {
+        surface_reconciliation_t reconciliation;
+        auto baseline = make_entry(
+            "security_drift_marker", "surface/security_drift_marker.cpp",
+            surface_entry_kind_t::security_guard);
+        baseline.security_note = "strict baseline";
+        auto actual = baseline;
+        actual.security_note = "drifted actual";
+        reconciliation.register_baseline_entry(baseline);
+        reconciliation.register_actual_entry(actual);
+        reconciliation.mark_security_regression(
+            baseline.identifier, "explicit lower-priority marker");
+        const auto result = reconciliation.reconcile();
+        require(finding_count(
+                    result, surface_error_code_t::security_regression_detected,
+                    baseline.identifier) == 1,
+                "marker and drift emitted duplicate security dispositions");
+        const auto& finding = require_finding(
+            result, surface_error_code_t::security_regression_detected,
+            baseline.identifier);
+        require(finding.severity == 950 &&
+                    finding.canonical_path == baseline.canonical_path,
+                "explicit marker suppressed stronger security drift evidence");
+        require_detail(
+            finding,
+            "security-relevant baseline drift in fields: security_note");
+    }
+}
+
+void verify_security_conflict_and_intrinsic_priority() {
+    const auto exercise_conflict = [](bool reverse) {
+        surface_reconciliation_t reconciliation;
+        constexpr std::string_view weak = "short evidence";
+        constexpr std::string_view strong =
+            "deterministically stronger explicit security evidence";
+        const auto add = [&](std::string_view detail) {
+            reconciliation.mark_security_regression(
+                "security_conflicting_reason", detail);
+        };
+        if (reverse) {
+            add(strong);
+            add(weak);
+            add(strong);
+            add(weak);
+        } else {
+            add(weak);
+            add(strong);
+            add(weak);
+            add(strong);
+        }
+        return reconciliation.reconcile();
+    };
+    const auto conflict_forward = exercise_conflict(false);
+    const auto conflict_reverse = exercise_conflict(true);
+    require_detail(
+        require_finding(
+            conflict_forward, surface_error_code_t::invalid_surface_marker,
+            "security_conflicting_reason"),
+        "surface marker rejected; collection=security_regressions, reason=conflicting_duplicate_marker, malformed=1");
+    const auto& conflict_finding = require_finding(
+        conflict_forward, surface_error_code_t::security_regression_detected,
+        "security_conflicting_reason");
+    require_detail(
+        conflict_finding,
+        "security regression: deterministically stronger explicit security evidence");
+    require(conflict_forward.attempted_auxiliary_markers == 4 &&
+                conflict_forward.rejected_auxiliary_markers == 1 &&
+                conflict_forward.malformed_markers == 1 &&
+                equal_results(conflict_forward, conflict_reverse),
+            "security reason conflict merge is order-dependent");
+
+    const auto exercise_tie = [](bool reverse) {
+        surface_reconciliation_t reconciliation;
+        const auto add = [&](std::string_view detail) {
+            reconciliation.mark_security_regression(
+                "security_equal_reason", detail);
+        };
+        if (reverse) {
+            add("bbbb");
+            add("aaaa");
+            add("bbbb");
+            add("aaaa");
+        } else {
+            add("aaaa");
+            add("bbbb");
+            add("aaaa");
+            add("bbbb");
+        }
+        return reconciliation.reconcile();
+    };
+    const auto tie_forward = exercise_tie(false);
+    const auto tie_reverse = exercise_tie(true);
+    require_detail(
+        require_finding(
+            tie_forward, surface_error_code_t::security_regression_detected,
+            "security_equal_reason"),
+        "security regression: aaaa");
+    require(tie_forward.rejected_auxiliary_markers == 1 &&
+                tie_forward.malformed_markers == 1 &&
+                equal_results(tie_forward, tie_reverse),
+            "equal-priority security reason tie is order-dependent");
+
+    for (std::uint64_t visible_limit = 1; visible_limit <= 1000;
+         ++visible_limit) {
+        const auto exercise = [visible_limit](bool reverse) {
+            surface_reconciliation_limits_t limits;
+            limits.maximum_severity = visible_limit;
+            surface_reconciliation_t reconciliation(limits);
+            auto baseline = make_entry(
+                "security_intrinsic_priority",
+                "surface/security_intrinsic_priority.cpp",
+                surface_entry_kind_t::security_guard);
+            baseline.security_note = "strict baseline guard";
+            auto actual = inactive(baseline);
+            actual.security_note = std::string(3000, 'z');
+            const auto add_markers = [&](bool reverse_markers) {
+                const auto weak = std::string(2500, 'x');
+                const auto strong = std::string(3500, 'y');
+                if (reverse_markers) {
+                    reconciliation.mark_security_regression(
+                        baseline.identifier, strong);
+                    reconciliation.mark_security_regression(
+                        baseline.identifier, weak);
+                } else {
+                    reconciliation.mark_security_regression(
+                        baseline.identifier, weak);
+                    reconciliation.mark_security_regression(
+                        baseline.identifier, strong);
+                }
+            };
+            if (reverse) {
+                add_markers(true);
+                reconciliation.register_actual_entry(actual);
+                reconciliation.register_baseline_entry(baseline);
+            } else {
+                reconciliation.register_baseline_entry(baseline);
+                reconciliation.register_actual_entry(actual);
+                add_markers(false);
+            }
+            return reconciliation.reconcile();
+        };
+        const auto forward = exercise(false);
+        const auto reverse = exercise(true);
+        const auto& strongest = require_finding(
+            forward, surface_error_code_t::security_regression_detected,
+            "security_intrinsic_priority");
+        require_detail(
+            strongest,
+            "baseline security guard is missing or inactive in actual surface");
+        require(strongest.canonical_path ==
+                    "surface/security_intrinsic_priority.cpp" &&
+                    strongest.severity == visible_limit &&
+                    finding_count(
+                        forward,
+                        surface_error_code_t::security_regression_detected,
+                        "security_intrinsic_priority") == 1 &&
+                    forward.rejected_auxiliary_markers == 1 &&
+                    forward.malformed_markers == 1 &&
+                    equal_results(forward, reverse),
+                "visible severity clamp changed intrinsic security precedence");
+    }
+}
+
+void verify_security_priority_finding_caps() {
+    {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_findings = 2;
+        surface_reconciliation_t reconciliation(limits);
+        reconciliation.mark_stale_registration("invalid marker identity");
+        reconciliation.mark_duplicate_store(
+            "cap_low_priority", "surface/cap_low_priority.cpp");
+        reconciliation.mark_security_regression(
+            "cap_security", "late security evidence");
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(first.finding_cap_exceeded && first.findings.size() == 2,
+                "minimum valid finding cap did not remain bounded");
+        require_finding(
+            first, surface_error_code_t::finding_cap_exceeded,
+            "surface_findings");
+        require_finding(
+            first, surface_error_code_t::security_regression_detected,
+            "cap_security");
+        require_no_finding(
+            first, surface_error_code_t::invalid_surface_marker);
+        require_no_finding(
+            first, surface_error_code_t::duplicate_store_detected);
+        require(first.findings_discarded != 0 && equal_results(first, second),
+                "security-priority minimum cap retention is nondeterministic");
+    }
+    {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_findings = 3;
+        surface_reconciliation_t reconciliation(limits);
+        for (const auto* identifier : {
+                 "security_cap_4", "security_cap_1", "security_cap_3",
+                 "security_cap_0", "security_cap_2"}) {
+            reconciliation.mark_security_regression(
+                identifier, "equal-priority security evidence");
+        }
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(first.finding_cap_exceeded && first.findings.size() == 3,
+                "multi-security finding cap did not remain bounded");
+        require_finding(
+            first, surface_error_code_t::finding_cap_exceeded,
+            "surface_findings");
+        require_finding(
+            first, surface_error_code_t::security_regression_detected,
+            "security_cap_0");
+        require_finding(
+            first, surface_error_code_t::security_regression_detected,
+            "security_cap_1");
+        require_no_finding(
+            first, surface_error_code_t::security_regression_detected,
+            "security_cap_2");
+        require_no_finding(
+            first, surface_error_code_t::security_regression_detected,
+            "security_cap_3");
+        require_no_finding(
+            first, surface_error_code_t::security_regression_detected,
+            "security_cap_4");
+        require(equal_results(first, second),
+                "equal-priority security cap tie is nondeterministic");
+    }
+    {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_findings = 3;
+        surface_reconciliation_t ascending(limits);
+        surface_reconciliation_t descending(limits);
+        for (int index = 0; index < 6; ++index) {
+            ascending.mark_security_regression(
+                "permuted_security_" + std::to_string(index),
+                "equal-priority security evidence");
+            descending.mark_security_regression(
+                "permuted_security_" + std::to_string(5 - index),
+                "equal-priority security evidence");
+        }
+        const auto ascending_result = ascending.reconcile();
+        const auto descending_result = descending.reconcile();
+        require(equal_results(ascending_result, descending_result),
+                "finding retention changed under input order permutation");
     }
 }
 
@@ -1073,18 +2728,25 @@ void verify_marker_validation_and_capacity() {
         surface_reconciliation_t reconciliation(limits);
         auto old_source = make_entry(
             "dead", "surface/dead.cpp", surface_entry_kind_t::source_file);
-        reconciliation.register_actual_entry(old_source);
+        reconciliation.register_actual_entry(retired(old_source, "dead_target"));
         reconciliation.register_actual_entry(make_entry(
             "dead_target", "surface/dead_target.cpp",
             surface_entry_kind_t::source_file));
-        reconciliation.register_actual_entry(make_entry(
-            "alias", "surface/alias.cpp", surface_entry_kind_t::alias_mapping));
+        reconciliation.register_actual_entry(retired(make_entry(
+            "alias", "surface/alias.cpp", surface_entry_kind_t::alias_mapping),
+            "alias_target"));
         reconciliation.register_actual_entry(make_entry(
             "alias_target", "surface/alias_target.cpp",
             surface_entry_kind_t::handler_registration));
-        reconciliation.register_actual_entry(make_entry(
+        reconciliation.register_actual_entry(inactive(make_entry(
             "stale", "surface/stale.cpp",
-            surface_entry_kind_t::handler_registration));
+            surface_entry_kind_t::handler_registration)));
+        reconciliation.register_baseline_entry(make_entry(
+            "schema", "surface/schema.cpp",
+            surface_entry_kind_t::schema_writer, true, "v8"));
+        reconciliation.register_actual_entry(make_entry(
+            "schema", "surface/schema.cpp",
+            surface_entry_kind_t::schema_writer, true, "v9"));
         const auto add_markers = [&reconciliation] {
             reconciliation.mark_dead_replaced_path("dead", "dead_target");
             reconciliation.mark_duplicate_store("duplicate", "surface/duplicate.cpp");
@@ -1099,13 +2761,16 @@ void verify_marker_validation_and_capacity() {
         reconciliation.mark_stale_registration("overflow");
         const auto result = reconciliation.reconcile();
         require(result.attempted_auxiliary_markers == 15 &&
-                    result.rejected_auxiliary_markers == 1 &&
-                    result.malformed_markers == 0 &&
+                    result.rejected_auxiliary_markers == 2 &&
+                    result.malformed_markers == 1 &&
                     result.auxiliary_cap_exceeded,
                 "idempotent markers consumed capacity or overflow accounting regressed");
         require_finding(result,
                         surface_error_code_t::auxiliary_marker_cap_exceeded,
-                        "stale_registrations");
+                        "unsupported_aliases");
+        require_marker_reason(
+            result, "stale_registrations", "overflow",
+            "missing_actual_source_identity");
     }
 
     constexpr std::array<std::string_view, 7> collections = {
@@ -1132,6 +2797,217 @@ void verify_marker_validation_and_capacity() {
         require_finding(result,
                         surface_error_code_t::auxiliary_marker_cap_exceeded,
                         collections[index]);
+    }
+}
+
+void verify_canonical_invalid_and_overflow_evidence() {
+    constexpr std::array<std::array<std::size_t, 3>, 6> permutations = {{
+        {{0, 1, 2}}, {{0, 2, 1}}, {{1, 0, 2}},
+        {{1, 2, 0}}, {{2, 0, 1}}, {{2, 1, 0}}
+    }};
+
+    surface_reconciliation_result_t canonical_entries;
+    bool have_entries = false;
+    for (const auto& order : permutations) {
+        surface_reconciliation_t reconciliation;
+        for (const auto index : order) {
+            if (index == 0) {
+                auto entry = make_entry(
+                    "z invalid", "surface/z_invalid.cpp",
+                    surface_entry_kind_t::source_file);
+                reconciliation.register_baseline_entry(entry);
+            } else if (index == 1) {
+                auto entry = make_entry(
+                    "a invalid", "surface/a_invalid.cpp",
+                    surface_entry_kind_t::source_file);
+                reconciliation.register_actual_entry(entry);
+            } else {
+                auto entry = make_entry(
+                    "middle_invalid", "bad\\path.cpp",
+                    surface_entry_kind_t::source_file);
+                reconciliation.register_baseline_entry(entry);
+            }
+        }
+        const auto result = reconciliation.reconcile();
+        const auto& finding = require_finding(
+            result, surface_error_code_t::invalid_surface_entry, "a invalid");
+        require_detail(
+            finding,
+            "actual surface entry rejected; reason=invalid_identifier, malformed=3");
+        require(result.malformed_entries == 3 &&
+                    result.rejected_baseline_entries == 2 &&
+                    result.rejected_actual_entries == 1,
+                "invalid-entry canonical accounting is incorrect");
+        if (!have_entries) {
+            canonical_entries = result;
+            have_entries = true;
+        } else {
+            require(equal_results(canonical_entries, result),
+                    "invalid-entry evidence depends on registration order");
+        }
+    }
+
+    surface_reconciliation_result_t canonical_markers;
+    bool have_markers = false;
+    for (const auto& order : permutations) {
+        surface_reconciliation_t reconciliation;
+        for (const auto index : order) {
+            if (index == 0) {
+                reconciliation.mark_stale_registration("z invalid");
+            } else if (index == 1) {
+                reconciliation.mark_security_regression("a", "");
+            } else {
+                reconciliation.mark_duplicate_store("m", "bad\\path.cpp");
+            }
+        }
+        const auto result = reconciliation.reconcile();
+        const auto& finding = require_finding(
+            result, surface_error_code_t::invalid_surface_marker, "a");
+        require_detail(
+            finding,
+            "surface marker rejected; collection=security_regressions, reason=invalid_security_marker, malformed=3");
+        require(result.attempted_auxiliary_markers == 3 &&
+                    result.rejected_auxiliary_markers == 3 &&
+                    result.malformed_markers == 3,
+                "invalid-marker canonical accounting is incorrect");
+        if (!have_markers) {
+            canonical_markers = result;
+            have_markers = true;
+        } else {
+            require(equal_results(canonical_markers, result),
+                    "invalid-marker evidence depends on registration order");
+        }
+    }
+}
+
+void verify_auxiliary_security_priority() {
+    constexpr std::array<std::array<std::size_t, 5>, 3> orders = {{
+        {{0, 1, 2, 3, 4}},
+        {{4, 3, 2, 1, 0}},
+        {{2, 4, 1, 3, 0}}
+    }};
+    for (std::size_t capacity = 1; capacity <= 5; ++capacity) {
+        surface_reconciliation_result_t canonical;
+        bool have_canonical = false;
+        for (const auto& order : orders) {
+            surface_reconciliation_limits_t limits;
+            limits.maximum_entries = capacity;
+            surface_reconciliation_t reconciliation(limits);
+            reconciliation.register_actual_entry(inactive(make_entry(
+                "priority_stale", "surface/priority_stale.cpp",
+                surface_entry_kind_t::handler_registration)));
+            for (const auto index : order) {
+                switch (index) {
+                case 0:
+                    reconciliation.mark_security_regression(
+                        "priority_security_a", "security evidence a");
+                    break;
+                case 1:
+                    reconciliation.mark_security_regression(
+                        "priority_security_b", "security evidence b");
+                    break;
+                case 2:
+                    reconciliation.mark_duplicate_store(
+                        "priority_duplicate", "surface/priority_duplicate.cpp");
+                    break;
+                case 3:
+                    reconciliation.mark_legacy_invalid_ast_flow(
+                        "priority_legacy");
+                    break;
+                case 4:
+                    reconciliation.mark_stale_registration("priority_stale");
+                    break;
+                default:
+                    throw std::runtime_error(
+                        "unreachable auxiliary-priority fixture");
+                }
+            }
+            const auto result = reconciliation.reconcile();
+            require(result.attempted_auxiliary_markers == 5 &&
+                        result.rejected_auxiliary_markers == 5 - capacity &&
+                        result.auxiliary_cap_exceeded == (capacity < 5),
+                    "auxiliary priority capacity accounting is incorrect");
+            require_finding(
+                result, surface_error_code_t::security_regression_detected,
+                "priority_security_a");
+            if (capacity == 1) {
+                require_no_finding(
+                    result, surface_error_code_t::security_regression_detected,
+                    "priority_security_b");
+            } else {
+                require_finding(
+                    result, surface_error_code_t::security_regression_detected,
+                    "priority_security_b");
+            }
+            if (capacity < 5) {
+                require_finding(
+                    result,
+                    surface_error_code_t::auxiliary_marker_cap_exceeded,
+                    capacity <= 2
+                        ? "duplicate_stores"
+                        : capacity == 3
+                              ? "legacy_ast_flows"
+                              : "stale_registrations");
+            }
+            if (!have_canonical) {
+                canonical = result;
+                have_canonical = true;
+            } else {
+                require(equal_results(canonical, result),
+                        "auxiliary priority retention depends on input order");
+            }
+        }
+    }
+
+    constexpr std::array<std::array<std::size_t, 3>, 6> proof_orders = {{
+        {{0, 1, 2}}, {{0, 2, 1}}, {{1, 0, 2}},
+        {{1, 2, 0}}, {{2, 0, 1}}, {{2, 1, 0}}
+    }};
+    surface_reconciliation_result_t canonical_proof_overflow;
+    bool have_proof_overflow = false;
+    for (const auto& order : proof_orders) {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_entries = 2;
+        surface_reconciliation_t reconciliation(limits);
+        const auto source = make_entry(
+            "priority_proof_source", "surface/priority_proof_source.cpp",
+            surface_entry_kind_t::source_file);
+        reconciliation.register_actual_entry(retired(
+            source, "priority_proof_target"));
+        reconciliation.register_actual_entry(make_entry(
+            "priority_proof_target", "surface/priority_proof_target.cpp",
+            surface_entry_kind_t::source_file));
+        for (const auto index : order) {
+            if (index == 0) {
+                reconciliation.mark_dead_replaced_path(
+                    "priority_proof_source", "priority_proof_target");
+            } else if (index == 1) {
+                reconciliation.mark_security_regression(
+                    "priority_proof_security", "security evidence");
+            } else {
+                reconciliation.mark_stale_registration(
+                    "priority_proof_stale");
+            }
+        }
+        const auto result = reconciliation.reconcile();
+        require(result.auxiliary_cap_exceeded &&
+                    result.attempted_auxiliary_markers == 3 &&
+                    result.rejected_auxiliary_markers == 1 &&
+                    result.unexplained_removals == 1,
+                "incomplete auxiliary inventory did not fail proof closure");
+        require_finding(
+            result, surface_error_code_t::security_regression_detected,
+            "priority_proof_security");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            "priority_proof_source");
+        if (!have_proof_overflow) {
+            canonical_proof_overflow = result;
+            have_proof_overflow = true;
+        } else {
+            require(equal_results(canonical_proof_overflow, result),
+                    "overflow proof closure depends on marker order");
+        }
     }
 }
 
@@ -1300,14 +3176,25 @@ void run_surface_reconciliation_harness() {
     verify_clean_boundaries_and_determinism();
     verify_semantic_drift_and_security_precedence();
     verify_lawful_migrations();
+    verify_inactive_actual_proof_closure();
     verify_schema_migration_predicate();
     verify_stale_registration_proofs();
     verify_replacement_target_graph();
+    verify_baseline_only_retirement_rejection();
+    verify_schema_identity_and_proof_matrix();
+    verify_alias_proof_matrix();
+    verify_cross_proof_exclusion_matrix();
+    verify_same_key_conflict_invalidation();
+    verify_security_evidence_deduplication();
+    verify_security_conflict_and_intrinsic_priority();
+    verify_security_priority_finding_caps();
     verify_finding_source_fidelity();
     verify_duplicate_identity_contract();
     verify_limits_and_finding_cap();
     verify_invalid_entries();
     verify_marker_validation_and_capacity();
+    verify_canonical_invalid_and_overflow_evidence();
+    verify_auxiliary_security_priority();
     verify_diagnostic_families();
     verify_metric_saturation();
 }

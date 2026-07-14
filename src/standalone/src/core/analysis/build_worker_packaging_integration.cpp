@@ -12,8 +12,10 @@
 #include <array>
 #include <cctype>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <queue>
 #include <set>
 #include <system_error>
 #include <unordered_map>
@@ -65,6 +67,16 @@ constexpr stable_code_entry_t k_stable_codes[] = {
     {build_worker_error_code_t::source_authority_invalid, "source_authority_invalid"},
     {build_worker_error_code_t::online_fetch_marker, "online_fetch_marker"},
     {build_worker_error_code_t::package_policy_violation, "package_policy_violation"},
+    {build_worker_error_code_t::named_stream_forbidden, "named_stream_forbidden"},
+    {build_worker_error_code_t::resource_file_limit, "resource_file_limit"},
+    {build_worker_error_code_t::resource_directory_limit, "resource_directory_limit"},
+    {build_worker_error_code_t::resource_entry_limit, "resource_entry_limit"},
+    {build_worker_error_code_t::resource_depth_limit, "resource_depth_limit"},
+    {build_worker_error_code_t::resource_path_limit, "resource_path_limit"},
+    {build_worker_error_code_t::resource_file_bytes_limit, "resource_file_bytes_limit"},
+    {build_worker_error_code_t::resource_total_bytes_limit, "resource_total_bytes_limit"},
+    {build_worker_error_code_t::resource_stream_limit, "resource_stream_limit"},
+    {build_worker_error_code_t::directory_cycle, "directory_cycle"},
     {build_worker_error_code_t::required_external_artifact_missing, "required_external_artifact_missing"},
     {build_worker_error_code_t::internal_error, "internal_error"},
 };
@@ -87,7 +99,9 @@ build_worker_error_t error(build_worker_error_code_t code,
 
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
-        return static_cast<char>(std::tolower(character));
+        return static_cast<char>(character >= 'A' && character <= 'Z'
+            ? character + ('a' - 'A')
+            : character);
     });
     return value;
 }
@@ -167,6 +181,15 @@ struct win_handle_t final {
     }
 };
 
+struct find_handle_t final {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    ~find_handle_t() {
+        if (handle != INVALID_HANDLE_VALUE && handle != nullptr)
+            FindClose(handle);
+    }
+};
+
 struct certificate_store_t final {
     HCERTSTORE handle = nullptr;
 
@@ -194,6 +217,41 @@ struct certificate_context_t final {
     }
 };
 
+build_worker_result_t<std::size_t> verify_stream_inventory(
+    const std::filesystem::path& path) {
+    WIN32_FIND_STREAM_DATA stream_data{};
+    find_handle_t stream;
+    stream.handle = FindFirstStreamW(path.c_str(), FindStreamInfoStandard, &stream_data, 0);
+    if (stream.handle == INVALID_HANDLE_VALUE) {
+        const DWORD last_error = GetLastError();
+        if (last_error == ERROR_HANDLE_EOF)
+            return build_worker_result_t<std::size_t>::success(0);
+        return build_worker_result_t<std::size_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "FindFirstStreamW", 0, last_error));
+    }
+    std::size_t count = 0;
+    for (;;) {
+        ++count;
+        if (count > k_default_stream_count_limit)
+            return build_worker_result_t<std::size_t>::failure(
+                error(build_worker_error_code_t::resource_stream_limit, path,
+                      "stream_count", k_default_stream_count_limit, count));
+        if (std::wstring_view(stream_data.cStreamName) != L"::$DATA")
+            return build_worker_result_t<std::size_t>::failure(
+                error(build_worker_error_code_t::named_stream_forbidden, path));
+        if (!FindNextStreamW(stream.handle, &stream_data)) {
+            const DWORD last_error = GetLastError();
+            if (last_error == ERROR_HANDLE_EOF)
+                break;
+            return build_worker_result_t<std::size_t>::failure(
+                error(build_worker_error_code_t::file_read_failed, path,
+                      "FindNextStreamW", 0, last_error));
+        }
+    }
+    return build_worker_result_t<std::size_t>::success(count);
+}
+
 build_worker_result_t<file_evidence_t> inspect_regular_file(
     const std::filesystem::path& path, std::uint64_t maximum_bytes, bool retain_content) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -206,6 +264,9 @@ build_worker_result_t<file_evidence_t> inspect_regular_file(
     if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
         return build_worker_result_t<file_evidence_t>::failure(
             error(build_worker_error_code_t::file_type_invalid, path));
+    auto streams = verify_stream_inventory(path);
+    if (!streams)
+        return build_worker_result_t<file_evidence_t>::failure(streams.error());
 
     win_handle_t file;
     file.handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -389,18 +450,23 @@ build_worker_result_t<std::filesystem::path> canonical_directory(
 }
 
 bool safe_relative_path(std::string_view value) noexcept {
-    if (value.empty() || value.size() > 32768 || value.front() == '/' ||
-        value.find('\\') != std::string_view::npos ||
-        value.find(':') != std::string_view::npos ||
-        value.find('\0') != std::string_view::npos)
+    if (value.empty() || value.size() > k_default_relative_path_limit ||
+        value.front() == '/' || value.back() == '/')
         return false;
+    for (const unsigned char character : value) {
+        if (character < 0x21U || character > 0x7eU || character == '\\' ||
+            character == ':' || character == '<' || character == '>' ||
+            character == '"' || character == '|' || character == '?' ||
+            character == '*')
+            return false;
+    }
     std::size_t begin = 0;
     while (begin <= value.size()) {
         const auto end = value.find('/', begin);
         const auto part = value.substr(begin, end == std::string_view::npos
                                                 ? value.size() - begin
                                                 : end - begin);
-        if (part.empty() || part == "." || part == "..")
+        if (part.empty() || part == "." || part == ".." || part.back() == '.')
             return false;
         if (end == std::string_view::npos)
             break;
@@ -1376,28 +1442,313 @@ build_worker_result_t<void> verify_worker_manifest_binary(
 }
 
 bool unexpected_customer_file(std::string_view relative) {
-    const auto lower = lowercase(std::string(relative));
-    if (lower.find("camoufox-reverse-mcp/") != std::string::npos ||
-        lower.find("camoufox_reverse_mcp/") != std::string::npos ||
-        lower.find(".dist-info/") != std::string::npos ||
-        lower.find(".egg-info/") != std::string::npos ||
-        lower.find("/sdk/") != std::string::npos ||
-        lower.find("/packs/") != std::string::npos ||
-        lower.find("/templates/") != std::string::npos ||
-        lower.find("/library-packs/") != std::string::npos)
+    if (!safe_relative_path(relative))
         return true;
-    const std::array<std::string_view, 28> forbidden_extensions{
-        ".py", ".pyc", ".pyo", ".pyz", ".whl", ".pth", ".spec", ".sln",
-        ".vcxproj", ".vcxproj.filters", ".pdb", ".ilk", ".lib", ".obj", ".exp",
-        ".map", ".a", ".nupkg", ".snupkg", ".nuspec", ".targets", ".props",
-        ".cs", ".csproj", ".fs", ".fsproj", ".vb", ".vbproj"
+    const auto lower = lowercase(std::string(relative));
+    constexpr std::string_view forbidden_extensions[]{
+        ".a", ".asm", ".bash", ".bat", ".c", ".c++", ".cc", ".cmake", ".cmd", ".cpp",
+        ".cppm", ".cs", ".csproj", ".cxx", ".def", ".exp", ".fs", ".fsproj", ".go",
+        ".gradle", ".h", ".hh", ".hpp", ".hxx", ".ilk", ".in", ".inc", ".inl", ".ipp",
+        ".ixx", ".java", ".kt", ".kts", ".lib", ".m", ".make", ".map", ".mk", ".mm",
+        ".natvis", ".nupkg", ".nuspec", ".obj", ".pdb", ".props", ".ps1", ".psd1",
+        ".psm1", ".pth", ".py", ".pyc", ".pyo", ".pyz", ".rc", ".rc2", ".rs", ".s",
+        ".sh", ".sln", ".snupkg", ".spec", ".swift", ".targets", ".tpp", ".vb",
+        ".vbproj", ".vcxproj", ".vcxproj.filters", ".whl", ".zig", ".zsh"
     };
-    return std::any_of(forbidden_extensions.begin(), forbidden_extensions.end(),
-                       [&](std::string_view extension) {
-                           return lower.size() >= extension.size() &&
-                                  lower.compare(lower.size() - extension.size(), extension.size(),
-                                                extension) == 0;
+    constexpr std::string_view forbidden_names[]{
+        "build", "build.bazel", "cmakelists.txt", "gnumakefile", "makefile",
+        "meson.build", "workspace", "workspace.bazel"
+    };
+    constexpr std::string_view forbidden_directories[]{
+        "c03-safe-headless", "camoufox-reverse-mcp", "camoufox_reverse_mcp",
+        "library-packs", "metadata", "packs", "sdk", "templates"
+    };
+    constexpr std::string_view stock_browsers[]{
+        "chrome", "chrome.exe", "msedge", "msedge.exe", "stock-firefox", "stock-firefox.exe"
+    };
+    const auto ascii_alphanumeric = [](char character) noexcept {
+        return (character >= 'a' && character <= 'z') ||
+               (character >= '0' && character <= '9');
+    };
+    const auto policy_name_match = [&](std::string_view segment,
+                                       std::string_view forbidden) noexcept {
+        return segment == forbidden ||
+               (segment.size() > forbidden.size() &&
+                segment.compare(0, forbidden.size(), forbidden) == 0 &&
+                !ascii_alphanumeric(segment[forbidden.size()]));
+    };
+    const auto forbidden_extension = [&](std::string_view segment) {
+        for (const auto extension : forbidden_extensions) {
+            std::size_t offset = 0;
+            while (offset < segment.size()) {
+                const auto match = segment.find(extension, offset);
+                if (match == std::string_view::npos)
+                    break;
+                const auto after = match + extension.size();
+                if (after == segment.size() || !ascii_alphanumeric(segment[after]))
+                    return true;
+                offset = match + 1;
+            }
+        }
+        return false;
+    };
+    std::string_view remaining(lower);
+    std::string_view leaf;
+    while (!remaining.empty()) {
+        const auto separator = remaining.find('/');
+        const auto segment = remaining.substr(0, separator);
+        const auto dot = segment.find('.');
+        const auto device_base = segment.substr(0, dot);
+        const bool reserved_device = device_base == "con" || device_base == "prn" ||
+            device_base == "aux" || device_base == "nul" ||
+            (device_base.size() == 4 &&
+             (device_base.compare(0, 3, "com") == 0 ||
+              device_base.compare(0, 3, "lpt") == 0) &&
+             device_base[3] >= '1' && device_base[3] <= '9');
+        const bool forbidden_name = std::any_of(
+            std::begin(forbidden_names), std::end(forbidden_names),
+            [&](std::string_view value) { return policy_name_match(segment, value); });
+        const bool forbidden_directory = std::any_of(
+            std::begin(forbidden_directories), std::end(forbidden_directories),
+            [&](std::string_view value) { return policy_name_match(segment, value); });
+        const bool metadata_wrapper = policy_name_match(segment, ".dist-info") ||
+            policy_name_match(segment, ".egg-info") ||
+            segment.find(".dist-info") != std::string_view::npos ||
+            segment.find(".egg-info") != std::string_view::npos;
+        if (reserved_device || forbidden_name || forbidden_directory || metadata_wrapper ||
+            forbidden_extension(segment))
+            return true;
+        leaf = segment;
+        if (separator == std::string_view::npos)
+            break;
+        remaining.remove_prefix(separator + 1);
+    }
+    return std::any_of(std::begin(stock_browsers), std::end(stock_browsers),
+                       [&](std::string_view value) {
+                           return policy_name_match(leaf, value);
                        });
+}
+
+struct directory_identity_t final {
+    DWORD volume = 0;
+    std::uint64_t file = 0;
+
+    bool operator<(const directory_identity_t& other) const noexcept {
+        return volume < other.volume || (volume == other.volume && file < other.file);
+    }
+};
+
+build_worker_result_t<directory_identity_t> inspect_directory_identity(
+    const std::filesystem::path& path) {
+    win_handle_t directory;
+    directory.handle = CreateFileW(
+        path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (directory.handle == INVALID_HANDLE_VALUE)
+        return build_worker_result_t<directory_identity_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "CreateFileW:directory", 0, GetLastError()));
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    if (!GetFileInformationByHandleEx(directory.handle, FileAttributeTagInfo, &tag,
+                                      sizeof(tag)))
+        return build_worker_result_t<directory_identity_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "FileAttributeTagInfo:directory", 0, GetLastError()));
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        return build_worker_result_t<directory_identity_t>::failure(
+            error(build_worker_error_code_t::reparse_point, path));
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        return build_worker_result_t<directory_identity_t>::failure(
+            error(build_worker_error_code_t::file_type_invalid, path));
+    BY_HANDLE_FILE_INFORMATION identity{};
+    if (!GetFileInformationByHandle(directory.handle, &identity))
+        return build_worker_result_t<directory_identity_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "GetFileInformationByHandle:directory", 0, GetLastError()));
+    auto streams = verify_stream_inventory(path);
+    if (!streams)
+        return build_worker_result_t<directory_identity_t>::failure(streams.error());
+    return build_worker_result_t<directory_identity_t>::success({
+        identity.dwVolumeSerialNumber,
+        (static_cast<std::uint64_t>(identity.nFileIndexHigh) << 32U) |
+            identity.nFileIndexLow});
+}
+
+build_worker_result_t<std::uint64_t> inspect_file_size_only(
+    const std::filesystem::path& path) {
+    win_handle_t file;
+    file.handle = CreateFileW(
+        path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file.handle == INVALID_HANDLE_VALUE)
+        return build_worker_result_t<std::uint64_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "CreateFileW:size", 0, GetLastError()));
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    if (!GetFileInformationByHandleEx(file.handle, FileAttributeTagInfo, &tag, sizeof(tag)))
+        return build_worker_result_t<std::uint64_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "FileAttributeTagInfo:size", 0, GetLastError()));
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+        return build_worker_result_t<std::uint64_t>::failure(
+            error(build_worker_error_code_t::reparse_point, path));
+    if ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        return build_worker_result_t<std::uint64_t>::failure(
+            error(build_worker_error_code_t::file_type_invalid, path));
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file.handle, &size) || size.QuadPart < 0)
+        return build_worker_result_t<std::uint64_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "GetFileSizeEx:size", 0, GetLastError()));
+    auto streams = verify_stream_inventory(path);
+    if (!streams)
+        return build_worker_result_t<std::uint64_t>::failure(streams.error());
+    return build_worker_result_t<std::uint64_t>::success(
+        static_cast<std::uint64_t>(size.QuadPart));
+}
+
+struct bounded_package_inventory_t final {
+    std::vector<std::string> files;
+    std::size_t directories = 0;
+    std::size_t entries = 0;
+    std::size_t stream_inventories = 0;
+    std::uint64_t bytes = 0;
+};
+
+build_worker_result_t<bounded_package_inventory_t> enumerate_package_tree(
+    const std::filesystem::path& root, const package_verification_request_t& request) {
+    bounded_package_inventory_t result;
+    result.directories = 1;
+    result.stream_inventories = 1;
+    auto root_identity = inspect_directory_identity(root);
+    if (!root_identity)
+        return build_worker_result_t<bounded_package_inventory_t>::failure(
+            root_identity.error());
+    std::set<directory_identity_t> directory_identities;
+    directory_identities.emplace(root_identity.value());
+    struct pending_directory_t final {
+        std::filesystem::path path;
+        std::size_t depth = 0;
+    };
+    std::queue<pending_directory_t> pending;
+    pending.push({root, 0});
+    while (!pending.empty()) {
+        auto current = std::move(pending.front());
+        pending.pop();
+        std::error_code iteration_error;
+        std::filesystem::directory_iterator iterator(
+            current.path, std::filesystem::directory_options::none, iteration_error);
+        const std::filesystem::directory_iterator end;
+        if (iteration_error)
+            return build_worker_result_t<bounded_package_inventory_t>::failure(
+                error(build_worker_error_code_t::file_read_failed, current.path,
+                      iteration_error.message()));
+        for (; iterator != end; iterator.increment(iteration_error)) {
+            if (iteration_error)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::file_read_failed, current.path,
+                          iteration_error.message()));
+            ++result.entries;
+            if (result.entries > request.maximum_total_entry_count)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::resource_entry_limit, iterator->path(),
+                          "total_entries", request.maximum_total_entry_count,
+                          result.entries));
+            const DWORD attributes = GetFileAttributesW(iterator->path().c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::file_read_failed, iterator->path(),
+                          "GetFileAttributesW", 0, GetLastError()));
+            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::reparse_point, iterator->path()));
+            std::error_code relative_error;
+            const auto relative = std::filesystem::relative(
+                iterator->path(), root, relative_error);
+            if (relative_error || relative.empty() || relative.is_absolute())
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::path_escape, iterator->path(),
+                          relative_error.message()));
+            std::string text;
+            try {
+                text = relative.generic_u8string();
+            } catch (const std::exception& exception) {
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::unsafe_path, iterator->path(),
+                          exception.what()));
+            }
+            if (text.size() > request.maximum_relative_path_bytes)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::resource_path_limit, iterator->path(),
+                          "relative_path_bytes", request.maximum_relative_path_bytes,
+                          text.size()));
+            if (unexpected_customer_file(text))
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::package_policy_violation,
+                          iterator->path()));
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                ++result.directories;
+                ++result.stream_inventories;
+                if (result.directories > request.maximum_directory_count)
+                    return build_worker_result_t<bounded_package_inventory_t>::failure(
+                        error(build_worker_error_code_t::resource_directory_limit,
+                              iterator->path(), "directories",
+                              request.maximum_directory_count, result.directories));
+                const auto depth = current.depth + 1;
+                if (depth > request.maximum_depth)
+                    return build_worker_result_t<bounded_package_inventory_t>::failure(
+                        error(build_worker_error_code_t::resource_depth_limit,
+                              iterator->path(), "depth", request.maximum_depth, depth));
+                auto identity = inspect_directory_identity(iterator->path());
+                if (!identity)
+                    return build_worker_result_t<bounded_package_inventory_t>::failure(
+                        identity.error());
+                if (!directory_identities.emplace(identity.value()).second)
+                    return build_worker_result_t<bounded_package_inventory_t>::failure(
+                        error(build_worker_error_code_t::directory_cycle,
+                              iterator->path()));
+                pending.push({iterator->path(), depth});
+                continue;
+            }
+            ++result.stream_inventories;
+            if (result.files.size() >= request.maximum_file_count)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::resource_file_limit,
+                          iterator->path(), "files", request.maximum_file_count,
+                          result.files.size() + 1));
+            auto size = inspect_file_size_only(iterator->path());
+            if (!size)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    size.error());
+            if (size.value() > request.maximum_artifact_bytes)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::resource_file_bytes_limit,
+                          iterator->path(), "file_bytes", request.maximum_artifact_bytes,
+                          size.value()));
+            if (size.value() > request.maximum_total_artifact_bytes - result.bytes)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::resource_total_bytes_limit,
+                          iterator->path(), "aggregate_bytes",
+                          request.maximum_total_artifact_bytes,
+                          result.bytes + size.value()));
+            result.bytes += size.value();
+            result.files.emplace_back(std::move(text));
+        }
+    }
+    std::sort(result.files.begin(), result.files.end());
+    if (std::adjacent_find(result.files.begin(), result.files.end()) != result.files.end())
+        return build_worker_result_t<bounded_package_inventory_t>::failure(
+            error(build_worker_error_code_t::duplicate_entry, root));
+    std::set<std::string> folded_paths;
+    for (const auto& path : result.files) {
+        if (!folded_paths.emplace(lowercase(path)).second)
+            return build_worker_result_t<bounded_package_inventory_t>::failure(
+                error(build_worker_error_code_t::duplicate_entry,
+                      std::filesystem::u8path(path), "case-colliding path"));
+    }
+    return build_worker_result_t<bounded_package_inventory_t>::success(std::move(result));
 }
 
 }
@@ -1440,12 +1791,18 @@ build_worker_packaging_integration_t::verify_distribution_package(
     if (request.package_root.empty() || request.manifest_path.empty() ||
         request.maximum_manifest_bytes == 0 || request.maximum_receipt_bytes == 0 ||
         request.maximum_artifact_bytes == 0 || request.maximum_total_artifact_bytes == 0 ||
-        request.maximum_file_count == 0 ||
+        request.maximum_file_count == 0 || request.maximum_directory_count == 0 ||
+        request.maximum_total_entry_count == 0 || request.maximum_depth == 0 ||
+        request.maximum_relative_path_bytes == 0 ||
         request.maximum_manifest_bytes > k_default_manifest_limit ||
         request.maximum_receipt_bytes > k_default_receipt_limit ||
         request.maximum_artifact_bytes > k_default_artifact_limit ||
         request.maximum_total_artifact_bytes > k_default_package_total_limit ||
-        request.maximum_file_count > k_default_file_count_limit)
+        request.maximum_file_count > k_default_file_count_limit ||
+        request.maximum_directory_count > k_default_directory_count_limit ||
+        request.maximum_total_entry_count > k_default_total_entry_count_limit ||
+        request.maximum_depth > k_default_depth_limit ||
+        request.maximum_relative_path_bytes > k_default_relative_path_limit)
         return build_worker_result_t<package_verification_result_t>::failure(
             make_error(build_worker_error_code_t::invalid_argument));
     if (!valid_sha256(request.expected_manifest_sha256) ||
@@ -1549,6 +1906,7 @@ build_worker_packaging_integration_t::verify_distribution_package(
                        request.manifest_path));
     std::unordered_map<std::string, artifact_t> artifacts;
     std::unordered_set<std::string> paths;
+    std::set<std::string> folded_paths;
     std::uint64_t total_bytes = 0;
     std::size_t notice_count = 0;
     const std::set<std::string_view> artifact_kinds{
@@ -1578,7 +1936,8 @@ build_worker_packaging_integration_t::verify_distribution_package(
             return build_worker_result_t<package_verification_result_t>::failure(
                 make_error(build_worker_error_code_t::schema_mismatch, request.manifest_path));
         if (!artifacts.emplace(artifact.id, artifact).second ||
-            !paths.emplace(artifact.relative_path).second)
+            !paths.emplace(artifact.relative_path).second ||
+            !folded_paths.emplace(lowercase(artifact.relative_path)).second)
             return build_worker_result_t<package_verification_result_t>::failure(
                 make_error(build_worker_error_code_t::duplicate_entry,
                            std::filesystem::u8path(artifact.relative_path)));
@@ -1586,6 +1945,17 @@ build_worker_packaging_integration_t::verify_distribution_package(
             return build_worker_result_t<package_verification_result_t>::failure(
                 make_error(build_worker_error_code_t::package_policy_violation,
                            std::filesystem::u8path(artifact.relative_path)));
+        if (artifact.size > request.maximum_artifact_bytes)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::resource_file_bytes_limit,
+                           std::filesystem::u8path(artifact.relative_path), "file_bytes",
+                           request.maximum_artifact_bytes, artifact.size));
+        if (artifact.size > request.maximum_total_artifact_bytes - total_bytes)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::resource_total_bytes_limit,
+                           package_root, "aggregate_bytes",
+                           request.maximum_total_artifact_bytes,
+                           total_bytes + artifact.size));
         auto resolved = resolve_regular_under_root(package_root, artifact.relative_path);
         if (!resolved)
             return build_worker_result_t<package_verification_result_t>::failure(resolved.error());
@@ -1600,40 +1970,22 @@ build_worker_packaging_integration_t::verify_distribution_package(
             return build_worker_result_t<package_verification_result_t>::failure(
                 make_error(build_worker_error_code_t::hash_mismatch, resolved.value(),
                            evidence.value().sha256));
-        if (evidence.value().size > request.maximum_total_artifact_bytes - total_bytes)
-            return build_worker_result_t<package_verification_result_t>::failure(
-                make_error(build_worker_error_code_t::file_too_large, package_root));
         total_bytes += evidence.value().size;
         artifacts[artifact.id].path = resolved.value();
         if (artifact.kind == "notice" || artifact.kind == "license")
             ++notice_count;
     }
 
-    std::unordered_set<std::string> actual_paths;
-    std::error_code enumeration_error;
-    for (std::filesystem::recursive_directory_iterator iterator(
-             package_root, std::filesystem::directory_options::none, enumeration_error), end;
-         iterator != end && !enumeration_error; iterator.increment(enumeration_error)) {
-        const DWORD attributes = GetFileAttributesW(iterator->path().c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
-            return build_worker_result_t<package_verification_result_t>::failure(
-                make_error(build_worker_error_code_t::reparse_point, iterator->path()));
-        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-            continue;
-        const auto relative = std::filesystem::relative(iterator->path(), package_root,
-                                                        enumeration_error);
-        if (enumeration_error)
-            break;
-        const auto text = relative.generic_u8string();
-        if (!actual_paths.emplace(text).second || actual_paths.size() > request.maximum_file_count)
-            return build_worker_result_t<package_verification_result_t>::failure(
-                make_error(build_worker_error_code_t::artifact_inventory_mismatch,
-                           iterator->path()));
-    }
-    if (enumeration_error || actual_paths != paths)
+    auto bounded_inventory = enumerate_package_tree(package_root, request);
+    if (!bounded_inventory)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            bounded_inventory.error());
+    std::unordered_set<std::string> actual_paths(
+        bounded_inventory.value().files.begin(), bounded_inventory.value().files.end());
+    if (actual_paths != paths || bounded_inventory.value().bytes != total_bytes)
         return build_worker_result_t<package_verification_result_t>::failure(
             make_error(build_worker_error_code_t::artifact_inventory_mismatch, package_root,
-                       enumeration_error.message(), paths.size(), actual_paths.size()));
+                       "bounded exact inventory", paths.size(), actual_paths.size()));
 
     const auto managed_runtime_manifest = artifacts.find("managed-runtime-manifest");
     const auto managed_runtime_digest = artifacts.find("managed-runtime-manifest-digest");
@@ -2179,6 +2531,9 @@ build_worker_packaging_integration_t::verify_distribution_package(
     result.protector_receipts_verified = protector_receipts;
     result.signature_receipts_verified = signature_receipts;
     result.artifact_bytes_verified = total_bytes;
+    result.directories_verified = bounded_inventory.value().directories;
+    result.entries_verified = bounded_inventory.value().entries;
+    result.stream_inventories_verified = bounded_inventory.value().stream_inventories;
     result.exact_package_inventory = true;
     result.no_network_fetch = true;
     result.deny_link_policy = true;

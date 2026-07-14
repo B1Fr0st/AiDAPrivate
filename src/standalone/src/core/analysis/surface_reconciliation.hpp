@@ -8,6 +8,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace aida::analysis::c03 {
@@ -150,7 +151,8 @@ private:
         std::string_view reason);
     void record_invalid_marker(std::string_view collection,
         std::string_view identifier, std::string_view reason);
-    bool reserve_auxiliary_marker(std::string_view collection) noexcept;
+    bool reserve_auxiliary_marker(std::string_view collection,
+        std::string_view identifier, bool security_priority);
     void append_finding(surface_reconciliation_result_t& result,
         surface_finding_t finding) const;
     void append_input_contract_findings(surface_reconciliation_result_t& result) const;
@@ -161,6 +163,8 @@ private:
 
     void check_duplicate_identifiers(surface_reconciliation_result_t& result) const;
     void check_baseline_mismatches(surface_reconciliation_result_t& result,
+        const marker_target_proof_t& target_proof) const;
+    void check_inactive_actual_entries(surface_reconciliation_result_t& result,
         const marker_target_proof_t& target_proof) const;
     void check_dead_replaced_paths(surface_reconciliation_result_t& result,
         const marker_target_proof_t& target_proof) const;
@@ -173,20 +177,19 @@ private:
     void check_unsupported_aliases(surface_reconciliation_result_t& result,
         const marker_target_proof_t& target_proof) const;
     void check_security_regressions(surface_reconciliation_result_t& result) const;
-    void check_unexplained_removals(surface_reconciliation_result_t& result,
-        const marker_target_proof_t& target_proof) const;
+    void check_unexplained_removals(surface_reconciliation_result_t& result) const;
 
     surface_reconciliation_limits_t limits_;
     bool limit_contract_valid_ = true;
     std::vector<surface_entry_t> baseline_;
     std::vector<surface_entry_t> actual_;
-    std::unordered_map<std::string, std::string> dead_replaced_paths_;
-    std::unordered_map<std::string, std::string> duplicate_stores_;
+    std::unordered_map<std::string, std::pair<std::string, bool>> dead_replaced_paths_;
+    std::unordered_map<std::string, std::pair<std::string, bool>> duplicate_stores_;
     std::unordered_set<std::string> stale_registrations_;
-    std::unordered_map<std::string, std::string> old_schema_v8_writers_;
+    std::unordered_map<std::string, std::pair<std::string, bool>> old_schema_v8_writers_;
     std::unordered_set<std::string> legacy_ast_flows_;
-    std::unordered_map<std::string, std::string> unsupported_aliases_;
-    std::unordered_map<std::string, std::string> security_regressions_;
+    std::unordered_map<std::string, std::pair<std::string, bool>> unsupported_aliases_;
+    std::unordered_map<std::string, std::pair<std::string, bool>> security_regressions_;
 
     std::uint64_t attempted_baseline_entries_ = 0;
     std::uint64_t attempted_actual_entries_ = 0;
@@ -200,6 +203,7 @@ private:
     bool baseline_cap_exceeded_ = false;
     bool actual_cap_exceeded_ = false;
     bool auxiliary_cap_exceeded_ = false;
+    bool auxiliary_capacity_incomplete_ = false;
     std::string first_invalid_entry_identifier_;
     std::string_view first_invalid_entry_reason_;
     bool first_invalid_entry_is_baseline_ = true;

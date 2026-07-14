@@ -636,16 +636,21 @@ function(aida_c03_register_auxiliary_notice_package)
 endfunction()
 
 function(aida_c03_register_distribution_manifest)
-    cmake_parse_arguments(PARSE_ARGV 0 _aida_c03 "REQUIRE_ANALYSIS_PYTHON" "TARGET;PACKAGE_ROOT;SPEC;OUTPUT_MANIFEST;OUTPUT_DIGEST" "DEPENDS")
+    cmake_parse_arguments(PARSE_ARGV 0 _aida_c03 "REQUIRE_ANALYSIS_PYTHON" "TARGET;APPLICATION_TARGET;APPLICATION_ROOT;SOURCE_ROOT;DEVELOPER_ROOT;CUSTOMER_STAGE_ANCHOR;PACKAGE_ROOT;SPEC;OUTPUT_MANIFEST;OUTPUT_DIGEST;POWERSHELL_EXECUTABLE" "DEPENDS")
     if(_aida_c03_UNPARSED_ARGUMENTS OR _aida_c03_KEYWORDS_MISSING_VALUES OR
-       NOT _aida_c03_TARGET OR NOT _aida_c03_PACKAGE_ROOT OR NOT _aida_c03_SPEC OR
+       NOT _aida_c03_TARGET OR NOT _aida_c03_APPLICATION_TARGET OR
+       NOT _aida_c03_APPLICATION_ROOT OR NOT _aida_c03_SOURCE_ROOT OR
+       NOT _aida_c03_DEVELOPER_ROOT OR NOT _aida_c03_CUSTOMER_STAGE_ANCHOR OR
+       NOT _aida_c03_PACKAGE_ROOT OR NOT _aida_c03_SPEC OR
        NOT _aida_c03_OUTPUT_MANIFEST OR NOT _aida_c03_OUTPUT_DIGEST OR NOT _aida_c03_DEPENDS OR
+       NOT _aida_c03_POWERSHELL_EXECUTABLE OR
        TARGET "${_aida_c03_TARGET}")
         message(FATAL_ERROR "AiDA C03 distribution manifest arguments are incomplete, malformed, or duplicated")
     endif()
     if(NOT _aida_c03_REQUIRE_ANALYSIS_PYTHON)
         message(FATAL_ERROR "AiDA C03 distribution requires the complete three-worker inventory")
     endif()
+    _aida_c03_package_require_target("${_aida_c03_APPLICATION_TARGET}" "distribution application")
     _aida_c03_package_require_dependency_targets("distribution manifest" ${_aida_c03_DEPENDS})
     if(NOT EXISTS "${_aida_c03_SPEC}" OR IS_DIRECTORY "${_aida_c03_SPEC}")
         message(FATAL_ERROR "AiDA C03 distribution specification is missing: ${_aida_c03_SPEC}")
@@ -664,19 +669,41 @@ function(aida_c03_register_distribution_manifest)
         message(FATAL_ERROR "AiDA C03 distribution specification is malformed, remote, or downgraded")
     endif()
     _aida_c03_package_require_distinct_paths("${_aida_c03_OUTPUT_MANIFEST}" "${_aida_c03_OUTPUT_DIGEST}" "distribution manifest/digest")
-    set(_aida_c03_root_generator_expression -1)
-    if("${_aida_c03_PACKAGE_ROOT}" MATCHES "^\\$<TARGET_FILE_DIR:([A-Za-z0-9_.:+-]+)>$")
-        set(_aida_c03_package_target "${CMAKE_MATCH_1}")
-        if(NOT TARGET "${_aida_c03_package_target}")
-            message(FATAL_ERROR "AiDA C03 distribution package root references an unknown target")
+    set(_aida_c03_expected_source_root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>")
+    set(_aida_c03_expected_package_root "${_aida_c03_CUSTOMER_STAGE_ANCHOR}/$<CONFIG>")
+    if(NOT _aida_c03_SOURCE_ROOT STREQUAL _aida_c03_expected_source_root OR
+       NOT _aida_c03_PACKAGE_ROOT STREQUAL _aida_c03_expected_package_root)
+        message(FATAL_ERROR "AiDA C03 distribution must stage from the exact application target into the exact detached customer root")
+    endif()
+    foreach(_aida_c03_literal_root IN ITEMS
+            "${_aida_c03_APPLICATION_ROOT}"
+            "${_aida_c03_DEVELOPER_ROOT}"
+            "${_aida_c03_CUSTOMER_STAGE_ANCHOR}")
+        string(FIND "${_aida_c03_literal_root}" "$<" _aida_c03_literal_generator_expression)
+        if(NOT _aida_c03_literal_generator_expression EQUAL -1 OR
+           NOT IS_ABSOLUTE "${_aida_c03_literal_root}" OR
+           NOT IS_DIRECTORY "${_aida_c03_literal_root}" OR
+           IS_SYMLINK "${_aida_c03_literal_root}")
+            message(FATAL_ERROR "AiDA C03 application, developer, and customer roots must be existing literal absolute non-reparse directories")
         endif()
-        set(_aida_c03_root_generator_expression 0)
-    else()
-        string(FIND "${_aida_c03_PACKAGE_ROOT}" "$<" _aida_c03_invalid_root_generator_expression)
-        if(NOT _aida_c03_invalid_root_generator_expression EQUAL -1 OR
-           NOT IS_ABSOLUTE "${_aida_c03_PACKAGE_ROOT}")
-            message(FATAL_ERROR "AiDA C03 distribution package root must be a literal absolute path or an exact TARGET_FILE_DIR expression for an existing target")
+    endforeach()
+    foreach(_aida_c03_pair IN ITEMS
+            "${_aida_c03_APPLICATION_ROOT}|${_aida_c03_DEVELOPER_ROOT}"
+            "${_aida_c03_APPLICATION_ROOT}|${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+            "${_aida_c03_DEVELOPER_ROOT}|${_aida_c03_CUSTOMER_STAGE_ANCHOR}")
+        string(REPLACE "|" ";" _aida_c03_pair_fields "${_aida_c03_pair}")
+        list(GET _aida_c03_pair_fields 0 _aida_c03_left)
+        list(GET _aida_c03_pair_fields 1 _aida_c03_right)
+        cmake_path(IS_PREFIX _aida_c03_left "${_aida_c03_right}" NORMALIZE _aida_c03_left_contains_right)
+        cmake_path(IS_PREFIX _aida_c03_right "${_aida_c03_left}" NORMALIZE _aida_c03_right_contains_left)
+        if(_aida_c03_left_contains_right OR _aida_c03_right_contains_left)
+            message(FATAL_ERROR "AiDA C03 application, developer, and customer roots must not equal, contain, or descend from one another")
         endif()
+    endforeach()
+    if(NOT EXISTS "${_aida_c03_POWERSHELL_EXECUTABLE}" OR
+       IS_DIRECTORY "${_aida_c03_POWERSHELL_EXECUTABLE}" OR
+       IS_SYMLINK "${_aida_c03_POWERSHELL_EXECUTABLE}")
+        message(FATAL_ERROR "AiDA C03 distribution requires the validated system PowerShell executable")
     endif()
     foreach(_aida_c03_output IN ITEMS "${_aida_c03_OUTPUT_MANIFEST}" "${_aida_c03_OUTPUT_DIGEST}")
         string(FIND "${_aida_c03_output}" "$<" _aida_c03_output_generator_expression)
@@ -686,15 +713,17 @@ function(aida_c03_register_distribution_manifest)
         endif()
     endforeach()
     foreach(_aida_c03_detached IN ITEMS "${_aida_c03_OUTPUT_MANIFEST}" "${_aida_c03_OUTPUT_DIGEST}")
-        if(_aida_c03_root_generator_expression EQUAL -1)
-            get_filename_component(_aida_c03_root_absolute "${_aida_c03_PACKAGE_ROOT}" ABSOLUTE)
-            get_filename_component(_aida_c03_detached_absolute "${_aida_c03_detached}" ABSOLUTE)
-            cmake_path(IS_PREFIX _aida_c03_root_absolute "${_aida_c03_detached_absolute}"
+        get_filename_component(_aida_c03_detached_absolute "${_aida_c03_detached}" ABSOLUTE)
+        foreach(_aida_c03_root IN ITEMS
+                "${_aida_c03_APPLICATION_ROOT}"
+                "${_aida_c03_DEVELOPER_ROOT}"
+                "${_aida_c03_CUSTOMER_STAGE_ANCHOR}")
+            cmake_path(IS_PREFIX _aida_c03_root "${_aida_c03_detached_absolute}"
                 NORMALIZE _aida_c03_detached_inside_root)
             if(_aida_c03_detached_inside_root)
-                message(FATAL_ERROR "AiDA C03 distribution manifest and digest must remain outside the exact package inventory root")
+                message(FATAL_ERROR "AiDA C03 distribution evidence must remain outside application, developer, and customer inventory roots")
             endif()
-        endif()
+        endforeach()
     endforeach()
     if(NOT AIDA_C03_ANALYSIS_PYTHON_WORKER_AVAILABLE OR
        NOT TARGET "${AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_TARGET}")
@@ -730,15 +759,17 @@ function(aida_c03_register_distribution_manifest)
     endforeach()
     get_filename_component(_aida_c03_manifest_directory "${_aida_c03_OUTPUT_MANIFEST}" DIRECTORY)
     get_filename_component(_aida_c03_digest_directory "${_aida_c03_OUTPUT_DIGEST}" DIRECTORY)
-    _aida_c03_package_find_powershell(_aida_c03_powershell)
     add_custom_target("${_aida_c03_TARGET}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory
-            "${_aida_c03_PACKAGE_ROOT}"
+            "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
             "${_aida_c03_manifest_directory}"
             "${_aida_c03_digest_directory}"
-        COMMAND "${_aida_c03_powershell}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+        COMMAND "${_aida_c03_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
             -File "${AIDA_C03_DISTRIBUTION_MANIFEST_MATERIALIZER}"
             -PackageRoot "${_aida_c03_PACKAGE_ROOT}"
+            -SourceRoot "${_aida_c03_SOURCE_ROOT}"
+            -CustomerStageAnchor "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+            -StageCustomerPackage
             -Spec "${_aida_c03_SPEC}"
             -AuthorityLock "${AIDA_C03_WORKER_MANIFEST_LOCK}"
             -OutputManifest "${_aida_c03_OUTPUT_MANIFEST}"
@@ -755,6 +786,11 @@ function(aida_c03_register_distribution_manifest)
         FOLDER "Packaging/C03"
         AIDA_C03_PACKAGE_ROLE "detached-exact-distribution-manifest-v2"
         AIDA_C03_PACKAGE_ROOT "${_aida_c03_PACKAGE_ROOT}"
+        AIDA_C03_PACKAGE_SOURCE_ROOT "${_aida_c03_SOURCE_ROOT}"
+        AIDA_C03_APPLICATION_ROOT "${_aida_c03_APPLICATION_ROOT}"
+        AIDA_C03_DEVELOPER_ROOT "${_aida_c03_DEVELOPER_ROOT}"
+        AIDA_C03_CUSTOMER_STAGE_ANCHOR "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+        AIDA_C03_SANITIZED_CUSTOMER_STAGE "TRUE"
         AIDA_C03_PACKAGE_OUTPUTS "${_aida_c03_OUTPUT_MANIFEST};${_aida_c03_OUTPUT_DIGEST}"
         AIDA_C03_WORKER_CARDINALITY "3"
         AIDA_C03_DISTRIBUTION_AVAILABLE "TRUE"

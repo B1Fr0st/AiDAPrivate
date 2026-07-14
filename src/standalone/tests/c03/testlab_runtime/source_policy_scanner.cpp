@@ -12,11 +12,13 @@
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -142,6 +144,46 @@ std::size_t json_count(const json& value, const std::string_view key,
 	return static_cast<std::size_t>(number);
 }
 
+std::int64_t json_signed(const json& value, const std::string_view key,
+	const std::string_view label)
+{
+	const auto& member = json_member(value, key, label);
+	require(member.is_number_integer() || member.is_number_unsigned(),
+		std::string(label) + " integer field: " + std::string(key));
+	return member.get<std::int64_t>();
+}
+
+std::string json_string(const json& value, const std::string_view key,
+	const std::string_view label)
+{
+	const auto& member = json_member(value, key, label);
+	require(member.is_string() && !member.get_ref<const std::string&>().empty(),
+		std::string(label) + " string field: " + std::string(key));
+	return member.get<std::string>();
+}
+
+std::vector<std::string> json_string_vector(const json& value,
+	const std::string_view label)
+{
+	require(value.is_array(), std::string(label) + " is an array");
+	std::vector<std::string> output;
+	output.reserve(value.size());
+	for (const auto& item : value) {
+		require(item.is_string() && !item.get_ref<const std::string&>().empty(),
+			std::string(label) + " contains valid strings");
+		output.push_back(item.get<std::string>());
+	}
+	return output;
+}
+
+void require_sha256(const std::string_view value, const std::string_view label)
+{
+	require(value.size() == 64U &&
+		std::all_of(value.begin(), value.end(), [](const unsigned char character) {
+			return std::isxdigit(character) != 0;
+		}), std::string(label) + " is a SHA-256 identity");
+}
+
 std::set<std::string> json_names(const json& value, const std::string_view label)
 {
 	require(value.is_array(), std::string(label) + " is an array");
@@ -213,6 +255,26 @@ std::string_view slice_between(const std::string_view bytes,
 	require(begin != std::string_view::npos && end != std::string_view::npos && end > begin,
 		std::string(label) + " is isolated by stable boundaries");
 	return bytes.substr(begin, end - begin);
+}
+
+std::set<std::string> quoted_source_literals(const std::string_view bytes,
+	const char quote, const std::string_view label)
+{
+	std::set<std::string> values;
+	std::size_t cursor = 0;
+	while (cursor < bytes.size()) {
+		const auto begin = bytes.find(quote, cursor);
+		if (begin == std::string_view::npos)
+			break;
+		const auto end = bytes.find(quote, begin + 1);
+		require(end != std::string_view::npos && end > begin + 1,
+			std::string(label) + " has closed nonempty quoted literals");
+		require(values.emplace(bytes.substr(begin + 1, end - begin - 1)).second,
+			std::string(label) + " has unique quoted literals");
+		cursor = end + 1;
+	}
+	require(!values.empty(), std::string(label) + " has quoted literals");
+	return values;
 }
 
 void require_clean_source(const std::string_view bytes,
@@ -325,12 +387,397 @@ void verify_customer_launch_policy(const std::string_view deploy)
 		"raw executable-package rejection");
 }
 
+void verify_mcp_reachability_artifact(const std::filesystem::path& root,
+	const json& ledger, const json& current)
+{
+	const auto& mcp = json_member(current, "mcp", "surface final inventory");
+	const auto& reachability = json_member(mcp, "production_reachability", "final MCP");
+	require(reachability.is_object() && reachability.size() == 13U &&
+		json_count(reachability, "schema_version", "MCP reachability") == 1U &&
+		json_count(reachability, "concrete_registration_count", "MCP reachability") == 331U &&
+		json_count(reachability, "direct_registration_count", "MCP reachability") == 281U &&
+		json_count(reachability, "generated_projection_count", "MCP reachability") == 50U,
+		"MCP reachability schema and concrete partition");
+
+	const auto& production_entry = json_member(reachability, "production_entry", "MCP reachability");
+	require(production_entry.is_object() && production_entry.size() == 6U,
+		"MCP production entry exact field inventory");
+	const auto root_id = json_string(production_entry, "root_registrar_id", "production entry");
+	require(json_string(production_entry, "file", "production entry") ==
+		"src/standalone/src/core/ai/standalone_chat.cpp" &&
+		json_string(production_entry, "expression", "production entry") ==
+		"mcp_standalone::register_standalone_tools(s_mcp_server)" &&
+		json_string(production_entry, "root_registrar_symbol", "production entry") ==
+		"mcp_standalone::register_standalone_tools" &&
+		json_count(production_entry, "line", "production entry") != 0U &&
+		json_count(production_entry, "character_offset", "production entry") != 0U,
+		"MCP production entry exact identity");
+
+	const auto& registrars = json_member(reachability, "registrars", "MCP reachability");
+	const auto& edges = json_member(reachability, "edges", "MCP reachability");
+	require(registrars.is_array() && !registrars.empty() &&
+		registrars.size() == json_count(reachability, "reachable_registrar_count", "MCP reachability") &&
+		edges.is_array() && edges.size() ==
+			json_count(reachability, "registrar_edge_count", "MCP reachability") &&
+		registrars.size() == edges.size() + 1U,
+		"MCP reachable registrar graph cardinality");
+	std::unordered_map<std::string, const json*> registrar_by_id;
+	std::unordered_map<std::string, std::string> registrar_parent;
+	std::set<std::string> registrar_files;
+	for (const auto& registrar : registrars) {
+		require(registrar.is_object() && registrar.size() == 8U,
+			"reachable registrar exact field inventory");
+		const auto id = json_string(registrar, "id", "reachable registrar");
+		require(registrar_by_id.emplace(id, &registrar).second,
+			"reachable registrar identities are unique");
+		const auto file = json_string(registrar, "file", "reachable registrar");
+		registrar_files.insert(file);
+		resolve_file(root, std::filesystem::u8path(file));
+		require(json_count(registrar, "line", "reachable registrar") != 0U &&
+			json_count(registrar, "body_start", "reachable registrar") <
+				json_count(registrar, "body_end", "reachable registrar"),
+			"reachable registrar source range");
+		const auto chain = json_string_vector(
+			json_member(registrar, "chain", "reachable registrar"), "reachable registrar chain");
+		require(!chain.empty() && chain.front() == root_id && chain.back() == id &&
+			std::set<std::string>(chain.begin(), chain.end()).size() == chain.size(),
+			"reachable registrar chain is rooted and acyclic");
+		const auto& parent = json_member(registrar, "parent_id", "reachable registrar");
+		if (id == root_id) {
+			require(parent.is_null() && chain.size() == 1U,
+				"production registrar root has no parent");
+		} else {
+			require(parent.is_string() && !parent.get_ref<const std::string&>().empty() &&
+				chain.size() >= 2U && chain[chain.size() - 2U] == parent.get<std::string>(),
+				"reachable registrar parent agrees with its chain");
+			registrar_parent.emplace(id, parent.get<std::string>());
+		}
+	}
+	require(registrar_by_id.count(root_id) == 1U,
+		"production registrar root is reachable");
+	std::unordered_map<std::string, std::size_t> incoming;
+	std::set<std::string> direct_edge_identities;
+	for (const auto& edge : edges) {
+		require(edge.is_object() && edge.size() == 7U,
+			"direct registrar edge exact field inventory");
+		const auto caller = json_string(edge, "caller_id", "registrar edge");
+		const auto callee = json_string(edge, "callee_id", "registrar edge");
+		const auto file = json_string(edge, "file", "registrar edge");
+		const auto offset = json_count(edge, "character_offset", "registrar edge");
+		require(registrar_by_id.count(caller) == 1U && registrar_by_id.count(callee) == 1U &&
+			registrar_parent.count(callee) == 1U && registrar_parent.at(callee) == caller &&
+			json_count(edge, "line", "registrar edge") != 0U &&
+			!json_string(edge, "expression", "registrar edge").empty(),
+			"registrar edge has exact reachable ownership");
+		require(direct_edge_identities.insert(
+			caller + "\t" + callee + "\t" + file + "\t" + std::to_string(offset)).second,
+			"registrar edges have unique source identities");
+		++incoming[callee];
+	}
+	for (const auto& [id, registrar] : registrar_by_id) {
+		static_cast<void>(registrar);
+		require(incoming[id] == (id == root_id ? 0U : 1U),
+			"direct registrar graph is a rooted tree");
+	}
+	require_sha256(json_string(reachability, "row_binding_sha256", "MCP reachability"),
+		"MCP reachability row fingerprint");
+	require_sha256(json_string(reachability, "registrar_graph_sha256", "MCP reachability"),
+		"MCP registrar graph fingerprint");
+
+	const auto& route = json_member(reachability, "generated_route", "MCP reachability");
+	require(route.is_object() && route.size() == 14U &&
+		json_count(route, "node_count", "generated route") == 7U &&
+		json_count(route, "edge_count", "generated route") == 7U &&
+		json_count(route, "terminal_operation_count", "generated route") == 2U &&
+		json_count(route, "binding_count", "generated route") == 92U &&
+		json_count(route, "generated_compatibility_count", "generated route") == 88U &&
+		json_count(route, "extension_count", "generated route") == 4U,
+		"generated MCP route exact cardinality");
+	const auto shared_id = json_string(route, "shared_terminal_definition_id", "generated route");
+	const auto shared_parents = json_names(
+		json_member(route, "shared_terminal_parent_ids", "generated route"),
+		"generated route shared parents");
+	require(shared_parents.size() == 2U,
+		"generated route has exactly two shared-terminal parents");
+	const auto& route_nodes = json_member(route, "nodes", "generated route");
+	const auto& route_edges = json_member(route, "edges", "generated route");
+	const auto& terminal_operations = json_member(route, "terminal_operations", "generated route");
+	const auto& bindings = json_member(route, "bindings", "generated route");
+	require(route_nodes.is_array() && route_nodes.size() == 7U &&
+		route_edges.is_array() && route_edges.size() == 7U &&
+		terminal_operations.is_array() && terminal_operations.size() == 2U &&
+		bindings.is_array() && bindings.size() == 92U,
+		"generated MCP route arrays match their cardinalities");
+	std::unordered_map<std::string, const json*> route_node_by_id;
+	std::string generated_parent;
+	std::string extension_parent;
+	for (const auto& node : route_nodes) {
+		require(node.is_object() && node.size() == 7U,
+			"generated route node exact field inventory");
+		const auto id = json_string(node, "id", "generated route node");
+		require(route_node_by_id.emplace(id, &node).second &&
+			json_count(node, "line", "generated route node") != 0U &&
+			json_count(node, "body_start", "generated route node") <
+				json_count(node, "body_end", "generated route node"),
+			"generated route node exact source identity");
+		const auto symbol = json_string(node, "symbol", "generated route node");
+		if (symbol.find("register_generated_tools") != std::string::npos) {
+			require(generated_parent.empty(), "generated route has one generated branch registrar");
+			generated_parent = id;
+		}
+		if (symbol.find("register_extension_tools") != std::string::npos) {
+			require(extension_parent.empty(), "generated route has one extension branch registrar");
+			extension_parent = id;
+		}
+	}
+	require(route_node_by_id.count(root_id) == 1U &&
+		route_node_by_id.count(shared_id) == 1U &&
+		!generated_parent.empty() && !extension_parent.empty() &&
+		shared_parents == std::set<std::string>{generated_parent, extension_parent},
+		"generated route root, branches, and shared leaf identities");
+	std::map<std::string, std::set<std::string>> route_incoming;
+	std::set<std::string> route_adjacency;
+	std::set<std::string> route_edge_identities;
+	for (const auto& edge : route_edges) {
+		require(edge.is_object() && edge.size() == 8U,
+			"generated route edge exact field inventory");
+		const auto caller = json_string(edge, "caller_id", "generated route edge");
+		const auto callee = json_string(edge, "callee_id", "generated route edge");
+		const auto file = json_string(edge, "file", "generated route edge");
+		const auto offset = json_count(edge, "character_offset", "generated route edge");
+		require(route_node_by_id.count(caller) == 1U && route_node_by_id.count(callee) == 1U &&
+			json_count(edge, "line", "generated route edge") != 0U &&
+			!json_string(edge, "expression", "generated route edge").empty(),
+			"generated route edge exact source identity");
+		require(route_edge_identities.insert(
+			caller + "\t" + callee + "\t" + file + "\t" + std::to_string(offset)).second,
+			"generated route edges have unique source identities");
+		route_incoming[callee].insert(caller);
+		route_adjacency.insert(caller + "\t" + callee);
+	}
+	for (const auto& [id, node] : route_node_by_id) {
+		static_cast<void>(node);
+		const auto& parents = route_incoming[id];
+		if (id == root_id)
+			require(parents.empty(), "generated route root has no parent");
+		else if (id == shared_id)
+			require(parents == shared_parents, "generated route shared leaf has exact parents");
+		else
+			require(parents.size() == 1U, "generated route non-shared node has one parent");
+	}
+	std::set<std::string> terminal_kinds;
+	std::set<std::string> terminal_sources;
+	for (const auto& operation : terminal_operations) {
+		require(operation.is_object() && operation.size() == 6U,
+			"generated terminal operation exact field inventory");
+		require(json_string(operation, "caller_id", "generated terminal operation") == shared_id &&
+			json_count(operation, "line", "generated terminal operation") != 0U,
+			"generated terminal operation is owned by the shared leaf");
+		const auto expression = json_string(operation, "expression", "generated terminal operation");
+		const auto kind = expression.find("replace_tool") != std::string::npos
+			? std::string("replace_tool")
+			: expression.find("register_tool") != std::string::npos
+				? std::string("register_tool") : std::string();
+		require(!kind.empty() && terminal_kinds.insert(kind).second,
+			"generated terminal operations are exact and unique");
+		terminal_sources.insert(
+			json_string(operation, "file", "generated terminal operation") + "\t" +
+			std::to_string(json_count(operation, "character_offset", "generated terminal operation")));
+	}
+	require(terminal_sources.size() == 2U,
+		"generated terminal operations have distinct source identities");
+
+	std::unordered_map<std::string, const json*> binding_by_name;
+	std::size_t compatibility_bindings = 0;
+	std::size_t extension_bindings = 0;
+	for (const auto& binding : bindings) {
+		require(binding.is_object() && binding.size() == 6U,
+			"generated route binding exact field inventory");
+		const auto name = json_string(binding, "name", "generated route binding");
+		require(binding_by_name.emplace(name, &binding).second &&
+			json_string(binding, "registrar_id", "generated route binding") == shared_id,
+			"generated per-name bindings are unique and terminate at the shared leaf");
+		const auto branch = json_string(binding, "branch", "generated route binding");
+		const auto chain = json_string_vector(
+			json_member(binding, "chain", "generated route binding"),
+			"generated route binding chain");
+		require(chain.size() == 6U && chain.front() == root_id && chain.back() == shared_id &&
+			std::set<std::string>(chain.begin(), chain.end()).size() == chain.size(),
+			"generated per-name binding has an exact acyclic route chain");
+		for (std::size_t index = 1U; index < chain.size(); ++index)
+			require(route_adjacency.count(chain[index - 1U] + "\t" + chain[index]) == 1U,
+				"generated per-name binding chain uses declared route edges");
+		if (branch == "generated_compatibility") {
+			require(chain[chain.size() - 2U] == generated_parent,
+				"generated compatibility binding uses its exact branch");
+			++compatibility_bindings;
+		} else {
+			require(branch == "extension" && chain[chain.size() - 2U] == extension_parent,
+				"extension binding uses its exact branch");
+			++extension_bindings;
+		}
+		require_sha256(json_string(binding, "chain_sha256", "generated route binding"),
+			"generated route chain fingerprint");
+	}
+	require(compatibility_bindings == 88U && extension_bindings == 4U,
+		"generated route binding branch partition");
+	require_sha256(json_string(route, "route_sha256", "generated route"),
+		"generated route fingerprint");
+	require_sha256(json_string(route, "binding_sha256", "generated route"),
+		"generated binding fingerprint");
+
+	const auto& compatibility = json_member(
+		json_member(current, "source_contracts", "surface final inventory"),
+		"ida_compatibility", "source contracts");
+	const auto& compatibility_rows = json_member(
+		compatibility, "registrations", "IDA compatibility");
+	require(compatibility_rows.is_array() && compatibility_rows.size() == 92U,
+		"canonical generated compatibility row cardinality");
+	std::set<std::string> canonical_names;
+	for (const auto& row : compatibility_rows) {
+		const auto name = json_string(row, "name", "canonical compatibility row");
+		const auto found = binding_by_name.find(name);
+		require(found != binding_by_name.end() && canonical_names.insert(name).second &&
+			json_member(row, "production_reachability", "canonical compatibility row") ==
+				*found->second,
+			"canonical compatibility row has exact per-name production reachability");
+	}
+	require(canonical_names == json_names(
+		json_member(mcp, "generated_union_names", "final MCP"), "generated MCP union"),
+		"canonical reachability covers the exact 92-name union");
+
+	const auto generated_only = json_names(
+		json_member(mcp, "generated_only_names", "final MCP"), "generated-only MCP names");
+	const auto& registrations = json_member(mcp, "registrations", "final MCP");
+	require(registrations.is_array() && registrations.size() == 331U,
+		"MCP concrete reachability row cardinality");
+	std::set<std::string> projection_names;
+	std::size_t direct_count = 0;
+	std::size_t projection_count = 0;
+	for (const auto& row : registrations) {
+		const auto name = json_string(row, "name", "MCP concrete registration");
+		const auto& source = json_member(row, "source", "MCP concrete registration");
+		const auto offset = json_signed(source, "character_offset", "MCP registration source");
+		const auto& binding = json_member(
+			row, "production_reachability", "MCP concrete registration");
+		const auto mode = json_string(binding, "mode", "MCP registration reachability");
+		const auto chain = json_string_vector(
+			json_member(binding, "chain", "MCP registration reachability"),
+			"MCP registration reachability chain");
+		require(!chain.empty() && chain.front() == root_id &&
+			json_string(binding, "registrar_id", "MCP registration reachability") == chain.back(),
+			"MCP registration binding has a rooted registrar chain");
+		require_sha256(json_string(binding, "chain_sha256", "MCP registration reachability"),
+			"MCP registration chain fingerprint");
+		if (mode == "direct_registration") {
+			require(binding.is_object() && binding.size() == 5U,
+				"direct MCP binding exact field inventory");
+			require(offset >= 0 && registrar_by_id.count(chain.back()) == 1U,
+				"direct MCP registration binds a reachable registrar");
+			resolve_file(root, std::filesystem::u8path(
+				json_string(source, "file", "MCP registration source")));
+			++direct_count;
+		} else {
+			require(binding.is_object() && binding.size() == 6U,
+				"generated projection exact field inventory");
+			require(mode == "generated_compatibility_projection" && offset == -1 &&
+				binding_by_name.count(name) == 1U,
+				"generated-only MCP registration has an exact route projection");
+			const auto& generated = *binding_by_name.at(name);
+			require(json_string(binding, "generated_branch", "MCP registration reachability") ==
+					json_string(generated, "branch", "generated route binding") &&
+				json_string(binding, "registrar_id", "MCP registration reachability") ==
+					json_string(generated, "registrar_id", "generated route binding") &&
+				json_string(binding, "registrar_symbol", "MCP registration reachability") ==
+					json_string(generated, "registrar_symbol", "generated route binding") &&
+				json_string(binding, "chain_sha256", "MCP registration reachability") ==
+					json_string(generated, "chain_sha256", "generated route binding") &&
+				json_member(binding, "chain", "MCP registration reachability") ==
+					json_member(generated, "chain", "generated route binding"),
+				"generated-only MCP projection equals its per-name route");
+			projection_names.insert(name);
+			++projection_count;
+		}
+	}
+	require(direct_count == 281U && projection_count == 50U &&
+		projection_names == generated_only,
+		"MCP direct/generated-only production reachability partition");
+
+	const auto source_files = json_names(
+		json_member(reachability, "source_files", "MCP reachability"),
+		"MCP reachability source files");
+	auto expected_source_files = registrar_files;
+	for (const auto file : std::array<std::string_view, 4>{
+		"src/standalone/src/core/ai/standalone_chat.cpp",
+		"src/standalone/src/core/mcp/mcp_standalone.cpp",
+		"src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp",
+		"src/standalone/src/core/mcp/compat/mcp_server_integration.cpp"})
+		expected_source_files.emplace(file);
+	require(source_files == expected_source_files,
+		"MCP reachability source inventory is exact");
+	for (const auto& file : source_files)
+		resolve_file(root, std::filesystem::u8path(file));
+
+	const auto& authority = json_member(
+		json_member(json_member(ledger, "current_surface_contract", "authority ledger"),
+			"mcp", "current surface contract"),
+		"production_reachability", "current surface MCP");
+	require(authority.is_object() && authority.size() == 17U,
+		"reachability authority exact field inventory");
+	for (const auto field : std::array<std::string_view, 16>{
+		"schema_version", "concrete_registration_count", "direct_registration_count",
+		"generated_projection_count", "reachable_registrar_count", "registrar_edge_count",
+		"row_binding_sha256", "registrar_graph_sha256", "generated_route_node_count",
+		"generated_route_edge_count", "generated_terminal_operation_count",
+		"generated_binding_count", "generated_compatibility_count",
+		"generated_extension_count", "generated_route_sha256", "generated_binding_sha256"}) {
+		if (field == "generated_route_node_count")
+			require(json_member(authority, field, "reachability authority") == route.at("node_count"),
+				"reachability authority generated node count");
+		else if (field == "generated_route_edge_count")
+			require(json_member(authority, field, "reachability authority") == route.at("edge_count"),
+				"reachability authority generated edge count");
+		else if (field == "generated_terminal_operation_count")
+			require(json_member(authority, field, "reachability authority") ==
+				route.at("terminal_operation_count"),
+				"reachability authority terminal count");
+		else if (field == "generated_binding_count")
+			require(json_member(authority, field, "reachability authority") == route.at("binding_count"),
+				"reachability authority binding count");
+		else if (field == "generated_compatibility_count")
+			require(json_member(authority, field, "reachability authority") ==
+				route.at("generated_compatibility_count"),
+				"reachability authority compatibility count");
+		else if (field == "generated_extension_count")
+			require(json_member(authority, field, "reachability authority") == route.at("extension_count"),
+				"reachability authority extension count");
+		else if (field == "generated_route_sha256")
+			require(json_member(authority, field, "reachability authority") == route.at("route_sha256"),
+				"reachability authority route identity");
+		else if (field == "generated_binding_sha256")
+			require(json_member(authority, field, "reachability authority") == route.at("binding_sha256"),
+				"reachability authority binding identity");
+		else
+			require(json_member(authority, field, "reachability authority") ==
+				json_member(reachability, field, "MCP reachability"),
+				"reachability authority field equals final MCP evidence");
+	}
+	const json expected_authority_entry = {
+		{"file", production_entry.at("file")},
+		{"expression", production_entry.at("expression")},
+		{"root_registrar_symbol", production_entry.at("root_registrar_symbol")}
+	};
+	require(json_member(authority, "production_entry", "reachability authority") ==
+		expected_authority_entry,
+		"reachability authority production entry is exact");
+}
+
 void verify_surface_authority(const std::filesystem::path& root,
 	const std::string_view generator, const std::string_view verifier,
 	const std::string_view ledger_bytes, const std::string_view baseline_bytes,
 	const std::string_view final_bytes)
 {
-	for (const auto token : std::array<std::string_view, 19>{
+	for (const auto token : std::initializer_list<std::string_view>{
 		"$unresolvedRegistrationEvidence.Count -ne 0",
 		"Unresolved public MCP registrations remain",
 		"resolved_helper_template_count = $resolvedHelperRecords.Count",
@@ -349,12 +796,32 @@ void verify_surface_authority(const std::filesystem::path& root,
 		"marker_count = @($allCmakeMarkers | Sort-Object -Unique).Count",
 		"marker_sha256 = Get-StringListSha256 $allCmakeMarkers.ToArray()",
 		"source_files = @($replacements | ForEach-Object",
-		"Write-AtomicUtf8 $OutputPath"})
+		"Write-AtomicUtf8 $OutputPath",
+		"function Test-CppDigitSeparator(",
+		"function Get-CppMaskErrorContext(",
+		"function Get-CppCodeMask(",
+		"function Test-CppRegistrarDeclaration(",
+		"function Get-CppRegistrarCalls(",
+		"function Get-McpProductionReachability(",
+		"(?:register|replace)_[A-Za-z0-9_]+",
+		"Registrar declaration is forbidden in reachable code",
+		"Indirect registrar edge",
+		"$immediatePrevious",
+		"$previousIndex",
+		"registrar_character_offset",
+		"C03 registrar body has an unclassified or missing edge",
+		"production_reachability = $mcpProductionReachability",
+		"shared_terminal_definition_id",
+		"shared_terminal_parent_ids",
+		"row_binding_sha256",
+		"registrar_graph_sha256",
+		"generated_projection_count",
+		"character_offset = $absolute"})
 		require_contains(generator, token, "standalone surface generator");
 	require_absent(generator,
 		"unresolved_dynamic_templates = $resolvedHelperRecords.Count",
 		"standalone surface terminal receipt");
-	for (const auto token : std::array<std::string_view, 15>{
+	for (const auto token : std::initializer_list<std::string_view>{
 		"def archive_tool_names(", "verify_generated_contract_reproduction",
 		"verify_current_surface_reproduction", "reproduced != checked_in",
 		"generated MCP contract artifact is stale",
@@ -363,7 +830,28 @@ void verify_surface_authority(const std::filesystem::path& root,
 		"sha256_file(path)", "reject_external_refs", "MAX_COMPRESSION_RATIO",
 		"parser.add_argument(\"--powershell\", type=Path, required=True)",
 		"validate_absolute_executable(args.powershell",
-		"ledger, root, powershell_path)"})
+		"ledger, root, powershell_path)",
+		"def cpp_digit_separator(",
+		"def cpp_mask_error_context(",
+		"def cpp_code_mask(",
+		"def cpp_registrar_declaration(",
+		"def cpp_registrar_calls(",
+		"def derive_cpp_reachability_graph(",
+		"def derive_generated_compatibility_route(",
+		"def verify_mcp_production_reachability(",
+		"(?:register|replace)_[A-Za-z0-9_]+",
+		"registrar declaration is forbidden in reachable code",
+		"indirect registrar edge",
+		"immediate_previous",
+		"previous_index",
+		"registrar_character_offset",
+		"C03 registrar body has an unclassified or missing edge",
+		"shared_terminal_definition_id",
+		"shared_terminal_parent_ids",
+		"row_binding_sha256",
+		"registrar_graph_sha256",
+		"generated_projection_count",
+		"production_reachability"})
 		require_contains(verifier, token, "combined authority reproduction verifier");
 
 	const auto ledger = parse_json(ledger_bytes, "authority ledger");
@@ -412,6 +900,7 @@ void verify_surface_authority(const std::filesystem::path& root,
 	}
 	require(registration_names.size() == 331U,
 		"final MCP concrete registration inventory cardinality");
+	verify_mcp_reachability_artifact(root, ledger, current);
 	const auto& helpers = json_member(mcp, "resolved_registration_helpers", "final MCP");
 	require(helpers.is_array() && helpers.size() == 2U,
 		"final MCP resolved helper inventory cardinality");
@@ -484,6 +973,162 @@ void verify_manifest_registration(const std::string_view cmake_manifest)
 	require_exact_count(cmake_manifest,
 		"aida_c03_register_direct_test(", 13,
 		"safe-headless direct-test inventory");
+	require_exact_count(cmake_manifest, "add_test(NAME", 3,
+		"safe-headless explicit CTest declarations");
+	require_exact_count(cmake_manifest,
+		"add_test(NAME aida_c03_authority_surface_reproduction", 1,
+		"combined authority reproduction CTest");
+	require_exact_count(cmake_manifest,
+		"set_tests_properties(aida_c03_authority_surface_reproduction PROPERTIES", 1,
+		"combined authority reproduction properties");
+	require_absent(cmake_manifest, "aida_c03_mcp_contract_generator_reproduction",
+		"retired split contract reproduction CTest");
+	const auto authority_test = slice_between(cmake_manifest,
+		"add_test(NAME aida_c03_authority_surface_reproduction",
+		"get_property(_aida_compiler_harness_inputs",
+		"combined authority reproduction CTest");
+	for (const auto token : std::array<std::string_view, 12>{
+		"COMMAND \"${_aida_python_executable}\"",
+		"\"${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py\"",
+		"--repository-root \"${CMAKE_SOURCE_DIR}\"",
+		"--ledger \"${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json\"",
+		"--archive \"${_aida_authority_archive}\"",
+		"--powershell \"${_aida_system_powershell}\"",
+		"WORKING_DIRECTORY \"${CMAKE_CURRENT_SOURCE_DIR}\"",
+		"TIMEOUT 600",
+		"LABELS \"c03;c03_safe_headless;safe-headless;authority;surface;contract-reproduction\"",
+		"RESOURCE_LOCK \"aida_c03_authority_surface_reproduction\"",
+		"set_tests_properties(aida_c03_authority_surface_reproduction PROPERTIES",
+		"add_test(NAME aida_c03_authority_surface_reproduction"})
+		require_exact_count(authority_test, token, 1,
+			"combined authority reproduction exact command and properties");
+	require_absent(authority_test, "${Python3_EXECUTABLE}",
+		"combined authority reproduction validated interpreter command");
+	for (const auto token : std::array<std::string_view, 7>{
+		"set(_aida_lexical_candidate \"${input_path}\")",
+		"file(TO_CMAKE_PATH \"${_aida_lexical_candidate}\" _aida_candidate)",
+		"set(_aida_normalized_candidate \"${_aida_candidate}\")",
+		"cmake_path(NORMAL_PATH _aida_normalized_candidate)",
+		"string(TOLOWER \"${_aida_candidate}\" _aida_candidate_comparison)",
+		"string(TOLOWER \"${_aida_normalized_candidate}\" _aida_normalized_comparison)",
+		"if(NOT _aida_candidate_comparison STREQUAL _aida_normalized_comparison)"})
+		require_exact_count(cmake_manifest, token, 2,
+			"canonical path validators preserve and reject lexical normalization transitions");
+	require_exact_count(cmake_manifest,
+		"must use its canonical lexical path spelling", 2,
+		"canonical path validator rejection diagnostics");
+	require_exact_count(cmake_manifest,
+		"COMMAND \"${Python3_EXECUTABLE}\"", 0,
+		"raw unvalidated Python command absence");
+	const auto canonical_file_validator = slice_between(cmake_manifest,
+		"function(aida_c03_validate_canonical_regular_file",
+		"function(aida_c03_validate_canonical_directory",
+		"canonical regular-file validator");
+	const auto canonical_directory_validator = slice_between(cmake_manifest,
+		"function(aida_c03_validate_canonical_directory",
+		"function(aida_c03_register_safe_headless_targets",
+		"canonical directory validator");
+	for (const auto token : std::array<std::string_view, 10>{
+		"NOT IS_ABSOLUTE \"${input_path}\"", "NOT EXISTS \"${input_path}\"",
+		"IS_DIRECTORY \"${input_path}\"", "IS_SYMLINK \"${input_path}\"",
+		"cmake_path(NORMAL_PATH _aida_normalized_candidate)",
+		"if(NOT _aida_candidate_comparison STREQUAL _aida_normalized_comparison)",
+		"get_filename_component(_aida_real_path \"${_aida_normalized_candidate}\" REALPATH)",
+		"if(NOT _aida_normalized_comparison STREQUAL _aida_real_comparison)",
+		"file(SHA256 \"${_aida_real_candidate}\" _aida_sha256)",
+		"set(${output_path} \"${_aida_real_candidate}\" PARENT_SCOPE)"})
+		require_contains(canonical_file_validator, token,
+			"canonical regular-file adverse path and identity policy");
+	for (const auto token : std::array<std::string_view, 8>{
+		"NOT IS_ABSOLUTE \"${input_path}\"", "NOT EXISTS \"${input_path}\"",
+		"NOT IS_DIRECTORY \"${input_path}\"", "IS_SYMLINK \"${input_path}\"",
+		"cmake_path(NORMAL_PATH _aida_normalized_candidate)",
+		"if(NOT _aida_candidate_comparison STREQUAL _aida_normalized_comparison)",
+		"get_filename_component(_aida_real_path \"${_aida_normalized_candidate}\" REALPATH)",
+		"if(NOT _aida_normalized_comparison STREQUAL _aida_real_comparison)"})
+		require_contains(canonical_directory_validator, token,
+			"canonical directory adverse path policy");
+	for (const auto retired : std::array<std::string_view, 3>{
+		"cmake_path(SET _aida_candidate NORMALIZE",
+		"cmake_path(NORMAL_PATH _aida_candidate)",
+		"get_filename_component(_aida_real_path \"${_aida_candidate}\" REALPATH)"})
+		require_absent(cmake_manifest, retired,
+			"normalize-in-place authority path acceptance");
+
+	const std::array<std::string_view, 11> authority_inputs = {
+		"tools/c03_authority/verify_authority_surface_ledger.py",
+		"tools/c03_authority/authority_surface_ledger.json",
+		"tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py",
+		"src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1",
+		"src/standalone/tests/analysis_workspace/standalone_surface_baseline.json",
+		"src/standalone/tests/analysis_workspace/standalone_surface_final.json",
+		"src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json",
+		"src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json",
+		"src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json",
+		"src/standalone/src/core/mcp/compat/ida_contracts_generated.hpp",
+		"src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
+	};
+	const auto authority_configuration = slice_between(cmake_manifest,
+		"if(NOT Python3_Interpreter_FOUND OR NOT Python3_EXECUTABLE)",
+		"set_property(GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGETS",
+		"authority configure and identity inputs");
+	for (const auto token : std::array<std::string_view, 18>{
+		"if(NOT Python3_Interpreter_FOUND OR NOT Python3_EXECUTABLE)",
+		"_aida_python_sha256", "${Python3_EXECUTABLE}",
+		"_aida_system_powershell_sha256",
+		"${_aida_system_root}/System32/WindowsPowerShell/v1.0/powershell.exe",
+		"set(_aida_authority_archive \"C:/Users/ruar1337/ida-pro-mcp.zip\")",
+		"_aida_authority_archive_sha256",
+		"3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7",
+		"set(_aida_authority_repository_files",
+		"aida_c03_require_sources(\"authority and surface reproduction\"",
+		"CMAKE_CONFIGURE_DEPENDS", "${_aida_python_executable}",
+		"${_aida_system_powershell}", "${_aida_authority_archive}",
+		"foreach(_aida_authority_file IN LISTS _aida_authority_repository_files)",
+		"file(SHA256 \"${_aida_authority_file}\" _aida_authority_file_sha256)",
+		"string(SHA256 _aida_authority_identity",
+		"_aida_authority_identity_material"})
+		require_contains(authority_configuration, token,
+			"authority configure and hash identity contract");
+	const auto authority_file_inventory = slice_between(authority_configuration,
+		"set(_aida_authority_repository_files",
+		"aida_c03_require_sources(\"authority and surface reproduction\"",
+		"authority repository file inventory");
+	for (const auto input : authority_inputs)
+		require_exact_count(authority_file_inventory, input, 1,
+			"authority repository file inventory");
+	const auto policy_runtime = slice_between(cmake_manifest,
+		"set(_aida_policy_runtime", "foreach(_aida_relative IN LISTS _aida_policy_runtime)",
+		"source policy staged runtime inventory");
+	for (const auto input : authority_inputs)
+		require_exact_count(policy_runtime, input, 1,
+			"source policy authority runtime inventory");
+	for (const auto input : std::array<std::string_view, 3>{
+		"packaging/c03_distribution_manifest.ps1",
+		"src/standalone/src/core/analysis/build_worker_packaging_integration.cpp",
+		"src/standalone/tests/c03/build_packaging_integration_harness.cpp"})
+		require_exact_count(policy_runtime, input, 1,
+			"source policy package-boundary runtime inventory");
+	const auto production_sources = slice_between(cmake_manifest,
+		"set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES",
+		"list(REMOVE_DUPLICATES AIDA_C03_PRODUCTION_STANDALONE_SOURCES)",
+		"C03 production source registration");
+	const auto harness_support_sources = slice_between(cmake_manifest,
+		"set(AIDA_C03_HARNESS_SUPPORT_SOURCES",
+		"set(AIDA_C03_WORKSPACE_HARNESS_SUPPORT_SOURCES",
+		"C03 harness support registration");
+	const auto compiler_matrix_cm15 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_15",
+		"set(AIDA_C03_COMPILER_MATRIX_UNION)",
+		"C03 CM-15 compiler matrix");
+	require_absent(production_sources, "surface_reconciliation.cpp",
+		"application production source registration");
+	require_exact_count(harness_support_sources, "surface_reconciliation.cpp", 1,
+		"harness-only surface reconciliation support registration");
+	require_exact_count(compiler_matrix_cm15, "surface_reconciliation.cpp", 1,
+		"surface reconciliation CM-15 retention");
+	require_exact_count(cmake_manifest, "surface_reconciliation.cpp", 2,
+		"surface reconciliation harness-only source classification");
 	for (const auto target : std::array<std::string_view, 6>{
 		"TARGET aida_c03_a00_authority_surface_harness",
 		"TARGET aida_c03_c08_c19_mcp_compatibility_harness",
@@ -522,18 +1167,188 @@ void verify_manifest_registration(const std::string_view cmake_manifest)
 	require_contains(cmake_manifest,
 		"decompiler_quality_scorer_harness.cpp",
 		"safe-headless scorer registration");
-	for (const auto retired : std::array<std::string, 9>{
-		std::string("driver_bridge_") + "stub",
-		std::string("workspace_mcp_") + "harness",
-		std::string("decompiler_quality_scorer_harness_") + "main",
-		std::string("decompiler_provider_matrix/") + "main.cpp",
-		std::string("materialize_quality_") + "selftest",
-		std::string("c03_protocol_core_harness_") + "main.cpp.in",
-		std::string("c03_provider_snapshot_harness_") + "main.cpp.in",
-		std::string("handlers/routing_extensions_") + "harness.cpp",
-		std::string("handlers/type_handlers_") + "harness.cpp"})
+	for (const auto retired : std::array<std::string, 6>{
+		std::string("src/standalone/tests/c03/driver_bridge_") + "stub.cpp",
+		std::string("src/standalone/tests/c03/driver_bridge_") + "stub.hpp",
+		std::string("src/standalone/tests/analysis_workspace/workspace_mcp_") + "harness.cpp",
+		std::string("src/standalone/tests/c03/decompiler_provider_matrix/") + "main.cpp",
+		std::string("src/standalone/tests/c03/decompiler_quality_scorer_harness_") + "main.cpp",
+		std::string("cmake/c03_safe_headless/materialize_quality_") + "selftest.py"})
 		require_absent(cmake_manifest, retired,
 			"safe-headless retired source registration");
+}
+
+void verify_distribution_source_leak_policy(const std::string_view producer,
+	const std::string_view verifier, const std::string_view harness,
+	const std::string_view cmake_manifest)
+{
+	constexpr std::string_view forbidden_extensions[]{
+		".a", ".asm", ".bash", ".bat", ".c", ".c++", ".cc", ".cmake", ".cmd", ".cpp",
+		".cppm", ".cs", ".csproj", ".cxx", ".def", ".exp", ".fs", ".fsproj", ".go",
+		".gradle", ".h", ".hh", ".hpp", ".hxx", ".ilk", ".in", ".inc", ".inl", ".ipp",
+		".ixx", ".java", ".kt", ".kts", ".lib", ".m", ".make", ".map", ".mk", ".mm",
+		".natvis", ".nupkg", ".nuspec", ".obj", ".pdb", ".props", ".ps1", ".psd1",
+		".psm1", ".pth", ".py", ".pyc", ".pyo", ".pyz", ".rc", ".rc2", ".rs", ".s",
+		".sh", ".sln", ".snupkg", ".spec", ".swift", ".targets", ".tpp", ".vb",
+		".vbproj", ".vcxproj", ".vcxproj.filters", ".whl", ".zig", ".zsh"
+	};
+	std::set<std::string> expected_extensions;
+	for (const auto extension : forbidden_extensions)
+		expected_extensions.emplace(extension);
+	const auto producer_extensions = quoted_source_literals(slice_between(producer,
+		"$script:ForbiddenCustomerExtensions", "$script:ForbiddenCustomerFileNames",
+		"distribution producer extension policy"), '\'',
+		"distribution producer extension policy");
+	const auto verifier_extensions = quoted_source_literals(slice_between(verifier,
+		"constexpr std::string_view forbidden_extensions[]{",
+		"constexpr std::string_view forbidden_names[]{",
+		"distribution verifier extension policy"), '"',
+		"distribution verifier extension policy");
+	const auto harness_extensions = quoted_source_literals(slice_between(harness,
+		"constexpr std::string_view forbidden_extensions[]{",
+		"constexpr std::string_view forbidden_paths[]{",
+		"distribution harness extension cases"), '"',
+		"distribution harness extension cases");
+	require(producer_extensions == expected_extensions &&
+		verifier_extensions == expected_extensions && harness_extensions == expected_extensions,
+		"distribution source and script extension policy is exact across producer, verifier, and fixtures");
+	for (const auto extension : forbidden_extensions) {
+		require_contains(producer, "'" + std::string(extension) + "'",
+			"distribution producer forbidden source and script extension inventory");
+		require_contains(verifier, "\"" + std::string(extension) + "\"",
+			"distribution verifier forbidden source and script extension inventory");
+		require_contains(harness, "\"" + std::string(extension) + "\"",
+			"distribution production-path forbidden extension fixtures");
+	}
+	const auto lowered_harness = ascii_lower(std::string(harness));
+	const std::array<std::string_view, 8> forbidden_names{
+		"build", "build.bazel", "cmakelists.txt", "gnumakefile", "makefile",
+		"meson.build", "workspace", "workspace.bazel"};
+	std::set<std::string> expected_names;
+	for (const auto name : forbidden_names)
+		expected_names.emplace(name);
+	require(quoted_source_literals(slice_between(producer,
+		"$script:ForbiddenCustomerFileNames", "$script:ForbiddenCustomerDirectoryNames",
+		"distribution producer build-file policy"), '\'',
+		"distribution producer build-file policy") == expected_names &&
+		quoted_source_literals(slice_between(verifier,
+			"constexpr std::string_view forbidden_names[]{",
+			"constexpr std::string_view forbidden_directories[]{",
+			"distribution verifier build-file policy"), '"',
+			"distribution verifier build-file policy") == expected_names,
+		"distribution forbidden build-file policy is exact across producer and verifier");
+	for (const auto name : forbidden_names) {
+		require_contains(producer, "'" + std::string(name) + "'",
+			"distribution producer forbidden build-file inventory");
+		require_contains(verifier, "\"" + std::string(name) + "\"",
+			"distribution verifier forbidden build-file inventory");
+		require_contains(lowered_harness, std::string(name),
+			"distribution forbidden build-file production fixture");
+	}
+	const std::array<std::string_view, 8> forbidden_directories{
+		"c03-safe-headless", "camoufox-reverse-mcp", "camoufox_reverse_mcp",
+		"library-packs", "metadata", "packs", "sdk", "templates"};
+	std::set<std::string> expected_directories;
+	for (const auto directory : forbidden_directories)
+		expected_directories.emplace(directory);
+	require(quoted_source_literals(slice_between(producer,
+		"$script:ForbiddenCustomerDirectoryNames",
+		"function Test-ForbiddenCustomerRelativePath",
+		"distribution producer forbidden directory policy"), '\'',
+		"distribution producer forbidden directory policy") == expected_directories &&
+		quoted_source_literals(slice_between(verifier,
+			"constexpr std::string_view forbidden_directories[]{",
+			"const auto forbidden_extension =",
+			"distribution verifier forbidden directory policy"), '"',
+			"distribution verifier forbidden directory policy") == expected_directories,
+		"distribution forbidden directory policy is exact across producer and verifier");
+	for (const auto directory : forbidden_directories) {
+		require_contains(producer, "'" + std::string(directory) + "'",
+			"distribution producer forbidden directory inventory");
+		require_contains(verifier, "\"" + std::string(directory) + "\"",
+			"distribution verifier forbidden directory inventory");
+		require_contains(lowered_harness, std::string(directory),
+			"distribution forbidden directory production fixture");
+	}
+	for (const auto token : std::array<std::string_view, 12>{
+		"function Test-ForbiddenCustomerRelativePath",
+		"$script:ForbiddenCustomerExtensions",
+		"$script:ForbiddenCustomerFileNames",
+		"$script:ForbiddenCustomerDirectoryNames",
+		"$RelativePath.Length -gt 32768",
+		"$lower.EndsWith('.dist-info', [StringComparison]::Ordinal)",
+		"$lower.EndsWith('.egg-info', [StringComparison]::Ordinal)",
+		"$lower[$after] -eq '.'", "$lower[$after] -eq '-'",
+		"$lower[$after] -eq '_'",
+		"'stock-firefox', 'stock-firefox.exe'",
+		"if (Test-ForbiddenCustomerRelativePath -RelativePath $RelativePath)"})
+		require_contains(producer, token,
+			"distribution producer fail-closed customer path policy");
+	for (const auto token : std::array<std::string_view, 13>{
+		"bool unexpected_customer_file(std::string_view relative)",
+		"forbidden_extensions[]", "forbidden_names[]", "forbidden_directories[]",
+		"lower.size() > 32768",
+		"segment[after] == '.'", "segment[after] == '-'", "segment[after] == '_'",
+		".dist-info", ".egg-info", "stock-firefox.exe",
+		"if (unexpected_customer_file(artifact.relative_path))",
+		"if (unexpected_customer_file(text))"})
+		require_contains(verifier, token,
+			"distribution verifier fail-closed customer path policy");
+	for (const auto token : std::array<std::string_view, 15>{
+		"verify_allowed_customer_path_neighbors(fixture, integration);",
+		"verify_forbidden_customer_path_policy(fixture, integration);",
+		"integration.verify_distribution_package(request_for(fixture, digest))",
+		"nested/payload.CpP", "nested/payload.PS1.backup",
+		"nested/payload.HPP_copy", "nested/payload.CMAKE-old",
+		"nested/C03-SAFE-HEADLESS/bin/harness.exe",
+		"c03-safe-headless/nested/HARNESS.CPP",
+		"unlisted developer safe-headless source payload was accepted",
+		"reject(std::string(32769, 'x'))",
+		"resources/runtime-policy.json", "resources/runtime-policy.sha256",
+		"resources/LICENSE.txt", "resources/NOTICE.md"})
+		require_contains(harness, token,
+			"distribution production-shaped package-boundary fixtures");
+	const auto materializer_command = slice_between(cmake_manifest,
+		"add_custom_command(OUTPUT \"${AIDA_C03_SAFE_HEADLESS_MANIFEST}\"",
+		"add_custom_command(OUTPUT \"${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}\"",
+		"safe-headless manifest materializer command");
+	require_exact_count(materializer_command,
+		"COMMAND \"${_aida_python_executable}\" \"${AIDA_C03_SAFE_HEADLESS_MATERIALIZER}\"", 1,
+		"safe-headless validated Python materializer command");
+	require_absent(materializer_command, "${Python3_EXECUTABLE}",
+		"safe-headless raw Python materializer command");
+	const auto developer_manifest = slice_between(cmake_manifest,
+		"add_custom_target(aida_c03_safe_headless_manifest",
+		"add_custom_target(aida_c03_safe_headless_application_package",
+		"safe-headless developer manifest identity");
+	for (const auto token : std::array<std::string_view, 5>{
+		"AIDA_C03_DEVELOPER_ONLY TRUE",
+		"AIDA_C03_DEVELOPER_SUITE_OUTPUTS \"c03-safe-headless/manifest.json;c03-safe-headless/manifest.sha256\"",
+		"${AIDA_C03_SAFE_HEADLESS_MANIFEST}", "${AIDA_C03_SAFE_HEADLESS_DIGEST}",
+		"${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"})
+		require_contains(developer_manifest, token,
+			"developer-only safe-headless manifest and digest identity");
+	require_absent(developer_manifest, "AIDA_C03_PACKAGE_OUTPUTS",
+		"customer package output classification for developer safe-headless artifacts");
+	const auto application_package = slice_between(cmake_manifest,
+		"add_custom_target(aida_c03_safe_headless_application_package",
+		"add_executable(aida_c03_safe_headless_manifest_suite",
+		"safe-headless application package boundary");
+	for (const auto token : std::array<std::string_view, 7>{
+		"COMMAND ${CMAKE_COMMAND} -E rm -rf \"$<TARGET_FILE_DIR:${application_target}>/c03-safe-headless\"",
+		"DEPENDS aida_c03_safe_headless_manifest",
+		"AIDA_C03_CUSTOMER_PAYLOAD_FORBIDDEN TRUE",
+		"add_dependencies(${application_target} aida_c03_safe_headless_application_package)",
+		"target_include_directories(${application_target} PRIVATE \"${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}\")",
+		"target_compile_options(${application_target} PRIVATE",
+		"/FI${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"})
+		require_exact_count(application_package, token, 1,
+			"application manifest identity and developer-payload exclusion");
+	for (const auto token : std::array<std::string_view, 4>{
+		"copy_directory", "copy_if_different", "make_directory",
+		"${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"})
+		require_absent(application_package, token,
+			"customer application developer-payload copy path");
 }
 
 void verify_safe_headless_runtime(const std::string_view safe_headless,
@@ -634,6 +1449,15 @@ int main(int argc, char** argv)
 		const auto cmake_manifest = read_bounded(root,
 			"cmake/aida_c03_safe_headless_manifest.cmake",
 			8ULL * 1024ULL * 1024ULL);
+		const auto distribution_producer = read_bounded(root,
+			"packaging/c03_distribution_manifest.ps1",
+			4ULL * 1024ULL * 1024ULL);
+		const auto distribution_verifier = read_bounded(root,
+			"src/standalone/src/core/analysis/build_worker_packaging_integration.cpp",
+			8ULL * 1024ULL * 1024ULL);
+		const auto distribution_harness = read_bounded(root,
+			"src/standalone/tests/c03/build_packaging_integration_harness.cpp",
+			4ULL * 1024ULL * 1024ULL);
 		const auto resource_cases = read_bounded(root,
 			"cmake/c03_safe_headless/target_resource_policy_cases.json",
 			256ULL * 1024ULL);
@@ -660,6 +1484,8 @@ int main(int argc, char** argv)
 		verify_browser_policy(browser);
 		verify_customer_launch_policy(deploy);
 		verify_manifest_registration(cmake_manifest);
+		verify_distribution_source_leak_policy(distribution_producer,
+			distribution_verifier, distribution_harness, cmake_manifest);
 		verify_safe_headless_runtime(safe_headless, materializer,
 			cmake_manifest, resource_cases);
 		verify_quality_pipeline(quality_pipeline, cmake_manifest);
@@ -670,6 +1496,9 @@ int main(int argc, char** argv)
 		require_clean_source(browser, "browser policy source");
 		require_clean_source(safe_headless, "safe-headless runtime source");
 		require_clean_source(cmake_manifest, "safe-headless CMake source");
+		require_clean_source(distribution_producer, "distribution producer source");
+		require_clean_source(distribution_verifier, "distribution verifier source");
+		require_clean_source(distribution_harness, "distribution harness source");
 		require_clean_source(quality_pipeline, "quality pipeline source");
 		require_clean_source(authority_verifier, "authority reproduction verifier");
 		return 0;

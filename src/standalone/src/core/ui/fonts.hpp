@@ -2,6 +2,7 @@
 
 #include "imgui/imgui.h"
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 extern ImFont* g_font_ui_400;
 extern ImFont* g_font_ui_500;
 extern ImFont* g_font_ui_600;
@@ -12,8 +13,63 @@ extern ImFont* g_font_ui_700_xl;
 extern ImFont* g_font_code_400;
 extern ImFont* g_font_code_600;
 extern ImFont* g_font_code_400_lg;
+#else
+inline ImFont* g_font_ui_400 = nullptr;
+inline ImFont* g_font_ui_500 = nullptr;
+inline ImFont* g_font_ui_600 = nullptr;
+inline ImFont* g_font_ui_700 = nullptr;
+inline ImFont* g_font_ui_400_lg = nullptr;
+inline ImFont* g_font_ui_500_sm = nullptr;
+inline ImFont* g_font_ui_700_xl = nullptr;
+inline ImFont* g_font_code_400 = nullptr;
+inline ImFont* g_font_code_600 = nullptr;
+inline ImFont* g_font_code_400_lg = nullptr;
+#endif
 
 namespace aida::ui::fonts {
+	#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+	struct font_bindings_t {
+		ImFont* ui_400 = nullptr;
+		ImFont* ui_500 = nullptr;
+		ImFont* ui_600 = nullptr;
+		ImFont* ui_700 = nullptr;
+		ImFont* ui_400_lg = nullptr;
+		ImFont* ui_500_sm = nullptr;
+		ImFont* ui_700_xl = nullptr;
+		ImFont* code_400 = nullptr;
+		ImFont* code_600 = nullptr;
+		ImFont* code_400_lg = nullptr;
+	};
+
+	inline void bind(const font_bindings_t& bindings) {
+		g_font_ui_400 = bindings.ui_400;
+		g_font_ui_500 = bindings.ui_500 ? bindings.ui_500 : g_font_ui_400;
+		g_font_ui_600 = bindings.ui_600 ? bindings.ui_600 : g_font_ui_500;
+		g_font_ui_700 = bindings.ui_700 ? bindings.ui_700 : g_font_ui_600;
+		g_font_ui_400_lg = bindings.ui_400_lg ? bindings.ui_400_lg : g_font_ui_400;
+		g_font_ui_500_sm = bindings.ui_500_sm ? bindings.ui_500_sm : g_font_ui_500;
+		g_font_ui_700_xl = bindings.ui_700_xl ? bindings.ui_700_xl : g_font_ui_700;
+		g_font_code_400 = bindings.code_400 ? bindings.code_400 : g_font_ui_400;
+		g_font_code_600 = bindings.code_600 ? bindings.code_600 : g_font_code_400;
+		g_font_code_400_lg = bindings.code_400_lg ? bindings.code_400_lg : g_font_code_400;
+	}
+
+	inline font_bindings_t bindings() {
+		return {
+			g_font_ui_400,
+			g_font_ui_500,
+			g_font_ui_600,
+			g_font_ui_700,
+			g_font_ui_400_lg,
+			g_font_ui_500_sm,
+			g_font_ui_700_xl,
+			g_font_code_400,
+			g_font_code_600,
+			g_font_code_400_lg
+		};
+	}
+	#endif
+
 	struct font_policy_t {
 		float scale = 1.f;
 		float body_px = 16.5f;

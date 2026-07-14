@@ -56,7 +56,32 @@ def cpp_matching_index(text: str, start: int, opening: str, closing: str) -> int
     raise LedgerError(f"unterminated C++ balanced range at offset {start}")
 
 
-def cpp_code_mask(source: str) -> str:
+def cpp_digit_separator(source: str, index: int) -> bool:
+    if index <= 0 or index + 1 >= len(source) or source[index] != "'":
+        return False
+    start = index - 1
+    while start >= 0 and re.fullmatch(r"[A-Za-z0-9_'.]", source[start]) is not None:
+        start -= 1
+    prefix = source[start + 1:index]
+    previous = source[index - 1]
+    following = source[index + 1]
+    if re.fullmatch(r"0[xX][0-9A-Fa-f.pP']*", prefix) is not None:
+        return (re.fullmatch(r"[0-9A-Fa-f]", previous) is not None and
+                re.fullmatch(r"[0-9A-Fa-f]", following) is not None)
+    if re.fullmatch(r"0[bB][01']*", prefix) is not None:
+        return previous in "01" and following in "01"
+    return (re.fullmatch(r"[0-9][0-9.eE']*", prefix) is not None and
+            previous in "0123456789" and following in "0123456789")
+
+
+def cpp_mask_error_context(source: str, index: int, label: str) -> str:
+    bounded = max(0, min(index, len(source)))
+    byte_offset = len(source[:bounded].encode("utf-8"))
+    return (f"source={label!r} line={source_line(source, bounded)} "
+            f"character_offset={bounded} byte_offset={byte_offset}")
+
+
+def cpp_code_mask(source: str, label: str = "<memory>") -> str:
     masked = list(source)
     index = 0
     length = len(source)
@@ -69,6 +94,7 @@ def cpp_code_mask(source: str) -> str:
                 index += 1
             continue
         if current == "/" and following == "*":
+            comment_start = index
             masked[index] = " "
             masked[index + 1] = " "
             index += 2
@@ -84,9 +110,12 @@ def cpp_code_mask(source: str) -> str:
                     masked[index] = " "
                 index += 1
             if not closed:
-                raise LedgerError("unterminated C++ block comment in reachability source")
+                raise LedgerError(
+                    "unterminated C++ block comment " +
+                    cpp_mask_error_context(source, comment_start, label))
             continue
         if current == "R" and following == '"':
+            raw_start = index
             delimiter_start = index + 2
             opening = source.find("(", delimiter_start)
             if delimiter_start <= opening <= delimiter_start + 16:
@@ -95,14 +124,21 @@ def cpp_code_mask(source: str) -> str:
                     terminator = ")" + delimiter + '"'
                     closing = source.find(terminator, opening + 1)
                     if closing < 0:
-                        raise LedgerError("unterminated C++ raw string in reachability source")
+                        raise LedgerError(
+                            "unterminated C++ raw string " +
+                            cpp_mask_error_context(source, raw_start, label))
                     end = closing + len(terminator)
                     while index < end:
                         if source[index] not in "\r\n":
                             masked[index] = " "
                         index += 1
                     continue
+        if current == "'" and cpp_digit_separator(source, index):
+            masked[index] = " "
+            index += 1
+            continue
         if current in ('"', "'"):
+            literal_start = index
             quote = current
             masked[index] = " "
             index += 1
@@ -124,7 +160,9 @@ def cpp_code_mask(source: str) -> str:
                     closed = True
                     break
             if not closed:
-                raise LedgerError("unterminated C++ quoted literal in reachability source")
+                raise LedgerError(
+                    "unterminated C++ quoted literal " +
+                    cpp_mask_error_context(source, literal_start, label))
             continue
         index += 1
     return "".join(masked)
@@ -156,6 +194,48 @@ def value_contains(value: dict[str, Any], offset: int) -> bool:
     return int(value["open"]) < offset < int(value["close"])
 
 
+def cpp_split_top_level(text: str) -> list[str]:
+    if not text.strip():
+        return []
+    output: list[str] = []
+    start = 0
+    round_depth = 0
+    curly_depth = 0
+    square_depth = 0
+    quote = ""
+    escape = False
+    for index, character in enumerate(text):
+        if quote:
+            if escape:
+                escape = False
+            elif character == "\\":
+                escape = True
+            elif character == quote:
+                quote = ""
+            continue
+        if character == "'" and cpp_digit_separator(text, index):
+            continue
+        if character in ('"', "'"):
+            quote = character
+        elif character == "(":
+            round_depth += 1
+        elif character == ")":
+            round_depth -= 1
+        elif character == "{":
+            curly_depth += 1
+        elif character == "}":
+            curly_depth -= 1
+        elif character == "[":
+            square_depth += 1
+        elif character == "]":
+            square_depth -= 1
+        elif character == "," and round_depth == 0 and curly_depth == 0 and square_depth == 0:
+            output.append(text[start:index].strip())
+            start = index + 1
+    output.append(text[start:].strip())
+    return output
+
+
 def cpp_registrar_definitions(relative: str, source: str, mask: str) -> list[dict[str, Any]]:
     definitions: list[dict[str, Any]] = []
     namespaces = cpp_namespace_ranges(source, mask)
@@ -165,8 +245,6 @@ def cpp_registrar_definitions(relative: str, source: str, mask: str) -> list[dic
         opening = mask.find("(", match.start())
         closing = cpp_matching_index(mask, opening, "(", ")")
         parameters = source[opening + 1:closing]
-        if re.search(r"(?:mcp_standalone::)?server_t\s*&", parameters) is None:
-            continue
         cursor = closing + 1
         while cursor < len(mask) and mask[cursor].isspace():
             cursor += 1
@@ -186,6 +264,8 @@ def cpp_registrar_definitions(relative: str, source: str, mask: str) -> list[dic
             "symbol": symbol,
             "bare_name": declared.rsplit("::", 1)[-1],
             "namespace": namespace,
+            "parameters": re.sub(r"\s+", " ", parameters).strip(),
+            "parameter_count": len(cpp_split_top_level(parameters)),
             "file": relative,
             "line": line,
             "name_offset": match.start(),
@@ -196,7 +276,8 @@ def cpp_registrar_definitions(relative: str, source: str, mask: str) -> list[dic
 
 
 def resolve_cpp_registrar_target(caller: dict[str, Any], callee: str,
-                                 definitions: list[dict[str, Any]]) -> dict[str, Any]:
+                                 definitions: list[dict[str, Any]],
+                                 argument_count: int) -> dict[str, Any]:
     namespace = str(caller["namespace"])
     candidates: list[str] = []
     while namespace:
@@ -204,7 +285,9 @@ def resolve_cpp_registrar_target(caller: dict[str, Any], callee: str,
         namespace = namespace.rsplit("::", 1)[0] if "::" in namespace else ""
     candidates.append(callee)
     for candidate in candidates:
-        matches = [value for value in definitions if value["symbol"] == candidate]
+        matches = [value for value in definitions
+                   if value["symbol"] == candidate and
+                   int(value["parameter_count"]) == argument_count]
         if len(matches) > 1:
             raise LedgerError(f"ambiguous registrar definition for {callee} from {caller['id']}")
         if len(matches) == 1:
@@ -212,9 +295,13 @@ def resolve_cpp_registrar_target(caller: dict[str, Any], callee: str,
     bare = callee.rsplit("::", 1)[-1]
     if "::" in callee:
         matches = [value for value in definitions
-                   if value["symbol"] == callee or value["symbol"].endswith("::" + callee)]
+                   if (value["symbol"] == callee or
+                       value["symbol"].endswith("::" + callee)) and
+                   int(value["parameter_count"]) == argument_count]
     else:
-        matches = [value for value in definitions if value["bare_name"] == bare]
+        matches = [value for value in definitions
+                   if value["bare_name"] == bare and
+                   int(value["parameter_count"]) == argument_count]
     if len(matches) != 1:
         raise LedgerError(
             f"unresolved or ambiguous registrar edge {callee} from {caller['id']} candidates={len(matches)}")
@@ -468,33 +555,77 @@ def reject_external_refs(value: Any, label: str) -> None:
             reject_external_refs(child, label)
 
 
+def cpp_registrar_declaration(mask: str, start: int, closing: int) -> bool:
+    after = closing + 1
+    while after < len(mask) and mask[after].isspace():
+        after += 1
+    if after >= len(mask) or mask[after] != ";":
+        return False
+    boundary = start - 1
+    while boundary >= 0 and mask[boundary] not in ";{}\r\n":
+        boundary -= 1
+    prefix = mask[boundary + 1:start].strip()
+    if not prefix:
+        return False
+    if re.match(r"^(?:return|co_return|co_await|throw)\b", prefix):
+        return False
+    type_token = r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*(?:\s*<[^;{}()]*>)?(?:\s*[*&]+)?"
+    return re.fullmatch(
+        rf"(?:(?:extern|static|inline|constexpr|consteval|constinit|friend|virtual|explicit|typename|const|volatile)\s+)*(?:{type_token})(?:\s+{type_token})*",
+        prefix) is not None
+
+
 def cpp_registrar_calls(definition: dict[str, Any], source: str, mask: str,
-                        definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                        definitions: list[dict[str, Any]], terminal_offsets: set[str],
+                        explicit_edges: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     body_start = int(definition["body_start"]) + 1
     body_end = int(definition["body_end"])
     body_mask = mask[body_start:body_end]
-    known_names = {str(value["bare_name"]) for value in definitions}
-    excluded = {
-        "register_tool", "register_compat", "register_one", "register_direct_alias",
-        "register_dispatch_alias", "register_c03_compatibility_tools",
-    }
     calls: list[dict[str, Any]] = []
-    pattern = re.compile(r"(?P<callee>(?:[A-Za-z_]\w*::)*register_[A-Za-z0-9_]+)\s*\(")
+    pattern = re.compile(
+        r"(?P<callee>(?:[A-Za-z_]\w*::)*(?:register|replace)_[A-Za-z0-9_]+)\s*\(")
     for match in pattern.finditer(body_mask):
         absolute = body_start + match.start()
         callee = match.group("callee")
-        bare = callee.rsplit("::", 1)[-1]
-        if bare not in known_names or bare in excluded:
+        terminal_key = f"{definition['file']}:{absolute}"
+        previous_terminal_key = f"{definition['file']}:{absolute - 1}"
+        if terminal_key in terminal_offsets or previous_terminal_key in terminal_offsets:
             continue
-        previous = mask[absolute - 1] if absolute else "\0"
+        opening = mask.find("(", absolute)
+        closing = cpp_matching_index(mask, opening, "(", ")")
+        if cpp_registrar_declaration(mask, absolute, closing):
+            raise LedgerError(
+                f"registrar declaration is forbidden in reachable code: {callee} from {definition['id']}")
+        if terminal_key in explicit_edges:
+            edge = explicit_edges[terminal_key]
+            if edge.get("caller_id") != definition["id"]:
+                raise LedgerError(f"explicit registrar edge has the wrong enclosing owner at {terminal_key}")
+            calls.append({
+                "caller_id": edge["caller_id"],
+                "callee_id": edge["callee_id"],
+                "callee_symbol": edge["callee_symbol"],
+                "file": definition["file"],
+                "line": source_line(source, absolute),
+                "character_offset": absolute,
+                "expression": edge["expression"],
+            })
+            continue
+        immediate_previous = mask[absolute - 1] if absolute > 0 else "\0"
+        previous_index = absolute - 1
+        while previous_index >= 0 and mask[previous_index].isspace():
+            previous_index -= 1
+        previous = mask[previous_index] if previous_index >= 0 else "\0"
         if previous in ".>":
             raise LedgerError(
                 f"indirect registrar edge {callee} is not source-resolvable from {definition['id']}")
-        if previous.isalnum() or previous == "_":
+        if previous == ":":
+            raise LedgerError(
+                f"whitespace-separated registrar qualification {callee} is not source-resolvable from {definition['id']}")
+        if immediate_previous.isalnum() or immediate_previous == "_":
             continue
-        target = resolve_cpp_registrar_target(definition, callee, definitions)
-        opening = mask.find("(", absolute)
-        closing = cpp_matching_index(mask, opening, "(", ")")
+        arguments = source[opening + 1:closing]
+        target = resolve_cpp_registrar_target(
+            definition, callee, definitions, len(cpp_split_top_level(arguments)))
         expression = re.sub(r"\s+", " ", source[absolute:closing + 1]).strip()
         calls.append({
             "caller_id": definition["id"],
@@ -511,7 +642,7 @@ def cpp_registrar_calls(definition: dict[str, Any], source: str, mask: str,
 def unique_cpp_code_call(root: Path, relative: str, pattern: str, label: str) -> dict[str, Any]:
     path = resolve_repository_file(root, relative, label)
     source = path.read_text(encoding="utf-8")
-    mask = cpp_code_mask(source)
+    mask = cpp_code_mask(source, relative)
     matches = list(re.finditer(pattern, mask))
     if len(matches) != 1:
         raise LedgerError(f"{label} must have exactly one code occurrence, observed {len(matches)}")
@@ -524,6 +655,42 @@ def unique_cpp_code_call(root: Path, relative: str, pattern: str, label: str) ->
         "character_offset": match.start(),
         "expression": re.sub(r"\s+", " ", source[match.start():closing + 1]).strip(),
     }
+
+
+def owned_cpp_code_call(root: Path, relative: str, pattern: str, label: str,
+                        definitions: list[dict[str, Any]]) -> dict[str, Any]:
+    call = unique_cpp_code_call(root, relative, pattern, label)
+    owners = [definition for definition in definitions
+              if definition["file"] == relative and
+              int(definition["body_start"]) < int(call["character_offset"]) <
+              int(definition["body_end"])]
+    if len(owners) != 1:
+        raise LedgerError(f"{label} has {len(owners)} enclosing function definitions")
+    call["caller_id"] = owners[0]["id"]
+    call["caller_symbol"] = owners[0]["symbol"]
+    path = resolve_repository_file(root, relative, label)
+    mask = cpp_code_mask(path.read_text(encoding="utf-8"), relative)
+    opening = mask.find("(", int(call["character_offset"]))
+    closing = cpp_matching_index(mask, opening, "(", ")")
+    token = re.search(r"\b(?:register|replace)_[A-Za-z0-9_]+\s*\(",
+                      mask[int(call["character_offset"]):closing + 1])
+    if token is None:
+        raise LedgerError(f"{label} does not contain a registrar-like call")
+    call["registrar_character_offset"] = int(call["character_offset"]) + token.start()
+    return call
+
+
+def select_unique_cpp_definition(definitions: list[dict[str, Any]], relative: str,
+                                 bare_name: str, parameter_pattern: str,
+                                 label: str) -> dict[str, Any]:
+    pattern = re.compile(parameter_pattern)
+    matches = [definition for definition in definitions
+               if definition["file"] == relative and
+               definition["bare_name"] == bare_name and
+               pattern.search(str(definition["parameters"])) is not None]
+    if len(matches) != 1:
+        raise LedgerError(f"{label} definition count is {len(matches)}, expected one")
+    return matches[0]
 
 
 def load_cpp_reachability_sources(root: Path) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, str]]:
@@ -546,7 +713,7 @@ def load_cpp_reachability_sources(root: Path) -> tuple[list[dict[str, Any]], dic
         if "register_" not in source:
             continue
         relative = path.relative_to(root).as_posix()
-        mask = cpp_code_mask(source)
+        mask = cpp_code_mask(source, relative)
         sources[relative] = source
         masks[relative] = mask
         definitions.extend(cpp_registrar_definitions(relative, source, mask))
@@ -555,9 +722,11 @@ def load_cpp_reachability_sources(root: Path) -> tuple[list[dict[str, Any]], dic
     return definitions, sources, masks
 
 
-def derive_cpp_reachability_graph(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]],
-                                                       list[dict[str, Any]], dict[str, list[str]],
-                                                       list[dict[str, Any]], dict[str, str], dict[str, str]]:
+def derive_cpp_reachability_graph(
+        root: Path, registrations: list[Any]) -> tuple[
+            dict[str, Any], list[dict[str, Any]], list[dict[str, Any]],
+            dict[str, list[str]], list[dict[str, Any]], dict[str, str],
+            dict[str, str], dict[str, Any], dict[str, Any], set[str]]:
     definitions, sources, masks = load_cpp_reachability_sources(root)
     roots = [value for value in definitions
              if value["symbol"] == "mcp_standalone::register_standalone_tools"]
@@ -570,6 +739,26 @@ def derive_cpp_reachability_graph(root: Path) -> tuple[dict[str, Any], list[dict
         "standalone production MCP initialization call")
     entry["root_registrar_id"] = root_definition["id"]
     entry["root_registrar_symbol"] = root_definition["symbol"]
+    route_entry = owned_cpp_code_call(
+        root, "src/standalone/src/core/mcp/mcp_standalone_tools.cpp",
+        r"\bregister_c03_compatibility_tools\s*\(\s*srv\s*\)",
+        "C03 compatibility root registrar edge", definitions)
+    if route_entry["caller_id"] != root_definition["id"]:
+        raise LedgerError("C03 compatibility root registrar edge is outside the production root")
+    registration_terminal_offsets: set[str] = set()
+    for value in registrations:
+        registration = require_object(value, "current MCP reachability registration")
+        source_record = require_object(
+            registration.get("source"), "current MCP reachability registration source")
+        relative = source_record.get("file")
+        offset = source_record.get("character_offset")
+        if not isinstance(relative, str) or not isinstance(offset, int) or isinstance(offset, bool):
+            raise LedgerError("current MCP reachability registration lacks an exact source offset")
+        if offset >= 0:
+            registration_terminal_offsets.add(f"{relative}:{offset}")
+    direct_terminal_offsets = set(registration_terminal_offsets)
+    direct_terminal_offsets.add(
+        f"{route_entry['file']}:{route_entry['registrar_character_offset']}")
     by_id = {str(value["id"]): value for value in definitions}
     reachable = {str(root_definition["id"]): root_definition}
     parents: dict[str, str] = {}
@@ -581,7 +770,9 @@ def derive_cpp_reachability_graph(root: Path) -> tuple[dict[str, Any], list[dict
         relative = str(caller["file"])
         if relative not in sources or relative not in masks:
             raise LedgerError(f"registrar source cache is unavailable: {relative}")
-        calls = cpp_registrar_calls(caller, sources[relative], masks[relative], definitions)
+        calls = cpp_registrar_calls(
+            caller, sources[relative], masks[relative], definitions,
+            direct_terminal_offsets, {})
         local_targets: set[str] = set()
         for edge in calls:
             target_id = str(edge["callee_id"])
@@ -613,56 +804,227 @@ def derive_cpp_reachability_graph(root: Path) -> tuple[dict[str, Any], list[dict
         })
     edge_rows = sorted(edges, key=lambda item: (
         str(item["caller_id"]), str(item["callee_id"]), str(item["file"]), int(item["line"])))
-    return entry, registrar_rows, edge_rows, chains, definitions, sources, masks
+    return (entry, registrar_rows, edge_rows, chains, definitions, sources, masks,
+            root_definition, route_entry, registration_terminal_offsets)
 
 
-def generated_compatibility_route(root: Path) -> tuple[list[str], list[dict[str, Any]], str]:
-    calls = [
-        unique_cpp_code_call(
-            root, "src/standalone/src/core/mcp/mcp_standalone_tools.cpp",
-            r"\bregister_c03_compatibility_tools\s*\(\s*srv\s*\)",
-            "C03 compatibility root registrar edge"),
-        unique_cpp_code_call(
-            root, "src/standalone/src/core/mcp/mcp_standalone.cpp",
+def derive_generated_compatibility_route(
+        root: Path, definitions: list[dict[str, Any]], sources: dict[str, str],
+        masks: dict[str, str], root_definition: dict[str, Any],
+        direct_edges: list[dict[str, Any]], route_entry: dict[str, Any],
+        registration_terminal_offsets: set[str],
+        generated_rows: dict[str, dict[str, Any]]) -> tuple[
+            dict[str, Any], dict[str, dict[str, Any]]]:
+    standalone_tools = "src/standalone/src/core/mcp/mcp_standalone_tools.cpp"
+    server_path = "src/standalone/src/core/mcp/mcp_standalone.cpp"
+    registration_path = "src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp"
+    integration_path = "src/standalone/src/core/mcp/compat/mcp_server_integration.cpp"
+    server_bridge = select_unique_cpp_definition(
+        definitions, server_path, "register_c03_compatibility_tools",
+        r"server_t\s*&", "C03 server bridge")
+    config_bridge = select_unique_cpp_definition(
+        definitions, registration_path, "register_c03_compatibility_tools",
+        r"tool_registry_t\s*&.*c03_compatibility_runtime_config_t",
+        "C03 runtime-config bridge")
+    wave_registrar = select_unique_cpp_definition(
+        definitions, registration_path, "register_wave_c_compatibility_tools",
+        r"tool_registry_t\s*&.*c03_compatibility_runtime_config_t",
+        "C03 Wave C registrar")
+    generated_registrar = select_unique_cpp_definition(
+        definitions, integration_path, "register_generated_tools", r"^$",
+        "C03 generated registrar")
+    extension_registrar = select_unique_cpp_definition(
+        definitions, integration_path, "register_extension_tools", r"^$",
+        "C03 extension registrar")
+    entry_registrar = select_unique_cpp_definition(
+        definitions, integration_path, "register_entry",
+        r"shared_ptr<mcp_server_integration_t>.*std::string\s*&",
+        "C03 per-name registrar")
+    specifications = [
+        (route_entry, root_definition, server_bridge),
+        (owned_cpp_code_call(
+            root, server_path,
             r"\bregister_c03_compatibility_tools\s*\(\s*server\.registry\s*\(\s*\)\s*,\s*make_application_c03_compatibility_runtime_config\s*\(\s*\)\s*\)",
-            "C03 compatibility server bridge edge"),
-        unique_cpp_code_call(
-            root, "src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp",
+            "C03 compatibility server bridge edge", definitions),
+         server_bridge, config_bridge),
+        (owned_cpp_code_call(
+            root, registration_path,
             r"\bregister_wave_c_compatibility_tools\s*\(\s*registry\s*,\s*std::move\s*\(\s*config\s*\)\s*\)",
-            "C03 compatibility wave registrar edge"),
-        unique_cpp_code_call(
-            root, "src/standalone/src/core/mcp/compat/c03_compatibility_registration.cpp",
+            "C03 compatibility wave registrar edge", definitions),
+         config_bridge, wave_registrar),
+        (owned_cpp_code_call(
+            root, registration_path,
             r"\bintegration\s*->\s*register_generated_tools\s*\(\s*\)",
-            "C03 generated compatibility registrar edge"),
-        unique_cpp_code_call(
-            root, "src/standalone/src/core/mcp/compat/mcp_server_integration.cpp",
+            "C03 generated compatibility registrar edge", definitions),
+         wave_registrar, generated_registrar),
+        (owned_cpp_code_call(
+            root, registration_path,
+            r"\bintegration\s*->\s*register_extension_tools\s*\(\s*\)",
+            "C03 extension registrar edge", definitions),
+         wave_registrar, extension_registrar),
+        (owned_cpp_code_call(
+            root, integration_path,
             r"\bimpl_\s*->\s*register_entry\s*\(\s*owner\s*,\s*name\s*\)",
-            "C03 generated compatibility per-name registration edge"),
+            "C03 generated per-name registrar edge", definitions),
+         generated_registrar, entry_registrar),
+        (owned_cpp_code_call(
+            root, integration_path,
+            r"\bimpl_\s*->\s*register_entry\s*\(\s*owner\s*,\s*std::string\s*\(\s*name\s*\)\s*\)",
+            "C03 extension per-name registrar edge", definitions),
+         extension_registrar, entry_registrar),
     ]
-    symbols = [
-        "mcp_standalone::register_standalone_tools",
-        "mcp_standalone::register_c03_compatibility_tools(server_t&)",
-        "mcp_standalone::register_c03_compatibility_tools(tool_registry_t&,runtime_config)",
-        "mcp_standalone::<anonymous>::register_wave_c_compatibility_tools",
-        "aida::standalone::mcp::integration::mcp_server_integration_t::register_generated_tools",
-        "aida::standalone::mcp::integration::impl_t::register_entry",
+    route_edges: list[dict[str, Any]] = []
+    for call, caller, callee in specifications:
+        if call["caller_id"] != caller["id"]:
+            raise LedgerError(f"C03 route call has the wrong enclosing owner: {call['expression']}")
+        route_edges.append({
+            "caller_id": caller["id"],
+            "caller_symbol": caller["symbol"],
+            "callee_id": callee["id"],
+            "callee_symbol": callee["symbol"],
+            "file": call["file"],
+            "line": call["line"],
+            "character_offset": call["registrar_character_offset"],
+            "expression": call["expression"],
+        })
+    operation_calls = [
+        owned_cpp_code_call(
+            root, integration_path,
+            r"\bstate\.registry\s*->\s*replace_tool\s*\(\s*std::move\s*\(\s*tool\s*\)\s*\)",
+            "C03 replacement terminal registration", definitions),
+        owned_cpp_code_call(
+            root, integration_path,
+            r"\bstate\.registry\s*->\s*register_tool\s*\(\s*std::move\s*\(\s*tool\s*\)\s*\)",
+            "C03 insertion terminal registration", definitions),
     ]
-    lines = ["R\t" + symbol for symbol in symbols]
-    lines.extend(
-        f"E\t{call['file']}\t{call['line']}\t{call['character_offset']}\t{call['expression']}"
-        for call in calls)
-    return symbols, calls, sha256_lines(lines)
+    terminal_operations: list[dict[str, Any]] = []
+    for operation in operation_calls:
+        if operation["caller_id"] != entry_registrar["id"]:
+            raise LedgerError("C03 terminal registration is outside the per-name registrar")
+        terminal_operations.append({
+            "file": operation["file"],
+            "line": operation["line"],
+            "character_offset": operation["registrar_character_offset"],
+            "expression": operation["expression"],
+            "caller_id": operation["caller_id"],
+            "caller_symbol": operation["caller_symbol"],
+        })
+    explicit_edges: dict[str, dict[str, Any]] = {}
+    for edge in route_edges:
+        key = f"{edge['file']}:{edge['character_offset']}"
+        if key in explicit_edges:
+            raise LedgerError(f"C03 explicit registrar route offset is duplicated: {key}")
+        explicit_edges[key] = edge
+    route_terminal_offsets = set(registration_terminal_offsets)
+    route_terminal_offsets.update(
+        f"{operation['file']}:{operation['character_offset']}"
+        for operation in terminal_operations)
+    route_definitions = [
+        root_definition, server_bridge, config_bridge, wave_registrar,
+        generated_registrar, extension_registrar, entry_registrar,
+    ]
+    for definition in route_definitions:
+        relative = str(definition["file"])
+        observed = cpp_registrar_calls(
+            definition, sources[relative], masks[relative], definitions,
+            route_terminal_offsets, explicit_edges)
+        expected = [edge for edge in route_edges
+                    if edge["caller_id"] == definition["id"]]
+        if definition["id"] == root_definition["id"]:
+            expected.extend(edge for edge in direct_edges
+                            if edge["caller_id"] == definition["id"])
+        observed_lines = sorted(
+            f"{edge['caller_id']}\t{edge['callee_id']}\t{edge['file']}\t{edge['character_offset']}"
+            for edge in observed)
+        expected_lines = sorted(
+            f"{edge['caller_id']}\t{edge['callee_id']}\t{edge['file']}\t{edge['character_offset']}"
+            for edge in expected)
+        if observed_lines != expected_lines:
+            raise LedgerError(
+                f"C03 registrar body has an unclassified or missing edge: {definition['id']}")
+    route_nodes = [{
+        "id": definition["id"],
+        "symbol": definition["symbol"],
+        "file": definition["file"],
+        "line": definition["line"],
+        "body_start": definition["body_start"],
+        "body_end": definition["body_end"],
+        "parameters": definition["parameters"],
+    } for definition in route_definitions]
+    generated_base_chain = [
+        str(root_definition["id"]), str(server_bridge["id"]),
+        str(config_bridge["id"]), str(wave_registrar["id"]),
+    ]
+    compatibility_chain = generated_base_chain + [
+        str(generated_registrar["id"]), str(entry_registrar["id"])]
+    extension_chain = generated_base_chain + [
+        str(extension_registrar["id"]), str(entry_registrar["id"])]
+    bindings: list[dict[str, Any]] = []
+    binding_by_name: dict[str, dict[str, Any]] = {}
+    for name, row in generated_rows.items():
+        if name in binding_by_name:
+            raise LedgerError(f"C03 generated reachability binding is duplicated: {name}")
+        extension = "#wave_c_extension_binding" in str(row.get("descriptor_source", ""))
+        chain = extension_chain if extension else compatibility_chain
+        binding = {
+            "name": name,
+            "branch": "extension" if extension else "generated_compatibility",
+            "registrar_id": entry_registrar["id"],
+            "registrar_symbol": entry_registrar["symbol"],
+            "chain": chain,
+            "chain_sha256": sha256_lines(chain),
+        }
+        binding_by_name[name] = binding
+        bindings.append(binding)
+    bindings.sort(key=lambda value: str(value["name"]))
+    if (len(bindings) != 92 or
+            sum(value["branch"] == "generated_compatibility" for value in bindings) != 88 or
+            sum(value["branch"] == "extension" for value in bindings) != 4):
+        raise LedgerError("C03 generated per-name reachability partition is invalid")
+    route_lines = [
+        f"R\t{node['id']}\t{node['symbol']}\t{node['file']}\t{node['line']}"
+        for node in route_nodes]
+    route_lines.extend(
+        f"E\t{edge['caller_id']}\t{edge['callee_id']}\t{edge['file']}\t{edge['line']}\t{edge['character_offset']}\t{edge['expression']}"
+        for edge in route_edges)
+    route_lines.extend(
+        f"T\t{operation['caller_id']}\t{operation['file']}\t{operation['line']}\t{operation['character_offset']}\t{operation['expression']}"
+        for operation in terminal_operations)
+    binding_lines = [
+        f"{binding['name']}\t{binding['branch']}\t{binding['registrar_id']}\t{binding['chain_sha256']}"
+        for binding in bindings]
+    generated_route = {
+        "node_count": len(route_nodes),
+        "edge_count": len(route_edges),
+        "terminal_operation_count": len(terminal_operations),
+        "binding_count": len(bindings),
+        "generated_compatibility_count": 88,
+        "extension_count": 4,
+        "shared_terminal_definition_id": entry_registrar["id"],
+        "shared_terminal_parent_ids": sorted([
+            str(generated_registrar["id"]), str(extension_registrar["id"])]),
+        "nodes": route_nodes,
+        "edges": route_edges,
+        "terminal_operations": terminal_operations,
+        "bindings": bindings,
+        "route_sha256": sha256_lines(sorted(set(route_lines))),
+        "binding_sha256": sha256_lines(sorted(set(binding_lines))),
+    }
+    return generated_route, binding_by_name
 
 
 def verify_mcp_production_reachability(root: Path, mcp: dict[str, Any],
                                        authority: dict[str, Any],
-                                       contract_rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                                       generated_rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
     policy = require_object(mcp.get("production_reachability"),
                             "current MCP production reachability")
     if policy.get("schema_version") != 1:
         raise LedgerError("current MCP production reachability schema is invalid")
-    entry, registrar_rows, edge_rows, chains, definitions, sources, masks = \
-        derive_cpp_reachability_graph(root)
+    registrations = require_array(mcp.get("registrations"),
+                                  "current MCP reachability registrations")
+    (entry, registrar_rows, edge_rows, chains, definitions, sources, masks,
+     root_definition, route_entry, registration_terminal_offsets) = \
+        derive_cpp_reachability_graph(root, registrations)
     if require_object(policy.get("production_entry"),
                       "current MCP production entry") != entry:
         raise LedgerError("current MCP production entry identity is invalid")
@@ -686,13 +1048,20 @@ def verify_mcp_production_reachability(root: Path, mcp: dict[str, Any],
     graph_hash = sha256_lines(sorted(set(graph_lines)))
     if policy.get("reachable_registrar_count") != len(registrar_rows) or policy.get("registrar_edge_count") != len(edge_rows) or policy.get("registrar_graph_sha256") != graph_hash:
         raise LedgerError("current MCP registrar graph cardinality or identity is invalid")
-    generated_symbols, generated_calls, generated_hash = generated_compatibility_route(root)
+    generated_route_expected, generated_bindings = derive_generated_compatibility_route(
+        root, definitions, sources, masks, root_definition, edge_rows, route_entry,
+        registration_terminal_offsets, generated_rows)
     generated_route = require_object(policy.get("generated_route"),
                                      "current generated MCP production route")
-    if generated_route.get("symbols") != generated_symbols or generated_route.get("calls") != generated_calls or generated_route.get("route_sha256") != generated_hash:
+    if generated_route != generated_route_expected:
         raise LedgerError("current generated MCP production route differs from independently derived source evidence")
-    generated_chain_hash = sha256_lines(generated_symbols)
-    registrations = require_array(mcp.get("registrations"), "current MCP reachability registrations")
+    for name, row in generated_rows.items():
+        observed_binding = require_object(
+            row.get("production_reachability"),
+            f"current generated MCP registration {name} reachability")
+        if observed_binding != generated_bindings[name]:
+            raise LedgerError(
+                f"current generated MCP registration {name} has invalid production reachability")
     definition_by_id = {str(value["id"]): value for value in definitions}
     direct_count = 0
     projection_count = 0
@@ -749,14 +1118,16 @@ def verify_mcp_production_reachability(root: Path, mcp: dict[str, Any],
                 raise LedgerError(f"current MCP registration {name} has invalid registrar binding")
             direct_count += 1
         else:
-            if offset != -1 or name not in contract_rows:
+            if offset != -1 or name not in generated_bindings:
                 raise LedgerError(f"current MCP registration {name} has an invalid generated projection")
+            generated_binding = generated_bindings[name]
             expected = {
                 "mode": "generated_compatibility_projection",
-                "registrar_id": "c03_generated_compatibility_registry",
-                "registrar_symbol": generated_symbols[-2],
-                "chain": generated_symbols,
-                "chain_sha256": generated_chain_hash,
+                "generated_branch": generated_binding["branch"],
+                "registrar_id": generated_binding["registrar_id"],
+                "registrar_symbol": generated_binding["registrar_symbol"],
+                "chain": generated_binding["chain"],
+                "chain_sha256": generated_binding["chain_sha256"],
             }
             if reachability != expected:
                 raise LedgerError(f"current MCP registration {name} has invalid generated route binding")
@@ -787,7 +1158,14 @@ def verify_mcp_production_reachability(root: Path, mcp: dict[str, Any],
         "registrar_edge_count": len(edge_rows),
         "row_binding_sha256": row_hash,
         "registrar_graph_sha256": graph_hash,
-        "generated_route_sha256": generated_hash,
+        "generated_route_node_count": generated_route_expected["node_count"],
+        "generated_route_edge_count": generated_route_expected["edge_count"],
+        "generated_terminal_operation_count": generated_route_expected["terminal_operation_count"],
+        "generated_binding_count": generated_route_expected["binding_count"],
+        "generated_compatibility_count": generated_route_expected["generated_compatibility_count"],
+        "generated_extension_count": generated_route_expected["extension_count"],
+        "generated_route_sha256": generated_route_expected["route_sha256"],
+        "generated_binding_sha256": generated_route_expected["binding_sha256"],
     }
     if any(expected_authority.get(field) != expected for field, expected in expected_values.items()):
         raise LedgerError("MCP production reachability does not match the authority ledger")
@@ -808,7 +1186,14 @@ def verify_mcp_production_reachability(root: Path, mcp: dict[str, Any],
         "registrar_edge_count": len(edge_rows),
         "row_binding_sha256": row_hash,
         "registrar_graph_sha256": graph_hash,
-        "generated_route_sha256": generated_hash,
+        "generated_route_node_count": generated_route_expected["node_count"],
+        "generated_route_edge_count": generated_route_expected["edge_count"],
+        "generated_terminal_operation_count": generated_route_expected["terminal_operation_count"],
+        "generated_binding_count": generated_route_expected["binding_count"],
+        "generated_compatibility_count": generated_route_expected["generated_compatibility_count"],
+        "generated_extension_count": generated_route_expected["extension_count"],
+        "generated_route_sha256": generated_route_expected["route_sha256"],
+        "generated_binding_sha256": generated_route_expected["binding_sha256"],
     }
 
 
@@ -927,8 +1312,6 @@ def verify_current_surface_reproduction(ledger: dict[str, Any], root: Path,
     contract = ledger["current_surface_contract"]
     mcp_contract = contract["mcp"]
     mcp = require_object(current.get("mcp"), "current standalone MCP surface")
-    reachability_report = verify_mcp_production_reachability(
-        root, mcp, mcp_contract, contract_rows)
     registrations = require_array(mcp.get("registrations"), "current standalone MCP registrations")
     names = [require_object(record, "current standalone MCP registration").get("name")
              for record in registrations]
@@ -1006,6 +1389,8 @@ def verify_current_surface_reproduction(ledger: dict[str, Any], root: Path,
                                   "current generated MCP compatibility union")
     if require_unique(surface_union, "current generated MCP compatibility union") != required_union or len(surface_union) != 92:
         raise LedgerError("current generated MCP compatibility union does not match the authority ledger")
+    reachability_report = verify_mcp_production_reachability(
+        root, mcp, mcp_contract, rows_by_name)
     domains = require_object(mcp_contract.get("domains"), "MCP compatibility domain contract")
     domain_for_name: dict[str, str] = {}
     expected_domain_records: dict[str, dict[str, Any]] = {}

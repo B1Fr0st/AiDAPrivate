@@ -2,6 +2,9 @@ include_guard(GLOBAL)
 
 set(AIDA_C03_SAFE_HEADLESS_CMAKE_ROOT "${CMAKE_CURRENT_LIST_DIR}")
 set(AIDA_C03_SAFE_HEADLESS_CMAKE_MODULE "${CMAKE_CURRENT_LIST_FILE}")
+set(AIDA_C03_PATH_POLICY_MODULE "${CMAKE_CURRENT_LIST_DIR}/c03_safe_headless/package_policy_fixture/aida_c03_path_policy.cmake")
+set(AIDA_C03_PATH_IDENTITY_POLICY "${CMAKE_CURRENT_LIST_DIR}/c03_safe_headless/package_policy_fixture/aida_c03_path_identity.ps1")
+include("${AIDA_C03_PATH_POLICY_MODULE}")
 
 if(NOT DEFINED STANDALONE_ROOT OR NOT IS_DIRECTORY "${STANDALONE_ROOT}")
     message(FATAL_ERROR "AiDA C03 integration requires STANDALONE_ROOT")
@@ -32,8 +35,19 @@ aida_c03_require_components(managed_worker_packages ICSharpCode.Decompiler Syste
 set(AIDA_C03_TEST_ROOT "${STANDALONE_ROOT}/../tests/c03")
 set(AIDA_C03_MCP_TEST_ROOT "${STANDALONE_ROOT}/../tests/mcp_compat")
 set(AIDA_C03_WORKSPACE_TEST_ROOT "${STANDALONE_ROOT}/../tests/analysis_workspace")
-set(AIDA_C03_SAFE_HEADLESS_STAGE_ROOT "${CMAKE_BINARY_DIR}/c03-safe-headless/$<CONFIG>")
-set(AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT "${CMAKE_CURRENT_BINARY_DIR}/generated/c03-safe-headless")
+set(AIDA_C03_APPLICATION_BUILD_ROOT "${CMAKE_BINARY_DIR}")
+set(AIDA_C03_DEVELOPER_ROOT "${CMAKE_BINARY_DIR}-c03-developer-safe-headless")
+set(AIDA_C03_CUSTOMER_STAGE_ANCHOR "${CMAKE_BINARY_DIR}-c03-customer-package")
+file(MAKE_DIRECTORY
+    "${AIDA_C03_DEVELOPER_ROOT}"
+    "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}")
+aida_c03_require_detached_roots(
+    "${AIDA_C03_APPLICATION_BUILD_ROOT}"
+    "${AIDA_C03_DEVELOPER_ROOT}"
+    "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}")
+set(AIDA_C03_SAFE_HEADLESS_STAGE_ROOT "${AIDA_C03_DEVELOPER_ROOT}/suite/$<CONFIG>")
+set(AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT "${AIDA_C03_DEVELOPER_ROOT}/generated")
+set(AIDA_C03_CUSTOMER_PACKAGE_ROOT "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}/$<CONFIG>")
 set(AIDA_C03_SAFE_HEADLESS_INVENTORY "${AIDA_C03_TEST_ROOT}/testlab_runtime/safe_headless_inventory.json")
 set(AIDA_C03_SAFE_HEADLESS_ASSERTION_INVENTORY "${AIDA_C03_TEST_ROOT}/testlab_runtime/assertion_site_inventory.json")
 set(AIDA_C03_SAFE_HEADLESS_MATERIALIZER "${AIDA_C03_TEST_ROOT}/testlab_runtime/materialize_safe_headless_manifest.py")
@@ -92,7 +106,6 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/analysis/readers/managed/managed_reader_contracts.cpp"
     "${STANDALONE_ROOT}/core/analysis/spill_provider.cpp"
     "${STANDALONE_ROOT}/core/analysis/subrange_provider.cpp"
-    "${STANDALONE_ROOT}/core/analysis/surface_reconciliation.cpp"
     "${STANDALONE_ROOT}/core/analysis/tile_decode_orchestrator.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/baseline_engine_integration.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/c03_analysis_contracts.cpp"
@@ -393,6 +406,7 @@ endforeach()
 list(REMOVE_DUPLICATES AIDA_C03_COMPILER_MATRIX_UNION)
 
 set(AIDA_C03_HARNESS_SUPPORT_SOURCES
+    "${STANDALONE_ROOT}/core/analysis/surface_reconciliation.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/elf_reader.cpp"
     "${STANDALONE_ROOT}/core/analysis/readers/pe_coff_reader.cpp"
     "${STANDALONE_ROOT}/core/analysis/workspace/advanced_cfg.cpp"
@@ -702,7 +716,7 @@ function(aida_c03_register_direct_test)
         add_dependencies(${_aida_TARGET} ${_aida_DEPENDS})
     endif()
     set_target_properties(${_aida_TARGET} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/c03-direct/$<CONFIG>"
+        RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/direct/$<CONFIG>"
         FOLDER "Tests/C03/SafeHeadless/Direct"
         AIDA_C03_PACKAGE "${_aida_PACKAGE}"
         AIDA_C03_SAFE_HEADLESS TRUE
@@ -752,7 +766,7 @@ function(aida_c03_register_worker_targets application_target)
     target_link_libraries(aida_c03_b14_native_decompiler_worker PRIVATE libdecomp_aida bcrypt advapi32 userenv ws2_32)
     set_target_properties(aida_c03_b14_native_decompiler_worker PROPERTIES
         OUTPUT_NAME "AiDA_NativeDecompilerWorker"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/c03-workers/$<CONFIG>"
+        RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/workers/$<CONFIG>"
         FOLDER "Workers/C03"
         AIDA_C03_PACKAGE "B14"
         AIDA_C03_SAFE_HEADLESS FALSE)
@@ -763,7 +777,7 @@ function(aida_c03_register_worker_targets application_target)
         "${AIDA_C03_MANAGED_WORKER_ROOT}/*.csproj"
         "${AIDA_C03_MANAGED_WORKER_ROOT}/NuGet.Config")
     aida_c03_require_sources("B16 managed decompiler worker" ${_aida_managed_inputs})
-    set(AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT "${CMAKE_BINARY_DIR}/c03-managed-worker/publish")
+    set(AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT "${AIDA_C03_DEVELOPER_ROOT}/managed-worker/publish")
     set(AIDA_C03_MANAGED_WORKER_EXECUTABLE "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}/AiDA_ManagedDecompilerWorker.exe")
     set(AIDA_C03_MANAGED_WORKER_PROVIDER "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}/ICSharpCode.Decompiler.dll")
     set(AIDA_C03_MANAGED_WORKER_RUNTIME_FILES
@@ -779,15 +793,15 @@ function(aida_c03_register_worker_targets application_target)
         ${_aida_managed_inputs})
     add_custom_target(aida_c03_b16_managed_decompiler_worker
         COMMAND ${CMAKE_COMMAND} -E rm -rf
-            "${CMAKE_BINARY_DIR}/c03-managed-worker/packages"
-            "${CMAKE_BINARY_DIR}/c03-managed-worker/cli-home"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-worker/packages"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-worker/cli-home"
             "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}"
         COMMAND ${CMAKE_COMMAND} -E make_directory
-            "${CMAKE_BINARY_DIR}/c03-managed-worker/packages"
-            "${CMAKE_BINARY_DIR}/c03-managed-worker/cli-home"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-worker/packages"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-worker/cli-home"
             "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}"
         COMMAND ${CMAKE_COMMAND} -E env
-            DOTNET_CLI_HOME=${CMAKE_BINARY_DIR}/c03-managed-worker/cli-home
+            DOTNET_CLI_HOME=${AIDA_C03_DEVELOPER_ROOT}/managed-worker/cli-home
             DOTNET_CLI_TELEMETRY_OPTOUT=1
             DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1
             DOTNET_NOLOGO=1
@@ -796,17 +810,17 @@ function(aida_c03_register_worker_targets application_target)
             DOTNET_ROOT=${_aida_c03_dotnet_root}
             DOTNET_ROLL_FORWARD=Disable
             NUGET_CERT_REVOCATION_MODE=offline
-            NUGET_PACKAGES=${CMAKE_BINARY_DIR}/c03-managed-worker/packages
+            NUGET_PACKAGES=${AIDA_C03_DEVELOPER_ROOT}/managed-worker/packages
             "${AIDA_C03_DOTNET_EXECUTABLE}" restore "${AIDA_C03_MANAGED_WORKER_PROJECT}"
             --configfile "${AIDA_C03_MANAGED_WORKER_NUGET_CONFIG}"
-            --packages "${CMAKE_BINARY_DIR}/c03-managed-worker/packages"
+            --packages "${AIDA_C03_DEVELOPER_ROOT}/managed-worker/packages"
             --locked-mode --no-cache --disable-parallel
             --runtime win-x64
             -p:AssemblyName=AiDA_ManagedDecompilerWorker
             -p:RuntimeFrameworkVersion=10.0.9
             -p:TargetLatestRuntimePatch=false
         COMMAND ${CMAKE_COMMAND} -E env
-            DOTNET_CLI_HOME=${CMAKE_BINARY_DIR}/c03-managed-worker/cli-home
+            DOTNET_CLI_HOME=${AIDA_C03_DEVELOPER_ROOT}/managed-worker/cli-home
             DOTNET_CLI_TELEMETRY_OPTOUT=1
             DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1
             DOTNET_NOLOGO=1
@@ -815,7 +829,7 @@ function(aida_c03_register_worker_targets application_target)
             DOTNET_ROOT=${_aida_c03_dotnet_root}
             DOTNET_ROLL_FORWARD=Disable
             NUGET_CERT_REVOCATION_MODE=offline
-            NUGET_PACKAGES=${CMAKE_BINARY_DIR}/c03-managed-worker/packages
+            NUGET_PACKAGES=${AIDA_C03_DEVELOPER_ROOT}/managed-worker/packages
             "${AIDA_C03_DOTNET_EXECUTABLE}" publish "${AIDA_C03_MANAGED_WORKER_PROJECT}"
             --configuration Release --framework net10.0 --runtime win-x64 --self-contained false --no-restore
             --output "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}"
@@ -849,19 +863,19 @@ function(aida_c03_register_worker_targets application_target)
         "${AIDA_C03_MANAGED_FIXTURE_ROOT}/*.csproj"
         "${AIDA_C03_MANAGED_FIXTURE_ROOT}/NuGet.Config")
     aida_c03_require_sources("A06 managed CLI fixture" ${_aida_c03_managed_fixture_inputs})
-    set(AIDA_C03_MANAGED_FIXTURE_PUBLISH_ROOT "${CMAKE_BINARY_DIR}/c03-managed-fixture/publish")
+    set(AIDA_C03_MANAGED_FIXTURE_PUBLISH_ROOT "${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/publish")
     set(AIDA_C03_MANAGED_FIXTURE_DLL "${AIDA_C03_MANAGED_FIXTURE_PUBLISH_ROOT}/ManagedCliFixtures.dll")
     add_custom_target(aida_c03_a06_managed_cli_fixture
         COMMAND ${CMAKE_COMMAND} -E rm -rf
-            "${CMAKE_BINARY_DIR}/c03-managed-fixture/packages"
-            "${CMAKE_BINARY_DIR}/c03-managed-fixture/cli-home"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/packages"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/cli-home"
             "${AIDA_C03_MANAGED_FIXTURE_PUBLISH_ROOT}"
         COMMAND ${CMAKE_COMMAND} -E make_directory
-            "${CMAKE_BINARY_DIR}/c03-managed-fixture/packages"
-            "${CMAKE_BINARY_DIR}/c03-managed-fixture/cli-home"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/packages"
+            "${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/cli-home"
             "${AIDA_C03_MANAGED_FIXTURE_PUBLISH_ROOT}"
         COMMAND ${CMAKE_COMMAND} -E env
-            DOTNET_CLI_HOME=${CMAKE_BINARY_DIR}/c03-managed-fixture/cli-home
+            DOTNET_CLI_HOME=${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/cli-home
             DOTNET_CLI_TELEMETRY_OPTOUT=1
             DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1
             DOTNET_NOLOGO=1
@@ -870,13 +884,13 @@ function(aida_c03_register_worker_targets application_target)
             DOTNET_ROOT=${_aida_c03_dotnet_root}
             DOTNET_ROLL_FORWARD=Disable
             NUGET_CERT_REVOCATION_MODE=offline
-            NUGET_PACKAGES=${CMAKE_BINARY_DIR}/c03-managed-fixture/packages
+            NUGET_PACKAGES=${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/packages
             "${AIDA_C03_DOTNET_EXECUTABLE}" restore "${AIDA_C03_MANAGED_FIXTURE_PROJECT}"
             --configfile "${AIDA_C03_MANAGED_FIXTURE_NUGET_CONFIG}"
-            --packages "${CMAKE_BINARY_DIR}/c03-managed-fixture/packages"
+            --packages "${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/packages"
             --locked-mode --no-cache --disable-parallel
         COMMAND ${CMAKE_COMMAND} -E env
-            DOTNET_CLI_HOME=${CMAKE_BINARY_DIR}/c03-managed-fixture/cli-home
+            DOTNET_CLI_HOME=${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/cli-home
             DOTNET_CLI_TELEMETRY_OPTOUT=1
             DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1
             DOTNET_NOLOGO=1
@@ -885,7 +899,7 @@ function(aida_c03_register_worker_targets application_target)
             DOTNET_ROOT=${_aida_c03_dotnet_root}
             DOTNET_ROLL_FORWARD=Disable
             NUGET_CERT_REVOCATION_MODE=offline
-            NUGET_PACKAGES=${CMAKE_BINARY_DIR}/c03-managed-fixture/packages
+            NUGET_PACKAGES=${AIDA_C03_DEVELOPER_ROOT}/managed-fixture/packages
             "${AIDA_C03_DOTNET_EXECUTABLE}" build "${AIDA_C03_MANAGED_FIXTURE_PROJECT}"
             --configuration Release --framework net10.0 --no-restore
             --output "${AIDA_C03_MANAGED_FIXTURE_PUBLISH_ROOT}"
@@ -922,7 +936,7 @@ function(aida_c03_register_worker_targets application_target)
     aida_c03_register_customer_notice_package(APPLICATION_TARGET ${application_target})
     aida_c03_register_auxiliary_notice_package(
         TARGET aida_c03_auxiliary_notice_package
-        OUTPUT_ROOT "${CMAKE_BINARY_DIR}/c03-auxiliary-notices")
+        OUTPUT_ROOT "${AIDA_C03_DEVELOPER_ROOT}/auxiliary-notices")
     set(_aida_c03_distribution_dependencies
         ${application_target}
         ${AIDA_C03_GHIDRA_SPEC_PACKAGE_TARGET}
@@ -933,66 +947,47 @@ function(aida_c03_register_worker_targets application_target)
         list(APPEND _aida_c03_distribution_dependencies
             ${AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_TARGET})
     endif()
-    if(NOT DEFINED ENV{TEMP} OR NOT IS_ABSOLUTE "$ENV{TEMP}")
-        message(FATAL_ERROR "AiDA C03 detached distribution evidence requires an absolute TEMP directory")
+    if(NOT DEFINED ENV{SystemDrive} OR NOT "$ENV{SystemDrive}" MATCHES "^[A-Z]:$" OR
+       NOT DEFINED ENV{SystemRoot} OR
+       NOT "$ENV{SystemRoot}" STREQUAL "$ENV{SystemDrive}\\Windows")
+        message(FATAL_ERROR "AiDA C03 distribution requires the canonical Windows system root")
     endif()
-    string(SHA256 _aida_c03_distribution_build_key "${CMAKE_BINARY_DIR}")
+    set(_aida_c03_distribution_system_root "$ENV{SystemDrive}/Windows")
+    aida_c03_validate_canonical_directory(
+        _aida_c03_distribution_system_root
+        "${_aida_c03_distribution_system_root}"
+        "distribution Windows system root")
+    aida_c03_validate_canonical_regular_file(
+        _aida_c03_distribution_powershell
+        _aida_c03_distribution_powershell_sha256
+        "${_aida_c03_distribution_system_root}/System32/WindowsPowerShell/v1.0/powershell.exe"
+        "distribution system PowerShell")
+    aida_c03_validate_no_reparse_chain(
+        "${_aida_c03_distribution_powershell}"
+        "${AIDA_C03_PATH_IDENTITY_POLICY}"
+        "${_aida_c03_distribution_powershell}"
+        "distribution system PowerShell")
     set(_aida_c03_distribution_output_root
-        "$ENV{TEMP}/aida-c03-distribution/${_aida_c03_distribution_build_key}")
+        "${CMAKE_BINARY_DIR}-c03-distribution-evidence")
     aida_c03_register_distribution_manifest(
         REQUIRE_ANALYSIS_PYTHON
         TARGET aida_c03_distribution_manifest
-        PACKAGE_ROOT "$<TARGET_FILE_DIR:${application_target}>"
+        APPLICATION_TARGET ${application_target}
+        APPLICATION_ROOT "${AIDA_C03_APPLICATION_BUILD_ROOT}"
+        SOURCE_ROOT "$<TARGET_FILE_DIR:${application_target}>"
+        DEVELOPER_ROOT "${AIDA_C03_DEVELOPER_ROOT}"
+        CUSTOMER_STAGE_ANCHOR "${AIDA_C03_CUSTOMER_STAGE_ANCHOR}"
+        PACKAGE_ROOT "${AIDA_C03_CUSTOMER_PACKAGE_ROOT}"
         SPEC "${AIDA_C03_DISTRIBUTION_MANIFEST_SPEC}"
         OUTPUT_MANIFEST "${_aida_c03_distribution_output_root}/AiDA_C03.distribution.json"
         OUTPUT_DIGEST "${_aida_c03_distribution_output_root}/AiDA_C03.distribution.sha256"
+        POWERSHELL_EXECUTABLE "${_aida_c03_distribution_powershell}"
         DEPENDS ${_aida_c03_distribution_dependencies})
     set(AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT "${AIDA_C03_MANAGED_WORKER_PUBLISH_ROOT}" PARENT_SCOPE)
     set(AIDA_C03_MANAGED_WORKER_EXECUTABLE "${AIDA_C03_MANAGED_WORKER_EXECUTABLE}" PARENT_SCOPE)
     set(AIDA_C03_MANAGED_WORKER_PROVIDER "${AIDA_C03_MANAGED_WORKER_PROVIDER}" PARENT_SCOPE)
     set(AIDA_C03_MANAGED_WORKER_RUNTIME_FILES "${AIDA_C03_MANAGED_WORKER_RUNTIME_FILES}" PARENT_SCOPE)
     set(AIDA_C03_MANAGED_FIXTURE_DLL "${AIDA_C03_MANAGED_FIXTURE_DLL}" PARENT_SCOPE)
-endfunction()
-
-function(aida_c03_validate_canonical_regular_file output_path output_sha256 input_path descriptor)
-    if("${input_path}" STREQUAL "" OR
-       NOT IS_ABSOLUTE "${input_path}" OR
-       NOT EXISTS "${input_path}" OR
-       IS_DIRECTORY "${input_path}" OR
-       IS_SYMLINK "${input_path}")
-        message(FATAL_ERROR "AiDA C03 ${descriptor} must be an absolute non-reparse regular file: ${input_path}")
-    endif()
-    cmake_path(SET _aida_candidate NORMALIZE "${input_path}")
-    get_filename_component(_aida_real_path "${_aida_candidate}" REALPATH)
-    cmake_path(SET _aida_real_candidate NORMALIZE "${_aida_real_path}")
-    string(TOLOWER "${_aida_candidate}" _aida_candidate_comparison)
-    string(TOLOWER "${_aida_real_candidate}" _aida_real_comparison)
-    if(NOT _aida_candidate_comparison STREQUAL _aida_real_comparison)
-        message(FATAL_ERROR "AiDA C03 ${descriptor} must resolve without a reparse or noncanonical path transition: ${input_path}")
-    endif()
-    file(SHA256 "${_aida_real_candidate}" _aida_sha256)
-    string(TOUPPER "${_aida_sha256}" _aida_sha256)
-    set(${output_path} "${_aida_real_candidate}" PARENT_SCOPE)
-    set(${output_sha256} "${_aida_sha256}" PARENT_SCOPE)
-endfunction()
-
-function(aida_c03_validate_canonical_directory output_path input_path descriptor)
-    if("${input_path}" STREQUAL "" OR
-       NOT IS_ABSOLUTE "${input_path}" OR
-       NOT EXISTS "${input_path}" OR
-       NOT IS_DIRECTORY "${input_path}" OR
-       IS_SYMLINK "${input_path}")
-        message(FATAL_ERROR "AiDA C03 ${descriptor} must be an absolute non-reparse directory: ${input_path}")
-    endif()
-    cmake_path(SET _aida_candidate NORMALIZE "${input_path}")
-    get_filename_component(_aida_real_path "${_aida_candidate}" REALPATH)
-    cmake_path(SET _aida_real_candidate NORMALIZE "${_aida_real_path}")
-    string(TOLOWER "${_aida_candidate}" _aida_candidate_comparison)
-    string(TOLOWER "${_aida_real_candidate}" _aida_real_comparison)
-    if(NOT _aida_candidate_comparison STREQUAL _aida_real_comparison)
-        message(FATAL_ERROR "AiDA C03 ${descriptor} must resolve without a reparse or noncanonical path transition: ${input_path}")
-    endif()
-    set(${output_path} "${_aida_real_candidate}" PARENT_SCOPE)
 endfunction()
 
 function(aida_c03_register_safe_headless_targets application_target)
@@ -1010,12 +1005,15 @@ function(aida_c03_register_safe_headless_targets application_target)
         _aida_python_sha256
         "${Python3_EXECUTABLE}"
         "Python interpreter")
-    if(NOT DEFINED ENV{SystemRoot} OR "$ENV{SystemRoot}" STREQUAL "")
+    if(NOT DEFINED ENV{SystemDrive} OR NOT "$ENV{SystemDrive}" MATCHES "^[A-Z]:$" OR
+       NOT DEFINED ENV{SystemRoot} OR
+       NOT "$ENV{SystemRoot}" STREQUAL "$ENV{SystemDrive}\\Windows")
         message(FATAL_ERROR "AiDA C03 authority reproduction requires the canonical Windows system root")
     endif()
+    set(_aida_system_root_input "$ENV{SystemDrive}/Windows")
     aida_c03_validate_canonical_directory(
         _aida_system_root
-        "$ENV{SystemRoot}"
+        "${_aida_system_root_input}"
         "Windows system root")
     aida_c03_validate_canonical_regular_file(
         _aida_system_powershell
@@ -1032,6 +1030,8 @@ function(aida_c03_register_safe_headless_targets application_target)
         message(FATAL_ERROR "AiDA C03 pinned ida-pro-mcp archive SHA-256 is invalid")
     endif()
     set(_aida_authority_repository_files
+        "${AIDA_C03_PATH_POLICY_MODULE}"
+        "${AIDA_C03_PATH_IDENTITY_POLICY}"
         "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py"
         "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json"
         "${CMAKE_SOURCE_DIR}/tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py"
@@ -1044,6 +1044,18 @@ function(aida_c03_register_safe_headless_targets application_target)
         "${CMAKE_SOURCE_DIR}/src/standalone/src/core/mcp/compat/ida_contracts_generated.hpp"
         "${CMAKE_SOURCE_DIR}/src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp")
     aida_c03_require_sources("authority and surface reproduction" ${_aida_authority_repository_files})
+    foreach(_aida_authority_path IN ITEMS
+            "${_aida_system_root}"
+            "${_aida_system_powershell}"
+            "${_aida_python_executable}"
+            "${_aida_authority_archive}"
+            ${_aida_authority_repository_files})
+        aida_c03_validate_no_reparse_chain(
+            "${_aida_system_powershell}"
+            "${AIDA_C03_PATH_IDENTITY_POLICY}"
+            "${_aida_authority_path}"
+            "authority path")
+    endforeach()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         ${_aida_authority_repository_files}
         "${_aida_python_executable}"
@@ -1450,6 +1462,9 @@ function(aida_c03_register_safe_headless_targets application_target)
         "src/standalone/src/main.cpp"
         "deploy_to_server.ps1"
         "src/standalone/src/core/auth/auth_browser_launch.hpp"
+        "packaging/c03_distribution_manifest.ps1"
+        "src/standalone/src/core/analysis/build_worker_packaging_integration.cpp"
+        "src/standalone/tests/c03/build_packaging_integration_harness.cpp"
         "src/standalone/src/core/testlab/test_lab_features_c03_safe_headless.cpp"
         "src/standalone/tests/c03/testlab_runtime/materialize_safe_headless_manifest.py"
         "cmake/aida_c03_safe_headless_manifest.cmake"
@@ -1582,7 +1597,7 @@ function(aida_c03_register_safe_headless_targets application_target)
     add_custom_command(OUTPUT "${AIDA_C03_SAFE_HEADLESS_MANIFEST}" "${AIDA_C03_SAFE_HEADLESS_DIGEST}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}/scratch"
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_SAFE_HEADLESS_MATERIALIZER}"
+        COMMAND "${_aida_python_executable}" "${AIDA_C03_SAFE_HEADLESS_MATERIALIZER}"
             --inventory "${AIDA_C03_SAFE_HEADLESS_INVENTORY}"
             --target-records "${AIDA_C03_SAFE_HEADLESS_RECORDS}"
             --policy-cases "${AIDA_C03_SAFE_HEADLESS_RESOURCE_POLICY_CASES}"
@@ -1618,7 +1633,8 @@ function(aida_c03_register_safe_headless_targets application_target)
     set_target_properties(aida_c03_safe_headless_manifest PROPERTIES
         FOLDER "Tests/C03/SafeHeadless"
         AIDA_C03_SAFE_HEADLESS TRUE
-        AIDA_C03_PACKAGE_OUTPUTS "c03-safe-headless/manifest.json;c03-safe-headless/manifest.sha256"
+        AIDA_C03_DEVELOPER_ONLY TRUE
+        AIDA_C03_DEVELOPER_SUITE_OUTPUTS "c03-safe-headless/manifest.json;c03-safe-headless/manifest.sha256"
         AIDA_C03_ASSERTION_INVENTORY_SHA256 "${_aida_assertion_inventory_identity}"
         AIDA_C03_AUTHORITY_SURFACE_IDENTITY "${_aida_authority_identity}"
         AIDA_C03_AUTHORITY_LEDGER_SHA256 "${_aida_authority_ledger_sha256}"
@@ -1636,13 +1652,8 @@ function(aida_c03_register_safe_headless_targets application_target)
         LABELS "c03;c03_safe_headless;safe-headless;manifest")
 
     add_custom_target(aida_c03_safe_headless_application_package
-        COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:${application_target}>/c03-safe-headless"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${application_target}>/c03-safe-headless"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"
-            "$<TARGET_FILE_DIR:${application_target}>/c03-safe-headless"
         DEPENDS aida_c03_safe_headless_manifest
-        COMMENT "Staging the canonical C03 safe-headless suite beside ${application_target}"
+        COMMENT "Binding the detached C03 safe-headless manifest identity to ${application_target}"
         VERBATIM)
     set_target_properties(aida_c03_safe_headless_application_package PROPERTIES
         FOLDER "Packaging/C03"
@@ -1651,6 +1662,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         AIDA_C03_PYTHON_SHA256 "${_aida_python_sha256}"
         AIDA_C03_POWERSHELL_SHA256 "${_aida_system_powershell_sha256}"
         AIDA_C03_MCP_ARCHIVE_SHA256 "${_aida_authority_archive_sha256}"
+        AIDA_C03_CUSTOMER_PAYLOAD_FORBIDDEN TRUE
         LABELS "c03;c03_safe_headless;safe-headless;package")
     add_dependencies(${application_target} aida_c03_safe_headless_application_package)
     target_include_directories(${application_target} PRIVATE "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}")
@@ -1671,7 +1683,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         aida_c03_safe_headless_runtime bcrypt advapi32 userenv)
     add_dependencies(aida_c03_safe_headless_manifest_suite aida_c03_safe_headless_manifest)
     set_target_properties(aida_c03_safe_headless_manifest_suite PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/c03-direct/$<CONFIG>"
+        RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/direct/$<CONFIG>"
         FOLDER "Tests/C03/SafeHeadless/Direct"
         AIDA_C03_SAFE_HEADLESS TRUE
         LABELS "c03;c03_safe_headless;safe-headless;manifest-suite")
@@ -1688,7 +1700,7 @@ function(aida_c03_register_safe_headless_targets application_target)
     aida_c03_configure_native_target(aida_c03_testlab_fake_safe_headless_adapter)
     set_target_properties(aida_c03_testlab_fake_safe_headless_adapter PROPERTIES
         OUTPUT_NAME "aida_c03_testlab_fake_safe_headless_adapter"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/c03-direct/$<CONFIG>"
+        RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/direct/$<CONFIG>"
         FOLDER "Tests/C03/SafeHeadless/Support"
         AIDA_C03_SAFE_HEADLESS TRUE)
     add_executable(aida_c03_b14_fake_native_decompiler_worker
@@ -1699,7 +1711,7 @@ function(aida_c03_register_safe_headless_targets application_target)
     target_link_libraries(aida_c03_b14_fake_native_decompiler_worker PRIVATE bcrypt advapi32 ws2_32)
     set_target_properties(aida_c03_b14_fake_native_decompiler_worker PROPERTIES
         OUTPUT_NAME "fake_native_decompiler_worker"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/c03-direct/$<CONFIG>"
+        RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/direct/$<CONFIG>"
         FOLDER "Tests/C03/SafeHeadless/Support"
         AIDA_C03_SAFE_HEADLESS TRUE)
     add_executable(aida_c03_b24_fake_analysis_python_worker
@@ -1710,7 +1722,7 @@ function(aida_c03_register_safe_headless_targets application_target)
     target_link_libraries(aida_c03_b24_fake_analysis_python_worker PRIVATE bcrypt advapi32 ws2_32)
     set_target_properties(aida_c03_b24_fake_analysis_python_worker PROPERTIES
         OUTPUT_NAME "fake_analysis_python_worker"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/c03-direct/$<CONFIG>"
+        RUNTIME_OUTPUT_DIRECTORY "${AIDA_C03_DEVELOPER_ROOT}/direct/$<CONFIG>"
         FOLDER "Tests/C03/SafeHeadless/Support"
         AIDA_C03_SAFE_HEADLESS TRUE)
     set_property(GLOBAL APPEND PROPERTY AIDA_C03_COMPILER_MATRIX_HARNESS_INPUTS
@@ -1733,7 +1745,7 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
         ARGUMENTS
             "$<TARGET_FILE:aida_c03_testlab_fake_safe_headless_adapter>"
-            "${CMAKE_BINARY_DIR}/c03-direct/testlab-scratch"
+            "${AIDA_C03_DEVELOPER_ROOT}/scratch/testlab"
         INCLUDE_DIRECTORIES "${imgui_SOURCE_DIR}"
         COMPILE_DEFINITIONS AIDA_C03_SAFE_HEADLESS_MANIFEST_SHA256=\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"
         LINK_LIBRARIES bcrypt advapi32 userenv
@@ -1743,7 +1755,7 @@ function(aida_c03_register_safe_headless_targets application_target)
         SOURCES "${AIDA_C03_TEST_ROOT}/native_worker_protocol_harness.cpp"
         ARGUMENTS
             "$<TARGET_FILE:aida_c03_b14_fake_native_decompiler_worker>"
-            "${CMAKE_BINARY_DIR}/c03-direct/native-worker-scratch"
+            "${AIDA_C03_DEVELOPER_ROOT}/scratch/native-worker"
         LINK_LIBRARIES bcrypt advapi32 userenv ws2_32
         DEPENDS aida_c03_b14_fake_native_decompiler_worker)
     aida_c03_register_direct_test(
@@ -1783,7 +1795,7 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS
             "${CMAKE_SOURCE_DIR}"
-            "${CMAKE_BINARY_DIR}/c03-direct/materialized-fixtures")
+            "${AIDA_C03_DEVELOPER_ROOT}/fixtures/materialized")
     set_tests_properties(aida_c03_fixture_materializer_direct PROPERTIES
         FIXTURES_SETUP aida_c03_materialized_corpus)
 
@@ -1808,7 +1820,7 @@ function(aida_c03_register_safe_headless_targets application_target)
             "${AIDA_C03_TEST_ROOT}/evidence_hash.cpp"
         ARGUMENTS
             "deterministic_component"
-            "${CMAKE_BINARY_DIR}/c03-direct/materialized-fixtures/first/pe32plus-x64.exe"
+            "${AIDA_C03_DEVELOPER_ROOT}/fixtures/materialized/first/pe32plus-x64.exe"
         LINK_LIBRARIES bcrypt)
     set_tests_properties(aida_c03_analysis_benchmark_harness PROPERTIES
         FIXTURES_REQUIRED aida_c03_materialized_corpus)
@@ -1823,8 +1835,8 @@ function(aida_c03_register_safe_headless_targets application_target)
         SOURCES ${_aida_managed_consumer_sources}
         ARGUMENTS
             "--cli-fixture" "${AIDA_C03_MANAGED_FIXTURE_DLL}"
-            "--class-fixture" "${CMAKE_BINARY_DIR}/c03-direct/materialized-fixtures/first/classfile-jvm.class"
-            "--dex-fixture" "${CMAKE_BINARY_DIR}/c03-direct/materialized-fixtures/first/dex-dalvik.dex"
+            "--class-fixture" "${AIDA_C03_DEVELOPER_ROOT}/fixtures/materialized/first/classfile-jvm.class"
+            "--dex-fixture" "${AIDA_C03_DEVELOPER_ROOT}/fixtures/materialized/first/dex-dalvik.dex"
         LINK_LIBRARIES
             bcrypt
         DEPENDS aida_c03_a06_managed_cli_fixture)
@@ -1836,7 +1848,7 @@ function(aida_c03_register_safe_headless_targets application_target)
     endif()
 
     add_test(NAME aida_c03_authority_surface_reproduction
-        COMMAND "${Python3_EXECUTABLE}"
+        COMMAND "${_aida_python_executable}"
             "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py"
             --repository-root "${CMAKE_SOURCE_DIR}"
             --ledger "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json"

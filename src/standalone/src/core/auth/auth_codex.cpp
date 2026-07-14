@@ -9,7 +9,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <shellapi.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
 
@@ -20,19 +19,17 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "Ws2_32.lib")
-#pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Crypt32.lib")
 
 namespace aida {
@@ -64,10 +61,26 @@ namespace codex {
 		}
 
 		struct listener_t {
-			SOCKET sock = INVALID_SOCKET;
+			std::atomic<SOCKET> sock{ INVALID_SOCKET };
+			std::atomic<SOCKET> active_client{ INVALID_SOCKET };
 			std::atomic<bool> worker_done{ true };
 			std::atomic<bool> stop{ false };
 		};
+
+		void close_active_client(const std::shared_ptr<listener_t>& ctx, SOCKET client) noexcept
+		{
+			if (!ctx || client == INVALID_SOCKET) return;
+			SOCKET expected = client;
+			if (ctx->active_client.compare_exchange_strong(expected, INVALID_SOCKET,
+				std::memory_order_acq_rel, std::memory_order_acquire)) closesocket(client);
+		}
+
+		void close_listener_socket(const std::shared_ptr<listener_t>& ctx) noexcept
+		{
+			if (!ctx) return;
+			const SOCKET socket_value = ctx->sock.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+			if (socket_value != INVALID_SOCKET) closesocket(socket_value);
+		}
 
 		const char kVerifierCharset[] =
 			"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
@@ -324,7 +337,8 @@ namespace codex {
 		{
 			while (!ctx->stop.load() && !state->cancelled.load()) {
 				WSAPOLLFD pfd{};
-				pfd.fd = ctx->sock;
+				pfd.fd = ctx->sock.load(std::memory_order_acquire);
+				if (pfd.fd == INVALID_SOCKET) return;
 				pfd.events = POLLIN;
 				int rc = WSAPoll(&pfd, 1, 250);
 				if (rc <= 0)
@@ -332,9 +346,10 @@ namespace codex {
 
 				sockaddr_storage cli{};
 				int cli_len = sizeof(cli);
-				SOCKET client = accept(ctx->sock, reinterpret_cast<sockaddr*>(&cli), &cli_len);
+				SOCKET client = accept(pfd.fd, reinterpret_cast<sockaddr*>(&cli), &cli_len);
 				if (client == INVALID_SOCKET)
 					continue;
+				ctx->active_client.store(client, std::memory_order_release);
 
 				DWORD tv = 5000;
 				setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
@@ -360,7 +375,7 @@ namespace codex {
 					: raw.find(' ', first_space + 1);
 				if (first_space == std::string::npos || second_space == std::string::npos) {
 					send_response(client, 400, failure_html("malformed request"));
-					closesocket(client);
+					close_active_client(ctx, client);
 					continue;
 				}
 
@@ -368,7 +383,7 @@ namespace codex {
 
 				if (target.rfind("/auth/callback", 0) != 0) {
 					send_response(client, 404, failure_html("not found"));
-					closesocket(client);
+					close_active_client(ctx, client);
 					continue;
 				}
 
@@ -383,9 +398,12 @@ namespace codex {
 					const auto desc_it = params.find("error_description");
 					if (desc_it != params.end())
 						detail += ": " + desc_it->second;
-					state->error = detail;
+					{
+						std::lock_guard<std::mutex> lock(state->mutex);
+						state->error = detail;
+					}
 					send_response(client, 200, failure_html(detail));
-					closesocket(client);
+					close_active_client(ctx, client);
 					state->done.store(true);
 					return;
 				}
@@ -393,58 +411,74 @@ namespace codex {
 				const auto code_it = params.find("code");
 				const auto state_it = params.find("state");
 				if (code_it == params.end() || state_it == params.end()) {
-					state->error = "missing code or state";
+					{
+						std::lock_guard<std::mutex> lock(state->mutex);
+						state->error = "missing code or state";
+					}
 					send_response(client, 400, failure_html("missing code or state"));
-					closesocket(client);
+					close_active_client(ctx, client);
 					state->done.store(true);
 					return;
 				}
 
-				if (state_it->second != state->state) {
-					state->error = "state mismatch (csrf)";
+				std::string expected_state;
+				{
+					std::lock_guard<std::mutex> lock(state->mutex);
+					expected_state = state->state;
+				}
+				if (state_it->second != expected_state) {
+					{
+						std::lock_guard<std::mutex> lock(state->mutex);
+						state->error = "state mismatch (csrf)";
+					}
 					send_response(client, 400, failure_html("state mismatch"));
-					closesocket(client);
+					close_active_client(ctx, client);
 					state->done.store(true);
 					return;
 				}
 
-				state->received_code = code_it->second;
-				state->received_state = state_it->second;
+				{
+					std::lock_guard<std::mutex> lock(state->mutex);
+					state->received_code = code_it->second;
+					state->received_state = state_it->second;
+				}
 				send_response(client, 200, success_html());
-				closesocket(client);
+				close_active_client(ctx, client);
 				state->done.store(true);
 				return;
 			}
 		}
 
-		std::mutex& listener_mutex()
-		{
-			static std::mutex m;
-			return m;
-		}
-
 		void stop_listener(codex_login_state_t& state)
 		{
-			std::shared_ptr<listener_t>* raw_holder = nullptr;
+			std::shared_ptr<listener_t> ctx;
 			{
-				std::lock_guard<std::mutex> lk(listener_mutex());
+				std::lock_guard<std::mutex> lk(state.mutex);
 				if (!state.listener_handle)
 					return;
-				raw_holder = static_cast<std::shared_ptr<listener_t>*>(state.listener_handle);
-				state.listener_handle = nullptr;
+				ctx = std::static_pointer_cast<listener_t>(state.listener_handle);
+				state.listener_handle.reset();
 			}
-			std::unique_ptr<std::shared_ptr<listener_t>> holder(raw_holder);
-			(*holder)->stop.store(true);
-			if ((*holder)->sock != INVALID_SOCKET) {
-				closesocket((*holder)->sock);
-				(*holder)->sock = INVALID_SOCKET;
-			}
-			while (!(*holder)->worker_done.load(std::memory_order_acquire))
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			ctx->stop.store(true, std::memory_order_release);
+			close_listener_socket(ctx);
+			const SOCKET client = ctx->active_client.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+			if (client != INVALID_SOCKET) closesocket(client);
+			if (!ctx->worker_done.load(std::memory_order_acquire))
+				anti_tamper::webhook::write_log("auth.codex",
+					"[aida.auth.codex] listener task retained until socket-close cancellation completes");
 		}
 
 		bool start_listener_locked(codex_login_state_t& state)
 		{
+			std::shared_ptr<codex_login_state_t> state_owner;
+			try {
+				state_owner = state.shared_from_this();
+			} catch (...) {
+			}
+			if (!state_owner) {
+				set_last_error("login state requires shared ownership");
+				return false;
+			}
 			if (!ensure_winsock()) {
 				set_last_error("winsock init failed");
 				return false;
@@ -455,6 +489,16 @@ namespace codex {
 				set_last_error("socket() failed wsa=" + std::to_string(WSAGetLastError()));
 				return false;
 			}
+			struct socket_owner_t {
+				SOCKET value = INVALID_SOCKET;
+				~socket_owner_t() noexcept { if (value != INVALID_SOCKET) closesocket(value); }
+				SOCKET release() noexcept
+				{
+					const SOCKET result = value;
+					value = INVALID_SOCKET;
+					return result;
+				}
+			} socket_owner{s};
 
 			BOOL yes = TRUE;
 			setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
@@ -462,46 +506,101 @@ namespace codex {
 
 			sockaddr_in addr{};
 			addr.sin_family = AF_INET;
-			addr.sin_port = htons(static_cast<u_short>(state.port));
+			int port = CODEX_OAUTH_PORT;
+			{
+				std::lock_guard<std::mutex> lock(state.mutex);
+				port = state.port;
+			}
+			addr.sin_port = htons(static_cast<u_short>(port));
 			addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
 			if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
 				const int wsa = WSAGetLastError();
-				closesocket(s);
-				set_last_error("bind 127.0.0.1:" + std::to_string(state.port)
+				set_last_error("bind 127.0.0.1:" + std::to_string(port)
 					+ " failed wsa=" + std::to_string(wsa));
 				return false;
 			}
 
 			if (listen(s, 4) == SOCKET_ERROR) {
 				const int wsa = WSAGetLastError();
-				closesocket(s);
 				set_last_error("listen failed wsa=" + std::to_string(wsa));
 				return false;
 			}
 
 			auto ctx = std::make_shared<listener_t>();
-			ctx->sock = s;
-			auto holder = std::make_unique<std::shared_ptr<listener_t>>(ctx);
-
-			state.listener_handle = holder.release();
+			ctx->sock.store(socket_owner.release(), std::memory_order_release);
 			ctx->worker_done.store(false, std::memory_order_release);
-			codex_login_state_t* state_ptr = &state;
-			aida::infra::executor::submission_t sub;
-			sub.owner_subsystem = "auth_provider";
-			sub.label = "auth.codex.listener";
-			sub.thread_class = "service_loop";
-			sub.domain = aida::infra::executor::domain_t::security_liveness;
-			sub.priority = 1;
-			sub.body = [state_ptr, ctx]() {
-					listener_thread(state_ptr, ctx);
-					ctx->worker_done.store(true, std::memory_order_release);
+			aida::infra::executor::submit_result_t submitted;
+			try {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "auth_provider";
+				sub.label = "auth.codex.listener";
+				sub.thread_class = "service_loop";
+				sub.domain = aida::infra::executor::domain_t::security_liveness;
+				sub.priority = 1;
+				sub.shutdown_policy = "cancel_pending";
+				sub.cancel_hook = [ctx]() noexcept {
+					ctx->stop.store(true, std::memory_order_release);
+					close_listener_socket(ctx);
+					const SOCKET client = ctx->active_client.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+					if (client != INVALID_SOCKET) closesocket(client);
 				};
-			if (!aida::infra::executor::submit(std::move(sub)).submitted)
-			{
+				sub.body = [state_owner, ctx]() noexcept {
+					struct terminal_t {
+						std::shared_ptr<listener_t> value;
+						~terminal_t() noexcept { value->worker_done.store(true, std::memory_order_release); }
+					} terminal{ctx};
+					const char* failure = nullptr;
+					try {
+						const std::function<void()> guarded = [state_owner, ctx]() { listener_thread(state_owner.get(), ctx); };
+						if (aida::infra::win_thread::run_function_seh_guarded(guarded) != 0)
+							failure = "listener terminated after structured exception";
+					} catch (...) {
+						failure = "listener terminated after exception";
+					}
+					if (!failure && !state_owner->done.load(std::memory_order_acquire)
+						&& !state_owner->cancelled.load(std::memory_order_acquire)
+						&& !ctx->stop.load(std::memory_order_acquire))
+						failure = "listener exited before callback";
+					if (failure && !state_owner->cancelled.load(std::memory_order_acquire)
+						&& !ctx->stop.load(std::memory_order_acquire)) {
+						ctx->stop.store(true, std::memory_order_release);
+						close_listener_socket(ctx);
+						const SOCKET client = ctx->active_client.exchange(INVALID_SOCKET,
+							std::memory_order_acq_rel);
+						if (client != INVALID_SOCKET) closesocket(client);
+						try {
+							std::lock_guard<std::mutex> lock(state_owner->mutex);
+							state_owner->error = failure;
+						} catch (...) {
+						}
+						state_owner->done.store(true, std::memory_order_release);
+						try { set_last_error(failure); } catch (...) {}
+					}
+				};
+				submitted = aida::infra::executor::submit(std::move(sub));
+			} catch (...) {
 				ctx->worker_done.store(true, std::memory_order_release);
+				close_listener_socket(ctx);
+				try { set_last_error("listener submission exception"); } catch (...) {}
 				return false;
 			}
+			if (!submitted.submitted) {
+				ctx->worker_done.store(true, std::memory_order_release);
+				close_listener_socket(ctx);
+				try { set_last_error("listener submission rejected"); } catch (...) {}
+				return false;
+			}
+			try {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				state.listener_handle = ctx;
+			} catch (...) {
+				try { aida::infra::executor::cancel(submitted.task_id); } catch (...) {}
+				try { set_last_error("listener ownership publication failed"); } catch (...) {}
+				return false;
+			}
+			if (state.cancelled.load(std::memory_order_acquire))
+				stop_listener(state);
 			return true;
 		}
 
@@ -601,19 +700,21 @@ namespace codex {
 
 		bool exchange_code(codex_login_state_t& state)
 		{
+			const codex_login_snapshot_t current = snapshot(state);
 			const std::string client_id = load_custom_client_id();
-			const std::string redirect_uri = load_redirect_uri(state.port);
+			const std::string redirect_uri = load_redirect_uri(current.port);
 
 			std::string body = "grant_type=authorization_code";
-			body += "&code=" + url_encode(state.received_code);
+			body += "&code=" + url_encode(current.received_code);
 			body += "&redirect_uri=" + url_encode(redirect_uri);
 			body += "&client_id=" + url_encode(client_id);
-			body += "&code_verifier=" + url_encode(state.verifier);
+			body += "&code_verifier=" + url_encode(current.verifier);
 
 			nlohmann::json resp;
 			std::string err;
 			if (!token_post(body, resp, err)) {
 				set_last_error(err);
+				std::lock_guard<std::mutex> lock(state.mutex);
 				state.error = err;
 				return false;
 			}
@@ -625,6 +726,7 @@ namespace codex {
 
 			if (access.empty() || refresh.empty()) {
 				set_last_error("token response missing access/refresh");
+				std::lock_guard<std::mutex> lock(state.mutex);
 				state.error = "token response missing access/refresh";
 				return false;
 			}
@@ -661,6 +763,7 @@ namespace codex {
 
 			if (!store::set("openai", info)) {
 				set_last_error("store::set openai failed: " + store::last_error());
+				std::lock_guard<std::mutex> lock(state.mutex);
 				state.error = "store::set openai failed";
 				return false;
 			}
@@ -670,41 +773,64 @@ namespace codex {
 
 	}
 
-	bool start_login(codex_login_state_t& state)
+	bool start_login(codex_login_state_t& state, std::uint64_t absolute_deadline_ms)
 	{
 		state.done.store(false);
-		state.cancelled.store(false);
-		state.error.clear();
-		state.received_code.clear();
-		state.received_state.clear();
-		state.port = CODEX_OAUTH_PORT;
-		state.started_unix = static_cast<int64_t>(std::time(nullptr));
-
-		state.verifier = generate_verifier();
-		if (state.verifier.empty()) {
+		if (state.cancelled.load(std::memory_order_acquire)) {
+			set_last_error("login cancelled before start");
+			return false;
+		}
+		const std::string verifier = generate_verifier();
+		if (verifier.empty()) {
 			set_last_error("verifier generation failed");
 			return false;
 		}
-		state.challenge = sha256_base64url(state.verifier);
-		if (state.challenge.empty()) {
+		const std::string challenge = sha256_base64url(verifier);
+		if (challenge.empty()) {
 			set_last_error("challenge sha256 failed");
 			return false;
 		}
-		state.state = generate_state_token();
-		if (state.state.empty()) {
+		const std::string state_token = generate_state_token();
+		if (state_token.empty()) {
 			set_last_error("state token generation failed");
 			return false;
+		}
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.error.clear();
+			state.received_code.clear();
+			state.received_state.clear();
+			state.port = CODEX_OAUTH_PORT;
+			state.started_unix = static_cast<int64_t>(std::time(nullptr));
+			state.verifier = verifier;
+			state.challenge = challenge;
+			state.state = state_token;
+			state.auth_url.clear();
 		}
 
 		if (!start_listener_locked(state))
 			return false;
+		if (state.cancelled.load(std::memory_order_acquire)) {
+			stop_listener(state);
+			set_last_error("login cancelled during start");
+			return false;
+		}
 
 		const std::string client_id = load_custom_client_id();
-		const std::string redirect_uri = load_redirect_uri(state.port);
-		state.auth_url = build_authorize_url(redirect_uri, state.challenge,
-			state.state, client_id);
+		const std::string redirect_uri = load_redirect_uri(CODEX_OAUTH_PORT);
+		const std::string auth_url = build_authorize_url(redirect_uri, challenge,
+			state_token, client_id);
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.auth_url = auth_url;
+		}
+		if (state.cancelled.load(std::memory_order_acquire)) {
+			stop_listener(state);
+			set_last_error("login cancelled before browser navigation");
+			return false;
+		}
 
-		if (!aida::auth::open_url_external(state.auth_url))
+		if (!aida::auth::open_url_external_until(auth_url, absolute_deadline_ms))
 			anti_tamper::webhook::write_log("auth.codex",
 				"[aida.auth.codex] open browser failed; user must open auth_url manually");
 
@@ -720,11 +846,15 @@ namespace codex {
 		}
 
 		const int64_t now = static_cast<int64_t>(std::time(nullptr));
-		if (state.started_unix != 0
-			&& now - state.started_unix > OAUTH_TIMEOUT_SECONDS
+		codex_login_snapshot_t current = snapshot(state);
+		if (current.started_unix != 0
+			&& now - current.started_unix > OAUTH_TIMEOUT_SECONDS
 			&& !state.done.load()) {
-			state.error = "login timed out";
-			set_last_error(state.error);
+			{
+				std::lock_guard<std::mutex> lock(state.mutex);
+				state.error = "login timed out";
+			}
+			set_last_error("login timed out");
 			stop_listener(state);
 			return false;
 		}
@@ -733,14 +863,18 @@ namespace codex {
 			return false;
 
 		stop_listener(state);
+		current = snapshot(state);
 
-		if (!state.error.empty()) {
-			set_last_error(state.error);
+		if (!current.error.empty()) {
+			set_last_error(current.error);
 			return false;
 		}
-		if (state.received_code.empty()) {
-			state.error = "callback completed without code";
-			set_last_error(state.error);
+		if (current.received_code.empty()) {
+			{
+				std::lock_guard<std::mutex> lock(state.mutex);
+				state.error = "callback completed without code";
+			}
+			set_last_error("callback completed without code");
 			return false;
 		}
 		return exchange_code(state);
@@ -881,7 +1015,26 @@ namespace codex {
 		return revoke_tokens(info.access, info.refresh, info.custom_client_id);
 	}
 
-	const std::string& last_error()
+	codex_login_snapshot_t snapshot(const codex_login_state_t& state)
+	{
+		codex_login_snapshot_t value;
+		std::lock_guard<std::mutex> lock(state.mutex);
+		value.verifier = state.verifier;
+		value.challenge = state.challenge;
+		value.state = state.state;
+		value.auth_url = state.auth_url;
+		value.port = state.port;
+		value.done = state.done.load(std::memory_order_acquire);
+		value.cancelled = state.cancelled.load(std::memory_order_acquire);
+		value.received_code = state.received_code;
+		value.received_state = state.received_state;
+		value.error = state.error;
+		value.listener_active = static_cast<bool>(state.listener_handle);
+		value.started_unix = state.started_unix;
+		return value;
+	}
+
+	std::string last_error()
 	{
 		std::lock_guard<std::mutex> lk(mtx());
 		return last_error_ref();

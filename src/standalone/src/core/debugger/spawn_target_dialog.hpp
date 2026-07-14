@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <utility>
 
 #include "imgui/imgui.h"
 #include "../ui/components.hpp"
@@ -401,7 +402,11 @@ inline void open_url(const wchar_t* url) {
 	std::string utf8(static_cast<size_t>(len), '\0');
 	WideCharToMultiByte(CP_UTF8, 0, url, -1, utf8.data(), len, nullptr, nullptr);
 	if (!utf8.empty() && utf8.back() == '\0') utf8.pop_back();
-	aida::auth::open_url_external(utf8);
+	const auto submitted = aida::auth::submit_open_url_external(std::move(utf8));
+	if (!submitted.submitted) {
+		toast_notification::push("Camoufox could not queue the requested page",
+			toast_notification::toast_type_t::error, 5.0f);
+	}
 }
 
 inline bool prepare_launch_result(bool host_mode) {

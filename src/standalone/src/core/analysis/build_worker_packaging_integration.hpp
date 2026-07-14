@@ -43,6 +43,16 @@ enum class build_worker_error_code_t : std::uint8_t {
     source_authority_invalid,
     online_fetch_marker,
     package_policy_violation,
+    named_stream_forbidden,
+    resource_file_limit,
+    resource_directory_limit,
+    resource_entry_limit,
+    resource_depth_limit,
+    resource_path_limit,
+    resource_file_bytes_limit,
+    resource_total_bytes_limit,
+    resource_stream_limit,
+    directory_cycle,
     required_external_artifact_missing,
     internal_error
 };
@@ -125,6 +135,11 @@ inline constexpr std::uint64_t k_default_artifact_limit = 8ULL * 1024ULL * 1024U
 inline constexpr std::uint64_t k_default_package_total_limit = 16ULL * 1024ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint64_t k_default_source_total_limit = 32ULL * 1024ULL * 1024ULL * 1024ULL;
 inline constexpr std::size_t k_default_file_count_limit = 250000;
+inline constexpr std::size_t k_default_directory_count_limit = 65536;
+inline constexpr std::size_t k_default_total_entry_count_limit = 300000;
+inline constexpr std::size_t k_default_depth_limit = 64;
+inline constexpr std::size_t k_default_relative_path_limit = 32768;
+inline constexpr std::size_t k_default_stream_count_limit = 16;
 
 struct deny_link_check_request_t final {
     std::string target_name;
@@ -150,6 +165,10 @@ struct package_verification_request_t final {
     std::uint64_t maximum_artifact_bytes = k_default_artifact_limit;
     std::uint64_t maximum_total_artifact_bytes = k_default_package_total_limit;
     std::size_t maximum_file_count = k_default_file_count_limit;
+    std::size_t maximum_directory_count = k_default_directory_count_limit;
+    std::size_t maximum_total_entry_count = k_default_total_entry_count_limit;
+    std::size_t maximum_depth = k_default_depth_limit;
+    std::size_t maximum_relative_path_bytes = k_default_relative_path_limit;
 };
 
 struct package_verification_result_t final {
@@ -164,6 +183,9 @@ struct package_verification_result_t final {
     std::size_t protector_receipts_verified = 0;
     std::size_t signature_receipts_verified = 0;
     std::uint64_t artifact_bytes_verified = 0;
+    std::size_t directories_verified = 0;
+    std::size_t entries_verified = 0;
+    std::size_t stream_inventories_verified = 0;
     bool exact_package_inventory = false;
     bool no_network_fetch = false;
     bool deny_link_policy = false;

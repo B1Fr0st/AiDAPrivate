@@ -8,16 +8,14 @@
 #include "anti-tamper/webhook.hpp"
 
 #include <windows.h>
-#include <shellapi.h>
 
 #include <nlohmann/json.hpp>
 
-#include <chrono>
+#include <algorithm>
 #include <ctime>
 #include <mutex>
 #include <string>
 
-#pragma comment(lib, "Shell32.lib")
 
 namespace aida {
 namespace auth {
@@ -161,17 +159,26 @@ namespace copilot {
 	}
 
 	bool start_login(copilot_login_state_t& state,
-		std::optional<std::string> enterprise_url)
+		std::optional<std::string> enterprise_url,
+		std::uint64_t absolute_deadline_ms)
 	{
 		state.done.store(false);
-		state.cancelled.store(false);
-		state.error.clear();
-		state.device_code.clear();
-		state.user_code.clear();
-		state.verification_uri.clear();
-		state.enterprise_url = enterprise_url;
-		state.last_poll_unix = 0;
-		state.next_poll_unix = 0;
+		if (state.cancelled.load(std::memory_order_acquire)) {
+			set_last_error("login cancelled before start");
+			return false;
+		}
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.error.clear();
+			state.device_code.clear();
+			state.user_code.clear();
+			state.verification_uri.clear();
+			state.enterprise_url = enterprise_url;
+			state.interval = 5;
+			state.expires_unix = 0;
+			state.last_poll_unix = 0;
+			state.next_poll_unix = 0;
+		}
 
 		const std::string client_id = load_custom_client_id();
 		const std::string host = device_host(enterprise_url);
@@ -185,28 +192,43 @@ namespace copilot {
 		std::string err;
 		if (!github_post(host, "/login/device/code", req_body.dump(), resp, err)) {
 			set_last_error(err);
+			std::lock_guard<std::mutex> lock(state.mutex);
 			state.error = err;
 			return false;
 		}
-
-		state.device_code = resp.value("device_code", std::string{});
-		state.user_code = resp.value("user_code", std::string{});
-		state.verification_uri = resp.value("verification_uri", std::string{});
-		state.interval = resp.value("interval", 5);
-		const int64_t expires_in = resp.value("expires_in", static_cast<int64_t>(900));
-		state.expires_unix = static_cast<int64_t>(std::time(nullptr)) + expires_in;
-
-		if (state.device_code.empty() || state.user_code.empty()
-			|| state.verification_uri.empty()) {
-			set_last_error("device code response incomplete");
-			state.error = "device code response incomplete";
+		if (state.cancelled.load(std::memory_order_acquire)) {
+			set_last_error("login cancelled during device authorization");
 			return false;
 		}
 
-		state.next_poll_unix = static_cast<int64_t>(std::time(nullptr))
-			+ state.interval + (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
+		const std::string device_code = resp.value("device_code", std::string{});
+		const std::string user_code = resp.value("user_code", std::string{});
+		const std::string verification_uri = resp.value("verification_uri", std::string{});
+		const int interval = (std::max)(1, resp.value("interval", 5));
+		const int64_t expires_in = resp.value("expires_in", static_cast<int64_t>(900));
+		const int64_t now = static_cast<int64_t>(std::time(nullptr));
 
-		if (!aida::auth::open_url_external(state.verification_uri))
+		if (device_code.empty() || user_code.empty() || verification_uri.empty()) {
+			set_last_error("device code response incomplete");
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.error = "device code response incomplete";
+			return false;
+		}
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.device_code = device_code;
+			state.user_code = user_code;
+			state.verification_uri = verification_uri;
+			state.interval = interval;
+			state.expires_unix = now + expires_in;
+			state.next_poll_unix = now + interval + (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
+		}
+		if (state.cancelled.load(std::memory_order_acquire)) {
+			set_last_error("login cancelled before browser navigation");
+			return false;
+		}
+
+		if (!aida::auth::open_url_external_until(verification_uri, absolute_deadline_ms))
 			anti_tamper::webhook::write_log("auth.copilot",
 				"[aida.auth.copilot] open browser failed; user must open verification_uri manually");
 
@@ -220,28 +242,37 @@ namespace copilot {
 			return false;
 
 		const int64_t now = static_cast<int64_t>(std::time(nullptr));
-		if (state.expires_unix > 0 && now > state.expires_unix) {
-			state.error = "device code expired";
-			set_last_error(state.error);
+		copilot_login_snapshot_t current = snapshot(state);
+		if (current.expires_unix > 0 && now > current.expires_unix) {
+			{
+				std::lock_guard<std::mutex> lock(state.mutex);
+				state.error = "device code expired";
+			}
+			set_last_error("device code expired");
 			return false;
 		}
-		if (state.next_poll_unix > 0 && now < state.next_poll_unix)
+		if (current.next_poll_unix > 0 && now < current.next_poll_unix)
 			return false;
 
-		state.last_poll_unix = now;
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			if (state.cancelled.load(std::memory_order_acquire)) return false;
+			state.last_poll_unix = now;
+		}
 
 		const std::string client_id = load_custom_client_id();
-		const std::string host = device_host(state.enterprise_url);
+		const std::string host = device_host(current.enterprise_url);
 
 		nlohmann::json req_body = {
 			{ "client_id", client_id },
-			{ "device_code", state.device_code },
+			{ "device_code", current.device_code },
 			{ "grant_type", "urn:ietf:params:oauth:grant-type:device_code" },
 		};
 
 		nlohmann::json resp;
 		std::string err;
 		if (!github_post(host, "/login/oauth/access_token", req_body.dump(), resp, err)) {
+			std::lock_guard<std::mutex> lock(state.mutex);
 			state.next_poll_unix = now + state.interval + (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
 			return false;
 		}
@@ -251,9 +282,10 @@ namespace copilot {
 			std::string short_token;
 			int64_t expires_at = 0;
 			std::string fetch_err;
-			if (!fetch_internal_token(access_token, state.enterprise_url,
+			if (!fetch_internal_token(access_token, current.enterprise_url,
 					short_token, expires_at, fetch_err)) {
 				set_last_error(fetch_err);
+				std::lock_guard<std::mutex> lock(state.mutex);
 				state.error = fetch_err;
 				state.done.store(true);
 				return false;
@@ -264,8 +296,8 @@ namespace copilot {
 			info.refresh = access_token;
 			info.access = short_token;
 			info.expires_unix = expires_at;
-			if (state.enterprise_url.has_value() && !state.enterprise_url->empty())
-				info.enterprise_url = normalize_domain(*state.enterprise_url);
+			if (current.enterprise_url.has_value() && !current.enterprise_url->empty())
+				info.enterprise_url = normalize_domain(*current.enterprise_url);
 
 			auth_info_t prev;
 			if (store::get("github-copilot", prev)) {
@@ -276,6 +308,7 @@ namespace copilot {
 
 			if (!store::set("github-copilot", info)) {
 				set_last_error("store::set github-copilot failed: " + store::last_error());
+				std::lock_guard<std::mutex> lock(state.mutex);
 				state.error = "store::set github-copilot failed";
 				state.done.store(true);
 				return false;
@@ -287,34 +320,47 @@ namespace copilot {
 
 		const std::string err_field = resp.value("error", std::string{});
 		if (err_field == "authorization_pending") {
+			std::lock_guard<std::mutex> lock(state.mutex);
 			state.next_poll_unix = now + state.interval
 				+ (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
 			return false;
 		}
 		if (err_field == "slow_down") {
-			int new_interval = state.interval + 5;
+			int new_interval = current.interval + 5;
 			if (resp.contains("interval") && resp["interval"].is_number_integer())
 				new_interval = resp["interval"].get<int>();
+			std::lock_guard<std::mutex> lock(state.mutex);
 			state.interval = new_interval;
 			state.next_poll_unix = now + new_interval
 				+ (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
 			return false;
 		}
 		if (err_field == "expired_token" || err_field == "access_denied") {
-			state.error = "device flow " + err_field;
-			set_last_error(state.error);
+			const std::string failure = "device flow " + err_field;
+			{
+				std::lock_guard<std::mutex> lock(state.mutex);
+				state.error = failure;
+			}
+			set_last_error(failure);
 			state.done.store(true);
 			return false;
 		}
 		if (!err_field.empty()) {
-			state.error = "device flow error: " + err_field;
-			set_last_error(state.error);
-			state.next_poll_unix = now + state.interval
+			const std::string failure = "device flow error: " + err_field;
+			{
+				std::lock_guard<std::mutex> lock(state.mutex);
+				state.error = failure;
+				state.next_poll_unix = now + state.interval
 				+ (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
+			}
+			set_last_error(failure);
 			return false;
 		}
-		state.next_poll_unix = now + state.interval
-			+ (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.next_poll_unix = now + state.interval
+				+ (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
+		}
 		return false;
 	}
 
@@ -383,7 +429,25 @@ namespace copilot {
 		return revoke_tokens(info.access, info.refresh, info.custom_client_id);
 	}
 
-	const std::string& last_error()
+	copilot_login_snapshot_t snapshot(const copilot_login_state_t& state)
+	{
+		copilot_login_snapshot_t value;
+		std::lock_guard<std::mutex> lock(state.mutex);
+		value.device_code = state.device_code;
+		value.user_code = state.user_code;
+		value.verification_uri = state.verification_uri;
+		value.interval = state.interval;
+		value.expires_unix = state.expires_unix;
+		value.enterprise_url = state.enterprise_url;
+		value.done = state.done.load(std::memory_order_acquire);
+		value.cancelled = state.cancelled.load(std::memory_order_acquire);
+		value.error = state.error;
+		value.last_poll_unix = state.last_poll_unix;
+		value.next_poll_unix = state.next_poll_unix;
+		return value;
+	}
+
+	std::string last_error()
 	{
 		std::lock_guard<std::mutex> lk(mtx());
 		return last_error_ref();

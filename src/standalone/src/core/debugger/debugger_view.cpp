@@ -26,6 +26,7 @@
 #include "clock.hpp"
 #include "transition.hpp"
 #include "components.hpp"
+#include "metrics.hpp"
 #include "blur_layer.hpp"
 #include "empty_state.hpp"
 #include "no_target_overlay.hpp"
@@ -56,12 +57,12 @@
 
 namespace debugger_view {
 
-static constexpr float TAB_HEIGHT      = 32.f;
-static constexpr float ROW_HEIGHT      = 26.f;
-static constexpr float HEADER_H        = 28.f;
-static constexpr float TOOLBAR_H       = 36.f;
+static constexpr float TAB_HEIGHT      = aida::ui::metrics::tab::primary_h;
+static constexpr float ROW_HEIGHT      = aida::ui::metrics::table::row_h;
+static constexpr float HEADER_H        = aida::ui::metrics::table::header_h;
+static constexpr float TOOLBAR_H       = aida::ui::metrics::toolbar::height;
 static constexpr float TOOLBAR_BTN_W   = 38.f;
-static constexpr float TOOLBAR_BTN_GAP = 4.f;
+static constexpr float TOOLBAR_BTN_GAP = aida::ui::metrics::spacing::xs;
 static constexpr int   TOOLBAR_BTN_COUNT = 8;
 
 namespace {
@@ -770,7 +771,9 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	static const int visible_tab_count = static_cast<int>(sizeof(visible_tabs) / sizeof(visible_tabs[0]));
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT),
-	                  with_a(t.panel_bg, a));
+	                  with_a(t.bg_elevated, a), aida::ui::metrics::radius::md);
+	dl->AddRect(ImVec2(ox, oy), ImVec2(ox + w, oy + TAB_HEIGHT),
+	            with_a(t.border_subtle, a), aida::ui::metrics::radius::md);
 	dl->AddLine(ImVec2(ox, oy + TAB_HEIGHT - 1.f),
 	            ImVec2(ox + w, oy + TAB_HEIGHT - 1.f),
 	            with_a(t.border_subtle, a * 0.7f));
@@ -900,7 +903,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 			ImU32 wash = aida::ui::mix(t.hover_wash, t.accent_glow, tab_a * 0.6f);
 			dl->AddRectFilled(ImVec2(tx + 3.f, ty + 1.f),
 			                  ImVec2(tx + tw - 3.f, ty + th - 1.f),
-			                  with_a(wash, ra), 6.f);
+			                  with_a(wash, ra), aida::ui::metrics::radius::sm);
 		}
 
 		ImVec2 ts = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, tab_name_str);
@@ -4468,31 +4471,191 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	}
 }
 
+static const char* debugger_status_label(debugger_engine::dbg_status_t status) {
+	switch (status) {
+		case debugger_engine::dbg_status_t::idle: return "Idle";
+		case debugger_engine::dbg_status_t::running: return "Running";
+		case debugger_engine::dbg_status_t::paused: return "Paused";
+		case debugger_engine::dbg_status_t::stepping: return "Stepping";
+		case debugger_engine::dbg_status_t::terminated: return "Terminated";
+	}
+	return "Unknown";
+}
+
+static aida::ui::components::status_kind_t debugger_status_kind(
+	debugger_engine::dbg_status_t status, bool has_target) {
+	if (!has_target)
+		return aida::ui::components::status_kind_t::warning;
+	switch (status) {
+		case debugger_engine::dbg_status_t::idle:
+			return aida::ui::components::status_kind_t::neutral;
+		case debugger_engine::dbg_status_t::running:
+			return aida::ui::components::status_kind_t::success;
+		case debugger_engine::dbg_status_t::paused:
+			return aida::ui::components::status_kind_t::info;
+		case debugger_engine::dbg_status_t::stepping:
+			return aida::ui::components::status_kind_t::accent;
+		case debugger_engine::dbg_status_t::terminated:
+			return aida::ui::components::status_kind_t::error;
+	}
+	return aida::ui::components::status_kind_t::neutral;
+}
+
+static const char* debugger_tab_label(sub_tab_t tab) {
+	switch (tab) {
+		case sub_tab_t::cpu: return "CPU";
+		case sub_tab_t::breakpoints: return "Breakpoints";
+		case sub_tab_t::memory_map: return "Memory Map";
+		case sub_tab_t::call_stack: return "Call Stack";
+		case sub_tab_t::threads: return "Threads";
+		case sub_tab_t::watches: return "Watches";
+		case sub_tab_t::handles: return "Handles";
+		case sub_tab_t::trace_log: return "Trace";
+		case sub_tab_t::strings: return "Strings";
+		case sub_tab_t::bookmarks: return "Bookmarks";
+		case sub_tab_t::modules: return "Modules";
+		case sub_tab_t::patches: return "Patches";
+		case sub_tab_t::seh_chain: return "SEH";
+		case sub_tab_t::cfg: return "CFG";
+		case sub_tab_t::COUNT: return "Debugger";
+	}
+	return "Debugger";
+}
+
+static void render_debugger_status_bar(ImVec2 pos, float width,
+	debugger_engine::dbg_status_t status, uint32_t pid, bool has_target) {
+	ImGui::SetCursorPos(pos);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+	bool region_visible = ImGui::BeginChild("##debugger_status_region",
+		ImVec2(width, aida::ui::metrics::status_bar::height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	if (region_visible) {
+		ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+		bool visible = aida::ui::components::begin_status_bar("##debugger_status_bar");
+		if (visible) {
+			char pid_text[24] = {};
+			if (pid != 0)
+				std::snprintf(pid_text, sizeof(pid_text), "%u", static_cast<unsigned>(pid));
+			else
+				std::snprintf(pid_text, sizeof(pid_text), "none");
+
+			aida::ui::components::status_item("target", "Target", pid_text,
+				has_target ? aida::ui::components::status_kind_t::success
+				           : aida::ui::components::status_kind_t::warning);
+			aida::ui::components::status_item("engine", "Engine", debugger_status_label(status),
+				debugger_status_kind(status, has_target));
+			if (width >= 620.f) {
+				aida::ui::components::status_item("panel", "Panel",
+					debugger_tab_label(g_ui.active_tab),
+					aida::ui::components::status_kind_t::accent,
+					false, width >= 820.f);
+			}
+			if (width >= 820.f) {
+				uint64_t rip = debugger_engine::cached_registers().rip;
+				char rip_text[24] = {};
+				std::snprintf(rip_text, sizeof(rip_text), "0x%016" PRIX64, rip);
+				aida::ui::components::status_item("rip", "RIP", rip_text,
+					rip != 0 ? aida::ui::components::status_kind_t::info
+					         : aida::ui::components::status_kind_t::neutral,
+					false, false);
+			}
+		}
+		aida::ui::components::end_status_bar();
+	}
+	ImGui::EndChild();
+	ImGui::PopStyleVar();
+}
+
 
 void render(float pos_x, float pos_y, float width, float height,
 			float alpha, float accent_r, float accent_g, float accent_b) {
 	(void)accent_r; (void)accent_g; (void)accent_b;
 
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
-	ImGui::BeginChild("##debugger_view", ImVec2(width, height), false,
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+	bool root_visible = ImGui::BeginChild("##debugger_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-	if (!analysis_session::has_active_target()) {
-		ImVec2 wp_e = ImGui::GetWindowPos();
-		aida::ui::no_target_overlay::render(wp_e, ImVec2(width, height),
-			"No target attached",
-			"The debugger needs a target. Launch a binary with full isolation, attach to a running process, or open a static file to inspect imports, exports and sections.",
-			alpha, aida::ui::empty_state::glyph_t::shield);
+	ImGui::PopStyleVar();
+	if (!root_visible) {
 		ImGui::EndChild();
 		return;
 	}
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wp = ImGui::GetWindowPos();
-	float ox = wp.x;
-	float oy = wp.y;
-	float w = width;
-	float h = height;
+	ImVec2 root_size = ImGui::GetWindowSize();
+	float w = root_size.x;
+	float h = root_size.y;
+	const auto& t = aida::ui::resolved();
+	dl->AddRectFilled(wp, ImVec2(wp.x + w, wp.y + h), with_a(t.bg_base, alpha));
+
+	const float min_width = 320.f;
+	const float min_height = 260.f;
+	if (w < min_width || h < min_height) {
+		static bool clamp_logged = false;
+		if (!clamp_logged) {
+			clamp_logged = true;
+			::diag::log_tagged_fmt("responsive",
+				"debugger_view clamp_overlay width=%.0f height=%.0f min_width=%.0f min_height=%.0f",
+				w, h, min_width, min_height);
+		}
+		aida::ui::responsive::draw_clamp_overlay(
+			wp, root_size, "Widen or raise the panel to view debugger tools");
+		ImGui::EndChild();
+		return;
+	}
+
+	const float outer_pad = aida::ui::metrics::spacing::md;
+	const float inner_width = std::max(1.f, w - outer_pad * 2.f);
+	const bool has_target = analysis_session::has_active_target();
+	const uint32_t attached_pid = driver_bridge::attached_pid();
+	const debugger_engine::dbg_status_t header_status =
+		debugger_engine::g_state.status.load(std::memory_order_acquire);
+	char header_subtitle[128] = {};
+	if (has_target && attached_pid != 0) {
+		std::snprintf(header_subtitle, sizeof(header_subtitle), "%s target | PID %u | %s",
+			debugger_status_label(header_status), static_cast<unsigned>(attached_pid),
+			debugger_tab_label(g_ui.active_tab));
+	} else {
+		std::snprintf(header_subtitle, sizeof(header_subtitle),
+			"Attach or launch a target to begin a live debugging session");
+	}
+
+	ImGui::SetCursorPos(ImVec2(outer_pad, outer_pad));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+	bool header_visible = ImGui::BeginChild("##debugger_header_region",
+		ImVec2(inner_width, aida::ui::metrics::panel::view_header_h), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	if (header_visible) {
+		ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+		aida::ui::components::view_header("Debugger", header_subtitle, nullptr, nullptr,
+			debugger_status_kind(header_status, has_target));
+	}
+	ImGui::EndChild();
+	ImGui::PopStyleVar();
+
+	const float nav_y_local = outer_pad + aida::ui::metrics::panel::view_header_h +
+		aida::ui::metrics::spacing::sm;
+	const float status_h = aida::ui::metrics::status_bar::height;
+	const float status_y_local = h - outer_pad - status_h;
+	const float content_bottom = wp.y + status_y_local - aida::ui::metrics::spacing::sm;
+
+	if (!has_target) {
+		float empty_y = wp.y + nav_y_local;
+		aida::ui::no_target_overlay::render(
+			ImVec2(wp.x + outer_pad, empty_y),
+			ImVec2(inner_width, std::max(1.f, content_bottom - empty_y)),
+			"No target attached",
+			"The debugger needs a target. Launch a binary with full isolation, attach to a running process, or open a static file to inspect imports, exports and sections.",
+			alpha, aida::ui::empty_state::glyph_t::shield);
+		render_debugger_status_bar(ImVec2(outer_pad, status_y_local), inner_width,
+			header_status, attached_pid, has_target);
+		ImGui::EndChild();
+		return;
+	}
+
+	float ox = wp.x + outer_pad;
+	float oy = wp.y + nav_y_local;
 	float dt = aida::ui::clock::dt();
 
 	auto& ui = g_ui;
@@ -4666,17 +4829,12 @@ void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	float a = alpha * std::max(ui.content_fade, 0.3f);
-	const auto& t = aida::ui::resolved();
+	render_tab_bar(dl, ox, oy, inner_width, alpha);
 
-	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
-	                  with_a(t.bg_base, alpha));
+	float content_y = oy + TAB_HEIGHT + aida::ui::metrics::spacing::sm;
+	float content_h = std::max(1.f, content_bottom - content_y);
 
-	render_tab_bar(dl, ox, oy, w, alpha);
-
-	float content_y = oy + TAB_HEIGHT;
-	float content_h = h - TAB_HEIGHT;
-
-	float toolbar_y = content_y + 6.f;
+	float toolbar_y = content_y;
 	bool tab_uses_toolbar =
 		ui.active_tab != sub_tab_t::memory_map &&
 		ui.active_tab != sub_tab_t::modules &&
@@ -4684,20 +4842,20 @@ void render(float pos_x, float pos_y, float width, float height,
 		ui.active_tab != sub_tab_t::cfg;
 	float panel_offset = 0.f;
 	if (tab_uses_toolbar) {
-		draw_run_toolbar(dl, ox, toolbar_y, w, alpha);
-		panel_offset = TOOLBAR_H + 8.f;
+		draw_run_toolbar(dl, ox, toolbar_y, inner_width, alpha);
+		panel_offset = TOOLBAR_H + aida::ui::metrics::spacing::sm;
 	}
 
 	float panel_y = content_y + panel_offset;
-	float panel_h = content_h - panel_offset;
+	float panel_h = std::max(1.f, content_h - panel_offset);
 
 	float slide_t = ui.tab_animator.slide.eased();
 	float slide_offset = (1.f - slide_t) * ui.tab_animator.direction * 28.f;
 	if (slide_t >= 0.999f) slide_offset = 0.f;
 
-	ImGui::PushClipRect(ImVec2(ox, panel_y), ImVec2(ox + w, panel_y + panel_h), true);
+	ImGui::PushClipRect(ImVec2(ox, panel_y), ImVec2(ox + inner_width, panel_y + panel_h), true);
 	float panel_x = ox + slide_offset;
-	float panel_w = w;
+	float panel_w = inner_width;
 	float content_alpha = a * (slide_t < 0.999f ? (0.4f + slide_t * 0.6f) : 1.f);
 
 	switch (ui.active_tab) {
@@ -4762,6 +4920,10 @@ void render(float pos_x, float pos_y, float width, float height,
 			break;
 	}
 	ImGui::PopClipRect();
+
+	render_debugger_status_bar(ImVec2(outer_pad, status_y_local), inner_width,
+		debugger_engine::g_state.status.load(std::memory_order_acquire),
+		driver_bridge::attached_pid(), analysis_session::has_active_target());
 
 	ImGui::EndChild();
 

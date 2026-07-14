@@ -1,9 +1,13 @@
 #pragma once
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../helpers/blur.h"
+#endif
 #include "imgui/imgui.h"
 #include "theme.hpp"
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 #include <atomic>
+#endif
 
 namespace aida::ui::blur {
 
@@ -18,17 +22,25 @@ namespace aida::ui::blur {
 	};
 
 	namespace detail {
+	#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 		inline constexpr int k_max_blur_draws_per_frame = 3;
 		inline std::atomic<bool> s_blur_supported{ false };
 		inline std::atomic<int> s_frame_index{ -1 };
 		inline std::atomic<int> s_frame_draws{ 0 };
 		inline std::atomic<unsigned long long> s_dropped_draws{ 0 };
+	#endif
 	}
 
+	#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 	inline void mark_supported(bool s) { detail::s_blur_supported.store(s, std::memory_order_release); }
 	inline bool supported() { return detail::s_blur_supported.load(std::memory_order_acquire); }
+	#else
+	inline void mark_supported(bool) {}
+	inline bool supported() { return false; }
+	#endif
 
 	inline void schedule(const layer_request_t& r) {
+	#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 		if (!supported() || !ImGui::GetCurrentContext() || r.alpha <= 0.f || r.size.x <= 1.f || r.size.y <= 1.f)
 			return;
 		int frame = ImGui::GetFrameCount();
@@ -55,6 +67,23 @@ namespace aida::ui::blur {
 			const auto& t = aida::ui::resolved();
 			dl->AddRect(a, b, aida::ui::with_alpha(t.accent, alpha * 0.28f), r.radius, 0, 1.15f);
 		}
+	#else
+		if (!ImGui::GetCurrentContext() || r.alpha <= 0.f || r.size.x <= 1.f || r.size.y <= 1.f)
+			return;
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		if (!dl)
+			return;
+		ImVec2 a = r.pos;
+		ImVec2 b(r.pos.x + r.size.x, r.pos.y + r.size.y);
+		float alpha = r.alpha < 0.f ? 0.f : (r.alpha > 1.f ? 1.f : r.alpha);
+		float strength = r.strength < 0.f ? 0.f : (r.strength > 1.f ? 1.f : r.strength);
+		if (r.tint != 0)
+			dl->AddRectFilled(a, b, aida::ui::with_alpha(r.tint, alpha * strength * 0.38f), r.radius);
+		if (r.accent_glow) {
+			const auto& t = aida::ui::resolved();
+			dl->AddRect(a, b, aida::ui::with_alpha(t.accent, alpha * 0.28f), r.radius, 0, 1.15f);
+		}
+	#endif
 	}
 
 	inline void render_glass_fill(ImDrawList* dl, ImVec2 a, ImVec2 b,

@@ -372,6 +372,8 @@ struct job_record_t {
     bool admitted = false;
     bool active = true;
     bool deadline_reported = false;
+    bool cancel_hook_invoked = false;
+    bool cancellation_accounted = false;
     job_state_t state = job_state_t::queued;
     std::string exception_text;
     std::vector<graph_node_record_t> nodes;
@@ -897,6 +899,36 @@ inline void invoke_body(const std::function<void()>& body, const std::function<v
     }
 }
 
+inline void invoke_cancel_hook_noexcept(const std::shared_ptr<job_record_t>& record,
+    std::function<void()> hook) noexcept
+{
+    if (!record || !hook)
+        return;
+    DWORD seh = 0;
+    try {
+        const std::function<void()> guarded = [&]() { hook(); };
+        seh = aida::infra::win_thread::run_function_seh_guarded(guarded);
+    } catch (const std::exception& ex) {
+        diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
+            "taskflow_cancel_hook_exception job_id=%llu err=%s tid=%lu",
+            static_cast<unsigned long long>(record->id), ex.what(),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return;
+    } catch (...) {
+        diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
+            "taskflow_cancel_hook_exception job_id=%llu err=unknown tid=%lu",
+            static_cast<unsigned long long>(record->id),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+        return;
+    }
+    if (seh != 0) {
+        diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
+            "taskflow_cancel_hook_seh job_id=%llu seh=0x%08lX tid=%lu",
+            static_cast<unsigned long long>(record->id), static_cast<unsigned long>(seh),
+            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+}
+
 inline std::string seh_text(DWORD code) {
     if (code == 0)
         return {};
@@ -936,6 +968,9 @@ inline void execute_single_record(const std::shared_ptr<job_record_t>& record) {
         std::lock_guard<std::mutex> lk(record->mtx);
         if (record->state == job_state_t::timed_out)
             final_state = job_state_t::timed_out;
+        else if (record->state == job_state_t::cancelled
+            || (record->cancel_token && record->cancel_token->requested.load(std::memory_order_acquire)))
+            final_state = job_state_t::cancelled;
     }
     if (final_state == job_state_t::failed) {
         g_total_failed.fetch_add(1u, std::memory_order_acq_rel);
@@ -1486,6 +1521,7 @@ inline bool cancel(job_handle_t handle) {
         return false;
     bool signalled = false;
     std::function<void()> cancel_hook;
+    bool account_cancellation = false;
     {
         std::lock_guard<std::mutex> lk(record->mtx);
         if (!record->active && terminal_state(record->state))
@@ -1496,27 +1532,18 @@ inline bool cancel(job_handle_t handle) {
             record->state = job_state_t::cancelled;
         if (record->has_future)
             signalled = record->future.cancel();
-        cancel_hook = record->cancel_hook;
-    }
-    if (cancel_hook) {
-        try {
-            cancel_hook();
-        } catch (const std::exception& ex) {
-            diag::log_tagged_fmt("taskflow_runtime",
-                "taskflow_cancel_hook_exception job_id=%llu err=%s tid=%lu",
-                static_cast<unsigned long long>(handle.id),
-                ex.what(),
-                static_cast<unsigned long>(GetCurrentThreadId()));
-        } catch (...) {
-            diag::log_tagged_fmt("taskflow_runtime",
-                "taskflow_cancel_hook_exception job_id=%llu err=unknown tid=%lu",
-                static_cast<unsigned long long>(handle.id),
-                static_cast<unsigned long>(GetCurrentThreadId()));
+        if (!record->cancel_hook_invoked) {
+            record->cancel_hook_invoked = true;
+            cancel_hook = record->cancel_hook;
+        }
+        if (!record->cancellation_accounted) {
+            record->cancellation_accounted = true;
+            account_cancellation = true;
         }
     }
-    g_total_cancelled.fetch_add(1u, std::memory_order_acq_rel);
-    if (record->pool)
-        record->pool->cancelled_tasks.fetch_add(1u, std::memory_order_acq_rel);
+    invoke_cancel_hook_noexcept(record, std::move(cancel_hook));
+    if (account_cancellation)
+        g_total_cancelled.fetch_add(1u, std::memory_order_acq_rel);
     record->cv.notify_all();
     diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
         "taskflow_cancel job_id=%llu state=cancelled future_signalled=%d label=%s owner=%s domain=%s tid=%lu",
@@ -1598,17 +1625,13 @@ inline void check_deadlines() {
             std::lock_guard<std::mutex> lk(record->mtx);
             if (record->has_future)
                 signalled = record->future.cancel();
-            cancel_hook = record->cancel_hook;
-        }
-        if (cancel_hook) {
-            try {
-                cancel_hook();
-            } catch (...) {
+            if (!record->cancel_hook_invoked) {
+                record->cancel_hook_invoked = true;
+                cancel_hook = record->cancel_hook;
             }
         }
+        invoke_cancel_hook_noexcept(record, std::move(cancel_hook));
         g_total_timed_out.fetch_add(1u, std::memory_order_acq_rel);
-        if (record->pool)
-            record->pool->timed_out_tasks.fetch_add(1u, std::memory_order_acq_rel);
         diag::log_tagged_fmt(record->pool ? safe_log_tag(*record->pool) : "taskflow_runtime",
             "taskflow_deadline_timeout job_id=%llu label=%s owner=%s domain=%s deadline_ms=%llu now_ms=%llu future_signalled=%d tid=%lu",
             static_cast<unsigned long long>(record->id),
@@ -2144,14 +2167,40 @@ inline std::string snapshot_json_string() {
 inline void shutdown(std::uint32_t timeout_ms = 15000) {
     g_shutdown_requested.store(true, std::memory_order_release);
     g_stop_accepting.store(true, std::memory_order_release);
+    std::vector<job_handle_t> cancel_pending;
+    {
+        std::lock_guard<std::mutex> jobs_lk(g_jobs_mtx);
+        cancel_pending.reserve(g_jobs.size());
+        for (const auto& entry : g_jobs) {
+            const auto& record = entry.second;
+            if (!record)
+                continue;
+            std::lock_guard<std::mutex> record_lk(record->mtx);
+            if (record->active && record->shutdown_policy == "cancel_pending")
+                cancel_pending.push_back(job_handle_t{record->id});
+        }
+    }
+    for (const auto handle : cancel_pending)
+        cancel(handle);
     std::vector<pool_t*> pools;
     {
         std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
         pools = g_registered_pools;
     }
+    const std::uint64_t started = now_ms();
+    const std::uint64_t deadline = timeout_ms == INFINITE
+        ? (std::numeric_limits<std::uint64_t>::max)()
+        : started + static_cast<std::uint64_t>(timeout_ms);
     for (auto* p : pools) {
-        if (p)
-            shutdown_pool(*p, safe_pool_name(*p), timeout_ms);
+        if (!p)
+            continue;
+        const std::uint64_t current = now_ms();
+        const std::uint32_t remaining = timeout_ms == INFINITE
+            ? INFINITE
+            : current >= deadline ? 0u
+            : static_cast<std::uint32_t>((std::min<std::uint64_t>)(deadline - current,
+                static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)())));
+        shutdown_pool(*p, safe_pool_name(*p), remaining);
     }
 }
 

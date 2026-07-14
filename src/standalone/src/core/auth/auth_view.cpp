@@ -40,17 +40,17 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include <windows.h>
-#include <shellapi.h>
 
 #include <nlohmann/json.hpp>
 
@@ -149,6 +149,43 @@ namespace auth_view {
 			failure = 2,
 		};
 
+		enum class login_start_result_t : int {
+			idle = 0,
+			pending,
+			succeeded,
+			failed,
+			cancelled,
+			timed_out,
+			rejected
+		};
+
+		struct login_start_ticket_t {
+			std::atomic<bool> worker_started{false};
+			std::atomic<bool> cancellation_requested{false};
+			std::atomic<bool> terminal_published{false};
+			std::uint64_t generation = 0;
+			std::uint64_t deadline_ms = 0;
+			std::atomic<std::uint64_t> task_id{0};
+		};
+
+		struct login_start_control_t {
+			std::mutex mutex;
+			std::shared_ptr<login_start_ticket_t> current;
+			std::atomic<bool> active{false};
+			std::atomic<bool> completion_pending{false};
+			std::atomic<int> result{static_cast<int>(login_start_result_t::idle)};
+			std::atomic<std::uint64_t> deadline_ms{0};
+			std::atomic<std::uint64_t> generation{0};
+		};
+
+		struct browser_open_control_t {
+			std::atomic<bool> in_flight{false};
+			std::atomic<bool> completion_pending{false};
+			std::atomic<int> result{static_cast<int>(aida::auth::browser_open_result_t::queue_rejected)};
+			std::atomic<std::uint64_t> generation{0};
+			std::atomic<std::uint64_t> task_id{0};
+		};
+
 		struct test_result_t {
 			bool        completed = false;
 			bool        success = false;
@@ -175,9 +212,9 @@ namespace auth_view {
 			std::atomic<bool> copilot_modal_open{ false };
 			std::atomic<bool> claude_code_modal_open{ false };
 
-			std::atomic<bool> codex_starting{ false };
-			std::atomic<bool> copilot_starting{ false };
-			std::atomic<bool> claude_code_starting{ false };
+			login_start_control_t codex_start;
+			login_start_control_t copilot_start;
+			login_start_control_t claude_code_start;
 
 			std::atomic<bool> codex_exchange_in_flight{ false };
 			std::atomic<bool> copilot_poll_in_flight{ false };
@@ -187,11 +224,8 @@ namespace auth_view {
 			std::atomic<int> copilot_poll_result{ static_cast<int>(exchange_result_t::pending) };
 			std::atomic<int> claude_code_exchange_result{ static_cast<int>(exchange_result_t::pending) };
 
-			std::atomic<bool> codex_start_done{true};
-			std::atomic<bool> copilot_start_done{true};
-			std::atomic<bool> claude_code_start_done{true};
-
 			std::string err;
+			browser_open_control_t browser_open;
 
 			aida::events::subscription_handle_t sub_completed;
 			aida::events::subscription_handle_t sub_failed;
@@ -372,68 +406,540 @@ namespace auth_view {
 			return out;
 		}
 
-		static void open_url_in_browser(const std::string& url)
+		inline constexpr std::uint64_t kLoginStartDeadlineMs =
+			aida::auth::kBrowserExternalOperationDeadlineMs;
+		inline constexpr std::uint64_t kLoginCancelDeadlineMs = 35000;
+
+		static const char* login_start_result_name(login_start_result_t result)
 		{
-			aida::auth::open_url_external(url);
+			switch (result) {
+			case login_start_result_t::idle: return "idle";
+			case login_start_result_t::pending: return "pending";
+			case login_start_result_t::succeeded: return "succeeded";
+			case login_start_result_t::failed: return "failed";
+			case login_start_result_t::cancelled: return "cancelled";
+			case login_start_result_t::timed_out: return "timed_out";
+			case login_start_result_t::rejected: return "rejected";
+			default: return "unknown";
+			}
+		}
+
+		static std::uint64_t bounded_deadline(std::uint64_t budget_ms)
+		{
+			const std::uint64_t now = aida::infra::executor::now_ms();
+			return now > (std::numeric_limits<std::uint64_t>::max)() - budget_ms
+				? (std::numeric_limits<std::uint64_t>::max)()
+				: now + budget_ms;
+		}
+
+		template <typename State>
+		static void publish_login_start_failure(
+			const std::shared_ptr<State>& state,
+			const char* error) noexcept
+		{
+			if (!state || !error || !*error) return;
+			try {
+				std::lock_guard<std::mutex> state_lock(state->mutex);
+				state->error = error;
+			} catch (...) {
+			}
+			state->done.store(true, std::memory_order_release);
+			try {
+				std::lock_guard<std::mutex> view_lock(g_state.mtx);
+				set_err_locked(error);
+			} catch (...) {
+			}
+		}
+
+		template <typename State, typename StartFn, typename CancelFn, typename ErrorFn>
+		static bool submit_login_start_task(
+			const char* label,
+			const char* provider,
+			login_start_control_t& control,
+			const std::shared_ptr<State>& state,
+			const std::shared_ptr<State>& previous,
+			StartFn start_fn,
+			CancelFn cancel_fn,
+			ErrorFn error_fn)
+		{
+			std::shared_ptr<login_start_ticket_t> ticket;
+			try {
+				ticket = std::make_shared<login_start_ticket_t>();
+			} catch (...) {
+				publish_login_start_failure(state, "Login startup state allocation failed");
+				control.result.store(static_cast<int>(login_start_result_t::rejected), std::memory_order_release);
+				control.completion_pending.store(true, std::memory_order_release);
+				return false;
+			}
+			{
+				std::lock_guard<std::mutex> lock(control.mutex);
+				if (control.current || control.active.load(std::memory_order_acquire)) return false;
+				ticket->generation = control.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+				control.current = ticket;
+				control.active.store(true, std::memory_order_release);
+			}
+
+			const std::uint64_t generation = ticket->generation;
+			const std::uint64_t deadline = bounded_deadline(kLoginStartDeadlineMs);
+			ticket->deadline_ms = deadline;
+			control.completion_pending.store(false, std::memory_order_release);
+			control.result.store(static_cast<int>(login_start_result_t::pending),
+				std::memory_order_release);
+			control.deadline_ms.store(deadline, std::memory_order_release);
+
+			auto finish = [state, ticket, &control, provider](
+				login_start_result_t result,
+				const char* error,
+				bool worker_finished) noexcept {
+				try {
+					bool expected_terminal = false;
+					if (ticket->terminal_published.compare_exchange_strong(expected_terminal, true,
+						std::memory_order_acq_rel, std::memory_order_acquire)) {
+						if (result == login_start_result_t::failed
+							|| result == login_start_result_t::timed_out
+							|| result == login_start_result_t::rejected) {
+							publish_login_start_failure(state, error);
+						}
+						std::lock_guard<std::mutex> lock(control.mutex);
+						if (control.current == ticket) {
+							control.result.store(static_cast<int>(result), std::memory_order_release);
+							control.deadline_ms.store(0, std::memory_order_release);
+							control.completion_pending.store(true, std::memory_order_release);
+						}
+					}
+					if (worker_finished || !ticket->worker_started.load(std::memory_order_acquire)) {
+						std::lock_guard<std::mutex> lock(control.mutex);
+						if (control.current == ticket) {
+							control.current.reset();
+							control.active.store(false, std::memory_order_release);
+						}
+					}
+					diag::log_tagged_fmt("auth",
+						"AUTH-LOGIN-START-PUBLISH provider=%s generation=%llu result=%s worker_finished=%d error_len=%zu",
+						provider, static_cast<unsigned long long>(ticket->generation),
+						login_start_result_name(result), worker_finished ? 1 : 0,
+						error ? std::strlen(error) : 0);
+				} catch (...) {
+					if (worker_finished) {
+						try {
+							std::lock_guard<std::mutex> lock(control.mutex);
+							if (control.current == ticket) {
+								control.current.reset();
+								control.active.store(false, std::memory_order_release);
+							}
+						} catch (...) {
+						}
+					}
+				}
+			};
+			std::shared_ptr<CancelFn> cancel_operation;
+			try {
+				cancel_operation = std::make_shared<CancelFn>(std::move(cancel_fn));
+			} catch (...) {
+				finish(login_start_result_t::rejected,
+					"Login cancellation state allocation failed", false);
+				return false;
+			}
+
+			aida::infra::executor::submit_result_t submitted;
+			try {
+			aida::infra::executor::submission_t sub;
+			sub.owner_subsystem = "auth_provider";
+			sub.label = label;
+			sub.thread_class = "security_liveness";
+			sub.domain = aida::infra::executor::domain_t::security_liveness;
+			sub.priority = 1;
+			sub.deadline_ms = deadline;
+			sub.generation = generation;
+			sub.ui_access_policy = "none";
+			sub.failure_policy = "publish_typed_failure";
+			sub.shutdown_policy = "cancel_pending";
+			sub.cancel_hook = [state, cancel_operation, ticket, deadline, finish]() mutable noexcept {
+				ticket->cancellation_requested.store(true, std::memory_order_release);
+				if (state) state->cancelled.store(true, std::memory_order_release);
+				if (state && cancel_operation) {
+					try {
+						const std::function<void()> guarded_cancel = [&]() { (*cancel_operation)(*state); };
+						aida::infra::win_thread::run_function_seh_guarded(guarded_cancel);
+					} catch (...) {
+					}
+				}
+				const login_start_result_t result = aida::infra::executor::now_ms() >= deadline
+					? login_start_result_t::timed_out
+					: login_start_result_t::cancelled;
+				finish(result,
+					result == login_start_result_t::timed_out
+						? "Login startup timed out"
+						: "Login startup cancelled",
+					false);
+			};
+			sub.body = [state, previous, start_fn = std::move(start_fn),
+				cancel_operation, error_fn = std::move(error_fn),
+				ticket, finish]() mutable noexcept {
+				ticket->worker_started.store(true, std::memory_order_release);
+				bool ok = false;
+				std::string error;
+				const char* fallback_error = nullptr;
+				login_start_result_t result = login_start_result_t::failed;
+				struct terminal_guard_t {
+					decltype(finish)* callback;
+					login_start_result_t* result;
+					std::string* error;
+					const char** fallback_error;
+					~terminal_guard_t() noexcept
+					{
+						(*callback)(*result, *fallback_error ? *fallback_error
+							: (error->empty() ? nullptr : error->c_str()), true);
+					}
+				} terminal{&finish, &result, &error, &fallback_error};
+				try {
+					const std::function<void()> guarded = [&]() {
+						if (previous) (*cancel_operation)(*previous);
+						if (!state) {
+							error = "Login startup state is unavailable";
+							return;
+						}
+						if (g_state.shutdown_flag.load(std::memory_order_acquire)
+							|| ticket->cancellation_requested.load(std::memory_order_acquire)
+							|| state->cancelled.load(std::memory_order_acquire)) {
+							result = login_start_result_t::cancelled;
+							error = "Login startup cancelled";
+							return;
+						}
+						ok = start_fn(*state, ticket->deadline_ms);
+						if (ticket->cancellation_requested.load(std::memory_order_acquire)) {
+							state->cancelled.store(true, std::memory_order_release);
+							(*cancel_operation)(*state);
+							result = login_start_result_t::cancelled;
+							return;
+						}
+						if (!ok) error = error_fn();
+					};
+					const DWORD seh = aida::infra::win_thread::run_function_seh_guarded(guarded);
+					if (seh != 0) {
+						ok = false;
+						char buffer[96];
+						std::snprintf(buffer, sizeof(buffer),
+							"Login startup raised SEH 0x%08lX",
+							static_cast<unsigned long>(seh));
+						error = buffer;
+						result = login_start_result_t::failed;
+					}
+				} catch (...) {
+					ok = false;
+					fallback_error = "Login startup exception";
+					result = login_start_result_t::failed;
+				}
+				if (ticket->cancellation_requested.load(std::memory_order_acquire)
+					|| (state && state->cancelled.load(std::memory_order_acquire))) {
+					result = login_start_result_t::cancelled;
+				} else if (ok) {
+					result = login_start_result_t::succeeded;
+				}
+				if (!ok && state) {
+					state->cancelled.store(true, std::memory_order_release);
+					try {
+						const std::function<void()> guarded_cancel = [&]() { (*cancel_operation)(*state); };
+						aida::infra::win_thread::run_function_seh_guarded(guarded_cancel);
+					} catch (...) {
+					}
+				}
+				if (!ok && error.empty() && !fallback_error
+					&& result != login_start_result_t::cancelled)
+					fallback_error = "Login startup failed";
+			};
+
+			submitted = aida::infra::executor::submit(std::move(sub));
+			} catch (...) {
+				finish(login_start_result_t::rejected,
+					"Login startup submission exception", false);
+				return false;
+			}
+			if (!submitted.submitted) {
+				finish(login_start_result_t::rejected,
+					submitted.reject_reason.empty()
+						? "Login startup queue rejected"
+						: submitted.reject_reason.c_str(),
+					false);
+				return false;
+			}
+			ticket->task_id.store(submitted.task_id, std::memory_order_release);
+			try {
+				diag::log_tagged_fmt("auth",
+					"AUTH-LOGIN-START-QUEUED provider=%s generation=%llu task_id=%llu deadline_ms=%llu",
+					provider,
+					static_cast<unsigned long long>(generation),
+					static_cast<unsigned long long>(submitted.task_id),
+					static_cast<unsigned long long>(deadline));
+			} catch (...) {
+			}
+			return true;
+		}
+
+		template <typename State, typename CancelFn>
+		static void submit_provider_cancel(
+			const char* label,
+			const char* provider,
+			const std::shared_ptr<State>& state,
+			CancelFn cancel_fn)
+		{
+			if (!state) return;
+			state->cancelled.store(true, std::memory_order_release);
+			std::shared_ptr<std::atomic<bool>> terminal;
+			try { terminal = std::make_shared<std::atomic<bool>>(false); } catch (...) {}
+			auto publish_terminal = [terminal, provider](const char* result) noexcept {
+				if (!terminal) return;
+				bool expected = false;
+				if (!terminal->compare_exchange_strong(expected, true,
+					std::memory_order_acq_rel, std::memory_order_acquire)) return;
+				try { diag::log_tagged_fmt("auth", "AUTH-LOGIN-CANCEL-TERMINAL provider=%s result=%s",
+					provider, result ? result : "unknown"); } catch (...) {}
+			};
+			auto execute_cancel = [state, cancel_fn, publish_terminal]() mutable noexcept {
+				const char* result = "completed";
+				struct terminal_guard_t {
+					decltype(publish_terminal)* publish;
+					const char** result;
+					~terminal_guard_t() noexcept { (*publish)(*result); }
+				} guard{&publish_terminal, &result};
+				try {
+					const std::function<void()> guarded = [&]() { cancel_fn(*state); };
+					if (aida::infra::win_thread::run_function_seh_guarded(guarded) != 0)
+						result = "seh_failure";
+				} catch (...) {
+					result = "exception";
+				}
+			};
+			if (!terminal) {
+				execute_cancel();
+				return;
+			}
+			aida::infra::executor::submit_result_t submitted;
+			try {
+				aida::infra::executor::submission_t sub;
+				sub.owner_subsystem = "auth_provider";
+				sub.label = label;
+				sub.thread_class = "security_liveness";
+				sub.domain = aida::infra::executor::domain_t::security_liveness;
+				sub.priority = 0;
+				sub.deadline_ms = bounded_deadline(kLoginCancelDeadlineMs);
+				sub.ui_access_policy = "none";
+				sub.failure_policy = "publish_typed_failure";
+				sub.shutdown_policy = "cancel_pending";
+				sub.cancel_hook = execute_cancel;
+				sub.body = execute_cancel;
+				submitted = aida::infra::executor::submit(std::move(sub));
+			} catch (...) {
+				execute_cancel();
+				return;
+			}
+			if (!submitted.submitted)
+				execute_cancel();
+			try {
+				diag::log_tagged_fmt("auth",
+					"AUTH-LOGIN-CANCEL-QUEUE provider=%s submitted=%d task_id=%llu reason=%s",
+					provider,
+					submitted.submitted ? 1 : 0,
+					static_cast<unsigned long long>(submitted.task_id),
+					submitted.reject_reason.empty() ? "none" : submitted.reject_reason.c_str());
+			} catch (...) {
+			}
+		}
+
+		static std::string browser_open_failure_message(aida::auth::browser_open_result_t result)
+		{
+			switch (result) {
+			case aida::auth::browser_open_result_t::queued:
+				return {};
+			case aida::auth::browser_open_result_t::invalid_url:
+				return "The browser URL was rejected";
+			case aida::auth::browser_open_result_t::queue_rejected:
+				return "The Camoufox request queue is unavailable";
+			case aida::auth::browser_open_result_t::cancelled:
+				return "The Camoufox request was cancelled";
+			case aida::auth::browser_open_result_t::deadline_expired:
+				return "The Camoufox request timed out";
+			case aida::auth::browser_open_result_t::ensure_ready_failed:
+				return "Camoufox could not become ready";
+			case aida::auth::browser_open_result_t::navigate_failed:
+				return "Camoufox could not open the requested page";
+			case aida::auth::browser_open_result_t::exception:
+				return "Camoufox failed while opening the requested page";
+			case aida::auth::browser_open_result_t::opened:
+			default:
+				return {};
+			}
+		}
+
+		static bool open_url_in_browser(const std::string& url)
+		{
+			if (g_state.shutdown_flag.load(std::memory_order_acquire)) return false;
+			bool expected = false;
+			if (!g_state.browser_open.in_flight.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel, std::memory_order_acquire)) {
+				diag::log_tagged_fmt("auth", "AUTH-BROWSER-UI-QUEUE-REJECT reason=already_in_flight");
+				toast_notification::push("A Camoufox request is already in progress",
+					toast_notification::toast_type_t::warning, 4.0f);
+				return false;
+			}
+			const std::uint64_t generation =
+				g_state.browser_open.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+			g_state.browser_open.completion_pending.store(false, std::memory_order_release);
+			g_state.browser_open.result.store(static_cast<int>(aida::auth::browser_open_result_t::queued),
+				std::memory_order_release);
+			aida::auth::browser_open_submission_t submitted;
+			try {
+				submitted = aida::auth::submit_open_url_external(url,
+					[generation](const aida::auth::browser_open_completion_t& result) noexcept {
+						if (g_state.browser_open.generation.load(std::memory_order_acquire)
+							!= generation) return;
+						g_state.browser_open.result.store(static_cast<int>(result.result),
+							std::memory_order_release);
+						g_state.browser_open.task_id.store(0, std::memory_order_release);
+						g_state.browser_open.in_flight.store(false, std::memory_order_release);
+						g_state.browser_open.completion_pending.store(true, std::memory_order_release);
+					});
+			} catch (...) {
+				g_state.browser_open.result.store(static_cast<int>(aida::auth::browser_open_result_t::exception),
+					std::memory_order_release);
+				g_state.browser_open.task_id.store(0, std::memory_order_release);
+				g_state.browser_open.in_flight.store(false, std::memory_order_release);
+				g_state.browser_open.completion_pending.store(true, std::memory_order_release);
+				return false;
+			}
+			if (submitted.submitted
+				&& g_state.browser_open.generation.load(std::memory_order_acquire) == generation
+				&& g_state.browser_open.in_flight.load(std::memory_order_acquire))
+				g_state.browser_open.task_id.store(submitted.task_id, std::memory_order_release);
+			return submitted.submitted;
+		}
+
+		static void poll_browser_open_completion()
+		{
+			if (!g_state.browser_open.completion_pending.exchange(false,
+				std::memory_order_acq_rel)) return;
+			const auto result = static_cast<aida::auth::browser_open_result_t>(
+				g_state.browser_open.result.load(std::memory_order_acquire));
+			if (result == aida::auth::browser_open_result_t::opened) return;
+			const std::string message = browser_open_failure_message(result);
+			if (!message.empty() && !g_state.shutdown_flag.load(std::memory_order_acquire)) {
+				toast_notification::push(message,
+					toast_notification::toast_type_t::error, 6.0f);
+			}
+		}
+
+		template <typename State>
+		static void poll_login_start_control(
+			const char* provider,
+			login_start_control_t& control,
+			const std::shared_ptr<State>& state)
+		{
+			std::shared_ptr<login_start_ticket_t> ticket;
+			{
+				std::lock_guard<std::mutex> lock(control.mutex);
+				ticket = control.current;
+			}
+			const std::uint64_t deadline = control.deadline_ms.load(std::memory_order_acquire);
+			const std::uint64_t now = aida::infra::executor::now_ms();
+			if (ticket && control.active.load(std::memory_order_acquire)
+				&& deadline != 0 && now >= deadline) {
+				int pending = static_cast<int>(login_start_result_t::pending);
+				if (control.result.compare_exchange_strong(pending,
+					static_cast<int>(login_start_result_t::timed_out),
+					std::memory_order_acq_rel, std::memory_order_acquire)) {
+					ticket->cancellation_requested.store(true, std::memory_order_release);
+					if (state) state->cancelled.store(true, std::memory_order_release);
+					publish_login_start_failure(state, "Login startup timed out");
+					control.deadline_ms.store(0, std::memory_order_release);
+					control.completion_pending.store(true, std::memory_order_release);
+					const std::uint64_t task_id = ticket->task_id.load(std::memory_order_acquire);
+					if (task_id != 0) {
+						try { aida::infra::executor::cancel(task_id); } catch (...) {}
+					}
+				}
+			}
+			if (control.completion_pending.exchange(false, std::memory_order_acq_rel)) {
+				const auto result = static_cast<login_start_result_t>(
+					control.result.load(std::memory_order_acquire));
+				diag::log_tagged_fmt("auth",
+					"AUTH-LOGIN-START-POLL provider=%s result=%s active=%d worker_started=%d",
+					provider,
+					login_start_result_name(result),
+					control.active.load(std::memory_order_acquire) ? 1 : 0,
+					ticket && ticket->worker_started.load(std::memory_order_acquire) ? 1 : 0);
+			}
+		}
+
+		static void poll_login_startups()
+		{
+			std::shared_ptr<aida::auth::codex::codex_login_state_t> codex;
+			std::shared_ptr<aida::auth::copilot::copilot_login_state_t> copilot;
+			std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> claude;
+			{
+				std::lock_guard<std::mutex> lk(g_state.mtx);
+				codex = g_state.codex_state;
+				copilot = g_state.copilot_state;
+				claude = g_state.claude_code_state;
+			}
+			poll_login_start_control("openai", g_state.codex_start, codex);
+			poll_login_start_control("github-copilot", g_state.copilot_start, copilot);
+			poll_login_start_control("anthropic", g_state.claude_code_start, claude);
+		}
+
+		static void request_login_start_cancel(login_start_control_t& control) noexcept
+		{
+			std::shared_ptr<login_start_ticket_t> ticket;
+			try {
+				std::lock_guard<std::mutex> lock(control.mutex);
+				ticket = control.current;
+			} catch (...) {
+				return;
+			}
+			if (!ticket) return;
+			ticket->cancellation_requested.store(true, std::memory_order_release);
+			const std::uint64_t task_id = ticket->task_id.load(std::memory_order_acquire);
+			if (task_id != 0) {
+				try { aida::infra::executor::cancel(task_id); } catch (...) {}
+			}
 		}
 
 		static void start_codex_login()
 		{
-			if (g_state.codex_starting.exchange(true)) return;
-
+			if (g_state.codex_start.active.load(std::memory_order_acquire)) {
+				toast_notification::push("The previous OpenAI login is still stopping",
+					toast_notification::toast_type_t::warning, 4.0f);
+				return;
+			}
 			std::shared_ptr<aida::auth::codex::codex_login_state_t> previous;
+			std::shared_ptr<aida::auth::codex::codex_login_state_t> current;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				previous = g_state.codex_state;
-				g_state.codex_state = std::make_shared<aida::auth::codex::codex_login_state_t>();
+				current = std::make_shared<aida::auth::codex::codex_login_state_t>();
+				g_state.codex_state = current;
 				g_state.codex_modal_open.store(true);
 				g_state.codex_anim.reset_for_open();
 				g_state.codex_exchange_result.store(static_cast<int>(exchange_result_t::pending));
 			}
-			if (previous)
-				aida::auth::codex::cancel_login(*previous);
-			while (!g_state.codex_start_done.load(std::memory_order_acquire))
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-			std::shared_ptr<aida::auth::codex::codex_login_state_t> codex_ref;
-			{
-				std::lock_guard<std::mutex> lk(g_state.mtx);
-				codex_ref = g_state.codex_state;
-			}
-			g_state.codex_start_done.store(false, std::memory_order_release);
-			aida::infra::executor::submission_t sub;
-			sub.owner_subsystem = "auth_provider";
-			sub.label = "auth.codex.start_login";
-			sub.thread_class = "service_task";
-			sub.domain = aida::infra::executor::domain_t::security_liveness;
-			sub.priority = 1;
-			sub.body = [codex_ref]() {
-					if (!codex_ref) {
-						g_state.codex_starting.store(false);
-						g_state.codex_start_done.store(true, std::memory_order_release);
-						return;
-					}
-					const bool ok = aida::auth::codex::start_login(*codex_ref);
-					{
-						std::lock_guard<std::mutex> lk(g_state.mtx);
-						if (!ok) {
-							codex_ref->error = aida::auth::codex::last_error();
-							codex_ref->done.store(true);
-							set_err_locked(codex_ref->error);
-						}
-					}
-					g_state.codex_starting.store(false);
-					g_state.codex_start_done.store(true, std::memory_order_release);
-				};
-			if (!aida::infra::executor::submit(std::move(sub)).submitted)
-			{
-				g_state.codex_starting.store(false);
-				g_state.codex_start_done.store(true, std::memory_order_release);
-			}
+			submit_login_start_task(
+				"auth.codex.start_login", "openai", g_state.codex_start,
+				current, previous,
+				[](aida::auth::codex::codex_login_state_t& state, std::uint64_t deadline_ms) {
+					return aida::auth::codex::start_login(state, deadline_ms);
+				},
+				[](aida::auth::codex::codex_login_state_t& state) {
+					return aida::auth::codex::cancel_login(state);
+				},
+				[]() { return aida::auth::codex::last_error(); });
 		}
 
 		static void open_copilot_modal()
 		{
+			if (g_state.copilot_start.active.load(std::memory_order_acquire)) {
+				toast_notification::push("The previous GitHub login is still stopping",
+					toast_notification::toast_type_t::warning, 4.0f);
+				return;
+			}
 			std::shared_ptr<aida::auth::copilot::copilot_login_state_t> previous;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -455,113 +961,73 @@ namespace auth_view {
 					g_state.copilot_ghe_buf[len] = '\0';
 				}
 			}
-			if (previous)
-				aida::auth::copilot::cancel_login(*previous);
-			while (!g_state.copilot_start_done.load(std::memory_order_acquire))
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			if (previous) {
+				submit_provider_cancel("auth.copilot.cancel_previous", "github-copilot",
+					previous,
+					[](aida::auth::copilot::copilot_login_state_t& state) {
+						return aida::auth::copilot::cancel_login(state);
+					});
+			}
 		}
 
 		static void start_copilot_flow(std::optional<std::string> enterprise_url)
 		{
-			if (g_state.copilot_starting.exchange(true)) return;
+			if (g_state.copilot_start.active.load(std::memory_order_acquire)) {
+				toast_notification::push("The previous GitHub login is still stopping",
+					toast_notification::toast_type_t::warning, 4.0f);
+				return;
+			}
 			g_state.copilot_flow_started.store(true);
-
-			std::shared_ptr<aida::auth::copilot::copilot_login_state_t> copilot_ref;
+			std::shared_ptr<aida::auth::copilot::copilot_login_state_t> current;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
-				copilot_ref = g_state.copilot_state;
+				current = g_state.copilot_state;
 			}
-			while (!g_state.copilot_start_done.load(std::memory_order_acquire))
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			g_state.copilot_start_done.store(false, std::memory_order_release);
-			aida::infra::executor::submission_t sub;
-			sub.owner_subsystem = "auth_provider";
-			sub.label = "auth.copilot.start_login";
-			sub.thread_class = "service_task";
-			sub.domain = aida::infra::executor::domain_t::security_liveness;
-			sub.priority = 1;
-			sub.body = [copilot_ref, enterprise_url]() {
-					if (!copilot_ref) {
-						g_state.copilot_starting.store(false);
-						g_state.copilot_start_done.store(true, std::memory_order_release);
-						return;
-					}
-					const bool ok = aida::auth::copilot::start_login(*copilot_ref, enterprise_url);
-					{
-						std::lock_guard<std::mutex> lk(g_state.mtx);
-						if (!ok) {
-							copilot_ref->error = aida::auth::copilot::last_error();
-							copilot_ref->done.store(true);
-							set_err_locked(copilot_ref->error);
-						}
-					}
-					g_state.copilot_starting.store(false);
-					g_state.copilot_start_done.store(true, std::memory_order_release);
-				};
-			if (!aida::infra::executor::submit(std::move(sub)).submitted)
-			{
-				g_state.copilot_starting.store(false);
-				g_state.copilot_start_done.store(true, std::memory_order_release);
-			}
+			submit_login_start_task(
+				"auth.copilot.start_login", "github-copilot", g_state.copilot_start,
+				current, std::shared_ptr<aida::auth::copilot::copilot_login_state_t>{},
+				[enterprise_url](aida::auth::copilot::copilot_login_state_t& state, std::uint64_t deadline_ms) {
+					return aida::auth::copilot::start_login(state, enterprise_url, deadline_ms);
+				},
+				[](aida::auth::copilot::copilot_login_state_t& state) {
+					return aida::auth::copilot::cancel_login(state);
+				},
+				[]() { return aida::auth::copilot::last_error(); });
 		}
 
 		static void start_claude_code_login()
 		{
-			if (g_state.claude_code_starting.exchange(true)) return;
-
+			if (g_state.claude_code_start.active.load(std::memory_order_acquire)) {
+				toast_notification::push("The previous Claude Code login is still stopping",
+					toast_notification::toast_type_t::warning, 4.0f);
+				return;
+			}
 			std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> previous;
+			std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> current;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				previous = g_state.claude_code_state;
-				g_state.claude_code_state = std::make_shared<aida::auth::claude_code::claude_code_login_state_t>();
+				current = std::make_shared<aida::auth::claude_code::claude_code_login_state_t>();
+				g_state.claude_code_state = current;
 				g_state.claude_code_modal_open.store(true);
 				g_state.claude_code_anim.reset_for_open();
 				g_state.claude_code_exchange_result.store(static_cast<int>(exchange_result_t::pending));
 			}
-			if (previous)
-				aida::auth::claude_code::cancel_login(*previous);
-			while (!g_state.claude_code_start_done.load(std::memory_order_acquire))
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-			std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> claude_ref;
-			{
-				std::lock_guard<std::mutex> lk(g_state.mtx);
-				claude_ref = g_state.claude_code_state;
-			}
-			g_state.claude_code_start_done.store(false, std::memory_order_release);
-			aida::infra::executor::submission_t sub;
-			sub.owner_subsystem = "auth_provider";
-			sub.label = "auth.claude_code.start_login";
-			sub.thread_class = "service_task";
-			sub.domain = aida::infra::executor::domain_t::security_liveness;
-			sub.priority = 1;
-			sub.body = [claude_ref]() {
-					if (!claude_ref) {
-						g_state.claude_code_starting.store(false);
-						g_state.claude_code_start_done.store(true, std::memory_order_release);
-						return;
-					}
-					const bool ok = aida::auth::claude_code::start_login(*claude_ref);
-					{
-						std::lock_guard<std::mutex> lk(g_state.mtx);
-						if (!ok) {
-							claude_ref->error = aida::auth::claude_code::last_error();
-							claude_ref->done.store(true);
-							set_err_locked(claude_ref->error);
-						}
-					}
-					g_state.claude_code_starting.store(false);
-					g_state.claude_code_start_done.store(true, std::memory_order_release);
-				};
-			if (!aida::infra::executor::submit(std::move(sub)).submitted)
-			{
-				g_state.claude_code_starting.store(false);
-				g_state.claude_code_start_done.store(true, std::memory_order_release);
-			}
+			submit_login_start_task(
+				"auth.claude_code.start_login", "anthropic", g_state.claude_code_start,
+				current, previous,
+				[](aida::auth::claude_code::claude_code_login_state_t& state, std::uint64_t deadline_ms) {
+					return aida::auth::claude_code::start_login(state, deadline_ms);
+				},
+				[](aida::auth::claude_code::claude_code_login_state_t& state) {
+					return aida::auth::claude_code::cancel_login(state);
+				},
+				[]() { return aida::auth::claude_code::last_error(); });
 		}
 
 		static void close_codex_modal_immediate()
 		{
+			request_login_start_cancel(g_state.codex_start);
 			std::shared_ptr<aida::auth::codex::codex_login_state_t> state_ref;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -571,23 +1037,16 @@ namespace auth_view {
 					state_ref->cancelled.store(true);
 			}
 			if (state_ref) {
-				aida::infra::executor::submission_t sub;
-				sub.owner_subsystem = "auth_provider";
-				sub.label = "auth.codex.cancel_login";
-				sub.thread_class = "service_task";
-				sub.domain = aida::infra::executor::domain_t::security_liveness;
-				sub.priority = 1;
-				sub.body = [state_ref]() {
-						aida::auth::codex::cancel_login(*state_ref);
-					};
-				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-					aida::auth::codex::cancel_login(*state_ref);
-				}
+				submit_provider_cancel("auth.codex.cancel_login", "openai", state_ref,
+					[](aida::auth::codex::codex_login_state_t& state) {
+						return aida::auth::codex::cancel_login(state);
+					});
 			}
 		}
 
 		static void close_copilot_modal_immediate()
 		{
+			request_login_start_cancel(g_state.copilot_start);
 			std::shared_ptr<aida::auth::copilot::copilot_login_state_t> state_ref;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -599,23 +1058,16 @@ namespace auth_view {
 					state_ref->cancelled.store(true);
 			}
 			if (state_ref) {
-				aida::infra::executor::submission_t sub;
-				sub.owner_subsystem = "auth_provider";
-				sub.label = "auth.copilot.cancel_login";
-				sub.thread_class = "service_task";
-				sub.domain = aida::infra::executor::domain_t::security_liveness;
-				sub.priority = 1;
-				sub.body = [state_ref]() {
-						aida::auth::copilot::cancel_login(*state_ref);
-					};
-				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-					aida::auth::copilot::cancel_login(*state_ref);
-				}
+				submit_provider_cancel("auth.copilot.cancel_login", "github-copilot", state_ref,
+					[](aida::auth::copilot::copilot_login_state_t& state) {
+						return aida::auth::copilot::cancel_login(state);
+					});
 			}
 		}
 
 		static void close_claude_code_modal_immediate()
 		{
+			request_login_start_cancel(g_state.claude_code_start);
 			std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> state_ref;
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
@@ -625,18 +1077,10 @@ namespace auth_view {
 					state_ref->cancelled.store(true);
 			}
 			if (state_ref) {
-				aida::infra::executor::submission_t sub;
-				sub.owner_subsystem = "auth_provider";
-				sub.label = "auth.claude_code.cancel_login";
-				sub.thread_class = "service_task";
-				sub.domain = aida::infra::executor::domain_t::security_liveness;
-				sub.priority = 1;
-				sub.body = [state_ref]() {
-						aida::auth::claude_code::cancel_login(*state_ref);
-					};
-				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-					aida::auth::claude_code::cancel_login(*state_ref);
-				}
+				submit_provider_cancel("auth.claude_code.cancel_login", "anthropic", state_ref,
+					[](aida::auth::claude_code::claude_code_login_state_t& state) {
+						return aida::auth::claude_code::cancel_login(state);
+					});
 			}
 		}
 
@@ -663,8 +1107,17 @@ namespace auth_view {
 				auto sp = g_state.codex_state;
 				bool finished = sp->done.load();
 				const int prior_result = g_state.codex_exchange_result.load();
+				const auto start_result = static_cast<login_start_result_t>(
+					g_state.codex_start.result.load(std::memory_order_acquire));
+				const bool start_failed = start_result == login_start_result_t::failed
+					|| start_result == login_start_result_t::timed_out
+					|| start_result == login_start_result_t::rejected;
 
-				if (finished
+				if (finished && start_failed
+					&& prior_result == static_cast<int>(exchange_result_t::pending)) {
+					g_state.codex_exchange_result.store(
+						static_cast<int>(exchange_result_t::failure));
+				} else if (finished
 					&& !g_state.codex_exchange_in_flight.load()
 					&& prior_result == static_cast<int>(exchange_result_t::pending)) {
 					g_state.codex_exchange_in_flight.store(true);
@@ -715,7 +1168,7 @@ namespace auth_view {
 					g_state.codex_exchange_result.store(
 						static_cast<int>(exchange_result_t::pending));
 					std::string err = aida::auth::codex::last_error();
-					if (err.empty() && sp) err = sp->error;
+					if (err.empty() && sp) err = aida::auth::codex::snapshot(*sp).error;
 					if (err.empty()) err = "OpenAI login failed";
 					lk.unlock();
 					toast_notification::push("OpenAI login failed: " + err,
@@ -730,10 +1183,11 @@ namespace auth_view {
 			if (g_state.copilot_modal_open.load() && g_state.copilot_state) {
 				auto sp = g_state.copilot_state;
 				int64_t now = now_unix();
-				bool ready_to_poll = sp->next_poll_unix == 0 || now >= sp->next_poll_unix;
+				const auto copilot_snapshot = aida::auth::copilot::snapshot(*sp);
+				bool ready_to_poll = copilot_snapshot.next_poll_unix == 0 || now >= copilot_snapshot.next_poll_unix;
 				bool finished = sp->done.load();
-				bool can_poll = !finished && ready_to_poll && !sp->device_code.empty();
-				bool start_failed = finished && sp->device_code.empty();
+				bool can_poll = !finished && ready_to_poll && !copilot_snapshot.device_code.empty();
+				bool start_failed = finished && copilot_snapshot.device_code.empty();
 				const int prior_result = g_state.copilot_poll_result.load();
 
 				if (start_failed && prior_result == static_cast<int>(exchange_result_t::pending)) {
@@ -790,7 +1244,7 @@ namespace auth_view {
 					g_state.copilot_poll_result.store(
 						static_cast<int>(exchange_result_t::pending));
 					std::string err = aida::auth::copilot::last_error();
-					if (err.empty() && sp) err = sp->error;
+					if (err.empty() && sp) err = aida::auth::copilot::snapshot(*sp).error;
 					if (err.empty()) err = "Copilot login failed";
 					lk.unlock();
 					toast_notification::push("Copilot login failed: " + err,
@@ -806,8 +1260,17 @@ namespace auth_view {
 				auto sp = g_state.claude_code_state;
 				bool finished = sp->done.load();
 				const int prior_result = g_state.claude_code_exchange_result.load();
+				const auto start_result = static_cast<login_start_result_t>(
+					g_state.claude_code_start.result.load(std::memory_order_acquire));
+				const bool start_failed = start_result == login_start_result_t::failed
+					|| start_result == login_start_result_t::timed_out
+					|| start_result == login_start_result_t::rejected;
 
-				if (finished
+				if (finished && start_failed
+					&& prior_result == static_cast<int>(exchange_result_t::pending)) {
+					g_state.claude_code_exchange_result.store(
+						static_cast<int>(exchange_result_t::failure));
+				} else if (finished
 					&& !g_state.claude_code_exchange_in_flight.load()
 					&& prior_result == static_cast<int>(exchange_result_t::pending)) {
 					g_state.claude_code_exchange_in_flight.store(true);
@@ -858,7 +1321,7 @@ namespace auth_view {
 					g_state.claude_code_exchange_result.store(
 						static_cast<int>(exchange_result_t::pending));
 					std::string err = aida::auth::claude_code::last_error();
-					if (err.empty() && sp) err = sp->error;
+					if (err.empty() && sp) err = aida::auth::claude_code::snapshot(*sp).error;
 					if (err.empty()) err = "Claude Code login failed";
 					lk.unlock();
 					toast_notification::push("Claude Code login failed: " + err,
@@ -1625,7 +2088,7 @@ namespace auth_view {
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::md,
 						ImVec2(120.f, 36.f))) {
-					aida::auth::open_url_external(selected.console_url);
+					open_url_in_browser(selected.console_url);
 				}
 			}
 			cy += 48.f;
@@ -1782,11 +2245,14 @@ namespace auth_view {
 				const bool authed = st.authenticated && !st.expired;
 				bool busy = false;
 				if (e.glyph == brand_glyph::kind_t::anthropic)
-					busy = g_state.claude_code_modal_open.load();
+					busy = g_state.claude_code_modal_open.load()
+						|| g_state.claude_code_start.active.load(std::memory_order_acquire);
 				else if (e.glyph == brand_glyph::kind_t::openai)
-					busy = g_state.codex_modal_open.load();
+					busy = g_state.codex_modal_open.load()
+						|| g_state.codex_start.active.load(std::memory_order_acquire);
 				else if (e.glyph == brand_glyph::kind_t::github)
-					busy = g_state.copilot_modal_open.load();
+					busy = g_state.copilot_modal_open.load()
+						|| g_state.copilot_start.active.load(std::memory_order_acquire);
 
 				float btn_w = btn_w_full;
 				ImVec2 btn_pos;
@@ -2278,10 +2744,11 @@ namespace auth_view {
 		{
 			if (ma.success_played) return flow_phase_t::complete;
 			if (!sp) return flow_phase_t::browser;
-			if (sp->done.load() && !exchange_in_progress && !sp->error.empty())
+			const auto value = aida::auth::codex::snapshot(*sp);
+			if (value.done && !exchange_in_progress && !value.error.empty())
 				return flow_phase_t::error_state;
-			if (sp->done.load()) return flow_phase_t::session;
-			if (!sp->received_code.empty()) return flow_phase_t::callback;
+			if (value.done) return flow_phase_t::session;
+			if (!value.received_code.empty()) return flow_phase_t::callback;
 			return flow_phase_t::browser;
 		}
 
@@ -2290,10 +2757,11 @@ namespace auth_view {
 		{
 			if (ma.success_played) return flow_phase_t::complete;
 			if (!sp) return flow_phase_t::browser;
-			if (sp->done.load() && !exchange_in_progress && !sp->error.empty())
+			const auto value = aida::auth::claude_code::snapshot(*sp);
+			if (value.done && !exchange_in_progress && !value.error.empty())
 				return flow_phase_t::error_state;
-			if (sp->done.load()) return flow_phase_t::session;
-			if (!sp->received_code.empty()) return flow_phase_t::callback;
+			if (value.done) return flow_phase_t::session;
+			if (!value.received_code.empty()) return flow_phase_t::callback;
 			return flow_phase_t::browser;
 		}
 
@@ -2302,10 +2770,11 @@ namespace auth_view {
 		{
 			if (ma.success_played) return flow_phase_t::complete;
 			if (!sp) return flow_phase_t::browser;
-			if (sp->done.load() && !poll_in_progress && !sp->error.empty())
+			const auto value = aida::auth::copilot::snapshot(*sp);
+			if (value.done && !poll_in_progress && !value.error.empty())
 				return flow_phase_t::error_state;
-			if (sp->done.load()) return flow_phase_t::session;
-			if (!sp->user_code.empty()) return flow_phase_t::callback;
+			if (value.done) return flow_phase_t::session;
+			if (!value.user_code.empty()) return flow_phase_t::callback;
 			return flow_phase_t::browser;
 		}
 
@@ -2361,15 +2830,16 @@ namespace auth_view {
 			std::string url_open;
 			std::string err_text;
 			flow_phase_t phase = flow_phase_t::browser;
-			const bool starting_in_progress = g_state.codex_starting.load();
+			const bool starting_in_progress = g_state.codex_start.active.load();
 			const bool exchange_in_progress = g_state.codex_exchange_in_flight.load();
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				if (g_state.codex_state) {
+					const auto value = aida::auth::codex::snapshot(*g_state.codex_state);
 					if (!starting_in_progress)
-						url_open = g_state.codex_state->auth_url;
-					if (g_state.codex_state->done.load() && !exchange_in_progress)
-						err_text = g_state.codex_state->error;
+						url_open = value.auth_url;
+					if (value.done && !exchange_in_progress)
+						err_text = value.error;
 					phase = derive_phase_codex(g_state.codex_state.get(), g_state.codex_anim,
 						exchange_in_progress);
 				}
@@ -2449,15 +2919,16 @@ namespace auth_view {
 			std::string url_open;
 			std::string err_text;
 			flow_phase_t phase = flow_phase_t::browser;
-			const bool starting_in_progress = g_state.claude_code_starting.load();
+			const bool starting_in_progress = g_state.claude_code_start.active.load();
 			const bool exchange_in_progress = g_state.claude_code_exchange_in_flight.load();
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				if (g_state.claude_code_state) {
+					const auto value = aida::auth::claude_code::snapshot(*g_state.claude_code_state);
 					if (!starting_in_progress)
-						url_open = g_state.claude_code_state->auth_url;
-					if (g_state.claude_code_state->done.load() && !exchange_in_progress)
-						err_text = g_state.claude_code_state->error;
+						url_open = value.auth_url;
+					if (value.done && !exchange_in_progress)
+						err_text = value.error;
 					phase = derive_phase_claude(g_state.claude_code_state.get(),
 						g_state.claude_code_anim, exchange_in_progress);
 				}
@@ -2661,18 +3132,19 @@ namespace auth_view {
 			std::string err_text;
 			flow_phase_t phase = flow_phase_t::browser;
 			bool have_code = false;
-			const bool starting_in_progress = g_state.copilot_starting.load();
+			const bool starting_in_progress = g_state.copilot_start.active.load();
 			const bool poll_in_progress = g_state.copilot_poll_in_flight.load();
 			{
 				std::lock_guard<std::mutex> lk(g_state.mtx);
 				if (g_state.copilot_state) {
+					const auto value = aida::auth::copilot::snapshot(*g_state.copilot_state);
 					if (!starting_in_progress) {
-						user_code = g_state.copilot_state->user_code;
-						verify_uri = g_state.copilot_state->verification_uri;
+						user_code = value.user_code;
+						verify_uri = value.verification_uri;
 						have_code = !user_code.empty();
 					}
-					if (g_state.copilot_state->done.load() && !poll_in_progress)
-						err_text = g_state.copilot_state->error;
+					if (value.done && !poll_in_progress)
+						err_text = value.error;
 					phase = derive_phase_copilot(g_state.copilot_state.get(),
 						g_state.copilot_anim, poll_in_progress);
 				}
@@ -2840,6 +3312,9 @@ namespace auth_view {
 	void shutdown()
 	{
 		g_state.shutdown_flag.store(true);
+		request_login_start_cancel(g_state.codex_start);
+		request_login_start_cancel(g_state.copilot_start);
+		request_login_start_cancel(g_state.claude_code_start);
 		std::shared_ptr<aida::auth::codex::codex_login_state_t> codex_local;
 		std::shared_ptr<aida::auth::copilot::copilot_login_state_t> copilot_local;
 		std::shared_ptr<aida::auth::claude_code::claude_code_login_state_t> claude_local;
@@ -2868,28 +3343,30 @@ namespace auth_view {
 			SecureZeroMemory(g_state.copilot_ghe_buf, sizeof(g_state.copilot_ghe_buf));
 		}
 
-		while (!g_state.codex_start_done.load(std::memory_order_acquire))
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		while (!g_state.copilot_start_done.load(std::memory_order_acquire))
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		while (!g_state.claude_code_start_done.load(std::memory_order_acquire))
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-		using namespace std::chrono_literals;
-		const auto deadline = std::chrono::steady_clock::now() + 35s;
-		while ((g_state.codex_exchange_in_flight.load()
-				|| g_state.copilot_poll_in_flight.load()
-				|| g_state.claude_code_exchange_in_flight.load())
-			&& std::chrono::steady_clock::now() < deadline) {
-			std::this_thread::sleep_for(20ms);
+		if (codex_local) {
+			submit_provider_cancel("auth.codex.shutdown_cancel", "openai", codex_local,
+				[](aida::auth::codex::codex_login_state_t& state) {
+					return aida::auth::codex::cancel_login(state);
+				});
 		}
-
-		if (codex_local)
-			aida::auth::codex::cancel_login(*codex_local);
-		if (copilot_local)
-			aida::auth::copilot::cancel_login(*copilot_local);
-		if (claude_local)
-			aida::auth::claude_code::cancel_login(*claude_local);
+		if (copilot_local) {
+			submit_provider_cancel("auth.copilot.shutdown_cancel", "github-copilot", copilot_local,
+				[](aida::auth::copilot::copilot_login_state_t& state) {
+					return aida::auth::copilot::cancel_login(state);
+				});
+		}
+		if (claude_local) {
+			submit_provider_cancel("auth.claude_code.shutdown_cancel", "anthropic", claude_local,
+				[](aida::auth::claude_code::claude_code_login_state_t& state) {
+					return aida::auth::claude_code::cancel_login(state);
+				});
+		}
+		const std::uint64_t browser_task_id = g_state.browser_open.task_id.exchange(0,
+			std::memory_order_acq_rel);
+		if (browser_task_id != 0) aida::auth::cancel_open_url_external(browser_task_id);
+		g_state.browser_open.generation.fetch_add(1, std::memory_order_acq_rel);
+		g_state.browser_open.in_flight.store(false, std::memory_order_release);
+		g_state.browser_open.completion_pending.store(false, std::memory_order_release);
 
 		std::lock_guard<std::mutex> lk(g_state.mtx);
 
@@ -2944,6 +3421,8 @@ namespace auth_view {
 	void render(float panel_w, float panel_h)
 	{
 		ImGui::PushID("aida_auth_view");
+		poll_login_startups();
+		poll_browser_open_completion();
 
 		if (aida::provider::catalog::list_providers().empty()) {
 			aida::infra::executor::submission_t sub;

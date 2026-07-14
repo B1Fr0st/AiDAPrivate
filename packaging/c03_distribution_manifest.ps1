@@ -2,19 +2,185 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$PackageRoot,
-    [Parameter(Mandatory = $true)]
     [string]$Spec,
-    [Parameter(Mandatory = $true)]
     [string]$AuthorityLock,
-    [Parameter(Mandatory = $true)]
     [string]$OutputManifest,
-    [Parameter(Mandatory = $true)]
     [string]$OutputDigest,
+    [string]$SourceRoot,
+    [string]$CustomerStageAnchor,
+    [switch]$StageCustomerPackage,
+    [string]$PolicyFixtureReport,
     [switch]$Force
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:ForbiddenCustomerExtensions = [string[]]@(
+    '.a', '.asm', '.bash', '.bat', '.c', '.c++', '.cc', '.cmake', '.cmd', '.cpp',
+    '.cppm', '.cs', '.csproj', '.cxx', '.def', '.exp', '.fs', '.fsproj', '.go',
+    '.gradle', '.h', '.hh', '.hpp', '.hxx', '.ilk', '.in', '.inc', '.inl', '.ipp',
+    '.ixx', '.java', '.kt', '.kts', '.lib', '.m', '.make', '.map', '.mk', '.mm',
+    '.natvis', '.nupkg', '.nuspec', '.obj', '.pdb', '.props', '.ps1', '.psd1',
+    '.psm1', '.pth', '.py', '.pyc', '.pyo', '.pyz', '.rc', '.rc2', '.rs', '.s',
+    '.sh', '.sln', '.snupkg', '.spec', '.swift', '.targets', '.tpp', '.vb',
+    '.vbproj', '.vcxproj', '.vcxproj.filters', '.whl', '.zig', '.zsh'
+)
+$script:ForbiddenCustomerFileNames = [string[]]@(
+    'build', 'build.bazel', 'cmakelists.txt', 'gnumakefile', 'makefile',
+    'meson.build', 'workspace', 'workspace.bazel'
+)
+$script:ForbiddenCustomerDirectoryNames = [string[]]@(
+    'c03-safe-headless', 'camoufox-reverse-mcp', 'camoufox_reverse_mcp',
+    'library-packs', 'metadata', 'packs', 'sdk', 'templates'
+)
+$script:StockBrowserNames = [string[]]@(
+    'chrome', 'chrome.exe', 'msedge', 'msedge.exe', 'stock-firefox', 'stock-firefox.exe'
+)
+$script:MaximumPackageFiles = 250000
+$script:MaximumPackageDirectories = 65536
+$script:MaximumPackageEntries = 300000
+$script:MaximumPackageDepth = 64
+$script:MaximumRelativePathBytes = 32768
+$script:MaximumEntryBytes = [Int64]8589934592
+$script:MaximumAggregateBytes = [Int64]17179869184
+$script:MaximumStreamsPerEntry = 16
+
+if (-not ('AidaC03PackageNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class AidaC03PackageNative
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct WIN32_FIND_STREAM_DATA
+    {
+        public long StreamSize;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 296)]
+        public string StreamName;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr FindFirstStreamW(string path, int level, out WIN32_FIND_STREAM_DATA data, uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool FindNextStreamW(IntPtr handle, out WIN32_FIND_STREAM_DATA data);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool FindClose(IntPtr handle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION information);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+}
+
+function Throw-PackagePolicy {
+    param([string]$Code, [string]$Path)
+    throw ('AIDA_C03_PACKAGE_POLICY_' + $Code + '|' + $Path)
+}
+
+function Test-AsciiAlphaNumeric {
+    param([char]$Character)
+    return ($Character -ge 'a' -and $Character -le 'z') -or
+        ($Character -ge '0' -and $Character -le '9')
+}
+
+function Test-PolicyNameMatch {
+    param([string]$Segment, [string]$Forbidden)
+    if ([string]::Equals($Segment, $Forbidden, [StringComparison]::Ordinal)) {
+        return $true
+    }
+    if ($Segment.Length -gt $Forbidden.Length -and
+        $Segment.StartsWith($Forbidden, [StringComparison]::Ordinal) -and
+        -not (Test-AsciiAlphaNumeric -Character $Segment[$Forbidden.Length])) {
+        return $true
+    }
+    return $false
+}
+
+function Test-ForbiddenCustomerRelativePath {
+    param([string]$RelativePath)
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+        $RelativePath.Length -gt $script:MaximumRelativePathBytes -or
+        $RelativePath[0] -eq '/' -or $RelativePath[$RelativePath.Length - 1] -eq '/') {
+        return $true
+    }
+    foreach ($character in $RelativePath.ToCharArray()) {
+        $code = [int]$character
+        if ($code -lt 0x21 -or $code -gt 0x7e -or $character -in @('\', ':', '<', '>', '"', '|', '?', '*')) {
+            return $true
+        }
+    }
+    $segments = @($RelativePath -split '/')
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or
+            $segment -eq '..' -or $segment.EndsWith('.', [StringComparison]::Ordinal)) {
+            return $true
+        }
+        $lower = $segment.ToLowerInvariant()
+        $deviceBase = $lower.Split('.')[0]
+        if ($deviceBase -in @('con', 'prn', 'aux', 'nul') -or
+            $deviceBase -cmatch '^(?:com|lpt)[1-9]$') {
+            return $true
+        }
+        foreach ($name in $script:ForbiddenCustomerFileNames) {
+            if (Test-PolicyNameMatch -Segment $lower -Forbidden $name) { return $true }
+        }
+        foreach ($directory in $script:ForbiddenCustomerDirectoryNames) {
+            if (Test-PolicyNameMatch -Segment $lower -Forbidden $directory) { return $true }
+        }
+        if ($lower.IndexOf('.dist-info', [StringComparison]::Ordinal) -ge 0 -or
+            $lower.IndexOf('.egg-info', [StringComparison]::Ordinal) -ge 0) {
+            return $true
+        }
+        foreach ($extension in $script:ForbiddenCustomerExtensions) {
+            $offset = 0
+            while ($offset -lt $lower.Length) {
+                $match = $lower.IndexOf($extension, $offset, [StringComparison]::Ordinal)
+                if ($match -lt 0) {
+                    break
+                }
+                $after = $match + $extension.Length
+                if ($after -eq $lower.Length -or
+                    -not (Test-AsciiAlphaNumeric -Character $lower[$after])) {
+                    return $true
+                }
+                $offset = $match + 1
+            }
+        }
+    }
+    $leaf = $segments[$segments.Count - 1].ToLowerInvariant()
+    foreach ($browser in $script:StockBrowserNames) {
+        if (Test-PolicyNameMatch -Segment $leaf -Forbidden $browser) { return $true }
+    }
+    return $false
+}
 
 function Assert-ExactProperties {
     param(
@@ -46,7 +212,303 @@ function Assert-RegularFile {
     if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Label must be a regular non-reparse file"
     }
+    Assert-NoNamedStreams -Path $item.FullName | Out-Null
     return $item
+}
+
+function Assert-NoNamedStreams {
+    param([string]$Path)
+    $data = New-Object AidaC03PackageNative+WIN32_FIND_STREAM_DATA
+    $handle = [AidaC03PackageNative]::FindFirstStreamW($Path, 0, [ref]$data, 0)
+    if ($handle -eq [IntPtr](-1)) {
+        $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($lastError -eq 38) { return 0 }
+        Throw-PackagePolicy -Code 'STREAM_ENUMERATION' -Path $Path
+    }
+    $count = 0
+    try {
+        while ($true) {
+            ++$count
+            if ($count -gt $script:MaximumStreamsPerEntry) {
+                Throw-PackagePolicy -Code 'RESOURCE_STREAM_LIMIT' -Path $Path
+            }
+            if (-not [string]::Equals($data.StreamName, '::$DATA', [StringComparison]::Ordinal)) {
+                Throw-PackagePolicy -Code 'NAMED_STREAM_FORBIDDEN' -Path $Path
+            }
+            $next = New-Object AidaC03PackageNative+WIN32_FIND_STREAM_DATA
+            if (-not [AidaC03PackageNative]::FindNextStreamW($handle, [ref]$next)) {
+                $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                if ($lastError -ne 38) {
+                    Throw-PackagePolicy -Code 'STREAM_ENUMERATION' -Path $Path
+                }
+                break
+            }
+            $data = $next
+        }
+    } finally {
+        [AidaC03PackageNative]::FindClose($handle) | Out-Null
+    }
+    return $count
+}
+
+function Get-DirectoryIdentity {
+    param([string]$Path)
+    $handle = [AidaC03PackageNative]::CreateFileW(
+        $Path, 0, 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+    if ($handle -eq [IntPtr](-1)) {
+        Throw-PackagePolicy -Code 'DIRECTORY_IDENTITY' -Path $Path
+    }
+    try {
+        $information = New-Object AidaC03PackageNative+BY_HANDLE_FILE_INFORMATION
+        if (-not [AidaC03PackageNative]::GetFileInformationByHandle($handle, [ref]$information)) {
+            Throw-PackagePolicy -Code 'DIRECTORY_IDENTITY' -Path $Path
+        }
+        return ([string]$information.VolumeSerialNumber + ':' +
+            ([UInt64]$information.FileIndexHigh).ToString('x8') +
+            ([UInt64]$information.FileIndexLow).ToString('x8'))
+    } finally {
+        [AidaC03PackageNative]::CloseHandle($handle) | Out-Null
+    }
+}
+
+function Get-BoundedTreeInventory {
+    param([string]$Root, [switch]$AllowForbiddenPaths)
+    $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $rootItem = Get-Item -LiteralPath $normalizedRoot -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or
+        ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Throw-PackagePolicy -Code 'REPARSE_POINT' -Path $normalizedRoot
+    }
+    $streamInventories = 1
+    Assert-NoNamedStreams -Path $normalizedRoot | Out-Null
+    $identities = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    if (-not $identities.Add((Get-DirectoryIdentity -Path $normalizedRoot))) {
+        Throw-PackagePolicy -Code 'DIRECTORY_CYCLE' -Path $normalizedRoot
+    }
+    $pending = [Collections.Generic.Queue[object]]::new()
+    $pending.Enqueue([pscustomobject]@{ path = $normalizedRoot; depth = 0 })
+    $files = [Collections.Generic.List[object]]::new()
+    $exactPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $foldedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $directories = 1
+    $entries = 0
+    [Int64]$bytes = 0
+    while ($pending.Count -ne 0) {
+        $current = $pending.Dequeue()
+        foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries([string]$current.path)) {
+            ++$entries
+            if ($entries -gt $script:MaximumPackageEntries) {
+                Throw-PackagePolicy -Code 'RESOURCE_ENTRY_LIMIT' -Path $entryPath
+            }
+            $item = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Throw-PackagePolicy -Code 'REPARSE_POINT' -Path $entryPath
+            }
+            $relative = $item.FullName.Substring($normalizedRoot.Length + 1).Replace('\', '/')
+            if ([Text.Encoding]::UTF8.GetByteCount($relative) -gt $script:MaximumRelativePathBytes) {
+                Throw-PackagePolicy -Code 'RESOURCE_PATH_LIMIT' -Path $relative
+            }
+            if (-not $AllowForbiddenPaths -and
+                (Test-ForbiddenCustomerRelativePath -RelativePath $relative)) {
+                Throw-PackagePolicy -Code 'PATH_POLICY' -Path $relative
+            }
+            if (-not $exactPaths.Add($relative) -or -not $foldedPaths.Add($relative)) {
+                Throw-PackagePolicy -Code 'DUPLICATE_CASE_PATH' -Path $relative
+            }
+            ++$streamInventories
+            Assert-NoNamedStreams -Path $item.FullName | Out-Null
+            if ($item.PSIsContainer) {
+                ++$directories
+                if ($directories -gt $script:MaximumPackageDirectories) {
+                    Throw-PackagePolicy -Code 'RESOURCE_DIRECTORY_LIMIT' -Path $relative
+                }
+                $depth = [int]$current.depth + 1
+                if ($depth -gt $script:MaximumPackageDepth) {
+                    Throw-PackagePolicy -Code 'RESOURCE_DEPTH_LIMIT' -Path $relative
+                }
+                if (-not $identities.Add((Get-DirectoryIdentity -Path $item.FullName))) {
+                    Throw-PackagePolicy -Code 'DIRECTORY_CYCLE' -Path $relative
+                }
+                $pending.Enqueue([pscustomobject]@{ path = $item.FullName; depth = $depth })
+                continue
+            }
+            if ($files.Count -ge $script:MaximumPackageFiles) {
+                Throw-PackagePolicy -Code 'RESOURCE_FILE_LIMIT' -Path $relative
+            }
+            $size = [Int64]$item.Length
+            if ($size -lt 0 -or $size -gt $script:MaximumEntryBytes) {
+                Throw-PackagePolicy -Code 'RESOURCE_FILE_BYTES_LIMIT' -Path $relative
+            }
+            if ($size -gt $script:MaximumAggregateBytes - $bytes) {
+                Throw-PackagePolicy -Code 'RESOURCE_TOTAL_BYTES_LIMIT' -Path $relative
+            }
+            $bytes += $size
+            $files.Add([pscustomobject]@{
+                full_name = $item.FullName
+                relative_path = $relative
+                size_bytes = $size
+            })
+        }
+    }
+    $ordered = @($files | Sort-Object -Property relative_path -CaseSensitive)
+    return [pscustomobject]@{
+        files = $ordered
+        file_count = $ordered.Count
+        directory_count = $directories
+        entry_count = $entries
+        total_size_bytes = $bytes
+        stream_inventory_count = $streamInventories
+    }
+}
+
+function Test-ContainedPath {
+    param([string]$Candidate, [string]$Root)
+    $candidateFull = [IO.Path]::GetFullPath($Candidate).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    return [string]::Equals($candidateFull, $rootFull, [StringComparison]::OrdinalIgnoreCase) -or
+        $candidateFull.StartsWith($rootFull + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Stage-SanitizedCustomerPackage {
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [string]$Anchor,
+        [string]$SpecificationPath
+    )
+    $sourceFull = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $sourceItem = Get-Item -LiteralPath $sourceFull -Force
+    if (-not $sourceItem.PSIsContainer -or
+        ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Throw-PackagePolicy -Code 'STAGE_SOURCE' -Path $sourceFull
+    }
+    [IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($Anchor)) | Out-Null
+    $anchorFull = (Resolve-Path -LiteralPath $Anchor -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $anchorItem = Get-Item -LiteralPath $anchorFull -Force
+    if (-not $anchorItem.PSIsContainer -or
+        ($anchorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Throw-PackagePolicy -Code 'STAGE_ANCHOR' -Path $anchorFull
+    }
+    Assert-NoNamedStreams -Path $anchorFull | Out-Null
+    $destinationFull = [IO.Path]::GetFullPath($Destination).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if ([string]::Equals($destinationFull, $anchorFull, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-ContainedPath -Candidate $destinationFull -Root $anchorFull) -or
+        (Test-ContainedPath -Candidate $sourceFull -Root $anchorFull) -or
+        (Test-ContainedPath -Candidate $anchorFull -Root $sourceFull) -or
+        (Test-ContainedPath -Candidate $sourceFull -Root $destinationFull) -or
+        (Test-ContainedPath -Candidate $destinationFull -Root $sourceFull)) {
+        Throw-PackagePolicy -Code 'STAGE_CONTAINMENT' -Path $destinationFull
+    }
+    if ([IO.Directory]::Exists($destinationFull)) {
+        Get-BoundedTreeInventory -Root $destinationFull -AllowForbiddenPaths | Out-Null
+        [IO.Directory]::Delete($destinationFull, $true)
+    } elseif ([IO.File]::Exists($destinationFull)) {
+        Throw-PackagePolicy -Code 'STAGE_DESTINATION_TYPE' -Path $destinationFull
+    }
+    [IO.Directory]::CreateDirectory($destinationFull) | Out-Null
+    $specification = (Read-StrictJson -Path $SpecificationPath -Label 'distribution manifest spec').value
+    $paths = [Collections.Generic.List[string]]::new()
+    $exactPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $foldedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $addPath = {
+        param([string]$RelativePath)
+        if (Test-ForbiddenCustomerRelativePath -RelativePath $RelativePath) {
+            Throw-PackagePolicy -Code 'PATH_POLICY' -Path $RelativePath
+        }
+        if ($exactPaths.Contains($RelativePath)) { return }
+        if (-not $foldedPaths.Add($RelativePath)) {
+            Throw-PackagePolicy -Code 'DUPLICATE_CASE_PATH' -Path $RelativePath
+        }
+        $exactPaths.Add($RelativePath) | Out-Null
+        $paths.Add($RelativePath)
+    }
+    foreach ($artifact in @($specification.artifacts)) {
+        & $addPath ([string]$artifact.relative_path)
+    }
+    foreach ($inventorySource in @($specification.inventory_sources)) {
+        $type = [string]$inventorySource.type
+        if ($type -eq 'managed_runtime_manifest_v1') {
+            & $addPath ([string]$inventorySource.manifest_relative_path)
+            & $addPath ([string]$inventorySource.digest_relative_path)
+            $manifestPath = Resolve-SafeRelativePath -Root $sourceFull `
+                -RelativePath ([string]$inventorySource.manifest_relative_path) `
+                -Label 'managed runtime stage manifest'
+            $managed = (Read-StrictJson -Path $manifestPath -Label 'managed runtime stage manifest').value
+            foreach ($entry in @($managed.runtime.files) + @($managed.application.files)) {
+                & $addPath ([string]$entry.relative_path)
+            }
+        } elseif ($type -eq 'ghidra_spec_manifest_v1') {
+            & $addPath ([string]$inventorySource.manifest_relative_path)
+            & $addPath ([string]$inventorySource.digest_relative_path)
+            $manifestPath = Resolve-SafeRelativePath -Root $sourceFull `
+                -RelativePath ([string]$inventorySource.manifest_relative_path) `
+                -Label 'Ghidra stage manifest'
+            $ghidra = (Read-StrictJson -Path $manifestPath -Label 'Ghidra stage manifest').value
+            foreach ($entry in @($ghidra.specifications.files)) {
+                foreach ($mirror in @($ghidra.specifications.mirrors)) {
+                    & $addPath (([string]$mirror) + '/' + ([string]$entry.name))
+                }
+            }
+        } elseif ($type -eq 'exact_tree_v1') {
+            $relativeRoot = [string]$inventorySource.relative_root
+            $treeRoot = Resolve-SafeRelativePath -Root $sourceFull -RelativePath $relativeRoot `
+                -Label 'exact customer stage tree'
+            $treeInventory = Get-BoundedTreeInventory -Root $treeRoot
+            $treeEntries = [Collections.Generic.List[object]]::new()
+            foreach ($entry in $treeInventory.files) {
+                $identity = Get-LockedIdentity -Path $entry.full_name -Label 'exact customer stage artifact'
+                $treeEntries.Add([pscustomobject]@{
+                    relative_path = $entry.relative_path
+                    size_bytes = $identity.size_bytes
+                    sha256 = $identity.sha256
+                })
+                & $addPath ($relativeRoot + '/' + [string]$entry.relative_path)
+            }
+            if ($treeEntries.Count -ne [int]$inventorySource.expected_file_count -or
+                [Int64](@($treeEntries | Measure-Object -Property size_bytes -Sum).Sum) -ne
+                    [Int64]$inventorySource.expected_size_bytes -or
+                (Get-CanonicalInventorySha256 -Entries @($treeEntries)) -cne
+                    [string]$inventorySource.expected_inventory_sha256) {
+                Throw-PackagePolicy -Code 'STAGE_EXACT_TREE_IDENTITY' -Path $relativeRoot
+            }
+        } elseif ($type -eq 'allowlisted_files_v1') {
+            foreach ($relativePath in @($inventorySource.relative_paths)) {
+                & $addPath ([string]$relativePath)
+            }
+        } else {
+            Throw-PackagePolicy -Code 'STAGE_SOURCE_TYPE' -Path $type
+        }
+    }
+    if ($paths.Count -gt $script:MaximumPackageFiles) {
+        Throw-PackagePolicy -Code 'RESOURCE_FILE_LIMIT' -Path $destinationFull
+    }
+    $orderedPaths = @($paths | Sort-Object -CaseSensitive)
+    [Int64]$copiedBytes = 0
+    foreach ($relativePath in $orderedPaths) {
+        $sourcePath = Resolve-SafeRelativePath -Root $sourceFull -RelativePath $relativePath `
+            -Label 'customer stage source'
+        $sourceIdentity = Get-LockedIdentity -Path $sourcePath -Label 'customer stage source'
+        if ($sourceIdentity.size_bytes -gt $script:MaximumAggregateBytes - $copiedBytes) {
+            Throw-PackagePolicy -Code 'RESOURCE_TOTAL_BYTES_LIMIT' -Path $relativePath
+        }
+        $destinationPath = [IO.Path]::GetFullPath((Join-Path $destinationFull ($relativePath -replace '/', '\')))
+        $destinationDirectory = Split-Path -Parent $destinationPath
+        [IO.Directory]::CreateDirectory($destinationDirectory) | Out-Null
+        [IO.File]::Copy($sourcePath, $destinationPath, $false)
+        $destinationIdentity = Get-LockedIdentity -Path $destinationPath -Label 'customer stage destination'
+        if ([Int64]$destinationIdentity.size_bytes -ne [Int64]$sourceIdentity.size_bytes -or
+            [string]$destinationIdentity.sha256 -cne [string]$sourceIdentity.sha256) {
+            Throw-PackagePolicy -Code 'STAGE_COPY_IDENTITY' -Path $relativePath
+        }
+        $copiedBytes += [Int64]$destinationIdentity.size_bytes
+    }
+    $staged = Get-BoundedTreeInventory -Root $destinationFull
+    if ($staged.file_count -ne $orderedPaths.Count -or
+        [Int64]$staged.total_size_bytes -ne $copiedBytes) {
+        Throw-PackagePolicy -Code 'STAGE_EXACT_INVENTORY' -Path $destinationFull
+    }
+    return $staged
 }
 
 function Get-LockedIdentity {
@@ -108,8 +570,8 @@ function Resolve-SafeRelativePath {
         [string]$RelativePath,
         [string]$Label
     )
-    if (-not $RelativePath -or [IO.Path]::IsPathRooted($RelativePath) -or $RelativePath.Contains('\') -or
-        $RelativePath.Contains(':') -or ($RelativePath -split '/' | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' })) {
+    if ([IO.Path]::IsPathRooted($RelativePath) -or
+        (Test-ForbiddenCustomerRelativePath -RelativePath $RelativePath)) {
         throw "$Label contains an unsafe relative path"
     }
     $path = [IO.Path]::GetFullPath((Join-Path $Root ($RelativePath -replace '/', '\')))
@@ -237,10 +699,7 @@ function Add-PackageArtifact {
     if ($LicenseIds.Count -gt 128 -or @($LicenseIds | Where-Object { $_ -cnotmatch '^[A-Za-z0-9_.-]{1,256}$' }).Count -ne 0) {
         throw "distribution artifact license identity is invalid: $Id"
     }
-    if ($RelativePath -match '(?i)(?:^|/)(?:camoufox[-_]reverse[-_]mcp|[^/]+\.(?:dist|egg)-info)(?:/|$)' -or
-        $RelativePath -match '(?i)(?:^|/)[^/]+\.(?:py|pyc|pyo|pyz|whl|pth|spec|sln|vcxproj|vcxproj\.filters|pdb|ilk|lib|obj|exp|map|a|nupkg|snupkg|nuspec|targets|props|cs|csproj|fs|fsproj|vb|vbproj)$' -or
-        $RelativePath -match '(?i)(?:^|/)(?:sdk|packs|templates|metadata|library-packs)(?:/|$)' -or
-        $RelativePath -match '(?i)(?:chrome|msedge|stock-firefox)(?:\.exe)?$') {
+    if (Test-ForbiddenCustomerRelativePath -RelativePath $RelativePath) {
         throw "customer package contains a forbidden source, SDK, package, symbol, build artifact, or stock browser: $RelativePath"
     }
     $path = Resolve-SafeRelativePath -Root $Root -RelativePath $RelativePath -Label 'distribution artifact'
@@ -324,11 +783,52 @@ function Assert-SignatureReceipt {
     }
 }
 
+if ($PolicyFixtureReport) {
+    if ($StageCustomerPackage -or $Spec -or $AuthorityLock -or $OutputManifest -or
+        $OutputDigest -or $SourceRoot -or $CustomerStageAnchor) {
+        Throw-PackagePolicy -Code 'FIXTURE_ARGUMENTS' -Path $PackageRoot
+    }
+    $fixtureRoot = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $fixtureReportPath = [IO.Path]::GetFullPath($PolicyFixtureReport)
+    if (Test-ContainedPath -Candidate $fixtureReportPath -Root $fixtureRoot) {
+        Throw-PackagePolicy -Code 'FIXTURE_REPORT_CONTAINMENT' -Path $fixtureReportPath
+    }
+    $fixtureInventory = Get-BoundedTreeInventory -Root $fixtureRoot
+    $fixtureResult = [ordered]@{
+        schema = 'aida.c03.package-policy-fixture.v1'
+        file_count = $fixtureInventory.file_count
+        directory_count = $fixtureInventory.directory_count
+        entry_count = $fixtureInventory.entry_count
+        total_size_bytes = $fixtureInventory.total_size_bytes
+        stream_inventory_count = $fixtureInventory.stream_inventory_count
+        package_root = $fixtureRoot
+    }
+    $fixtureBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
+        (($fixtureResult | ConvertTo-Json -Compress) + "`n"))
+    Write-AtomicBytes -Path $fixtureReportPath -Bytes $fixtureBytes -Replace:$Force
+    $fixtureResult | ConvertTo-Json -Compress
+    return
+}
+
+if (-not $Spec -or -not $AuthorityLock -or -not $OutputManifest -or -not $OutputDigest) {
+    Throw-PackagePolicy -Code 'PRODUCTION_ARGUMENTS' -Path $PackageRoot
+}
+if ($StageCustomerPackage) {
+    if (-not $SourceRoot -or -not $CustomerStageAnchor) {
+        Throw-PackagePolicy -Code 'STAGE_ARGUMENTS' -Path $PackageRoot
+    }
+    Stage-SanitizedCustomerPackage -Source $SourceRoot -Destination $PackageRoot `
+        -Anchor $CustomerStageAnchor -SpecificationPath $Spec | Out-Null
+} elseif ($SourceRoot -or $CustomerStageAnchor) {
+    Throw-PackagePolicy -Code 'STAGE_ARGUMENTS' -Path $PackageRoot
+}
+
 $root = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
 $rootItem = Get-Item -LiteralPath $root -Force
 if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
     throw 'package root must be a regular non-reparse directory'
 }
+$packageInventory = Get-BoundedTreeInventory -Root $root
 $manifestPath = [IO.Path]::GetFullPath($OutputManifest)
 $digestPath = [IO.Path]::GetFullPath($OutputDigest)
 if ([string]::Equals($manifestPath, $digestPath, [StringComparison]::OrdinalIgnoreCase) -or
@@ -363,8 +863,8 @@ if (-not [bool]$specification.distribution.acl_restricted_ipc -or -not [bool]$sp
     -not [bool]$specification.distribution.raw_standalone_download_forbidden -or $specification.distribution.package_layout -ne 'self-contained') {
     throw 'distribution policy is invalid'
 }
-$artifactIds = @{}
-$artifactPaths = @{}
+$artifactIds = [Collections.Generic.Dictionary[string, bool]]::new([StringComparer]::Ordinal)
+$artifactPaths = [Collections.Generic.Dictionary[string, bool]]::new([StringComparer]::Ordinal)
 $materializedArtifacts = [Collections.Generic.List[object]]::new()
 [Int64]$totalArtifactBytes = 0
 foreach ($artifact in @($specification.artifacts)) {
@@ -376,7 +876,7 @@ foreach ($artifact in @($specification.artifacts)) {
 }
 
 $inventorySourceIds = @{}
-$remainderSource = $null
+$allowlistedSource = $null
 foreach ($source in @($specification.inventory_sources)) {
     $sourceType = [string]$source.type
     $sourceId = [string]$source.id
@@ -541,15 +1041,11 @@ foreach ($source in @($specification.inventory_sources)) {
         if (-not $treeItem.PSIsContainer -or ($treeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'exact tree root must be a regular non-reparse directory'
         }
+        $treeInventory = Get-BoundedTreeInventory -Root $treeRoot
         $treeEntries = [Collections.Generic.List[object]]::new()
-        foreach ($entry in Get-ChildItem -LiteralPath $treeRoot -Recurse -Force | Sort-Object -Property FullName -CaseSensitive) {
-            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "exact tree inventory contains a reparse point: $($entry.FullName)"
-            }
-            if ($entry.PSIsContainer) { continue }
-            $relativeInTree = $entry.FullName.Substring($treeRoot.Length + 1).Replace('\', '/')
-            $identity = Get-LockedIdentity -Path $entry.FullName -Label 'exact tree artifact'
-            $treeEntries.Add([pscustomobject]@{ relative_path = $relativeInTree; size_bytes = $identity.size_bytes; sha256 = $identity.sha256 })
+        foreach ($entry in $treeInventory.files) {
+            $identity = Get-LockedIdentity -Path $entry.full_name -Label 'exact tree artifact'
+            $treeEntries.Add([pscustomobject]@{ relative_path = $entry.relative_path; size_bytes = $identity.size_bytes; sha256 = $identity.sha256 })
         }
         $treeBytes = [Int64](@($treeEntries | Measure-Object -Property size_bytes -Sum).Sum)
         if ($treeEntries.Count -ne [int]$source.expected_file_count -or $treeBytes -ne [Int64]$source.expected_size_bytes -or
@@ -575,54 +1071,51 @@ foreach ($source in @($specification.inventory_sources)) {
         if (-not $distinguishedSeen) {
             throw 'exact tree distinguished artifact is absent'
         }
-    } elseif ($sourceType -eq 'remainder_tree_v1') {
-        if ($null -ne $remainderSource) {
-            throw 'distribution manifest spec contains duplicate remainder sources'
+    } elseif ($sourceType -eq 'allowlisted_files_v1') {
+        if ($null -ne $allowlistedSource) {
+            throw 'distribution manifest spec contains duplicate allowlisted file sources'
         }
-        Assert-ExactProperties -Value $source -Expected @('distinguished_artifact_id', 'distinguished_relative_path', 'expected_maximum_file_count', 'expected_minimum_file_count', 'id', 'id_prefix', 'kind', 'license_ids', 'owner', 'type') -Label 'remainder inventory source'
-        $remainderSource = $source
+        Assert-ExactProperties -Value $source -Expected @('distinguished_artifact_id', 'distinguished_relative_path', 'expected_file_count', 'id', 'id_prefix', 'kind', 'license_ids', 'owner', 'relative_paths', 'type') -Label 'allowlisted file inventory source'
+        $allowlistedSource = $source
     } else {
         throw "distribution manifest spec contains an unsupported inventory source type: $sourceType"
     }
 }
 
-if ($null -eq $remainderSource) {
-    throw 'distribution manifest spec lacks the bounded remainder inventory source'
+if ($null -eq $allowlistedSource) {
+    throw 'distribution manifest spec lacks the exact allowlisted file inventory source'
 }
-$remainderEntries = [Collections.Generic.List[object]]::new()
-foreach ($entry in Get-ChildItem -LiteralPath $root -Recurse -Force | Sort-Object -Property FullName -CaseSensitive) {
-    if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "package remainder contains a reparse point: $($entry.FullName)"
+$allowlistedPaths = @($allowlistedSource.relative_paths | ForEach-Object { [string]$_ })
+if ($allowlistedPaths.Count -ne [int]$allowlistedSource.expected_file_count -or
+    $allowlistedPaths.Count -ne 13) {
+    throw 'allowlisted customer file count violates its exact contract'
+}
+$allowlistedSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$allowlistedFolded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$allowlistedIndex = 0
+$allowlistedDistinguishedSeen = $false
+foreach ($relativePath in $allowlistedPaths) {
+    if ((Test-ForbiddenCustomerRelativePath -RelativePath $relativePath) -or
+        -not $allowlistedSeen.Add($relativePath) -or
+        -not $allowlistedFolded.Add($relativePath)) {
+        throw 'allowlisted customer file path is unsafe, duplicated, or case-colliding'
     }
-    if ($entry.PSIsContainer) { continue }
-    $relative = $entry.FullName.Substring($root.Length + 1).Replace('\', '/')
-    if (-not $artifactPaths.ContainsKey($relative)) {
-        $remainderEntries.Add([pscustomobject]@{ path = $entry.FullName; relative_path = $relative })
-    }
-}
-if ($remainderEntries.Count -lt [int]$remainderSource.expected_minimum_file_count -or
-    $remainderEntries.Count -gt [int]$remainderSource.expected_maximum_file_count) {
-    throw 'package remainder file count violates its bounded contract'
-}
-$remainderIndex = 0
-$remainderDistinguishedSeen = $false
-foreach ($entry in @($remainderEntries | Sort-Object -Property relative_path -CaseSensitive)) {
-    if ([string]$entry.relative_path -ceq [string]$remainderSource.distinguished_relative_path) {
-        $artifactId = [string]$remainderSource.distinguished_artifact_id
+    if ($relativePath -ceq [string]$allowlistedSource.distinguished_relative_path) {
+        $artifactId = [string]$allowlistedSource.distinguished_artifact_id
         $artifactKind = 'application'
-        $remainderDistinguishedSeen = $true
+        $allowlistedDistinguishedSeen = $true
     } else {
-        $artifactId = ([string]$remainderSource.id_prefix) + '-' + ('{0:D4}' -f $remainderIndex)
-        $artifactKind = [string]$remainderSource.kind
+        $artifactId = ([string]$allowlistedSource.id_prefix) + '-' + ('{0:D4}' -f $allowlistedIndex)
+        $artifactKind = [string]$allowlistedSource.kind
     }
     Add-PackageArtifact -Ids $artifactIds -Paths $artifactPaths -Output $materializedArtifacts `
         -TotalBytes ([ref]$totalArtifactBytes) -Root $root -Id $artifactId -Kind $artifactKind `
-        -RelativePath ([string]$entry.relative_path) -Owner ([string]$remainderSource.owner) `
-        -LicenseIds @($remainderSource.license_ids | ForEach-Object { [string]$_ })
-    ++$remainderIndex
+        -RelativePath $relativePath -Owner ([string]$allowlistedSource.owner) `
+        -LicenseIds @($allowlistedSource.license_ids | ForEach-Object { [string]$_ })
+    ++$allowlistedIndex
 }
-if (-not $remainderDistinguishedSeen) {
-    throw 'protected standalone executable is absent from the package remainder'
+if (-not $allowlistedDistinguishedSeen) {
+    throw 'protected standalone executable is absent from the exact allowlist'
 }
 $standaloneArtifact = Get-ArtifactById -Artifacts $materializedArtifacts -Id 'standalone-executable' -Label 'standalone executable'
 $standaloneProtectorArtifact = Get-ArtifactById -Artifacts $materializedArtifacts -Id 'standalone-protector' -Label 'standalone protector receipt'
@@ -637,7 +1130,7 @@ Assert-ProtectorReceipt -Root $root -ReceiptArtifact $standaloneProtectorArtifac
 Assert-SignatureReceipt -Root $root -ReceiptArtifact $standaloneSignatureArtifact -ExecutableArtifact $standaloneArtifact
 
 $expectedWorkers = @{
-    native_decompiler = @('aida-native-decompiler', 2, 2, 'native')
+    native_decompiler = @('aida-native-decompiler', 3, 2, 'native')
     managed_cli_decompiler = @('aida-managed-cli-decompiler', 3, 3, 'managed')
     analysis_python = @('aida-analysis-python', 1, 1, 'analysis_python')
 }
@@ -816,19 +1309,12 @@ if ($specification.customer_sidecars.only_supported_browser -ne 'camoufox' -or
     $specification.customer_sidecars.environment.AIDA_CAMOUFOX_PYTHON -ne 'unset-unless-verified-sidecar-runtime') {
     throw 'customer sidecar policy is incomplete or weakened'
 }
-$actualPaths = @{}
-foreach ($entry in Get-ChildItem -LiteralPath $root -Recurse -Force) {
-    if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "package inventory contains a reparse point: $($entry.FullName)"
-    }
-    if ($entry.PSIsContainer) {
-        continue
-    }
-    $relative = $entry.FullName.Substring($root.Length + 1).Replace('\', '/')
-    if ($actualPaths.ContainsKey($relative)) {
+$actualPaths = [Collections.Generic.Dictionary[string, bool]]::new([StringComparer]::Ordinal)
+foreach ($entry in $packageInventory.files) {
+    if ($actualPaths.ContainsKey([string]$entry.relative_path)) {
         throw 'package inventory contains a duplicate path'
     }
-    $actualPaths[$relative] = $true
+    $actualPaths[[string]$entry.relative_path] = $true
 }
 if ($actualPaths.Count -ne $artifactPaths.Count) {
     throw "package inventory count mismatch: expected=$($artifactPaths.Count) actual=$($actualPaths.Count)"
@@ -837,6 +1323,9 @@ foreach ($relative in $actualPaths.Keys) {
     if (-not $artifactPaths.ContainsKey($relative)) {
         throw "package inventory contains an unlisted file: $relative"
     }
+}
+if ([Int64]$packageInventory.total_size_bytes -ne [Int64]$totalArtifactBytes) {
+    throw 'package inventory byte count differs from its exact artifact inventory'
 }
 $result = [ordered]@{
     schema = 'aida.c03.distribution-manifest'
@@ -865,6 +1354,10 @@ if ($manifestIdentity.sha256 -ne $manifestDigest -or (Get-Content -LiteralPath $
 }
 [pscustomobject]@{
     artifact_count = $materializedArtifacts.Count
+    directory_count = $packageInventory.directory_count
+    entry_count = $packageInventory.entry_count
+    total_size_bytes = $packageInventory.total_size_bytes
+    stream_inventory_count = $packageInventory.stream_inventory_count
     manifest = $manifestPath
     manifest_sha256 = $manifestDigest
     package_root = $root

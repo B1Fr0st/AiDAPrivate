@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace aida {
@@ -23,7 +25,8 @@ namespace claude_code {
 		"user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 	constexpr int OAUTH_TIMEOUT_SECONDS = 300;
 
-	struct claude_code_login_state_t {
+	struct claude_code_login_state_t : std::enable_shared_from_this<claude_code_login_state_t> {
+		mutable std::mutex mutex;
 		std::string verifier;
 		std::string challenge;
 		std::string state;
@@ -34,7 +37,7 @@ namespace claude_code {
 		std::string received_code;
 		std::string received_state;
 		std::string error;
-		void* listener_handle = nullptr;
+		std::shared_ptr<void> listener_handle;
 		int64_t started_unix = 0;
 
 		claude_code_login_state_t() = default;
@@ -42,7 +45,22 @@ namespace claude_code {
 		claude_code_login_state_t& operator=(const claude_code_login_state_t&) = delete;
 	};
 
-	bool start_login(claude_code_login_state_t& state);
+	struct claude_code_login_snapshot_t {
+		std::string verifier;
+		std::string challenge;
+		std::string state;
+		std::string auth_url;
+		int port = 0;
+		bool done = false;
+		bool cancelled = false;
+		std::string received_code;
+		std::string received_state;
+		std::string error;
+		bool listener_active = false;
+		int64_t started_unix = 0;
+	};
+
+	bool start_login(claude_code_login_state_t& state, std::uint64_t absolute_deadline_ms = 0);
 	bool poll_login(claude_code_login_state_t& state);
 	bool cancel_login(claude_code_login_state_t& state);
 	bool refresh_token();
@@ -50,7 +68,8 @@ namespace claude_code {
 	bool revoke_tokens(const std::string& access_token,
 		const std::string& refresh_token_value,
 		const std::string& client_id_override);
-	const std::string& last_error();
+	claude_code_login_snapshot_t snapshot(const claude_code_login_state_t& state);
+	std::string last_error();
 
 }
 }

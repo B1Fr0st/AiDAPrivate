@@ -6986,48 +6986,57 @@ static aida::ui::components::status_kind_t network_header_status(const state_t& 
 
 static void render_network_status_bar(state_t& state, ImVec2 pos, float width, bool has_target) {
     ImGui::SetCursorPos(pos);
-    bool visible = aida::ui::components::begin_status_bar("##network_status_bar");
-    if (visible) {
-        uint32_t attached_pid = driver_bridge::attached_pid();
-        char pid_text[24] = {};
-        if (attached_pid != 0)
-            std::snprintf(pid_text, sizeof(pid_text), "%u", static_cast<unsigned>(attached_pid));
-        else
-            std::snprintf(pid_text, sizeof(pid_text), "none");
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    bool region_visible = ImGui::BeginChild("##network_status_region",
+        ImVec2(width, aida::ui::metrics::status_bar::height), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    if (region_visible) {
+        ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+        bool visible = aida::ui::components::begin_status_bar("##network_status_bar");
+        if (visible) {
+            uint32_t attached_pid = driver_bridge::attached_pid();
+            char pid_text[24] = {};
+            if (attached_pid != 0)
+                std::snprintf(pid_text, sizeof(pid_text), "%u", static_cast<unsigned>(attached_pid));
+            else
+                std::snprintf(pid_text, sizeof(pid_text), "none");
 
-        bool capture_running = state.cap_running.load(std::memory_order_acquire);
-        bool capture_pending = state.cap_start_pending.load(std::memory_order_acquire) ||
-                               state.cap_stop_pending.load(std::memory_order_acquire);
-        const char* capture_text = capture_pending ? "transitioning" : capture_running ? "running" : "idle";
-        aida::ui::components::status_kind_t capture_kind = capture_pending
-            ? aida::ui::components::status_kind_t::info
-            : capture_running ? aida::ui::components::status_kind_t::success
-                              : aida::ui::components::status_kind_t::neutral;
+            bool capture_running = state.cap_running.load(std::memory_order_acquire);
+            bool capture_pending = state.cap_start_pending.load(std::memory_order_acquire) ||
+                                   state.cap_stop_pending.load(std::memory_order_acquire);
+            const char* capture_text = capture_pending ? "transitioning" : capture_running ? "running" : "idle";
+            aida::ui::components::status_kind_t capture_kind = capture_pending
+                ? aida::ui::components::status_kind_t::info
+                : capture_running ? aida::ui::components::status_kind_t::success
+                                  : aida::ui::components::status_kind_t::neutral;
 
-        size_t packet_count = 0;
-        {
-            std::lock_guard<std::mutex> lock(state.cap_mutex);
-            packet_count = state.captured_packets.size();
+            size_t packet_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(state.cap_mutex);
+                packet_count = state.captured_packets.size();
+            }
+            char packet_text[32] = {};
+            std::snprintf(packet_text, sizeof(packet_text), "%zu", packet_count);
+
+            aida::ui::components::status_item("target", "Target", pid_text,
+                has_target ? aida::ui::components::status_kind_t::success
+                           : aida::ui::components::status_kind_t::warning);
+            aida::ui::components::status_item("capture", "Capture", capture_text, capture_kind);
+            if (width >= 620.f)
+                aida::ui::components::status_item("packets", "Packets", packet_text,
+                    packet_count > 0 ? aida::ui::components::status_kind_t::info
+                                     : aida::ui::components::status_kind_t::neutral);
+            if (width >= 820.f) {
+                int tab_index = std::clamp(static_cast<int>(state.active_tab), 0,
+                    static_cast<int>(sub_tab_t::COUNT) - 1);
+                aida::ui::components::status_item("tool", "Tool", tab_names[tab_index],
+                    aida::ui::components::status_kind_t::accent, false, false);
+            }
         }
-        char packet_text[32] = {};
-        std::snprintf(packet_text, sizeof(packet_text), "%zu", packet_count);
-
-        aida::ui::components::status_item("target", "Target", pid_text,
-            has_target ? aida::ui::components::status_kind_t::success
-                       : aida::ui::components::status_kind_t::warning);
-        aida::ui::components::status_item("capture", "Capture", capture_text, capture_kind);
-        if (width >= 620.f)
-            aida::ui::components::status_item("packets", "Packets", packet_text,
-                packet_count > 0 ? aida::ui::components::status_kind_t::info
-                                 : aida::ui::components::status_kind_t::neutral);
-        if (width >= 820.f) {
-            int tab_index = std::clamp(static_cast<int>(state.active_tab), 0,
-                static_cast<int>(sub_tab_t::COUNT) - 1);
-            aida::ui::components::status_item("tool", "Tool", tab_names[tab_index],
-                aida::ui::components::status_kind_t::accent, false, false);
-        }
+        aida::ui::components::end_status_bar();
     }
-    aida::ui::components::end_status_bar();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
 }
 
 
@@ -7089,9 +7098,19 @@ void render(float pos_x, float pos_y, float width, float height,
         : nullptr;
 
     ImGui::SetCursorPos(ImVec2(outer_pad, outer_pad));
-    aida::ui::components::view_header_result_t header = aida::ui::components::view_header(
-        "Network", subtitle, primary_action, secondary_action,
-        network_header_status(g_state, has_target));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    bool header_visible = ImGui::BeginChild("##network_header_region",
+        ImVec2(inner_width, aida::ui::metrics::panel::view_header_h), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    aida::ui::components::view_header_result_t header;
+    if (header_visible) {
+        ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+        header = aida::ui::components::view_header(
+            "Network", subtitle, primary_action, secondary_action,
+            network_header_status(g_state, has_target));
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
     if (header.primary_clicked) {
         if (capture_running)
             request_capture_stop(g_state);
@@ -7104,7 +7123,8 @@ void render(float pos_x, float pos_y, float width, float height,
         g_state.content_fade = 0.f;
     }
 
-    const float nav_y = ImGui::GetCursorPosY();
+    const float nav_y = outer_pad + aida::ui::metrics::panel::view_header_h +
+        aida::ui::metrics::spacing::sm;
     const float status_h = aida::ui::metrics::status_bar::height;
     const float status_y = root_size.y - outer_pad - status_h;
     const float content_bottom = status_y - aida::ui::metrics::spacing::sm;
@@ -7161,106 +7181,106 @@ void render(float pos_x, float pos_y, float width, float height,
             render_capture(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::intercept:
-            render_intercept(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_intercept(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::proxy:
-            render_proxy(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_proxy(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::dns:
-            render_dns(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_dns(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::filters:
-            render_filters(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_filters(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::bandwidth:
-            render_bandwidth(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_bandwidth(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::repeater:
-            render_repeater(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_repeater(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::keylog:
-            render_keylog(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_keylog(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::pcap_export:
-            render_pcap_export(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_pcap_export(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::fuzzer:
-            render_fuzzer(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_fuzzer(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::offensive:
-            render_offensive(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_offensive(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::websocket:
-            render_websocket(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_websocket(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::scripting:
-            render_scripting(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_scripting(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::decoder:
-            render_decoder(g_state, pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            render_decoder(g_state, outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::sitemap:
-            aida::burp::sitemap::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::sitemap::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::scope:
-            aida::burp::scope::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::scope::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::cookies:
-            aida::burp::cookie_jar::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::cookie_jar::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::scanner:
-            aida::burp::scanner_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::scanner_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::recon:
-            aida::burp::recon_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::recon_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::intruder:
-            aida::burp::intruder_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::intruder_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::collab:
-            aida::burp::collaborator_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::collaborator_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::sequencer:
-            aida::burp::sequencer_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::sequencer_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::comparer:
-            aida::burp::comparer_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::comparer_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::jwt:
-            aida::burp::jwt_lab_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::jwt_lab_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::mr:
-            aida::burp::match_replace_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::match_replace_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::session:
-            aida::burp::session_handler_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::session_handler_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::api:
-            aida::burp::api_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::api_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::ws_edit:
-            aida::burp::ws_editor_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::ws_editor_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::h2_edit:
-            aida::burp::h2_editor_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::h2_editor_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::logger:
-            aida::burp::logger_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::logger_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::csp:
-            aida::burp::csp::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::csp::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::upstream:
-            aida::burp::upstream::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::upstream::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::browser:
-            aida::burp::browser::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::browser::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::reports:
-            aida::burp::report_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::report_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         case sub_tab_t::headless:
-            aida::burp::headless_view::render(pos_x, content_y, width, content_h, ca, accent_r, accent_g, accent_b);
+            aida::burp::headless_view::render(outer_pad, content_y, inner_width, content_h, ca, accent_r, accent_g, accent_b);
             break;
         default:
             break;
@@ -7268,6 +7288,9 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(8);
+
+    render_network_status_bar(g_state, ImVec2(outer_pad, status_y), inner_width, has_target);
+    ImGui::EndChild();
 }
 
 }
