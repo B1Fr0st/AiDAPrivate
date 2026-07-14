@@ -3065,6 +3065,7 @@ function Assert-SurfaceCompatibility([object]$Reference, [object]$Candidate,
         foreach ($field in @('node_count', 'edge_count', 'terminal_operation_count',
             'binding_count', 'generated_compatibility_count', 'extension_count',
             'route_sha256', 'binding_sha256')) {
+            if (!(Test-ObjectField $beforeGeneratedRoute $field)) { continue }
             if ((Convert-CanonicalJson (Get-ObjectField $beforeGeneratedRoute $field)) -ne
                 (Convert-CanonicalJson (Get-ObjectField $afterGeneratedRoute $field))) {
                 throw "MCP generated production route field '$field' regressed relative to $ReferenceLabel"

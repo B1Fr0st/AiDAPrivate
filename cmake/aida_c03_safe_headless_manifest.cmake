@@ -954,6 +954,47 @@ function(aida_c03_register_worker_targets application_target)
     set(AIDA_C03_MANAGED_FIXTURE_DLL "${AIDA_C03_MANAGED_FIXTURE_DLL}" PARENT_SCOPE)
 endfunction()
 
+function(aida_c03_validate_canonical_regular_file output_path output_sha256 input_path descriptor)
+    if("${input_path}" STREQUAL "" OR
+       NOT IS_ABSOLUTE "${input_path}" OR
+       NOT EXISTS "${input_path}" OR
+       IS_DIRECTORY "${input_path}" OR
+       IS_SYMLINK "${input_path}")
+        message(FATAL_ERROR "AiDA C03 ${descriptor} must be an absolute non-reparse regular file: ${input_path}")
+    endif()
+    cmake_path(SET _aida_candidate NORMALIZE "${input_path}")
+    get_filename_component(_aida_real_path "${_aida_candidate}" REALPATH)
+    cmake_path(SET _aida_real_candidate NORMALIZE "${_aida_real_path}")
+    string(TOLOWER "${_aida_candidate}" _aida_candidate_comparison)
+    string(TOLOWER "${_aida_real_candidate}" _aida_real_comparison)
+    if(NOT _aida_candidate_comparison STREQUAL _aida_real_comparison)
+        message(FATAL_ERROR "AiDA C03 ${descriptor} must resolve without a reparse or noncanonical path transition: ${input_path}")
+    endif()
+    file(SHA256 "${_aida_real_candidate}" _aida_sha256)
+    string(TOUPPER "${_aida_sha256}" _aida_sha256)
+    set(${output_path} "${_aida_real_candidate}" PARENT_SCOPE)
+    set(${output_sha256} "${_aida_sha256}" PARENT_SCOPE)
+endfunction()
+
+function(aida_c03_validate_canonical_directory output_path input_path descriptor)
+    if("${input_path}" STREQUAL "" OR
+       NOT IS_ABSOLUTE "${input_path}" OR
+       NOT EXISTS "${input_path}" OR
+       NOT IS_DIRECTORY "${input_path}" OR
+       IS_SYMLINK "${input_path}")
+        message(FATAL_ERROR "AiDA C03 ${descriptor} must be an absolute non-reparse directory: ${input_path}")
+    endif()
+    cmake_path(SET _aida_candidate NORMALIZE "${input_path}")
+    get_filename_component(_aida_real_path "${_aida_candidate}" REALPATH)
+    cmake_path(SET _aida_real_candidate NORMALIZE "${_aida_real_path}")
+    string(TOLOWER "${_aida_candidate}" _aida_candidate_comparison)
+    string(TOLOWER "${_aida_real_candidate}" _aida_real_comparison)
+    if(NOT _aida_candidate_comparison STREQUAL _aida_real_comparison)
+        message(FATAL_ERROR "AiDA C03 ${descriptor} must resolve without a reparse or noncanonical path transition: ${input_path}")
+    endif()
+    set(${output_path} "${_aida_real_candidate}" PARENT_SCOPE)
+endfunction()
+
 function(aida_c03_register_safe_headless_targets application_target)
     if(NOT WIN32 OR NOT MSVC OR NOT TARGET "${application_target}")
         message(FATAL_ERROR "AiDA C03 safe-headless registration requires the Windows MSVC standalone target")
@@ -964,6 +1005,80 @@ function(aida_c03_register_safe_headless_targets application_target)
     if(NOT Python3_Interpreter_FOUND OR NOT Python3_EXECUTABLE)
         message(FATAL_ERROR "AiDA C03 safe-headless materialization requires the pinned local Python interpreter")
     endif()
+    aida_c03_validate_canonical_regular_file(
+        _aida_python_executable
+        _aida_python_sha256
+        "${Python3_EXECUTABLE}"
+        "Python interpreter")
+    if(NOT DEFINED ENV{SystemRoot} OR "$ENV{SystemRoot}" STREQUAL "")
+        message(FATAL_ERROR "AiDA C03 authority reproduction requires the canonical Windows system root")
+    endif()
+    aida_c03_validate_canonical_directory(
+        _aida_system_root
+        "$ENV{SystemRoot}"
+        "Windows system root")
+    aida_c03_validate_canonical_regular_file(
+        _aida_system_powershell
+        _aida_system_powershell_sha256
+        "${_aida_system_root}/System32/WindowsPowerShell/v1.0/powershell.exe"
+        "Windows system PowerShell interpreter")
+    set(_aida_authority_archive "C:/Users/ruar1337/ida-pro-mcp.zip")
+    aida_c03_validate_canonical_regular_file(
+        _aida_authority_archive
+        _aida_authority_archive_sha256
+        "${_aida_authority_archive}"
+        "pinned ida-pro-mcp archive")
+    if(NOT _aida_authority_archive_sha256 STREQUAL "3F7E7D9F534E3534C191D21251BBF0788DB14376C659488EA61681D48BC8D0F7")
+        message(FATAL_ERROR "AiDA C03 pinned ida-pro-mcp archive SHA-256 is invalid")
+    endif()
+    set(_aida_authority_repository_files
+        "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py"
+        "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json"
+        "${CMAKE_SOURCE_DIR}/tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py"
+        "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1"
+        "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/standalone_surface_baseline.json"
+        "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/standalone_surface_final.json"
+        "${CMAKE_SOURCE_DIR}/src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json"
+        "${CMAKE_SOURCE_DIR}/src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json"
+        "${CMAKE_SOURCE_DIR}/src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json"
+        "${CMAKE_SOURCE_DIR}/src/standalone/src/core/mcp/compat/ida_contracts_generated.hpp"
+        "${CMAKE_SOURCE_DIR}/src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp")
+    aida_c03_require_sources("authority and surface reproduction" ${_aida_authority_repository_files})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        ${_aida_authority_repository_files}
+        "${_aida_python_executable}"
+        "${_aida_system_powershell}"
+        "${_aida_authority_archive}")
+    set(_aida_authority_identity_material "aida-c03-authority-surface-reproduction-v1")
+    foreach(_aida_authority_file IN LISTS _aida_authority_repository_files)
+        file(SHA256 "${_aida_authority_file}" _aida_authority_file_sha256)
+        string(TOUPPER "${_aida_authority_file_sha256}" _aida_authority_file_sha256)
+        file(RELATIVE_PATH _aida_authority_relative "${CMAKE_SOURCE_DIR}" "${_aida_authority_file}")
+        string(REPLACE "\\" "/" _aida_authority_relative "${_aida_authority_relative}")
+        string(APPEND _aida_authority_identity_material
+            "|${_aida_authority_relative}=${_aida_authority_file_sha256}")
+    endforeach()
+    string(APPEND _aida_authority_identity_material
+        "|python=${_aida_python_executable}:${_aida_python_sha256}"
+        "|powershell=${_aida_system_powershell}:${_aida_system_powershell_sha256}"
+        "|archive=${_aida_authority_archive}:${_aida_authority_archive_sha256}")
+    string(SHA256 _aida_authority_identity "${_aida_authority_identity_material}")
+    string(TOUPPER "${_aida_authority_identity}" _aida_authority_identity)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py" _aida_authority_verifier_sha256)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json" _aida_authority_ledger_sha256)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py" _aida_contract_generator_sha256)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1" _aida_surface_generator_sha256)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/standalone_surface_baseline.json" _aida_surface_baseline_sha256)
+    file(SHA256 "${CMAKE_SOURCE_DIR}/src/standalone/tests/analysis_workspace/standalone_surface_final.json" _aida_surface_final_sha256)
+    foreach(_aida_hash_variable IN ITEMS
+            _aida_authority_verifier_sha256
+            _aida_authority_ledger_sha256
+            _aida_contract_generator_sha256
+            _aida_surface_generator_sha256
+            _aida_surface_baseline_sha256
+            _aida_surface_final_sha256)
+        string(TOUPPER "${${_aida_hash_variable}}" ${_aida_hash_variable})
+    endforeach()
     set_property(GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGETS "")
     set_property(GLOBAL PROPERTY AIDA_C03_MANIFEST_TARGET_RECORDS "")
     set_property(GLOBAL PROPERTY AIDA_C03_DIRECT_TARGETS "")
@@ -1333,14 +1448,24 @@ function(aida_c03_register_safe_headless_targets application_target)
 
     set(_aida_policy_runtime
         "src/standalone/src/main.cpp"
-        "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp"
         "deploy_to_server.ps1"
         "src/standalone/src/core/auth/auth_browser_launch.hpp"
         "src/standalone/src/core/testlab/test_lab_features_c03_safe_headless.cpp"
         "src/standalone/tests/c03/testlab_runtime/materialize_safe_headless_manifest.py"
         "cmake/aida_c03_safe_headless_manifest.cmake"
         "cmake/c03_safe_headless/target_resource_policy_cases.json"
-        "cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp")
+        "cmake/c03_safe_headless/decompiler_quality_pipeline_main.cpp"
+        "tools/c03_authority/verify_authority_surface_ledger.py"
+        "tools/c03_authority/authority_surface_ledger.json"
+        "tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py"
+        "src/standalone/tests/analysis_workspace/generate_surface_manifest.ps1"
+        "src/standalone/tests/analysis_workspace/standalone_surface_baseline.json"
+        "src/standalone/tests/analysis_workspace/standalone_surface_final.json"
+        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/contracts.json"
+        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/effect_ledger.json"
+        "src/standalone/src/resources/mcp/ida_pro_mcp_2_0_0/archive_manifest.json"
+        "src/standalone/src/core/mcp/compat/ida_contracts_generated.hpp"
+        "src/standalone/src/core/mcp/compat/ida_contracts_generated.cpp")
     foreach(_aida_relative IN LISTS _aida_policy_runtime)
         aida_c03_stage_runtime_file("${CMAKE_SOURCE_DIR}/${_aida_relative}" "${_aida_relative}")
     endforeach()
@@ -1433,6 +1558,12 @@ function(aida_c03_register_safe_headless_targets application_target)
     set_target_properties(aida_c03_safe_headless_runtime_files PROPERTIES
         FOLDER "Tests/C03/SafeHeadless"
         AIDA_C03_SAFE_HEADLESS TRUE
+        AIDA_C03_AUTHORITY_SURFACE_IDENTITY "${_aida_authority_identity}"
+        AIDA_C03_AUTHORITY_LEDGER_SHA256 "${_aida_authority_ledger_sha256}"
+        AIDA_C03_AUTHORITY_VERIFIER_SHA256 "${_aida_authority_verifier_sha256}"
+        AIDA_C03_SURFACE_GENERATOR_SHA256 "${_aida_surface_generator_sha256}"
+        AIDA_C03_SURFACE_BASELINE_SHA256 "${_aida_surface_baseline_sha256}"
+        AIDA_C03_SURFACE_FINAL_SHA256 "${_aida_surface_final_sha256}"
         LABELS "c03;c03_safe_headless;safe-headless;fixtures")
 
     file(SHA256 "${AIDA_C03_SAFE_HEADLESS_INVENTORY}" _aida_contract_identity)
@@ -1446,7 +1577,7 @@ function(aida_c03_register_safe_headless_targets application_target)
     string(TOLOWER "${_aida_contract_identity}" _aida_contract_identity)
     string(TOLOWER "${_aida_assertion_inventory_identity}" _aida_assertion_inventory_identity)
     string(SHA256 _aida_build_identity
-        "aida-c03-safe-headless|${_aida_contract_identity}|${_aida_assertion_inventory_identity}|${_aida_materializer_identity}|${_aida_resource_policy_cases_identity}|${_aida_root_cmake_identity}|${_aida_manifest_cmake_identity}|${_aida_dependency_cmake_identity}|${_aida_package_cmake_identity}")
+        "aida-c03-safe-headless|${_aida_contract_identity}|${_aida_assertion_inventory_identity}|${_aida_materializer_identity}|${_aida_resource_policy_cases_identity}|${_aida_root_cmake_identity}|${_aida_manifest_cmake_identity}|${_aida_dependency_cmake_identity}|${_aida_package_cmake_identity}|${_aida_authority_identity}")
     string(TOLOWER "${_aida_build_identity}" _aida_build_identity)
     add_custom_command(OUTPUT "${AIDA_C03_SAFE_HEADLESS_MANIFEST}" "${AIDA_C03_SAFE_HEADLESS_DIGEST}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"
@@ -1489,6 +1620,19 @@ function(aida_c03_register_safe_headless_targets application_target)
         AIDA_C03_SAFE_HEADLESS TRUE
         AIDA_C03_PACKAGE_OUTPUTS "c03-safe-headless/manifest.json;c03-safe-headless/manifest.sha256"
         AIDA_C03_ASSERTION_INVENTORY_SHA256 "${_aida_assertion_inventory_identity}"
+        AIDA_C03_AUTHORITY_SURFACE_IDENTITY "${_aida_authority_identity}"
+        AIDA_C03_AUTHORITY_LEDGER_SHA256 "${_aida_authority_ledger_sha256}"
+        AIDA_C03_AUTHORITY_VERIFIER_SHA256 "${_aida_authority_verifier_sha256}"
+        AIDA_C03_CONTRACT_GENERATOR_SHA256 "${_aida_contract_generator_sha256}"
+        AIDA_C03_SURFACE_GENERATOR_SHA256 "${_aida_surface_generator_sha256}"
+        AIDA_C03_SURFACE_BASELINE_SHA256 "${_aida_surface_baseline_sha256}"
+        AIDA_C03_SURFACE_FINAL_SHA256 "${_aida_surface_final_sha256}"
+        AIDA_C03_PYTHON_EXECUTABLE "${_aida_python_executable}"
+        AIDA_C03_PYTHON_SHA256 "${_aida_python_sha256}"
+        AIDA_C03_POWERSHELL_EXECUTABLE "${_aida_system_powershell}"
+        AIDA_C03_POWERSHELL_SHA256 "${_aida_system_powershell_sha256}"
+        AIDA_C03_MCP_ARCHIVE "${_aida_authority_archive}"
+        AIDA_C03_MCP_ARCHIVE_SHA256 "${_aida_authority_archive_sha256}"
         LABELS "c03;c03_safe_headless;safe-headless;manifest")
 
     add_custom_target(aida_c03_safe_headless_application_package
@@ -1503,6 +1647,10 @@ function(aida_c03_register_safe_headless_targets application_target)
     set_target_properties(aida_c03_safe_headless_application_package PROPERTIES
         FOLDER "Packaging/C03"
         AIDA_C03_SAFE_HEADLESS TRUE
+        AIDA_C03_AUTHORITY_SURFACE_IDENTITY "${_aida_authority_identity}"
+        AIDA_C03_PYTHON_SHA256 "${_aida_python_sha256}"
+        AIDA_C03_POWERSHELL_SHA256 "${_aida_system_powershell_sha256}"
+        AIDA_C03_MCP_ARCHIVE_SHA256 "${_aida_authority_archive_sha256}"
         LABELS "c03;c03_safe_headless;safe-headless;package")
     add_dependencies(${application_target} aida_c03_safe_headless_application_package)
     target_include_directories(${application_target} PRIVATE "${AIDA_C03_SAFE_HEADLESS_GENERATED_ROOT}")
@@ -1687,17 +1835,18 @@ function(aida_c03_register_safe_headless_targets application_target)
             ${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET})
     endif()
 
-    add_test(NAME aida_c03_mcp_contract_generator_reproduction
+    add_test(NAME aida_c03_authority_surface_reproduction
         COMMAND "${Python3_EXECUTABLE}"
-            "${CMAKE_SOURCE_DIR}/tools/generate_ida_mcp_contracts/generate_ida_mcp_contracts.py"
-            --archive "C:/Users/ruar1337/ida-pro-mcp.zip"
-            --repo-root "${CMAKE_SOURCE_DIR}"
-            --check)
-    set_tests_properties(aida_c03_mcp_contract_generator_reproduction PROPERTIES
+            "${CMAKE_SOURCE_DIR}/tools/c03_authority/verify_authority_surface_ledger.py"
+            --repository-root "${CMAKE_SOURCE_DIR}"
+            --ledger "${CMAKE_SOURCE_DIR}/tools/c03_authority/authority_surface_ledger.json"
+            --archive "${_aida_authority_archive}"
+            --powershell "${_aida_system_powershell}")
+    set_tests_properties(aida_c03_authority_surface_reproduction PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        TIMEOUT 120
-        LABELS "c03;c03_safe_headless;safe-headless;mcp;contract-reproduction"
-        RESOURCE_LOCK "aida_c03_contract_reproduction")
+        TIMEOUT 600
+        LABELS "c03;c03_safe_headless;safe-headless;authority;surface;contract-reproduction"
+        RESOURCE_LOCK "aida_c03_authority_surface_reproduction")
 
     get_property(_aida_compiler_harness_inputs GLOBAL PROPERTY AIDA_C03_COMPILER_MATRIX_HARNESS_INPUTS)
     get_property(_aida_compiler_native_worker_inputs GLOBAL PROPERTY AIDA_C03_COMPILER_MATRIX_NATIVE_WORKER_INPUTS)

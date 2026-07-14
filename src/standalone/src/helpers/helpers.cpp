@@ -4583,6 +4583,11 @@ void helpers::render_title()
 			const float bc_font_sz = aida::ui::fonts::size_or(body, metrics.caption_font);
 			float bc_x = title_x + name_ts.x + gap * 2.f;
 			float bc_y = wp.y + (title_h - bc_font_sz) * 0.5f;
+			const float status_reserved_w = aida::ui::scale_px(104.f, metrics.scale);
+			const float breadcrumb_clip_right = wp.x + ww - pad - gap * 10.f -
+				metrics.title_control * 4.f - status_reserved_w;
+			dl->PushClipRect(ImVec2(bc_x, wp.y),
+				ImVec2((std::max)(bc_x, breadcrumb_clip_right), wp.y + title_h), true);
 			std::vector<std::string> segs;
 			if (active_workspace_context)
 				segs.push_back(active_workspace_context.workspace->identity().bin_name());
@@ -4618,6 +4623,7 @@ void helpers::render_title()
 					aida::ui::with_alpha(col, a), segs[si].c_str());
 				bc_x += ss.x + gap * 2.f;
 			}
+			dl->PopClipRect();
 		}
 
 		auto draw_ctl = [&](float right_offset, const char* tag) -> std::pair<ImVec2, ImVec2> {
@@ -4759,6 +4765,30 @@ void helpers::render_title()
 			}
 			if (tgl_hov) ImGui::SetTooltip("Toggle dark/light mode");
 			ctl_off += toggle_sz + gap * 2.f;
+		}
+
+		{
+			const char* status_text = active_workspace_context ? "WORKSPACE" : "READY";
+			const float status_w = aida::ui::scale_px(104.f, metrics.scale);
+			const float status_h = aida::ui::scale_px(24.f, metrics.scale);
+			ImVec2 status_b(wp.x + ww - ctl_off,
+				wp.y + (title_h + status_h) * 0.5f);
+			ImVec2 status_a(status_b.x - status_w, status_b.y - status_h);
+			dl->AddRectFilled(status_a, status_b,
+				aida::ui::with_alpha(th_tb.bg_elevated, 0.72f * a), status_h * 0.5f);
+			dl->AddRect(status_a, status_b,
+				aida::ui::with_alpha(th_tb.border_subtle, 0.92f * a), status_h * 0.5f);
+			const ImU32 status_color = active_workspace_context
+				? th_tb.accent_u32 : th_tb.success;
+			dl->AddCircleFilled(ImVec2(status_a.x + 12.f, status_a.y + status_h * 0.5f),
+				3.f, aida::ui::with_alpha(status_color, a), 16);
+			ImFont* status_font = aida::ui::fonts::caption();
+			if (!status_font) status_font = ImGui::GetFont();
+			const float status_fs = aida::ui::fonts::size_or(status_font, metrics.caption_font);
+			dl->AddText(status_font, status_fs,
+				ImVec2(status_a.x + 22.f, status_a.y + (status_h - status_fs) * 0.5f),
+				aida::ui::with_alpha(th_tb.text_secondary, a), status_text);
+			ctl_off += status_w + gap * 2.f;
 		}
 
 		{
