@@ -1,18 +1,26 @@
 #pragma once
 
 #include "pdb_parser.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "symbol_store.hpp"
+#endif
 #include "struct_dissector.hpp"
 #include "struct_dissector_view.hpp"
 #include "struct_recon_view.hpp"
 #include "workspace/search_index.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/pseudocode_view.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/taskflow_runtime.hpp"
+#endif
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../session/analysis_session.hpp"
+#endif
 #include "../ui/theme.hpp"
 #include "../../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/win32_dialog.hpp"
+#endif
 #include "imgui/imgui.h"
 
 #include <algorithm>
@@ -22,8 +30,6 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -33,7 +39,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/re_hubs_preview_adapter.hpp"
+#endif
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 extern HWND g_hwnd;
+#endif
 
 namespace types_hub_view {
 
@@ -65,6 +77,10 @@ struct state_t {
     sub_tab_t visible_tab = sub_tab_t::structs;
     std::string visible_filter;
     std::atomic<bool> visible_loading{false};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    bool pdb_dialog_open = false;
+    std::array<char, 260> pdb_dialog_path{};
+#endif
 };
 
 struct struct_entry_t {
@@ -123,6 +139,10 @@ inline std::shared_ptr<state_t> state_for(const disasm_view::workspace_context_t
     if (found != values.end())
         return found->second;
     auto created = std::make_shared<state_t>();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::snprintf(created->pdb_dialog_path.data(), created->pdb_dialog_path.size(),
+        "%s", "AiDA_Target.pdb");
+#endif
     values.emplace(id, created);
     return created;
 }
@@ -140,12 +160,14 @@ inline const char* sub_tab_label(sub_tab_t tab) {
     return index >= 0 && index < static_cast<int>(sub_tab_t::COUNT) ? labels[index] : "";
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 inline std::shared_ptr<symbol_store::workspace_state_t> symbol_state_for(
     const disasm_view::workspace_context_t& context) {
     if (!context.workspace)
         return {};
     return analysis_session::symbols_for_workspace(context.workspace);
 }
+#endif
 
 inline std::string provenance_name(aida::analysis::fact_provenance_t provenance) {
     using aida::analysis::fact_provenance_t;
@@ -169,6 +191,7 @@ inline std::string provenance_name(aida::analysis::fact_provenance_t provenance)
 
 inline catalog_t build_catalog(const disasm_view::workspace_context_t& context) {
     catalog_t catalog;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (auto symbols = symbol_state_for(context)) {
         const auto modules = symbols->modules_snapshot();
         for (const auto& module : modules) {
@@ -186,6 +209,7 @@ inline catalog_t build_catalog(const disasm_view::workspace_context_t& context) 
                 catalog.enums.push_back({module.first, definition});
         }
     }
+#endif
     if (context.publication && context.publication->snapshot) {
         const auto& snapshot = *context.publication->snapshot;
         catalog.functions.reserve(snapshot.functions.size());
@@ -227,6 +251,34 @@ inline catalog_t build_catalog(const disasm_view::workspace_context_t& context) 
 		function.signature = evidence != catalog.typedefs.end()
 			? evidence->canonical_type : "unknown " + function.name + "(unknown)";
 	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    pdb_parser::pdb_info_t preview_pdb;
+    pdb_parser::parse_pdb("AiDA_Target.pdb", {}, preview_pdb);
+    for (const auto& definition : preview_pdb.structs) {
+        struct_entry_t entry{"AiDA_Target", definition};
+        if (definition.is_union)
+            catalog.unions.push_back(std::move(entry));
+        else
+            catalog.structs.push_back(std::move(entry));
+    }
+    for (const auto& definition : preview_pdb.enums)
+        catalog.enums.push_back({"AiDA_Target", definition});
+    if (catalog.functions.empty()) {
+        catalog.functions = {
+            {{aida::analysis::address_space_id_t::relative_virtual, 0x1180}, "WinMain", "int WinMain(HINSTANCE, HINSTANCE, LPSTR, int)", 0x13A, "debug symbol"},
+            {{aida::analysis::address_space_id_t::relative_virtual, 0x12C0}, "AnalyzeImage", "analysis_result_t AnalyzeImage(const image_t&)", 0x1D4, "debug symbol"},
+            {{aida::analysis::address_space_id_t::relative_virtual, 0x14A0}, "DispatchCommand", "bool DispatchCommand(command_id_t, context_t*)", 0xF8, "recursive traversal"}
+        };
+    }
+    if (catalog.typedefs.empty()) {
+        catalog.typedefs = {
+            {{aida::analysis::address_space_id_t::relative_virtual, 0x1180}, "image_base_t", "uintptr_t", false, 99},
+            {{aida::analysis::address_space_id_t::relative_virtual, 0x12C0}, "analysis_callback_t", "analysis_result_t (*)(const image_t&)", false, 94},
+            {{aida::analysis::address_space_id_t::relative_virtual, 0x14A0}, "command_flags_t", "std::uint32_t", false, 91},
+            {{aida::analysis::address_space_id_t::relative_virtual, 0x1510}, "unresolved_dispatch_context", {}, true, 38}
+        };
+    }
+#endif
     auto struct_order = [](const struct_entry_t& left, const struct_entry_t& right) {
         if (left.definition.name != right.definition.name)
             return left.definition.name < right.definition.name;
@@ -254,6 +306,24 @@ inline void request_catalog(const disasm_view::workspace_context_t& context,
             return;
         }
     }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    auto catalog = std::make_shared<const catalog_t>(build_catalog(context));
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->catalog = std::move(catalog);
+        state->catalog_generation = context.publication->generation;
+        state->catalog_analysis_revision = context.publication->analysis_revision;
+        state->visible_indices.reset();
+        state->visible_catalog = nullptr;
+        state->selected = -1;
+        state->pdb_error.clear();
+    }
+    state->catalog_loading.store(false, std::memory_order_release);
+    aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types,
+        default_active_tab().load(std::memory_order_acquire),
+        "catalog_ready", "Studio workspace fixture");
+    return;
+#else
     const std::string target_id = context.workspace->identity().binary_id().to_hex();
     aida::infra::taskflow_runtime::task_descriptor_t descriptor;
     descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
@@ -283,6 +353,7 @@ inline void request_catalog(const disasm_view::workspace_context_t& context,
         std::lock_guard<std::mutex> lock(state->mutex);
         state->pdb_error = submitted.reject_reason;
     }
+#endif
 }
 
 inline bool contains_case_insensitive(const std::string& text, const std::string& filter) {
@@ -295,7 +366,12 @@ inline bool contains_case_insensitive(const std::string& text, const std::string
         }) != text.end();
 }
 
-inline void request_visible_indices(const disasm_view::workspace_context_t& context,
+inline void request_visible_indices(
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                                    const disasm_view::workspace_context_t&,
+#else
+                                    const disasm_view::workspace_context_t& context,
+#endif
                                     const std::shared_ptr<state_t>& state,
                                     const std::shared_ptr<const catalog_t>& catalog,
                                     sub_tab_t tab, std::string filter) {
@@ -309,6 +385,44 @@ inline void request_visible_indices(const disasm_view::workspace_context_t& cont
     }
     if (state->visible_loading.exchange(true, std::memory_order_acq_rel))
         return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::vector<std::size_t> visible;
+    if (tab == sub_tab_t::structs || tab == sub_tab_t::unions) {
+        const auto& entries = tab == sub_tab_t::structs ? catalog->structs : catalog->unions;
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (contains_case_insensitive(entries[index].definition.name, filter) ||
+                contains_case_insensitive(entries[index].module, filter))
+                visible.push_back(index);
+        }
+    } else if (tab == sub_tab_t::enums) {
+        for (std::size_t index = 0; index < catalog->enums.size(); ++index) {
+            if (contains_case_insensitive(catalog->enums[index].definition.name, filter))
+                visible.push_back(index);
+        }
+    } else if (tab == sub_tab_t::functions) {
+        for (std::size_t index = 0; index < catalog->functions.size(); ++index) {
+            if (contains_case_insensitive(catalog->functions[index].name, filter))
+                visible.push_back(index);
+        }
+    } else {
+        for (std::size_t index = 0; index < catalog->typedefs.size(); ++index) {
+            if (contains_case_insensitive(catalog->typedefs[index].name, filter) ||
+                contains_case_insensitive(catalog->typedefs[index].canonical_type, filter))
+                visible.push_back(index);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->visible_indices =
+            std::make_shared<const std::vector<std::size_t>>(std::move(visible));
+        state->visible_catalog = catalog.get();
+        state->visible_tab = tab;
+        state->visible_filter = std::move(filter);
+        state->selected = -1;
+    }
+    state->visible_loading.store(false, std::memory_order_release);
+    return;
+#else
     const std::string target_id = context.workspace->identity().binary_id().to_hex();
     aida::infra::taskflow_runtime::task_descriptor_t descriptor;
     descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
@@ -371,6 +485,7 @@ inline void request_visible_indices(const disasm_view::workspace_context_t& cont
         std::lock_guard<std::mutex> lock(state->mutex);
         state->pdb_error = submitted.reject_reason;
     }
+#endif
 }
 
 inline std::optional<std::uint64_t> parse_address(std::string text) {
@@ -387,11 +502,25 @@ inline void request_pdb_load(const disasm_view::workspace_context_t& context,
                              std::string path) {
     if (!context.workspace || !state || path.empty())
         return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    auto catalog = std::make_shared<const catalog_t>(build_catalog(context));
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->catalog = std::move(catalog);
+        state->visible_indices.reset();
+        state->visible_catalog = nullptr;
+        state->selected = -1;
+        state->pdb_error.clear();
+    }
+    aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types,
+        default_active_tab().load(std::memory_order_acquire), "load_pdb", path);
+#else
     const auto accepted = analysis_session::approve_local_pdb(
         context.workspace, path, true, true);
     std::lock_guard<std::mutex> lock(state->mutex);
     state->pdb_error = accepted ? std::string() :
         accepted.error().stable_code() + ": " + accepted.error().message;
+#endif
 }
 
 inline void set_sub_tab(const disasm_view::workspace_context_t& context, sub_tab_t tab) {
@@ -399,6 +528,10 @@ inline void set_sub_tab(const disasm_view::workspace_context_t& context, sub_tab
     if (index < 0 || index >= static_cast<int>(sub_tab_t::COUNT))
         return;
     default_active_tab().store(index, std::memory_order_release);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    aida::preview::re_hubs::select(aida::preview::re_hubs::domain_t::types,
+        index, sub_tab_label(tab));
+#endif
     auto state = state_for(context);
     if (!state)
         return;
@@ -604,6 +737,10 @@ inline void render(float, float, float width, float height,
         active = state->active;
         selected = state->selected;
     }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    aida::preview::re_hubs::rendered(aida::preview::re_hubs::domain_t::types,
+        static_cast<int>(active), sub_tab_label(active));
+#endif
     for (int index = 0; index < static_cast<int>(sub_tab_t::COUNT); ++index) {
         if (index != 0)
             ImGui::SameLine();
@@ -613,6 +750,10 @@ inline void render(float, float, float width, float height,
             state->active = static_cast<sub_tab_t>(index);
             state->selected = -1;
             default_active_tab().store(index, std::memory_order_release);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            aida::preview::re_hubs::select(aida::preview::re_hubs::domain_t::types,
+                index, tabs[index]);
+#endif
             active = state->active;
             selected = -1;
         }
@@ -623,13 +764,43 @@ inline void render(float, float, float width, float height,
         !context.workspace->closing() && !context.workspace->closed();
     ImGui::BeginDisabled(!can_load_pdb);
     if (ImGui::Button("Load PDB...")) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        state->pdb_dialog_open = true;
+        ImGui::OpenPopup("Select PDB file##types_hub_view");
+#else
         std::array<char, 32768> path{};
         if (win32_dialog::show_open_file_dialog(g_hwnd, "Select PDB file",
                 "Program Database (*.pdb)\0*.pdb\0All files (*.*)\0*.*\0\0",
                 path.data(), path.size(), "types_hub_view"))
             request_pdb_load(context, state, path.data());
+#endif
     }
     ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (state->pdb_dialog_open)
+        ImGui::OpenPopup("Select PDB file##types_hub_view");
+    if (ImGui::BeginPopupModal("Select PDB file##types_hub_view", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Program Database (*.pdb)");
+        ImGui::SetNextItemWidth(460.0f);
+        ImGui::InputText("##pdb_path", state->pdb_dialog_path.data(),
+            state->pdb_dialog_path.size());
+        if (ImGui::Button("Open", ImVec2(96.0f, 0.0f))) {
+            request_pdb_load(context, state, state->pdb_dialog_path.data());
+            state->pdb_dialog_open = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(96.0f, 0.0f))) {
+            state->pdb_dialog_open = false;
+            aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types,
+                static_cast<int>(active), "cancel_pdb_dialog");
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+#endif
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     const auto pdb_prompt = analysis_session::pdb_prompt_snapshot(context.workspace);
     if (pdb_prompt && pdb_prompt.value().loading) {
         const float progress = pdb_prompt.value().bytes_total != 0
@@ -664,6 +835,7 @@ inline void render(float, float, float width, float height,
     }
     else if (pdb_prompt && pdb_prompt.value().loading)
         ImGui::TextWrapped("%s", pdb_prompt.value().status.c_str());
+#endif
     if (active == sub_tab_t::inferred || active == sub_tab_t::dissector) {
         ImGui::Separator();
         const float content_y = ImGui::GetCursorPosY();

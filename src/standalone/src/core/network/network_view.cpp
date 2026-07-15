@@ -1,16 +1,35 @@
 #include "network_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_adapter.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_executor.hpp"
+#else
 #include "../infra/executor.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "executor_status.hpp"
+#endif
 #include "standalone_driver.hpp"
 #include "../runtime/standalone_license.hpp"
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_certificates.hpp"
+#else
 #include "cert_pin_bypass.hpp"
 #include "cert_generator.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_ssl_keylog.hpp"
+#else
 #include "ssl_keylog.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_tools.hpp"
+#else
 #include "script_engine.hpp"
 #include "decoder_pipeline.hpp"
+#endif
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
@@ -26,10 +45,14 @@
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
 #include "../helpers/helpers.h"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_services.hpp"
+#else
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../session/analysis_session.hpp"
 #include "../anti-tamper/webhook.hpp"
+#endif
 
 #include "burp/burp_module.hpp"
 #include "burp/site_map.hpp"
@@ -51,9 +74,14 @@
 #include "burp/csp_view.hpp"
 #include "burp/upstream_view.hpp"
 #include "burp/browser_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_browser.hpp"
+#else
 #include "burp/browser_launch.hpp"
+#endif
 #include "burp/report_view.hpp"
 #include "burp/headless_view.hpp"
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 #include "burp/offensive/api_security_engine.hpp"
 #include "burp/offensive/auth_attack_engine.hpp"
 #include "burp/offensive/business_logic_engine.hpp"
@@ -64,19 +92,26 @@
 #include "burp/offensive/server_attack_engine.hpp"
 #include "burp/offensive/sqli_engine.hpp"
 #include "burp/offensive/xss_engine.hpp"
+#endif
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 #include "intercept/cert_profile_manager.hpp"
 #include "intercept/diagnostics.hpp"
 #include "intercept/instrumentation_provider.hpp"
 #include "intercept/script_handoff.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commdlg.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -156,15 +191,6 @@ static ImU32 status_code_color(int code) {
     return t.text_dim;
 }
 
-static aida::ui::pill_kind_t status_code_pill(int code) {
-    if (code >= 200 && code < 300) return aida::ui::pill_kind_t::success;
-    if (code >= 300 && code < 400) return aida::ui::pill_kind_t::info;
-    if (code >= 400 && code < 500) return aida::ui::pill_kind_t::warning;
-    if (code >= 500)               return aida::ui::pill_kind_t::error;
-    return aida::ui::pill_kind_t::neutral;
-}
-
-
 struct row_entrance_state_t {
     std::vector<float> spawn_time;
 };
@@ -180,14 +206,14 @@ static void compute_row_entrance(row_entrance_state_t& rs, size_t total, float& 
         float stagger = 0.012f;
         size_t base = rs.spawn_time.size();
         for (size_t i = base; i < total; ++i)
-            rs.spawn_time.push_back(now + (float)(i - base) * stagger);
+            rs.spawn_time.push_back(now + static_cast<float>(i - base) * stagger);
     } else if (rs.spawn_time.size() > total) {
         rs.spawn_time.resize(total);
     }
-    if (row_index < 0 || (size_t)row_index >= rs.spawn_time.size()) {
+    if (row_index < 0 || static_cast<size_t>(row_index) >= rs.spawn_time.size()) {
         alpha_out = 1.f; off_out = 0.f; return;
     }
-    float age = aida::ui::clock::seconds() - rs.spawn_time[row_index];
+    float age = aida::ui::clock::seconds() - rs.spawn_time[static_cast<size_t>(row_index)];
     float dur = 0.180f;
     if (age >= dur) { alpha_out = 1.f; off_out = 0.f; return; }
     if (age < 0.f) { alpha_out = 0.f; off_out = 8.f; return; }
@@ -225,7 +251,7 @@ static void proxy_chart_tick(uint64_t total_requests) {
     float dt = now - s_proxy_chart.last_sample_time;
     if (dt < 0.5f) return;
     uint64_t diff = total_requests - s_proxy_chart.last_total;
-    float rate = (dt > 0.f) ? (float)diff / dt : 0.f;
+    float rate = (dt > 0.f) ? static_cast<float>(diff) / dt : 0.f;
     s_proxy_chart.values[s_proxy_chart.head] = rate;
     s_proxy_chart.head = (s_proxy_chart.head + 1) % proxy_history_chart_t::N;
     s_proxy_chart.last_total = total_requests;
@@ -302,6 +328,7 @@ static bool post_network_task(const char* name,
     }
 }
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static bool initialize_executor_for_network() {
     try {
         const auto snap = aida::infra::taskflow_runtime::active_snapshot(0);
@@ -326,6 +353,7 @@ static bool initialize_executor_for_network() {
         return false;
     }
 }
+#endif
 
 static float capture_rate_tick(size_t total_packets) {
     float now = aida::ui::clock::seconds();
@@ -337,7 +365,7 @@ static float capture_rate_tick(size_t total_packets) {
     float dt = now - s_cap_rate.last_sample_time;
     if (dt >= 0.25f) {
         size_t diff = total_packets >= s_cap_rate.last_count ? total_packets - s_cap_rate.last_count : 0;
-        float rate = (dt > 0.f) ? (float)diff / dt : 0.f;
+        float rate = (dt > 0.f) ? static_cast<float>(diff) / dt : 0.f;
         float a = 0.35f;
         s_cap_rate.ema = s_cap_rate.ema * (1.f - a) + rate * a;
         s_cap_rate.last_count = total_packets;
@@ -422,7 +450,9 @@ static void cert_diag_apply_proxy_observations(cert_intercept::diagnostic_contex
 static std::string format_ip(const uint8_t* addr, uint8_t af) {
     char buf[INET6_ADDRSTRLEN] = {};
     if (af == 2) {
-        snprintf(buf, sizeof(buf), "%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+        snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+            static_cast<unsigned>(addr[0]), static_cast<unsigned>(addr[1]),
+            static_cast<unsigned>(addr[2]), static_cast<unsigned>(addr[3]));
     } else if (af == 23) {
         inet_ntop(AF_INET6, addr, buf, sizeof(buf));
     }
@@ -619,6 +649,7 @@ static bool driver_feature_ready(const char* feature, int iter = -1) {
 }
 
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static void connection_poll_thread(state_t& state) {
     diag::log_tagged_fmt("network", "connection_poll_thread_started auto_refresh=%d filter_pid=%u filter_proto=%u",
         state.conn_auto_refresh_enabled.load(std::memory_order_acquire) ? 1 : 0, state.conn_filter_pid, state.conn_filter_protocol);
@@ -639,11 +670,19 @@ static void connection_poll_thread(state_t& state) {
             for (auto& c : raw_conns) {
                 connection_entry_t e;
                 e.pid = c.pid;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                e.protocol = static_cast<uint8_t>((std::min)(c.protocol, static_cast<uint32_t>(UINT8_MAX)));
+                e.state = static_cast<uint8_t>((std::min)(c.state, static_cast<uint32_t>(UINT8_MAX)));
+                e.local_port = static_cast<uint16_t>((std::min)(c.local_port, static_cast<uint32_t>(UINT16_MAX)));
+                e.remote_port = static_cast<uint16_t>((std::min)(c.remote_port, static_cast<uint32_t>(UINT16_MAX)));
+                e.address_family = static_cast<uint8_t>((std::min)(c.address_family, static_cast<uint32_t>(UINT8_MAX)));
+#else
                 e.protocol = c.protocol;
                 e.state = c.state;
                 e.local_port = c.local_port;
                 e.remote_port = c.remote_port;
                 e.address_family = c.address_family;
+#endif
                 memcpy(e.local_addr, c.local_addr, 16);
                 memcpy(e.remote_addr, c.remote_addr, 16);
                 entries.push_back(std::move(e));
@@ -669,6 +708,7 @@ static void connection_poll_thread(state_t& state) {
     }
     diag::log_tagged("network", "connection_poll_thread_exited");
 }
+#endif
 
 static void capture_poll_thread(state_t& state) {
     diag::log_tagged("network", "capture_poll_thread_started");
@@ -738,6 +778,7 @@ static void capture_poll_thread(state_t& state) {
     diag::log_tagged("network", "capture_poll_thread_exited");
 }
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static void dns_poll_thread(state_t& state) {
     diag::log_tagged("network", "dns_poll_thread_started");
     state.dns_thread_alive.store(true);
@@ -768,8 +809,10 @@ static void dns_poll_thread(state_t& state) {
                     std::lock_guard<std::mutex> lock(state.dns_mutex);
                     for (auto& d : raw_dns) {
                         bool duplicate = false;
+                        const auto recent_count = static_cast<std::ptrdiff_t>((std::min)(
+                            static_cast<std::size_t>(256), state.dns_entries.size()));
                         for (auto it = state.dns_entries.rbegin();
-                             it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + (std::min)(static_cast<size_t>(256), state.dns_entries.size());
+                             it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + recent_count;
                              ++it) {
                             if (it->timestamp == d.timestamp && it->domain == d.domain && it->pid == d.pid) {
                                 duplicate = true;
@@ -878,8 +921,10 @@ static void bandwidth_poll_thread(state_t& state) {
     }
     diag::log_tagged("network", "bandwidth_poll_thread_exited");
 }
+#endif
 
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static void run_fuzzer_thread(state_t& state);
 
 static bool start_connection_worker(state_t& state) {
@@ -904,6 +949,7 @@ static bool start_connection_worker(state_t& state) {
     diag::log_tagged("network", "connection_worker_post_failed");
     return false;
 }
+#endif
 
 static bool start_capture_worker(state_t& state) {
     if (!state.cap_thread_done.load(std::memory_order_acquire) &&
@@ -930,6 +976,7 @@ static bool start_capture_worker(state_t& state) {
     return false;
 }
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static bool start_dns_worker(state_t& state) {
     if (!state.dns_thread_done.load(std::memory_order_acquire) &&
         state.dns_thread_alive.load(std::memory_order_acquire)) {
@@ -1016,8 +1063,13 @@ static bool start_fuzzer_worker(state_t& state) {
     diag::log_tagged("network", "fuzzer_thread_post_failed");
     return false;
 }
+#endif
 
 void initialize() {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    aida::preview::network::initialize(g_state);
+    return;
+#else
     g_state.active = true;
     diag::log_tagged("network", "initialize_begin");
     anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view initialize begin");
@@ -1046,7 +1098,8 @@ void initialize() {
             entry.preview.clear();
             size_t cap = frame.payload.size() < 16 ? frame.payload.size() : 16;
             for (size_t bi = 0; bi < cap; ++bi) {
-                snprintf(buf, sizeof(buf), bi == 0 ? "%02X" : " %02X", frame.payload[bi]);
+                snprintf(buf, sizeof(buf), bi == 0 ? "%02X" : " %02X",
+                    static_cast<unsigned>(frame.payload[bi]));
                 entry.preview += buf;
             }
             if (frame.payload.size() > cap) entry.preview += " ...";
@@ -1091,9 +1144,14 @@ void initialize() {
     }
 
     diag::log_tagged("network", "initialize_complete");
+#endif
 }
 
 void shutdown() {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    aida::preview::network::shutdown(g_state);
+    return;
+#else
     diag::log_tagged("network", "shutdown_begin");
     anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view shutdown begin");
     mitm_proxy::set_ws_frame_callback(nullptr);
@@ -1146,6 +1204,7 @@ void shutdown() {
     ssl_keylog::stop_watching();
     g_state.active = false;
     diag::log_tagged("network", "shutdown_complete");
+#endif
 }
 
 
@@ -1713,11 +1772,19 @@ static void render_connections(state_t& state, float x, float y, float w, float 
             for (auto& c : raw) {
                 connection_entry_t e;
                 e.pid = c.pid;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                e.protocol = static_cast<uint8_t>((std::min)(c.protocol, static_cast<uint32_t>(UINT8_MAX)));
+                e.state = static_cast<uint8_t>((std::min)(c.state, static_cast<uint32_t>(UINT8_MAX)));
+                e.local_port = static_cast<uint16_t>((std::min)(c.local_port, static_cast<uint32_t>(UINT16_MAX)));
+                e.remote_port = static_cast<uint16_t>((std::min)(c.remote_port, static_cast<uint32_t>(UINT16_MAX)));
+                e.address_family = static_cast<uint8_t>((std::min)(c.address_family, static_cast<uint32_t>(UINT8_MAX)));
+#else
                 e.protocol = c.protocol;
                 e.state = c.state;
                 e.local_port = c.local_port;
                 e.remote_port = c.remote_port;
                 e.address_family = c.address_family;
+#endif
                 memcpy(e.local_addr, c.local_addr, 16);
                 memcpy(e.remote_addr, c.remote_addr, 16);
                 state.connections.push_back(std::move(e));
@@ -1760,7 +1827,6 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         if (remain_w < 80.f) remain_w = 80.f;
     }
     float col_local = remain_w * 0.5f;
-    float col_remote = col_local;
 
     dl->AddRectFilled(ImVec2(org.x, hdr_y), ImVec2(org.x + w, hdr_y + row_h),
                       aida::ui::with_alpha(th.panel_header, alpha));
@@ -1800,6 +1866,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
             ? "Connections will appear once the kernel driver enumerates them."
             : "Kernel driver not attached. Some features are unavailable.";
         aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
+        ImGui::Dummy(ImVec2(0.f, 0.f));
         ImGui::EndChild();
         return;
     }
@@ -1894,6 +1961,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         ImGui::SetCursorPosY(ry + row_h);
     }
 
+    ImGui::Dummy(ImVec2(0.f, 0.f));
     dl->PopClipRect();
     ImGui::EndChild();
     ImGui::EndChild();
@@ -2394,9 +2462,9 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                                "Packet #%d  -  %s", state.cap_selected + 1, p.protocol_label.c_str());
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                 "%s:%u -> %s:%u  -  PID: %u  -  %u bytes  -  %s",
-                format_ip(p.src_addr, 2).c_str(), p.src_port,
-                format_ip(p.dst_addr, 2).c_str(), p.dst_port,
-                p.pid, p.payload_size,
+                format_ip(p.src_addr, 2).c_str(), static_cast<unsigned>(p.src_port),
+                format_ip(p.dst_addr, 2).c_str(), static_cast<unsigned>(p.dst_port),
+                static_cast<unsigned>(p.pid), static_cast<unsigned>(p.payload_size),
                 p.direction == 0 ? "Inbound" : "Outbound");
 
             if (!p.summary.empty())
@@ -2408,7 +2476,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 
             if (!p.payload.empty()) {
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                                    "Payload (%u bytes):", p.payload_size);
+                                    "Payload (%u bytes):", static_cast<unsigned>(p.payload_size));
                 ImGui::BeginChild("##cap_hex", ImVec2(0, 0), false, ImGuiWindowFlags_NoBackground);
 
                 ImFont* mono_font = aida::ui::fonts::code();
@@ -2423,7 +2491,8 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                     size_t end = std::min(off + 16, display_size);
                     for (size_t j = off; j < off + 16; j++) {
                         if (j < end)
-                            pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "%02X ", p.payload[j]);
+                            pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "%02X ",
+                                static_cast<unsigned>(p.payload[j]));
                         else
                             pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "   ");
                         if (j == off + 7)
@@ -2496,8 +2565,10 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
             std::lock_guard<std::mutex> lock(state.dns_mutex);
             for (auto& d : raw) {
                 bool duplicate = false;
+                const auto recent_count = static_cast<std::ptrdiff_t>((std::min)(
+                    static_cast<std::size_t>(256), state.dns_entries.size()));
                 for (auto it = state.dns_entries.rbegin();
-                     it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + (std::min)(static_cast<size_t>(256), state.dns_entries.size());
+                     it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + recent_count;
                      ++it) {
                     if (it->timestamp == d.timestamp && it->domain == d.domain && it->pid == d.pid) {
                         duplicate = true;
@@ -2646,7 +2717,7 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         cx = list_org.x + 8.f;
         char buf[16];
 
-        snprintf(buf, sizeof(buf), "%u", d.pid);
+        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(d.pid));
         dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += col_pid;
 
         const char* qtype = d.query_type == 1 ? "A" : d.query_type == 28 ? "AAAA" : d.query_type == 5 ? "CNAME" : "?";
@@ -2661,13 +2732,13 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
 
         dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, d.resolved_addr.c_str()); cx += col_addr;
 
-        snprintf(buf, sizeof(buf), "%u", d.response_code);
+        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(d.response_code));
         ImU32 rcode_col = d.response_code == 0
             ? aida::ui::with_alpha(th.success, r_alpha)
             : aida::ui::with_alpha(th.error, r_alpha);
         dl->AddText(ImVec2(cx, abs_ry + text_oy), rcode_col, buf); cx += col_rcode;
 
-        snprintf(buf, sizeof(buf), "%u", d.ttl);
+        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(d.ttl));
         dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_dim, r_alpha), buf);
 
         dns_visible_row++;
@@ -2723,7 +2794,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             char buf[160];
             snprintf(buf, sizeof(buf),
                 "[net_audit] proxy start clicked bind=%s:%u tls=%d ok=%d running=%d",
-                state.proxy_bind_addr, state.proxy_port, state.proxy_decode_tls ? 1 : 0,
+                state.proxy_bind_addr, static_cast<unsigned>(state.proxy_port), state.proxy_decode_tls ? 1 : 0,
                 ok ? 1 : 0, mitm_proxy::is_running() ? 1 : 0);
             anti_tamper::webhook::write_log("net_audit", buf);
             if (!ok) {
@@ -2757,7 +2828,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         char stats_buf[192];
         snprintf(stats_buf, sizeof(stats_buf), "%llu req  %u active  In %s  Out %s",
             static_cast<unsigned long long>(stats.total_requests),
-            stats.active_connections,
+            static_cast<unsigned>(stats.active_connections),
             format_bytes(stats.total_bytes_in).c_str(),
             format_bytes(stats.total_bytes_out).c_str());
         same_line_if_fits(estimate_chip_w(stats_buf, 10.f));
@@ -2940,11 +3011,22 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                     request.provider_statuses = s_cert_diag_ui.providers;
                     request.target_label = s_cert_diag_ui.report.process_name.empty() ? "target" : s_cert_diag_ui.report.process_name;
                     request.proxy_endpoint = std::string(state.proxy_bind_addr) + ":" + std::to_string(state.proxy_port);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    request.ca_cert_pem_path = aida::preview::network::filesystem_path_utf8(exported.pem_path);
+                    request.ca_cert_der_path = aida::preview::network::filesystem_path_utf8(exported.der_path);
+#else
                     request.ca_cert_pem_path = exported.pem_path.u8string();
                     request.ca_cert_der_path = exported.der_path.u8string();
+#endif
                     auto handoff = cert_intercept::generate_handoff(request);
                     ok = handoff.ok;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    s_cert_diag_ui.handoff_status = ok
+                        ? aida::preview::network::filesystem_path_utf8(handoff.metadata_path)
+                        : handoff.error;
+#else
                     s_cert_diag_ui.handoff_status = ok ? handoff.metadata_path.u8string() : handoff.error;
+#endif
                 } else {
                     s_cert_diag_ui.handoff_status = exported.error.empty() ? "ca_export_failed" : exported.error;
                 }
@@ -3099,7 +3181,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
         char meta_buf[256];
         snprintf(meta_buf, sizeof(meta_buf), "%s:%u  %s  %llums  req=%s  resp=%s",
-            ex.target_host.c_str(), ex.target_port,
+            ex.target_host.c_str(), static_cast<unsigned>(ex.target_port),
             ex.is_tls ? "TLS" : "Plain",
             static_cast<unsigned long long>(ex.latency_ms),
             format_bytes(ex.raw_request.size()).c_str(),
@@ -3271,11 +3353,11 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
         auto& f = state.filters[static_cast<size_t>(i)];
         char rule_buf[192];
         snprintf(rule_buf, sizeof(rule_buf), "#%u  %s  %s %s  PID:%u  Port:%u  %s",
-                 f.rule_id,
+                 static_cast<unsigned>(f.rule_id),
                  f.action == 0 ? "BLOCK" : "ALLOW",
                  f.direction == 0 ? "IN" : f.direction == 1 ? "OUT" : "BOTH",
                  f.protocol == 6 ? "TCP" : f.protocol == 17 ? "UDP" : "ANY",
-                 f.pid, f.port, f.ip_addr.c_str());
+                 static_cast<unsigned>(f.pid), static_cast<unsigned>(f.port), f.ip_addr.c_str());
         aida::ui::pill_kind_t kind = (f.action == 0)
             ? aida::ui::pill_kind_t::error
             : aida::ui::pill_kind_t::success;
@@ -3291,7 +3373,7 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
         bool drv_removed = driver_bridge::remove_filter_rule(f.rule_id);
         diag::log_tagged_fmt("network", "filter_remove_rule rule_id=%u drv_removed=%d", f.rule_id,
             drv_removed ? 1 : 0);
-        state.filters.erase(state.filters.begin() + remove_idx);
+        state.filters.erase(state.filters.begin() + static_cast<ptrdiff_t>(remove_idx));
     }
 
     ImGui::EndChild();
@@ -3414,7 +3496,7 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
         cx = list_org.x + 8.f;
 
         char buf[32];
-        snprintf(buf, sizeof(buf), "%u", b.pid);
+        snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(b.pid));
         dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, buf); cx += col_pid;
 
         std::string name = b.process_name.empty() ? "-" : b.process_name;
@@ -3819,10 +3901,11 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         dl->AddRect(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y),
                      glow, 8.f, 0, 2.f);
         for (int gi = 1; gi <= 3; ++gi) {
-            float ga = (0.18f - (float)gi * 0.05f) * border_v * alpha;
-            dl->AddRect(ImVec2(list_org.x - (float)gi, list_org.y - (float)gi),
-                         ImVec2(list_org.x + list_sz.x + (float)gi, list_org.y + list_sz.y + (float)gi),
-                         aida::ui::with_alpha(th.accent_glow, ga), 8.f + (float)gi, 0, 1.f);
+            const float glow_offset = static_cast<float>(gi);
+            float ga = (0.18f - glow_offset * 0.05f) * border_v * alpha;
+            dl->AddRect(ImVec2(list_org.x - glow_offset, list_org.y - glow_offset),
+                         ImVec2(list_org.x + list_sz.x + glow_offset, list_org.y + list_sz.y + glow_offset),
+                         aida::ui::with_alpha(th.accent_glow, ga), 8.f + glow_offset, 0, 1.f);
         }
     }
 
@@ -3830,7 +3913,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     float cx = list_org.x + 8.f;
     float cy = list_org.y + ImGui::GetCursorPosY() + 4.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
-    float col_id = 50.f, col_method = 64.f, col_host = 200.f, col_path = 260.f, col_size = 80.f;
+    float col_id = 50.f, col_method = 64.f, col_host = 200.f, col_path = 260.f;
 
     dl->AddText(ImVec2(cx, cy), hdr_col, "ID"); cx += col_id;
     dl->AddText(ImVec2(cx, cy), hdr_col, "Method"); cx += col_method;
@@ -4171,6 +4254,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
         cfg.title = "No keys captured";
         cfg.body  = "Launch a target executable or watch a SSLKEYLOGFILE to start collecting TLS secrets.";
         aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
+        ImGui::Dummy(ImVec2(0.f, 0.f));
         ImGui::EndChild();
         return;
     }
@@ -4269,6 +4353,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
 }
 
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static void write_pcap_header(std::ofstream& f) {
 
     uint32_t magic = 0xa1b2c3d4;
@@ -4353,6 +4438,7 @@ static void write_pcap_packet(std::ofstream& f, const packet_entry_t& pkt) {
     f.write(reinterpret_cast<const char*>(&frame_len), 4);
     f.write(reinterpret_cast<const char*>(frame.data()), static_cast<std::streamsize>(frame_len));
 }
+#endif
 
 static void render_pcap_export(state_t& state, float x, float y, float w, float h,
                                 float alpha, float ar, float ag, float ab) {
@@ -4385,6 +4471,9 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                 "pcap",
                 path_buf, sizeof(path_buf),
                 "network_view::pcap_save")) {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+            aida::preview::network::record_receipt("Save PCAP", path_buf);
+#endif
             snprintf(state.pcap_path, sizeof(state.pcap_path), "%s", path_buf);
             diag::log_tagged_fmt("network", "pcap_path_picked path='%s'", path_buf);
             anti_tamper::webhook::write_log("net_audit",
@@ -4464,6 +4553,17 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 
             const bool posted = post_network_task("pcap_export", aida::infra::executor::domain_t::diagnostics, "bounded_task", [packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
                          st = &state]() {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+                uint32_t count = 0;
+                for (const auto& packet : packets_copy) {
+                    if (filter_pid != 0 && packet.pid != filter_pid) continue;
+                    if (filter_proto != 0 && packet.protocol != filter_proto) continue;
+                    ++count;
+                }
+                st->pcap_written_count.store(count, std::memory_order_release);
+                st->pcap_writing.store(false, std::memory_order_release);
+                aida::preview::network::record_receipt("PCAP export", path + " " + std::to_string(count) + " packets");
+#else
                 std::ofstream f(path, std::ios::binary);
                 if (!f.is_open()) {
                     diag::log_tagged_fmt("network", "pcap_export_failed_open path='%s'", path.c_str());
@@ -4492,6 +4592,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                     path.c_str(), count);
                 anti_tamper::webhook::write_log("net_audit",
                     ("[net_audit] pcap export ok path='" + path + "' written=" + std::to_string(count)).c_str());
+#endif
             });
             if (!posted) {
                 std::lock_guard<std::mutex> elock(state.pcap_error_mutex);
@@ -4563,6 +4664,9 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                 "[net_audit] HAR export dialog cancelled");
         } else {
         std::string har_path(har_buf);
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        aida::preview::network::record_receipt("Export HAR", har_path);
+#endif
 
         auto history = mitm_proxy::get_history(0);
         diag::log_tagged_fmt("network", "har_export_clicked path='%s' history_count=%zu",
@@ -4571,7 +4675,9 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             (std::string("[net_audit] HAR export path='") + har_path + "' count=" +
              std::to_string(history.size())).c_str());
         (void)post_network_task("har_export", aida::infra::executor::domain_t::diagnostics, "bounded_task", [history = std::move(history), har_path]() {
-
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+            aida::preview::network::record_receipt("HAR export", har_path + " " + std::to_string(history.size()) + " exchanges");
+#else
             std::ofstream f(har_path);
             if (!f.is_open()) {
                 diag::log_tagged_fmt("network", "har_export_failed_open path='%s'", har_path.c_str());
@@ -4602,6 +4708,7 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             f.close();
             diag::log_tagged_fmt("network", "har_export_done path='%s' entries=%zu",
                 har_path.c_str(), history.size());
+#endif
         });
         }
     }
@@ -4610,11 +4717,15 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 }
 
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static void run_fuzzer_thread(state_t& state) {
     auto& cfg = state.fuzz_config;
 
 
     auto load_set = [](const payload_set_t& ps) -> std::vector<std::string> {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        if (!ps.entries.empty()) return ps.entries;
+#endif
         std::vector<std::string> lines;
         auto push_line = [&](std::istream& is) {
             std::string line;
@@ -4797,7 +4908,7 @@ static void run_fuzzer_thread(state_t& state) {
     int total   = static_cast<int>(combos.size());
     int threads = std::min(std::max(cfg.thread_count, 1), 32);
     diag::log_tagged_fmt("network", "fuzzer_run_start host=%s:%u tls=%d mode=%d combos=%d threads=%d",
-        cfg.host.c_str(), cfg.port, cfg.use_tls ? 1 : 0,
+        cfg.host.c_str(), static_cast<unsigned>(cfg.port), cfg.use_tls ? 1 : 0,
         static_cast<int>(cfg.attack_mode), total, threads);
 
     auto worker = [&]() {
@@ -4880,6 +4991,7 @@ static void run_fuzzer_thread(state_t& state) {
 
     state.fuzz_running.store(false);
 }
+#endif
 
 static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                            float alpha, float ar, float ag, float ab) {
@@ -4993,7 +5105,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
         ImGui::BeginChild("##fuzz_sets_panel", ImVec2(w - 8.f, sets_h), true,
                           ImGuiWindowFlags_NoBackground);
 
-        static int  set_sel = 0;
         const char* set_type_items[] = { "Wordlist File", "Inline List" };
 
         for (int si = 0; si < static_cast<int>(cfg.payload_sets.size()); si++) {
@@ -5144,7 +5255,7 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
                 char buf[256];
                 snprintf(buf, sizeof(buf),
                     "[net_audit] fuzzer start host=%s:%u tls=%d mode=%d threads=%d sets=%zu",
-                    cfg.host.c_str(), cfg.port, cfg.use_tls ? 1 : 0,
+                    cfg.host.c_str(), static_cast<unsigned>(cfg.port), cfg.use_tls ? 1 : 0,
                     static_cast<int>(cfg.attack_mode), cfg.thread_count, cfg.payload_sets.size());
                 anti_tamper::webhook::write_log("net_audit", buf);
             }
@@ -5226,8 +5337,6 @@ static void render_fuzzer(state_t& state, float x, float y, float w, float h,
     float c_len     = 80.f;
     float c_time    = 80.f;
     float c_match   = 50.f;
-    float c_extract = show_extract ? 120.f : 0.f;
-
     float cy  = list_org.y + ImGui::GetCursorPosY();
     float cx0 = list_org.x + 8.f;
     ImU32 hdr_col = aida::ui::with_alpha(th.text_secondary, alpha);
@@ -5511,6 +5620,7 @@ static void offensive_apply_base_payload(state_t& state, json& payload) {
         payload["max_payloads_per_set"] = max_payloads;
 }
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 static bool offensive_json_bool(const json& obj, const char* primary, const char* secondary, bool fallback) {
     if (obj.is_object() && obj.contains(primary) && obj[primary].is_boolean())
         return obj[primary].get<bool>();
@@ -5565,8 +5675,23 @@ static offensive_run_result_t offensive_from_sqli_result(const aida::burp::offen
 static offensive_run_result_t offensive_from_xss_result(const aida::burp::offensive::xss::engine_result_t& r) {
     return offensive_run_result_t{r.ok, r.message, r.code, r.data};
 }
+#endif
 
 static offensive_run_result_t offensive_dispatch(const offensive_workflow_t& workflow, json payload) {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    json data = {
+        {"workflow", workflow.label},
+        {"target", payload.value("url", payload.value("target_url", std::string("preview target")))},
+        {"requests", 12},
+        {"findings", json::array({
+            {{"severity", "high"}, {"title", "Authorization boundary bypass"}, {"confidence", 0.94}},
+            {{"severity", "medium"}, {"title", "Response behavior differs across roles"}, {"confidence", 0.81}}
+        })},
+        {"receipt", "Studio preview executed the deterministic workflow fixture"}
+    };
+    aida::preview::network::record_receipt("Offensive workflow", workflow.label);
+    return offensive_run_result_t{true, "Deterministic preview workflow completed", std::string(), std::move(data)};
+#else
     using namespace aida::burp::offensive;
     switch (workflow.kind) {
         case offensive_workflow_kind_t::sqli_detect:
@@ -5619,6 +5744,7 @@ static offensive_run_result_t offensive_dispatch(const offensive_workflow_t& wor
             return offensive_from_json_result(recon::waf_detect(payload), "Recon WAF detection completed");
     }
     return offensive_run_result_t{false, "Unsupported offensive workflow", "unsupported_workflow", json::object()};
+#endif
 }
 
 static void collect_offensive_issue_ids(const json& node, std::vector<uint64_t>& ids) {
@@ -5749,6 +5875,17 @@ static void stop_offensive_fuzz_job(state_t& state) {
         state.off_status = "Stopping fuzz job";
     }
     const bool posted = post_network_task("offensive_fuzz_stop", aida::infra::executor::domain_t::feature_worker, "bounded_task", [job_id]() {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        json out;
+        out["workflow"] = "Fuzz Stop";
+        out["success"] = true;
+        out["message"] = "Deterministic preview fuzz job stopped";
+        out["data"] = json{{"job_id", job_id}, {"state", "stopped"}};
+        aida::preview::network::record_receipt("Fuzz job stopped", std::to_string(job_id));
+        std::lock_guard<std::mutex> lk(g_state.off_mutex);
+        g_state.off_status = "Fuzz job stopped";
+        g_state.off_result = out.dump(2);
+#else
         auto result = aida::burp::offensive::fuzzing::stop(json{{"job_id", job_id}});
         json out;
         out["workflow"] = "Fuzz Stop";
@@ -5758,6 +5895,7 @@ static void stop_offensive_fuzz_job(state_t& state) {
         std::lock_guard<std::mutex> lk(g_state.off_mutex);
         g_state.off_status = result.success ? "Fuzz job stopped" : result.text;
         g_state.off_result = out.dump(2);
+#endif
     });
     if (!posted) {
         std::lock_guard<std::mutex> lk(state.off_mutex);
@@ -6011,10 +6149,10 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
             fr.is_outbound ? "\xe2\x86\x91" : "\xe2\x86\x93"); cx += c_dir;
 
         char buf[512];
-        snprintf(buf, sizeof(buf), "%s:%u", fr.host.c_str(), fr.port);
+        snprintf(buf, sizeof(buf), "%s:%u", fr.host.c_str(), static_cast<unsigned>(fr.port));
         dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + text_oy), txt_col, buf); cx += c_host;
 
-        snprintf(buf, sizeof(buf), "0x%02X", fr.opcode);
+        snprintf(buf, sizeof(buf), "0x%02X", static_cast<unsigned>(fr.opcode));
         dl->AddText(ImVec2(ImGui::GetWindowPos().x + cx, abs_ry + text_oy), dim_col, buf); cx += c_opcode;
 
         snprintf(buf, sizeof(buf), "%zu", fr.payload.size());
@@ -6053,7 +6191,8 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
             int pos = snprintf(line, sizeof(line), "%04zx  ", off);
             for (size_t j = 0; j < 16; j++) {
                 if (off + j < fr.payload.size())
-                    pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "%02x ", fr.payload[off + j]);
+                    pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "%02x ",
+                        static_cast<unsigned>(fr.payload[off + j]));
                 else
                     pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "   ");
             }
@@ -6140,7 +6279,7 @@ namespace scripting_detail {
                                   const char* meta, ImU32 col) {
         ImDrawList* pdl = ImGui::GetWindowDrawList();
         ImFont* mf = aida::ui::fonts::caption();
-        float fs = mf ? mf->FontSize : ImGui::GetFontSize();
+        float fs = aida::ui::fonts::size_or(mf, ImGui::GetFontSize());
         float tw = mf ? mf->CalcTextSizeA(fs, FLT_MAX, 0.f, meta).x
                       : ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0.f, meta).x;
         float tx = pf.body_max.x - 14.f - tw;
@@ -6273,7 +6412,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
 
         {
             ImFont* mf = aida::ui::fonts::caption();
-            float mfs = mf ? mf->FontSize : ImGui::GetFontSize();
+            float mfs = aida::ui::fonts::size_or(mf, ImGui::GetFontSize());
             char lib_meta[40];
             snprintf(lib_meta, sizeof(lib_meta), "%zu hooks", hook_count);
             float meta_w = mf ? mf->CalcTextSizeA(mfs, FLT_MAX, 0.f, lib_meta).x
@@ -6357,7 +6496,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                 ldl->AddCircle(dot_c, 6.f, aida::ui::with_alpha(dot_col, alpha * 0.4f), 16, 1.f);
 
                 ImFont* nf = aida::ui::fonts::body_em();
-                float nfs = nf ? nf->FontSize : ImGui::GetFontSize();
+                float nfs = aida::ui::fonts::size_or(nf, ImGui::GetFontSize());
                 ImU32 name_col = s.enabled
                     ? aida::ui::with_alpha(th.text_primary, alpha)
                     : aida::ui::with_alpha(th.text_secondary, alpha);
@@ -6371,7 +6510,8 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                 ImU32 badge_col = !s.loaded ? th.text_dim
                                   : (s.enabled ? th.success : th.warning);
                 ImFont* cf = aida::ui::fonts::caption();
-                float cfs = cf ? cf->FontSize * 0.92f : ImGui::GetFontSize() * 0.82f;
+                float cfs = cf ? aida::ui::fonts::size_or(cf, ImGui::GetFontSize()) * 0.92f
+                               : ImGui::GetFontSize() * 0.82f;
                 float bw = (cf ? cf->CalcTextSizeA(cfs, FLT_MAX, 0.f, state_label).x
                                : ImGui::GetFont()->CalcTextSizeA(cfs, FLT_MAX, 0.f, state_label).x)
                            + 14.f;
@@ -6450,6 +6590,13 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                              aida::ui::size_t_::sm, ImVec2(rail_w - 16.f, 30.f),
                              !can_edit) && can_edit) {
             const auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+            std::string contents = "function onRequest(request) {\n  request.headers.remove('Authorization');\n  return request;\n}\n\nfunction onResponse(response) {\n  if (response.status >= 500) response.tags.add('server-error');\n  return response;\n}";
+            size_t copy_n = std::min(contents.size(), sizeof(state.script_editor_buf) - 1);
+            memcpy(state.script_editor_buf, contents.data(), copy_n);
+            state.script_editor_buf[copy_n] = '\0';
+            aida::preview::network::record_receipt("Script opened in editor", s.path);
+#else
             std::ifstream ifs(s.path, std::ios::binary);
             if (ifs) {
                 std::stringstream ss;
@@ -6459,6 +6606,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                 memcpy(state.script_editor_buf, contents.data(), copy_n);
                 state.script_editor_buf[copy_n] = '\0';
             }
+#endif
         }
     }
 
@@ -6517,7 +6665,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
 
         if (char_count == 0 && !editor_active) {
             ImFont* hint_font = aida::ui::fonts::code();
-            float hfs = hint_font ? hint_font->FontSize : ImGui::GetFontSize();
+            float hfs = aida::ui::fonts::size_or(hint_font, ImGui::GetFontSize());
             const char* hint = "-- write a Lua hook, e.g. function on_request(req) ... end";
             if (hint_font)
                 dl->AddText(hint_font, hfs, ImVec2(fa.x + 12.f, fa.y + 8.f),
@@ -6566,7 +6714,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         dl->AddRectFilled(fa, fb, aida::ui::with_alpha(th.bg_base, alpha * 0.85f), 8.f);
 
         ImFont* code_font = aida::ui::fonts::code();
-        float prompt_fs = code_font ? code_font->FontSize : ImGui::GetFontSize();
+        float prompt_fs = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
         if (code_font)
             dl->AddText(code_font, prompt_fs, ImVec2(fa.x + 10.f, fa.y + (field_h - prompt_fs) * 0.5f),
                         aida::ui::with_alpha(th.accent_u32, alpha), ">");
@@ -6697,7 +6845,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                 std::string repeat_badge;
                 if (e.repeat_count > 1) {
                     char rb[24];
-                    snprintf(rb, sizeof(rb), "  x%u", e.repeat_count);
+                    snprintf(rb, sizeof(rb), "  x%u", static_cast<unsigned>(e.repeat_count));
                     repeat_badge = rb;
                 }
 
@@ -6897,7 +7045,7 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
                     for (size_t j = 0; j < 16; j++) {
                         if (off + j < data.size())
                             pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos),
-                                "%02x ", data[off + j]);
+                                "%02x ", static_cast<unsigned>(data[off + j]));
                         else
                             pos += snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "   ");
                     }
@@ -7045,7 +7193,11 @@ void render(float pos_x, float pos_y, float width, float height,
     float dt = ImGui::GetIO().DeltaTime;
     const auto& th = aida::ui::resolved();
     const bool has_target = analysis_session::has_active_target();
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    g_state.last_render_tick_ms.store(aida::preview::network::monotonic_ms(), std::memory_order_release);
+#else
     g_state.last_render_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+#endif
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
@@ -7108,6 +7260,7 @@ void render(float pos_x, float pos_y, float width, float height,
         header = aida::ui::components::view_header(
             "Network", subtitle, primary_action, secondary_action,
             network_header_status(g_state, has_target));
+        ImGui::Dummy(ImVec2(0.f, 0.f));
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();

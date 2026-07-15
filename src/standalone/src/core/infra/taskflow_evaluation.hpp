@@ -1,8 +1,14 @@
 #pragma once
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <taskflow/taskflow.hpp>
+#endif
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #include "../../helpers/diag_log.hpp"
+#endif
 
 namespace aida::infra::taskflow_eval {
 
@@ -124,7 +130,9 @@ inline void log_integration_status() {
         kTaskflowRuntimeUsesTrackedRunFutures ? 1 : 0);
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 static_assert(TF_VERSION == 301100, "AiDAStandalone Taskflow integration is pinned to Taskflow v3.11.0");
+#endif
 static_assert(kTaskflowRequiredCxxStandard == 17, "Taskflow v3.11.0 is integrated under AiDAStandalone C++17");
 static_assert(kAidaStandaloneCxxStandard == 17, "AiDAStandalone targets C++17 per root CMakeLists.txt");
 static_assert(kTaskflowRequiresCxx20 == false, "Taskflow v3.11.0 checkout supports C++17");

@@ -6,12 +6,13 @@
 #include <function/SentinelBridge.h>
 #include <function/impl/driver/Strong.h>
 #include <function/TargetingLatch.h>
+#include <function/KernelLayout.h>
 #include <function/DmaDefense.h>
 
 namespace anti_dma_canary {
 
     constexpr ULONG POOL_TAG       = 'aCiA';
-    constexpr ULONG MAX_CANARIES   = 32;
+    constexpr ULONG MAX_CANARIES   = 64;
     constexpr ULONG SCAN_BATCH     = 16;
     constexpr ULONG READ_BUDGET_PER_PROCESS = 1024;
     constexpr ULONG READ_BUDGET_PER_BATCH = 4096;
@@ -78,6 +79,19 @@ namespace anti_dma_canary {
     inline volatile ULONG g_canary_crc_hits = 0;
     inline volatile ULONG g_canary_accessed_hits = 0;
     inline volatile ULONG g_canary_refresh_count = 0;
+
+    struct expanded_crc_entry_t { UINT64 pa; UINT32 crc; };
+    inline expanded_crc_entry_t g_expanded_crcs[16] = {};
+    inline volatile LONG g_expanded_crc_initialized = 0;
+
+    struct protected_pa_entry_t { UINT64 pa; BOOLEAN is_private; };
+    inline protected_pa_entry_t g_protected_pa_set[4096] = {};
+    inline volatile ULONG g_protected_pa_count = 0;
+    inline volatile LONG g_protected_pa_set_initialized = 0;
+
+    struct private_va_range_t { UINT64 va_start; UINT64 va_end; };
+    inline private_va_range_t g_private_va_ranges[256] = {};
+    inline volatile ULONG g_private_va_range_count = 0;
 
     __forceinline ULONG elapsed_us_from_100ns(ULONGLONG start_100ns, ULONGLONG end_100ns) {
         return end_100ns >= start_100ns
@@ -554,6 +568,329 @@ namespace anti_dma_canary {
         return found;
     }
 
+    __forceinline BOOLEAN is_pa_in_protected_set(UINT64 pa, BOOLEAN* out_is_private) {
+        if (out_is_private) *out_is_private = FALSE;
+        pa &= ~0xFFFULL;
+        ULONG count = static_cast<ULONG>(
+            _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_protected_pa_count), 0, 0));
+        for (ULONG i = 0; i < count && i < 4096; i++) {
+            if ((g_protected_pa_set[i].pa & ~0xFFFULL) == pa) {
+                if (out_is_private) *out_is_private = g_protected_pa_set[i].is_private;
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
+    __forceinline BOOLEAN is_pa_range_in_protected_set(UINT64 range_start, UINT64 range_size,
+                                                       BOOLEAN* out_is_private) {
+        if (out_is_private) *out_is_private = FALSE;
+        range_start &= ~0xFFFULL;
+        ULONG count = static_cast<ULONG>(
+            _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_protected_pa_count), 0, 0));
+        for (ULONG i = 0; i < count && i < 4096; i++) {
+            UINT64 entry_pa = g_protected_pa_set[i].pa & ~0xFFFULL;
+            if (entry_pa >= range_start && entry_pa < range_start + range_size) {
+                if (out_is_private) *out_is_private = g_protected_pa_set[i].is_private;
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
+    __forceinline void build_private_va_ranges(PEPROCESS proc) {
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_private_va_range_count), 0);
+
+        if (!proc) return;
+
+        SIZE_T vadroot_off = whoswho_kernel_layout::eprocess_vadroot_offset();
+        if (!vadroot_off) {
+            WW_LOG("dma_canary::build_private_va_ranges no_vadroot_offset");
+            return;
+        }
+
+        PVOID root = nullptr;
+        __try {
+            root = *(PVOID*)(reinterpret_cast<UCHAR*>(proc) + vadroot_off);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            WW_LOG("dma_canary::build_private_va_ranges vadroot_read_failed");
+            return;
+        }
+        if (!root) {
+            WW_LOG("dma_canary::build_private_va_ranges null_root");
+            return;
+        }
+
+        ULONG build = whoswho_kernel_layout::build_number();
+        SIZE_T left_off, right_off, start_vpn_off, end_vpn_off, vad_flags_off;
+        if (build >= 26100) {
+            left_off = 0x10; right_off = 0x18;
+            start_vpn_off = 0x20; end_vpn_off = 0x28;
+            vad_flags_off = 0x30;
+        } else {
+            left_off = 0x00; right_off = 0x08;
+            start_vpn_off = 0x18; end_vpn_off = 0x20;
+            vad_flags_off = 0x28;
+        }
+
+        PVOID stk[64] = {};
+        LONG sp = 0;
+        if (root && sp < 64) stk[sp++] = root;
+        ULONG recorded = 0;
+
+        while (sp > 0) {
+            PVOID node = stk[--sp];
+            if (!node) continue;
+
+            UINT64 starting_vpn = 0;
+            UINT64 ending_vpn = 0;
+            ULONG vad_flags = 0;
+            PVOID left = nullptr;
+            PVOID right = nullptr;
+            BOOLEAN valid = FALSE;
+
+            __try {
+                starting_vpn = *(UINT64*)(reinterpret_cast<UCHAR*>(node) + start_vpn_off);
+                ending_vpn = *(UINT64*)(reinterpret_cast<UCHAR*>(node) + end_vpn_off);
+                vad_flags = *(ULONG*)(reinterpret_cast<UCHAR*>(node) + vad_flags_off);
+                left = *(PVOID*)(reinterpret_cast<UCHAR*>(node) + left_off);
+                right = *(PVOID*)(reinterpret_cast<UCHAR*>(node) + right_off);
+                valid = TRUE;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                valid = FALSE;
+            }
+
+            if (!valid) continue;
+
+            ULONG vad_type = vad_flags & 0x7;
+            BOOLEAN is_private_vad = (vad_type == 0) || ((vad_flags & 0x100) != 0);
+
+            if (is_private_vad && recorded < 256) {
+                g_private_va_ranges[recorded].va_start = starting_vpn << 12;
+                g_private_va_ranges[recorded].va_end = (ending_vpn + 1) << 12;
+                recorded++;
+            }
+
+            if (right && sp < 64) stk[sp++] = right;
+            if (left && sp < 64) stk[sp++] = left;
+        }
+
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_private_va_range_count),
+            static_cast<LONG>(recorded));
+        WW_LOG("dma_canary::build_private_va_ranges recorded=%lu build=%lu",
+            recorded, build);
+    }
+
+    __forceinline BOOLEAN is_va_in_private_range(UINT64 va) {
+        ULONG count = static_cast<ULONG>(
+            _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_private_va_range_count), 0, 0));
+        for (ULONG i = 0; i < count && i < 256; i++) {
+            if (va >= g_private_va_ranges[i].va_start && va < g_private_va_ranges[i].va_end)
+                return TRUE;
+        }
+        return FALSE;
+    }
+
+    __forceinline BOOLEAN is_va_range_in_private_range(UINT64 range_start, UINT64 range_end) {
+        ULONG count = static_cast<ULONG>(
+            _InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_private_va_range_count), 0, 0));
+        for (ULONG i = 0; i < count && i < 256; i++) {
+            if (range_start < g_private_va_ranges[i].va_end && range_end > g_private_va_ranges[i].va_start)
+                return TRUE;
+        }
+        return FALSE;
+    }
+
+    __forceinline void build_protected_pa_set(UINT32 owner_pid) {
+        if (!owner_pid) return;
+        UINT64 dtb = anti_dma::get_process_dtb(owner_pid);
+        if (!dtb) {
+            WW_LOG("dma_canary::build_protected_pa_set no_dtb pid=%lu", owner_pid);
+            return;
+        }
+        dtb &= 0x000FFFFFFFFFF000ULL;
+
+        PEPROCESS proc = nullptr;
+        NTSTATUS proc_st = PsLookupProcessByProcessId(
+            reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(owner_pid)), &proc);
+        if (NT_SUCCESS(proc_st) && proc) {
+            build_private_va_ranges(proc);
+            ObDereferenceObject(proc);
+        } else {
+            WW_LOG("dma_canary::build_protected_pa_set proc_lookup_failed pid=%lu status=0x%08lx",
+                owner_pid, proc_st);
+        }
+
+        ULONG recorded = 0;
+        ULONG budget = 8192;
+
+        for (ULONG pml4i = 0; pml4i < 256 && recorded < 4096 && budget > 0; pml4i++) {
+            UINT64 pml4e = 0;
+            SIZE_T br = 0;
+            if (!NT_SUCCESS(strong::read_physical(dtb + pml4i * 8, &pml4e, 8, &br)) || br != 8) continue;
+            if (!(pml4e & 1)) continue;
+            budget--;
+
+            UINT64 pdpt_pa = pml4e & 0x000FFFFFFFFFF000ULL;
+            for (ULONG pdpti = 0; pdpti < 512 && recorded < 4096 && budget > 0; pdpti++) {
+                UINT64 pdpte = 0;
+                if (!NT_SUCCESS(strong::read_physical(pdpt_pa + pdpti * 8, &pdpte, 8, &br)) || br != 8) continue;
+                if (!(pdpte & 1)) continue;
+                budget--;
+
+                if (pdpte & 0x80) {
+                    UINT64 start_pa = pdpte & 0x000FFFFFC0000000ULL;
+                    UINT64 large_va = ((UINT64)pml4i << 39) | ((UINT64)pdpti << 30);
+                    BOOLEAN large_private = is_va_range_in_private_range(large_va, large_va + (1ULL << 30));
+                    for (UINT64 off = 0; off < (1ULL << 30) && recorded < 4096; off += 0x1000) {
+                        g_protected_pa_set[recorded].pa = start_pa + off;
+                        g_protected_pa_set[recorded].is_private = large_private;
+                        recorded++;
+                    }
+                    continue;
+                }
+
+                UINT64 pd_pa = pdpte & 0x000FFFFFFFFFF000ULL;
+                for (ULONG pdi = 0; pdi < 512 && recorded < 4096 && budget > 0; pdi++) {
+                    UINT64 pde = 0;
+                    if (!NT_SUCCESS(strong::read_physical(pd_pa + pdi * 8, &pde, 8, &br)) || br != 8) continue;
+                    if (!(pde & 1)) continue;
+                    budget--;
+
+                    if (pde & 0x80) {
+                        UINT64 start_pa = pde & 0x000FFFFFFFE00000ULL;
+                        UINT64 large_va = ((UINT64)pml4i << 39) | ((UINT64)pdpti << 30) | ((UINT64)pdi << 21);
+                        BOOLEAN large_private = is_va_range_in_private_range(large_va, large_va + (2ULL * 1024 * 1024));
+                        for (UINT64 off = 0; off < (2ULL * 1024 * 1024) && recorded < 4096; off += 0x1000) {
+                            g_protected_pa_set[recorded].pa = start_pa + off;
+                            g_protected_pa_set[recorded].is_private = large_private;
+                            recorded++;
+                        }
+                        continue;
+                    }
+
+                    UINT64 pt_pa = pde & 0x000FFFFFFFFFF000ULL;
+                    for (ULONG pti = 0; pti < 512 && recorded < 4096 && budget > 0; pti++) {
+                        UINT64 pte = 0;
+                        if (!NT_SUCCESS(strong::read_physical(pt_pa + pti * 8, &pte, 8, &br)) || br != 8) continue;
+                        if (!(pte & 1)) continue;
+                        budget--;
+
+                        UINT64 phys = pte & 0x000FFFFFFFFFF000ULL;
+                        UINT64 page_va = ((UINT64)pml4i << 39) | ((UINT64)pdpti << 30) |
+                                         ((UINT64)pdi << 21) | ((UINT64)pti << 12);
+                        g_protected_pa_set[recorded].pa = phys;
+                        g_protected_pa_set[recorded].is_private = is_va_in_private_range(page_va);
+                        recorded++;
+                    }
+                }
+            }
+        }
+
+        _InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_protected_pa_count),
+            static_cast<LONG>(recorded));
+        _InterlockedExchange(&g_protected_pa_set_initialized, 1);
+        WW_LOG("dma_canary::build_protected_pa_set pid=%lu recorded=%lu budget_left=%lu private_ranges=%lu",
+            owner_pid, recorded, budget,
+            static_cast<ULONG>(_InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(&g_private_va_range_count), 0, 0)));
+    }
+
+    __forceinline BOOLEAN check_vad_covers_va(PEPROCESS proc, UINT64 va) {
+        if (!proc || !va) return FALSE;
+        SIZE_T vadroot_off = whoswho_kernel_layout::eprocess_vadroot_offset();
+        if (!vadroot_off) return FALSE;
+
+        PVOID root = nullptr;
+        __try {
+            root = *(PVOID*)(reinterpret_cast<UCHAR*>(proc) + vadroot_off);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return FALSE;
+        }
+        if (!root) return FALSE;
+
+        ULONG build = whoswho_kernel_layout::build_number();
+        SIZE_T left_off, right_off, start_vpn_off, end_vpn_off;
+        if (build >= 26100) {
+            left_off = 0x10; right_off = 0x18;
+            start_vpn_off = 0x20; end_vpn_off = 0x28;
+        } else {
+            left_off = 0x00; right_off = 0x08;
+            start_vpn_off = 0x18; end_vpn_off = 0x20;
+        }
+
+        UINT64 target_vpn = va >> 12;
+        PVOID stack[64] = {};
+        LONG sp = 0;
+        PVOID node = root;
+
+        while (node && sp < 64) {
+            UINT64 starting_vpn = 0;
+            UINT64 ending_vpn = 0;
+            PVOID left = nullptr;
+            PVOID right = nullptr;
+            BOOLEAN valid = FALSE;
+
+            __try {
+                starting_vpn = *(UINT64*)(reinterpret_cast<UCHAR*>(node) + start_vpn_off);
+                ending_vpn = *(UINT64*)(reinterpret_cast<UCHAR*>(node) + end_vpn_off);
+                left = *(PVOID*)(reinterpret_cast<UCHAR*>(node) + left_off);
+                right = *(PVOID*)(reinterpret_cast<UCHAR*>(node) + right_off);
+                valid = TRUE;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                valid = FALSE;
+            }
+
+            if (!valid) break;
+
+            if (target_vpn >= starting_vpn && target_vpn <= ending_vpn)
+                return TRUE;
+
+            if (target_vpn < starting_vpn) {
+                if (right && sp < 64) stack[sp++] = right;
+                node = left;
+            } else {
+                if (left && sp < 64) stack[sp++] = left;
+                node = right;
+            }
+        }
+
+        while (sp > 0) {
+            node = stack[--sp];
+            if (!node) continue;
+
+            UINT64 starting_vpn = 0;
+            UINT64 ending_vpn = 0;
+            PVOID left = nullptr;
+            PVOID right = nullptr;
+            BOOLEAN valid = FALSE;
+
+            __try {
+                starting_vpn = *(UINT64*)(reinterpret_cast<UCHAR*>(node) + start_vpn_off);
+                ending_vpn = *(UINT64*)(reinterpret_cast<UCHAR*>(node) + end_vpn_off);
+                left = *(PVOID*)(reinterpret_cast<UCHAR*>(node) + left_off);
+                right = *(PVOID*)(reinterpret_cast<UCHAR*>(node) + right_off);
+                valid = TRUE;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                valid = FALSE;
+            }
+
+            if (!valid) continue;
+
+            if (target_vpn >= starting_vpn && target_vpn <= ending_vpn)
+                return TRUE;
+
+            if (target_vpn < starting_vpn) {
+                if (right && sp < 64) stack[sp++] = right;
+                if (left && sp < 64) stack[sp++] = left;
+            } else {
+                if (left && sp < 64) stack[sp++] = left;
+                if (right && sp < 64) stack[sp++] = right;
+            }
+        }
+
+        return FALSE;
+    }
+
     __forceinline BOOLEAN scan_one_process(ULONG pid, const canary_t* snapshot,
                                            ULONG snapshot_count, ULONG* batch_budget,
                                            scan_hit_t* out_hit, BOOLEAN* out_budget_exhausted) {
@@ -615,6 +952,29 @@ namespace anti_dma_canary {
                             break;
                         }
                     }
+                    if (_InterlockedCompareExchange(&g_protected_pa_set_initialized, 0, 0)) {
+                        BOOLEAN pa_is_private = FALSE;
+                        if (is_pa_range_in_protected_set(start_pa, 1ULL << 30, &pa_is_private)) {
+                            if (pml4i < 256 && !(pdpte & 0x200)) {
+                                UINT64 foreign_va = ((UINT64)pml4i << 39) | ((UINT64)pdpti << 30);
+                                BOOLEAN vad_covers = check_vad_covers_va(proc, foreign_va);
+                                UINT64 evidence_hash = __rdtsc() ^ start_pa ^ foreign_va ^ pid;
+                                if (!vad_covers) {
+                                    WW_LOG("dma_canary::protected_pa_no_vad_1gb pid=%lu pa=0x%llx va=0x%llx pdpte=0x%llx",
+                                        pid, static_cast<unsigned long long>(start_pa),
+                                        static_cast<unsigned long long>(foreign_va),
+                                        static_cast<unsigned long long>(pdpte));
+                                    anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0009u, start_pa, pid, evidence_hash);
+                                } else if (pa_is_private) {
+                                    WW_LOG("dma_canary::protected_pa_private_mapped_1gb pid=%lu pa=0x%llx va=0x%llx pdpte=0x%llx",
+                                        pid, static_cast<unsigned long long>(start_pa),
+                                        static_cast<unsigned long long>(foreign_va),
+                                        static_cast<unsigned long long>(pdpte));
+                                    anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0007u, start_pa, pid, evidence_hash);
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -639,6 +999,29 @@ namespace anti_dma_canary {
                                 break;
                             }
                         }
+                        if (_InterlockedCompareExchange(&g_protected_pa_set_initialized, 0, 0)) {
+                            BOOLEAN pa_is_private = FALSE;
+                            if (is_pa_range_in_protected_set(start_pa, 2ULL * 1024 * 1024, &pa_is_private)) {
+                                if (pml4i < 256 && !(pde & 0x200)) {
+                                    UINT64 foreign_va = ((UINT64)pml4i << 39) | ((UINT64)pdpti << 30) | ((UINT64)pdi << 21);
+                                    BOOLEAN vad_covers = check_vad_covers_va(proc, foreign_va);
+                                    UINT64 evidence_hash = __rdtsc() ^ start_pa ^ foreign_va ^ pid;
+                                    if (!vad_covers) {
+                                        WW_LOG("dma_canary::protected_pa_no_vad_2mb pid=%lu pa=0x%llx va=0x%llx pde=0x%llx",
+                                            pid, static_cast<unsigned long long>(start_pa),
+                                            static_cast<unsigned long long>(foreign_va),
+                                            static_cast<unsigned long long>(pde));
+                                        anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0009u, start_pa, pid, evidence_hash);
+                                    } else if (pa_is_private) {
+                                        WW_LOG("dma_canary::protected_pa_private_mapped_2mb pid=%lu pa=0x%llx va=0x%llx pde=0x%llx",
+                                            pid, static_cast<unsigned long long>(start_pa),
+                                            static_cast<unsigned long long>(foreign_va),
+                                            static_cast<unsigned long long>(pde));
+                                        anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0007u, start_pa, pid, evidence_hash);
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -657,6 +1040,30 @@ namespace anti_dma_canary {
                                 phys, dtb, pte, pml4i, pdpti, pdi, pti, 0x1000ul);
                             hit = TRUE;
                             break;
+                        }
+                        if (_InterlockedCompareExchange(&g_protected_pa_set_initialized, 0, 0)) {
+                            BOOLEAN pa_is_private = FALSE;
+                            if (is_pa_in_protected_set(phys, &pa_is_private)) {
+                                if (pml4i < 256 && !(pte & 0x200)) {
+                                    UINT64 foreign_va = ((UINT64)pml4i << 39) | ((UINT64)pdpti << 30) |
+                                                        ((UINT64)pdi << 21) | ((UINT64)pti << 12);
+                                    BOOLEAN vad_covers = check_vad_covers_va(proc, foreign_va);
+                                    UINT64 evidence_hash = __rdtsc() ^ phys ^ foreign_va ^ pid;
+                                    if (!vad_covers) {
+                                        WW_LOG("dma_canary::protected_pa_no_vad pid=%lu pa=0x%llx va=0x%llx pte=0x%llx",
+                                            pid, static_cast<unsigned long long>(phys),
+                                            static_cast<unsigned long long>(foreign_va),
+                                            static_cast<unsigned long long>(pte));
+                                        anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0009u, phys, pid, evidence_hash);
+                                    } else if (pa_is_private) {
+                                        WW_LOG("dma_canary::protected_pa_private_mapped pid=%lu pa=0x%llx va=0x%llx pte=0x%llx",
+                                            pid, static_cast<unsigned long long>(phys),
+                                            static_cast<unsigned long long>(foreign_va),
+                                            static_cast<unsigned long long>(pte));
+                                        anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0007u, phys, pid, evidence_hash);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -741,6 +1148,96 @@ namespace anti_dma_canary {
         WW_LOG("dma_canary::corrupt_canaries corrupted=%lu", corrupted);
     }
 
+    __forceinline void expanded_page_checksum(const canary_t* snapshot, ULONG snapshot_count) {
+        if (!snapshot || snapshot_count == 0) return;
+
+        if (_InterlockedCompareExchange(&g_protected_pa_set_initialized, 0, 0) == 0) {
+            WW_LOG("dma_canary::expanded_page_checksum skipped reason=pa_set_not_built");
+            return;
+        }
+
+        _InterlockedExchange(&g_expanded_crc_initialized, 1);
+
+        UINT8* page_buf = static_cast<UINT8*>(
+            ExAllocatePool2(POOL_FLAG_NON_PAGED, 0x1000, POOL_TAG));
+        if (!page_buf) {
+            WW_LOG("dma_canary::expanded_page_checksum alloc_failed");
+            return;
+        }
+
+        ULONG checked = 0;
+        ULONG changed = 0;
+
+        for (ULONG ci = 0; ci < snapshot_count && ci < MAX_CANARIES && ci < 16; ci++) {
+            if (!snapshot[ci].active || !snapshot[ci].pa) continue;
+            UINT64 canary_pa = snapshot[ci].pa & ~0xFFFULL;
+            if (canary_pa <= 0x1000) continue;
+
+            UINT64 adj_pa = canary_pa - 0x1000;
+
+            BOOLEAN adj_is_private = FALSE;
+            if (!is_pa_in_protected_set(adj_pa, &adj_is_private) || !adj_is_private) {
+                continue;
+            }
+
+            SIZE_T br = 0;
+            if (!NT_SUCCESS(strong::read_physical(adj_pa, page_buf, 0x1000, &br)) || br != 0x1000)
+                continue;
+
+            UINT32 current_crc = anti_dma::compute_crc32(page_buf, 0x1000);
+            UINT32 prev_crc = g_expanded_crcs[ci].crc;
+            g_expanded_crcs[ci].pa = adj_pa;
+
+            if (prev_crc != 0 && current_crc != prev_crc) {
+                changed++;
+                UINT32 owner_pid = snapshot[ci].owner_pid;
+                UINT64 canary_va = snapshot[ci].va;
+                UINT64 owner_dtb = anti_dma::get_process_dtb(owner_pid);
+                BOOLEAN accessed_set = FALSE;
+
+                if (owner_dtb && canary_va) {
+                    UINT64 pte_pa = anti_dma::accessed_bit::get_pte_phys_addr(owner_dtb, canary_va);
+                    if (pte_pa) {
+                        UINT64 pte_val = 0;
+                        SIZE_T br2 = 0;
+                        if (NT_SUCCESS(strong::read_physical(pte_pa, &pte_val, 8, &br2)) && br2 == 8) {
+                            accessed_set = (pte_val & 0x20) != 0;
+                        }
+                    }
+                }
+
+                if (!accessed_set) {
+                    WW_LOG("dma_canary::expanded_crc_dma_write canary_pa=0x%llx adj_pa=0x%llx prev=0x%08x cur=0x%08x accessed=0",
+                        static_cast<unsigned long long>(canary_pa),
+                        static_cast<unsigned long long>(adj_pa),
+                        prev_crc, current_crc);
+                    UINT64 evidence_hash = __rdtsc() ^ adj_pa ^ canary_pa ^ current_crc;
+                    anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0005u, adj_pa, 0, evidence_hash);
+                } else {
+                    LONG foreign_attach = _InterlockedCompareExchange(
+                        &anti_dump_kernel::g_foreign_attach_detected, 0, 0);
+                    WW_LOG("dma_canary::expanded_crc_cpu_write canary_pa=0x%llx adj_pa=0x%llx prev=0x%08x cur=0x%08x foreign_attach=%ld",
+                        static_cast<unsigned long long>(canary_pa),
+                        static_cast<unsigned long long>(adj_pa),
+                        prev_crc, current_crc, foreign_attach);
+                    if (foreign_attach == 1) {
+                        UINT64 evidence_hash = __rdtsc() ^ adj_pa ^ canary_pa ^ current_crc;
+                        anti_dma::countermeasure::scrub_keys_then_bsod(0xA1DA0006u, adj_pa, 0, evidence_hash);
+                    }
+                }
+            }
+
+            g_expanded_crcs[ci].crc = current_crc;
+            checked++;
+        }
+
+        RtlSecureZeroMemory(page_buf, 0x1000);
+        ExFreePoolWithTag(page_buf, POOL_TAG);
+
+        WW_LOG("dma_canary::expanded_page_checksum checked=%lu changed=%lu",
+            checked, changed);
+    }
+
     __forceinline void do_scan_batch() {
         UINT32 registered_pid = current_registered_client_pid();
         if (!registered_pid) {
@@ -767,6 +1264,10 @@ namespace anti_dma_canary {
         }
 
         cleanup_dead_owners();
+
+        if (!_InterlockedCompareExchange(&g_protected_pa_set_initialized, 0, 0)) {
+            build_protected_pa_set(registered_pid);
+        }
 
         LONG cycles = _InterlockedIncrement(&g_scan_cycle_since_refresh);
         if (cycles >= 12) {
@@ -855,6 +1356,10 @@ namespace anti_dma_canary {
 
         if ((batch_id & 1) == 0) {
             anti_dma::pte_protect::verify_all_protections();
+        }
+
+        if (static_cast<ULONG64>(batch_id) % 5 == 0) {
+            expanded_page_checksum(snapshot, snapshot_count);
         }
 
         ULONG batch_budget = READ_BUDGET_PER_BATCH;
@@ -1141,6 +1646,13 @@ namespace anti_dma_canary {
             g_canary_count,
             client_pid,
             static_cast<ULONG>(KeGetCurrentIrql()));
+        UINT64 jitter_ms = __rdtsc() % 1500;
+        if (jitter_ms > 0 && KeGetCurrentIrql() == PASSIVE_LEVEL && _KeDelayExecutionThread) {
+            LARGE_INTEGER jitter_wait;
+            jitter_wait.QuadPart = -static_cast<LONGLONG>(jitter_ms) * 10000LL;
+            _KeDelayExecutionThread(KernelMode, FALSE, &jitter_wait);
+        }
+        WW_LOG("dma_canary::jitter_applied ms=%llu", jitter_ms);
         __try {
             do_scan_batch();
         } __except (EXCEPTION_EXECUTE_HANDLER) {

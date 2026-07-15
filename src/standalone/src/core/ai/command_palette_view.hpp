@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -107,7 +108,7 @@ namespace command_palette {
 		{
 			std::string k;
 			k.reserve(c.name.size() + c.source_path.size() + 8);
-			k.push_back((char)('0' + (int)c.source));
+			k.push_back(static_cast<char>('0' + static_cast<int>(c.source)));
 			k.push_back('|');
 			k += c.name;
 			k.push_back('|');
@@ -121,7 +122,7 @@ namespace command_palette {
 			std::string k;
 			k.reserve(v.size() * 16);
 			for (const auto& c : v) {
-				k.push_back((char)('0' + (int)c.source));
+				k.push_back(static_cast<char>('0' + static_cast<int>(c.source)));
 				k.push_back(':');
 				k += c.name;
 				k.push_back(';');
@@ -265,7 +266,7 @@ namespace command_palette {
 		{
 			const auto& th = ui::resolved();
 
-			const int   shadow_passes = std::max(1, (int)floorf(open_t * 4.5f) - (int)floorf(close_t * 4.0f));
+			const int   shadow_passes = std::max(1, static_cast<int>(floorf(open_t * 4.5f)) - static_cast<int>(floorf(close_t * 4.0f)));
 			const float shadow_strength = 0.40f * open_t * (1.f - close_t);
 			ui::blur::render_drop_shadow(dl, a, b, radius, shadow_passes, shadow_strength,
 				ImVec2(0.f, 6.f + 2.f * (1.f - open_t)));
@@ -303,30 +304,32 @@ namespace command_palette {
 		inline float row_eased_progress(int idx)
 		{
 			auto& v = row_anims();
-			if (idx < 0 || idx >= (int)v.size()) return 1.f;
-			return v[idx].eased();
+			if (idx < 0) return 1.f;
+			const std::size_t row_index = static_cast<std::size_t>(idx);
+			if (row_index >= v.size()) return 1.f;
+			return v[row_index].eased();
 		}
 
 
-		inline void ensure_row_anims(int count)
+		inline void ensure_row_anims(std::size_t count)
 		{
 			auto& v = row_anims();
-			if ((int)v.size() == count) return;
+			if (v.size() == count) return;
 			v.resize(count);
-			for (int i = 0; i < count; ++i) {
-				const float delay = std::min(8, i) * 0.012f;
+			for (std::size_t i = 0; i < count; ++i) {
+				const float delay = static_cast<float>(std::min<std::size_t>(8, i)) * 0.012f;
 				v[i].reset();
 				v[i].start(0.260f, motion::ease::out_quint, delay);
 			}
 		}
 
 
-		inline void retrigger_row_anims(int count)
+		inline void retrigger_row_anims(std::size_t count)
 		{
 			auto& v = row_anims();
 			v.assign(count, ui::transition_t{});
-			for (int i = 0; i < count; ++i) {
-				const float delay = std::min(8, i) * 0.012f;
+			for (std::size_t i = 0; i < count; ++i) {
+				const float delay = static_cast<float>(std::min<std::size_t>(8, i)) * 0.012f;
 				v[i].start(0.260f, motion::ease::out_quint, delay);
 			}
 		}
@@ -339,7 +342,6 @@ namespace command_palette {
 		{
 			const auto& t = ui::resolved();
 
-			const float row_h = rb.y - ra.y;
 			const float lift_y = (1.f - entrance_t) * 6.f;
 			ImVec2 a(ra.x, ra.y + lift_y);
 			ImVec2 b(rb.x, rb.y + lift_y);
@@ -384,7 +386,6 @@ namespace command_palette {
 			const float desc_fs = 13.f;
 
 			const float text_x = a.x + inner_pad + icon_size + 12.f;
-			const float text_top = a.y + (row_h - (name_fs + desc_fs * 0.0f)) * 0.5f;
 
 			ImU32 name_col = ui::with_alpha(
 				is_selected ? t.text_primary : ui::mix(t.text_primary, t.text_secondary, 0.25f),
@@ -407,7 +408,7 @@ namespace command_palette {
 					std::string desc = c.description;
 					ImVec2 dts = desc_font->CalcTextSizeA(desc_fs, FLT_MAX, 0.f, desc.c_str());
 					if (dts.x > max_desc_w) {
-						const size_t approx = (size_t)(max_desc_w / (dts.x / (float)desc.size() + 0.0001f));
+						const std::size_t approx = static_cast<std::size_t>(max_desc_w / (dts.x / static_cast<float>(desc.size()) + 0.0001f));
 						if (approx + 3 < desc.size()) desc = desc.substr(0, approx) + "...";
 					}
 					dl->AddText(desc_font, desc_fs,
@@ -424,9 +425,9 @@ namespace command_palette {
 					{ "preview", "Tab" },
 				};
 				float right_x = b.x - inner_pad;
-				for (int i = 0; i < (int)(sizeof(chips) / sizeof(chips[0])); ++i) {
-					ImVec2 lts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, chips[i].lbl);
-					ImVec2 kts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, chips[i].key);
+				for (const auto& chip : chips) {
+					ImVec2 lts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, chip.lbl);
+					ImVec2 kts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, chip.key);
 					float kw = kts.x + 10.f;
 					float total = kw + 4.f + lts.x;
 					float chip_y = (a.y + b.y) * 0.5f - 8.f;
@@ -437,9 +438,9 @@ namespace command_palette {
 					dl->AddRect(ka, kb,
 						ui::with_alpha(t.border_subtle, 0.95f * alpha), 4.f, 0, 1.f);
 					dl->AddText(sf, kfs, ImVec2(ka.x + 5.f, ka.y + (16.f - kfs) * 0.5f),
-						ui::with_alpha(t.text_secondary, alpha), chips[i].key);
+						ui::with_alpha(t.text_secondary, alpha), chip.key);
 					dl->AddText(sf, kfs, ImVec2(kb.x + 4.f, ka.y + (16.f - kfs) * 0.5f),
-						ui::with_alpha(t.text_dim, alpha), chips[i].lbl);
+						ui::with_alpha(t.text_dim, alpha), chip.lbl);
 					right_x -= total + 8.f;
 				}
 			}
@@ -471,16 +472,16 @@ namespace command_palette {
 			ImFont* mono = ui::fonts::code();
 			const float fs = 13.f;
 			float y = origin.y;
-			size_t i = 0;
+			std::size_t i = 0;
 			int line = 0;
 			while (i < text.size() && line < max_lines) {
-				size_t end = text.find('\n', i);
+				std::size_t end = text.find('\n', i);
 				if (end == std::string::npos) end = text.size();
 				std::string ln = text.substr(i, end - i);
 				if (!ln.empty() && ln.back() == '\r') ln.pop_back();
 				ImVec2 tsz = mono->CalcTextSizeA(fs, FLT_MAX, 0.f, ln.c_str());
 				if (tsz.x > max_w) {
-					size_t approx = (size_t)(max_w / (tsz.x / (float)ln.size() + 0.0001f));
+					std::size_t approx = static_cast<std::size_t>(max_w / (tsz.x / static_cast<float>(ln.size()) + 0.0001f));
 					if (approx + 3 < ln.size()) ln = ln.substr(0, approx) + "...";
 				}
 				dl->AddText(mono, fs, ImVec2(origin.x, y), col, ln.c_str());
@@ -515,33 +516,33 @@ namespace command_palette {
 			ImU32 base = ui::with_alpha(t.text_secondary, alpha);
 			ImU32 ph_col = ui::with_alpha(t.accent_u32, alpha);
 
-			size_t i = 0;
+			std::size_t i = 0;
 			int line = 0;
 			const int max_lines = 18;
 			while (i < body.size() && line < max_lines && y + line_h < b.y - pad - 60.f) {
-				size_t end = body.find('\n', i);
+				std::size_t end = body.find('\n', i);
 				if (end == std::string::npos) end = body.size();
 				std::string ln = body.substr(i, end - i);
 				if (!ln.empty() && ln.back() == '\r') ln.pop_back();
 
 				ImVec2 tsz = mono->CalcTextSizeA(fs, FLT_MAX, 0.f, ln.c_str());
 				if (tsz.x > max_w) {
-					size_t approx = (size_t)(max_w / (tsz.x / (float)ln.size() + 0.0001f));
+					std::size_t approx = static_cast<std::size_t>(max_w / (tsz.x / static_cast<float>(ln.size()) + 0.0001f));
 					if (approx + 3 < ln.size()) ln = ln.substr(0, approx) + "...";
 				}
 
 				float x = a.x + pad;
-				size_t k = 0;
+				std::size_t k = 0;
 				while (k < ln.size()) {
 					if (ln[k] == '$' && k + 1 < ln.size() && ln[k + 1] == '{') {
-						size_t close = ln.find('}', k + 2);
+						std::size_t close = ln.find('}', k + 2);
 						if (close == std::string::npos) close = ln.size();
 						std::string token = ln.substr(k, close - k + 1);
 						dl->AddText(mono, fs, ImVec2(x, y), ph_col, token.c_str());
 						x += mono->CalcTextSizeA(fs, FLT_MAX, 0.f, token.c_str()).x;
 						k = close + 1;
 					} else {
-						size_t next = ln.find('$', k);
+						std::size_t next = ln.find('$', k);
 						if (next == std::string::npos) next = ln.size();
 						std::string seg = ln.substr(k, next - k);
 						dl->AddText(mono, fs, ImVec2(x, y), base, seg.c_str());
@@ -561,7 +562,7 @@ namespace command_palette {
 					ui::with_alpha(t.text_dim, alpha), "ARGUMENTS");
 				y += 18.f;
 				std::string args;
-				for (size_t j = 0; j < c.placeholder_hints.size(); ++j) {
+				for (std::size_t j = 0; j < c.placeholder_hints.size(); ++j) {
 					if (j > 0) args += ", ";
 					args += c.placeholder_hints[j];
 				}
@@ -571,7 +572,7 @@ namespace command_palette {
 		}
 
 
-		inline void render_agent_preview(ImDrawList* dl, ImVec2 a, ImVec2 b,
+		inline void render_agent_preview(ImDrawList* dl, ImVec2 a, ImVec2,
 		                                   const commands::command_t& c, float alpha)
 		{
 			const auto& t = ui::resolved();
@@ -750,11 +751,11 @@ namespace command_palette {
 		std::sort(hits.begin(), hits.end(), [](const commands::command_t& a, const commands::command_t& b) {
 			category_t ca = classify(a);
 			category_t cb = classify(b);
-			if (ca != cb) return (int)ca < (int)cb;
+			if (ca != cb) return static_cast<int>(ca) < static_cast<int>(cb);
 			return a.name < b.name;
 		});
 
-		const int hit_count = (int)hits.size();
+		const int hit_count = static_cast<int>(hits.size());
 		if (selected_index() >= hit_count) selected_index() = std::max(0, hit_count - 1);
 		if (selected_index() < 0) selected_index() = 0;
 
@@ -765,12 +766,12 @@ namespace command_palette {
 		}
 
 		if (new_results_key != last_result_key()) {
-			retrigger_row_anims(hit_count);
+			retrigger_row_anims(hits.size());
 			filter_xfade().reset();
 			filter_xfade().start(0.140f, motion::ease::out_cubic);
 			last_result_key() = new_results_key;
 		} else {
-			ensure_row_anims(hit_count);
+			ensure_row_anims(hits.size());
 		}
 
 		const float open_t = open_anim().eased();
@@ -816,12 +817,15 @@ namespace command_palette {
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
 		ImGui::PushStyleVar(ImGuiStyleVar_Alpha,           ImGui::GetStyle().Alpha * close_alpha);
 
-		const ImGuiWindowFlags flags =
+		ImGuiWindowFlags flags =
 			ImGuiWindowFlags_NoTitleBar   | ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove       | ImGuiWindowFlags_NoCollapse |
-			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+			ImGuiWindowFlags_NoSavedSettings |
 			ImGuiWindowFlags_NoScrollbar  | ImGuiWindowFlags_NoScrollWithMouse |
 			ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
+#ifdef IMGUI_HAS_DOCK
+		flags |= ImGuiWindowFlags_NoDocking;
+#endif
 
 		const bool window_visible = ImGui::Begin("##aida_command_palette", nullptr, flags);
 		if (!window_visible) {
@@ -890,7 +894,7 @@ namespace command_palette {
 
 		if (globals::ui::command_palette_buf[0] == '\0') {
 			ImFont* placeholder_font = ui::fonts::lg();
-			float pfs = placeholder_font->FontSize;
+			float pfs = ui::fonts::size_or(placeholder_font, ImGui::GetFontSize());
 			fdl->AddText(placeholder_font, pfs,
 				ImVec2(input_text_left, (input_a.y + input_b.y) * 0.5f - pfs * 0.5f),
 				ui::with_alpha(th.text_dim, close_alpha),
@@ -926,7 +930,7 @@ namespace command_palette {
 		}
 
 		if (enter_pressed && hit_count > 0 && !block_input) {
-			execute_selection(hits[selected_index()]);
+			execute_selection(hits[static_cast<std::size_t>(selected_index())]);
 		}
 
 		const float list_top = input_b.y + 14.f;
@@ -942,10 +946,10 @@ namespace command_palette {
 		const float row_h = 40.f;
 		const float row_gap = 4.f;
 
-		std::vector<bool> show_header_for(hit_count, false);
+		std::vector<bool> show_header_for(hits.size(), false);
 		bool any_two_categories = false;
 		category_t prev_cat = category_t::count;
-		for (int i = 0; i < hit_count; ++i) {
+		for (std::size_t i = 0; i < hits.size(); ++i) {
 			category_t cat = classify(hits[i]);
 			if (cat != prev_cat) {
 				show_header_for[i] = true;
@@ -973,7 +977,8 @@ namespace command_palette {
 		ImVec2 win_pos = ImGui::GetCursorScreenPos();
 		ImVec2 win_avail = ImGui::GetContentRegionAvail();
 
-		for (int idx = 0; idx < hit_count; ++idx) {
+		for (std::size_t idx = 0; idx < hits.size(); ++idx) {
+			const int row_index = static_cast<int>(idx);
 			const commands::command_t& c = hits[idx];
 			const bool show_header = show_headers && show_header_for[idx];
 
@@ -988,19 +993,19 @@ namespace command_palette {
 			ImVec2 rb(ra.x + win_avail.x - xfade_dx, ra.y + row_h);
 
 			ImGui::SetCursorScreenPos(ImVec2(win_pos.x, win_pos.y + y_cursor));
-			ImGui::PushID(idx);
+			ImGui::PushID(row_index);
 			ImGui::InvisibleButton("##row", ImVec2(win_avail.x, row_h));
 			const bool hovered = ImGui::IsItemHovered();
 			const bool clicked = ImGui::IsItemClicked();
 			ImGui::PopID();
 
-			if (hovered) selected_index() = idx;
+			if (hovered) selected_index() = row_index;
 
-			float entrance_t = row_eased_progress(idx);
+			float entrance_t = row_eased_progress(row_index);
 			float row_close_alpha = new_alpha * close_alpha;
 
 			ImGui::PushClipRect(ra, rb, true);
-			render_row(wdl, ra, rb, c, idx == selected_index(), hovered,
+			render_row(wdl, ra, rb, c, row_index == selected_index(), hovered,
 				entrance_t, row_close_alpha, true);
 			ImGui::PopClipRect();
 
@@ -1023,7 +1028,7 @@ namespace command_palette {
 			float target_y = 0.f;
 			category_t prev = category_t::count;
 			for (int i = 0; i <= selected_index(); ++i) {
-				category_t cat = classify(hits[i]);
+				category_t cat = classify(hits[static_cast<std::size_t>(i)]);
 				if (show_headers && cat != prev) {
 					if (i != 0) target_y += 26.f;
 					else target_y += 0.f;
@@ -1056,7 +1061,7 @@ namespace command_palette {
 			float p_alpha = preview_anim().eased() * close_alpha;
 			const commands::command_t* sel =
 				(selected_index() >= 0 && selected_index() < hit_count)
-				? &hits[selected_index()] : nullptr;
+				? &hits[static_cast<std::size_t>(selected_index())] : nullptr;
 
 			std::string key = sel ? preview_key_for(*sel) : std::string();
 			if (key != preview_state().key) {
@@ -1102,8 +1107,7 @@ namespace command_palette {
 			};
 			ImFont* sf = ui::fonts::caption();
 			float spacing = 14.f;
-			for (int i = 0; i < (int)(sizeof(pairs) / sizeof(pairs[0])); ++i) {
-				const auto& p = pairs[i];
+			for (const auto& p : pairs) {
 				ImVec2 lts = sf->CalcTextSizeA(11.f, FLT_MAX, 0.f, p.lbl);
 				ImVec2 kts = sf->CalcTextSizeA(11.f, FLT_MAX, 0.f, p.key);
 				float kw = kts.x + 12.f;

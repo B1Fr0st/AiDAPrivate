@@ -1,20 +1,36 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "api_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_routed.hpp"
+#else
 #include "api_definition.hpp"
 #include "audit_http.hpp"
+#endif
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
 #include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include "imgui/imgui.h"
 
@@ -192,10 +208,13 @@ void render(float pos_x, float pos_y, float width, float height,
     }
     ImGui::EndChild();
 
+    const size_t selected_collection_index = static_cast<size_t>(s_state.selected_collection_index);
+    const size_t selected_request_index = static_cast<size_t>(s_state.selected_request_index);
+
     ImGui::SetCursorPos(ImVec2(left_w + 8.f, content_y));
     ImGui::BeginChild("##api_center", ImVec2(center_w, content_h), false);
-    if (s_state.selected_collection_index >= 0 && s_state.selected_collection_index < static_cast<int>(collections.size())) {
-        const auto& c = collections[s_state.selected_collection_index];
+    if (s_state.selected_collection_index >= 0 && selected_collection_index < collections.size()) {
+        const auto& c = collections[selected_collection_index];
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                            "Requests in %s", c.name.c_str());
         ImGui::Separator();
@@ -262,11 +281,11 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SetCursorPos(ImVec2(left_w + center_w + 16.f, content_y));
     ImGui::BeginChild("##api_right", ImVec2(right_w, content_h), false);
 
-    if (s_state.selected_collection_index >= 0 && s_state.selected_collection_index < static_cast<int>(collections.size())
+    if (s_state.selected_collection_index >= 0 && selected_collection_index < collections.size()
         && s_state.selected_request_index >= 0
-        && s_state.selected_request_index < static_cast<int>(collections[s_state.selected_collection_index].requests.size())) {
-        const auto& c = collections[s_state.selected_collection_index];
-        const auto& r = c.requests[s_state.selected_request_index];
+        && selected_request_index < collections[selected_collection_index].requests.size()) {
+        const auto& c = collections[selected_collection_index];
+        const auto& r = c.requests[selected_request_index];
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
                            "%s %s", r.method.c_str(), r.path.c_str());
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),

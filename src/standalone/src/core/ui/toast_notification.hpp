@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <functional>
 #include <cstdint>
+#include <cstddef>
 #include <cmath>
 
 namespace toast_notification
@@ -61,7 +62,7 @@ namespace toast_notification
         bool action_clicked_this_frame = false;
     };
 
-    inline constexpr int   MAX_VISIBLE       = 5;
+    inline constexpr std::size_t MAX_VISIBLE = 5;
     inline constexpr float DEDUP_WINDOW      = 3.0f;
     inline constexpr float TOAST_WIDTH       = 380.0f;
     inline constexpr float TOAST_HEIGHT      = 56.0f;
@@ -205,7 +206,7 @@ namespace toast_notification
                 float a0 = -1.5707963f;
                 float a1 = a0 + progress * 6.2831853f;
                 int seg_count = 64;
-                int steps = static_cast<int>(seg_count * progress);
+                int steps = static_cast<int>(static_cast<float>(seg_count) * progress);
                 if (steps < 2) steps = 2;
                 dl->PathArcTo(center, radius, a0, a1, steps);
                 dl->PathStroke(multiply_alpha(color, alpha), 0, thickness);
@@ -243,7 +244,7 @@ namespace toast_notification
         nt.duration = duration;
         detail::s_toasts.push_back(std::move(nt));
 
-        while (static_cast<int>(detail::s_toasts.size()) > MAX_VISIBLE * 2) {
+        while (detail::s_toasts.size() > MAX_VISIBLE * std::size_t{2}) {
             detail::s_toasts.erase(detail::s_toasts.begin());
         }
     }
@@ -273,7 +274,7 @@ namespace toast_notification
         nt.has_action = !nt.action.label.empty();
         detail::s_toasts.push_back(std::move(nt));
 
-        while (static_cast<int>(detail::s_toasts.size()) > MAX_VISIBLE * 2) {
+        while (detail::s_toasts.size() > MAX_VISIBLE * std::size_t{2}) {
             detail::s_toasts.erase(detail::s_toasts.begin());
         }
     }
@@ -300,8 +301,8 @@ namespace toast_notification
         ImFont* font_action = aida::ui::fonts::caption();
         if (!font_msg)    font_msg    = ImGui::GetFont();
         if (!font_action) font_action = ImGui::GetFont();
-        const float font_size_msg    = font_msg ? font_msg->FontSize : ImGui::GetFontSize();
-        const float font_size_action = font_action ? font_action->FontSize : ImGui::GetFontSize();
+        const float font_size_msg    = aida::ui::fonts::size_or(font_msg, ImGui::GetFontSize());
+        const float font_size_action = aida::ui::fonts::size_or(font_action, ImGui::GetFontSize());
 
         const auto& th = aida::ui::resolved();
         const ImU32 text_primary   = th.text_primary;
@@ -312,7 +313,7 @@ namespace toast_notification
         const bool mouse_clicked = ImGui::IsMouseClicked(0);
         const bool mouse_released = ImGui::IsMouseReleased(0);
 
-        int visible_index = 0;
+        std::size_t visible_index = 0;
         std::vector<float> stack_target_y;
         std::vector<float> stack_height;
         stack_target_y.reserve(detail::s_toasts.size());
@@ -345,25 +346,26 @@ namespace toast_notification
             }
 
             float ty = display.y - BOTTOM_MARGIN - h;
-            for (int p = 0; p < visible_index; ++p) {
-                int idx_above = static_cast<int>(stack_height.size()) - 2 - p;
-                if (idx_above < 0) break;
+            for (std::size_t p = 0; p < visible_index; ++p) {
+                const std::size_t stack_offset = p + 2;
+                if (stack_offset > stack_height.size()) break;
+                const std::size_t idx_above = stack_height.size() - stack_offset;
                 ty -= stack_height[idx_above] + GAP;
             }
             stack_target_y.push_back(ty);
             ++visible_index;
         }
 
-        std::vector<size_t> render_order;
+        std::vector<std::size_t> render_order;
         render_order.reserve(detail::s_toasts.size());
-        for (size_t i = 0; i < detail::s_toasts.size(); ++i)
+        for (std::size_t i = 0; i < detail::s_toasts.size(); ++i)
             render_order.push_back(i);
 
-        for (size_t order_i = 0; order_i < render_order.size(); ++order_i) {
-            size_t i = render_order[order_i];
+        for (std::size_t order_i = 0; order_i < render_order.size(); ++order_i) {
+            std::size_t i = render_order[order_i];
             auto& t = detail::s_toasts[i];
 
-            size_t reverse_i = detail::s_toasts.size() - 1 - i;
+            std::size_t reverse_i = detail::s_toasts.size() - 1 - i;
             float target_y = stack_target_y[reverse_i];
             float h = stack_height[reverse_i];
 

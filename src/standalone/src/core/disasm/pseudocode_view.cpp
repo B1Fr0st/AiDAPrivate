@@ -7,6 +7,9 @@
 #include "../ui/theme.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
 #include "../../helpers/globals.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/disasm_preview_adapter.hpp"
+#endif
 
 #include "imgui/imgui.h"
 
@@ -91,7 +94,7 @@ std::optional<aida::analysis::address_t> function_address(
     return disasm_view::typed_address(context, function);
 }
 
-std::uint64_t runtime_address(
+std::uint64_t canonical_runtime_address(
     const disasm_view::workspace_context_t& context,
     const aida::analysis::address_t& address)
 {
@@ -290,6 +293,20 @@ void refresh_tab_states(
     }
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void settle_preview_request(
+    aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    const pseudocode_request_t& request)
+{
+    for (std::uint32_t attempt = 0; attempt < 8; ++attempt) {
+        const auto* cached = model.cached_document(request);
+        if (!cached || cached->state != pseudocode_cache_state_t::requesting)
+            return;
+        static_cast<void>(model.poll(cached->job_id));
+    }
+}
+#endif
+
 disasm_view::workspace_context_t selected_context()
 {
     return disasm_view::capture_selected_workspace();
@@ -331,7 +348,7 @@ void navigate_to_disassembly(
     std::uint64_t source_address)
 {
     const auto typed = typed_source_address(context, source_address);
-    const auto target = typed ? runtime_address(context, *typed) : source_address;
+    const auto target = typed ? canonical_runtime_address(context, *typed) : source_address;
     aida::workbench::selection_context_t selection;
     selection.kind = aida::workbench::selection_kind_t::address;
     selection.has_address = true;
@@ -363,7 +380,7 @@ void persist_line_selection(
     if (source_address) {
         const auto typed = typed_source_address(context, *source_address);
         selection.has_address = true;
-        selection.address = typed ? runtime_address(context, *typed) : *source_address;
+        selection.address = typed ? canonical_runtime_address(context, *typed) : *source_address;
     } else {
         selection.entity_key = "pseudocode.line." +
             std::to_string(line.line_number);
@@ -397,7 +414,7 @@ void request_decompile(const disasm_view::workspace_context_t& context,
     const auto typed = function_address(context, address);
     if (!typed)
         return;
-    const auto canonical_address = runtime_address(context, *typed);
+    const auto canonical_address = canonical_runtime_address(context, *typed);
     auto state = state_for(context);
     if (!state)
         return;
@@ -420,6 +437,13 @@ void request_decompile(const disasm_view::workspace_context_t& context,
     aida::workbench::pseudocode_document::pseudocode_error_t requested;
     if (resolved)
         requested = workbench.pseudocode_document->request(request, force_refresh);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (resolved && requested) {
+        settle_preview_request(*workbench.pseudocode_document, request);
+        aida::preview::disasm::record("decompile_function", canonical_address,
+            force_refresh ? "refresh" : "open");
+    }
+#endif
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         const auto index = find_tab(*state, canonical_address);
@@ -494,6 +518,12 @@ void request_decompile(
     if (resolved)
         requested = workbench.pseudocode_document->request(
             request, force_refresh);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (resolved && requested) {
+        settle_preview_request(*workbench.pseudocode_document, request);
+        aida::preview::disasm::record("decompile_entity", 0, *canonical);
+    }
+#endif
     std::lock_guard<std::mutex> lock(state->mutex);
     const auto index = find_tab(*state, *canonical);
     if (!index)
@@ -537,7 +567,7 @@ void close_tab_by_addr(const disasm_view::workspace_context_t& context,
     const auto typed = function_address(context, address);
     if (!typed)
         return;
-    const auto canonical_address = runtime_address(context, *typed);
+    const auto canonical_address = canonical_runtime_address(context, *typed);
     aida::workbench::workbench_shell_workspace_context_t workbench;
     if (workbench_context(context, workbench) && workbench.pseudocode_document) {
         auto state = state_for(context);
@@ -632,7 +662,7 @@ void activate_tab_by_addr(const disasm_view::workspace_context_t& context,
     const auto typed = function_address(context, address);
     if (!typed)
         return;
-    const auto canonical_address = runtime_address(context, *typed);
+    const auto canonical_address = canonical_runtime_address(context, *typed);
     aida::workbench::workbench_shell_workspace_context_t workbench;
     const auto activated =
         aida::workbench::workbench_shell_runtime_t::instance()
@@ -768,7 +798,7 @@ bool has_tab_for(const disasm_view::workspace_context_t& context,
         return false;
     synchronize_tabs(context, workbench, state);
     std::lock_guard<std::mutex> lock(state->mutex);
-    return find_tab(*state, runtime_address(context, *typed)).has_value();
+    return find_tab(*state, canonical_runtime_address(context, *typed)).has_value();
 }
 
 std::uint64_t active_tab_address(const disasm_view::workspace_context_t& context)
@@ -831,7 +861,7 @@ void render(float, float, float width, float height,
 {
     if (!context) {
         ImGui::BeginChild("##workspace_pseudocode_empty", ImVec2(width, height), false);
-        aida::ui::empty_state("pseudocode_workspace_empty", "No workspace selected",
+        aida::ui::compact_empty_state("pseudocode_workspace_empty", "No workspace selected",
             "Open a target and decompile a function to inspect pseudocode.", nullptr,
             ImVec2(0.0f, (std::max)(152.0f, height - aida::ui::metrics::spacing::lg)));
         ImGui::EndChild();
@@ -1002,11 +1032,11 @@ void render(float, float, float width, float height,
     }
 
     if (!has_active || tabs.empty()) {
-        aida::ui::empty_state("pseudocode_no_function", "No function selected",
+        aida::ui::compact_empty_state("pseudocode_no_function", "No function selected",
             "Press F5 in disassembly or choose Decompile function to open pseudocode.",
             nullptr, ImVec2(0.0f, 152.0f));
     } else if (status == pseudocode_cache_state_t::empty) {
-        if (aida::ui::empty_state("pseudocode_not_generated", "Pseudocode not generated",
+        if (aida::ui::compact_empty_state("pseudocode_not_generated", "Pseudocode not generated",
                 "Decompile this function explicitly to produce a source-like view.",
                 "Decompile", ImVec2(0.0f, 152.0f)))
             refresh_active_tab(context);

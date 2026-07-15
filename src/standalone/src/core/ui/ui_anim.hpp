@@ -71,10 +71,10 @@ inline ImU32 color_lerp(ImU32 col_a, ImU32 col_b, float t)
 	int gb = (col_b >> IM_COL32_G_SHIFT) & 0xFF;
 	int bb = (col_b >> IM_COL32_B_SHIFT) & 0xFF;
 	int ab = (col_b >> IM_COL32_A_SHIFT) & 0xFF;
-	int r = ra + static_cast<int>((rb - ra) * t);
-	int g = ga + static_cast<int>((gb - ga) * t);
-	int b = ba + static_cast<int>((bb - ba) * t);
-	int a = aa + static_cast<int>((ab - aa) * t);
+	int r = ra + static_cast<int>(static_cast<float>(rb - ra) * t);
+	int g = ga + static_cast<int>(static_cast<float>(gb - ga) * t);
+	int b = ba + static_cast<int>(static_cast<float>(bb - ba) * t);
+	int a = aa + static_cast<int>(static_cast<float>(ab - aa) * t);
 	return IM_COL32(r, g, b, a);
 }
 
@@ -152,10 +152,11 @@ inline void render_spinner(ImDrawList* dl, float cx, float cy, float radius, flo
 	const float arc_start = time * 5.f;
 	const float arc_len = 1.8f;
 	const int segments = 24;
+	const float segment_count = static_cast<float>(segments);
 	for (int i = 0; i < segments; ++i) {
-		float t0 = arc_start + (static_cast<float>(i) / segments) * arc_len;
-		float t1 = arc_start + (static_cast<float>(i + 1) / segments) * arc_len;
-		float a0 = static_cast<float>(i) / segments;
+		float t0 = arc_start + (static_cast<float>(i) / segment_count) * arc_len;
+		float t1 = arc_start + (static_cast<float>(i + 1) / segment_count) * arc_len;
+		float a0 = static_cast<float>(i) / segment_count;
 		ImU32 seg_col = (color & 0x00FFFFFF) | (static_cast<ImU32>(static_cast<int>(((color >> 24) & 0xFF) * a0)) << 24);
 		dl->AddLine(
 			ImVec2(cx + std::cos(t0) * radius, cy + std::sin(t0) * radius),
@@ -179,21 +180,22 @@ inline void render_progress_ring(ImDrawList* dl, float cx, float cy, float radiu
 								 float progress, ImU32 bg_color, ImU32 fg_color)
 {
 	const int segments = 48;
+	const float segment_count = static_cast<float>(segments);
 	const float start_angle = -1.5707963f;
 
 	for (int i = 0; i < segments; ++i) {
-		float t0 = start_angle + (static_cast<float>(i) / segments) * 6.2831853f;
-		float t1 = start_angle + (static_cast<float>(i + 1) / segments) * 6.2831853f;
+		float t0 = start_angle + (static_cast<float>(i) / segment_count) * 6.2831853f;
+		float t1 = start_angle + (static_cast<float>(i + 1) / segment_count) * 6.2831853f;
 		dl->AddLine(
 			ImVec2(cx + std::cos(t0) * radius, cy + std::sin(t0) * radius),
 			ImVec2(cx + std::cos(t1) * radius, cy + std::sin(t1) * radius),
 			bg_color, thickness);
 	}
 
-	int fill_segs = static_cast<int>(progress * segments);
+	int fill_segs = static_cast<int>(progress * segment_count);
 	for (int i = 0; i < fill_segs; ++i) {
-		float t0 = start_angle + (static_cast<float>(i) / segments) * 6.2831853f;
-		float t1 = start_angle + (static_cast<float>(i + 1) / segments) * 6.2831853f;
+		float t0 = start_angle + (static_cast<float>(i) / segment_count) * 6.2831853f;
+		float t1 = start_angle + (static_cast<float>(i + 1) / segment_count) * 6.2831853f;
 		dl->AddLine(
 			ImVec2(cx + std::cos(t0) * radius, cy + std::sin(t0) * radius),
 			ImVec2(cx + std::cos(t1) * radius, cy + std::sin(t1) * radius),
@@ -1070,11 +1072,12 @@ inline void render_donut_chart(ImDrawList* dl, float cx, float cy, float radius,
 	for (int s = 0; s < segment_count; ++s) {
 		float sweep = fractions[s] * 6.2831853f;
 		int segs_for_this = std::max(2, static_cast<int>(static_cast<float>(arc_segments) * fractions[s]));
+		float segment_divisor = static_cast<float>(segs_for_this);
 		ImU32 col = theme_alpha(colors[s], alpha);
 
 		for (int i = 0; i < segs_for_this; ++i) {
-			float t0 = angle + (static_cast<float>(i) / segs_for_this) * sweep;
-			float t1 = angle + (static_cast<float>(i + 1) / segs_for_this) * sweep;
+			float t0 = angle + (static_cast<float>(i) / segment_divisor) * sweep;
+			float t1 = angle + (static_cast<float>(i + 1) / segment_divisor) * sweep;
 			ImVec2 outer0(cx + std::cos(t0) * radius, cy + std::sin(t0) * radius);
 			ImVec2 outer1(cx + std::cos(t1) * radius, cy + std::sin(t1) * radius);
 			ImVec2 inner0(cx + std::cos(t0) * (radius - thickness), cy + std::sin(t0) * (radius - thickness));
@@ -1583,7 +1586,7 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 
 	ImFont* hdr_font = aida::ui::fonts::body_em();
 	if (!hdr_font) hdr_font = ImGui::GetFont();
-	float hdr_base = hdr_font && hdr_font->FontSize > 0.f ? hdr_font->FontSize : 13.f;
+	float hdr_base = aida::ui::fonts::size_or(hdr_font, 13.f);
 
 	const float rounding = 7.f * font_scale;
 	const float header_h = (hdr_base + 8.f) * font_scale;
@@ -1617,10 +1620,10 @@ inline void render_graph_node_card(ImDrawList* dl, float x, float y, float w, fl
 	int hdr_ra = (hdr_right >> IM_COL32_A_SHIFT) & 0xFF;
 	float hdr_t = 0.45f;
 	ImU32 hdr_mix = IM_COL32(
-		static_cast<int>(hdr_lr + (hdr_rr - hdr_lr) * hdr_t),
-		static_cast<int>(hdr_lg + (hdr_rg - hdr_lg) * hdr_t),
-		static_cast<int>(hdr_lb + (hdr_rb - hdr_lb) * hdr_t),
-		static_cast<int>(hdr_la + (hdr_ra - hdr_la) * hdr_t));
+		static_cast<int>(static_cast<float>(hdr_lr) + static_cast<float>(hdr_rr - hdr_lr) * hdr_t),
+		static_cast<int>(static_cast<float>(hdr_lg) + static_cast<float>(hdr_rg - hdr_lg) * hdr_t),
+		static_cast<int>(static_cast<float>(hdr_lb) + static_cast<float>(hdr_rb - hdr_lb) * hdr_t),
+		static_cast<int>(static_cast<float>(hdr_la) + static_cast<float>(hdr_ra - hdr_la) * hdr_t));
 	dl->AddRectFilled(
 		ImVec2(x + 1.f, y + 1.f), ImVec2(x + w - 1.f, y + header_h),
 		hdr_mix, rounding, ImDrawFlags_RoundCornersTop);

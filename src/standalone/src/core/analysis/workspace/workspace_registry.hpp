@@ -129,6 +129,9 @@ public:
     workspace_result_t<void> select_for_ui(const binary_id_t& id);
     std::shared_ptr<analysis_workspace_t> selected_for_ui() const;
     std::optional<binary_id_t> selected_binary_id() const;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    void bind_preview_workspace(std::shared_ptr<analysis_workspace_t> workspace);
+#endif
 
 private:
     workspace_result_t<std::shared_ptr<analysis_workspace_t>>

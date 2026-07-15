@@ -1,3 +1,109 @@
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "auth_http.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <string>
+
+namespace aida {
+namespace auth {
+namespace http {
+
+namespace {
+
+	bool contains_rejected_credential(const header_list_t& headers, const std::string& url)
+	{
+		std::string combined = url;
+		for (const auto& header : headers) {
+			combined.push_back(' ');
+			combined.append(header.second);
+		}
+		std::transform(combined.begin(), combined.end(), combined.begin(), [](unsigned char ch) {
+			return static_cast<char>(std::tolower(ch));
+		});
+		return combined.find("invalid") != std::string::npos
+			|| combined.find("rejected") != std::string::npos
+			|| combined.find("expired") != std::string::npos;
+	}
+
+	std::string fixture_body(const std::string& url)
+	{
+		if (url.find("generativelanguage.googleapis.com") != std::string::npos)
+			return R"({"models":[{"name":"gemini-2.5-pro"},{"name":"gemini-2.5-flash"},{"name":"gemini-2.0-flash"}]})";
+		return R"({"data":[{"id":"preview-primary"},{"id":"preview-fast"},{"id":"preview-reasoning"}]})";
+	}
+
+}
+
+response_t request(const char* verb,
+	const std::string& url,
+	const header_list_t& headers,
+	const std::string&,
+	const std::string&,
+	int)
+{
+	response_t result;
+	if (verb == nullptr || *verb == '\0' || url.rfind("http", 0) != 0) {
+		result.error = "invalid url";
+		return result;
+	}
+	result.ok = true;
+	if (contains_rejected_credential(headers, url)) {
+		result.status = 401;
+		result.body = R"({"error":{"message":"The preview credential was rejected"}})";
+		return result;
+	}
+	result.status = 200;
+	result.body = fixture_body(url);
+	return result;
+}
+
+response_t get(const std::string& url, const header_list_t& headers, int timeout_sec)
+{
+	return request("GET", url, headers, {}, {}, timeout_sec);
+}
+
+response_t post(const std::string& url,
+	const header_list_t& headers,
+	const std::string& body,
+	const std::string& content_type,
+	int timeout_sec)
+{
+	return request("POST", url, headers, body, content_type, timeout_sec);
+}
+
+stream_result_t stream(const char* verb,
+	const std::string& url,
+	const header_list_t& headers,
+	const std::string& body,
+	const std::string& content_type,
+	int timeout_sec,
+	const stream_chunk_cb_t& on_chunk)
+{
+	stream_result_t result;
+	const response_t response = request(verb, url, headers, body, content_type, timeout_sec);
+	result.status = response.status;
+	result.ok = response.ok;
+	result.error = response.error;
+	if (response.ok && on_chunk && !on_chunk(response.body.data(), response.body.size())) {
+		result.ok = false;
+		result.cancelled = true;
+		result.error = "cancelled";
+	}
+	return result;
+}
+
+void cleanup()
+{
+}
+
+}
+}
+}
+
+#else
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "auth_http.hpp"
@@ -1943,3 +2049,5 @@ namespace http {
 }
 }
 }
+
+#endif

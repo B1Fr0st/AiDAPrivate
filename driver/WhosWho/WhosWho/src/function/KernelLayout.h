@@ -55,7 +55,7 @@ namespace whoswho_kernel_layout {
         BOOLEAN valid = (build != 0 && unique_pid != 0 && active_links != 0 &&
             object_table != 0 && debug_port != 0 &&
             instrumentation_callback != 0 && active_threads != 0);
-        WW_LOG("KVALIDATE build=%lu kind=layout name=EPROCESS source=%s offset=0x%llx validation=%s evidence=\"UniqueProcessId=0x%llx ActiveProcessLinks=0x%llx ObjectTable=0x%llx DebugPort=0x%llx InstrumentationCallback=0x%llx ActiveThreads=0x%llx\" fail_closed=%s",
+        WW_LOG("KVALIDATE build=%lu kind=layout name=EPROCESS source=%s offset=0x%llx validation=%s evidence=\"UniqueProcessId=0x%llx ActiveProcessLinks=0x%llx ObjectTable=0x%llx DebugPort=0x%llx InstrumentationCallback=0x%llx ActiveThreads=0x%llx ApcState=0x98 ApcStateProcess=0xB8\" fail_closed=%s",
             build,
             source,
             static_cast<unsigned long long>(unique_pid),
@@ -207,5 +207,28 @@ namespace whoswho_kernel_layout {
         if (build >= 26100) return 0x2E0;
         if (build >= 17763) return 0x550;
         return 0;
+    }
+
+    __forceinline SIZE_T eprocess_vadroot_offset() {
+        ULONG build = build_number();
+        if (build >= 26100) return 0x558;
+        if (build >= 17763) return 0x7D8;
+        return 0;
+    }
+
+    __forceinline SIZE_T kthread_apc_state_offset() {
+        return 0x98;
+    }
+
+    __forceinline SIZE_T kthread_apc_state_process_offset() {
+        return 0x20;
+    }
+
+    __forceinline SIZE_T kthread_apc_state_process_absolute_offset() {
+        return 0xB8;
+    }
+
+    __forceinline SIZE_T kthread_apc_state_size() {
+        return 0x30;
     }
 }

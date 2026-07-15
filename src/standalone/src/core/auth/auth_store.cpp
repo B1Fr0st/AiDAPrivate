@@ -1,3 +1,119 @@
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "auth_store.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace aida {
+namespace auth {
+namespace store {
+
+namespace {
+
+	std::mutex& preview_mutex()
+	{
+		static std::mutex value;
+		return value;
+	}
+
+	std::unordered_map<std::string, auth_info_t>& preview_entries()
+	{
+		static std::unordered_map<std::string, auth_info_t> value;
+		return value;
+	}
+
+	std::string& preview_error()
+	{
+		static std::string value;
+		return value;
+	}
+
+	std::string normalize_provider(std::string provider_id)
+	{
+		while (!provider_id.empty() && provider_id.back() == '/') provider_id.pop_back();
+		for (char& ch : provider_id) {
+			if (ch == '\\') ch = '/';
+			else ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		}
+		return provider_id;
+	}
+
+}
+
+bool load()
+{
+	std::lock_guard<std::mutex> lock(preview_mutex());
+	preview_error().clear();
+	return true;
+}
+
+bool save()
+{
+	std::lock_guard<std::mutex> lock(preview_mutex());
+	preview_error().clear();
+	return true;
+}
+
+bool get(const std::string& provider_id, auth_info_t& out)
+{
+	std::lock_guard<std::mutex> lock(preview_mutex());
+	const auto found = preview_entries().find(normalize_provider(provider_id));
+	if (found == preview_entries().end()) return false;
+	out = found->second;
+	return true;
+}
+
+bool set(const std::string& provider_id, const auth_info_t& info)
+{
+	const std::string key = normalize_provider(provider_id);
+	std::lock_guard<std::mutex> lock(preview_mutex());
+	if (key.empty()) {
+		preview_error() = "provider id is empty";
+		return false;
+	}
+	preview_entries()[key] = info;
+	preview_error().clear();
+	return true;
+}
+
+bool remove(const std::string& provider_id)
+{
+	std::lock_guard<std::mutex> lock(preview_mutex());
+	preview_entries().erase(normalize_provider(provider_id));
+	preview_error().clear();
+	return true;
+}
+
+std::vector<std::pair<std::string, auth_info_t>> all()
+{
+	std::lock_guard<std::mutex> lock(preview_mutex());
+	std::vector<std::pair<std::string, auth_info_t>> result;
+	result.reserve(preview_entries().size());
+	for (const auto& entry : preview_entries()) result.emplace_back(entry.first, entry.second);
+	std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+		return left.first < right.first;
+	});
+	return result;
+}
+
+const std::string& last_error()
+{
+	std::lock_guard<std::mutex> lock(preview_mutex());
+	return preview_error();
+}
+
+}
+}
+}
+
+#else
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "auth_store.hpp"
@@ -565,3 +681,5 @@ namespace store {
 }
 }
 }
+
+#endif

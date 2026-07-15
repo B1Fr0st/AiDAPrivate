@@ -347,6 +347,10 @@ public:
     const std::vector<pe_codeview_t>& codeview_records() const noexcept { return codeview_records_; }
     const std::vector<pe_resource_t>& resources() const noexcept { return resources_; }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static std::shared_ptr<const pe_image_t> create_preview();
+#endif
+
     workspace_result_t<std::uint64_t> rva_to_file_offset(std::uint64_t rva,
                                                         std::uint64_t size = 1) const;
     workspace_result_t<std::uint64_t> file_offset_to_rva(std::uint64_t offset,

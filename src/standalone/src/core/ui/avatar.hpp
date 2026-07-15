@@ -34,9 +34,10 @@ namespace aida::ui::avatar {
 			ImU32 top = aida::ui::lighten(base, 30);
 			ImU32 bot = aida::ui::darken(base, 20);
 			int segs = 32;
+			float segment_count = static_cast<float>(segs);
 			for (int i = 0; i < segs; ++i) {
-				float a0 = ((float)i / segs) * 6.2831853f - 1.5707963f;
-				float a1 = ((float)(i + 1) / segs) * 6.2831853f - 1.5707963f;
+				float a0 = (static_cast<float>(i) / segment_count) * 6.2831853f - 1.5707963f;
+				float a1 = (static_cast<float>(i + 1) / segment_count) * 6.2831853f - 1.5707963f;
 				float fy = (sinf(a0) + 1.f) * 0.5f;
 				ImU32 col = aida::ui::mix(top, bot, fy);
 				ImVec2 p0 = ImVec2(center.x + cosf(a0) * radius, center.y + sinf(a0) * radius);

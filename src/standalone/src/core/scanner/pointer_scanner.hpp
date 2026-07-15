@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/scan_pointer_preview.hpp"
+#else
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -824,3 +828,5 @@ inline void clear_map()
 }
 
 }
+
+#endif

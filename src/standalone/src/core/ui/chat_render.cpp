@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 
@@ -661,8 +662,7 @@ float chat_render::render_code_block(
 
     const auto& th = aida::ui::resolved();
     ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
-    float code_fs = code_font->FontSize;
-    if (code_fs <= 0.f) code_fs = ImGui::GetFontSize();
+    float code_fs = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
     float pad      = 10.f;
     float header_h = 32.f;
@@ -935,8 +935,7 @@ static float render_table_block(
     const auto& th = aida::ui::resolved();
     ImFont* font = aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont();
     ImFont* head_font = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : font;
-    float fs = font->FontSize;
-    if (fs <= 0.f) fs = ImGui::GetFontSize();
+    float fs = aida::ui::fonts::size_or(font, ImGui::GetFontSize());
 
     size_t col_count = 0;
     for (auto& r : rows) col_count = std::max(col_count, r.size());
@@ -1061,7 +1060,7 @@ static float render_tool_call_card(
     float body_pad = 12.f;
 
     ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
-    float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
+    float code_fs = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
     float code_line_h = code_fs + 4.f;
     payload_metrics_t payload_metrics = measure_payload_metrics(
         payload, code_font, code_fs, code_line_h, (std::max)(40.f, max_w - body_pad * 2.f));
@@ -1181,7 +1180,7 @@ static float render_tool_result_card(
     const auto& th = aida::ui::resolved();
     ImFont* ui_font = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
     ImFont* code_font = aida::ui::fonts::code() ? aida::ui::fonts::code() : ImGui::GetFont();
-    float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : ImGui::GetFontSize();
+    float code_fs = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
     float fs = 14.f;
 
     char ck_buf[64]; snprintf(ck_buf, sizeof(ck_buf), "trc_%d_%d", msg_idx, span_idx);
@@ -1441,11 +1440,11 @@ chat_render::render_result_t chat_render::render_rich_message(
     ImFont* h2_font     = aida::ui::fonts::h2()           ? aida::ui::fonts::h2()           : strong_font;
     ImFont* code_font   = aida::ui::fonts::code()         ? aida::ui::fonts::code()         : body_font;
 
-    float body_fs   = body_font->FontSize > 0.f ? body_font->FontSize : ImGui::GetFontSize();
+    float body_fs   = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
     float h1_fs     = body_fs * 1.55f;
     float h2_fs     = body_fs * 1.30f;
     float h3_fs     = body_fs * 1.12f;
-    float code_fs   = code_font->FontSize > 0.f ? code_font->FontSize : body_fs;
+    float code_fs   = aida::ui::fonts::size_or(code_font, body_fs);
 
     float card_pad_x = 2.f;
     float card_pad_y = 12.f;
@@ -1455,7 +1454,10 @@ chat_render::render_result_t chat_render::render_rich_message(
 
     bool is_streaming = !show_actions;
 
-    int target_visible = (int)text.size();
+    const auto max_visible = static_cast<std::size_t>(std::numeric_limits<int>::max());
+    int target_visible = text.size() > max_visible
+        ? std::numeric_limits<int>::max()
+        : static_cast<int>(text.size());
     int visible_chars = target_visible;
     if (is_streaming) {
         streaming_track_t tr = load_stream_track(msg_idx, target_visible);
@@ -1472,9 +1474,10 @@ chat_render::render_result_t chat_render::render_rich_message(
         store_stream_track(msg_idx, tr);
     }
 
-    std::string visible_text = visible_chars >= (int)text.size()
+    const auto visible_count = static_cast<std::size_t>(std::clamp(visible_chars, 0, target_visible));
+    std::string visible_text = visible_count >= text.size()
         ? text
-        : text.substr(0, visible_chars);
+        : text.substr(0, visible_count);
 
     auto spans = parse_markdown(visible_text);
 

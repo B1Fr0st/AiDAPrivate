@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/re_hubs_preview_adapter.hpp"
+#endif
+
 #include "ui/hub_strip.hpp"
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
@@ -77,6 +81,9 @@ inline void set_sub_tab(const disasm_view::workspace_context_t& context, sub_tab
 	const int idx = static_cast<int>(tab);
 	if (idx < 0 || idx >= static_cast<int>(sub_tab_t::COUNT)) return;
 	default_active_tab().store(idx, std::memory_order_release);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::re_hubs::select(aida::preview::re_hubs::domain_t::analysis, idx, nullptr);
+#endif
 	auto state = state_for(context);
 	if (!state) return;
 	aida::ui::hub_strip::notify_select(state->strip, idx);
@@ -119,6 +126,10 @@ inline void render_active(int idx, float cw, float ch,
                           float fa, float ar, float ag, float ab,
                           const disasm_view::workspace_context_t& context)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (idx >= 0 && idx < static_cast<int>(sub_tab_t::COUNT))
+		aida::preview::re_hubs::rendered(aida::preview::re_hubs::domain_t::analysis, idx, s_tabs[idx].label);
+#endif
 	switch (static_cast<sub_tab_t>(idx)) {
 		case sub_tab_t::symbolic:
 			symbolic_view::render(0.f, 0.f, cw, ch, fa, ar, ag, ab);

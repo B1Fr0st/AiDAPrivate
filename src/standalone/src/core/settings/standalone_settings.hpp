@@ -1,10 +1,12 @@
 #pragma once
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <shlobj.h>
 #include <wincrypt.h>
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -20,11 +22,12 @@
 
 #include <nlohmann/json.hpp>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../auth/auth_store.hpp"
-#include "../../helpers/diag_log.hpp"
 
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shell32.lib")
+#endif
 
 namespace sa_settings_detail
 {
@@ -92,6 +95,10 @@ namespace sa_settings_detail
 
     inline std::string protect_dpapi(const std::string& plaintext, const char* scope)
     {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        (void)scope;
+        return plaintext;
+#else
         if (plaintext.empty())
             return plaintext;
 
@@ -112,10 +119,15 @@ namespace sa_settings_detail
         const std::string encoded = hex_encode(output_blob.pbData, output_blob.cbData);
         LocalFree(output_blob.pbData);
         return std::string(CFG_DPAPI_PREFIX) + encoded;
+#endif
     }
 
     inline std::string unprotect_dpapi(const std::string& encoded, const char* scope)
     {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        (void)scope;
+        return encoded;
+#else
         if (encoded.compare(0, std::strlen(CFG_DPAPI_PREFIX), CFG_DPAPI_PREFIX) != 0)
             return {};
 
@@ -138,6 +150,7 @@ namespace sa_settings_detail
         SecureZeroMemory(output_blob.pbData, output_blob.cbData);
         LocalFree(output_blob.pbData);
         return result;
+#endif
     }
 
     inline std::string xor_obfuscate(const std::string& plain)
@@ -189,7 +202,8 @@ namespace sa_settings_detail
     {
         std::string id;
         id.reserve(display_name.size() + 8);
-        for (unsigned char c : display_name) {
+        for (char value : display_name) {
+            const unsigned char c = static_cast<unsigned char>(value);
             if (std::isalnum(c))
                 id.push_back(static_cast<char>(std::tolower(c)));
             else if (c == ' ' || c == '-' || c == '_')
@@ -519,6 +533,9 @@ struct settings_sa_t
 
     static std::filesystem::path config_path()
     {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        return {};
+#else
         wchar_t* appdata = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
             auto path = std::filesystem::path(appdata) / L"AiDA" / L"Standalone" / L"settings.json";
@@ -526,6 +543,7 @@ struct settings_sa_t
             return path;
         }
         return std::filesystem::current_path() / "aida_standalone_settings.json";
+#endif
     }
 
     static const std::vector<std::string>& provider_kinds()
@@ -990,14 +1008,18 @@ struct settings_sa_t
                 return profile->api_key;
         }
 
-        const std::string pid = selected_provider_id();
-        if (!pid.empty()) {
-            aida::auth::auth_info_t info;
-            if (aida::auth::store::get(pid, info) && !info.api_key.empty()) {
-                out_from_store = true;
-                return info.api_key;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        {
+            const std::string pid = selected_provider_id();
+            if (!pid.empty()) {
+                aida::auth::auth_info_t info;
+                if (aida::auth::store::get(pid, info) && !info.api_key.empty()) {
+                    out_from_store = true;
+                    return info.api_key;
+                }
             }
         }
+#endif
 
         const auto* profile = get_active_profile();
         if (profile && !profile->api_key.empty())
@@ -1251,6 +1273,43 @@ struct settings_sa_t
     {
         std::lock_guard<std::recursive_mutex> lock(sa_settings_detail::io_mutex());
         sa_settings_detail::last_error_ref().clear();
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        ensure_default_profiles();
+        if (active_provider_profile_id.empty() && !provider_profiles.empty())
+            active_provider_profile_id = provider_profiles.front().id;
+        if (default_provider_id.empty())
+            default_provider_id = "openai_native";
+        if (default_model_id.empty())
+            default_model_id = "gpt-5.4";
+        if (small_model_provider_id.empty())
+            small_model_provider_id = "openai_native";
+        if (small_model_id.empty())
+            small_model_id = "gpt-5.4-mini";
+        if (mcp_client_servers.empty()) {
+            mcp_client_server_t local;
+            local.name = "AiDA Local Tools";
+            local.url = "http://127.0.0.1:29117/mcp";
+            local.transport = "http_sse";
+            local.enabled = true;
+            local.auto_connect = true;
+            mcp_client_servers.push_back(std::move(local));
+
+            mcp_client_server_t docs;
+            docs.name = "Reverse Engineering Docs";
+            docs.url = "http://127.0.0.1:29118/mcp";
+            docs.transport = "http_sse";
+            docs.enabled = true;
+            docs.auto_connect = false;
+            mcp_client_servers.push_back(std::move(docs));
+        }
+        workspace.root_path = "C:\\analysis\\nightfall";
+        workspace.last_active_path = "C:\\analysis\\nightfall\\nightfall.exe";
+        workspace.active_view = "disassembly";
+        first_run_completed = true;
+        sync_legacy_fields_from_active_profile();
+        return true;
+#else
 
         nlohmann::json root;
         auto source = config_path();
@@ -1540,6 +1599,7 @@ struct settings_sa_t
         sync_legacy_fields_from_active_profile();
 
         return true;
+#endif
     }
 
     static const std::string& last_error()
@@ -1555,6 +1615,10 @@ struct settings_sa_t
         ensure_default_profiles();
         apply_legacy_fields_to_active_profile();
         sync_legacy_fields_from_active_profile();
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        return true;
+#else
 
         auto path = config_path();
         std::error_code dir_ec;
@@ -1827,6 +1891,7 @@ struct settings_sa_t
             return false;
         }
         return true;
+#endif
     }
 };
 

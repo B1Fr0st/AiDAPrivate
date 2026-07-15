@@ -34,6 +34,7 @@
 #include "vm_jit.hpp"
 #include "cloakwork.hpp"
 #include "ai_deception.hpp"
+#include "anti_ai.hpp"
 #include "token_chain.hpp"
 #include "syscall.hpp"
 #include "packer.hpp"
@@ -2363,6 +2364,20 @@ inline bool initialize()
     webhook::write_log_critical("init", "ai_deception_ok_log_pre");
     webhook::write_log("init", "ai_deception_ok");
     webhook::write_log_critical("init", "ai_deception_ok_log_post");
+
+    uint64_t anti_ai_tick = GetTickCount64();
+    webhook::write_log_critical_fmt("init",
+        "anti_ai_initialize_pre pid=%lu tid=%lu tick=%llu",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        static_cast<unsigned long long>(anti_ai_tick));
+    anti_ai::initialize();
+    webhook::write_log_critical_fmt("init",
+        "anti_ai_initialize_post elapsed_ms=%llu",
+        static_cast<unsigned long long>(GetTickCount64() - anti_ai_tick));
+    webhook::write_log_critical("init", "anti_ai_ok_log_pre");
+    webhook::write_log("init", "anti_ai_ok");
+    webhook::write_log_critical("init", "anti_ai_ok_log_post");
 
     uint64_t call_obfuscation_tick = GetTickCount64();
     webhook::write_log_critical_fmt("init",
@@ -5122,6 +5137,7 @@ inline void shutdown()
     shutdown_phase_run("server_pages_shutdown", &server_pages::shutdown);
     shutdown_phase_run("nanomites_shutdown", &nanomites::shutdown);
     shutdown_phase_run("ai_deception_shutdown", &ai_deception::shutdown);
+    shutdown_phase_run("anti_ai_shutdown", &anti_ai::shutdown);
     shutdown_phase_run("code_encrypt_shutdown", &code_encrypt::shutdown);
     shutdown_phase_run("packer_shutdown", &packer::shutdown);
     shutdown_phase_run("anti_dump_shutdown", &anti_dump::shutdown);

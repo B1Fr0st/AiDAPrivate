@@ -1,6 +1,62 @@
 #pragma once
 #include "imgui/imgui.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include <string>
+
+class CKeybind
+{
+public:
+	enum c_keybind_type : int { TOGGLE, HOLD, ALWAYS };
+	int key = 0;
+	c_keybind_type type = TOGGLE;
+	const char* name = "none";
+	bool enabled = false;
+	bool waiting_for_input = false;
+
+	explicit CKeybind(const char* value) : name(value ? value : "none") {}
+
+	void update()
+	{
+		if (type == ALWAYS) enabled = true;
+		else if (type == HOLD && key != 0) enabled = ImGui::IsKeyDown(static_cast<ImGuiKey>(key));
+		else if (type == TOGGLE && key != 0 && ImGui::IsKeyPressed(static_cast<ImGuiKey>(key), false)) enabled = !enabled;
+	}
+
+	std::string get_key_name() const
+	{
+		if (key == 0) return "none";
+		const char* value = ImGui::GetKeyName(static_cast<ImGuiKey>(key));
+		return value && value[0] ? value : "none";
+	}
+
+	std::string get_name() const { return name ? name : "none"; }
+
+	std::string get_type() const
+	{
+		if (type == TOGGLE) return "toggle";
+		if (type == HOLD) return "hold";
+		if (type == ALWAYS) return "always";
+		return "none";
+	}
+
+	bool set_key()
+	{
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+			key = 0;
+			return true;
+		}
+		for (int candidate = ImGuiKey_NamedKey_BEGIN; candidate < ImGuiKey_NamedKey_END; ++candidate) {
+			if (ImGui::IsKeyPressed(static_cast<ImGuiKey>(candidate), false)) {
+				key = candidate;
+				return true;
+			}
+		}
+		return false;
+	}
+};
+#else
 #include "keybind.h"
+#endif
 #include "../core/ui/theme.hpp"
 #include "../core/ui/motion.hpp"
 #include "../core/ui/clock.hpp"
@@ -12,7 +68,14 @@
 #include "../core/ui/empty_state.hpp"
 #include "../core/ui/fonts.hpp"
 #include "../core/ui/skeleton.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include <cstdint>
+struct ID3D11Device;
+struct ID3D11ShaderResourceView;
+using HWND = void*;
+#else
 #include <d3d11.h>
+#endif
 #include <atomic>
 
 extern ID3D11Device* g_pd3dDevice;

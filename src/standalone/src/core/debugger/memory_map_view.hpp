@@ -1,7 +1,9 @@
 #pragma once
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <Windows.h>
 #include <commdlg.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -19,7 +21,14 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/debugger_preview_runtime.hpp"
+#endif
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/executor.hpp"
+#else
+#include "../../preview/ui_task_executor.hpp"
+#endif
 #include "disasm_view.hpp"
 #include "hex_view.hpp"
 #include "toast_notification.hpp"
@@ -34,9 +43,11 @@
 #include "fonts.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../anti-tamper/webhook.hpp"
+#endif
 
 namespace memory_map_view {
 
@@ -318,8 +329,10 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 
 	uint64_t total = 0;
 	for (int idx : filtered_indices) {
-		if (idx < 0 || idx >= static_cast<int>(regions.size())) continue;
-		total += regions[idx].size;
+		if (idx < 0) continue;
+		const auto region_index = static_cast<std::size_t>(idx);
+		if (region_index >= regions.size()) continue;
+		total += regions[region_index].size;
 	}
 	if (total == 0) {
 		ImFont* f = aida::ui::fonts::body();
@@ -351,8 +364,10 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 	segs.reserve(filtered_indices.size());
 	double cumulative = 0.0;
 	for (int idx : filtered_indices) {
-		if (idx < 0 || idx >= static_cast<int>(regions.size())) continue;
-		const auto& r = regions[idx];
+		if (idx < 0) continue;
+		const auto region_index = static_cast<std::size_t>(idx);
+		if (region_index >= regions.size()) continue;
+		const auto& r = regions[region_index];
 		double frac = static_cast<double>(r.size) / static_cast<double>(total);
 		hero_segment_t s;
 		s.base = r.base;
@@ -515,6 +530,10 @@ inline void render_stat_pod(ImDrawList* dl, float x, float y, float w, float h,
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float ar, float ag, float ab)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (g_ui.regions.empty())
+		refresh();
+#endif
 	{
 		static bool s_mem_map_logged = false;
 		if (!s_mem_map_logged) {
@@ -875,6 +894,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					toast_notification::push("Region has zero size.", toast_notification::toast_type_t::error);
 				}
 				else {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::debugger::record("memory_map_to_hex", std::to_string(r.base));
+					globals::ui::active_center_view = center_view_t::hex_view;
+#else
 					const auto context = disasm_view::capture_selected_workspace();
 					if (hex_view::read_live_memory(context, r.base, req)) {
 						globals::ui::active_center_view = center_view_t::hex_view;
@@ -882,6 +905,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					else {
 						toast_notification::push("Failed to read region for hex view.", toast_notification::toast_type_t::error);
 					}
+#endif
 				}
 			}
 			else {

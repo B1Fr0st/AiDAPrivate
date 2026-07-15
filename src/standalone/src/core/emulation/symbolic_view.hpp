@@ -16,14 +16,18 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -31,6 +35,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/re_hubs_preview_adapter.hpp"
+#endif
 
 namespace symbolic_view {
 
@@ -79,6 +87,16 @@ struct local_state_t {
 
 static local_state_t s_state;
 
+inline bool valid_index(int index, std::size_t count)
+{
+	return index >= 0 && static_cast<std::size_t>(index) < count;
+}
+
+inline bool index_fits_int(std::size_t index)
+{
+	return index <= static_cast<std::size_t>((std::numeric_limits<int>::max)());
+}
+
 inline constexpr const char* s_tab_labels[] = { "Trace", "Deobfuscation", "Slice", "Solver", "Constraints", "Expression" };
 
 inline int tab_count()
@@ -93,6 +111,10 @@ inline void set_active_tab(int idx)
 	s_state.prev_tab = s_state.active_tab;
 	s_state.active_tab = idx;
 	s_state.content_swap.start(aida::motion::dur::md, aida::motion::ease::out_cubic);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::re_hubs::select(aida::preview::re_hubs::domain_t::symbolic,
+		idx, s_tab_labels[static_cast<std::size_t>(idx)]);
+#endif
 }
 
 inline int active_tab()
@@ -104,7 +126,7 @@ inline const char* tab_label(int idx)
 {
 	if (idx < 0 || idx >= tab_count())
 		return "";
-	return s_tab_labels[idx];
+	return s_tab_labels[static_cast<std::size_t>(idx)];
 }
 
 namespace detail {
@@ -112,9 +134,9 @@ namespace detail {
 inline std::vector<std::string> parse_reg_list(const char* buf) {
 	std::vector<std::string> regs;
 	std::string s(buf);
-	size_t pos = 0;
+	std::size_t pos = 0;
 	while (pos < s.size()) {
-		size_t comma = s.find(',', pos);
+		std::size_t comma = s.find(',', pos);
 		if (comma == std::string::npos) comma = s.size();
 		std::string reg = s.substr(pos, comma - pos);
 		while (!reg.empty() && reg.front() == ' ') reg.erase(reg.begin());
@@ -145,6 +167,18 @@ inline void start_symbolic_exec(local_state_t& st) {
 		regs.size());
 
 	symbolic_engine::g_state.processing.store(true);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
+		symbolic_engine::g_state.last_result = symbolic_engine::execute_symbolic(
+			addr, end, static_cast<uint32_t>(st.max_insns), regs, {});
+	}
+	symbolic_engine::g_state.progress_current.store(symbolic_engine::g_state.last_result.total_instructions);
+	symbolic_engine::g_state.progress_total.store(symbolic_engine::g_state.last_result.total_instructions);
+	symbolic_engine::g_state.processing.store(false);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::symbolic, 0,
+		"symbolic.execute", "deterministic trace complete");
+#else
 	auto t0 = std::chrono::steady_clock::now();
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "emulation";
@@ -188,6 +222,7 @@ inline void start_symbolic_exec(local_state_t& st) {
 			"symbolic_exec_post_failed entry=0x%llX",
 			static_cast<unsigned long long>(addr));
 	}
+#endif
 }
 
 inline void start_deobfuscate(local_state_t& st) {
@@ -205,6 +240,18 @@ inline void start_deobfuscate(local_state_t& st) {
 		static_cast<unsigned long long>(addr), static_cast<uint32_t>(st.max_insns));
 
 	deobfuscation_engine::g_state.processing.store(true);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
+		deobfuscation_engine::g_state.last_result =
+			deobfuscation_engine::deobfuscate_function(addr, static_cast<uint32_t>(st.max_insns));
+	}
+	deobfuscation_engine::g_state.progress_current.store(5);
+	deobfuscation_engine::g_state.progress_total.store(5);
+	deobfuscation_engine::g_state.processing.store(false);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::symbolic, 1,
+		"deobfuscation.execute", "deterministic cleanup complete");
+#else
 	auto t0 = std::chrono::steady_clock::now();
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "emulation";
@@ -248,6 +295,7 @@ inline void start_deobfuscate(local_state_t& st) {
 			"deobfuscate_post_failed entry=0x%llX",
 			static_cast<unsigned long long>(addr));
 	}
+#endif
 }
 
 inline void start_slice(local_state_t& st) {
@@ -275,6 +323,16 @@ inline void start_slice(local_state_t& st) {
 		target.c_str(), static_cast<uint32_t>(st.max_insns));
 
 	symbolic_engine::g_state.processing.store(true);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
+		symbolic_engine::g_state.last_slice = symbolic_engine::slice_to_register(
+			addr, end, static_cast<uint32_t>(st.max_insns), target);
+	}
+	symbolic_engine::g_state.processing.store(false);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::symbolic, 2,
+		"symbolic.slice", target);
+#else
 	auto t0 = std::chrono::steady_clock::now();
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "emulation";
@@ -318,6 +376,7 @@ inline void start_slice(local_state_t& st) {
 			static_cast<unsigned long long>(addr),
 			target.c_str());
 	}
+#endif
 }
 
 inline void start_solve(local_state_t& st) {
@@ -345,6 +404,16 @@ inline void start_solve(local_state_t& st) {
 		static_cast<uint32_t>(st.max_insns), regs.size());
 
 	symbolic_engine::g_state.processing.store(true);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
+		symbolic_engine::g_state.last_solve = symbolic_engine::solve_for_path(
+			addr, target, static_cast<uint32_t>(st.max_insns), regs);
+	}
+	symbolic_engine::g_state.processing.store(false);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::symbolic, 3,
+		"symbolic.solve", "satisfiable fixture path");
+#else
 	auto t0 = std::chrono::steady_clock::now();
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "emulation";
@@ -390,6 +459,7 @@ inline void start_solve(local_state_t& st) {
 			static_cast<unsigned long long>(addr),
 			static_cast<unsigned long long>(target));
 	}
+#endif
 }
 
 inline std::shared_ptr<ast_node_t> parse_ast(const std::string& expr) {
@@ -401,7 +471,7 @@ inline std::shared_ptr<ast_node_t> parse_ast(const std::string& expr) {
 		return root;
 	}
 
-	size_t pos = 0;
+	std::size_t pos = 0;
 	auto skip_ws = [&]() {
 		while (pos < expr.size() && (expr[pos] == ' ' || expr[pos] == '\n' ||
 			expr[pos] == '\t' || expr[pos] == '\r' ||
@@ -526,6 +596,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float oy = wp.y;
 	auto& st = s_state;
 	float dt = aida::ui::clock::dt();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (st.active_tab >= 0 && st.active_tab < tab_count())
+		aida::preview::re_hubs::rendered(aida::preview::re_hubs::domain_t::symbolic,
+			st.active_tab, s_tab_labels[static_cast<std::size_t>(st.active_tab)]);
+#endif
 
 	const auto& t = aida::ui::resolved();
 	const ImU32 row_even  = aida::ui::with_alpha(t.panel_bg, 0.45f * alpha);
@@ -562,7 +637,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PopStyleColor();
 	};
 
-	auto input_at = [&](float ix, float iy, float w, const char* id, char* buf, size_t bufsz) {
+	auto input_at = [&](float ix, float iy, float w, const char* id, char* buf, std::size_t bufsz) {
 		ImGui::SetCursorScreenPos(ImVec2(ix, iy));
 		ImGui::SetNextItemWidth(w);
 		ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(t.panel_header, alpha));
@@ -670,7 +745,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float target_uw = 0.f;
 
 	ImFont* tab_fn = aida::ui::fonts::body_em();
-	float tab_fs = tab_fn ? tab_fn->FontSize : ImGui::GetFontSize();
+	if (!tab_fn) tab_fn = ImGui::GetFont();
+	float tab_fs = aida::ui::fonts::size_or(tab_fn, ImGui::GetFontSize());
 	for (int i = 0; i < tab_count; ++i) {
 		const char* tab_label_text = symbolic_view::tab_label(i);
 		ImVec2 lsz = tab_fn->CalcTextSizeA(tab_fs, FLT_MAX, 0.f, tab_label_text);
@@ -685,6 +761,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			st.prev_tab = st.active_tab;
 			st.active_tab = i;
 			st.content_swap.start(aida::motion::dur::md, aida::motion::ease::out_cubic);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::re_hubs::select(aida::preview::re_hubs::domain_t::symbolic,
+				i, tab_label_text);
+#endif
 		}
 
 		float text_alpha_val = (st.active_tab == i) ? 1.0f : (hov ? 0.85f : 0.55f);
@@ -734,7 +814,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		auto& trace = res.trace;
-		int total = static_cast<int>(trace.size());
+		const std::size_t total = trace.size();
 
 		struct col_t { const char* label; float w; };
 		col_t cols[] = {
@@ -760,16 +840,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float list_y = hdr_y + row_h + 2.f;
 		float list_h = table_h - row_h - 56.f;
 		int visible_rows = static_cast<int>(list_h / row_h);
+		const std::size_t visible_count = visible_rows > 0
+			? static_cast<std::size_t>(visible_rows)
+			: 0U;
 
 		ImGui::SetCursorScreenPos(ImVec2(cx, list_y));
 		ImGui::InvisibleButton("##sym_trace_scroll", ImVec2(width, list_h));
-		float max_scroll = (std::max)(0.f, static_cast<float>(total - visible_rows) * row_h);
+		float max_scroll = (std::max)(0.f,
+			static_cast<float>(total) - static_cast<float>(visible_rows)) * row_h;
 		if (ImGui::IsItemHovered())
 			ui_anim::handle_scroll_input(st.target_trace_scroll_y, 0.f, max_scroll, row_h);
 		ui_anim::smooth_scroll(st.trace_scroll_y, st.target_trace_scroll_y, 12.f, dt);
 
 		int start_row = static_cast<int>(st.trace_scroll_y / row_h);
 		if (start_row < 0) start_row = 0;
+		const std::size_t start_index = (std::min)(static_cast<std::size_t>(start_row), total);
+		const std::size_t row_capacity = visible_rows >= 0 ? visible_count + 1U : 0U;
+		const std::size_t draw_count = (std::min)(total - start_index, row_capacity);
+		const std::size_t end_index = start_index + draw_count;
 		ImGui::PushClipRect(ImVec2(cx, list_y), ImVec2(cx + width, list_y + list_h), true);
 
 		static float row_acc = 0.f;
@@ -777,8 +865,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		st.hovered_trace_row = -1;
 
-		for (int i = start_row; i < total && i < start_row + visible_rows + 1; ++i) {
-			auto& tr = trace[i];
+		for (std::size_t trace_index = start_index; trace_index < end_index; ++trace_index) {
+			if (!index_fits_int(trace_index)) break;
+			const int i = static_cast<int>(trace_index);
+			auto& tr = trace[trace_index];
 			if (st.show_tainted_only && !tr.is_tainted) continue;
 			if (!st.show_junk && tr.is_junk) continue;
 
@@ -970,7 +1060,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float hxx = cx + pad + 12.f;
 		const char* dcols[] = { "Address", "Instruction", "Status" };
 		float dwid[] = { 130.f, width * 0.55f, 80.f };
-		for (int i = 0; i < 3; ++i) {
+		for (std::size_t i = 0; i < 3U; ++i) {
 			dl->AddText(aida::ui::fonts::caption(), 13.f,
 				ImVec2(hxx, hdr_y + (row_h - 11.f) * 0.5f),
 				aida::ui::with_alpha(t.text_dim, alpha), dcols[i]);
@@ -981,24 +1071,34 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float list_h2 = table_h - card_h2 - 16.f - row_h;
 
 		auto& insns = res.clean_instructions;
-		int total = static_cast<int>(insns.size());
+		const std::size_t total = insns.size();
 		int visible = static_cast<int>(list_h2 / row_h);
+		const std::size_t visible_count = visible > 0 ? static_cast<std::size_t>(visible) : 0U;
 
 		ImGui::SetCursorScreenPos(ImVec2(cx, list_y2));
 		ImGui::InvisibleButton("##deob_scroll", ImVec2(width, list_h2));
-		float max_s = (std::max)(0.f, static_cast<float>(total - visible) * row_h);
+		float max_s = (std::max)(0.f,
+			static_cast<float>(total) - static_cast<float>(visible)) * row_h;
 		if (ImGui::IsItemHovered())
 			ui_anim::handle_scroll_input(st.target_expr_scroll_y, 0.f, max_s, row_h);
 		ui_anim::smooth_scroll(st.expr_scroll_y, st.target_expr_scroll_y, 12.f, dt);
 
 		int start = static_cast<int>(st.expr_scroll_y / row_h);
+		if (start < 0) start = 0;
+		const std::size_t start_index = (std::min)(static_cast<std::size_t>(start), total);
+		const std::size_t row_capacity = visible >= 0 ? visible_count + 1U : 0U;
+		const std::size_t draw_count = (std::min)(total - start_index, row_capacity);
+		const std::size_t end_index = start_index + draw_count;
 		ImGui::PushClipRect(ImVec2(cx, list_y2), ImVec2(cx + width, list_y2 + list_h2), true);
 
 		static float row_acc = 0.f;
 		row_acc += dt;
 
-		for (int i = start; i < total && i < start + visible + 1; ++i) {
-			auto& ci = insns[i];
+		for (std::size_t instruction_index = start_index;
+			instruction_index < end_index; ++instruction_index) {
+			if (!index_fits_int(instruction_index)) break;
+			const int i = static_cast<int>(instruction_index);
+			auto& ci = insns[instruction_index];
 			float ry = list_y2 + (static_cast<float>(i - start)) * row_h
 				- (st.expr_scroll_y - static_cast<float>(start) * row_h);
 			if (ry + row_h < list_y2 || ry > list_y2 + list_h2) continue;
@@ -1116,10 +1216,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float list_h2 = table_h - card_h2 - 16.f - row_h;
 
 		auto& insns = res.effective_instructions;
-		int total = static_cast<int>(insns.size());
+		const std::size_t total = insns.size();
 		int visible = static_cast<int>(list_h2 / row_h);
+		const std::size_t visible_count = visible > 0 ? static_cast<std::size_t>(visible) : 0U;
 
-		float max_s = (std::max)(0.f, static_cast<float>(total - visible) * row_h);
+		float max_s = (std::max)(0.f,
+			static_cast<float>(total) - static_cast<float>(visible)) * row_h;
 		ImGui::SetCursorScreenPos(ImVec2(cx, list_y2));
 		ImGui::InvisibleButton("##slice_scroll_area", ImVec2(width - 10.f, list_h2));
 		if (ImGui::IsItemHovered())
@@ -1130,13 +1232,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		int start = static_cast<int>(st.expr_scroll_y / row_h);
 		if (start < 0) start = 0;
+		const std::size_t start_index = (std::min)(static_cast<std::size_t>(start), total);
+		const std::size_t row_capacity = visible >= 0 ? visible_count + 1U : 0U;
+		const std::size_t draw_count = (std::min)(total - start_index, row_capacity);
+		const std::size_t end_index = start_index + draw_count;
 
 		ImGui::PushClipRect(ImVec2(cx, list_y2), ImVec2(cx + width, list_y2 + list_h2), true);
 
 		static float row_acc = 0.f;
 		row_acc += dt;
 
-		for (int i = start; i < total && i < start + visible + 1; ++i) {
+		for (std::size_t instruction_index = start_index;
+			instruction_index < end_index; ++instruction_index) {
+			if (!index_fits_int(instruction_index)) break;
+			const int i = static_cast<int>(instruction_index);
 			float ry = list_y2 + static_cast<float>(i - start) * row_h
 				- (st.expr_scroll_y - static_cast<float>(start) * row_h);
 			if (ry + row_h < list_y2 || ry > list_y2 + list_h2) continue;
@@ -1147,13 +1256,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(rbg, row_t), 4.f);
 
 			char abuf[20];
-			std::snprintf(abuf, sizeof(abuf), "%llX", static_cast<unsigned long long>(insns[i].address));
+			const auto& instruction = insns[instruction_index];
+			std::snprintf(abuf, sizeof(abuf), "%llX",
+				static_cast<unsigned long long>(instruction.address));
 			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(cx + pad + 12.f, ry + (row_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(t.text_address, alpha * row_t), abuf);
 			dl->AddText(aida::ui::fonts::code(), 13.f,
 				ImVec2(cx + pad + 142.f, ry + (row_h - 12.f) * 0.5f),
-				aida::ui::with_alpha(t.text_primary, alpha * row_t), insns[i].disasm.c_str());
+				aida::ui::with_alpha(t.text_primary, alpha * row_t), instruction.disasm.c_str());
 		}
 		ImGui::PopClipRect();
 		ui_anim::render_custom_scrollbar(dl, cx + width - 8.f, list_y2, 6.f, list_h2,
@@ -1361,7 +1472,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		static float entrance_acc = 0.f;
 		entrance_acc += dt;
 
-		for (size_t i = 0; i < rows.size(); ++i) {
+		for (std::size_t i = 0; i < rows.size(); ++i) {
+			if (!index_fits_int(i)) break;
 			float vy = ty + static_cast<float>(i) * (card_h + 6.f);
 			if (vy + card_h > cy + height - 8.f) break;
 
@@ -1408,6 +1520,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (simplify_clicked && !simplifying_now && !st.expression_text.empty()) {
 			st.simplifying.store(true);
 			std::string text_copy = st.expression_text;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			st.ast_root = detail::parse_ast(text_copy);
+			st.simplified_text = text_copy;
+			st.simplifying.store(false);
+			aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::symbolic, 5,
+				"expression.simplify", "deterministic AST refreshed");
+#else
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "emulation";
 			sub.label = "emulation.symbolic.simplify_ast";
@@ -1423,6 +1542,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			};
 			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 				st.simplifying.store(false);
+#endif
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(cx + pad + 110.f, ty));
@@ -1474,6 +1594,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		std::function<void(std::shared_ptr<ast_node_t>, int, int)> layout_pass;
 		layout_pass = [&](std::shared_ptr<ast_node_t> node, int depth, int parent) {
 			if (!node) return;
+			if (!index_fits_int(layout.size())) return;
 			layout_node_t ln;
 			ln.n = node;
 			ln.depth = depth;
@@ -1487,7 +1608,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		layout_pass(st.ast_root, 0, -1);
 
 		std::unordered_map<int, std::vector<int>> indices_at_depth;
-		for (size_t i = 0; i < layout.size(); ++i) {
+		for (std::size_t i = 0; i < layout.size(); ++i) {
+			if (!index_fits_int(i)) break;
 			indices_at_depth[layout[i].depth].push_back(static_cast<int>(i));
 		}
 
@@ -1508,10 +1630,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			float total_w = static_cast<float>(idxs.size()) * (node_w + h_gap) - h_gap;
 			float start_x = canvas_x + (canvas_w - total_w) * 0.5f;
 			if (start_x < canvas_x + 8.f) start_x = canvas_x + 8.f;
-			for (size_t k = 0; k < idxs.size(); ++k) {
+			for (std::size_t k = 0; k < idxs.size(); ++k) {
 				int li = idxs[k];
-				layout[li].center_x = start_x + static_cast<float>(k) * (node_w + h_gap) + node_w * 0.5f;
-				layout[li].y = row_y;
+				if (!valid_index(li, layout.size())) continue;
+				auto& layout_node = layout[static_cast<std::size_t>(li)];
+				layout_node.center_x = start_x + static_cast<float>(k) * (node_w + h_gap) + node_w * 0.5f;
+				layout_node.y = row_y;
 			}
 			row_y += node_h + v_gap;
 		}
@@ -1519,9 +1643,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PushClipRect(ImVec2(canvas_x + 1.f, canvas_y + 1.f),
 			ImVec2(canvas_x + canvas_w - 1.f, canvas_y + canvas_h - 1.f), true);
 
-		for (size_t i = 0; i < layout.size(); ++i) {
-			if (layout[i].parent_layout < 0) continue;
-			auto& parent = layout[static_cast<size_t>(layout[i].parent_layout)];
+		for (std::size_t i = 0; i < layout.size(); ++i) {
+			if (!valid_index(layout[i].parent_layout, layout.size())) continue;
+			auto& parent = layout[static_cast<std::size_t>(layout[i].parent_layout)];
 			auto& self = layout[i];
 			ImVec2 p1(parent.center_x, parent.y + node_h);
 			ImVec2 p4(self.center_x, self.y);
@@ -1534,7 +1658,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddBezierCubic(p1, p2, p3, p4, line_col, 1.4f);
 		}
 
-		for (size_t i = 0; i < layout.size(); ++i) {
+		for (std::size_t i = 0; i < layout.size(); ++i) {
 			auto& ln = layout[i];
 			if (!ln.n) continue;
 

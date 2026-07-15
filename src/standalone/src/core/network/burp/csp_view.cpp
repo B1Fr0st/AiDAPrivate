@@ -1,11 +1,20 @@
 #include "csp_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/network_preview_burp_core.hpp"
+#else
 #include "csp_analyzer.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdio>

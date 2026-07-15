@@ -263,11 +263,14 @@ namespace agent_picker {
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
 
 		bool win_open = true;
-		if (ImGui::Begin("##aida_agent_picker", &win_open,
+		ImGuiWindowFlags picker_flags =
 			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
-			ImGuiWindowFlags_NoDocking)) {
+			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
+	#ifdef IMGUI_HAS_DOCK
+		picker_flags |= ImGuiWindowFlags_NoDocking;
+	#endif
+		if (ImGui::Begin("##aida_agent_picker", &win_open, picker_flags)) {
 
 			ImDrawList* wdl = ImGui::GetWindowDrawList();
 			ImDrawList* bgdl = ImGui::GetBackgroundDrawList();
@@ -423,7 +426,7 @@ namespace agent_picker {
 						dl->AddRectFilled(
 							ImVec2(row_a.x - spread, row_a.y - spread + 4.f),
 							ImVec2(row_b.x + spread, row_b.y + spread + 4.f),
-							IM_COL32(0, 0, 0, static_cast<int>(((4 - s) / 4.f) * 28.f * row_alpha * hov_v)),
+							IM_COL32(0, 0, 0, static_cast<int>((static_cast<float>(4 - s) / 4.f) * 28.f * row_alpha * hov_v)),
 							10.f + spread);
 					}
 					(void)sh_col;

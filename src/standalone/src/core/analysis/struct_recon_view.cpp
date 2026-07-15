@@ -1,9 +1,16 @@
 #include "struct_recon_view.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/struct_recon_preview_runtime.hpp"
+#include "../../preview/ui_task_executor.hpp"
+#else
 #include "struct_recon_engine.hpp"
 #include "struct_monitor.hpp"
 #include "standalone_driver.hpp"
 #include "../disasm/zydis_disasm.hpp"
 #include "../disasm/function_index.hpp"
+#include "../infra/executor.hpp"
+#include "../anti-tamper/webhook.hpp"
+#endif
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
 #include "ui/motion.hpp"
@@ -17,14 +24,15 @@
 #include "ui/ui_anim.hpp"
 #include "imgui.h"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
-#include "../infra/executor.hpp"
-#include "../anti-tamper/webhook.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -143,6 +151,9 @@ static field_anim_t& fanim(int idx) { return s_state.field_anims[idx]; }
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	struct_recon::ensure_preview_fixture();
+#endif
 	{
 		static bool s_sr_render_logged = false;
 		if (!s_sr_render_logged) {
@@ -154,7 +165,9 @@ void render(float pos_x, float pos_y, float width, float height,
 		static bool s_types_font_logged_recon = false;
 		if (!s_types_font_logged_recon) {
 			s_types_font_logged_recon = true;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			anti_tamper::webhook::write_log("types_font", "[types_font] scaled struct_recon_view");
+#endif
 		}
 	}
 
@@ -471,8 +484,10 @@ void render(float pos_x, float pos_y, float width, float height,
 		static bool s_no_driver_logged = false;
 		if (!s_no_driver_logged) {
 			s_no_driver_logged = true;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			anti_tamper::webhook::write_log("types_audit",
 				"[types_audit] inferred_view_no_driver BROKEN reason='driver_not_loaded'");
+#endif
 		}
 		float callout_h = 40.f;
 		ui_anim::render_inline_callout(dl, ox + 8.f, cy, width - 16.f, callout_h,
@@ -519,7 +534,6 @@ void render(float pos_x, float pos_y, float width, float height,
 	bool show_right_panel = width > 640.f;
 	float main_w = show_right_panel ? width * 0.62f : width - 24.f;
 	float right_x = ox + main_w + 12.f;
-	float right_w = width - main_w - 24.f;
 
 	const float row_h = 38.f;
 	const float table_top = cy;
@@ -534,8 +548,6 @@ void render(float pos_x, float pos_y, float width, float height,
 	const float col_size_w   = main_w * 0.07f;
 	const float col_conf_w   = main_w * 0.08f;
 	const float col_heat_w   = main_w * 0.10f;
-	const float col_comment_w= main_w - col_offset_w - col_glyph_w - col_type_w
-	                          - col_name_w - col_size_w - col_conf_w - col_heat_w - 8.f;
 
 	ImU32 hdr_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.9f);
 	dl->AddRectFilled(ImVec2(ox, cy), ImVec2(ox + main_w, cy + row_h), hdr_bg, 6.f);

@@ -75,7 +75,8 @@ inline void push(uint64_t addr) {
     auto& s = stack_ref();
     if (!s.empty() && s.back() == addr) return;
     if (s.size() >= kMaxEntries) {
-        s.erase(s.begin(), s.begin() + (s.size() - kMaxEntries + 1));
+        const auto trim_count = static_cast<std::vector<uint64_t>::difference_type>(s.size() - kMaxEntries + 1);
+        s.erase(s.begin(), s.begin() + trim_count);
     }
     s.push_back(addr);
 }

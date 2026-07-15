@@ -1,5 +1,431 @@
 #include "analysis_session.hpp"
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "../../preview/workspace_preview_fixture.hpp"
+#include "../analysis/workspace/workspace_registry.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <utility>
+
+namespace analysis_session {
+namespace {
+
+struct preview_session_state_t final {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<analysis_session_t>> sessions;
+    std::size_t active = 0;
+    std::uint64_t sequence = 1;
+    std::string error;
+};
+
+std::uint64_t now_ms() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::string filename_from_path(const std::string& path) {
+    const auto separator = path.find_last_of("/\\");
+    return separator == std::string::npos ? path : path.substr(separator + 1);
+}
+
+std::shared_ptr<analysis_session_t> make_session(
+    preview_session_state_t& state, const std::string& path) {
+    const auto& fixture = aida::preview::workspace_preview_fixture();
+    auto session = std::make_shared<analysis_session_t>();
+    session->id = state.sequence == 1
+        ? fixture.session_id
+        : fixture.session_id + "_" + std::to_string(state.sequence);
+    ++state.sequence;
+    session->path = path.empty() ? fixture.source_path : path;
+    session->filename = filename_from_path(session->path);
+    session->session_name = session->filename;
+    session->session_created_ms = now_ms();
+    session->last_active_steady_ms = session->session_created_ms;
+    session->ui_selected = true;
+    session->workspace = fixture.workspace;
+    session->load_state = fixture.workspace
+        ? session_load_state_t::ready : session_load_state_t::failed;
+    if (!fixture.workspace)
+        session->load_error = aida::analysis::make_workspace_error(
+            aida::analysis::workspace_error_code_t::integrity_failure,
+            "preview analysis workspace fixture failed validation",
+            "preview_session");
+    return session;
+}
+
+preview_session_state_t& state() {
+    static preview_session_state_t value;
+    static const bool initialized = [&] {
+        value.sessions.push_back(make_session(value, {}));
+        if (value.sessions.front()->workspace)
+            aida::analysis::workspace_registry().bind_preview_workspace(
+                value.sessions.front()->workspace);
+        return true;
+    }();
+    static_cast<void>(initialized);
+    return value;
+}
+
+void select_locked(preview_session_state_t& value, std::size_t index) {
+    value.active = index;
+    for (std::size_t current = 0; current < value.sessions.size(); ++current)
+        value.sessions[current]->ui_selected = current == index;
+    if (index < value.sessions.size())
+        value.sessions[index]->last_active_steady_ms = now_ms();
+}
+
+bool same_path(const std::string& left, const std::string& right) {
+    if (left.size() != right.size())
+        return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        auto lhs = left[index] == '/' ? '\\' : left[index];
+        auto rhs = right[index] == '/' ? '\\' : right[index];
+        if (lhs >= 'A' && lhs <= 'Z')
+            lhs = static_cast<char>(lhs - 'A' + 'a');
+        if (rhs >= 'A' && rhs <= 'Z')
+            rhs = static_cast<char>(rhs - 'A' + 'a');
+        if (lhs != rhs)
+            return false;
+    }
+    return true;
+}
+
+session_summary_t summarize(const analysis_session_t& session, bool active) {
+    session_summary_t summary;
+    summary.id = session.id;
+    summary.kind = session.attached_pid == 0
+        ? session_kind_t::static_file : session_kind_t::live_attach;
+    summary.path = session.path;
+    summary.filename = session.filename;
+    summary.pid = session.attached_pid;
+    summary.process_name.assign(session.process_name.begin(),
+                                session.process_name.end());
+    summary.is_active = active;
+    summary.last_active_steady_ms = session.last_active_steady_ms;
+    summary.load_state = session.load_state;
+    summary.error = session.load_error;
+    if (session.workspace) {
+        summary.binary_id = session.workspace->identity().binary_id().to_hex();
+        summary.analysis_revision = session.workspace->analysis_revision();
+        summary.overlay_revision = session.workspace->overlay_revision();
+        summary.readiness = session.workspace->progress().readiness;
+    }
+    summary.pdb_status = "Symbols indexed from deterministic preview data";
+    summary.symbol_revision = 3;
+    return summary;
+}
+
+aida::analysis::workspace_result_t<void> pdb_action(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    if (!workspace)
+        return aida::analysis::workspace_result_t<void>::failure(
+            aida::analysis::make_workspace_error(
+                aida::analysis::workspace_error_code_t::target_required,
+                "preview PDB action requires a workspace", "preview_pdb"));
+    return aida::analysis::workspace_result_t<void>::success();
+}
+
+}
+
+bool open_session(const std::string& path) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    if (path.empty()) {
+        value.error = "A file path is required";
+        return false;
+    }
+    for (std::size_t index = 0; index < value.sessions.size(); ++index) {
+        if (same_path(value.sessions[index]->path, path)) {
+            select_locked(value, index);
+            value.error.clear();
+            return true;
+        }
+    }
+    if (value.sessions.size() >= kMaxSessions) {
+        value.error = "The preview session limit was reached";
+        return false;
+    }
+    value.sessions.push_back(make_session(value, path));
+    select_locked(value, value.sessions.size() - 1);
+    value.error.clear();
+    return value.sessions.back()->workspace != nullptr;
+}
+
+aida::analysis::workspace_result_t<static_workspace_acquisition_t>
+acquire_static_workspace(const std::string& path,
+                         const aida::analysis::cancellation_token_t& cancel) {
+    if (cancel.stop_requested())
+        return aida::analysis::workspace_result_t<static_workspace_acquisition_t>::failure(
+            aida::analysis::make_workspace_error(
+                cancel.deadline_exceeded()
+                    ? aida::analysis::workspace_error_code_t::deadline_exceeded
+                    : aida::analysis::workspace_error_code_t::cancelled,
+                "preview workspace acquisition was cancelled",
+                "preview_session"));
+    if (!path.empty())
+        static_cast<void>(open_session(path));
+    static_workspace_acquisition_t result;
+    result.workspace = active_workspace();
+    result.joined_existing = true;
+    if (!result.workspace)
+        return aida::analysis::workspace_result_t<static_workspace_acquisition_t>::failure(
+            aida::analysis::make_workspace_error(
+                aida::analysis::workspace_error_code_t::target_required,
+                "preview workspace is unavailable", "preview_session"));
+    return aida::analysis::workspace_result_t<static_workspace_acquisition_t>::success(
+        std::move(result));
+}
+
+bool open_attach_session(std::uint32_t pid, std::string* out_err) {
+    const std::string error = pid == 0
+        ? "A process identifier is required"
+        : "Live process attachment is unavailable in the UI-only preview";
+    if (out_err)
+        *out_err = error;
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    value.error = error;
+    return false;
+}
+
+bool switch_session(std::size_t index) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    if (index >= value.sessions.size())
+        return false;
+    select_locked(value, index);
+    return true;
+}
+
+bool close_session(std::size_t index) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    if (index >= value.sessions.size())
+        return false;
+    value.sessions.erase(value.sessions.begin() +
+                         static_cast<std::ptrdiff_t>(index));
+    if (value.sessions.empty()) {
+        value.active = 0;
+        return true;
+    }
+    select_locked(value, (std::min)(value.active,
+                                    value.sessions.size() - 1));
+    return true;
+}
+
+bool cancel_session(std::size_t index) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    if (index >= value.sessions.size())
+        return false;
+    if (value.sessions[index]->load_state == session_load_state_t::ready)
+        return true;
+    value.sessions[index]->load_cancellation.request_cancel();
+    value.sessions[index]->load_state = session_load_state_t::closed;
+    return true;
+}
+
+std::size_t active_session_idx() {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return value.sessions.empty() ? 0 : value.active;
+}
+
+std::size_t session_count() {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return value.sessions.size();
+}
+
+const analysis_session_t* session_at(std::size_t index) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return index < value.sessions.size() ? value.sessions[index].get() : nullptr;
+}
+
+std::shared_ptr<const analysis_session_t> session_handle_at(std::size_t index) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return index < value.sessions.size() ? value.sessions[index] : nullptr;
+}
+
+std::shared_ptr<aida::analysis::analysis_workspace_t> active_workspace() {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return value.sessions.empty() ? nullptr
+                                  : value.sessions[value.active]->workspace;
+}
+
+std::shared_ptr<aida::analysis::analysis_workspace_t>
+workspace_for_session(std::size_t index) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return index < value.sessions.size() ? value.sessions[index]->workspace
+                                         : nullptr;
+}
+
+std::shared_ptr<aida::analysis::analysis_workspace_t>
+workspace_for_session_id(const std::string& session_id) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    const auto found = std::find_if(value.sessions.begin(), value.sessions.end(),
+        [&](const auto& session) { return session->id == session_id; });
+    return found == value.sessions.end() ? nullptr : (*found)->workspace;
+}
+
+std::shared_ptr<symbol_store::workspace_state_t> symbols_for_workspace(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    for (const auto& session : value.sessions)
+        if (session->workspace == workspace)
+            return session->symbols;
+    return nullptr;
+}
+
+aida::analysis::workspace_result_t<pdb_prompt_snapshot_t> pdb_prompt_snapshot(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    if (!workspace)
+        return aida::analysis::workspace_result_t<pdb_prompt_snapshot_t>::failure(
+            aida::analysis::make_workspace_error(
+                aida::analysis::workspace_error_code_t::target_required,
+                "preview PDB state requires a workspace", "preview_pdb"));
+    pdb_prompt_snapshot_t result;
+    result.binary_id = workspace->identity().binary_id().to_hex();
+    result.module_name = workspace->identity().bin_name();
+    result.pdb_name = "AiDA_Target.pdb";
+    result.pdb_guid = "A1DA7B4294114C2DA870455972E3018D";
+    result.pdb_age = 1;
+    result.status = "Symbols loaded";
+    result.progress_percent = 100;
+    result.symbol_revision = 3;
+    return aida::analysis::workspace_result_t<pdb_prompt_snapshot_t>::success(
+        std::move(result));
+}
+
+aida::analysis::workspace_result_t<void> approve_remote_pdb(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    bool load_types, bool load_names) {
+    static_cast<void>(load_types);
+    static_cast<void>(load_names);
+    return pdb_action(workspace);
+}
+
+aida::analysis::workspace_result_t<void> approve_local_pdb(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+    const std::string& path, bool load_types, bool load_names) {
+    static_cast<void>(path);
+    static_cast<void>(load_types);
+    static_cast<void>(load_names);
+    return pdb_action(workspace);
+}
+
+aida::analysis::workspace_result_t<void> decline_remote_pdb(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    return pdb_action(workspace);
+}
+
+aida::analysis::workspace_result_t<void> decline_local_pdb(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    return pdb_action(workspace);
+}
+
+aida::analysis::workspace_result_t<void> cancel_pdb(
+    const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace) {
+    return pdb_action(workspace);
+}
+
+bool find_session_by_path(const std::string& path, std::size_t* out_idx) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    for (std::size_t index = 0; index < value.sessions.size(); ++index) {
+        if (!same_path(value.sessions[index]->path, path))
+            continue;
+        if (out_idx)
+            *out_idx = index;
+        return true;
+    }
+    return false;
+}
+
+bool find_session_by_pid(std::uint32_t pid, std::size_t* out_idx) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    for (std::size_t index = 0; index < value.sessions.size(); ++index) {
+        if (value.sessions[index]->attached_pid != pid || pid == 0)
+            continue;
+        if (out_idx)
+            *out_idx = index;
+        return true;
+    }
+    return false;
+}
+
+bool find_session_by_id(const std::string& session_id, std::size_t* out_idx) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    for (std::size_t index = 0; index < value.sessions.size(); ++index) {
+        if (value.sessions[index]->id != session_id)
+            continue;
+        if (out_idx)
+            *out_idx = index;
+        return true;
+    }
+    return false;
+}
+
+void prune_lru(std::size_t max_keep) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    max_keep = (std::max<std::size_t>)(1, max_keep);
+    while (value.sessions.size() > max_keep) {
+        std::size_t oldest = 0;
+        for (std::size_t index = 1; index < value.sessions.size(); ++index)
+            if (value.sessions[index]->last_active_steady_ms <
+                value.sessions[oldest]->last_active_steady_ms)
+                oldest = index;
+        value.sessions.erase(value.sessions.begin() +
+                             static_cast<std::ptrdiff_t>(oldest));
+    }
+    select_locked(value, (std::min)(value.active, value.sessions.size() - 1));
+}
+
+const char* last_error() {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return value.error.c_str();
+}
+
+bool has_active_target() {
+    return active_workspace() != nullptr;
+}
+
+std::vector<session_summary_t> list_session_summaries() {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    std::vector<session_summary_t> result;
+    result.reserve(value.sessions.size());
+    for (std::size_t index = 0; index < value.sessions.size(); ++index)
+        result.push_back(summarize(*value.sessions[index], index == value.active));
+    return result;
+}
+
+session_summary_t summarize_session_at(std::size_t index) {
+    auto& value = state();
+    std::lock_guard lock(value.mutex);
+    return index < value.sessions.size()
+        ? summarize(*value.sessions[index], index == value.active)
+        : session_summary_t{};
+}
+
+}
+
+#else
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -2878,3 +3304,5 @@ session_summary_t summarize_session_at(size_t idx)
 }
 
 }
+
+#endif

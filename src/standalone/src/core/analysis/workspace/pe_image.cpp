@@ -1,3 +1,125 @@
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "pe_image.hpp"
+#include "checked_range.hpp"
+
+#include <algorithm>
+#include <utility>
+
+namespace aida::analysis {
+
+workspace_result_t<std::uint64_t> pe_image_t::rva_to_file_offset(std::uint64_t rva,
+                                                                std::uint64_t size_value) const {
+    if (rva < headers_size_) {
+        auto range = validate_span(rva, size_value, headers_size_, "pe_map");
+        if (!range)
+            return workspace_result_t<std::uint64_t>::failure(range.error());
+        return workspace_result_t<std::uint64_t>::success(rva);
+    }
+    const auto* section = section_for_rva(rva, size_value);
+    if (!section) {
+        auto error = make_workspace_error(workspace_error_code_t::out_of_range,
+                                          "RVA is not file-backed", "pe_map");
+        error.address = address_t{address_space_id_t::relative_virtual, rva,
+                                  architecture_, mode_};
+        error.size = size_value;
+        return workspace_result_t<std::uint64_t>::failure(std::move(error));
+    }
+    const std::uint64_t delta = rva - section->virtual_address;
+    if (delta > section->raw_size || size_value > section->raw_size - delta) {
+        auto error = make_workspace_error(workspace_error_code_t::out_of_range,
+                                          "RVA lies in zero-filled virtual section data", "pe_map");
+        error.address = address_t{address_space_id_t::relative_virtual, rva,
+                                  architecture_, mode_};
+        error.size = size_value;
+        return workspace_result_t<std::uint64_t>::failure(std::move(error));
+    }
+    return workspace_result_t<std::uint64_t>::success(section->raw_offset + delta);
+}
+
+workspace_result_t<std::uint64_t> pe_image_t::file_offset_to_rva(std::uint64_t offset,
+                                                                std::uint64_t size_value) const {
+    if (offset < headers_size_) {
+        auto range = validate_span(offset, size_value, headers_size_, "pe_map");
+        if (!range)
+            return workspace_result_t<std::uint64_t>::failure(range.error());
+        return workspace_result_t<std::uint64_t>::success(offset);
+    }
+    const auto* section = section_for_file_offset(offset, size_value);
+    if (!section) {
+        auto error = make_workspace_error(workspace_error_code_t::out_of_range,
+                                          "file offset is not mapped into the image", "pe_map");
+        error.offset = offset;
+        error.size = size_value;
+        return workspace_result_t<std::uint64_t>::failure(std::move(error));
+    }
+    return workspace_result_t<std::uint64_t>::success(
+        section->virtual_address + (offset - section->raw_offset));
+}
+
+workspace_result_t<std::uint64_t> pe_image_t::rva_to_va(std::uint64_t rva) const {
+    if (rva >= image_size_)
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::out_of_range,
+                                 "RVA exceeds image size", "pe_map"));
+    std::uint64_t va = 0;
+    if (!checked_add_u64(image_base_, rva, va))
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::range_overflow,
+                                 "VA calculation overflowed", "pe_map"));
+    return workspace_result_t<std::uint64_t>::success(va);
+}
+
+workspace_result_t<std::uint64_t> pe_image_t::va_to_rva(std::uint64_t va) const {
+    std::uint64_t rva = 0;
+    if (!checked_sub_u64(va, image_base_, rva) || rva >= image_size_)
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::out_of_range,
+                                 "VA is outside image bounds", "pe_map"));
+    return workspace_result_t<std::uint64_t>::success(rva);
+}
+
+const pe_section_t* pe_image_t::section_for_rva(std::uint64_t rva,
+                                                std::uint64_t size_value) const noexcept {
+    const auto upper = std::upper_bound(
+        sections_.begin(), sections_.end(), rva,
+        [](std::uint64_t value, const pe_section_t& section) {
+            return value < section.virtual_address;
+        });
+    if (upper == sections_.begin())
+        return nullptr;
+    const checked_span_t requested{rva, size_value};
+    auto iterator = upper;
+    while (iterator != sections_.begin()) {
+        --iterator;
+        const std::uint64_t extent = std::max<std::uint64_t>(
+            iterator->virtual_size, iterator->raw_size);
+        const checked_span_t section_span{iterator->virtual_address, extent};
+        if (section_span.contains(requested))
+            return &*iterator;
+        std::uint64_t end = 0;
+        if (extent != 0 && checked_add_u64(iterator->virtual_address, extent, end) &&
+            end < rva)
+            break;
+    }
+    return nullptr;
+}
+
+const pe_section_t* pe_image_t::section_for_file_offset(std::uint64_t offset,
+                                                        std::uint64_t size_value) const noexcept {
+    for (const auto& section : sections_) {
+        const checked_span_t section_span{section.raw_offset, section.raw_size};
+        const checked_span_t requested{offset, size_value};
+        if (section_span.contains(requested))
+            return &section;
+    }
+    return nullptr;
+}
+
+}
+
+#else
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -2616,3 +2738,5 @@ std::vector<exception_edge_t> build_exception_edges(
 }
 
 }
+
+#endif

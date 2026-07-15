@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/scan_aob_preview.hpp"
+#else
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1616,3 +1620,5 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 }
 
 }
+
+#endif

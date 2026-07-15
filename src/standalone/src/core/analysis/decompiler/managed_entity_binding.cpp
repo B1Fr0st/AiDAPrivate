@@ -44,8 +44,9 @@ workspace_result_t<sha256_digest_t> current_provider_hash(
 }
 
 std::uint16_t read_u16_le(const std::uint8_t* bytes) noexcept {
-    return static_cast<std::uint16_t>(bytes[0]) |
-        static_cast<std::uint16_t>(bytes[1]) << 8;
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint32_t>(bytes[0]) |
+        (static_cast<std::uint32_t>(bytes[1]) << 8U));
 }
 
 std::uint32_t read_u32_le(const std::uint8_t* bytes) noexcept {
@@ -582,9 +583,10 @@ build_managed_artifact_publication(
         return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::success(
             nullptr);
     auto provider_hash = current_provider_hash(provider, cancel);
-    if (!provider_hash)
+    if (!provider_hash) {
         return workspace_result_t<std::shared_ptr<const managed_artifact_publication_t>>::failure(
             provider_hash.error());
+    }
         auto publication = std::make_shared<managed_artifact_publication_t>();
         publication->binary_id = identity.binary_id();
         publication->load_profile_hash = identity.load_profile_hash();
@@ -1038,11 +1040,12 @@ capture_jvm_entity_input(
     if (!image)
         return workspace_result_t<std::shared_ptr<const jvm_ssa::jvm_method_input_t>>::failure(
             image.error());
-    if (*binding.method_index >= image.value().methods.size())
+    if (*binding.method_index >= image.value().methods.size()) {
         return workspace_result_t<std::shared_ptr<const jvm_ssa::jvm_method_input_t>>::failure(
             binding_error(workspace_error_code_t::target_stale,
                 "JVM method index is absent after verified capture",
                 "managed.binding.jvm"));
+    }
         auto input = std::make_shared<jvm_ssa::jvm_method_input_t>();
         input->context = jvm_ssa::extract_method_context(
             image.value(), *binding.method_index);
@@ -1162,9 +1165,10 @@ capture_dalvik_entity_input(
         byte_count,
         publication.managed_artifacts->reader_limits.max_code_bytes,
         cancel);
-    if (!bytes)
+    if (!bytes) {
         return workspace_result_t<std::shared_ptr<const dalvik_ssa::dalvik_ssa_capture_t>>::failure(
             bytes.error());
+    }
         auto capture = std::make_shared<dalvik_ssa::dalvik_ssa_capture_t>();
         capture->request.provider = provider;
         capture->request.language.language_id = "dalvik-bytecode";

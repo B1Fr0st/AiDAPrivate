@@ -13,8 +13,10 @@
 #include "ui/toast_notification.hpp"
 #include "imgui.h"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #include "standalone_driver.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -189,12 +191,18 @@ void render(float pos_x, float pos_y, float width, float height,
 			if (cfg.input_size <= 0) cfg.input_size = 256;
 			if (cfg.max_iterations == 0) cfg.max_iterations = 10000;
 
-			uint32_t pid = driver_bridge::attached_pid();
+			uint32_t pid = 0;
 			uint32_t tid = 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			pid = 4242;
+			tid = 7331;
+#else
+			pid = driver_bridge::attached_pid();
 			if (pid != 0) {
 				auto threads = driver_bridge::enumerate_threads();
 				if (!threads.empty()) tid = threads[0].tid;
 			}
+#endif
 			cfg.pid = pid;
 			cfg.tid = tid;
 
@@ -576,8 +584,8 @@ void render(float pos_x, float pos_y, float width, float height,
 			ImU32 cell_col = aida::ui::mix(c_low, c_high, fill);
 			float pad = 1.5f;
 			dl->AddRectFilled(
-				ImVec2(cov_left + c * cell_w + pad, cov_top + r * cell_h + pad),
-				ImVec2(cov_left + (c + 1) * cell_w - pad, cov_top + (r + 1) * cell_h - pad),
+				ImVec2(cov_left + static_cast<float>(c) * cell_w + pad, cov_top + static_cast<float>(r) * cell_h + pad),
+				ImVec2(cov_left + static_cast<float>(c + 1) * cell_w - pad, cov_top + static_cast<float>(r + 1) * cell_h - pad),
 				cell_col, 2.f);
 		}
 	}

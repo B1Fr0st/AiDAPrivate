@@ -109,7 +109,11 @@ namespace aida::ui::fonts {
 	}
 
 	inline float size_or(ImFont* font, float fallback_px) {
+	#if IMGUI_VERSION_NUM >= 19200
+		return font && font->LegacySize > 0.f ? font->LegacySize : fallback_px;
+	#else
 		return font && font->FontSize > 0.f ? font->FontSize : fallback_px;
+	#endif
 	}
 
 	inline ImFont* body()         { return g_font_ui_400; }

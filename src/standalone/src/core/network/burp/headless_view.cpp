@@ -1,14 +1,22 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "headless_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_browser.hpp"
+#else
 #include "camoufox_bridge.hpp"
 #include "camoufox_install.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -16,8 +24,16 @@
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
 #include "../../infra/event_bus.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
 #include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -170,7 +186,8 @@ void append_install_log_line(std::string line)
     std::lock_guard<std::mutex> lk(g_state.log_mtx);
     if (g_state.install_log.size() >= kInstallLogCapacity) {
         const size_t drop = (kInstallLogCapacity / 4) + 1;
-        g_state.install_log.erase(g_state.install_log.begin(), g_state.install_log.begin() + drop);
+        const auto drop_count = static_cast<std::vector<std::string>::difference_type>(drop);
+        g_state.install_log.erase(g_state.install_log.begin(), g_state.install_log.begin() + drop_count);
     }
     g_state.install_log.push_back(std::move(line));
     g_state.install_log_dirty.store(true, std::memory_order_release);
@@ -501,6 +518,9 @@ void run_reload()
 
 std::string compute_screenshot_path()
 {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    std::string base = "/aida-preview/screenshots/";
+#else
     char buf[MAX_PATH];
     const DWORD len = GetEnvironmentVariableA("USERPROFILE", buf, MAX_PATH);
     std::string base;
@@ -509,10 +529,11 @@ std::string compute_screenshot_path()
     if (!base.empty() && base.back() != '\\') base.push_back('\\');
     base += "Downloads\\";
     CreateDirectoryA(base.c_str(), nullptr);
+#endif
 
     const uint64_t ts = now_ms() / 1000ULL;
     char fn[128];
-    _snprintf_s(fn, sizeof(fn), _TRUNCATE, "camoufox_%llu.png", static_cast<unsigned long long>(ts));
+    snprintf(fn, sizeof(fn), "camoufox_%llu.png", static_cast<unsigned long long>(ts));
     return base + fn;
 }
 
@@ -691,6 +712,9 @@ void run_add_init_script(const std::string& js)
 void open_in_explorer(const std::string& path)
 {
     if (path.empty()) return;
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    set_err("Preview receipt: " + path);
+#else
     std::wstring wpath;
     int needed = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
     if (needed > 0) {
@@ -702,6 +726,7 @@ void open_in_explorer(const std::string& path)
     }
     std::wstring args = L"/select,\"" + wpath + L"\"";
     ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+#endif
 }
 
 void draw_status_dot(ImDrawList* dl, ImVec2 center, float radius, ImU32 color, float alpha)

@@ -1,28 +1,39 @@
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../preview/shell_preview_platform.hpp"
+#include "../preview/shell_preview.hpp"
+#else
 #include <windows.h>
 #include <shlobj.h>
+#endif
 #ifdef small
 #undef small
 #endif
 
 #include "globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "standalone_license.hpp"
+#endif
 #include "hex_view.hpp"
 #include "image_view.hpp"
 #include "analysis_session.hpp"
 #include "standalone_settings.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "diag_log.hpp"
+#endif
 #include "imgui/imgui.h"
 #include "components.hpp"
 #include "theme.hpp"
 #include "fonts.hpp"
 #include "ui_anim.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../core/infra/executor.hpp"
 #include "../core/infra/taskflow_runtime.hpp"
 #include "../core/analysis/workspace/byte_provider.hpp"
 #include "../core/analysis/workspace/workspace_registry.hpp"
 #include "../core/analysis/workspace/zip_container.hpp"
 #include "../core/ui/ui_thread_dispatcher.hpp"
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -49,6 +60,27 @@ extern HWND g_hwnd;
 
 void file_browser::refresh(const std::string& dir)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (!dir.empty())
+        current_dir = dir;
+    if (current_dir.empty())
+        current_dir = "C:/Preview/ReverseEngineering";
+    strncpy_s(path_buf, sizeof(path_buf), current_dir.c_str(), _TRUNCATE);
+    if (entries.empty()) {
+        entries = {
+            { "samples", current_dir + "/samples", true, true, 0 },
+            { "sample.exe", current_dir + "/samples/sample.exe", false, false, 1 },
+            { "packed_sample.dll", current_dir + "/samples/packed_sample.dll", false, false, 1 },
+            { "symbols", current_dir + "/symbols", true, false, 0 },
+            { "notes.md", current_dir + "/notes.md", false, false, 0 }
+        };
+    }
+    needs_refresh = false;
+    if (selected_idx >= static_cast<int>(entries.size()))
+        selected_idx = -1;
+    aida::preview::record(aida::preview::shell_action_t::open_folder, current_dir);
+    return;
+#else
     if (!aida::ui_thread::is_owner_thread()) {
         const bool routed = aida::ui_thread::post([dir]() {
             file_browser::refresh(dir);
@@ -160,13 +192,14 @@ void file_browser::refresh(const std::string& dir)
         diag::log_tagged_fmt("file_browser", "refresh_exception_unknown dir=%s",
             current_dir.c_str());
     }
+#endif
 }
 
 
 void file_browser::toggle_dir(int idx)
 {
-    if (idx < 0 || idx >= (int)entries.size()) return;
-    auto& ent = entries[idx];
+    if (idx < 0 || static_cast<std::size_t>(idx) >= entries.size()) return;
+    auto& ent = entries[static_cast<std::size_t>(idx)];
     if (!ent.is_dir) return;
 
     ent.expanded = !ent.expanded;
@@ -175,6 +208,8 @@ void file_browser::toggle_dir(int idx)
 
 
 namespace file_browser {
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 namespace ext_classify {
 
@@ -490,8 +525,73 @@ void async_hex_fallback(const std::string& path, bool archive)
 
 }
 
+#endif
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+namespace {
+
+struct hex_preview_state_t {
+    std::mutex mutex;
+    std::uint64_t serial = 0;
+    bool loading = false;
+    std::string path;
+    std::string error;
+};
+
+hex_preview_state_t& hex_preview_state()
+{
+    static hex_preview_state_t value;
+    return value;
+}
+
+}
+#endif
+
 void open_path(const std::string& path)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (path.empty()) return;
+    const auto entry = std::find_if(entries.begin(), entries.end(), [&](const FileBrowserEntry& value) {
+        return value.full_path == path;
+    });
+    if (entry != entries.end() && entry->is_dir) {
+        current_dir = path;
+        strncpy_s(path_buf, sizeof(path_buf), current_dir.c_str(), _TRUNCATE);
+        globals::ui::active_activity = activity_item_t::explorer;
+        globals::ui::panel_left_visible = true;
+        needs_refresh = false;
+        aida::preview::record(aida::preview::shell_action_t::open_folder, path);
+        return;
+    }
+
+    const std::size_t slash = path.find_last_of("/\\");
+    const std::string filename = slash == std::string::npos ? path : path.substr(slash + 1);
+    const std::size_t dot = filename.find_last_of('.');
+    std::string extension = dot == std::string::npos ? std::string{} : filename.substr(dot);
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (image_view::is_image_extension(extension)) {
+        globals::ui::active_center_view = center_view_t::image_view;
+    } else if (extension == ".cpp" || extension == ".c" || extension == ".h"
+        || extension == ".hpp" || extension == ".asm" || extension == ".md"
+        || extension == ".txt" || extension == ".json") {
+        const std::string content = extension == ".md"
+            ? "# Reverse Engineering Notes\n\n- Entrypoint mapped\n- Import resolver identified\n- License gate cross-references indexed\n"
+            : "int analyze_target(const char* path) {\n    return path != nullptr ? 0 : -1;\n}\n";
+        file_tabs::open_or_focus(path, filename, content);
+        globals::ui::active_center_view = center_view_t::code_editor;
+    } else {
+        std::size_t existing_index = static_cast<std::size_t>(-1);
+        if (analysis_session::find_session_by_path(path, &existing_index))
+            analysis_session::switch_session(existing_index);
+        globals::ui::active_center_view = center_view_t::workbench;
+    }
+    record_recent_workspace(path);
+    aida::preview::record(aida::preview::shell_action_t::open_file, path);
+    return;
+#else
     if (path.empty()) return;
     if (!aida::ui_thread::is_owner_thread()) {
         const bool routed = aida::ui_thread::post([path]() {
@@ -627,14 +727,15 @@ void open_path(const std::string& path)
     diag::log_tagged_fmt("file_browser",
         "open_path failed path=%s err=%s", path.c_str(),
         err ? err : "(null)");
+#endif
 }
 
 }
 
 void file_browser::open_file(int idx)
 {
-    if (idx < 0 || idx >= (int)entries.size()) return;
-    auto& ent = entries[idx];
+    if (idx < 0 || static_cast<std::size_t>(idx) >= entries.size()) return;
+    auto& ent = entries[static_cast<std::size_t>(idx)];
     if (ent.is_dir) return;
     file_browser::request_open_confirmation(ent.full_path);
 }
@@ -710,6 +811,23 @@ void render_hex_loading_indicator()
 
 void request_open_confirmation(const std::string& path)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (path.empty()) return;
+    const auto entry = std::find_if(entries.begin(), entries.end(), [&](const FileBrowserEntry& value) {
+        return value.full_path == path;
+    });
+    if (entry != entries.end() && entry->is_dir) {
+        open_path(path);
+        return;
+    }
+    pending_open_path = path;
+    const std::size_t slash = path.find_last_of("/\\");
+    pending_open_filename = slash == std::string::npos ? path : path.substr(slash + 1);
+    pending_open_should_open = true;
+    pending_open_modal_visible = true;
+    aida::preview::record(aida::preview::shell_action_t::open_file, "confirm:" + path);
+    return;
+#else
     if (path.empty()) return;
     if (!aida::ui_thread::is_owner_thread()) {
         const bool routed = aida::ui_thread::post([path]() {
@@ -734,6 +852,7 @@ void request_open_confirmation(const std::string& path)
     pending_open_should_open = true;
     pending_open_modal_visible = true;
     diag::log_tagged_fmt("file_open", "explorer_confirm_requested path=%s", path.c_str());
+#endif
 }
 
 void record_recent_workspace(const std::string& path)
@@ -923,6 +1042,8 @@ void render_pending_confirm_modal()
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar(4);
 }
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 namespace watcher_detail {
 
@@ -1193,13 +1314,19 @@ inline void ensure_running_for(const std::string& dir)
 
 }
 
+#endif
+
 void tick_watcher()
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    needs_refresh = false;
+#else
     watcher_detail::ensure_running_for(current_dir);
     watcher_detail::watcher_t& w = watcher_detail::g_watcher();
     if (w.has_change.exchange(false, std::memory_order_acq_rel)) {
         needs_refresh = true;
     }
+#endif
 }
 
 }

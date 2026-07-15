@@ -3,14 +3,20 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#include "../../helpers/win32_dialog.hpp"
+#endif
 #include "../helpers/globals.h"
 #include "../../helpers/helpers.h"
-#include "../../helpers/win32_dialog.hpp"
 #include "binary_map.hpp"
 #include "../editor/hex_view.hpp"
 #include "disasm_view.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "binary_map_preview_runtime.hpp"
+#else
 #include "standalone_driver.hpp"
+#endif
 #include "event_bus.hpp"
 #include "toast_notification.hpp"
 #include "ui/theme.hpp"
@@ -24,20 +30,29 @@
 #include "ui/responsive.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/ui_task_executor.hpp"
+#include "../../preview/hex_preview_adapter.hpp"
+#else
 #include "../infra/executor.hpp"
+#endif
 #include "../session/analysis_session.hpp"
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <Windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -193,12 +208,28 @@ namespace binary_map_view {
 	}
 
 	namespace detail {
+		inline int count_as_int(std::size_t count)
+		{
+			const auto maximum = static_cast<std::size_t>((std::numeric_limits<int>::max)());
+			return count > maximum ? (std::numeric_limits<int>::max)() : static_cast<int>(count);
+		}
+
+		inline bool valid_index(int index, std::size_t count)
+		{
+			return index >= 0 && static_cast<std::size_t>(index) < count;
+		}
+
+		inline std::size_t hex_request_size(std::uint64_t size)
+		{
+			constexpr std::uint64_t maximum = 1ULL * 1024ULL * 1024ULL;
+			return static_cast<std::size_t>((std::min)(size, maximum));
+		}
 
 		inline std::string to_lower_copy(const std::string& s)
 		{
 			std::string out;
 			out.resize(s.size());
-			for (size_t i = 0; i < s.size(); ++i) {
+			for (std::size_t i = 0; i < s.size(); ++i) {
 				const unsigned char c = static_cast<unsigned char>(s[i]);
 				out[i] = static_cast<char>(std::tolower(c));
 			}
@@ -334,7 +365,7 @@ namespace binary_map_view {
 		inline std::string format_function_summary(const binary_map::map_function_t& f)
 		{
 			std::string callees;
-			for (size_t i = 0; i < f.top_callees.size() && i < 5; ++i) {
+			for (std::size_t i = 0; i < f.top_callees.size() && i < 5; ++i) {
 				if (i > 0) callees += ", ";
 				callees += f.top_callees[i];
 			}
@@ -359,8 +390,8 @@ namespace binary_map_view {
 		{
 			if (text.empty()) return;
 
-			const size_t cap = sizeof(g_chat_buf) - 1u;
-			const size_t cur = std::strlen(g_chat_buf);
+			const std::size_t cap = sizeof(g_chat_buf) - 1u;
+			const std::size_t cur = std::strlen(g_chat_buf);
 
 			if (cur + text.size() < cap) {
 				if (cur > 0) {
@@ -370,9 +401,9 @@ namespace binary_map_view {
 						g_chat_buf[cur + 2u] = '\0';
 					}
 				}
-				const size_t now = std::strlen(g_chat_buf);
-				const size_t room = cap - now;
-				const size_t copy = (text.size() < room) ? text.size() : room;
+				const std::size_t now = std::strlen(g_chat_buf);
+				const std::size_t room = cap - now;
+				const std::size_t copy = (text.size() < room) ? text.size() : room;
 				std::memcpy(g_chat_buf + now, text.data(), copy);
 				g_chat_buf[now + copy] = '\0';
 				toast_notification::push("Binary map appended to chat input",
@@ -494,7 +525,7 @@ namespace binary_map_view {
 				std::string err_copy;
 				if (!ok) err_copy = "Workspace binary-map generation failed.";
 
-				size_t f = 0, g_count = 0, i = 0, e = 0, sec = 0;
+				std::size_t f = 0, g_count = 0, i = 0, e = 0, sec = 0;
 				std::string mod;
 				if (ok) {
 					f = fresh.functions.size();
@@ -798,7 +829,7 @@ namespace binary_map_view {
 			else binary_map::unpin_function(workspace, va);
 		}
 
-		inline void jump_to_hex(view_state_t& state, uint64_t va, size_t size)
+		inline void jump_to_hex(view_state_t& state, uint64_t va, std::size_t size)
 		{
 			if (va == 0) {
 				diag::log_tagged_fmt("binary_map",
@@ -806,7 +837,7 @@ namespace binary_map_view {
 				return;
 			}
 			if (size == 0) size = 0x200;
-			const size_t kMaxHex = 1u * 1024u * 1024u;
+			const std::size_t kMaxHex = 1u * 1024u * 1024u;
 			if (size > kMaxHex) size = kMaxHex;
 
 			const auto context = disasm_view::capture_workspace(state.workspace.lock());
@@ -816,7 +847,7 @@ namespace binary_map_view {
 			bool used_static = false;
 			bool ok = false;
 			if (live_ok) {
-				ok = hex_view::read_from_process(context, va, size);
+				ok = hex_view::read_live_memory(context, va, size);
 			}
 			if (!ok) {
 				const auto address = disasm_view::typed_address(context, va);
@@ -826,12 +857,12 @@ namespace binary_map_view {
 							aida::analysis::workspace_error_code_t::out_of_range,
 							"Address is outside the selected workspace", "binary_map.hex"));
 				if (blob && !blob.value().empty()) {
-					char label[96];
-					std::snprintf(label, sizeof(label), "Static @ %016llX",
-						static_cast<unsigned long long>(va));
-					hex_view::set_data(context, blob.value(), va, label);
+					hex_view::activate(context);
 					ok = true;
 					used_static = true;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::hex::receipts.push_back({ "binary_map.activate", va });
+#endif
 				}
 			}
 			if (ok) {
@@ -864,6 +895,18 @@ namespace binary_map_view {
 					toast_notification::toast_type_t::warning, 3.0f);
 				return false;
 			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			(void)state;
+			char receipt[192];
+			std::snprintf(receipt, sizeof(receipt), "Dump %s 0x%016llX (%llu bytes)",
+				kind_label.empty() ? "region" : kind_label.c_str(),
+				static_cast<unsigned long long>(base),
+				static_cast<unsigned long long>(size));
+			ImGui::SetClipboardText(receipt);
+			toast_notification::push("Region dump receipt copied",
+				toast_notification::toast_type_t::info, 3.5f);
+			return true;
+#else
 
 			char default_name[96] = {};
 			std::snprintf(default_name, sizeof(default_name),
@@ -915,9 +958,9 @@ namespace binary_map_view {
 				if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot &&
 					context.workspace->identity().process()) {
 					driver_bridge::read_memory_for(context.workspace->identity().process()->pid,
-						base, static_cast<size_t>(size), buffer);
+						base, static_cast<std::size_t>(size), buffer);
 				} else if (const auto address = disasm_view::typed_address(context, base)) {
-					auto bytes = disasm_view::read_bytes(context, *address, static_cast<size_t>(size));
+					auto bytes = disasm_view::read_bytes(context, *address, static_cast<std::size_t>(size));
 					if (bytes) buffer = std::move(bytes.value());
 				}
 				if (buffer.empty()) {
@@ -942,6 +985,7 @@ namespace binary_map_view {
 				toast_notification::push(message, toast_notification::toast_type_t::info, 3.5f);
 			};
 			return aida::infra::executor::submit(std::move(submission)).submitted;
+#endif
 		}
 
 		inline std::string make_function_chat_payload(const binary_map::map_function_t& f)
@@ -1027,7 +1071,7 @@ namespace binary_map_view {
 				static_cast<unsigned>(snap.rwx_count),
 				snap.regions.size());
 			out = hdr;
-			for (size_t i = 0; i < snap.regions.size(); ++i) {
+			for (std::size_t i = 0; i < snap.regions.size(); ++i) {
 				if (i) out += ",";
 				out += region_to_json(snap.regions[i]);
 			}
@@ -1086,7 +1130,7 @@ namespace binary_map_view {
 			float reveal = aida::motion::ease::out_cubic(anim_p);
 
 			float total_w = width - gap * static_cast<float>(sections.size() - 1);
-			for (size_t i = 0; i < sections.size(); ++i) {
+			for (std::size_t i = 0; i < sections.size(); ++i) {
 				const auto& s = sections[i];
 				float frac = static_cast<float>(s.size) / total_size;
 				float sw = total_w * frac;
@@ -1110,7 +1154,7 @@ namespace binary_map_view {
 
 				ImFont* font = aida::ui::fonts::body_em();
 				if (!font) font = ImGui::GetFont();
-				float fs = font->FontSize > 0.f ? font->FontSize : 16.f;
+				float fs = aida::ui::fonts::size_or(font, 16.f);
 				ImU32 lbl_col = aida::ui::with_alpha(IM_COL32(255, 255, 255, 245), alpha);
 				ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.f, s.name.c_str());
 				if (effective_w > ts.x + 14.f) {
@@ -1120,7 +1164,7 @@ namespace binary_map_view {
 					float perm_w = effective_w - ts.x - 18.f;
 					ImFont* perm_font = aida::ui::fonts::caption();
 					if (!perm_font) perm_font = font;
-					float perm_fs = perm_font->FontSize > 0.f ? perm_font->FontSize : 13.f;
+					float perm_fs = aida::ui::fonts::size_or(perm_font, 13.f);
 					if (perm_w > 36.f) {
 						std::string p = section_perm_string(s);
 						ImVec2 perm_sz = perm_font->CalcTextSizeA(perm_fs, FLT_MAX, 0.f, p.c_str());
@@ -1191,7 +1235,7 @@ namespace binary_map_view {
 						s.name.c_str(),
 						static_cast<unsigned long long>(s.va),
 						static_cast<unsigned long long>(s.size));
-					detail::jump_to_hex(state, s.va, static_cast<size_t>(s.size));
+					detail::jump_to_hex(state, s.va, detail::hex_request_size(s.size));
 				}
 				ImGui::PopID();
 
@@ -1201,7 +1245,7 @@ namespace binary_map_view {
 
 			float entropy_y = y + strip_h + 4.f;
 			x = origin.x;
-			for (size_t i = 0; i < sections.size(); ++i) {
+			for (std::size_t i = 0; i < sections.size(); ++i) {
 				const auto& s = sections[i];
 				float frac = static_cast<float>(s.size) / total_size;
 				float sw = total_w * frac;
@@ -1228,7 +1272,7 @@ namespace binary_map_view {
 				if (s.sampled_bytes > 0) {
 					ImFont* tiny = aida::ui::fonts::caption();
 					if (!tiny) tiny = ImGui::GetFont();
-					const float tiny_fs = tiny->FontSize > 0.f ? tiny->FontSize * 0.85f : 11.f;
+					const float tiny_fs = aida::ui::fonts::size_or(tiny, 11.f / 0.85f) * 0.85f;
 					char ebuf[24];
 					std::snprintf(ebuf, sizeof(ebuf), "%.2f",
 						static_cast<double>(section_entropy_normalized(s)) * 8.0);
@@ -1286,14 +1330,16 @@ namespace binary_map_view {
 			const float gap = 3.f;
 			int cols = static_cast<int>((width + gap) / (cell_size + gap));
 			if (cols < 4) cols = 4;
-			int rows = (static_cast<int>(funcs.size()) + cols - 1) / cols;
+			const int function_count = count_as_int(funcs.size());
+			int rows = function_count / cols + (function_count % cols == 0 ? 0 : 1);
 			float used_h = static_cast<float>(rows) * (cell_size + gap);
 			if (used_h > height) used_h = height;
 
 			float anim_p = anim_time * 0.5f;
 			if (anim_p > 1.f) anim_p = 1.f;
 
-			for (size_t i = 0; i < funcs.size(); ++i) {
+			for (std::size_t i = 0; i < funcs.size(); ++i) {
+				if (i > static_cast<std::size_t>((std::numeric_limits<int>::max)())) break;
 				int r = static_cast<int>(i) / cols;
 				int c = static_cast<int>(i) % cols;
 				float ax = origin.x + static_cast<float>(c) * (cell_size + gap);
@@ -1307,7 +1353,7 @@ namespace binary_map_view {
 				float scale = 0.7f + 0.3f * aida::motion::ease::out_back(entrance);
 
 				ImGui::SetCursorScreenPos(ImVec2(ax, ay));
-				ImGui::PushID(static_cast<int>(0x10000000 | i));
+				ImGui::PushID(static_cast<int>(0x10000000u | static_cast<unsigned>(i)));
 				ImGui::InvisibleButton("##bm_heat_cell", ImVec2(cell_size, cell_size));
 				const bool hovered = ImGui::IsItemHovered();
 				const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
@@ -1413,9 +1459,13 @@ namespace binary_map_view {
 
 		inline int region_index_for_va(const std::vector<live_region_t>& regions, uint64_t va)
 		{
-			for (size_t i = 0; i < regions.size(); ++i) {
+			for (std::size_t i = 0; i < regions.size(); ++i) {
 				const auto& r = regions[i];
-				if (va >= r.base && va < r.base + r.size) return static_cast<int>(i);
+				if (va >= r.base && va < r.base + r.size) {
+					return i <= static_cast<std::size_t>((std::numeric_limits<int>::max)())
+						? static_cast<int>(i)
+						: -1;
+				}
 			}
 			return -1;
 		}
@@ -1423,7 +1473,7 @@ namespace binary_map_view {
 		inline void render_address_space_canvas(ImDrawList* dl, ImVec2 origin, float width, float height,
 			const std::vector<live_region_t>& regions,
 			const std::vector<driver_bridge::thread_info_t>& threads,
-			view_state_t& vs, float alpha, float anim_time, uint64_t selected_base)
+			view_state_t& vs, float alpha, float, uint64_t selected_base)
 		{
 			const auto& t = aida::ui::resolved();
 			ImVec2 a = origin;
@@ -1434,14 +1484,14 @@ namespace binary_map_view {
 
 			ImFont* hdr_font = aida::ui::fonts::body_em();
 			if (!hdr_font) hdr_font = ImGui::GetFont();
-			const float hdr_fs = hdr_font->FontSize > 0.f ? hdr_font->FontSize : 16.f;
+			const float hdr_fs = aida::ui::fonts::size_or(hdr_font, 16.f);
 			dl->AddText(hdr_font, hdr_fs, ImVec2(a.x + 12.f, a.y + 8.f),
 				aida::ui::with_alpha(t.text_secondary, alpha), "Address Space");
 
 			if (regions.empty()) {
 				ImFont* body = aida::ui::fonts::body();
 				if (!body) body = ImGui::GetFont();
-				const float body_fs = body->FontSize > 0.f ? body->FontSize : 16.f;
+				const float body_fs = aida::ui::fonts::size_or(body, 16.f);
 				const char* msg = "Attach to a process or refresh to see live mappings.";
 				ImVec2 ts = body->CalcTextSizeA(body_fs, FLT_MAX, 0.f, msg);
 				dl->AddText(body, body_fs,
@@ -1489,7 +1539,7 @@ namespace binary_map_view {
 			int hover_idx = -1;
 			ImVec2 mp = ImGui::GetMousePos();
 
-			for (size_t i = 0; i < regions.size(); ++i) {
+			for (std::size_t i = 0; i < regions.size(); ++i) {
 				const auto& r = regions[i];
 				if (r.base + r.size <= view_va_low) continue;
 				if (r.base >= view_va_high) break;
@@ -1589,8 +1639,8 @@ namespace binary_map_view {
 				}
 			}
 
-			if (hover_idx >= 0) {
-				const auto& hr = regions[static_cast<size_t>(hover_idx)];
+			if (valid_index(hover_idx, regions.size())) {
+				const auto& hr = regions[static_cast<std::size_t>(hover_idx)];
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.f, 8.f));
 				ImGui::PushStyleColor(ImGuiCol_PopupBg,
 					ImGui::ColorConvertU32ToFloat4(t.bg_overlay));
@@ -1628,7 +1678,7 @@ namespace binary_map_view {
 
 			ImFont* code_font = aida::ui::fonts::code();
 			if (!code_font) code_font = ImGui::GetFont();
-			const float tick_fs = (code_font->FontSize > 0.f ? code_font->FontSize : 13.f) * 0.95f;
+			const float tick_fs = aida::ui::fonts::size_or(code_font, 13.f) * 0.95f;
 			const int tick_count = 6;
 			for (int ti = 0; ti < tick_count; ++ti) {
 				const float frac = static_cast<float>(ti) / static_cast<float>(tick_count - 1);
@@ -1647,7 +1697,7 @@ namespace binary_map_view {
 			std::snprintf(zoom_buf, sizeof(zoom_buf), "zoom %.1fx", static_cast<double>(zoom));
 			ImFont* cap = aida::ui::fonts::caption();
 			if (!cap) cap = ImGui::GetFont();
-			const float cap_fs = cap->FontSize > 0.f ? cap->FontSize : 13.f;
+			const float cap_fs = aida::ui::fonts::size_or(cap, 13.f);
 			dl->AddText(cap, cap_fs,
 				ImVec2(a.x + 12.f, b.y - cap_fs - 6.f),
 				aida::ui::with_alpha(t.text_dim, alpha), zoom_buf);
@@ -1667,7 +1717,7 @@ namespace binary_map_view {
 			const auto& t = aida::ui::resolved();
 			ImFont* cap = aida::ui::fonts::caption();
 			if (!cap) cap = ImGui::GetFont();
-			const float fs = cap->FontSize > 0.f ? cap->FontSize : 13.f;
+			const float fs = aida::ui::fonts::size_or(cap, 13.f);
 
 			struct entry_t { const char* lbl; ImU32 col; };
 			entry_t entries[] = {
@@ -1777,7 +1827,7 @@ namespace binary_map_view {
 	namespace detail {
 
 		inline void render_pe_left_pane(ImDrawList* dl, view_state_t& s,
-			float panel_x, float panel_y, float panel_w, float content_h, float content_y,
+			float panel_x, float panel_y, float panel_w, float, float content_y,
 			float a, const std::vector<binary_map::map_section_t>& sections_copy,
 			const std::vector<binary_map::map_function_t>& functions_copy,
 			uint64_t image_size, uint64_t selected_va_local, float full_h)
@@ -1785,7 +1835,7 @@ namespace binary_map_view {
 			const auto& t = aida::ui::resolved();
 			ImFont* sec_label = aida::ui::fonts::body_em();
 			if (!sec_label) sec_label = ImGui::GetFont();
-			const float sec_label_fs = sec_label->FontSize > 0.f ? sec_label->FontSize : 16.f;
+			const float sec_label_fs = aida::ui::fonts::size_or(sec_label, 16.f);
 			dl->AddText(sec_label, sec_label_fs, ImVec2(panel_x, panel_y),
 				aida::ui::with_alpha(t.text_secondary, a), "Section Layout");
 
@@ -1797,7 +1847,7 @@ namespace binary_map_view {
 			{
 				ImFont* hh_font = aida::ui::fonts::body_em();
 				if (!hh_font) hh_font = ImGui::GetFont();
-				const float hh_fs = hh_font->FontSize > 0.f ? hh_font->FontSize : 16.f;
+				const float hh_fs = aida::ui::fonts::size_or(hh_font, 16.f);
 				dl->AddText(hh_font, hh_fs, ImVec2(panel_x, heat_top - hh_fs - 6.f),
 					aida::ui::with_alpha(t.text_secondary, a), "Function Heatmap");
 			}
@@ -1809,7 +1859,7 @@ namespace binary_map_view {
 		}
 
 		inline void render_live_left_pane(ImDrawList* dl, view_state_t& s,
-			float panel_x, float panel_y, float panel_w, float content_h, float content_y,
+			float panel_x, float panel_y, float panel_w, float, float,
 			float a, const std::vector<live_region_t>& regions_copy,
 			const std::vector<driver_bridge::thread_info_t>& threads_copy,
 			uint64_t selected_base, float full_h)
@@ -1818,7 +1868,7 @@ namespace binary_map_view {
 
 			ImFont* hdr_font = aida::ui::fonts::body_em();
 			if (!hdr_font) hdr_font = ImGui::GetFont();
-			const float hdr_fs = hdr_font->FontSize > 0.f ? hdr_font->FontSize : 16.f;
+			const float hdr_fs = aida::ui::fonts::size_or(hdr_font, 16.f);
 			dl->AddText(hdr_font, hdr_fs, ImVec2(panel_x, panel_y),
 				aida::ui::with_alpha(t.text_secondary, a), "Address Space Map");
 
@@ -1835,14 +1885,14 @@ namespace binary_map_view {
 			const float stats_y = legend_y + 24.f;
 			ImFont* cap = aida::ui::fonts::caption();
 			if (!cap) cap = ImGui::GetFont();
-			const float cap_fs = cap->FontSize > 0.f ? cap->FontSize : 13.f;
+			const float cap_fs = aida::ui::fonts::size_or(cap, 13.f);
 			const float strong_fs = hdr_fs * 1.05f;
 
 			uint64_t committed = 0, reserved = 0;
 			uint32_t rwx = 0;
 			uint32_t pid = 0;
 			std::string proc;
-			size_t region_n = 0, module_n = 0, thread_n = 0;
+			std::size_t region_n = 0, module_n = 0, thread_n = 0;
 			uint64_t enum_ms = 0;
 			{
 				std::lock_guard<std::mutex> g(s.mutex);
@@ -1919,8 +1969,8 @@ namespace binary_map_view {
 
 	}
 
-	inline void render(int x, int y, float w, float h,
-		float anim, float anim_x, float anim_y, float anim_z,
+	inline void render(int, int, float w, float h,
+		float anim, float, float, float,
 		const disasm_view::workspace_context_t& context)
 	{
 		auto state_handle = state_for(context);
@@ -1996,8 +2046,6 @@ namespace binary_map_view {
 		dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
 			aida::ui::with_alpha(t.bg_base, a));
 
-		(void)anim_x; (void)anim_y; (void)anim_z;
-
 		const float toolbar_h = 92.f;
 		const float pad = 12.f;
 
@@ -2017,7 +2065,7 @@ namespace binary_map_view {
 		std::string module_format;
 		uint64_t image_base = 0;
 		uint64_t image_size = 0;
-		size_t live_region_count = 0;
+		std::size_t live_region_count = 0;
 		uint32_t live_pid_now = 0;
 		std::string live_proc_name;
 		std::vector<binary_map::map_section_t> sections_copy;
@@ -2034,11 +2082,11 @@ namespace binary_map_view {
 
 		{
 			std::lock_guard<std::mutex> g(s.mutex);
-			total_funcs    = static_cast<int>(s.map.functions.size());
-			total_globs    = static_cast<int>(s.map.globals.size());
-			total_imports  = static_cast<int>(s.map.imports.size());
-			total_exports  = static_cast<int>(s.map.exports.size());
-			total_sections = static_cast<int>(s.map.sections.size());
+			total_funcs    = detail::count_as_int(s.map.functions.size());
+			total_globs    = detail::count_as_int(s.map.globals.size());
+			total_imports  = detail::count_as_int(s.map.imports.size());
+			total_exports  = detail::count_as_int(s.map.exports.size());
+			total_sections = detail::count_as_int(s.map.sections.size());
 			module_name    = s.map.module_name;
 			module_format  = s.map.format;
 			image_base     = s.map.image_base;
@@ -2059,7 +2107,7 @@ namespace binary_map_view {
 		ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + 6.f));
 		ImFont* head = aida::ui::fonts::body_strong();
 		if (!head) head = ImGui::GetFont();
-		const float head_fs = head->FontSize > 0.f ? head->FontSize : 16.f;
+		const float head_fs = aida::ui::fonts::size_or(head, 16.f);
 		dl->AddText(head, head_fs, ImVec2(ox + pad, oy + 6.f),
 			aida::ui::with_alpha(t.text_primary, a), "Binary Map");
 
@@ -2093,7 +2141,7 @@ namespace binary_map_view {
 		}
 		ImFont* code_font = aida::ui::fonts::code();
 		if (!code_font) code_font = ImGui::GetFont();
-		const float code_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+		const float code_fs = aida::ui::fonts::size_or(code_font, 14.f);
 		dl->AddText(code_font, code_fs, ImVec2(ox + pad + 130.f, oy + 12.f),
 			aida::ui::with_alpha(t.text_dim, a), subtitle.c_str());
 
@@ -2104,7 +2152,7 @@ namespace binary_map_view {
 		auto render_count_chip = [&](const char* lbl, const char* val, ImU32 col) {
 			ImFont* f = aida::ui::fonts::body();
 			if (!f) f = ImGui::GetFont();
-			float fs = f->FontSize > 0.f ? f->FontSize : 16.f;
+			float fs = aida::ui::fonts::size_or(f, 16.f);
 			float lblw = f->CalcTextSizeA(fs, FLT_MAX, 0.f, lbl).x;
 			float valw = f->CalcTextSizeA(fs, FLT_MAX, 0.f, val).x;
 			float pad_x = 10.f;
@@ -2148,7 +2196,7 @@ namespace binary_map_view {
 		float seg_label_w = 70.f;
 		ImFont* cap_font = aida::ui::fonts::caption();
 		if (!cap_font) cap_font = ImGui::GetFont();
-		const float cap_fs = cap_font->FontSize > 0.f ? cap_font->FontSize : 13.f;
+		const float cap_fs = aida::ui::fonts::size_or(cap_font, 13.f);
 		dl->AddText(cap_font, cap_fs, ImVec2(seg_x, seg_y + (seg_h - cap_fs) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), "Mode:");
 
@@ -2175,7 +2223,7 @@ namespace binary_map_view {
 			dl->AddRect(ma, mb, border, 5.f, 0, sel ? 1.4f : 1.f);
 			ImFont* btn_font = aida::ui::fonts::body();
 			if (!btn_font) btn_font = ImGui::GetFont();
-			const float btn_fs = btn_font->FontSize > 0.f ? btn_font->FontSize : 16.f;
+			const float btn_fs = aida::ui::fonts::size_or(btn_font, 16.f);
 			ImVec2 ts = btn_font->CalcTextSizeA(btn_fs, FLT_MAX, 0.f, modes_arr[i].label);
 			ImU32 txt_col = sel
 				? aida::ui::with_alpha(t.text_primary, a)
@@ -2185,7 +2233,7 @@ namespace binary_map_view {
 				txt_col, modes_arr[i].label);
 
 			ImGui::SetCursorScreenPos(ma);
-			ImGui::PushID(static_cast<int>(0x90000000 | i));
+			ImGui::PushID(static_cast<int>(0x90000000u | static_cast<unsigned>(i)));
 			ImGui::InvisibleButton("##bm_mode_btn", ImVec2(mode_btn_w, seg_h));
 			if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
 				const display_mode_t prev = s.mode_pref;
@@ -2256,7 +2304,7 @@ namespace binary_map_view {
 					committed_str.c_str(),
 					static_cast<unsigned>(rwx_total));
 				live_payload += hbuf;
-				for (size_t i = 0; i < regions_copy.size() && i < 64; ++i) {
+				for (std::size_t i = 0; i < regions_copy.size() && i < 64; ++i) {
 					live_payload += detail::make_region_chat_payload(regions_copy[i]);
 				}
 				payload = live_payload;
@@ -2297,6 +2345,24 @@ namespace binary_map_view {
 		ImGui::PushID("bm_export_live");
 		if (aida::ui::button("Export", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::sm, ImVec2(btn_w, btn_h))) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			std::string export_receipt;
+			if (resolved_mode == active_mode_t::live_process || resolved_mode == active_mode_t::merged) {
+				live_snapshot_t snap_copy;
+				{
+					std::lock_guard<std::mutex> g(s.mutex);
+					snap_copy = s.live;
+				}
+				export_receipt = detail::export_live_snapshot_json(snap_copy);
+			} else {
+				std::lock_guard<std::mutex> g(s.mutex);
+				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
+				export_receipt = s.rendered_text;
+			}
+			ImGui::SetClipboardText(export_receipt.c_str());
+			toast_notification::push("Export receipt copied",
+				toast_notification::toast_type_t::info, 3.0f);
+#else
 			if (resolved_mode == active_mode_t::live_process || resolved_mode == active_mode_t::merged) {
 				live_snapshot_t snap_copy;
 				{
@@ -2364,6 +2430,7 @@ namespace binary_map_view {
 					}
 				}
 			}
+#endif
 		}
 		ImGui::PopID();
 
@@ -2430,7 +2497,7 @@ namespace binary_map_view {
 		} else {
 			ImFont* body = aida::ui::fonts::body();
 			if (!body) body = ImGui::GetFont();
-			const float body_fs = body->FontSize > 0.f ? body->FontSize : 16.f;
+			const float body_fs = aida::ui::fonts::size_or(body, 16.f);
 			dl->AddText(body, body_fs,
 				ImVec2(panel_x + panel_w * 0.5f - 80.f, panel_y + content_h * 0.4f),
 				aida::ui::with_alpha(t.text_dim, a),
@@ -2458,7 +2525,7 @@ namespace binary_map_view {
 
 		ImFont* head_em = aida::ui::fonts::body_em();
 		if (!head_em) head_em = ImGui::GetFont();
-		const float head_em_fs = head_em->FontSize > 0.f ? head_em->FontSize : 16.f;
+		const float head_em_fs = aida::ui::fonts::size_or(head_em, 16.f);
 
 		const char* right_header = (resolved_mode == active_mode_t::live_process)
 			? "Live Regions"
@@ -2538,7 +2605,7 @@ namespace binary_map_view {
 
 			ImFont* f_strong = aida::ui::fonts::body_em();
 			if (!f_strong) f_strong = ImGui::GetFont();
-			const float gh_fs = f_strong->FontSize > 0.f ? f_strong->FontSize : 16.f;
+			const float gh_fs = aida::ui::fonts::size_or(f_strong, 16.f);
 			dl->AddText(f_strong, gh_fs, ImVec2(cp.x + 30.f, cp.y + (row_h - gh_fs) * 0.5f),
 				aida::ui::with_alpha(t.text_primary, a), hbuf);
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -2582,10 +2649,10 @@ namespace binary_map_view {
 				static_cast<unsigned long long>(r.base));
 			ImFont* code_f = aida::ui::fonts::code();
 			if (!code_f) code_f = ImGui::GetFont();
-			const float code_row_fs = code_f->FontSize > 0.f ? code_f->FontSize : 14.f;
+			const float code_row_fs = aida::ui::fonts::size_or(code_f, 14.f);
 			ImFont* body_f = aida::ui::fonts::body();
 			if (!body_f) body_f = ImGui::GetFont();
-			const float body_row_fs = body_f->FontSize > 0.f ? body_f->FontSize : 16.f;
+			const float body_row_fs = aida::ui::fonts::size_or(body_f, 16.f);
 
 			const float addr_y = cp.y + (row_h - code_row_fs) * 0.5f;
 			dl->AddText(code_f, code_row_fs,
@@ -2601,7 +2668,7 @@ namespace binary_map_view {
 			ImU32 lbl_col = detail::region_color(r, a);
 			ImFont* cap_f = aida::ui::fonts::caption();
 			if (!cap_f) cap_f = ImGui::GetFont();
-			const float cap_row_fs = cap_f->FontSize > 0.f ? cap_f->FontSize : 13.f;
+			const float cap_row_fs = aida::ui::fonts::size_or(cap_f, 13.f);
 			ImVec2 lbl_sz = cap_f->CalcTextSizeA(cap_row_fs, FLT_MAX, 0.f, lbl.c_str());
 			const float chip_h = cap_row_fs + 6.f;
 			const float chip_y = cp.y + (row_h - chip_h) * 0.5f;
@@ -2660,8 +2727,7 @@ namespace binary_map_view {
 					const uint64_t va_local = r.base;
 					const uint64_t sz_local = r.size;
 					ImGui::CloseCurrentPopup();
-					detail::jump_to_hex(s, va_local,
-						sz_local > 0x100000ULL ? 0x100000u : static_cast<size_t>(sz_local));
+					detail::jump_to_hex(s, va_local, detail::hex_request_size(sz_local));
 				}
 				if (ImGui::MenuItem("Dump region")) {
 					const uint64_t va_local = r.base;
@@ -2708,7 +2774,7 @@ namespace binary_map_view {
 		if (resolved_mode == active_mode_t::live_process || resolved_mode == active_mode_t::merged) {
 			std::vector<int> filtered;
 			filtered.reserve(regions_copy.size());
-			for (size_t i = 0; i < regions_copy.size(); ++i) {
+			for (std::size_t i = 0; i < regions_copy.size(); ++i) {
 				const auto& r = regions_copy[i];
 				if (filter_lower.empty()
 					|| detail::filter_matches(filter_lower, r.module_name)
@@ -2716,13 +2782,15 @@ namespace binary_map_view {
 					|| detail::filter_matches(filter_lower, r.info)
 					|| detail::filter_matches(filter_lower, detail::format_protect_word(r.protect)))
 				{
-					filtered.push_back(static_cast<int>(i));
+					if (i <= static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+						filtered.push_back(static_cast<int>(i));
 				}
 			}
-			int header_count = static_cast<int>(filtered.size());
+			int header_count = detail::count_as_int(filtered.size());
 			if (draw_section_header("Regions", header_count, "regions")) {
 				for (int idx : filtered) {
-					render_region_row(regions_copy[static_cast<size_t>(idx)], idx);
+					if (detail::valid_index(idx, regions_copy.size()))
+						render_region_row(regions_copy[static_cast<std::size_t>(idx)], idx);
 				}
 			}
 			std::vector<driver_bridge::module_info_t> mods_copy;
@@ -2730,7 +2798,7 @@ namespace binary_map_view {
 				std::lock_guard<std::mutex> g(s.mutex);
 				mods_copy = s.live.modules;
 			}
-			if (draw_section_header("Modules", static_cast<int>(mods_copy.size()), "modules"))
+			if (draw_section_header("Modules", detail::count_as_int(mods_copy.size()), "modules"))
 			{
 				int mi = 0;
 				for (const auto& m : mods_copy) {
@@ -2748,10 +2816,10 @@ namespace binary_map_view {
 						static_cast<unsigned long long>(m.base));
 					ImFont* code_f = aida::ui::fonts::code();
 					if (!code_f) code_f = ImGui::GetFont();
-					const float crfs = code_f->FontSize > 0.f ? code_f->FontSize : 14.f;
+					const float crfs = aida::ui::fonts::size_or(code_f, 14.f);
 					ImFont* body_f = aida::ui::fonts::body();
 					if (!body_f) body_f = ImGui::GetFont();
-					const float brfs = body_f->FontSize > 0.f ? body_f->FontSize : 16.f;
+					const float brfs = aida::ui::fonts::size_or(body_f, 16.f);
 					dl->AddText(code_f, crfs, ImVec2(cp.x + 12.f, cp.y + (row_h - crfs) * 0.5f),
 						aida::ui::with_alpha(t.text_address, a), addr_buf);
 					dl->AddText(body_f, brfs, ImVec2(cp.x + 12.f + 140.f, cp.y + (row_h - brfs) * 0.5f),
@@ -2811,15 +2879,15 @@ namespace binary_map_view {
 		}
 
 		if (resolved_mode == active_mode_t::pe_static || resolved_mode == active_mode_t::merged) {
-			if (draw_section_header("Sections", static_cast<int>(sections_copy.size()), "sections")) {
+			if (draw_section_header("Sections", detail::count_as_int(sections_copy.size()), "sections")) {
 				int idx = 0;
-				const float sec_row_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+				const float sec_row_fs = aida::ui::fonts::size_or(code_font, 14.f);
 				ImFont* sec_name_font = aida::ui::fonts::body();
 				if (!sec_name_font) sec_name_font = code_font;
-				const float sec_name_fs = sec_name_font->FontSize > 0.f ? sec_name_font->FontSize : 16.f;
+				const float sec_name_fs = aida::ui::fonts::size_or(sec_name_font, 16.f);
 				ImFont* sec_perm_font = aida::ui::fonts::caption();
 				if (!sec_perm_font) sec_perm_font = code_font;
-				const float sec_perm_fs = sec_perm_font->FontSize > 0.f ? sec_perm_font->FontSize : 13.f;
+				const float sec_perm_fs = aida::ui::fonts::size_or(sec_perm_font, 13.f);
 				for (const auto& sec : sections_copy) {
 					if (!detail::filter_matches(filter_lower, sec.name)) continue;
 					ImVec2 cp = ImGui::GetCursorScreenPos();
@@ -2899,7 +2967,7 @@ namespace binary_map_view {
 							"section_row_double_click name='%s' va=0x%llX (jump_to_hex)",
 							sec.name.c_str(),
 							static_cast<unsigned long long>(sec.va));
-						detail::jump_to_hex(s, sec.va, static_cast<size_t>(sec.size));
+						detail::jump_to_hex(s, sec.va, detail::hex_request_size(sec.size));
 					}
 					if (right_clicked) {
 						ImGui::OpenPopup("##bm_sec_ctx");
@@ -2912,7 +2980,7 @@ namespace binary_map_view {
 						}
 						if (ImGui::MenuItem("Open in hex view")) {
 							const uint64_t va_local = sec.va;
-							const size_t sz_local = static_cast<size_t>(sec.size);
+							const std::size_t sz_local = detail::hex_request_size(sec.size);
 							ImGui::CloseCurrentPopup();
 							detail::jump_to_hex(s, va_local, sz_local);
 						}
@@ -2940,16 +3008,16 @@ namespace binary_map_view {
 				}
 			}
 
-			if (draw_section_header("Functions", static_cast<int>(functions_copy.size()), "functions")) {
+			if (draw_section_header("Functions", detail::count_as_int(functions_copy.size()), "functions")) {
 				int idx = 0;
 				uint64_t cur_sel = s.selected_va.load();
-				const float fn_code_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+				const float fn_code_fs = aida::ui::fonts::size_or(code_font, 14.f);
 				ImFont* fn_name_font = aida::ui::fonts::body();
 				if (!fn_name_font) fn_name_font = ImGui::GetFont();
-				const float fn_name_fs = fn_name_font->FontSize > 0.f ? fn_name_font->FontSize : 16.f;
+				const float fn_name_fs = aida::ui::fonts::size_or(fn_name_font, 16.f);
 				ImFont* fn_chip_font = aida::ui::fonts::caption();
 				if (!fn_chip_font) fn_chip_font = code_font;
-				const float fn_chip_fs = fn_chip_font->FontSize > 0.f ? fn_chip_font->FontSize : 13.f;
+				const float fn_chip_fs = aida::ui::fonts::size_or(fn_chip_font, 13.f);
 				for (auto& fn : functions_copy) {
 					if (!detail::filter_matches(filter_lower, fn.name)) continue;
 					ImVec2 cp = ImGui::GetCursorScreenPos();
@@ -3103,15 +3171,15 @@ namespace binary_map_view {
 				}
 			}
 
-			if (draw_section_header("Globals", static_cast<int>(globals_copy.size()), "globals")) {
+			if (draw_section_header("Globals", detail::count_as_int(globals_copy.size()), "globals")) {
 				int idx = 0;
-				const float gl_code_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+				const float gl_code_fs = aida::ui::fonts::size_or(code_font, 14.f);
 				ImFont* gl_name_font = aida::ui::fonts::body();
 				if (!gl_name_font) gl_name_font = ImGui::GetFont();
-				const float gl_name_fs = gl_name_font->FontSize > 0.f ? gl_name_font->FontSize : 16.f;
+				const float gl_name_fs = aida::ui::fonts::size_or(gl_name_font, 16.f);
 				ImFont* gl_chip_font = aida::ui::fonts::caption();
 				if (!gl_chip_font) gl_chip_font = code_font;
-				const float gl_chip_fs = gl_chip_font->FontSize > 0.f ? gl_chip_font->FontSize : 13.f;
+				const float gl_chip_fs = aida::ui::fonts::size_or(gl_chip_font, 13.f);
 				for (const auto& gl : globals_copy) {
 					if (!detail::filter_matches(filter_lower, gl.name)) continue;
 					ImVec2 cp = ImGui::GetCursorScreenPos();
@@ -3212,16 +3280,16 @@ namespace binary_map_view {
 					const std::string dll = (colon == std::string::npos) ? imp : imp.substr(0, colon);
 					std::string func_list;
 					if (colon != std::string::npos && colon + 1 < imp.size()) {
-						size_t start = colon + 1;
+						std::size_t start = colon + 1;
 						while (start < imp.size() && imp[start] == ' ') ++start;
 						func_list = imp.substr(start);
 					}
 
 					std::vector<std::string> funcs;
 					{
-						size_t pos = 0;
+						std::size_t pos = 0;
 						while (pos < func_list.size()) {
-							size_t next = func_list.find(',', pos);
+							std::size_t next = func_list.find(',', pos);
 							if (next == std::string::npos) next = func_list.size();
 							std::string token = func_list.substr(pos, next - pos);
 							while (!token.empty() && token.front() == ' ') token.erase(token.begin());
@@ -3269,10 +3337,10 @@ namespace binary_map_view {
 					}
 					char hbuf[200];
 					std::snprintf(hbuf, sizeof(hbuf), "%s  (%d)",
-						dll.c_str(), static_cast<int>(funcs.size()));
+						dll.c_str(), detail::count_as_int(funcs.size()));
 					ImFont* imp_hdr_font = aida::ui::fonts::body_em();
 					if (!imp_hdr_font) imp_hdr_font = ImGui::GetFont();
-					const float imp_hdr_fs = imp_hdr_font->FontSize > 0.f ? imp_hdr_font->FontSize : 16.f;
+					const float imp_hdr_fs = aida::ui::fonts::size_or(imp_hdr_font, 16.f);
 					dl->AddText(imp_hdr_font, imp_hdr_fs,
 						ImVec2(cp.x + 28.f, cp.y + (row_h - imp_hdr_fs) * 0.5f),
 						aida::ui::with_alpha(t.text_primary, a), hbuf);
@@ -3297,7 +3365,7 @@ namespace binary_map_view {
 						}
 						if (ImGui::MenuItem("Copy function list")) {
 							std::string joined;
-							for (size_t fi = 0; fi < funcs.size(); ++fi) {
+							for (std::size_t fi = 0; fi < funcs.size(); ++fi) {
 								if (fi) joined += "\n";
 								joined += funcs[fi];
 							}
@@ -3310,7 +3378,7 @@ namespace binary_map_view {
 					ImGui::PopID();
 
 					if (!collapsed) {
-						const float imp_fn_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+						const float imp_fn_fs = aida::ui::fonts::size_or(code_font, 14.f);
 						const float imp_row_h = imp_fn_fs + 10.f;
 						int fn_idx = 0;
 						for (const auto& fn : funcs) {
@@ -3361,7 +3429,7 @@ namespace binary_map_view {
 
 			if (draw_section_header("Exports", total_exports, "exports")) {
 				int idx = 0;
-				const float exp_fs = code_font->FontSize > 0.f ? code_font->FontSize : 14.f;
+				const float exp_fs = aida::ui::fonts::size_or(code_font, 14.f);
 				const float exp_row_h = exp_fs + 10.f;
 				for (const auto& ex : exports_copy) {
 					if (!detail::filter_matches(filter_lower, ex)) continue;
@@ -3531,7 +3599,7 @@ namespace binary_map_view {
 			const auto process = context.workspace->identity().process();
 			const uint32_t live_pid_attached = process ? process->pid : 0;
 			uint32_t cached_pid = 0;
-			size_t cached_regions = 0;
+			std::size_t cached_regions = 0;
 			{
 				std::lock_guard<std::mutex> g(s.mutex);
 				cached_pid = s.live.pid;

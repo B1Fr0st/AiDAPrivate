@@ -15,8 +15,10 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -82,6 +84,17 @@ inline void start_deobfuscate(local_state_t& st) {
 	deobfuscation_engine::g_state.processing.store(true);
 	deobfuscation_engine::g_state.progress_current.store(0);
 	deobfuscation_engine::g_state.progress_total.store(5);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lk(deobfuscation_engine::g_state.mutex);
+		deobfuscation_engine::g_state.last_result =
+			deobfuscation_engine::deobfuscate_function(addr, max_insn);
+	}
+	deobfuscation_engine::g_state.progress_current.store(5);
+	deobfuscation_engine::g_state.processing.store(false);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 2,
+		"deobfuscation.execute", "deterministic cleanup complete");
+#else
 	auto t0 = std::chrono::steady_clock::now();
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "emulation";
@@ -125,6 +138,7 @@ inline void start_deobfuscate(local_state_t& st) {
 			"deob_view_post_failed entry=0x%llX",
 			static_cast<unsigned long long>(addr));
 	}
+#endif
 }
 
 inline void render_glass_panel(ImDrawList* dl, ImVec2 a, ImVec2 b, float radius,
@@ -518,10 +532,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2(code_x + code_w - 1.f, list_y + list_h), true);
 
 		for (int i = start_row;
-			i < static_cast<int>(single_view.size()) && i < start_row + visible_rows + 1; ++i) {
+			static_cast<size_t>(i) < single_view.size() && i < start_row + visible_rows + 1; ++i) {
 			float ry = list_y + static_cast<float>(i - start_row) * row_h;
 			if (ry > list_y + list_h) break;
-			draw_row(single_view[i], i, code_x + 4.f, code_x + code_w - 4.f, ry, true);
+			draw_row(single_view[static_cast<size_t>(i)], i,
+				code_x + 4.f, code_x + code_w - 4.f, ry, true);
 		}
 
 		ImGui::PopClipRect();
@@ -559,20 +574,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PushClipRect(ImVec2(code_x + 1.f, list_y),
 			ImVec2(split_x - 2.f, list_y + list_h), true);
 		for (int i = start_row;
-			i < static_cast<int>(visible_left.size()) && i < start_row + visible_rows + 1; ++i) {
+			static_cast<size_t>(i) < visible_left.size() && i < start_row + visible_rows + 1; ++i) {
 			float ry = list_y + static_cast<float>(i - start_row) * row_h;
 			if (ry > list_y + list_h) break;
-			draw_row(visible_left[i], i, code_x + 4.f, split_x - 4.f, ry, true);
+			draw_row(visible_left[static_cast<size_t>(i)], i,
+				code_x + 4.f, split_x - 4.f, ry, true);
 		}
 		ImGui::PopClipRect();
 
 		ImGui::PushClipRect(ImVec2(split_x + 2.f, list_y),
 			ImVec2(code_x + code_w - 1.f, list_y + list_h), true);
 		for (int i = start_row;
-			i < static_cast<int>(visible_right.size()) && i < start_row + visible_rows + 1; ++i) {
+			static_cast<size_t>(i) < visible_right.size() && i < start_row + visible_rows + 1; ++i) {
 			float ry = list_y + static_cast<float>(i - start_row) * row_h;
 			if (ry > list_y + list_h) break;
-			draw_row(visible_right[i], i + 100000, split_x + 4.f,
+			draw_row(visible_right[static_cast<size_t>(i)], i + 100000, split_x + 4.f,
 				code_x + code_w - 4.f, ry, false);
 		}
 		ImGui::PopClipRect();
@@ -685,7 +701,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(t.warning, alpha), sv.register_name.c_str());
 			iy += 18.f;
 
-			int sm_max = (int)((body_top + body_h - iy) / 16.f) - 1;
+			int sm_max = static_cast<int>((body_top + body_h - iy) / 16.f) - 1;
 			int shown = 0;
 			for (auto& [state_val, target] : sv.state_to_target) {
 				if (shown >= sm_max) break;
@@ -713,9 +729,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::PushClipRect(ImVec2(info_x, iy), ImVec2(info_x + info_w, body_top + body_h), true);
 		int max_show = static_cast<int>((body_top + body_h - iy) / 18.f) - 1;
-		int show_count = (std::min)(static_cast<int>(res.opaques.size()), max_show);
-		for (int i = 0; i < show_count; ++i) {
-			auto& op = res.opaques[static_cast<size_t>(i)];
+		const size_t show_count = max_show > 0
+			? (std::min)(res.opaques.size(), static_cast<size_t>(max_show))
+			: 0;
+		for (size_t i = 0; i < show_count; ++i) {
+			auto& op = res.opaques[i];
 			char obuf[80];
 			std::snprintf(obuf, sizeof(obuf), "%llX %s",
 				static_cast<unsigned long long>(op.address),
@@ -736,9 +754,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::PushClipRect(ImVec2(info_x, iy), ImVec2(info_x + info_w, body_top + body_h), true);
 		int max_show = static_cast<int>((body_top + body_h - iy) / 18.f) - 1;
-		int show_count = (std::min)(static_cast<int>(res.constants.size()), max_show);
-		for (int i = 0; i < show_count; ++i) {
-			auto& c = res.constants[static_cast<size_t>(i)];
+		const size_t show_count = max_show > 0
+			? (std::min)(res.constants.size(), static_cast<size_t>(max_show))
+			: 0;
+		for (size_t i = 0; i < show_count; ++i) {
+			auto& c = res.constants[i];
 			char cbuf[96];
 			std::snprintf(cbuf, sizeof(cbuf), "%llX %s = 0x%llX",
 				static_cast<unsigned long long>(c.address),

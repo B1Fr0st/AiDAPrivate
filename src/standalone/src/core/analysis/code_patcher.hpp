@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -89,6 +90,14 @@ inline size_t active_count() {
 	return n;
 }
 
+inline bool resolve_patch_index(int index, std::vector<patch_entry_t>::size_type size,
+								std::vector<patch_entry_t>::size_type& resolved) {
+	if (index < 0)
+		return false;
+	resolved = static_cast<std::vector<patch_entry_t>::size_type>(index);
+	return resolved < size;
+}
+
 inline int create_patch(uint64_t address, const std::vector<uint8_t>& new_bytes,
 						const std::string& description) {
 	if (!driver_bridge::is_loaded()) return -1;
@@ -107,16 +116,21 @@ inline int create_patch(uint64_t address, const std::vector<uint8_t>& new_bytes,
 	entry.timestamp = current_timestamp();
 
 	std::lock_guard<std::mutex> lk(g_state.mtx);
+	if (g_state.patches.size() >= static_cast<std::vector<patch_entry_t>::size_type>(
+			(std::numeric_limits<int>::max)()))
+		return -1;
+	const auto index = g_state.patches.size();
 	g_state.patches.push_back(std::move(entry));
-	return static_cast<int>(g_state.patches.size()) - 1;
+	return static_cast<int>(index);
 }
 
 inline bool apply_patch(int index) {
 	if (!driver_bridge::is_loaded()) return false;
 	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (index < 0 || index >= static_cast<int>(g_state.patches.size()))
+	std::vector<patch_entry_t>::size_type resolved = 0;
+	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 		return false;
-	auto& p = g_state.patches[index];
+	auto& p = g_state.patches[resolved];
 	if (p.active) return true;
 	if (!driver_bridge::write_memory(p.address, p.patched_bytes))
 		return false;
@@ -127,9 +141,10 @@ inline bool apply_patch(int index) {
 inline bool revert_patch(int index) {
 	if (!driver_bridge::is_loaded()) return false;
 	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (index < 0 || index >= static_cast<int>(g_state.patches.size()))
+	std::vector<patch_entry_t>::size_type resolved = 0;
+	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 		return false;
-	auto& p = g_state.patches[index];
+	auto& p = g_state.patches[resolved];
 	if (!p.active) return true;
 	if (!driver_bridge::write_memory(p.address, p.original_bytes))
 		return false;
@@ -141,9 +156,10 @@ inline bool toggle_patch(int index) {
 	bool is_active = false;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (index < 0 || index >= static_cast<int>(g_state.patches.size()))
+		std::vector<patch_entry_t>::size_type resolved = 0;
+		if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 			return false;
-		is_active = g_state.patches[index].active;
+		is_active = g_state.patches[resolved].active;
 	}
 	if (is_active)
 		return revert_patch(index);
@@ -154,16 +170,19 @@ inline bool remove_patch(int index) {
 	bool need_revert = false;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (index < 0 || index >= static_cast<int>(g_state.patches.size()))
+		std::vector<patch_entry_t>::size_type resolved = 0;
+		if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 			return false;
-		need_revert = g_state.patches[index].active;
+		need_revert = g_state.patches[resolved].active;
 	}
 	if (need_revert)
 		revert_patch(index);
 	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (index < 0 || index >= static_cast<int>(g_state.patches.size()))
+	std::vector<patch_entry_t>::size_type resolved = 0;
+	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 		return false;
-	g_state.patches.erase(g_state.patches.begin() + index);
+	g_state.patches.erase(g_state.patches.begin() +
+		static_cast<std::vector<patch_entry_t>::difference_type>(resolved));
 	return true;
 }
 

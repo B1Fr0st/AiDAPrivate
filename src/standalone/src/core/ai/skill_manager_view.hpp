@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cfloat>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -16,8 +19,10 @@
 #include <utility>
 #include <vector>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <windows.h>
 #include <shellapi.h>
+#endif
 
 #include "imgui/imgui.h"
 
@@ -26,7 +31,12 @@
 #include "skills.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview.hpp"
+#include "../../preview/ui_task_executor.hpp"
+#else
 #include "../infra/executor.hpp"
+#endif
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/brand.hpp"
@@ -39,7 +49,9 @@
 #include "../ui/transition.hpp"
 #include "../ui/responsive.hpp"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
+#endif
 
 namespace aida {
 namespace skill_manager {
@@ -153,7 +165,7 @@ namespace skill_manager {
 		return out;
 	}
 
-	inline std::string truncate_text(const std::string& s, size_t max_len)
+	inline std::string truncate_text(const std::string& s, std::size_t max_len)
 	{
 		if (s.size() <= max_len) return s;
 		return s.substr(0, max_len) + "...";
@@ -193,9 +205,15 @@ namespace skill_manager {
 	inline void open_path_in_shell(const std::string& path, bool select_in_explorer)
 	{
 		if (path.empty()) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::record(
+			select_in_explorer ? aida::preview::shell_action_t::open_folder
+			                   : aida::preview::shell_action_t::open_file,
+			path);
+#else
 		const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
 		if (wlen <= 0) return;
-		std::wstring wpath(static_cast<size_t>(wlen), L'\0');
+		std::wstring wpath(static_cast<std::size_t>(wlen), L'\0');
 		MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
 		if (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
 		if (select_in_explorer) {
@@ -204,6 +222,7 @@ namespace skill_manager {
 		} else {
 			ShellExecuteW(nullptr, L"open", wpath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 		}
+#endif
 	}
 
 
@@ -432,7 +451,7 @@ namespace skill_manager {
 
 		const float row1_y = root_y + 2.f;
 		if (avail < 520.f) {
-			const bool stack_all = avail < 340.f;
+			const bool stack_all = avail < 300.f;
 			const float full_w = (std::max)(120.f, avail);
 			ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row1_y));
 			char search_local[256];
@@ -592,9 +611,11 @@ namespace skill_manager {
 		static bool s_sm_logged_wrap = false;
 		if (tb_wrap && !s_sm_logged_wrap) {
 			s_sm_logged_wrap = true;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			::diag::log_tagged_fmt("responsive",
 				"skill_manager toolbar wrapped avail=%.0f need=%.0f",
 				avail, left_chain + gap + right_chain_full);
+#endif
 		} else if (!tb_wrap && s_sm_logged_wrap) {
 			s_sm_logged_wrap = false;
 		}
@@ -619,7 +640,7 @@ namespace skill_manager {
 		float sel_x = x;
 		float sel_w = btn_w;
 		for (int i = 0; i < 3; ++i) {
-			float bx = x + (btn_w + 4.f) * i;
+			float bx = x + (btn_w + 4.f) * static_cast<float>(i);
 			if (st.active_tab == tabs[i]) {
 				sel_x = bx;
 				sel_w = btn_w;
@@ -644,7 +665,7 @@ namespace skill_manager {
 			y + btn_h - 3.f, 1.f);
 
 		for (int i = 0; i < 3; ++i) {
-			float bx = x + (btn_w + 4.f) * i;
+			float bx = x + (btn_w + 4.f) * static_cast<float>(i);
 			ImGui::SetCursorScreenPos(ImVec2(bx, y));
 			ImGui::PushID(i);
 			ImGui::InvisibleButton("##tab_btn", ImVec2(btn_w, btn_h));
@@ -715,7 +736,8 @@ namespace skill_manager {
 		dl->AddText(aida::ui::fonts::body_strong(), 13.f,
 			ImVec2(text_x, a.y + 8.f), name_col, m.name.c_str());
 
-		std::string short_path = truncate_text(m.file_path, 60);
+		std::string short_path = aida::ui::responsive::ellipsize_middle(
+			m.file_path, aida::ui::fonts::caption(), 13.f, (std::max)(64.f, w - 118.f));
 		dl->AddText(aida::ui::fonts::caption(), 13.f,
 			ImVec2(text_x, a.y + 26.f),
 			aida::ui::with_alpha(th.text_dim, 0.85f), short_path.c_str());
@@ -754,8 +776,8 @@ namespace skill_manager {
 		const float list_h = (std::max)(48.f, h - tab_h - 4.f - remote_panel_h - (remote_tab ? 6.f : 0.f));
 
 		ImGui::SetCursorScreenPos(ImVec2(x, list_y));
-		ImGui::BeginChild("##sm_list_scroll", ImVec2(w, list_h), false,
-			ImGuiWindowFlags_NoBackground);
+		ImGui::BeginChild("##sm_list_scroll", ImVec2(w, list_h), true,
+			ImGuiWindowFlags_NoSavedSettings);
 
 		const std::string filter_lower = lower_copy(std::string(st.search_buf));
 		std::string agent_snapshot;
@@ -858,13 +880,14 @@ namespace skill_manager {
 			ImGui::SetCursorScreenPos(ImVec2(sp.x, sp.y + row_h + row_gap));
 		}
 
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 		ImGui::EndChild();
 
 		if (remote_tab) {
 			const float rp_y = list_y + list_h + 6.f;
 			ImGui::SetCursorScreenPos(ImVec2(x, rp_y));
-			ImGui::BeginChild("##sm_remote_panel", ImVec2(w, remote_panel_h), false,
-				ImGuiWindowFlags_NoBackground);
+			ImGui::BeginChild("##sm_remote_panel", ImVec2(w, remote_panel_h), true,
+				ImGuiWindowFlags_NoSavedSettings);
 
 			ImDrawList* dl2 = ImGui::GetWindowDrawList();
 			const ImVec2 rp = ImGui::GetCursorScreenPos();
@@ -982,8 +1005,8 @@ namespace skill_manager {
 	{
 		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
-		ImGui::BeginChild("##sm_detail_pane", ImVec2(w, h), false,
-			ImGuiWindowFlags_NoBackground);
+		ImGui::BeginChild("##sm_detail_pane", ImVec2(w, h), true,
+			ImGuiWindowFlags_NoSavedSettings);
 		auto* dl = ImGui::GetWindowDrawList();
 		const ImVec2 cs = ImGui::GetCursorScreenPos();
 
@@ -1111,8 +1134,8 @@ namespace skill_manager {
 		auto& st = state();
 		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
-		ImGui::BeginChild("##sm_preview_pane", ImVec2(w, h), false,
-			ImGuiWindowFlags_NoBackground);
+		ImGui::BeginChild("##sm_preview_pane", ImVec2(w, h), true,
+			ImGuiWindowFlags_NoSavedSettings);
 
 		const ImVec2 cs = ImGui::GetCursorScreenPos();
 		auto* dl = ImGui::GetWindowDrawList();
@@ -1188,12 +1211,23 @@ namespace skill_manager {
 		const float root_w = panel_w;
 		const float root_h = panel_h;
 
+		ImDrawList* root_dl = ImGui::GetWindowDrawList();
+		root_dl->AddText(aida::ui::fonts::h1(), 22.f,
+			ImVec2(root_x + 12.f, root_y + 2.f), aida::ui::resolved().text_primary, "Skills");
+		root_dl->AddText(aida::ui::fonts::caption(), 13.f,
+			ImVec2(root_x + 12.f, root_y + 29.f), aida::ui::resolved().text_dim,
+			root_w < 520.f
+				? "Manage reusable analysis workflows."
+				: "Discover, filter, inspect, and manage reusable analysis workflows.");
+
+		const float header_h = 54.f;
 		const float toolbar_h = 34.f;
 		const float pad = 8.f;
-		const float tb_used_h = render_toolbar(root_x, root_y, root_w, toolbar_h);
+		const float toolbar_y = root_y + header_h;
+		const float tb_used_h = render_toolbar(root_x, toolbar_y, root_w, toolbar_h);
 
-		const float body_y = root_y + tb_used_h + 6.f;
-		const float body_h = root_h - (tb_used_h + 8.f);
+		const float body_y = toolbar_y + tb_used_h + 6.f;
+		const float body_h = root_h - (header_h + tb_used_h + 8.f);
 		if (body_h < 120.f) {
 			aida::ui::responsive::draw_clamp_overlay(ImVec2(root_x, root_y),
 				ImVec2(root_w, root_h), "Increase Settings height");
@@ -1207,7 +1241,12 @@ namespace skill_manager {
 			meta = find_meta_in_list(all_for_lookup, st.selected_skill_name);
 		}
 
-		if (root_w >= 820.f) {
+		const auto& panel_theme = aida::ui::resolved();
+		ImGui::PushStyleColor(ImGuiCol_ChildBg,
+			ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(panel_theme.panel_header, 0.22f)));
+		ImGui::PushStyleColor(ImGuiCol_Border,
+			ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(panel_theme.border_subtle, 0.85f)));
+		if (root_w >= 760.f) {
 			const float left_w = std::max(280.f, root_w * st.list_split);
 			const float right_w = std::max(300.f, root_w * st.detail_split);
 			const float middle_w = std::max(220.f, root_w - left_w - right_w - pad * 2.f);
@@ -1219,7 +1258,7 @@ namespace skill_manager {
 
 			const float right_x = middle_x + middle_w + pad;
 			render_right_column(right_x, body_y, right_w, body_h, meta, alpha);
-		} else if (root_w >= 560.f) {
+		} else if (root_w >= 540.f) {
 			const float left_w = std::clamp(root_w * 0.42f, 250.f, 320.f);
 			const float right_w = (std::max)(240.f, root_w - left_w - pad * 3.f);
 			render_left_column(root_x + pad, body_y, left_w, body_h, dt);
@@ -1232,8 +1271,8 @@ namespace skill_manager {
 			render_right_column(right_x, body_y + detail_h + pad, right_w, preview_h, meta, alpha);
 		} else {
 			const float stack_w = (std::max)(240.f, root_w - pad * 2.f);
-			const float max_list_h = (std::max)(100.f, body_h - 150.f);
-			const float list_h = std::clamp(body_h * 0.38f, 100.f, (std::min)(260.f, max_list_h));
+			const float max_list_h = (std::max)(150.f, body_h - 190.f);
+			const float list_h = std::clamp(body_h * 0.28f, 170.f, (std::min)(230.f, max_list_h));
 			render_left_column(root_x + pad, body_y, stack_w, list_h, dt);
 
 			const float tabs_y = body_y + list_h + pad;
@@ -1260,6 +1299,7 @@ namespace skill_manager {
 			else
 				render_right_column(root_x + pad, pane_y, stack_w, pane_h, meta, alpha);
 		}
+		ImGui::PopStyleColor(2);
 
 		ImGui::EndChild();
 	}

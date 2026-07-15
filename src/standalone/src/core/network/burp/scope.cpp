@@ -1,6 +1,10 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlobj.h>
+#endif
 
 #ifdef small
 #undef small
@@ -13,7 +17,11 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -340,6 +348,9 @@ std::string last_error()
 
 std::string storage_path()
 {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return "/aida-preview/state/scope.json";
+#else
     PWSTR appdata = nullptr;
     std::string base;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata)) && appdata) {
@@ -362,6 +373,7 @@ std::string storage_path()
     std::filesystem::create_directories(base, ec);
     base += "\\scope.json";
     return base;
+#endif
 }
 
 nlohmann::json rule_to_json(const rule_t& r)
@@ -400,6 +412,9 @@ bool save_to_disk()
         std::lock_guard<std::mutex> lk(st.mtx);
         for (const auto& r : st.rules) arr.push_back(rule_to_json(r));
     }
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return !arr.is_discarded();
+#else
     const std::string path = storage_path();
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -409,10 +424,14 @@ bool save_to_disk()
     const std::string dump = arr.dump(2);
     out.write(dump.data(), static_cast<std::streamsize>(dump.size()));
     return true;
+#endif
 }
 
 bool load_from_disk()
 {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return !list_rules().empty();
+#else
     auto& st = s();
     const std::string path = storage_path();
     std::ifstream in(path, std::ios::binary);
@@ -449,6 +468,7 @@ bool load_from_disk()
     }
     st.next_id.store(max_id + 1);
     return true;
+#endif
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -613,6 +633,7 @@ void render(float pos_x, float pos_y, float width, float height,
         ++visible_row;
     }
 
+    ImGui::Dummy(ImVec2(0.f, 0.f));
     ImGui::EndChild();
 
     ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + height - 70.f));

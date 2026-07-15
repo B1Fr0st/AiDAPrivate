@@ -1,14 +1,20 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/re_hubs_preview_adapter.hpp"
+#else
 #include "standalone_driver.hpp"
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -77,6 +83,48 @@ struct state_t {
 
 inline state_t g_state;
 
+inline bool valid_index(int index, std::size_t count) {
+	return index >= 0 && static_cast<std::size_t>(index) < count;
+}
+
+inline bool index_fits_int(std::size_t index) {
+	return index <= static_cast<std::size_t>((std::numeric_limits<int>::max)());
+}
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline void ensure_preview_fixture() {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (!g_state.structs.empty())
+		return;
+	struct_def_t context;
+	context.name = "IMAGE_RUNTIME_CONTEXT";
+	context.fields = {
+		{"image_base", field_type_t::pointer, 0x00, 8, 1, -1, {}, true, -1, "Mapped image base"},
+		{"entry_point", field_type_t::pointer, 0x08, 8, 1, -1, {}, true, -1, "Resolved entry point"},
+		{"image_size", field_type_t::uint32, 0x10, 4, 1, -1, {}, false, -1, "Size of image"},
+		{"machine", field_type_t::uint16, 0x14, 2, 1, -1, {}, false, -1, "PE machine type"},
+		{"section_count", field_type_t::uint16, 0x16, 2, 1, -1, {}, false, -1, "Number of sections"},
+		{"flags", field_type_t::uint32, 0x18, 4, 1, -1, {}, false, -1, "Analysis flags"},
+		{"module_name", field_type_t::ascii_string, 0x20, 16, 1, -1, {}, false, -1, "Target module"}
+	};
+	context.total_size = 0x30;
+	struct_def_t node;
+	node.name = "CONTROL_FLOW_NODE";
+	node.fields = {
+		{"address", field_type_t::pointer, 0x00, 8, 1, -1, {}, true, -1, "Block start"},
+		{"successors", field_type_t::pointer, 0x08, 8, 1, -1, {}, true, -1, "Successor array"},
+		{"successor_count", field_type_t::uint32, 0x10, 4, 1, -1, {}, false, -1, "Outgoing edge count"},
+		{"instruction_count", field_type_t::uint32, 0x14, 4, 1, -1, {}, false, -1, "Instruction count"},
+		{"flags", field_type_t::uint64, 0x18, 8, 1, -1, {}, false, -1, "Node flags"},
+		{"confidence", field_type_t::float32, 0x20, 4, 1, -1, {}, false, -1, "Recovery confidence"}
+	};
+	node.total_size = 0x24;
+	g_state.structs = {std::move(context), std::move(node)};
+	g_state.active_struct = 0;
+	g_state.base_address = 0x0000000140005000ULL;
+}
+#endif
+
 inline const char* field_type_name(field_type_t t) {
 	static const char* names[] = {
 		"Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32",
@@ -84,12 +132,12 @@ inline const char* field_type_name(field_type_t t) {
 		"ASCII String", "UTF-16 String", "Byte Array", "Padding", "Struct"
 	};
 	int idx = static_cast<int>(t);
-	if (idx >= 0 && idx < static_cast<int>(field_type_t::COUNT))
-		return names[idx];
+	if (valid_index(idx, static_cast<std::size_t>(field_type_t::COUNT)))
+		return names[static_cast<std::size_t>(idx)];
 	return "Unknown";
 }
 
-inline size_t field_type_size(field_type_t t) {
+inline std::size_t field_type_size(field_type_t t) {
 	switch (t) {
 	case field_type_t::int8:          return 1;
 	case field_type_t::uint8:         return 1;
@@ -117,13 +165,14 @@ inline std::string format_field_value(const std::vector<uint8_t>& bytes, field_t
 	switch (type) {
 	case field_type_t::int8: {
 		int8_t v = 0;
-		std::memcpy(&v, bytes.data(), std::min<size_t>(bytes.size(), 1));
+		std::memcpy(&v, bytes.data(), (std::min)(bytes.size(), std::size_t{1}));
 		std::snprintf(buf, sizeof(buf), "%d", v);
 		return buf;
 	}
 	case field_type_t::uint8: {
 		uint8_t v = bytes[0];
-		std::snprintf(buf, sizeof(buf), "%u (0x%02X)", v, v);
+		std::snprintf(buf, sizeof(buf), "%u (0x%02X)",
+			static_cast<unsigned int>(v), static_cast<unsigned int>(v));
 		return buf;
 	}
 	case field_type_t::int16: {
@@ -135,7 +184,8 @@ inline std::string format_field_value(const std::vector<uint8_t>& bytes, field_t
 	case field_type_t::uint16: {
 		uint16_t v = 0;
 		if (bytes.size() >= 2) std::memcpy(&v, bytes.data(), 2);
-		std::snprintf(buf, sizeof(buf), "%u (0x%04X)", v, v);
+		std::snprintf(buf, sizeof(buf), "%u (0x%04X)",
+			static_cast<unsigned int>(v), static_cast<unsigned int>(v));
 		return buf;
 	}
 	case field_type_t::int32: {
@@ -191,7 +241,7 @@ inline std::string format_field_value(const std::vector<uint8_t>& bytes, field_t
 	}
 	case field_type_t::utf16_string: {
 		std::string s;
-		for (size_t i = 0; i + 1 < bytes.size(); i += 2) {
+		for (std::size_t i = 0; i + 1 < bytes.size(); i += 2) {
 			uint16_t ch = 0;
 			std::memcpy(&ch, bytes.data() + i, 2);
 			if (ch == 0) break;
@@ -205,11 +255,11 @@ inline std::string format_field_value(const std::vector<uint8_t>& bytes, field_t
 	case field_type_t::byte_array:
 	case field_type_t::padding: {
 		std::string hex;
-		size_t limit = std::min<size_t>(bytes.size(), 32);
-		for (size_t i = 0; i < limit; ++i) {
+		std::size_t limit = (std::min)(bytes.size(), std::size_t{32});
+		for (std::size_t i = 0; i < limit; ++i) {
 			if (!hex.empty()) hex += ' ';
 			char h[4];
-			std::snprintf(h, sizeof(h), "%02X", bytes[i]);
+			std::snprintf(h, sizeof(h), "%02X", static_cast<unsigned int>(bytes[i]));
 			hex += h;
 		}
 		if (bytes.size() > limit) hex += " ...";
@@ -227,7 +277,7 @@ inline void recalc_total_size(struct_def_t& sd) {
 	for (const auto& f : sd.fields) {
 		uint32_t fsz = f.size;
 		if (fsz == 0) {
-			size_t ts = field_type_size(f.type);
+			std::size_t ts = field_type_size(f.type);
 			fsz = static_cast<uint32_t>(ts > 0 ? ts : 1);
 		}
 		uint32_t end = f.offset + fsz * f.array_count;
@@ -238,17 +288,24 @@ inline void recalc_total_size(struct_def_t& sd) {
 
 inline int create_struct(const std::string& name) {
 	int idx = -1;
+	std::size_t total = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (!index_fits_int(g_state.structs.size())) {
+			diag::log_tagged_fmt("dissector",
+				"create_struct rejected reason='index_overflow' total=%zu", g_state.structs.size());
+			return -1;
+		}
 		struct_def_t sd;
 		sd.name = name;
 		sd.total_size = 0;
+		idx = static_cast<int>(g_state.structs.size());
 		g_state.structs.push_back(std::move(sd));
-		idx = static_cast<int>(g_state.structs.size()) - 1;
+		total = g_state.structs.size();
 	}
 	diag::log_tagged_fmt("dissector",
 		"create_struct name='%s' idx=%d total=%zu",
-		name.c_str(), idx, static_cast<size_t>(idx + 1));
+		name.c_str(), idx, total);
 	return idx;
 }
 
@@ -258,20 +315,26 @@ inline int add_field(int struct_idx, const field_def_t& field) {
 	std::string sd_name;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(struct_idx, g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"add_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
 			return -1;
 		}
-		auto& sd = g_state.structs[struct_idx];
+		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
 		field_def_t f = field;
 		if (f.size == 0) {
-			size_t ts = field_type_size(f.type);
+			std::size_t ts = field_type_size(f.type);
 			f.size = static_cast<uint32_t>(ts > 0 ? ts : 1);
 		}
+		if (!index_fits_int(sd.fields.size())) {
+			diag::log_tagged_fmt("dissector",
+				"add_field rejected reason='index_overflow' struct='%s' field_count=%zu",
+				sd.name.c_str(), sd.fields.size());
+			return -1;
+		}
 		idx = static_cast<int>(sd.fields.size());
-		if (f.parent_idx >= 0 && f.parent_idx < static_cast<int>(sd.fields.size()))
-			sd.fields[f.parent_idx].children.push_back(idx);
+		if (valid_index(f.parent_idx, sd.fields.size()))
+			sd.fields[static_cast<std::size_t>(f.parent_idx)].children.push_back(idx);
 		sd.fields.push_back(std::move(f));
 		recalc_total_size(sd);
 		total_after = sd.total_size;
@@ -295,26 +358,27 @@ inline bool remove_field(int struct_idx, int field_idx) {
 	uint32_t total_after = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(struct_idx, g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"remove_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
 			return false;
 		}
-		auto& sd = g_state.structs[struct_idx];
-		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
+		if (!valid_index(field_idx, sd.fields.size())) {
 			diag::log_tagged_fmt("dissector",
 				"remove_field rejected reason='bad_field_idx' struct='%s' field_idx=%d field_count=%zu",
 				sd.name.c_str(), field_idx, sd.fields.size());
 			return false;
 		}
-		removed_name = sd.fields[field_idx].name;
+		const auto field_index = static_cast<std::size_t>(field_idx);
+		removed_name = sd.fields[field_index].name;
 		sd_name = sd.name;
-		int parent = sd.fields[field_idx].parent_idx;
-		if (parent >= 0 && parent < static_cast<int>(sd.fields.size())) {
-			auto& pc = sd.fields[parent].children;
+		int parent = sd.fields[field_index].parent_idx;
+		if (valid_index(parent, sd.fields.size())) {
+			auto& pc = sd.fields[static_cast<std::size_t>(parent)].children;
 			pc.erase(std::remove(pc.begin(), pc.end(), field_idx), pc.end());
 		}
-		sd.fields.erase(sd.fields.begin() + field_idx);
+		sd.fields.erase(sd.fields.begin() + static_cast<std::ptrdiff_t>(field_index));
 		for (auto& f : sd.fields) {
 			if (f.parent_idx > field_idx) --f.parent_idx;
 			else if (f.parent_idx == field_idx) f.parent_idx = -1;
@@ -323,7 +387,7 @@ inline bool remove_field(int struct_idx, int field_idx) {
 			}
 			f.children.erase(
 				std::remove_if(f.children.begin(), f.children.end(),
-					[&](int c) { return c < 0 || c >= static_cast<int>(sd.fields.size()); }),
+					[&](int c) { return !valid_index(c, sd.fields.size()); }),
 				f.children.end());
 		}
 		recalc_total_size(sd);
@@ -339,7 +403,7 @@ inline bool rename_struct(int struct_idx, const std::string& new_name) {
 	std::string old_name;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(struct_idx, g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"rename_struct rejected reason='bad_idx' idx=%d", struct_idx);
 			return false;
@@ -349,7 +413,7 @@ inline bool rename_struct(int struct_idx, const std::string& new_name) {
 				"rename_struct rejected reason='empty_name' idx=%d", struct_idx);
 			return false;
 		}
-		auto& sd = g_state.structs[struct_idx];
+		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
 		old_name = sd.name;
 		sd.name = new_name;
 	}
@@ -363,21 +427,22 @@ inline bool rename_field(int struct_idx, int field_idx, const std::string& new_n
 	std::string sd_name, old_name;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(struct_idx, g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"rename_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
 			return false;
 		}
-		auto& sd = g_state.structs[struct_idx];
-		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
+		if (!valid_index(field_idx, sd.fields.size())) {
 			diag::log_tagged_fmt("dissector",
 				"rename_field rejected reason='bad_field_idx' struct='%s' field_idx=%d",
 				sd.name.c_str(), field_idx);
 			return false;
 		}
+		const auto field_index = static_cast<std::size_t>(field_idx);
 		sd_name = sd.name;
-		old_name = sd.fields[field_idx].name;
-		sd.fields[field_idx].name = new_name;
+		old_name = sd.fields[field_index].name;
+		sd.fields[field_index].name = new_name;
 	}
 	diag::log_tagged_fmt("dissector",
 		"rename_field struct='%s' field_idx=%d old='%s' new='%s'",
@@ -391,22 +456,22 @@ inline bool retype_field(int struct_idx, int field_idx, field_type_t new_type) {
 	uint32_t total_after = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(struct_idx, g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"retype_field rejected reason='bad_struct_idx' idx=%d", struct_idx);
 			return false;
 		}
-		auto& sd = g_state.structs[struct_idx];
-		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
+		if (!valid_index(field_idx, sd.fields.size())) {
 			diag::log_tagged_fmt("dissector",
 				"retype_field rejected reason='bad_field_idx' struct='%s' field_idx=%d",
 				sd.name.c_str(), field_idx);
 			return false;
 		}
-		auto& f = sd.fields[field_idx];
+		auto& f = sd.fields[static_cast<std::size_t>(field_idx)];
 		old_type = f.type;
 		f.type = new_type;
-		size_t ts = field_type_size(new_type);
+		std::size_t ts = field_type_size(new_type);
 		if (ts > 0) {
 			f.size = static_cast<uint32_t>(ts);
 		} else if (f.size == 0) {
@@ -430,13 +495,13 @@ inline bool set_field_size(int struct_idx, int field_idx, uint32_t new_size) {
 	uint32_t total_after = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(struct_idx, g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"set_field_size rejected reason='bad_struct_idx' idx=%d", struct_idx);
 			return false;
 		}
-		auto& sd = g_state.structs[struct_idx];
-		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
+		if (!valid_index(field_idx, sd.fields.size())) {
 			diag::log_tagged_fmt("dissector",
 				"set_field_size rejected reason='bad_field_idx' struct='%s' field_idx=%d",
 				sd.name.c_str(), field_idx);
@@ -447,7 +512,7 @@ inline bool set_field_size(int struct_idx, int field_idx, uint32_t new_size) {
 				"set_field_size rejected reason='bad_size' new=%u", new_size);
 			return false;
 		}
-		auto& f = sd.fields[field_idx];
+		auto& f = sd.fields[static_cast<std::size_t>(field_idx)];
 		old_size = f.size;
 		f.size = new_size;
 		recalc_total_size(sd);
@@ -465,21 +530,22 @@ inline bool set_field_comment(int struct_idx, int field_idx, const std::string& 
 	std::string sd_name, fname;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
-		if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(struct_idx, g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"set_field_comment rejected reason='bad_struct_idx' idx=%d", struct_idx);
 			return false;
 		}
-		auto& sd = g_state.structs[struct_idx];
-		if (field_idx < 0 || field_idx >= static_cast<int>(sd.fields.size())) {
+		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
+		if (!valid_index(field_idx, sd.fields.size())) {
 			diag::log_tagged_fmt("dissector",
 				"set_field_comment rejected reason='bad_field_idx' struct='%s' field_idx=%d",
 				sd.name.c_str(), field_idx);
 			return false;
 		}
-		sd.fields[field_idx].description = comment;
+		const auto field_index = static_cast<std::size_t>(field_idx);
+		sd.fields[field_index].description = comment;
 		sd_name = sd.name;
-		fname = sd.fields[field_idx].name;
+		fname = sd.fields[field_index].name;
 	}
 	diag::log_tagged_fmt("dissector",
 		"set_field_comment struct='%s' field='%s' bytes=%zu",
@@ -488,6 +554,38 @@ inline bool set_field_comment(int struct_idx, int field_idx, const std::string& 
 }
 
 inline void refresh_values() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	ensure_preview_fixture();
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (!valid_index(g_state.active_struct, g_state.structs.size()))
+		return;
+	const auto& definition = g_state.structs[static_cast<std::size_t>(g_state.active_struct)];
+	g_state.cached_values.resize(definition.fields.size());
+	const std::uint64_t sequence = g_state.refresh_seq.fetch_add(1) + 1;
+	for (std::size_t index = 0; index < definition.fields.size(); ++index) {
+		const auto& field = definition.fields[index];
+		const std::size_t length = (std::max)(std::size_t{1},
+			static_cast<std::size_t>(field.size) * field.array_count);
+		std::vector<std::uint8_t> bytes(length);
+		for (std::size_t offset = 0; offset < length; ++offset)
+			bytes[offset] = static_cast<std::uint8_t>(
+				(g_state.base_address + field.offset + offset + sequence * 3) & 0xFFu);
+		if (field.type == field_type_t::ascii_string) {
+			static constexpr char module[] = "AiDA_Target.exe";
+			std::fill(bytes.begin(), bytes.end(), 0);
+			std::copy_n(module, (std::min)(sizeof(module) - 1, bytes.size()), bytes.begin());
+		}
+		auto& value = g_state.cached_values[index];
+		value.changed = !value.raw_bytes.empty() && value.raw_bytes != bytes;
+		value.raw_bytes = std::move(bytes);
+		value.display_text = format_field_value(value.raw_bytes, field.type);
+	}
+	g_state.last_completed_seq.store(sequence, std::memory_order_release);
+	g_state.refresh_in_flight.store(false, std::memory_order_release);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types, 6,
+		"refresh_values", definition.name);
+	return;
+#else
 	if (!driver_bridge::is_loaded()) {
 		diag::log_tagged_fmt("dissector",
 			"refresh_values skipped reason='driver_not_loaded'");
@@ -504,11 +602,11 @@ inline void refresh_values() {
 	uint64_t base = 0;
 	uint32_t total_size = 0;
 	int active = -1;
-	size_t field_count = 0;
+	std::size_t field_count = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
 		active = g_state.active_struct;
-		if (active < 0 || active >= static_cast<int>(g_state.structs.size())) {
+		if (!valid_index(active, g_state.structs.size())) {
 			g_state.refresh_in_flight.store(false);
 			diag::log_tagged_fmt("dissector",
 				"refresh_values skipped reason='no_active_struct'");
@@ -520,7 +618,7 @@ inline void refresh_values() {
 				"refresh_values skipped reason='base_addr_zero' active=%d", active);
 			return;
 		}
-		const auto& sd = g_state.structs[active];
+		const auto& sd = g_state.structs[static_cast<std::size_t>(active)];
 		if (sd.total_size == 0) {
 			g_state.refresh_in_flight.store(false);
 			diag::log_tagged_fmt("dissector",
@@ -552,11 +650,11 @@ inline void refresh_values() {
 			return;
 		}
 
-		size_t changed_count = 0;
-		size_t oor_count = 0;
+		std::size_t changed_count = 0;
+		std::size_t oor_count = 0;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mtx);
-			if (active < 0 || active >= static_cast<int>(g_state.structs.size())) {
+			if (!valid_index(active, g_state.structs.size())) {
 				g_state.refresh_in_flight.store(false);
 				return;
 			}
@@ -564,19 +662,21 @@ inline void refresh_values() {
 				g_state.refresh_in_flight.store(false);
 				return;
 			}
-			const auto& sd = g_state.structs[active];
+			const auto& sd = g_state.structs[static_cast<std::size_t>(active)];
 			g_state.cached_values.resize(sd.fields.size());
-			for (size_t i = 0; i < sd.fields.size(); ++i) {
+			for (std::size_t i = 0; i < sd.fields.size(); ++i) {
 				const auto& f = sd.fields[i];
-				uint32_t fsz = f.size * f.array_count;
-				if (static_cast<uint64_t>(f.offset) + static_cast<uint64_t>(fsz) > block.size()) {
+				const std::size_t field_offset = static_cast<std::size_t>(f.offset);
+				const std::size_t field_size = static_cast<std::size_t>(f.size) * f.array_count;
+				if (field_offset > block.size() || field_size > block.size() - field_offset) {
 					g_state.cached_values[i].display_text = "<out of range>";
 					g_state.cached_values[i].changed = false;
 					++oor_count;
 					continue;
 				}
-				std::vector<uint8_t> raw(block.begin() + f.offset,
-					block.begin() + f.offset + fsz);
+				const auto first = block.begin() + static_cast<std::ptrdiff_t>(field_offset);
+				const auto last = first + static_cast<std::ptrdiff_t>(field_size);
+				std::vector<uint8_t> raw(first, last);
 				bool changed = (raw != g_state.cached_values[i].raw_bytes);
 				g_state.cached_values[i].raw_bytes = std::move(raw);
 				g_state.cached_values[i].display_text =
@@ -601,9 +701,19 @@ inline void refresh_values() {
 			static_cast<unsigned long long>(base), total_size, field_count,
 			static_cast<unsigned long long>(seq));
 	}
+#endif
 }
 
-inline std::string auto_detect_type(uint64_t address, size_t size) {
+inline std::string auto_detect_type(uint64_t address, std::size_t size) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (size >= 16)
+		return "byte_array";
+	if ((address & 7u) == 0)
+		return "pointer";
+	if ((address & 3u) == 0)
+		return "uint32";
+	return "uint8";
+#else
 	if (!driver_bridge::is_loaded()) return "unknown";
 	if (size == 0) size = 8;
 	std::vector<uint8_t> bytes;
@@ -631,7 +741,7 @@ inline std::string auto_detect_type(uint64_t address, size_t size) {
 			return "int32";
 	}
 	bool all_printable = true;
-	for (size_t i = 0; i < bytes.size(); ++i) {
+	for (std::size_t i = 0; i < bytes.size(); ++i) {
 		if (bytes[i] == 0) break;
 		if (bytes[i] < 0x20 || bytes[i] > 0x7E) { all_printable = false; break; }
 	}
@@ -639,16 +749,36 @@ inline std::string auto_detect_type(uint64_t address, size_t size) {
 		return "ascii_string";
 
 	return "byte_array";
+#endif
 }
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline bool write_preview_value(int field_index, const std::string& text) {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (!valid_index(g_state.active_struct, g_state.structs.size()))
+		return false;
+	const auto& definition = g_state.structs[static_cast<std::size_t>(g_state.active_struct)];
+	if (!valid_index(field_index, definition.fields.size()))
+		return false;
+	g_state.cached_values.resize(definition.fields.size());
+	auto& value = g_state.cached_values[static_cast<std::size_t>(field_index)];
+	value.display_text = text;
+	value.raw_bytes.assign(text.begin(), text.end());
+	value.changed = true;
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types, 6,
+		"write_field", definition.fields[static_cast<std::size_t>(field_index)].name);
+	return true;
+}
+#endif
 
 inline std::string export_to_c(int struct_idx) {
 	std::lock_guard<std::mutex> lk(g_state.mtx);
-	if (struct_idx < 0 || struct_idx >= static_cast<int>(g_state.structs.size())) {
+	if (!valid_index(struct_idx, g_state.structs.size())) {
 		diag::log_tagged_fmt("dissector",
 			"export_to_c rejected reason='bad_idx' idx=%d", struct_idx);
 		return {};
 	}
-	const auto& sd = g_state.structs[struct_idx];
+	const auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
 	std::string out;
 	out += "typedef struct {\n";
 	for (const auto& f : sd.fields) {

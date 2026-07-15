@@ -248,8 +248,8 @@ void hash_bool(std::uint64_t& hash, bool value) noexcept
 void hash_string(std::uint64_t& hash, const std::string& value) noexcept
 {
     hash_u64(hash, static_cast<std::uint64_t>(value.size()));
-    for (const unsigned char byte : value)
-        hash_byte(hash, byte);
+    for (const char byte : value)
+        hash_byte(hash, static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
 }
 
 void hash_selection(std::uint64_t& hash, const selection_context_t& selection) noexcept

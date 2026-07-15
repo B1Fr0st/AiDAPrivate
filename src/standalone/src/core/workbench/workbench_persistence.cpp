@@ -12,6 +12,9 @@
 #include <exception>
 #include <future>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -69,7 +72,8 @@ std::optional<persistence_codec_result_t> preflight_json(
         frame.array_expects_value = false;
         return true;
     };
-    for (const unsigned char byte : input) {
+    for (const char raw_byte : input) {
+        const auto byte = static_cast<unsigned char>(raw_byte);
         if (in_string) {
             if (escaped) {
                 escaped = false;
@@ -1035,6 +1039,39 @@ bool recover_unknown_documents(workbench_persistence_dto_t& dto,
     return true;
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+struct preview_workbench_state_record_t final {
+    std::uint64_t workspace_id = 0;
+    std::uint32_t contract_schema_version = 0;
+    std::uint64_t revision = 0;
+    std::uint64_t fingerprint = 0;
+    std::string payload_json;
+};
+
+struct preview_workbench_state_store_t final {
+    std::mutex mutex;
+    std::map<
+        std::weak_ptr<analysis::workspace_database_t>,
+        std::unordered_map<std::uint64_t, preview_workbench_state_record_t>,
+        std::owner_less<>> databases;
+};
+
+preview_workbench_state_store_t& preview_workbench_state_store()
+{
+    static preview_workbench_state_store_t store;
+    return store;
+}
+
+void remove_expired_preview_databases(preview_workbench_state_store_t& store)
+{
+    for (auto it = store.databases.begin(); it != store.databases.end();) {
+        if (it->first.expired())
+            it = store.databases.erase(it);
+        else
+            ++it;
+    }
+}
+#else
 workbench_error_t persistence_adapter_error(
     const analysis::workspace_error_t& error, std::uint64_t subject) noexcept
 {
@@ -1049,6 +1086,7 @@ workbench_error_t persistence_adapter_error(
         return {workbench_error_code_t::adapter_rejected, subject};
     }
 }
+#endif
 
 }
 
@@ -1456,6 +1494,33 @@ workbench_error_t workspace_database_workbench_persistence_adapter_t::load(
 {
     if (!database_ || !workspace_.valid() || workspace != workspace_)
         return {workbench_error_code_t::workspace_mismatch, workspace.value};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    preview_workbench_state_record_t record;
+    {
+        auto& store = preview_workbench_state_store();
+        std::lock_guard<std::mutex> lock(store.mutex);
+        remove_expired_preview_databases(store);
+        const auto database = store.databases.find(
+            std::weak_ptr<analysis::workspace_database_t>{database_});
+        if (database == store.databases.end())
+            return {workbench_error_code_t::adapter_rejected, workspace.value};
+        const auto state = database->second.find(workspace.value);
+        if (state == database->second.end())
+            return {workbench_error_code_t::adapter_rejected, workspace.value};
+        record = state->second;
+    }
+    if (record.workspace_id != workspace.value)
+        return {workbench_error_code_t::workspace_mismatch, record.workspace_id};
+    workbench_persistence_dto_t decoded;
+    const auto decoded_result = workbench_persistence_codec_t::decode(
+        record.payload_json, workspace, decoded, limits_);
+    if (!decoded_result || decoded.schema_version != record.contract_schema_version ||
+        decoded.revision.value != record.revision ||
+        decoded_result.fingerprint.value != record.fingerprint)
+        return {workbench_error_code_t::invalid_persistence, record.revision};
+    output = std::move(decoded);
+    return {};
+#else
     const auto deadline = std::chrono::steady_clock::now() +
         std::chrono::milliseconds(database_->options().candidate_operation_timeout_ms);
     analysis::cancellation_source_t cancellation(deadline);
@@ -1476,6 +1541,7 @@ workbench_error_t workspace_database_workbench_persistence_adapter_t::load(
         return {workbench_error_code_t::invalid_persistence, record.revision};
     output = std::move(decoded);
     return {};
+#endif
 }
 
 workbench_error_t workspace_database_workbench_persistence_adapter_t::store(
@@ -1496,6 +1562,20 @@ workbench_error_t workspace_database_workbench_persistence_adapter_t::store(
     if (!encoded)
         return {workbench_error_code_t::invalid_persistence,
                 normalized.revision.value};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    preview_workbench_state_record_t record;
+    record.workspace_id = normalized.workspace.value;
+    record.contract_schema_version = normalized.schema_version;
+    record.revision = normalized.revision.value;
+    record.fingerprint = encoded.fingerprint.value;
+    record.payload_json = std::move(payload);
+    auto& store = preview_workbench_state_store();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    remove_expired_preview_databases(store);
+    store.databases[std::weak_ptr<analysis::workspace_database_t>{database_}]
+        [record.workspace_id] = std::move(record);
+    return {};
+#else
     analysis::workbench_state_record_t record;
     record.workspace_id = normalized.workspace.value;
     record.contract_schema_version = normalized.schema_version;
@@ -1525,6 +1605,7 @@ workbench_error_t workspace_database_workbench_persistence_adapter_t::store(
                 normalized.revision.value};
     }
     return {};
+#endif
 }
 
 }

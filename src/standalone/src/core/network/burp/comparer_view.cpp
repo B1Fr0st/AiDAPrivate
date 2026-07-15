@@ -1,5 +1,9 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 #ifdef small
 #undef small
@@ -7,7 +11,11 @@
 
 #include "comparer_view.hpp"
 #include "comparer.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -371,6 +379,7 @@ void render(float pos_x, float pos_y, float width, float height,
         cfg.title = "Comparer";
         cfg.body  = "Add two slots from clipboard, file, or text, then select A and B to compute a Myers diff.";
         aida::ui::empty_state::render(rp, ImVec2(width, panes_h), cfg);
+        ImGui::Dummy(ImVec2(0.f, 0.f));
     }
 
     ImGui::EndChild();

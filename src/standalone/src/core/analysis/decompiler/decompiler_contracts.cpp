@@ -1048,11 +1048,11 @@ public:
         const std::uint64_t bit_length = static_cast<std::uint64_t>(total_bytes_) * 8U;
         block_[block_size_++] = 0x80U;
         if (block_size_ > 56) {
-            std::fill(block_.begin() + block_size_, block_.end(), 0);
+            std::fill(block_.begin() + static_cast<decltype(block_)::difference_type>(block_size_), block_.end(), 0);
             transform(block_.data());
             block_size_ = 0;
         }
-        std::fill(block_.begin() + block_size_, block_.begin() + 56, 0);
+        std::fill(block_.begin() + static_cast<decltype(block_)::difference_type>(block_size_), block_.begin() + 56, 0);
         for (std::size_t index = 0; index < 8; ++index)
             block_[63 - index] = static_cast<std::uint8_t>(bit_length >> (index * 8U));
         transform(block_.data());

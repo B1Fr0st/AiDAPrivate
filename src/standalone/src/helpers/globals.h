@@ -1,13 +1,26 @@
 #pragma once
 #include "imgui/imgui_internal.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "standalone_license.hpp"
+#endif
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../preview/shell_preview_platform.hpp"
+#else
 #include "terminal_view.hpp"
 #include "workspace_search.hpp"
 #include "../core/infra/executor.hpp"
 #include "diag_log.hpp"
 #include "../core/ui/ui_thread_dispatcher.hpp"
+#endif
 #include <iostream>
+#include <cstdio>
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include <cstdint>
+struct ID3D11ShaderResourceView;
+using DWORD = std::uint32_t;
+#else
 #include <d3d11.h>
+#endif
 #include <string>
 #include <vector>
 #include <deque>
@@ -23,8 +36,31 @@
 #include <fstream>
 #include <sstream>
 #include <system_error>
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <shlobj.h>
 #include <objbase.h>
+#endif
+
+namespace aida::shell_platform
+{
+	inline unsigned long long tick_ms()
+	{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		return static_cast<unsigned long long>(ImGui::GetTime() * 1000.0);
+#else
+		return GetTickCount64();
+#endif
+	}
+
+	inline unsigned long thread_id()
+	{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		return 1;
+#else
+		return GetCurrentThreadId();
+#endif
+	}
+}
 
 
 enum class center_view_t : int {
@@ -116,8 +152,8 @@ namespace output_log {
 	inline void set_owner(int op, int idx) {
 		owner_op.store(op, std::memory_order_relaxed);
 		owner_tab.store(idx, std::memory_order_relaxed);
-		owner_since_ms.store(GetTickCount64(), std::memory_order_relaxed);
-		owner_tid.store(GetCurrentThreadId(), std::memory_order_release);
+		owner_since_ms.store(aida::shell_platform::tick_ms(), std::memory_order_relaxed);
+		owner_tid.store(aida::shell_platform::thread_id(), std::memory_order_release);
 	}
 
 	inline void clear_owner() {
@@ -139,7 +175,7 @@ namespace output_log {
 		op = owner_op.load(std::memory_order_relaxed);
 		tab = owner_tab.load(std::memory_order_relaxed);
 		unsigned long long since = owner_since_ms.load(std::memory_order_relaxed);
-		unsigned long long now = GetTickCount64();
+		unsigned long long now = aida::shell_platform::tick_ms();
 		age_ms = (tid != 0 && since != 0 && now >= since) ? (now - since) : 0ULL;
 	}
 
@@ -150,7 +186,9 @@ namespace output_log {
 		return idx;
 	}
 	inline void push(bottom_tab_t tab, const std::string& line) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		if (tab == bottom_tab_t::terminal) return;
+#endif
 		int idx = tab_index(tab);
 		std::lock_guard<std::mutex> lk(mutex);
 		owner_scope owner(1, idx);
@@ -440,16 +478,24 @@ namespace license
 
 	inline bool preserve_valid_state(bool runtime_locked, bool full_test_running)
 	{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		return validated && !runtime_locked && full_test_running;
+#else
 		return validated && !runtime_locked && full_test_running && standalone_license::is_arc_loaded();
+#endif
 	}
 
 	inline bool runtime_ready(bool runtime_locked, bool full_test_running)
 	{
 		if (runtime_locked)
 			return false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		return validated || preserve_valid_state(runtime_locked, full_test_running);
+#else
 		if (standalone_license::is_valid())
 			return true;
 		return preserve_valid_state(runtime_locked, full_test_running);
+#endif
 	}
 }
 
@@ -599,7 +645,12 @@ namespace globals
 	inline ID3D11ShaderResourceView* bullet_srv = nullptr;
 
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	struct terminal_fixture_manager_t {};
+	inline terminal_fixture_manager_t terminal_mgr;
+#else
 	inline terminal_view::TerminalManager terminal_mgr;
+#endif
 
 	namespace ui
 	{
@@ -880,8 +931,10 @@ namespace cost_tracking {
 		           model.find("ollama") != std::string::npos || model.find("127.0.0.1") != std::string::npos) {
 			return 0.0;
 		}
-		return (in_tok * in_price + out_tok * out_price +
-		        cache_read * cache_read_price + cache_write * cache_write_price) / 1000000.0;
+		return (static_cast<double>(in_tok) * in_price +
+		        static_cast<double>(out_tok) * out_price +
+		        static_cast<double>(cache_read) * cache_read_price +
+		        static_cast<double>(cache_write) * cache_write_price) / 1000000.0;
 	}
 
 	inline void accumulate(const std::string& model, int64_t in_tok, int64_t out_tok,
@@ -926,6 +979,9 @@ namespace file_tabs {
 	inline int   close_confirm_hovered = -1;
 
 	inline std::string hot_exit_dir() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		return {};
+#else
 		wchar_t* appdata = nullptr;
 		if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
 			auto p = std::filesystem::path(appdata) / L"AiDA" / L"Standalone" / L"hot_exit";
@@ -935,12 +991,13 @@ namespace file_tabs {
 			return p.string();
 		}
 		return {};
+#endif
 	}
 
 	inline std::string hot_exit_key_for_path(const std::string& fpath) {
 		uint64_t h = 0xCBF29CE484222325ULL;
-		for (unsigned char c : fpath) {
-			h ^= c;
+		for (char c : fpath) {
+			h ^= static_cast<unsigned char>(c);
 			h *= 0x100000001B3ULL;
 		}
 		char buf[40];
@@ -995,7 +1052,11 @@ namespace file_tabs {
 		if (ec) return out;
 		if (fsize > (8ULL * 1024ULL * 1024ULL)) return out;
 		FILE* f = nullptr;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		f = std::fopen(fpath.c_str(), "rb");
+#else
 		fopen_s(&f, fpath.c_str(), "rb");
+#endif
 		if (!f) return out;
 		fseek(f, 0, SEEK_END);
 		long sz = ftell(f);
@@ -1008,10 +1069,18 @@ namespace file_tabs {
 		return out;
 	}
 
+	inline bool is_valid_tab_index(int idx) {
+		return idx >= 0 && static_cast<size_t>(idx) < tabs.size();
+	}
+
+	inline size_t tab_index(int idx) {
+		return static_cast<size_t>(idx);
+	}
+
 	inline void snapshot_active_to_tab() {
-		if (active_tab < 0 || active_tab >= (int)tabs.size()) return;
+		if (!is_valid_tab_index(active_tab)) return;
 		if (!code_editor::active) return;
-		auto& t = tabs[active_tab];
+		auto& t = tabs[tab_index(active_tab)];
 		if (t.filepath != code_editor::filepath) return;
 		t.buffer = code_editor::get_content();
 		t.buffer_loaded = true;
@@ -1019,13 +1088,19 @@ namespace file_tabs {
 	}
 
 	inline void load_tab_into_editor(int idx) {
-		if (idx < 0 || idx >= (int)tabs.size()) return;
-		auto& t = tabs[idx];
+		if (!is_valid_tab_index(idx)) return;
+		auto& t = tabs[tab_index(idx)];
 		if (t.buffer_loaded) {
 			code_editor::load(t.buffer, t.filename, t.filepath);
 			code_editor::dirty = t.dirty;
 			return;
 		}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		t.buffer.clear();
+		t.buffer_loaded = true;
+		t.dirty = false;
+		code_editor::load(t.buffer, t.filename, t.filepath);
+#else
 		std::error_code ec;
 		uintmax_t fsize = t.filepath.empty() ? 0 : std::filesystem::file_size(t.filepath, ec);
 		if (ec) fsize = 0;
@@ -1057,9 +1132,8 @@ namespace file_tabs {
 								break;
 							}
 						}
-						const bool active_matches_tab = active_tab >= 0 &&
-							active_tab < static_cast<int>(tabs.size()) &&
-							tabs[active_tab].filepath == fpath;
+						const bool active_matches_tab = is_valid_tab_index(active_tab) &&
+							tabs[tab_index(active_tab)].filepath == fpath;
 						const bool active_matches_editor = code_editor::active &&
 							code_editor::filepath == fpath;
 						if (active_matches_tab || active_matches_editor)
@@ -1071,7 +1145,7 @@ namespace file_tabs {
 				if (!posted) {
 					diag::log_tagged_critical_fmt("file_tabs",
 						"large_file_load_dispatch_failed worker_tid=%lu ui_tid=%lu path=%.260s",
-						static_cast<unsigned long>(GetCurrentThreadId()),
+						static_cast<unsigned long>(aida::shell_platform::thread_id()),
 						static_cast<unsigned long>(aida::ui_thread::owner_tid()),
 						fpath.c_str());
 				}
@@ -1080,12 +1154,13 @@ namespace file_tabs {
 			if (!submitted)
 				diag::log_tagged_critical_fmt("file_tabs", "large_file_load_submit_failed path=%.260s", fpath.c_str());
 		}
+#endif
 	}
 
 	inline void switch_to(int idx) {
-		if (idx < 0 || idx >= (int)tabs.size()) return;
+		if (!is_valid_tab_index(idx)) return;
 		if (idx == active_tab && code_editor::active &&
-		    code_editor::filepath == tabs[idx].filepath) {
+		    code_editor::filepath == tabs[tab_index(idx)].filepath) {
 			return;
 		}
 		snapshot_active_to_tab();
@@ -1094,9 +1169,18 @@ namespace file_tabs {
 	}
 
 	inline bool save_tab_to_disk(int idx) {
-		if (idx < 0 || idx >= (int)tabs.size()) return false;
-		auto& t = tabs[idx];
+		if (!is_valid_tab_index(idx)) return false;
+		auto& t = tabs[tab_index(idx)];
 		if (t.filepath.empty()) return false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		if (idx == active_tab && code_editor::active && code_editor::filepath == t.filepath) {
+			t.buffer = code_editor::get_content();
+			t.buffer_loaded = true;
+			code_editor::dirty = false;
+		}
+		t.dirty = false;
+		return true;
+#else
 		if (!standalone_license::is_valid()) return false;
 		{
 			uint64_t gt = standalone_license::inline_gate_check(
@@ -1122,6 +1206,7 @@ namespace file_tabs {
 			code_editor::dirty = false;
 		}
 		return true;
+#endif
 	}
 
 	inline bool save_active_to_disk() {
@@ -1130,9 +1215,9 @@ namespace file_tabs {
 
 	inline void open_or_focus(const std::string& fpath, const std::string& fname,
 	                          const std::string& content) {
-		for (int i = 0; i < (int)tabs.size(); i++) {
+		for (size_t i = 0; i < tabs.size(); i++) {
 			if (tabs[i].filepath == fpath && !fpath.empty()) {
-				switch_to(i);
+				switch_to(static_cast<int>(i));
 				return;
 			}
 		}
@@ -1151,20 +1236,20 @@ namespace file_tabs {
 			t.dirty = false;
 		}
 		tabs.push_back(std::move(t));
-		active_tab = (int)tabs.size() - 1;
-		auto& nt = tabs[active_tab];
+		active_tab = static_cast<int>(tabs.size()) - 1;
+		auto& nt = tabs[tab_index(active_tab)];
 		code_editor::load(nt.buffer, nt.filename, nt.filepath);
 		code_editor::dirty = nt.dirty;
 	}
 
 	inline void close_tab(int idx) {
-		if (idx < 0 || idx >= (int)tabs.size()) return;
+		if (!is_valid_tab_index(idx)) return;
 		bool was_active = (idx == active_tab);
-		tabs.erase(tabs.begin() + idx);
-		if (active_tab >= (int)tabs.size()) active_tab = (int)tabs.size() - 1;
+		tabs.erase(tabs.begin() + static_cast<std::vector<OpenTab>::difference_type>(idx));
+		if (active_tab >= static_cast<int>(tabs.size())) active_tab = static_cast<int>(tabs.size()) - 1;
 		else if (idx < active_tab) active_tab--;
-		if (active_tab >= 0 && active_tab < (int)tabs.size()) {
-			if (was_active || code_editor::filepath != tabs[active_tab].filepath)
+		if (is_valid_tab_index(active_tab)) {
+			if (was_active || code_editor::filepath != tabs[tab_index(active_tab)].filepath)
 				load_tab_into_editor(active_tab);
 		} else {
 			code_editor::active = false;
@@ -1194,10 +1279,9 @@ namespace file_tabs {
 namespace code_editor
 {
 	inline bool save() {
-		if (file_tabs::active_tab < 0 ||
-		    file_tabs::active_tab >= (int)file_tabs::tabs.size())
+		if (!file_tabs::is_valid_tab_index(file_tabs::active_tab))
 			return false;
-		auto& t = file_tabs::tabs[file_tabs::active_tab];
+		auto& t = file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)];
 		if (t.filepath != code_editor::filepath || code_editor::filepath.empty())
 			return false;
 		return file_tabs::save_tab_to_disk(file_tabs::active_tab);

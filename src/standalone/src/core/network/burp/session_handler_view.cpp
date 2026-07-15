@@ -1,6 +1,10 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #ifdef small
 #undef small
@@ -14,8 +18,16 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
 #include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "../../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -305,7 +317,8 @@ void render(float pos_x, float pos_y, float width, float height,
             if (aida::ui::button("Delete step", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
                 ::diag::log_tagged_fmt("session_v", "step_deleted macro_id=%llu step_idx=%d",
                     static_cast<unsigned long long>(cur.id), idx);
-                cur.steps.erase(cur.steps.begin() + idx);
+                const auto step_offset = static_cast<decltype(cur.steps)::difference_type>(idx);
+                cur.steps.erase(cur.steps.begin() + step_offset);
                 session_handler::update_macro(cur);
                 st.edit_step_index = -1;
             }

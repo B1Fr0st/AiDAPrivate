@@ -649,7 +649,7 @@ pseudocode_error_t pseudocode_document_model_t::resolve_request(
 pseudocode_error_t pseudocode_document_model_t::request(
     const pseudocode_request_t& request)
 {
-    return request(request, false);
+    return this->request(request, false);
 }
 
 pseudocode_error_t pseudocode_document_model_t::request(

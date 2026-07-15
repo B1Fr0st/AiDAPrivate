@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -12,10 +13,14 @@
 #include "disasm_view.hpp"
 #include "hex_view.hpp"
 #include "ui_anim.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #include "../anti-tamper/webhook.hpp"
-#include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#endif
+#include "../helpers/globals.h"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -89,6 +94,19 @@ inline ImU32 grade_color(float qs) {
 	return t.error;
 }
 
+inline void open_saved_in_hex(const disasm_view::workspace_context_t& context,
+	std::uint64_t address)
+{
+	if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
+		hex_view::read_live_memory(context, address, 256);
+		return;
+	}
+	hex_view::activate(context);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::scan::record("aob.open_hex", std::to_string(address));
+#endif
+}
+
 inline std::string format_for_tab(const aob_generator::signature_t& sig, format_tab_t f) {
 	switch (f) {
 	case format_tab_t::standard:     return aob_generator::format_signature(sig);
@@ -115,9 +133,10 @@ inline void render_format_segmented(float x, float y, float& width_used, format_
 	float pad_x = 4.f;
 	float h = 26.f;
 	float total_w = pad_x * 2.f;
-	float seg_w[(int)format_tab_t::COUNT];
-	for (int i = 0; i < (int)format_tab_t::COUNT; ++i) {
-		const char* nm = tab_name((format_tab_t)i);
+	constexpr int format_count = static_cast<int>(format_tab_t::COUNT);
+	float seg_w[format_count];
+	for (int i = 0; i < format_count; ++i) {
+		const char* nm = tab_name(static_cast<format_tab_t>(i));
 		ImVec2 sz = ImGui::CalcTextSize(nm);
 		seg_w[i] = sz.x + 18.f;
 		total_w += seg_w[i];
@@ -128,14 +147,14 @@ inline void render_format_segmented(float x, float y, float& width_used, format_
 		aida::ui::with_alpha(t.border_subtle, 1.f), h * 0.5f, 0, 1.f);
 
 	float cx = x + pad_x;
-	for (int i = 0; i < (int)format_tab_t::COUNT; ++i) {
+	for (int i = 0; i < format_count; ++i) {
 		ImGui::PushID(i);
 		ImGui::SetCursorScreenPos(ImVec2(cx, y));
 		ImGui::InvisibleButton("##seg", ImVec2(seg_w[i], h));
 		bool clk = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 		bool hov = ImGui::IsItemHovered();
-		bool act = (active == (format_tab_t)i);
-		if (clk) active = (format_tab_t)i;
+		bool act = (active == static_cast<format_tab_t>(i));
+		if (clk) active = static_cast<format_tab_t>(i);
 
 		if (act) {
 			ImVec2 a(cx + 2.f, y + 2.f);
@@ -150,7 +169,7 @@ inline void render_format_segmented(float x, float y, float& width_used, format_
 				aida::ui::with_alpha(t.hover_wash, 1.f), (h - 4.f) * 0.5f);
 		}
 
-		const char* nm = tab_name((format_tab_t)i);
+		const char* nm = tab_name(static_cast<format_tab_t>(i));
 		ImVec2 ts = ImGui::CalcTextSize(nm);
 		ImU32 tc = act ? IM_COL32(255, 255, 255, 240) : t.text_secondary;
 		dl->AddText(ImVec2(cx + (seg_w[i] - ts.x) * 0.5f, y + (h - ts.y) * 0.5f), tc, nm);
@@ -182,6 +201,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::EndChild();
 		return;
 	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (generator_state->last_request_addr == 0) {
+		std::snprintf(generator_state->name_input, sizeof(generator_state->name_input), "%s", "decrypt_dispatch");
+		const std::uint64_t address = context.workspace->identity().image_base() + 0x16A0;
+		aob_generator::generate_from_address(context, address, generator_state->instruction_count,
+			generator_state->auto_wildcard);
+		aob_generator::save_current(generator_state);
+	}
+#endif
 	{
 		std::string pending_clip;
 		if (aob_generator::take_pending_clipboard(generator_state, pending_clip)) {
@@ -192,6 +220,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = *view_state;
 	auto& gen = *generator_state;
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	ImVec2 wp = ImGui::GetWindowPos();
 	float ox = wp.x;
@@ -273,8 +307,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool aw = gen.auto_wildcard;
 		aida::ui::toggle_switch("##aw", &aw, aida::ui::size_t_::sm);
 		gen.auto_wildcard = aw;
-		ImFont* lbl_fn = aida::ui::fonts::body();
-		float lbl_fs = lbl_fn ? lbl_fn->FontSize : ImGui::GetFontSize();
+		ImFont* lbl_fn = body_font;
+		float lbl_fs = body_font_size;
 		float toggle_w = ImGui::GetItemRectSize().x;
 		float aw_lbl_x = cx + toggle_w + 14.f;
 		ImVec2 aw_ts = ImGui::CalcTextSize("Auto-wildcard");
@@ -378,7 +412,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		const auto process = context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
 			? context.workspace->identity().process() : std::nullopt;
 		const std::uint32_t live_pid = process ? process->pid : 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		bool attached_live = live_pid != 0;
+#else
 		bool attached_live = driver_bridge::is_loaded() && live_pid != 0;
+#endif
 		ImGui::SetCursorScreenPos(ImVec2(run_x, cy));
 		if (aida::ui::button("Optimize", aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !attached_live)) {
@@ -389,6 +427,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] aob optimize invoked");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aob_generator::optimize_signature(live_pid, to_optimize);
+			std::lock_guard<std::mutex> lk(generator_state->mutex);
+			generator_state->current = std::move(to_optimize);
+#else
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "scanner";
 			sub.label = "scanner.aob_optimize";
@@ -404,6 +447,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			};
 			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 				diag::log_tagged("aob", "optimize worker_queue_rejected");
+#endif
 		}
 		run_x = ImGui::GetItemRectMax().x + btn_gap + 6.f;
 
@@ -444,7 +488,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 lbl_sz = ImGui::CalcTextSize("Last error:");
 		ImGui::PushClipRect(ImVec2(err_x + 12.f + lbl_sz.x + 8.f, cy),
 			ImVec2(err_x + err_w - 12.f, cy + err_h), true);
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(err_x + 12.f + lbl_sz.x + 8.f, cy + (err_h - 11.f) * 0.5f),
 			err_col, error_copy.c_str());
 		ImGui::PopClipRect();
@@ -468,7 +512,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		              current_copy.module_name.empty() ? "<unknown>" : current_copy.module_name.c_str(),
 		              current_copy.bytes.size(),
 		              current_copy.quality_score * 100.f);
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(card_x + 12.f, cy + (card_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, alpha), info_buf);
 
@@ -493,7 +537,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddText(aida::ui::fonts::body_em(), 13.f,
 				ImVec2(dot_cx - g_ts.x * 0.5f, dot_cy - 6.f),
 				IM_COL32(255, 255, 255, 245), grade_str);
-			dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(dot_cx + 12.f, gy + (ph - 11.f) * 0.5f),
 				aida::ui::with_alpha(gc, 1.f), lbl);
 		}
@@ -508,7 +552,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImU32 wild_col = aida::ui::with_alpha(t.error, alpha);
 		ImU32 fixed_col = aida::ui::with_alpha(t.info, alpha);
 
-		for (size_t i = 0; i < current_copy.bytes.size(); ++i) {
+		for (std::size_t i = 0; i < current_copy.bytes.size(); ++i) {
 			if (byte_x + byte_w > max_x) {
 				byte_x = cx;
 				byte_y += byte_h + 2.f;
@@ -516,11 +560,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			char hex[4];
 			if (current_copy.bytes[i].wildcard) {
 				hex[0] = '?'; hex[1] = '?'; hex[2] = 0;
-				dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+				dl->AddText(code_font, code_font_size,
 					ImVec2(byte_x, byte_y), wild_col, hex);
 			} else {
 				std::snprintf(hex, sizeof(hex), "%02X", current_copy.bytes[i].value);
-				dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+				dl->AddText(code_font, code_font_size,
 					ImVec2(byte_x, byte_y), fixed_col, hex);
 			}
 			byte_x += byte_w;
@@ -541,7 +585,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2(ox + left_w - 12.f, cy + code_h),
 			aida::ui::with_alpha(t.border_subtle, alpha), 8.f, 0, 1.f);
 		ImGui::PushClipRect(ImVec2(cx, cy), ImVec2(ox + left_w - 16.f, cy + code_h), true);
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(cx + 4.f, cy + (code_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, alpha), fmt.c_str());
 		ImGui::PopClipRect();
@@ -575,8 +619,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Export JSON", aida::ui::button_kind_t::ghost,
 					aida::ui::size_t_::sm)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aob_generator::export_signatures_json(generator_state, {});
+#else
 				char* appdata = nullptr;
-				size_t elen = 0;
+				std::size_t elen = 0;
 				_dupenv_s(&appdata, &elen, "APPDATA");
 				if (appdata) {
 					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.json";
@@ -584,6 +631,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					diag::log_tagged_fmt("aob", "export_json path='%s'", path.c_str());
 					aob_generator::export_signatures_json(generator_state, path);
 				}
+#endif
 			}
 			bx += 110.f;
 
@@ -591,28 +639,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (aida::ui::button("Export YARA", aida::ui::button_kind_t::ghost,
 					aida::ui::size_t_::sm)) {
 				diag::log_tagged("aob", "export_yara_clicked");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aob_generator::export_signatures_yara(generator_state, {});
+#else
 				char* appdata = nullptr;
-				size_t elen = 0;
+				std::size_t elen = 0;
 				_dupenv_s(&appdata, &elen, "APPDATA");
 				if (appdata) {
 					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.yar";
 					free(appdata);
 					aob_generator::export_signatures_yara(generator_state, path);
 				}
+#endif
 			}
 			bx += 110.f;
 
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Export Header", aida::ui::button_kind_t::ghost,
 					aida::ui::size_t_::sm)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aob_generator::export_signatures_header(generator_state, {});
+#else
 				char* appdata = nullptr;
-				size_t elen = 0;
+				std::size_t elen = 0;
 				_dupenv_s(&appdata, &elen, "APPDATA");
 				if (appdata) {
 					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\signatures.hpp";
 					free(appdata);
 					aob_generator::export_signatures_header(generator_state, path);
 				}
+#endif
 			}
 			cy += 30.f;
 
@@ -622,7 +678,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
 				? context.workspace->identity().process() : std::nullopt;
 			const std::uint32_t compare_pid = compare_process ? compare_process->pid : 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			bool attached_cmp = compare_pid != 0;
+#else
 			bool attached_cmp = driver_bridge::is_loaded() && compare_pid != 0;
+#endif
 			if (aida::ui::button("Compare", aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !attached_cmp)) {
 				std::vector<aob_generator::signature_t> sigs_copy;
@@ -632,6 +692,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob compare invoked");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				auto results = aob_generator::compare_signatures_against_process(compare_pid, sigs_copy);
+				std::lock_guard<std::mutex> lk(generator_state->mutex);
+				auto& saved = generator_state->saved_signatures;
+				for (std::size_t ri = 0; ri < results.size() && ri < saved.size() && ri < sigs_copy.size(); ++ri) {
+					if (saved[ri].id != sigs_copy[ri].id) continue;
+					saved[ri].unique = results[ri].still_found;
+					saved[ri].uniqueness_count = results[ri].match_count;
+					saved[ri].quality_score = aob_generator::compute_quality_score(saved[ri]);
+				}
+#else
 				aida::infra::executor::submission_t sub;
 				sub.owner_subsystem = "scanner";
 				sub.label = "scanner.aob_compare";
@@ -643,7 +714,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					auto results = aob_generator::compare_signatures_against_process(compare_pid, sigs_copy);
 					std::lock_guard<std::mutex> lk(generator_state->mutex);
 					auto& saved = generator_state->saved_signatures;
-					for (size_t ri = 0; ri < results.size() && ri < saved.size() && ri < sigs_copy.size(); ++ri) {
+					for (std::size_t ri = 0; ri < results.size() && ri < saved.size() && ri < sigs_copy.size(); ++ri) {
 						if (saved[ri].id != sigs_copy[ri].id) continue;
 						saved[ri].unique = results[ri].still_found;
 						saved[ri].uniqueness_count = results[ri].match_count;
@@ -652,6 +723,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				};
 				if (!aida::infra::executor::submit(std::move(sub)).submitted)
 					diag::log_tagged("aob", "compare worker_queue_rejected");
+#endif
 			}
 			bx += 90.f;
 
@@ -706,7 +778,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	static float saved_anim_time = 0.f;
 	saved_anim_time += dt;
 
-	for (size_t i = 0; i < saved_copy.size(); ++i) {
+	for (std::size_t i = 0; i < saved_copy.size(); ++i) {
 		float row_y = ry + static_cast<float>(i) * row_h - st.scroll_y;
 		if (row_y + row_h < ry || row_y > oy + h) continue;
 
@@ -754,19 +826,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(gc, 1.f), g_str);
 		}
 
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(rx + 38.f, row_y + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, alpha * entrance), sig.name.c_str());
 
 		float mid_x = rx + right_w * 0.42f;
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(mid_x, row_y + (row_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, alpha * entrance), addr_buf);
 
 		float end_x = rx + right_w * 0.65f;
 		char sz_buf[16];
 		std::snprintf(sz_buf, sizeof(sz_buf), "%zu B", sig.bytes.size());
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(end_x, row_y + (row_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, alpha * entrance), sz_buf);
 
@@ -791,8 +863,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
 	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f);
 	if (ImGui::BeginPopup("##aob_saved_ctx")) {
-		if (ctx_saved_idx >= 0 && ctx_saved_idx < static_cast<int>(saved_copy.size())) {
-			auto& csig = saved_copy[static_cast<size_t>(ctx_saved_idx)];
+		if (ctx_saved_idx >= 0 && static_cast<std::size_t>(ctx_saved_idx) < saved_copy.size()) {
+			auto& csig = saved_copy[static_cast<std::size_t>(ctx_saved_idx)];
 			if (ImGui::MenuItem("Open in Disassembly")) {
 				globals::ui::active_center_view = center_view_t::disassembly;
 				disasm_view::goto_address(csig.address, context);
@@ -800,13 +872,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					"[scan_audit] aob saved ctx open_disasm");
 			}
 			if (ImGui::MenuItem("Open in Hex")) {
-				if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
-					hex_view::read_from_process(context, csig.address, 256);
-				} else if (const auto address = disasm_view::typed_address(context, csig.address)) {
-					auto bytes = disasm_view::read_bytes(context, *address, 256);
-					if (bytes) hex_view::set_data(context, bytes.value(), csig.address,
-						context.workspace->identity().bin_name());
-				}
+				detail::open_saved_in_hex(context, csig.address);
 				globals::ui::active_center_view = center_view_t::hex_view;
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob saved ctx open_hex");

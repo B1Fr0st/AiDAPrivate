@@ -1,21 +1,37 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlobj.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "h2_editor_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_routed.hpp"
+#else
 #include "h2_editor.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
 #include "../executor_status.hpp"
 #include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>

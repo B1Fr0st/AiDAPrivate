@@ -1,11 +1,12 @@
 #pragma once
 
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-
 #include "../infra/win_thread.hpp"
+#endif
 #include "imgui/imgui.h"
 #include "theme.hpp"
 #include "clock.hpp"
@@ -15,6 +16,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -35,7 +37,7 @@ struct Cell {
 
 struct TerminalSession
 {
-
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     HPCON                hPC          = INVALID_HANDLE_VALUE;
     HANDLE               hPipeIn      = INVALID_HANDLE_VALUE;
     HANDLE               hPipeOut     = INVALID_HANDLE_VALUE;
@@ -46,6 +48,10 @@ struct TerminalSession
     aida::infra::win_thread::joinable_thread_t reader_thread;
     std::atomic<bool>    stop_reader{false};
     std::atomic<bool>    reader_done{true};
+#else
+    std::atomic<bool>    stop_reader{false};
+    std::atomic<bool>    reader_done{true};
+#endif
 
 
     std::mutex           buffer_mtx;
@@ -344,6 +350,10 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
 
 inline void reader_thread_func(TerminalSession* s)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (s)
+        s->reader_done.store(true, std::memory_order_release);
+#else
     if (!s)
         return;
     char buf[4096];
@@ -361,11 +371,39 @@ inline void reader_thread_func(TerminalSession* s)
         s->alive.store(false, std::memory_order_release);
     }
     s->reader_done.store(true, std::memory_order_release);
+#endif
 }
 
 
 inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    (void)shell;
+    {
+        std::lock_guard<std::mutex> lk(s.buffer_mtx);
+        s.lines.clear();
+        s.line_entrance_time.clear();
+        s.cursor_row = 0;
+        s.cursor_col = 0;
+        s.scroll_y = 0.f;
+        s.scroll_to_bottom = true;
+        s.auto_follow = true;
+        s.prev_line_count = 0;
+    }
+    const char fixture[] =
+        "\x1b[38;5;75mAiDA Reverse Engineering Console\x1b[0m\r\n"
+        "Workspace  C:\\samples\\nightfall.exe\r\n"
+        "Architecture  x86-64  |  Image base  0x140000000\r\n"
+        "\r\n"
+        "PS C:\\analysis> aida inspect .\\nightfall.exe\r\n"
+        "\x1b[38;5;114m[ready]\x1b[0m  2,814 functions  47,203 xrefs  186 imports\r\n"
+        "PS C:\\analysis> ";
+    process_output(s, fixture, sizeof(fixture) - 1);
+    s.title = "PowerShell - AiDA Workspace";
+    s.alive.store(true, std::memory_order_release);
+    s.reader_done.store(true, std::memory_order_release);
+    return true;
+#else
     if (!shell)
         shell = L"powershell.exe";
 
@@ -484,15 +522,22 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
     }
 
     return true;
+#endif
 }
 
 
 inline void send_input(TerminalSession& s, const char* data, size_t len)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (!s.alive.load(std::memory_order_acquire) || data == nullptr || len == 0)
+        return;
+    process_output(s, data, len);
+#else
     if (s.hPipeOut == INVALID_HANDLE_VALUE || !s.alive.load(std::memory_order_acquire))
         return;
     DWORD written = 0;
     WriteFile(s.hPipeOut, data, static_cast<DWORD>(len), &written, nullptr);
+#endif
 }
 
 inline void clear_session(TerminalSession& s)
@@ -551,17 +596,24 @@ inline void resize_pty(TerminalSession& s, int cols, int rows)
 {
     s.cols = cols;
     s.rows_vis = rows;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (s.hPC != INVALID_HANDLE_VALUE) {
         COORD size;
         size.X = static_cast<SHORT>(cols);
         size.Y = static_cast<SHORT>(rows);
         ResizePseudoConsole(s.hPC, size);
     }
+#endif
 }
 
 
 inline void destroy_session(TerminalSession& s)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    s.stop_reader.store(true, std::memory_order_release);
+    s.alive.store(false, std::memory_order_release);
+    s.reader_done.store(true, std::memory_order_release);
+#else
     s.stop_reader.store(true, std::memory_order_release);
     s.alive.store(false, std::memory_order_release);
 
@@ -618,6 +670,7 @@ inline void destroy_session(TerminalSession& s)
         CloseHandle(s.hThread);
         s.hThread = INVALID_HANDLE_VALUE;
     }
+#endif
 }
 
 

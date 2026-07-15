@@ -1,20 +1,32 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "scanner_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_routed.hpp"
+#else
 #include "active_scanner.hpp"
 #include "audit_http.hpp"
 #include "issue.hpp"
 #include "passive_scanner.hpp"
 #include "scanner_module.hpp"
+#endif
 
 #include "../../ui/components.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "../../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -87,7 +99,6 @@ void render_audits_pane(float w, float h, float alpha)
     const auto& th = aida::ui::resolved();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImGui::BeginChild("##burp_audits", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
-    ImVec2 org = ImGui::GetWindowPos();
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Audits");
@@ -169,7 +180,6 @@ void render_issues_pane(float w, float h, float alpha)
     const auto& th = aida::ui::resolved();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImGui::BeginChild("##burp_issues", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
-    ImVec2 org = ImGui::GetWindowPos();
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Issues");
@@ -260,6 +270,7 @@ void render_issues_pane(float w, float h, float alpha)
 
         ImGui::SetCursorPosY(ry + row_h);
     }
+    ImGui::Dummy(ImVec2(0.f, 0.f));
     ImGui::EndChild();
 
     ImGui::Spacing();
@@ -497,6 +508,12 @@ void render(float pos_x, float pos_y, float width, float height,
         auto doc = issue_store::export_json(f);
         std::string path = issue_store::storage_path();
         path += ".export.json";
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        aida::preview::network::record_receipt("Scanner issue export", path);
+        _snprintf_s(vs().status_msg, sizeof(vs().status_msg), _TRUNCATE,
+                    "Prepared %zu issues at %s",
+                    doc.contains("count") ? doc["count"].get<size_t>() : 0, path.c_str());
+#else
         FILE* fp = nullptr;
         if (fopen_s(&fp, path.c_str(), "wb") == 0 && fp) {
             std::string dump = doc.dump(2);
@@ -506,6 +523,7 @@ void render(float pos_x, float pos_y, float width, float height,
                         "Exported %zu issues to %s",
                         doc.contains("count") ? doc["count"].get<size_t>() : 0, path.c_str());
         }
+#endif
     }
     ImGui::SameLine();
     if (aida::ui::button("Clear Issues", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {

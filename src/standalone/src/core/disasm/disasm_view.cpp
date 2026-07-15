@@ -8,18 +8,26 @@
 #include "rename_store.hpp"
 #include "comment_store.hpp"
 #include "../analysis/auto_comment_store.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/disasm_preview_adapter.hpp"
+#else
 #include "../analysis/source_reconstruct_view.hpp"
+#endif
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../analysis/workspace/x86_decoder.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/taskflow_runtime.hpp"
 #include "../scanner/aob_generator.hpp"
 #include "../scanner/scan_hub_view.hpp"
+#endif
 #include "../ui/components.hpp"
 #include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
 #include "../../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -30,7 +38,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <fstream>
+#endif
 #include <limits>
 #include <shared_mutex>
 #include <unordered_map>
@@ -245,16 +255,8 @@ void request_format_page(const workspace_context_t& context,
         if (!context.view->pending_format_pages.insert(page_key).second)
             return;
     }
-    const std::string target_id = context.workspace->identity().binary_id().to_hex();
-    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
-    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
-    descriptor.owner_subsystem = "analysis_ui";
-    descriptor.label = "format_visible_disassembly";
-    descriptor.target_id = target_id.c_str();
-    descriptor.generation = context.publication->generation;
-    descriptor.cancellable_body = [context, begin, end, page_key](
-        const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) {
-        if (runtime_cancel.requested.load(std::memory_order_acquire) ||
+    const auto format_body = [context, begin, end, page_key](const std::atomic<bool>& cancelled) {
+        if (cancelled.load(std::memory_order_acquire) ||
             context.workspace->cancellation_token().stop_requested()) {
             publish_format_failure(context, page_key, "Formatting cancelled.");
             return;
@@ -304,7 +306,7 @@ void request_format_page(const workspace_context_t& context,
         instruction_format_options_t options;
         options.maximum_text_bytes = 2048;
         for (std::size_t index = begin; index < end; ++index) {
-            if (runtime_cancel.requested.load(std::memory_order_acquire) ||
+            if (cancelled.load(std::memory_order_acquire) ||
                 context.workspace->cancellation_token().stop_requested())
                 break;
             const auto& instruction = instructions[index];
@@ -345,11 +347,29 @@ void request_format_page(const workspace_context_t& context,
             context.view->formatted.insert_or_assign(item.first, std::move(item.second));
         context.view->format_error.clear();
     };
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::atomic<bool> cancelled{false};
+    format_body(cancelled);
+    aida::preview::disasm::record("format_visible_disassembly", begin,
+        std::to_string(end - begin));
+#else
+    const std::string target_id = context.workspace->identity().binary_id().to_hex();
+    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+    descriptor.owner_subsystem = "analysis_ui";
+    descriptor.label = "format_visible_disassembly";
+    descriptor.target_id = target_id.c_str();
+    descriptor.generation = context.publication->generation;
+    descriptor.cancellable_body = [format_body](
+        const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) {
+        format_body(runtime_cancel.requested);
+    };
     const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
     if (!submitted.submitted)
         publish_format_failure(context, page_key,
             submitted.reject_reason.empty() ? "Formatting queue rejected the page." :
                                                submitted.reject_reason);
+#endif
 }
 
 void apply_committed_operation(const workspace_context_t& context,
@@ -402,17 +422,14 @@ bool queue_overlay_operation(const workspace_context_t& context,
         !context.workspace->overlay())
         return false;
     context.view->pending_mutations.fetch_add(1, std::memory_order_acq_rel);
-    const std::string target_id = context.workspace->identity().binary_id().to_hex();
-    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
-    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
-    descriptor.owner_subsystem = "analysis_ui";
-    descriptor.label = "workspace_overlay_mutation";
-    descriptor.target_id = target_id.c_str();
-    descriptor.generation = context.publication->generation;
-    descriptor.cancellable_body = [context, operation = std::move(operation)](
-        const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) mutable {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const auto preview_kind = operation.kind;
+    const auto preview_address = operation.address.value;
+#endif
+    auto mutation_body = [context, operation = std::move(operation)](
+        bool cancelled) mutable {
         std::string error;
-        if (runtime_cancel.requested.load(std::memory_order_acquire)) {
+        if (cancelled) {
             error = "Mutation cancelled before execution.";
         } else {
             std::lock_guard<std::mutex> mutation_lock(context.model->mutation_mutex);
@@ -438,6 +455,32 @@ bool queue_overlay_operation(const workspace_context_t& context,
         }
         context.view->pending_mutations.fetch_sub(1, std::memory_order_acq_rel);
     };
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    mutation_body(false);
+    bool succeeded = false;
+    std::string mutation_detail;
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        succeeded = context.view->mutation_error.empty();
+        mutation_detail = succeeded
+            ? std::to_string(static_cast<unsigned>(preview_kind))
+            : context.view->mutation_error;
+    }
+    aida::preview::disasm::record("workspace_overlay_mutation", preview_address,
+        std::move(mutation_detail));
+    return succeeded;
+#else
+    const std::string target_id = context.workspace->identity().binary_id().to_hex();
+    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+    descriptor.owner_subsystem = "analysis_ui";
+    descriptor.label = "workspace_overlay_mutation";
+    descriptor.target_id = target_id.c_str();
+    descriptor.generation = context.publication->generation;
+    descriptor.cancellable_body = [mutation_body = std::move(mutation_body)](
+        const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) mutable {
+        mutation_body(runtime_cancel.requested.load(std::memory_order_acquire));
+    };
     const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
     if (!submitted.submitted) {
         context.view->pending_mutations.fetch_sub(1, std::memory_order_acq_rel);
@@ -447,6 +490,7 @@ bool queue_overlay_operation(const workspace_context_t& context,
         return false;
     }
     return true;
+#endif
 }
 
 std::string address_label(const workspace_context_t& context,
@@ -554,7 +598,7 @@ void render_xref_popup(const workspace_context_t& context) {
         }
     }
     if (visible_entries == 0 && !scanning)
-        aida::ui::empty_state("xref_empty", "No cross references found",
+        aida::ui::compact_empty_state("xref_empty", "No cross references found",
             filter.empty() ? "No indexed references target this location."
                            : "No references match the current filter.",
             nullptr, ImVec2(0.0f, 140.0f));
@@ -573,6 +617,18 @@ void request_listing_export(const workspace_context_t& context) {
         !context.publication->snapshot ||
         context.view->export_pending.exchange(true, std::memory_order_acq_rel))
         return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const auto count = context.publication->snapshot->instructions.size();
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        context.view->export_error.clear();
+        context.view->export_status = "Exported " + std::to_string(count) +
+            " instructions to aida_disasm_dump.txt.";
+    }
+    context.view->export_pending.store(false, std::memory_order_release);
+    aida::preview::disasm::record("export_workspace_disassembly", count,
+        "aida_disasm_dump.txt");
+#else
     {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         context.view->export_error.clear();
@@ -673,6 +729,7 @@ void request_listing_export(const workspace_context_t& context) {
         context.view->export_error = submitted.reject_reason.empty()
             ? "Listing export queue rejected the request." : submitted.reject_reason;
     }
+#endif
 }
 
 }
@@ -1019,6 +1076,33 @@ void open_xrefs(std::uint64_t value, const workspace_context_t& context) {
         context.view->xref_results.clear();
         context.view->xref_popup_selected = -1;
     }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::vector<xref_popup_entry_t> results;
+    results.reserve(256);
+    constexpr std::size_t maximum_results = 10000;
+    for (const auto& xref : context.publication->snapshot->xrefs) {
+        if (context.workspace->cancellation_token().stop_requested())
+            break;
+        if (xref.target != *address)
+            continue;
+        xref_popup_entry_t entry;
+        entry.addr = runtime_address(context, xref.source).value_or(xref.source.value);
+        entry.type = static_cast<int>(xref.kind);
+        entry.module_name = context.workspace->identity().bin_name();
+        entry.function_name = resolve_name(context, xref.source);
+        results.push_back(std::move(entry));
+        if (results.size() >= maximum_results)
+            break;
+    }
+    const auto result_count = results.size();
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        context.view->xref_results = std::move(results);
+    }
+    context.view->xref_scanning.store(false, std::memory_order_release);
+    aida::preview::disasm::record("workspace_xref_query", value,
+        std::to_string(result_count));
+#else
     const std::string target_id = context.workspace->identity().binary_id().to_hex();
     aida::infra::taskflow_runtime::task_descriptor_t descriptor;
     descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
@@ -1058,6 +1142,7 @@ void open_xrefs(std::uint64_t value, const workspace_context_t& context) {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         context.view->format_error = submitted.reject_reason;
     }
+#endif
 }
 
 void bump_format_generation(const workspace_context_t& context) {
@@ -1102,7 +1187,7 @@ void render(float, float, float width, float height,
             const workspace_context_t& context, float) {
     if (!context) {
         ImGui::BeginChild("##workspace_disassembly_empty", ImVec2(width, height), false);
-        aida::ui::empty_state("disassembly_workspace_empty", "No workspace selected",
+        aida::ui::compact_empty_state("disassembly_workspace_empty", "No workspace selected",
             "Open or attach to a target to inspect its disassembly.", nullptr,
             ImVec2(0.0f, (std::max)(152.0f, height - aida::ui::metrics::spacing::lg)));
         ImGui::EndChild();
@@ -1342,7 +1427,7 @@ void render(float, float, float width, float height,
                 "Instruction records will appear as soon as analysis publishes them.",
                 ImVec2(0.0f, 152.0f));
         } else {
-            aida::ui::empty_state("disassembly_no_records", "No instructions available",
+            aida::ui::compact_empty_state("disassembly_no_records", "No instructions available",
                 "This target has no instruction records at the current readiness level.", nullptr,
                 ImVec2(0.0f, 152.0f));
         }
@@ -1551,9 +1636,23 @@ void render(float, float, float width, float height,
                     if (function != 0)
                         pseudocode_view::request_decompile(context, function, false);
                 }
-                if (ImGui::MenuItem("Reconstruct Source"))
+                if (ImGui::MenuItem("Reconstruct Source")) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    aida::preview::disasm::record("reconstruct_source",
+                        runtime_address(context, instruction.address).value_or(
+                            instruction.address.value));
+#else
                     source_reconstruct_view::open(context);
+#endif
+                }
                 if (ImGui::MenuItem("Generate AOB Signature")) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    const auto instruction_address = runtime_address(context,
+                        instruction.address).value_or(instruction.address.value);
+                    aida::preview::disasm::record("generate_aob_signature",
+                        instruction_address, "16:auto_wildcard");
+                    globals::ui::active_center_view = center_view_t::scan_hub;
+#else
                     const auto generator = aob_generator::state_for(context);
                     const auto instruction_address = runtime_address(context,
                         instruction.address).value_or(instruction.address.value);
@@ -1571,6 +1670,7 @@ void render(float, float, float width, float height,
                         instruction_count, auto_wildcard);
                     scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
                     globals::ui::active_center_view = center_view_t::scan_hub;
+#endif
                 }
                 ImGui::EndPopup();
             }

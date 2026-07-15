@@ -1,13 +1,16 @@
 #include "hex_view.hpp"
 
 #include "../analysis/workspace/overlay_journal.hpp"
-#include "../analysis/workspace/workspace_registry.hpp"
+#include "../../helpers/globals.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/hex_preview_adapter.hpp"
+#else
 #include "../infra/taskflow_runtime.hpp"
+#include "standalone_driver.hpp"
+#endif
 #include "../ui/components.hpp"
 #include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
-#include "../../helpers/globals.h"
-#include "standalone_driver.hpp"
 
 #include "imgui/imgui.h"
 
@@ -86,8 +89,10 @@ struct workspace_hex_state_t final : aida::analysis::workspace_lifecycle_partici
     std::atomic<std::uint32_t> pending_jobs{0};
     std::mutex drain_mutex;
     std::condition_variable drain_cv;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     aida::infra::taskflow_runtime::job_handle_t patch_job;
     aida::infra::taskflow_runtime::job_handle_t search_job;
+#endif
     std::uint64_t scroll_to_offset = (std::numeric_limits<std::uint64_t>::max)();
     std::string error;
 
@@ -96,6 +101,7 @@ struct workspace_hex_state_t final : aida::analysis::workspace_lifecycle_partici
         std::chrono::steady_clock::time_point deadline) override;
 };
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 struct pending_job_t final {
     explicit pending_job_t(std::shared_ptr<workspace_hex_state_t> state_value)
         : state(std::move(state_value)) {
@@ -109,6 +115,7 @@ struct pending_job_t final {
 
     std::shared_ptr<workspace_hex_state_t> state;
 };
+#endif
 
 std::mutex& registry_mutex() {
     static std::mutex value;
@@ -134,26 +141,32 @@ void unregister_state(const aida::analysis::binary_id_t& id,
 void workspace_hex_state_t::request_cancel() noexcept {
     cancelled.store(true, std::memory_order_release);
     std::shared_ptr<aida::analysis::cancellation_source_t> search;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     aida::infra::taskflow_runtime::job_handle_t patch;
     aida::infra::taskflow_runtime::job_handle_t search_task;
+#endif
     {
         std::lock_guard<std::mutex> lock(mutex);
         search = search_cancellation;
         search_cancellation.reset();
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
         patch = patch_job;
         search_task = search_job;
         patch_job = {};
         search_job = {};
+#endif
         window = {};
         window_size = 0;
         live_bytes.clear();
     }
     if (search)
         search->request_cancel();
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (patch.valid())
         aida::infra::taskflow_runtime::cancel(patch);
     if (search_task.valid())
         aida::infra::taskflow_runtime::cancel(search_task);
+#endif
     unregister_state(owner_id, this);
 }
 
@@ -255,6 +268,28 @@ void request_patch_refresh(const disasm_view::workspace_context_t& context,
     }
     if (state->patch_refreshing.exchange(true, std::memory_order_acq_rel))
         return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::vector<patch_span_t> patches;
+    if (auto overlay = context.workspace->overlay()) {
+        const auto operations = overlay->patch_operations();
+        patches.reserve(operations.size());
+        for (const auto& operation : operations) {
+            const auto offset = disasm_view::provider_offset(context, operation.address);
+            if (!offset || operation.bytes.empty())
+                continue;
+            patches.push_back({*offset, operation.bytes});
+        }
+        std::sort(patches.begin(), patches.end(), [](const auto& left, const auto& right) {
+            return left.offset < right.offset;
+        });
+    }
+    if (state_matches(context, state)) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->patches = std::move(patches);
+        state->patch_revision = context.workspace->overlay_revision();
+    }
+    state->patch_refreshing.store(false, std::memory_order_release);
+#else
     const std::string target_id = context.workspace->identity().binary_id().to_hex();
     auto pending = std::make_shared<pending_job_t>(state);
     aida::infra::taskflow_runtime::task_descriptor_t descriptor;
@@ -306,6 +341,7 @@ void request_patch_refresh(const disasm_view::workspace_context_t& context,
         if (cancel_submitted)
             aida::infra::taskflow_runtime::cancel(submitted.handle);
     }
+#endif
 }
 
 bool ensure_window(const disasm_view::workspace_context_t& context,
@@ -392,6 +428,58 @@ void start_search(const disasm_view::workspace_context_t& context,
             live_source = state->live_bytes;
     }
     state->searching.store(true, std::memory_order_release);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    constexpr std::uint64_t chunk_size = 4ULL << 20;
+    constexpr std::size_t maximum_matches = 100000;
+    std::vector<std::uint64_t> matches;
+    std::uint64_t cursor = 0;
+    if (!live_source.empty() && state_matches(context, state) &&
+        !cancellation->token().stop_requested()) {
+        auto found = std::search(live_source.begin(), live_source.end(),
+            pattern.begin(), pattern.end());
+        while (found != live_source.end() && matches.size() < maximum_matches &&
+               !cancellation->token().stop_requested()) {
+            matches.push_back(static_cast<std::uint64_t>(
+                std::distance(live_source.begin(), found)));
+            found = std::search(found + 1, live_source.end(), pattern.begin(), pattern.end());
+        }
+    }
+    while (live_source.empty() && cursor < context.workspace->provider().size() &&
+           matches.size() < maximum_matches && state_matches(context, state) &&
+           !cancellation->token().stop_requested()) {
+        const std::uint64_t remaining = context.workspace->provider().size() - cursor;
+        const std::uint64_t length = (std::min)(remaining, chunk_size);
+        auto lease = context.workspace->provider().lease(cursor, length,
+            cancellation->token());
+        if (!lease)
+            break;
+        const auto& view = lease.value();
+        if (view.size() >= pattern.size()) {
+            auto found = std::search(view.begin(), view.end(), pattern.begin(), pattern.end());
+            while (found != view.end() && matches.size() < maximum_matches) {
+                matches.push_back(cursor + static_cast<std::uint64_t>(
+                    std::distance(view.begin(), found)));
+                found = std::search(found + 1, view.end(), pattern.begin(), pattern.end());
+            }
+        }
+        if (length == remaining)
+            break;
+        const std::uint64_t overlap = pattern.size() > 1 ? pattern.size() - 1 : 0;
+        cursor += length - (std::min)(length - 1, overlap);
+    }
+    if (state_matches(context, state)) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->search_serial.load(std::memory_order_acquire) == serial) {
+            state->ui.search_matches = std::move(matches);
+            state->ui.search_match_idx = state->ui.search_matches.empty() ? -1 : 0;
+            state->ui.search_match = state->ui.search_matches.empty() ? -1 :
+                static_cast<std::int64_t>(state->ui.search_matches.front());
+            if (!state->ui.search_matches.empty())
+                state->scroll_to_offset = state->ui.search_matches.front();
+        }
+    }
+    state->searching.store(false, std::memory_order_release);
+#else
     const std::string target_id = context.workspace->identity().binary_id().to_hex();
     auto pending = std::make_shared<pending_job_t>(state);
     aida::infra::taskflow_runtime::task_descriptor_t descriptor;
@@ -475,6 +563,7 @@ void start_search(const disasm_view::workspace_context_t& context,
         if (cancel_submitted)
             aida::infra::taskflow_runtime::cancel(submitted.handle);
     }
+#endif
 }
 
 void step_search_result(const std::shared_ptr<workspace_hex_state_t>& state, int direction) {
@@ -621,8 +710,12 @@ void copy_selection(const disasm_view::workspace_context_t& context,
     if (!live_bytes.empty()) {
         if (static_cast<std::uint64_t>(end) >= live_bytes.size())
             return;
-        selected.assign(live_bytes.begin() + static_cast<std::size_t>(begin),
-            live_bytes.begin() + static_cast<std::size_t>(end + 1));
+        using byte_difference_t = std::vector<std::uint8_t>::difference_type;
+        if (end >= static_cast<std::int64_t>(std::numeric_limits<byte_difference_t>::max()))
+            return;
+        const auto first = static_cast<byte_difference_t>(begin);
+        const auto last = static_cast<byte_difference_t>(end + 1);
+        selected.assign(live_bytes.begin() + first, live_bytes.begin() + last);
     } else {
         auto bytes = context.workspace->provider().read_vector(static_cast<std::uint64_t>(begin),
             count, 1ULL << 20, context.workspace->cancellation_token());
@@ -678,7 +771,12 @@ bool read_live_memory(const disasm_view::workspace_context_t& context,
     }
     const std::uint32_t pid = context.workspace->identity().process()->pid;
     std::vector<std::uint8_t> bytes;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    bytes = aida::preview::hex::live_memory(pid, address, size);
+    if (bytes.size() != size) {
+#else
     if (!driver_bridge::read_memory_for(pid, address, size, bytes) || bytes.size() != size) {
+#endif
         std::lock_guard<std::mutex> lock(state->mutex);
         state->error = "IO_FAILURE: bounded live-memory read failed";
         return false;
@@ -739,7 +837,7 @@ void render(float, float, float width, float height,
             const disasm_view::workspace_context_t& context) {
     if (!context) {
         ImGui::BeginChild("##workspace_hex_empty", ImVec2(width, height), false);
-        aida::ui::empty_state("hex_workspace_empty", "No workspace selected",
+        aida::ui::compact_empty_state("hex_workspace_empty", "No workspace selected",
             "Open or attach to a target to inspect its bytes.", nullptr,
             ImVec2(0.0f, (std::max)(152.0f, height - aida::ui::metrics::spacing::lg)));
         ImGui::EndChild();
@@ -960,7 +1058,7 @@ void render(float, float, float width, float height,
             context.workspace->provider().size();
     }
     if (byte_count == 0) {
-        aida::ui::empty_state("hex_source_empty", "No bytes available",
+        aida::ui::compact_empty_state("hex_source_empty", "No bytes available",
             live_source ? "The selected memory snapshot does not contain readable bytes."
                         : "The workspace provider has not published readable bytes.",
             nullptr, ImVec2(0.0f, 152.0f));
@@ -1059,7 +1157,11 @@ void render(float, float, float width, float height,
                     if (!live_source && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                         if (auto translated = normalized_address_for_file_offset(context, offset)) {
                             disasm_view::goto_address(*translated, context);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                            aida::preview::hex::opened_disassembly(offset);
+#else
                             globals::ui::active_center_view = center_view_t::disassembly;
+#endif
                         }
                     }
                 }

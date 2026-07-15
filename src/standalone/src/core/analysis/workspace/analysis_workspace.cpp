@@ -1608,6 +1608,51 @@ workspace_result_t<std::shared_ptr<analysis_workspace_t>> analysis_workspace_t::
                        std::move(binding), cancel);
 }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+workspace_result_t<std::shared_ptr<analysis_workspace_t>>
+analysis_workspace_t::create_preview(
+    std::shared_ptr<const workspace_identity_t> identity,
+    std::shared_ptr<const byte_provider_t> provider,
+    std::shared_ptr<const workspace_image_t> normalized_image,
+    std::shared_ptr<const pe_image_t> image,
+    std::shared_ptr<const analysis_snapshot_t> snapshot_value) {
+    if (!identity || !provider || !normalized_image || !image || !snapshot_value)
+        return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+            make_workspace_error(workspace_error_code_t::invalid_argument,
+                                 "preview workspace fixture is incomplete",
+                                 "workspace_preview"));
+    auto workspace = std::shared_ptr<analysis_workspace_t>(new analysis_workspace_t(
+        std::move(identity), std::move(provider), std::move(normalized_image),
+        std::move(image)));
+    workspace->provider_binding_ = workspace_provider_binding_t(
+        workspace->identity().content_hash(),
+        workspace->source_provider().identity().normalized_source,
+        workspace->source_provider().size());
+    auto canonical = workspace->canonicalize_snapshot(
+        std::move(snapshot_value), workspace->provider_handle());
+    if (!canonical)
+        return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+            canonical.error());
+    auto validation = validate_analysis_snapshot(*canonical.value(), false);
+    if (!validation)
+        return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::failure(
+            validation.error());
+    const auto publication = std::make_shared<const analysis_publication_t>(
+        canonical.take_value(), workspace->provider_handle(), nullptr,
+        workspace_readiness_t::partial);
+    std::atomic_store_explicit(&workspace->publication_state_->publication,
+                               publication, std::memory_order_release);
+    workspace->progress_.readiness = workspace_readiness_t::partial;
+    workspace->progress_.phase = "analysis-ready";
+    workspace->progress_.completed_units = 7;
+    workspace->progress_.total_units = 7;
+    workspace->progress_.completed_bytes = workspace->source_provider().size();
+    workspace->progress_.total_bytes = workspace->source_provider().size();
+    return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::success(
+        std::move(workspace));
+}
+#endif
+
 workspace_result_t<std::shared_ptr<analysis_workspace_t>> analysis_workspace_t::create_impl(
     std::shared_ptr<const workspace_identity_t> identity,
     std::shared_ptr<const byte_provider_t> provider,
@@ -2593,7 +2638,7 @@ std::vector<projected_range_t> merged_projected_ranges(
         if (merged.empty()) {
             merged.push_back(range);
             merged.back().is_byte_patch = false;
-            merged.back().operation_kind =
+            merged.back().source_kind =
                 overlay_operation_kind_v9_t::reanalysis;
             continue;
         }
@@ -2603,7 +2648,7 @@ std::vector<projected_range_t> merged_projected_ranges(
         if (range.offset > previous_end) {
             merged.push_back(range);
             merged.back().is_byte_patch = false;
-            merged.back().operation_kind =
+            merged.back().source_kind =
                 overlay_operation_kind_v9_t::reanalysis;
             continue;
         }
@@ -2967,10 +3012,10 @@ make_projected_analysis_candidate(
         instruction.target_fact_begin =
             static_cast<std::uint32_t>(next->target_facts.size());
         next->operand_facts.insert(next->operand_facts.end(),
-            source.operand_facts.begin() + operand_begin,
+            source.operand_facts.begin() + static_cast<std::ptrdiff_t>(operand_begin),
             source.operand_facts.begin() + static_cast<std::ptrdiff_t>(operand_end));
         next->target_facts.insert(next->target_facts.end(),
-            source.target_facts.begin() + target_begin,
+            source.target_facts.begin() + static_cast<std::ptrdiff_t>(target_begin),
             source.target_facts.begin() + static_cast<std::ptrdiff_t>(target_end));
         next->instructions.push_back(std::move(instruction));
         if (!source.delay_slot_counts.empty())

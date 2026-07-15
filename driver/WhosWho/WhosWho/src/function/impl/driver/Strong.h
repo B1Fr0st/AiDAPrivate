@@ -6,6 +6,7 @@
 #include <intrin.h>
 #include <imports/Defs.h>
 #include <function/CoreSecurity.h>
+#include <function/KernelLayout.h>
 
 #define win_1803 17134
 #define win_1809 17763
@@ -16,7 +17,35 @@
 #define win_21H1 20180
 #define win_22H2 19045
 
-static const UINT64 PMASK = 0x000FFFFFFFFFF000ull;
+__forceinline UINT64 pfn_mask()
+{
+    static volatile LONG g_pfn_mask_resolved = 0;
+    static volatile UINT64 g_pfn_mask_value = 0x000FFFFFFFFFF000ULL;
+
+    if (_InterlockedCompareExchange(&g_pfn_mask_resolved, 0, 0) == 2)
+        return g_pfn_mask_value;
+
+    LONG prev = _InterlockedCompareExchange(&g_pfn_mask_resolved, 1, 0);
+    if (prev == 2)
+        return g_pfn_mask_value;
+    if (prev == 1) {
+        while (_InterlockedCompareExchange(&g_pfn_mask_resolved, 0, 0) == 1)
+            YieldProcessor();
+        return g_pfn_mask_value;
+    }
+
+    ULONG build = whoswho_kernel_layout::build_number();
+    if (build >= 22000)
+        g_pfn_mask_value = 0x000FFFFFFFFFFF000ULL;
+    else
+        g_pfn_mask_value = 0x000FFFFFFFFFF000ULL;
+
+    KeMemoryBarrier();
+    _InterlockedExchange(&g_pfn_mask_resolved, 2);
+    return g_pfn_mask_value;
+}
+
+#define PMASK pfn_mask()
 
 namespace timing_guard {
     inline volatile ULONG g_timing_seed = 0x5A5A5A5Au;

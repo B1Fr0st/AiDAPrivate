@@ -855,15 +855,15 @@ graph_error_t graph_document_model_t::layout_layered(
         increment_subject(subject);
     }
 
-    auto find_node_index = [&](graph_node_id_t id) -> std::uint64_t {
+    auto find_node_index = [&](graph_node_id_t id) -> std::size_t {
         auto it = std::lower_bound(nodes.begin(), nodes.end(), id,
             [](graph_node_id_t node, graph_node_id_t value) { return node < value; });
         if (it == nodes.end() || *it != id)
             return nodes.size();
-        return static_cast<std::uint64_t>(it - nodes.begin());
+        return static_cast<std::size_t>(it - nodes.begin());
     };
 
-    std::vector<std::vector<std::uint64_t>> successors(nodes.size());
+    std::vector<std::vector<std::size_t>> successors(nodes.size());
     for (std::size_t i = 0; i < edges.size(); ++i) {
         if (cancellation_requested(cancellation))
             return cancelled();
@@ -882,7 +882,7 @@ graph_error_t graph_document_model_t::layout_layered(
         auto& adjacent = successors[i];
         if (!cancellable_sort(
                 adjacent,
-                [](std::uint64_t lhs, std::uint64_t rhs) { return lhs < rhs; },
+                [](std::size_t lhs, std::size_t rhs) { return lhs < rhs; },
                 cancellation, subject))
             return cancelled();
         std::size_t write = 0;
@@ -898,9 +898,9 @@ graph_error_t graph_document_model_t::layout_layered(
 
     std::vector<std::uint32_t> layer(nodes.size(), 0);
     std::vector<bool> visited(nodes.size(), false);
-    std::vector<std::uint64_t> stack;
+    std::vector<std::size_t> stack;
     stack.reserve(nodes.size());
-    for (std::uint64_t i = 0; i < nodes.size(); ++i) {
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
         if (cancellation_requested(cancellation))
             return cancelled();
         if (visited[i])
@@ -935,7 +935,7 @@ graph_error_t graph_document_model_t::layout_layered(
         increment_subject(subject);
     }
 
-    const float layer_height = request.canvas_height / (max_layer + 2);
+    const float layer_height = request.canvas_height / static_cast<float>(max_layer + 2U);
     const float node_width = 120.0f;
     const float node_height = 40.0f;
 
@@ -949,7 +949,7 @@ graph_error_t graph_document_model_t::layout_layered(
 
     std::vector<std::uint32_t> layer_cursor(max_layer + 1, 0);
     output.nodes.reserve(nodes.size());
-    for (std::uint64_t i = 0; i < nodes.size(); ++i) {
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
         if (cancellation_requested(cancellation))
             return cancelled();
         graph_layout_node_t ln;
@@ -957,9 +957,9 @@ graph_error_t graph_document_model_t::layout_layered(
         const auto l = layer[i];
         const auto pos_in_layer = layer_cursor[l]++;
         const auto count_in_layer = nodes_per_layer[l];
-        const float col_width = request.canvas_width / (count_in_layer + 1);
-        ln.x = col_width * (pos_in_layer + 1) - node_width / 2.0f;
-        ln.y = layer_height * (l + 1);
+        const float col_width = request.canvas_width / static_cast<float>(count_in_layer + 1U);
+        ln.x = col_width * static_cast<float>(pos_in_layer + 1U) - node_width / 2.0f;
+        ln.y = layer_height * static_cast<float>(l + 1U);
         ln.width = node_width;
         ln.height = node_height;
         ln.layer = l;

@@ -153,8 +153,8 @@ namespace aida::mcp_marketplace_view {
 	inline std::string format_count(int64_t v)
 	{
 		char buf[32];
-		if (v >= 1000000) std::snprintf(buf, sizeof(buf), "%.1fM", v / 1000000.0);
-		else if (v >= 1000) std::snprintf(buf, sizeof(buf), "%.1fK", v / 1000.0);
+		if (v >= 1000000) std::snprintf(buf, sizeof(buf), "%.1fM", static_cast<double>(v) / 1000000.0);
+		else if (v >= 1000) std::snprintf(buf, sizeof(buf), "%.1fK", static_cast<double>(v) / 1000.0);
 		else std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v));
 		return std::string(buf);
 	}
@@ -834,11 +834,15 @@ namespace aida::mcp_marketplace_view {
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(0, 0, 0, 0));
-		if (ImGui::Begin("##mcp_market_blocker", nullptr,
+		ImGuiWindowFlags blocker_flags =
 			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
-			ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollbar)) {
+			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+			ImGuiWindowFlags_NoScrollbar;
+#ifdef IMGUI_HAS_DOCK
+		blocker_flags |= ImGuiWindowFlags_NoDocking;
+#endif
+		if (ImGui::Begin("##mcp_market_blocker", nullptr, blocker_flags)) {
 			ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), display,
 				IM_COL32(0, 0, 0, static_cast<int>(140.f * alpha)));
 			ImGui::InvisibleButton("##mcp_block", display);
@@ -857,10 +861,14 @@ namespace aida::mcp_marketplace_view {
 		ImGui::SetNextWindowFocus();
 
 		bool win_open = true;
-		if (ImGui::Begin("##aida_mcp_marketplace", &win_open,
+		ImGuiWindowFlags marketplace_flags =
 			ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-			ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking)) {
+			ImGuiWindowFlags_NoSavedSettings;
+#ifdef IMGUI_HAS_DOCK
+		marketplace_flags |= ImGuiWindowFlags_NoDocking;
+#endif
+		if (ImGui::Begin("##aida_mcp_marketplace", &win_open, marketplace_flags)) {
 
 			ImDrawList* wdl = ImGui::GetWindowDrawList();
 
@@ -918,8 +926,8 @@ namespace aida::mcp_marketplace_view {
 			float count_y = sep_y + 6.f;
 			if (!s.last_results.empty()) {
 				char count_buf[64];
-				std::snprintf(count_buf, sizeof(count_buf), "%d server%s",
-					(int)s.last_results.size(),
+				std::snprintf(count_buf, sizeof(count_buf), "%zu server%s",
+					s.last_results.size(),
 					s.last_results.size() == 1 ? "" : "s");
 				wdl->AddText(aida::ui::fonts::caption(), 12.f,
 					ImVec2(panel_a.x + pad, count_y),
@@ -945,7 +953,7 @@ namespace aida::mcp_marketplace_view {
 				ImDrawList* sdl = ImGui::GetWindowDrawList();
 				for (int i = 0; i < 6; ++i) {
 					float row_h = 58.f;
-					ImVec2 ka(sp.x, sp.y + i * (row_h + 1.f));
+					ImVec2 ka(sp.x, sp.y + static_cast<float>(i) * (row_h + 1.f));
 					ImVec2 kb(sp.x + content_w, ka.y + row_h);
 					aida::ui::skeleton::render_card(sdl, ka, kb, 6.f, 1.5f);
 				}

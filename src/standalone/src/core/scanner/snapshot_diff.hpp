@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -15,18 +17,25 @@
 #include <unordered_set>
 #include <vector>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <shlobj.h>
 #include <commdlg.h>
+#endif
 
 #include "imgui/imgui.h"
-#include "standalone_driver.hpp"
 #include "ui_anim.hpp"
-#include "../anti-tamper/webhook.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#include "../../preview/scan_preview_runtime.hpp"
+#else
+#include "standalone_driver.hpp"
+#include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../infra/executor.hpp"
+#endif
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -79,7 +88,7 @@ struct diff_result_t {
 	std::string                  snap_b_name;
 	std::vector<changed_region_t> changes;
 	uint64_t                     total_changed_bytes = 0;
-	size_t                       changed_page_count = 0;
+	std::size_t                  changed_page_count = 0;
 };
 
 struct state_t {
@@ -123,6 +132,9 @@ namespace detail {
 
 inline std::filesystem::path snapshot_dir()
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	return {};
+#else
 	wchar_t* appdata = nullptr;
 	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
 		auto p = std::filesystem::path(appdata) / L"AiDA" / L"Standalone" / L"snapshots";
@@ -130,6 +142,7 @@ inline std::filesystem::path snapshot_dir()
 		return p;
 	}
 	return std::filesystem::current_path() / "snapshots";
+#endif
 }
 
 inline change_type_t classify_change(const uint8_t* old_data, const uint8_t* new_data, uint32_t size)
@@ -207,6 +220,9 @@ inline aida::ui::components::pill_kind_t change_pill_kind(change_type_t t)
 
 inline void save_snapshot(const snapshot_t& snap)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::scan::record("snapshot.save", snap.name);
+#else
 	auto dir = snapshot_dir();
 	std::filesystem::create_directories(dir);
 
@@ -233,10 +249,16 @@ inline void save_snapshot(const snapshot_t& snap)
 		if (rsize > 0)
 			ofs.write(reinterpret_cast<const char*>(r.data.data()), static_cast<std::streamsize>(rsize));
 	}
+#endif
 }
 
 inline bool load_snapshot(const std::string& path, snapshot_t& out)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	(void)path;
+	out = {};
+	return false;
+#else
 	std::ifstream ifs(path, std::ios::binary);
 	if (!ifs.is_open()) {
 		g_state.last_error = "load_snapshot: failed to open file";
@@ -300,7 +322,7 @@ inline bool load_snapshot(const std::string& path, snapshot_t& out)
 
 		r.size = rsize;
 		if (rsize > 0) {
-			r.data.resize(static_cast<size_t>(rsize));
+			r.data.resize(static_cast<std::size_t>(rsize));
 			if (!ifs.read(reinterpret_cast<char*>(r.data.data()), static_cast<std::streamsize>(rsize))) {
 				g_state.last_error = "load_snapshot: failed reading region data";
 				return false;
@@ -312,12 +334,50 @@ inline bool load_snapshot(const std::string& path, snapshot_t& out)
 	}
 
 	return true;
+#endif
 }
 
 }
 
 inline void take_snapshot(const std::string& name = "")
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	g_state.capturing.store(true);
+	snapshot_t snapshot;
+	snapshot.id = g_state.next_snap_id.fetch_add(1);
+	snapshot.name = name;
+	if (snapshot.name.empty()) {
+		++g_state.snap_counter;
+		snapshot.name = "Snap" + std::to_string(g_state.snap_counter);
+	}
+	snapshot.pid = 6420;
+	snapshot.timestamp = 1710000000 + static_cast<std::int64_t>(snapshot.id) * 12;
+	for (int region_index = 0; region_index < 3; ++region_index) {
+		memory_region_t region;
+		region.base = 0x00007FF7A4C00000ULL + static_cast<std::uint64_t>(region_index) * 0x1000ULL;
+		region.size = 256;
+		region.protect = region_index == 0 ? 0x20 : 0x04;
+		region.data.resize(static_cast<std::size_t>(region.size));
+		for (std::size_t index = 0; index < region.data.size(); ++index)
+			region.data[index] = static_cast<std::uint8_t>(
+				(index * 29U + static_cast<std::size_t>(region_index) * 47U) & 0xFFU);
+		if (snapshot.id > 1 && region_index == 1) {
+			region.data[40] = static_cast<std::uint8_t>(region.data[40] + 1);
+			region.data[41] = 0;
+			region.data[42] ^= 0x80;
+		}
+		snapshot.total_bytes += region.data.size();
+		snapshot.regions.push_back(std::move(region));
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		g_state.snapshots.push_back(std::move(snapshot));
+		if (g_state.snapshots.size() > 10) g_state.snapshots.erase(g_state.snapshots.begin());
+	}
+	g_state.progress.store(1.f);
+	g_state.capturing.store(false);
+	aida::preview::scan::record("snapshot.capture", g_state.snapshots.back().name);
+#else
 	if (g_state.capturing.load()) {
 		diag::log_tagged("snapshot_diff", "take_snapshot refused already_capturing");
 		return;
@@ -384,7 +444,7 @@ inline void take_snapshot(const std::string& name = "")
 			sr.base = r.base;
 			sr.protect = r.protect;
 
-			if (driver_bridge::read_memory(r.base, static_cast<size_t>(r.size), sr.data) && !sr.data.empty()) {
+			if (driver_bridge::read_memory(r.base, static_cast<std::size_t>(r.size), sr.data) && !sr.data.empty()) {
 				sr.size = sr.data.size();
 				snap.total_bytes += sr.data.size();
 				snap.regions.push_back(std::move(sr));
@@ -396,7 +456,7 @@ inline void take_snapshot(const std::string& name = "")
 
 		detail::save_snapshot(snap);
 
-		size_t region_count = snap.regions.size();
+		std::size_t region_count = snap.regions.size();
 		uint64_t total_bytes = snap.total_bytes;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -428,10 +488,15 @@ inline void take_snapshot(const std::string& name = "")
 		g_state.progress.store(1.f);
 		g_state.capturing.store(false);
 	}
+#endif
 }
 
 inline void load_from_disk(const std::string& path)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	take_snapshot("Imported Snapshot");
+	aida::preview::scan::record("snapshot.load", path.empty() ? "fixture" : path);
+#else
 	if (g_state.loading.load() || g_state.capturing.load()) {
 		diag::log_tagged_fmt("snapshot_diff", "load_from_disk refused busy loading=%d capturing=%d",
 			static_cast<int>(g_state.loading.load()),
@@ -476,7 +541,7 @@ inline void load_from_disk(const std::string& path)
 			snap.name = fallback_name;
 		}
 
-		size_t region_count = snap.regions.size();
+		std::size_t region_count = snap.regions.size();
 		uint64_t total_bytes = snap.total_bytes;
 		std::string snap_name = snap.name;
 		{
@@ -508,10 +573,57 @@ inline void load_from_disk(const std::string& path)
 		g_state.progress.store(1.f);
 		g_state.loading.store(false);
 	}
+#endif
 }
 
 inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	g_state.comparing.store(true);
+	diff_result_t result;
+	snapshot_t first;
+	snapshot_t second;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		for (const auto& snapshot : g_state.snapshots) {
+			if (snapshot.id == id_a) first = snapshot;
+			if (snapshot.id == id_b) second = snapshot;
+		}
+	}
+	result.snap_a_name = first.name;
+	result.snap_b_name = second.name;
+	for (std::size_t region_index = 0;
+		region_index < first.regions.size() && region_index < second.regions.size(); ++region_index) {
+		const auto& old_region = first.regions[region_index];
+		const auto& new_region = second.regions[region_index];
+		const std::size_t size = (std::min)(old_region.data.size(), new_region.data.size());
+		bool region_changed = false;
+		for (std::size_t index = 0; index < size; ++index) {
+			if (old_region.data[index] == new_region.data[index]) continue;
+			changed_region_t change;
+			change.address = old_region.base + index;
+			change.size = 1;
+			change.old_data = {old_region.data[index]};
+			change.new_data = {new_region.data[index]};
+			change.type = detail::classify_change(change.old_data.data(), change.new_data.data(), 1);
+			change.module_name = "sample.exe";
+			result.changes.push_back(std::move(change));
+			++result.total_changed_bytes;
+			region_changed = true;
+		}
+		if (region_changed) ++result.changed_page_count;
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		g_state.diff = std::move(result);
+		g_state.selected_change = -1;
+		g_state.row_flash.assign(g_state.diff.changes.size(), 1.f);
+	}
+	g_state.progress.store(1.f);
+	g_state.comparing.store(false);
+	g_state.compare_cursor_active = false;
+	aida::preview::scan::record("snapshot.compare", std::to_string(id_a) + ":" + std::to_string(id_b));
+#else
 	if (g_state.comparing.load()) {
 		diag::log_tagged("snapshot_diff", "compare_snapshots refused already_comparing");
 		return;
@@ -571,8 +683,8 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 		result.snap_a_name = snap_a.name;
 		result.snap_b_name = snap_b.name;
 
-		std::unordered_map<uint64_t, size_t> b_map;
-		for (size_t i = 0; i < snap_b.regions.size(); ++i)
+		std::unordered_map<uint64_t, std::size_t> b_map;
+		for (std::size_t i = 0; i < snap_b.regions.size(); ++i)
 			b_map[snap_b.regions[i].base] = i;
 
 		auto modules = driver_bridge::enumerate_modules();
@@ -628,9 +740,9 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 			g_state.progress.store(static_cast<float>(done) / static_cast<float>(total));
 		}
 
-		size_t changes_count = result.changes.size();
+		std::size_t changes_count = result.changes.size();
 		uint64_t changed_bytes = result.total_changed_bytes;
-		size_t changed_pages = result.changed_page_count;
+		std::size_t changed_pages = result.changed_page_count;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.diff = std::move(result);
@@ -672,6 +784,7 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 		g_state.comparing.store(false);
 		g_state.compare_cursor_active = false;
 	}
+#endif
 }
 
 inline void clear_snapshots()
@@ -679,7 +792,7 @@ inline void clear_snapshots()
 	diag::log_tagged("snapshot_diff", "clear_snapshots signalled");
 	g_state.cancel.store(true);
 	std::lock_guard<std::mutex> lk(g_state.mutex);
-	size_t had = g_state.snapshots.size();
+	std::size_t had = g_state.snapshots.size();
 	g_state.snapshots.clear();
 	g_state.diff = {};
 	g_state.snap_a_id = 0;
@@ -696,18 +809,21 @@ namespace detail {
 inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h, float a)
 {
 	const auto& t = aida::ui::resolved();
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
 
 	dl->AddRectFilled(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
 		aida::ui::with_alpha(t.panel_bg, a), 10.f);
 	dl->AddRect(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
 		aida::ui::with_alpha(t.border_subtle, a), 10.f, 0, 1.f);
 
-	int snap_count = 0;
+	std::size_t snap_count = 0;
 	std::vector<uint64_t> snap_ids;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
-		snap_count = static_cast<int>(g_state.snapshots.size());
-		snap_ids.reserve(static_cast<size_t>(snap_count));
+		snap_count = g_state.snapshots.size();
+		snap_ids.reserve(snap_count);
 		for (auto& s : g_state.snapshots) snap_ids.push_back(s.id);
 	}
 
@@ -720,28 +836,30 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 	dl->AddLine(ImVec2(track_x0, track_y), ImVec2(track_x1, track_y),
 		aida::ui::with_alpha(t.border_strong, a), 2.f);
 
-	if (snap_count == 0) {
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+	if (snap_count == 0U) {
+		dl->AddText(body_font, body_font_size,
 			ImVec2(ox + w * 0.5f - 80.f, oy + h * 0.5f - 5.f),
 			aida::ui::with_alpha(t.text_dim, a),
 			"Capture snapshots to populate the timeline");
 		return;
 	}
 
-	float seg = (snap_count > 1) ? track_w / static_cast<float>(snap_count - 1) : 0.f;
+	float seg = (snap_count > 1U) ? track_w / static_cast<float>(snap_count - 1U) : 0.f;
 
-	int idx_a = -1;
-	int idx_b = -1;
-	for (int i = 0; i < snap_count; ++i) {
+	std::size_t idx_a = snap_count;
+	std::size_t idx_b = snap_count;
+	for (std::size_t i = 0; i < snap_count; ++i) {
 		if (g_state.snap_a_id != 0 && snap_ids[i] == g_state.snap_a_id) idx_a = i;
 		if (g_state.snap_b_id != 0 && snap_ids[i] == g_state.snap_b_id) idx_b = i;
 	}
 
-	int hot_marker = -1;
-	for (int i = 0; i < snap_count; ++i) {
-		float mx = (snap_count > 1) ? (track_x0 + seg * i) : (track_x0 + track_w * 0.5f);
+	std::size_t hot_marker = snap_count;
+	for (std::size_t i = 0; i < snap_count; ++i) {
+		float mx = (snap_count > 1U)
+			? (track_x0 + seg * static_cast<float>(i))
+			: (track_x0 + track_w * 0.5f);
 		float my = track_y;
-		ImGui::PushID(i + 100000);
+		ImGui::PushID(static_cast<int>(i) + 100000);
 		ImGui::SetCursorScreenPos(ImVec2(mx - 12.f, my - 12.f));
 		ImGui::InvisibleButton("##mk", ImVec2(24.f, 24.f));
 		bool hov = ImGui::IsItemHovered();
@@ -763,9 +881,13 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 		}
 	}
 
-	if (idx_a >= 0 && idx_a < snap_count && idx_b >= 0 && idx_b < snap_count) {
-		float ax = (snap_count > 1) ? (track_x0 + seg * idx_a) : (track_x0 + track_w * 0.5f);
-		float bx = (snap_count > 1) ? (track_x0 + seg * idx_b) : (track_x0 + track_w * 0.5f);
+	if (idx_a < snap_count && idx_b < snap_count) {
+		float ax = (snap_count > 1U)
+			? (track_x0 + seg * static_cast<float>(idx_a))
+			: (track_x0 + track_w * 0.5f);
+		float bx = (snap_count > 1U)
+			? (track_x0 + seg * static_cast<float>(idx_b))
+			: (track_x0 + track_w * 0.5f);
 		if (ax > bx) std::swap(ax, bx);
 		dl->AddRectFilledMultiColor(
 			ImVec2(ax, track_y - 2.f), ImVec2(bx, track_y + 2.f),
@@ -787,8 +909,10 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 		}
 	}
 
-	for (int i = 0; i < snap_count; ++i) {
-		float mx = (snap_count > 1) ? (track_x0 + seg * i) : (track_x0 + track_w * 0.5f);
+	for (std::size_t i = 0; i < snap_count; ++i) {
+		float mx = (snap_count > 1U)
+			? (track_x0 + seg * static_cast<float>(i))
+			: (track_x0 + track_w * 0.5f);
 		float my = track_y;
 		bool is_a = (idx_a == i);
 		bool is_b = (idx_b == i);
@@ -814,21 +938,21 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 		std::string nm;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			if (i < (int)g_state.snapshots.size())
+			if (i < g_state.snapshots.size())
 				nm = g_state.snapshots[i].name;
 		}
 		ImVec2 ts = ImGui::CalcTextSize(nm.c_str());
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(mx - ts.x * 0.5f, my + 11.f),
 			aida::ui::with_alpha(t.text_secondary, a), nm.c_str());
 
 		if (is_a) {
-			dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(mx - 5.f, my - 22.f),
 				aida::ui::with_alpha(t.accent_u32, a), "A");
 		}
 		if (is_b) {
-			dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(mx - 5.f, my - 22.f),
 				aida::ui::with_alpha(t.accent_u32, a), "B");
 		}
@@ -840,11 +964,31 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float, float, float)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static bool seeded = false;
+	if (!seeded) {
+		take_snapshot("Before Patch");
+		take_snapshot("After Patch");
+		compare_snapshots(g_state.snapshots[0].id, g_state.snapshots[1].id);
+		g_state.snap_a_id = g_state.snapshots[0].id;
+		g_state.snap_b_id = g_state.snapshots[1].id;
+		seeded = true;
+	}
+#endif
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wp = ImGui::GetWindowPos();
 	float a = alpha;
 
 	const auto& t = aida::ui::resolved();
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	ImFont* body_em_font = aida::ui::fonts::body_em();
+	if (!body_em_font) body_em_font = body_font;
+	const float body_em_font_size = aida::ui::fonts::size_or(body_em_font, 14.f);
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	float x0 = wp.x + pos_x;
 	float y0 = wp.y + pos_y;
@@ -862,10 +1006,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float cy = y0 + (toolbar_h - 32.f) * 0.5f;
 
 	{
-		ImFont* hdr_fn = aida::ui::fonts::body_em();
-		float hdr_fs = hdr_fn ? hdr_fn->FontSize : 14.f;
-		dl->AddText(hdr_fn, hdr_fs,
-			ImVec2(cx, y0 + (toolbar_h - hdr_fs) * 0.5f),
+		dl->AddText(body_em_font, body_em_font_size,
+			ImVec2(cx, y0 + (toolbar_h - body_em_font_size) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a), "Snapshot Diff");
 		ImVec2 ts = ImGui::CalcTextSize("Snapshot Diff");
 		cx += ts.x + 24.f;
@@ -877,7 +1019,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	bool taking = g_state.capturing.load();
 	bool comparing = g_state.comparing.load();
 	bool loading = g_state.loading.load();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	bool live_attach = true;
+#else
 	bool live_attach = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+#endif
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -891,13 +1037,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 
-	int snap_count = 0;
+	std::size_t snap_count = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
-		snap_count = static_cast<int>(g_state.snapshots.size());
+		snap_count = g_state.snapshots.size();
 	}
 
-	bool can_compare = (!busy && snap_count >= 2 &&
+	bool can_compare = (!busy && snap_count >= 2U &&
 		g_state.snap_a_id != 0 && g_state.snap_b_id != 0 &&
 		g_state.snap_a_id != g_state.snap_b_id);
 
@@ -916,7 +1062,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("Clear All", aida::ui::button_kind_t::destructive,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy || snap_count == 0)) {
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy || snap_count == 0U)) {
 			clear_snapshots();
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
@@ -927,6 +1073,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		const char* lbl_load = loading ? "Loading..." : "Load";
 		if (aida::ui::button(lbl_load, aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), busy, nullptr, loading)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			load_from_disk({});
+#else
 			auto initial_dir = detail::snapshot_dir();
 			std::error_code ec;
 			std::filesystem::create_directories(initial_dir, ec);
@@ -944,6 +1093,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::string picked(path_buf);
 				load_from_disk(picked);
 			}
+#endif
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
@@ -957,9 +1107,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::render_progress_bar(ImVec2(bar_x, bar_y), bar_w, 6.f, prog, false, true);
 		} else {
 			char info[64];
-			snprintf(info, sizeof(info), "%d snapshot%s", snap_count, snap_count == 1 ? "" : "s");
+			snprintf(info, sizeof(info), "%zu snapshot%s", snap_count, snap_count == 1U ? "" : "s");
 			ImVec2 ts = ImGui::CalcTextSize(info);
-			dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(t.text_secondary, a), info);
 		}
@@ -1002,8 +1152,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const char* col_names[5] = { "Address", "Old Value", "New Value", "Type", "Module" };
 	float col_widths[5] = { col_addr_w, col_old_w, col_new_w, col_type_w, col_mod_w };
 	float hx = x0 + 12.f;
-	for (int c = 0; c < 5; ++c) {
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+	for (std::size_t c = 0; c < 5U; ++c) {
+		dl->AddText(body_font, body_font_size,
 			ImVec2(hx, content_y + (hdr_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
 		hx += col_widths[c];
@@ -1035,7 +1185,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 		if (changed) {
-			for (size_t i = 0; i < filtered.size(); ++i) {
+			for (std::size_t i = 0; i < filtered.size(); ++i) {
 				if (g_state.prev_change_keys.find(filtered[i].address) == g_state.prev_change_keys.end()) {
 					if (i < g_state.row_flash.size()) g_state.row_flash[i] = 1.f;
 				}
@@ -1062,13 +1212,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	diff_row_anim_time += aida::ui::clock::dt();
 
 	float row_height = 22.f;
-	for (int i = 0; i < static_cast<int>(filtered.size()); ++i) {
-		auto& c = filtered[i];
+	for (std::size_t index = 0; index < filtered.size(); ++index) {
+		const int row_index = static_cast<int>(index);
+		auto& c = filtered[index];
 		ImVec2 rp = ImGui::GetCursorScreenPos();
 
-		float entrance = ui_anim::render_row_entrance(i, diff_row_anim_time, 0.012f);
+		float entrance = ui_anim::render_row_entrance(row_index, diff_row_anim_time, 0.012f);
 		bool hov = ImGui::IsMouseHoveringRect(rp, ImVec2(rp.x + width, rp.y + row_height), true);
-		bool sel = (g_state.selected_change == i);
+		bool sel = (g_state.selected_change == row_index);
 
 		if (sel) {
 			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
@@ -1078,58 +1229,64 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		} else if (hov) {
 			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
 				aida::ui::with_alpha(t.hover_wash, a * entrance));
-		} else if (i & 1) {
+		} else if ((index & 1U) != 0U) {
 			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
 				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a * entrance));
 		}
 
-		float flash = (i < (int)g_state.row_flash.size()) ? g_state.row_flash[i] : 0.f;
+		float flash = index < g_state.row_flash.size() ? g_state.row_flash[index] : 0.f;
 		if (flash > 0.f) {
 			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
 				aida::ui::with_alpha(t.accent_glow, a * flash * 0.85f));
 		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			g_state.selected_change = i;
+			g_state.selected_change = row_index;
 
 		char addr_str[24];
 		snprintf(addr_str, sizeof(addr_str), "0x%llX", static_cast<unsigned long long>(c.address));
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(rp.x + 12.f, rp.y + (row_height - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, a * entrance), addr_str);
 
 		float old_x = rp.x + 12.f + col_addr_w;
 		std::string old_hex;
-		for (uint32_t j = 0; j < c.size && j < 8; ++j) {
-			char hb[4]; snprintf(hb, sizeof(hb), "%02X ", c.old_data[j]);
+		const std::size_t old_preview_count = (std::min)({
+			static_cast<std::size_t>(c.size), c.old_data.size(), std::size_t{8}});
+		for (std::size_t j = 0; j < old_preview_count; ++j) {
+			char hb[4];
+			snprintf(hb, sizeof(hb), "%02X ", static_cast<unsigned int>(c.old_data[j]));
 			old_hex += hb;
 		}
 		if (c.size > 8) old_hex += "...";
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(old_x, rp.y + (row_height - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.error, a * entrance), old_hex.c_str());
 
 		float new_x = old_x + col_old_w;
 		std::string new_hex;
-		for (uint32_t j = 0; j < c.size && j < 8; ++j) {
-			char hb[4]; snprintf(hb, sizeof(hb), "%02X ", c.new_data[j]);
+		const std::size_t new_preview_count = (std::min)({
+			static_cast<std::size_t>(c.size), c.new_data.size(), std::size_t{8}});
+		for (std::size_t j = 0; j < new_preview_count; ++j) {
+			char hb[4];
+			snprintf(hb, sizeof(hb), "%02X ", static_cast<unsigned int>(c.new_data[j]));
 			new_hex += hb;
 		}
 		if (c.size > 8) new_hex += "...";
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(new_x, rp.y + (row_height - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.success, a * entrance), new_hex.c_str());
 
 		float type_x = new_x + col_new_w;
 		ImGui::SetCursorScreenPos(ImVec2(type_x, rp.y + (row_height - 18.f) * 0.5f));
-		ImGui::PushID(i + 8192);
+		ImGui::PushID(row_index + 8192);
 		aida::ui::pill_kind(detail::change_type_name(c.type), detail::change_pill_kind(c.type),
 			aida::ui::size_t_::sm, true);
 		ImGui::PopID();
 
 		float mod_x = type_x + col_type_w;
 		if (!c.module_name.empty()) {
-			dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(mod_x, rp.y + (row_height - 11.f) * 0.5f),
 				aida::ui::with_alpha(t.text_dim, a * entrance), c.module_name.c_str());
 		}
@@ -1152,22 +1309,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::EndChild();
 
-	if (g_state.selected_change >= 0 && g_state.selected_change < static_cast<int>(filtered.size())) {
-		auto& c = filtered[g_state.selected_change];
+	if (g_state.selected_change >= 0 &&
+		static_cast<std::size_t>(g_state.selected_change) < filtered.size()) {
+		auto& c = filtered[static_cast<std::size_t>(g_state.selected_change)];
 		float dy = y0 + height - detail_h;
 		dl->AddLine(ImVec2(x0, dy), ImVec2(x0 + width, dy),
 			aida::ui::with_alpha(t.border_subtle, a), 1.f);
 		dl->AddRectFilled(ImVec2(x0, dy), ImVec2(x0 + width, y0 + height),
 			aida::ui::with_alpha(t.panel_bg, a));
 
-		dl->AddText(aida::ui::fonts::body_em(), 13.f,
+		dl->AddText(body_em_font, 13.f,
 			ImVec2(x0 + 16.f, dy + 10.f),
 			aida::ui::with_alpha(t.text_primary, a), "Detail");
 
 		char addr_info[80];
 		snprintf(addr_info, sizeof(addr_info), "0x%llX  ·  %u bytes",
 		         static_cast<unsigned long long>(c.address), c.size);
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(x0 + 70.f, dy + 11.f),
 			aida::ui::with_alpha(t.text_secondary, a), addr_info);
 
@@ -1176,38 +1334,44 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float byte_h = 22.f;
 		float row_pad_x = 16.f;
 
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(x0 + row_pad_x, hex_y + (byte_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.error, a), "Old");
 		float ohx = x0 + row_pad_x + 36.f;
-		for (uint32_t j = 0; j < c.size && j < 32; ++j) {
-			char hb[4]; snprintf(hb, sizeof(hb), "%02X", c.old_data[j]);
+		const std::size_t old_detail_count = (std::min)({
+			static_cast<std::size_t>(c.size), c.old_data.size(), std::size_t{32}});
+		for (std::size_t j = 0; j < old_detail_count; ++j) {
+			char hb[4];
+			snprintf(hb, sizeof(hb), "%02X", static_cast<unsigned int>(c.old_data[j]));
 			bool diff = (j < c.new_data.size() && c.old_data[j] != c.new_data[j]);
 			if (diff) {
 				dl->AddRectFilled(ImVec2(ohx - 3.f, hex_y),
 					ImVec2(ohx + byte_w - 3.f, hex_y + byte_h),
 					aida::ui::with_alpha(t.error_soft, a), 4.f);
 			}
-			dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+			dl->AddText(code_font, code_font_size,
 				ImVec2(ohx, hex_y + (byte_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(diff ? t.error : t.text_dim, a), hb);
 			ohx += byte_w;
 		}
 
 		hex_y += byte_h + 6.f;
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(x0 + row_pad_x, hex_y + (byte_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.success, a), "New");
 		float nhx = x0 + row_pad_x + 36.f;
-		for (uint32_t j = 0; j < c.size && j < 32; ++j) {
-			char hb[4]; snprintf(hb, sizeof(hb), "%02X", c.new_data[j]);
+		const std::size_t new_detail_count = (std::min)({
+			static_cast<std::size_t>(c.size), c.new_data.size(), std::size_t{32}});
+		for (std::size_t j = 0; j < new_detail_count; ++j) {
+			char hb[4];
+			snprintf(hb, sizeof(hb), "%02X", static_cast<unsigned int>(c.new_data[j]));
 			bool diff = (j < c.old_data.size() && c.old_data[j] != c.new_data[j]);
 			if (diff) {
 				dl->AddRectFilled(ImVec2(nhx - 3.f, hex_y),
 					ImVec2(nhx + byte_w - 3.f, hex_y + byte_h),
 					aida::ui::with_alpha(t.success_soft, a), 4.f);
 			}
-			dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+			dl->AddText(code_font, code_font_size,
 				ImVec2(nhx, hex_y + (byte_h - 12.f) * 0.5f),
 				aida::ui::with_alpha(diff ? t.success : t.text_dim, a), hb);
 			nhx += byte_w;
@@ -1225,7 +1389,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			char val_info[160];
 			snprintf(val_info, sizeof(val_info), "Int32: %d -> %d   Float: %.6f -> %.6f",
 			         old_i, new_i, old_f, new_f);
-			dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+			dl->AddText(code_font, code_font_size,
 				ImVec2(x0 + row_pad_x, hex_y),
 				aida::ui::with_alpha(t.text_secondary, a), val_info);
 		} else if (c.size == 8) {
@@ -1235,7 +1399,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			char val_info[160];
 			snprintf(val_info, sizeof(val_info), "UInt64: 0x%llX -> 0x%llX",
 			         static_cast<unsigned long long>(old_v), static_cast<unsigned long long>(new_v));
-			dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+			dl->AddText(code_font, code_font_size,
 				ImVec2(x0 + row_pad_x, hex_y),
 				aida::ui::with_alpha(t.text_secondary, a), val_info);
 		}

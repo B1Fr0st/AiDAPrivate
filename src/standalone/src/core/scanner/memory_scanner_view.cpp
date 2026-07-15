@@ -1,15 +1,19 @@
 #include "memory_scanner_view.hpp"
 #include "memory_scanner.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #include "standalone_driver.hpp"
 #include "../anti-tamper/webhook.hpp"
 #include "../disasm/zydis_disasm.hpp"
-#include "disasm_view.hpp"
 #include "../disasm/function_index.hpp"
+#include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
+#endif
+#include "disasm_view.hpp"
 #include "hex_view.hpp"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
-#include "../helpers/diag_log.hpp"
-#include "../infra/executor.hpp"
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
@@ -28,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -47,7 +52,9 @@ constexpr float kAddrRowHeight       = 30.f;
 constexpr float kScrollbarTrackW     = 14.f;
 constexpr float kSplitterThickness   = 6.f;
 constexpr float kCalloutHeight       = 30.f;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 constexpr int   kRegionRefreshChunk  = 4096;
+#endif
 
 constexpr int kColResultAddr     = 0;
 constexpr int kColResultValue    = 1;
@@ -101,7 +108,7 @@ std::string compose_module_label(const memory_scanner::scan_result_t& r,
 		char buf[160];
 		snprintf(buf, sizeof(buf), "%s+0x%" PRIX64,
 			r.module_name.c_str(),
-			static_cast<unsigned long long>(r.module_offset));
+			r.module_offset);
 		return std::string(buf);
 	}
 	if (regions.empty()) return std::string();
@@ -113,7 +120,7 @@ std::string compose_module_label(const memory_scanner::scan_result_t& r,
 	const char* kind = region_kind_label(it->type, it->state);
 	char buf[96];
 	snprintf(buf, sizeof(buf), "%s+0x%" PRIX64,
-		kind, static_cast<unsigned long long>(r.address - it->base));
+		kind, r.address - it->base);
 	return std::string(buf);
 }
 
@@ -269,6 +276,13 @@ void interactive_scrollbar(scrollbar_state_t& sb,
 }
 
 void refresh_region_cache_locked(region_cache_t& c) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	std::vector<region_cache_entry_t> out{
+		{0x00007FF7A4C00000ULL, 0x00007FF7A4C36000ULL, 0x1000, 0x20, 0x1000000},
+		{0x00007FF7A4C36000ULL, 0x00007FF7A4C7A000ULL, 0x1000, 0x04, 0x1000000},
+		{0x000001D42A800000ULL, 0x000001D42AA00000ULL, 0x1000, 0x04, 0x20000}
+	};
+#else
 	auto regs = driver_bridge::enumerate_memory_regions(kRegionRefreshChunk);
 	std::vector<region_cache_entry_t> out;
 	out.reserve(regs.size());
@@ -285,6 +299,7 @@ void refresh_region_cache_locked(region_cache_t& c) {
 		[](const region_cache_entry_t& a, const region_cache_entry_t& b) {
 			return a.base < b.base;
 		});
+#endif
 	std::lock_guard<std::mutex> lk(c.mtx);
 	c.entries = std::move(out);
 	c.generation += 1;
@@ -299,6 +314,9 @@ void request_region_refresh() {
 		c.refreshing = true;
 	}
 	diag_log("region_cache refresh_post");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	refresh_region_cache_locked(g_ui.region_cache);
+#else
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "scanner";
 	sub.label = "scanner.region_cache_refresh";
@@ -316,13 +334,16 @@ void request_region_refresh() {
 		c.refreshing = false;
 		diag_log("region_cache refresh_post_failed");
 	}
+#endif
 }
 
 void rebuild_sorted_indices(int total) {
 	auto& ui = g_ui;
 	auto& sc = memory_scanner::g_state;
-	ui.sorted_result_indices.resize(static_cast<size_t>(total));
-	for (int i = 0; i < total; ++i) ui.sorted_result_indices[static_cast<size_t>(i)] = i;
+	const int safe_total = std::max(total, 0);
+	ui.sorted_result_indices.resize(static_cast<std::size_t>(safe_total));
+	for (int i = 0; i < safe_total; ++i)
+		ui.sorted_result_indices[static_cast<std::size_t>(i)] = i;
 
 	std::vector<region_cache_entry_t> regions_snapshot;
 	{
@@ -524,8 +545,9 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 
 	if (sc.config.scan_mode == memory_scanner::scan_mode_t::value_between) {
 		ImFont* body_fn = aida::ui::fonts::body();
-		dl->AddText(body_fn, body_fn->FontSize,
-			ImVec2(cx, oy + (kToolbarHeight - body_fn->FontSize) * 0.5f),
+		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
+		dl->AddText(body_fn, body_fs,
+			ImVec2(cx, oy + (kToolbarHeight - body_fs) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a), "to");
 		cx += 28.f;
 		float input2_w = 150.f;
@@ -547,7 +569,8 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 
 	{
 		ImFont* hex_fn = aida::ui::fonts::body();
-		float lbl_w = hex_fn->CalcTextSizeA(hex_fn->FontSize, FLT_MAX, 0.f, "HEX").x;
+		const float hex_fs = aida::ui::fonts::size_or(hex_fn, ImGui::GetFontSize());
+		float lbl_w = hex_fn->CalcTextSizeA(hex_fs, FLT_MAX, 0.f, "HEX").x;
 		float pill_w = lbl_w + 44.f;
 		float pill_h = input_h;
 		float py = input_y;
@@ -580,16 +603,21 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		ImU32 lbl_col = on ? aida::ui::with_alpha(t.text_primary, a)
 		                   : aida::ui::with_alpha(t.text_secondary, a);
 		float lbl_x = on ? (cx + 14.f) : (cx + pill_w - lbl_w - 16.f);
-		dl->AddText(hex_fn, hex_fn->FontSize,
-			ImVec2(lbl_x, py + (pill_h - hex_fn->FontSize) * 0.5f),
+		dl->AddText(hex_fn, hex_fs,
+			ImVec2(lbl_x, py + (pill_h - hex_fs) * 0.5f),
 			lbl_col, "HEX");
 		ImGui::PopID();
 		cx += pill_w + 14.f;
 	}
 
 	bool scanning = sc.scanning.load();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	bool attached = true;
+	bool static_pe = true;
+#else
 	bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 	bool static_pe = function_index::detail::static_pe_active();
+#endif
 	bool any_target = attached || static_pe;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -682,9 +710,10 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		char count_buf[64];
 		snprintf(count_buf, sizeof(count_buf), "%zu found", sc.total_found);
 		ImFont* body_fn = aida::ui::fonts::body();
-		ImVec2 cts = body_fn->CalcTextSizeA(body_fn->FontSize, FLT_MAX, 0.f, count_buf);
+		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
+		ImVec2 cts = body_fn->CalcTextSizeA(body_fs, FLT_MAX, 0.f, count_buf);
 		right_cx -= cts.x;
-		dl->AddText(body_fn, body_fn->FontSize,
+		dl->AddText(body_fn, body_fs,
 			ImVec2(right_cx, oy + (kToolbarHeight - cts.y) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a), count_buf);
 		right_cx -= 12.f;
@@ -700,8 +729,9 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		char pct_buf[8];
 		snprintf(pct_buf, sizeof(pct_buf), "%d%%", static_cast<int>(prog * 100.f));
 		ImFont* body_fn = aida::ui::fonts::body();
-		ImVec2 pct_sz = body_fn->CalcTextSizeA(body_fn->FontSize, FLT_MAX, 0.f, pct_buf);
-		dl->AddText(body_fn, body_fn->FontSize,
+		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
+		ImVec2 pct_sz = body_fn->CalcTextSizeA(body_fs, FLT_MAX, 0.f, pct_buf);
+		dl->AddText(body_fn, body_fs,
 			ImVec2(ring_cx - pct_sz.x * 0.5f, ring_cy - pct_sz.y * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a), pct_buf);
 		right_cx -= 12.f;
@@ -710,7 +740,8 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 	if (static_pe && !attached) {
 		const char* lbl = "Static PE scan";
 		ImFont* body_fn = aida::ui::fonts::body();
-		ImVec2 lsz = body_fn->CalcTextSizeA(body_fn->FontSize, FLT_MAX, 0.f, lbl);
+		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
+		ImVec2 lsz = body_fn->CalcTextSizeA(body_fs, FLT_MAX, 0.f, lbl);
 		float pad_x = 10.f;
 		float pad_y = 5.f;
 		float bw = lsz.x + pad_x * 2.f;
@@ -723,7 +754,7 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		dl->AddRect(ImVec2(right_cx, by),
 			ImVec2(right_cx + bw, by + bh),
 			aida::ui::with_alpha(t.warning, 0.65f * a), bh * 0.5f, 0, 1.f);
-		dl->AddText(body_fn, body_fn->FontSize,
+		dl->AddText(body_fn, body_fs,
 			ImVec2(right_cx + pad_x, by + pad_y),
 			aida::ui::with_alpha(t.warning, a), lbl);
 		right_cx -= 12.f;
@@ -747,7 +778,7 @@ void compute_result_columns(float ox, float w,
 	float widths[4] = { col_addr_w, col_val_w, col_prev_w, col_mod_w };
 	const char* names[4] = { "Address", "Value", "Previous", "Module / Region" };
 	float cx = ox + pad;
-	for (int i = 0; i < 4; ++i) {
+	for (std::size_t i = 0; i < 4U; ++i) {
 		cols[i].x0 = cx;
 		cols[i].x1 = cx + widths[i];
 		cols[i].inner_x0 = cx + 6.f;
@@ -782,7 +813,7 @@ void compute_addr_columns(float ox, float w,
 	const char* names[5] = { "Active", "Description", "Address", "Type", "Value" };
 
 	float cx = ox + pad;
-	for (int i = 0; i < 5; ++i) {
+	for (std::size_t i = 0; i < 5U; ++i) {
 		cols[i].x0 = cx;
 		cols[i].x1 = cx + widths[i];
 		cols[i].inner_x0 = cx + 6.f;
@@ -885,14 +916,14 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	compute_result_columns(ox, w, cols, content_w_total, include_sb);
 
 	ImFont* hdr_font = aida::ui::fonts::body_em();
-	float hdr_fs = hdr_font->FontSize;
+	const float hdr_fs = aida::ui::fonts::size_or(hdr_font, ImGui::GetFontSize());
 
-	for (int c = 0; c < 4; ++c) {
+	for (std::size_t c = 0; c < 4U; ++c) {
 		ImVec2 hmin(cols[c].x0, oy);
 		ImVec2 hmax(cols[c].x1, oy + kResultHeaderHeight);
 		bool hov = ImGui::IsMouseHoveringRect(hmin, hmax, false) &&
 			!ui_input_gate::popup_blocks_background_input();
-		ImGui::PushID(8000 + c);
+		ImGui::PushID(8000 + static_cast<int>(c));
 		ImGui::SetCursorScreenPos(hmin);
 		ImGui::InvisibleButton("##rh", ImVec2(hmax.x - hmin.x, hmax.y - hmin.y));
 		bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
@@ -947,7 +978,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			}
 			invalidate_sort();
 			diag_logf("results column_sort_click col=%d field=%d desc=%d",
-				c, static_cast<int>(ui.result_sort_field),
+				static_cast<int>(c), static_cast<int>(ui.result_sort_field),
 				static_cast<int>(ui.result_sort_desc));
 		}
 	}
@@ -1019,9 +1050,9 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	result_row_anim_time += dt;
 
 	ImFont* code_fn = aida::ui::fonts::code();
-	float code_fs = code_fn->FontSize;
+	const float code_fs = aida::ui::fonts::size_or(code_fn, ImGui::GetFontSize());
 	ImFont* body_fn = aida::ui::fonts::body();
-	float body_fs = body_fn->FontSize;
+	const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
 
 	int clicked_row = -1;
 	int dbl_click_row = -1;
@@ -1072,7 +1103,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 		char addr_buf[24];
 		snprintf(addr_buf, sizeof(addr_buf), "%016" PRIX64,
-			static_cast<unsigned long long>(r.address));
+			r.address);
 		dl->PushClipRect(ImVec2(cols[kColResultAddr].inner_x0, ry),
 			ImVec2(cols[kColResultAddr].inner_x1, ry + kResultRowHeight), true);
 		dl->AddText(code_fn, code_fs,
@@ -1197,7 +1228,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		float pa = ui.autoscroll_pill_alpha;
 		const char* lbl = "Jump to bottom";
 		ImFont* fnt = aida::ui::fonts::body();
-		ImVec2 pts = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, lbl);
+		const float font_fs = aida::ui::fonts::size_or(fnt, ImGui::GetFontSize());
+		ImVec2 pts = fnt->CalcTextSizeA(font_fs, FLT_MAX, 0.f, lbl);
 		float pad_x = 12.f;
 		float pw = pts.x + pad_x * 2.f + 14.f;
 		float ph = 28.f;
@@ -1218,8 +1250,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			ImVec2(dot_cx + 5.f, dot_cy - 3.f),
 			ImVec2(dot_cx, dot_cy + 4.f),
 			aida::ui::with_alpha(t.accent_u32, a * pa));
-		dl->AddText(fnt, fnt->FontSize,
-			ImVec2(dot_cx + 10.f, pa_min.y + (ph - fnt->FontSize) * 0.5f),
+		dl->AddText(fnt, font_fs,
+			ImVec2(dot_cx + 10.f, pa_min.y + (ph - font_fs) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a * pa), lbl);
 
 		ImGui::SetCursorScreenPos(pa_min);
@@ -1248,7 +1280,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
 	ImFont* h_font = aida::ui::fonts::body_em();
-	float h_fs = h_font->FontSize;
+	const float h_fs = aida::ui::fonts::size_or(h_font, ImGui::GetFontSize());
 	dl->AddText(h_font, h_fs,
 		ImVec2(ox + 12.f, oy + (kAddrHeaderHeight - h_fs) * 0.5f),
 		aida::ui::with_alpha(t.text_primary, a), "Address List");
@@ -1262,10 +1294,11 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		char count_buf[40];
 		snprintf(count_buf, sizeof(count_buf), "%zu items", addr_count);
 		ImFont* body_fn = aida::ui::fonts::body();
-		ImVec2 cts = body_fn->CalcTextSizeA(body_fn->FontSize, FLT_MAX, 0.f, count_buf);
-		dl->AddText(body_fn, body_fn->FontSize,
+		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
+		ImVec2 cts = body_fn->CalcTextSizeA(body_fs, FLT_MAX, 0.f, count_buf);
+		dl->AddText(body_fn, body_fs,
 			ImVec2(ox + 12.f + h_font->CalcTextSizeA(h_fs, FLT_MAX, 0.f, "Address List").x + 12.f,
-				oy + (kAddrHeaderHeight - body_fn->FontSize) * 0.5f),
+				oy + (kAddrHeaderHeight - body_fs) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), count_buf);
 		(void)cts;
 	}
@@ -1273,7 +1306,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	float right_x = ox + w - 12.f;
 
 	ImFont* btn_fn = aida::ui::fonts::body();
-	float btn_fs = btn_fn->FontSize;
+	const float btn_fs = aida::ui::fonts::size_or(btn_fn, ImGui::GetFontSize());
 
 	{
 		const char* lbl = "Auto-refresh";
@@ -1357,8 +1390,8 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		aida::ui::with_alpha(t.bg_overlay, a * 0.40f));
 	ImFont* col_fn = aida::ui::fonts::caption();
 	if (!col_fn) col_fn = aida::ui::fonts::body();
-	float col_fs = col_fn->FontSize;
-	for (int c = 0; c < 5; ++c) {
+	const float col_fs = aida::ui::fonts::size_or(col_fn, ImGui::GetFontSize());
+	for (std::size_t c = 0; c < 5U; ++c) {
 		if (!cols[c].title || cols[c].title[0] == '\0') continue;
 		dl->AddText(col_fn, col_fs,
 			ImVec2(cols[c].inner_x0, tbl_y0 + (kAddrTableHeaderH - col_fs) * 0.5f),
@@ -1407,9 +1440,9 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), true);
 
 	ImFont* code_fn = aida::ui::fonts::code();
-	float code_fs = code_fn->FontSize;
+	const float code_fs = aida::ui::fonts::size_or(code_fn, ImGui::GetFontSize());
 	ImFont* body_fn = aida::ui::fonts::body();
-	float body_fs = body_fn->FontSize;
+	const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
 
 	float row_right_edge = include_sb ? (ox + w - kScrollbarTrackW - 6.f) : (ox + w);
 
@@ -1510,7 +1543,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		{
 			char abuf[24];
 			snprintf(abuf, sizeof(abuf), "%016" PRIX64,
-				static_cast<unsigned long long>(e.address));
+				e.address);
 			float maxw = cols[kColAddrAddress].inner_x1 - cols[kColAddrAddress].inner_x0;
 			dl->PushClipRect(
 				ImVec2(cols[kColAddrAddress].inner_x0, ry),
@@ -2343,6 +2376,17 @@ void process_address_context_menu() {
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float, float, float)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static bool seeded = false;
+	if (!seeded) {
+		memory_scanner::scan_config_t config;
+		config.value_text = "1337";
+		memory_scanner::first_scan(config);
+		memory_scanner::add_address(0x00007FF7A4C42030ULL, "player_health", memory_scanner::value_type_t::int32_val);
+		memory_scanner::add_address(0x00007FF7A4C42108ULL, "session_flags", memory_scanner::value_type_t::int32_val);
+		seeded = true;
+	}
+#endif
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
 	ImGui::BeginChild("##scanner_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -2362,14 +2406,22 @@ void render(float pos_x, float pos_y, float width, float height,
 	auto& ui = g_ui;
 	auto& sc = memory_scanner::g_state;
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	bool attached_now = true;
+	bool static_pe_now = true;
+#else
 	bool attached_now = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 	bool static_pe_now = function_index::detail::static_pe_active();
+#endif
 	bool any_target = attached_now || static_pe_now;
 
 	if (ui.auto_refresh && attached_now) {
 		ui.refresh_timer += aida::ui::clock::dt();
 		if (ui.refresh_timer >= ui.refresh_interval) {
 			ui.refresh_timer = 0.f;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			memory_scanner::refresh_address_list();
+#else
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "scanner";
 			sub.label = "scanner.address_list_refresh";
@@ -2382,6 +2434,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			};
 			if (!aida::infra::executor::submit(std::move(sub)).submitted)
 				diag::log_tagged("value_scan", "address_list_refresh_post_failed");
+#endif
 		}
 	}
 

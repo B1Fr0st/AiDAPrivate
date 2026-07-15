@@ -1,3 +1,6 @@
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/debugger_preview_runtime.hpp"
+#else
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -5,18 +8,25 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
 
 #include "debugger_view.hpp"
 #include "debugger_engine.hpp"
 #include "spawn_target_dialog.hpp"
 #include "standalone_driver.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "zydis_disasm.hpp"
+#endif
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../anti-tamper/webhook.hpp"
+#endif
 #include "ui_anim.hpp"
 #include "memory_map_view.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "thread_view.hpp"
+#endif
 #include "module_view.hpp"
 #include "seh_view.hpp"
 #include "cfg_view.hpp"
@@ -34,18 +44,27 @@
 #include "skeleton.hpp"
 #include "fonts.hpp"
 #include "hex_view.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/executor.hpp"
+#else
+#include "../../preview/ui_task_executor.hpp"
+#endif
 #include "toast_notification.hpp"
+#include <fstream>
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../session/analysis_session.hpp"
 #include "../analysis/stealth_engine.hpp"
 #include "../helpers/win32_dialog.hpp"
-#include <fstream>
+#endif
 
 #include "imgui.h"
 #include "imgui_internal.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cfloat>
+#include <cstddef>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -224,7 +243,8 @@ inline void draw_panel_header(ImDrawList* dl, float x, float y, float w,
 	            with_a(t.border_subtle, alpha));
 	ImFont* font = aida::ui::fonts::caption();
 	if (!font) font = ImGui::GetFont();
-	dl->AddText(font, font->FontSize, ImVec2(x + 10.f, y + (HEADER_H - font->FontSize) * 0.5f),
+	const float font_size = aida::ui::fonts::size_or(font, 13.5f);
+	dl->AddText(font, font_size, ImVec2(x + 10.f, y + (HEADER_H - font_size) * 0.5f),
 	            with_a(t.text_secondary, alpha), label);
 }
 
@@ -244,10 +264,11 @@ inline void draw_table_header(ImDrawList* dl, float x, float y, float w,
 	            with_a(t.border_subtle, alpha));
 	ImFont* font = aida::ui::fonts::caption();
 	if (!font) font = ImGui::GetFont();
+	const float font_size = aida::ui::fonts::size_or(font, 13.5f);
 	float cx = x + 10.f;
 	for (int i = 0; i < n; ++i) {
-		ImVec2 sz = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.f, cols[i].label);
-		dl->AddText(font, font->FontSize,
+		ImVec2 sz = font->CalcTextSizeA(font_size, FLT_MAX, 0.f, cols[i].label);
+		dl->AddText(font, font_size,
 			ImVec2(cx, y + (HEADER_H - sz.y) * 0.5f),
 			with_a(t.text_dim, alpha), cols[i].label);
 		cx += cols[i].width;
@@ -287,8 +308,7 @@ inline bool draw_row_bg(ImDrawList* dl, float x, float y, float w, float h,
 	return hovered;
 }
 
-inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
-                             float alpha) {
+inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 	const auto& t = aida::ui::resolved();
 	auto& ui = g_ui;
 
@@ -597,7 +617,8 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 		}
 		ImFont* sf = aida::ui::fonts::caption();
 		if (!sf) sf = ImGui::GetFont();
-		ImVec2 sl_sz = sf->CalcTextSizeA(sf->FontSize, FLT_MAX, 0.f, status_label);
+		const float sf_size = aida::ui::fonts::size_or(sf, 13.5f);
+		ImVec2 sl_sz = sf->CalcTextSizeA(sf_size, FLT_MAX, 0.f, status_label);
 		float sx = bx + total_w + 6.f;
 		float sy = by + (28.f - 16.f) * 0.5f;
 		ImU32 col;
@@ -614,7 +635,7 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float w,
 		float dpulse = aida::ui::clock::pulse(1.6f, 0.55f, 1.f);
 		dl->AddCircleFilled(ImVec2(sx + 8.f, sy + 8.f), 3.f,
 		                    with_a(col, alpha * dpulse), 14);
-		dl->AddText(sf, sf->FontSize, ImVec2(sx + 14.f, sy + (16.f - sf->FontSize) * 0.5f),
+		dl->AddText(sf, sf_size, ImVec2(sx + 14.f, sy + (16.f - sf_size) * 0.5f),
 		            with_a(col, alpha), status_label);
 	}
 }
@@ -628,11 +649,17 @@ inline bool jump_to_disasm(uint64_t addr) {
 
 inline bool jump_to_hex(uint64_t addr, size_t bytes) {
 	if (addr == 0) return false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::debugger::record("jump_to_hex", std::to_string(addr) + ":" + std::to_string(bytes));
+	globals::ui::active_center_view = center_view_t::hex_view;
+	return true;
+#else
 	const auto context = disasm_view::capture_selected_workspace();
 	if (!hex_view::read_live_memory(context, addr, bytes))
 		return false;
 	globals::ui::active_center_view = center_view_t::hex_view;
 	return true;
+#endif
 }
 
 inline void copy_to_clipboard(const char* s) {
@@ -738,12 +765,6 @@ inline uint64_t evaluate_watch_expression(const std::string& expr,
 	return total;
 }
 
-inline std::string format_value_hex(uint64_t v) {
-	char buf[20];
-	std::snprintf(buf, sizeof(buf), "0x%016" PRIX64, v);
-	return buf;
-}
-
 }
 
 static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a) {
@@ -792,9 +813,10 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	float total_tabs_w_short = 6.f;
 	ImFont* tf = aida::ui::fonts::body_em();
 	if (!tf) tf = ImGui::GetFont();
+	const float tf_size = aida::ui::fonts::size_or(tf, 16.5f);
 	for (int i = 0; i < count; ++i) {
-		ImVec2 sz_full = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, visible_tabs[i].name);
-		ImVec2 sz_short = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, visible_tabs[i].short_name);
+		ImVec2 sz_full = tf->CalcTextSizeA(tf_size, FLT_MAX, 0.f, visible_tabs[i].name);
+		ImVec2 sz_short = tf->CalcTextSizeA(tf_size, FLT_MAX, 0.f, visible_tabs[i].short_name);
 		total_tabs_w_full += (sz_full.x + 22.f) + 2.f;
 		total_tabs_w_short += (sz_short.x + 18.f) + 2.f;
 	}
@@ -817,7 +839,7 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 	float total_tabs_w = 6.f;
 	for (int i = 0; i < count; ++i) {
 		const char* lbl = use_short_labels ? visible_tabs[i].short_name : visible_tabs[i].name;
-		ImVec2 sz = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, lbl);
+		ImVec2 sz = tf->CalcTextSizeA(tf_size, FLT_MAX, 0.f, lbl);
 		tab_widths[i] = sz.x + (use_short_labels ? 18.f : 22.f);
 		tab_positions[i] = total_tabs_w;
 		total_tabs_w += tab_widths[i] + 2.f;
@@ -906,13 +928,13 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 			                  with_a(wash, ra), aida::ui::metrics::radius::sm);
 		}
 
-		ImVec2 ts = tf->CalcTextSizeA(tf->FontSize, FLT_MAX, 0.f, tab_name_str);
+		ImVec2 ts = tf->CalcTextSizeA(tf_size, FLT_MAX, 0.f, tab_name_str);
 		ImU32 col = active
 			? with_a(t.accent_hover, a)
 			: aida::ui::mix(t.text_secondary, t.text_primary, hov ? 0.6f : 0.f);
 		col = with_a(col, a);
 
-		dl->AddText(tf, tf->FontSize,
+		dl->AddText(tf, tf_size,
 			ImVec2(tx + (tw - ts.x) * 0.5f, ty + (th - ts.y) * 0.5f),
 			col, tab_name_str);
 
@@ -1105,6 +1127,8 @@ static void draw_cpu_reg_row(ImDrawList* dl, float x, float y, float w, float ro
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, 16.5f);
+	const float code_font_size = aida::ui::fonts::size_or(code_font, 14.5f);
 
 	ImU32 name_col;
 	switch (r.group) {
@@ -1112,8 +1136,8 @@ static void draw_cpu_reg_row(ImDrawList* dl, float x, float y, float w, float ro
 		case 2:  name_col = t.warning;     break;
 		default: name_col = t.text_primary; break;
 	}
-	dl->AddText(body_font, body_font->FontSize,
-		ImVec2(x + 10.f, y + (row_h - body_font->FontSize) * 0.5f),
+	dl->AddText(body_font, body_font_size,
+		ImVec2(x + 10.f, y + (row_h - body_font_size) * 0.5f),
 		with_a(name_col, alpha), r.name);
 
 	char vbuf[20];
@@ -1124,8 +1148,8 @@ static void draw_cpu_reg_row(ImDrawList* dl, float x, float y, float w, float ro
 
 	ImU32 vcol = cpu_view_detail::register_value_color(r.value,
 		r.group == 1, r.group == 2, t);
-	dl->AddText(code_font, code_font->FontSize,
-		ImVec2(x + 64.f, y + (row_h - code_font->FontSize) * 0.5f),
+	dl->AddText(code_font, code_font_size,
+		ImVec2(x + 64.f, y + (row_h - code_font_size) * 0.5f),
 		with_a(vcol, alpha), vbuf);
 }
 
@@ -1140,9 +1164,10 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 	if (rip == 0) {
 		ImFont* fnt = aida::ui::fonts::caption();
 		if (!fnt) fnt = ImGui::GetFont();
+		const float fnt_size = aida::ui::fonts::size_or(fnt, 13.5f);
 		const char* msg = "RIP is zero (target not paused at a valid instruction).";
-		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
-		dl->AddText(fnt, fnt->FontSize,
+		ImVec2 sz = fnt->CalcTextSizeA(fnt_size, FLT_MAX, 0.f, msg);
+		dl->AddText(fnt, fnt_size,
 			ImVec2(x + (w - sz.x) * 0.5f, y + (h - sz.y) * 0.5f),
 			with_a(t.text_dim, alpha), msg);
 		return;
@@ -1154,9 +1179,10 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 	if (buf.empty() || base == 0) {
 		ImFont* fnt = aida::ui::fonts::caption();
 		if (!fnt) fnt = ImGui::GetFont();
+		const float fnt_size = aida::ui::fonts::size_or(fnt, 13.5f);
 		const char* msg = "Fetching instruction stream...";
-		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
-		dl->AddText(fnt, fnt->FontSize,
+		ImVec2 sz = fnt->CalcTextSizeA(fnt_size, FLT_MAX, 0.f, msg);
+		dl->AddText(fnt, fnt_size,
 			ImVec2(x + (w - sz.x) * 0.5f, y + (h - sz.y) * 0.5f),
 			with_a(t.text_dim, alpha), msg);
 		return;
@@ -1220,6 +1246,7 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 	if (!code_font) code_font = ImGui::GetFont();
 	ImFont* body_font = aida::ui::fonts::body_em();
 	if (!body_font) body_font = ImGui::GetFont();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, 14.5f);
 
 	ImGuiListClipper clipper;
 	clipper.Begin(static_cast<int>(rows.size()), row_h);
@@ -1259,32 +1286,34 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 
 			char addr_buf[20];
 			std::snprintf(addr_buf, sizeof(addr_buf), "%016" PRIX64, dr.addr);
-			dl->AddText(code_font, code_font->FontSize,
-				ImVec2(x + 18.f, ry + (row_h - code_font->FontSize) * 0.5f),
+			dl->AddText(code_font, code_font_size,
+				ImVec2(x + 18.f, ry + (row_h - code_font_size) * 0.5f),
 				with_a(is_rip ? t.accent_hover : t.text_address, alpha), addr_buf);
 
 			char bytes_buf[40] = {};
 			int blen = dr.ins.len > 8 ? 8 : dr.ins.len;
 			char* bp = bytes_buf;
 			for (int b = 0; b < blen; ++b) {
-				bp += std::snprintf(bp, sizeof(bytes_buf) - (bp - bytes_buf),
-					"%02X ", dr.ins.raw[b]);
+				bp += std::snprintf(bp,
+					sizeof(bytes_buf) - static_cast<std::size_t>(bp - bytes_buf),
+					"%02X ", static_cast<unsigned>(dr.ins.raw[b]));
 			}
 			if (dr.ins.len > 8) {
-				std::snprintf(bp, sizeof(bytes_buf) - (bp - bytes_buf), "+");
+				std::snprintf(bp,
+					sizeof(bytes_buf) - static_cast<std::size_t>(bp - bytes_buf), "+");
 			}
-			dl->AddText(code_font, code_font->FontSize,
-				ImVec2(x + 160.f, ry + (row_h - code_font->FontSize) * 0.5f),
+			dl->AddText(code_font, code_font_size,
+				ImVec2(x + 160.f, ry + (row_h - code_font_size) * 0.5f),
 				with_a(t.text_dim, alpha * 0.85f), bytes_buf);
 
 			ImU32 mc = cpu_view_detail::mnemonic_color(dr.ins, t);
-			dl->AddText(code_font, code_font->FontSize,
-				ImVec2(x + 300.f, ry + (row_h - code_font->FontSize) * 0.5f),
+			dl->AddText(code_font, code_font_size,
+				ImVec2(x + 300.f, ry + (row_h - code_font_size) * 0.5f),
 				with_a(mc, alpha), dr.ins.mnem);
 
 			if (dr.ins.ops[0] != 0) {
-				dl->AddText(code_font, code_font->FontSize,
-					ImVec2(x + 360.f, ry + (row_h - code_font->FontSize) * 0.5f),
+				dl->AddText(code_font, code_font_size,
+					ImVec2(x + 360.f, ry + (row_h - code_font_size) * 0.5f),
 					with_a(t.text_primary, alpha), dr.ins.ops);
 			}
 
@@ -1324,9 +1353,10 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 	if (rsp == 0) {
 		ImFont* fnt = aida::ui::fonts::caption();
 		if (!fnt) fnt = ImGui::GetFont();
+		const float fnt_size = aida::ui::fonts::size_or(fnt, 13.5f);
 		const char* msg = "RSP is zero (target not paused).";
-		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
-		dl->AddText(fnt, fnt->FontSize,
+		ImVec2 sz = fnt->CalcTextSizeA(fnt_size, FLT_MAX, 0.f, msg);
+		dl->AddText(fnt, fnt_size,
 			ImVec2(x + (w - sz.x) * 0.5f, y + (h - sz.y) * 0.5f),
 			with_a(t.text_dim, alpha), msg);
 		return;
@@ -1352,10 +1382,11 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 	if (buf.empty() || base != rsp) {
 		ImFont* fnt = aida::ui::fonts::caption();
 		if (!fnt) fnt = ImGui::GetFont();
+		const float fnt_size = aida::ui::fonts::size_or(fnt, 13.5f);
 		const char* msg = "Reading stack frame...";
-		ImVec2 sz = fnt->CalcTextSizeA(fnt->FontSize, FLT_MAX, 0.f, msg);
+		ImVec2 sz = fnt->CalcTextSizeA(fnt_size, FLT_MAX, 0.f, msg);
 		ImVec2 cp = ImGui::GetCursorScreenPos();
-		dl->AddText(fnt, fnt->FontSize,
+		dl->AddText(fnt, fnt_size,
 			ImVec2(cp.x + (child_w - sz.x) * 0.5f, cp.y + 16.f),
 			with_a(t.text_dim, alpha), msg);
 		ImGui::EndChild();
@@ -1365,6 +1396,7 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, 14.5f);
 
 	size_t qword_count = buf.size() / 8;
 	if (qword_count == 0) qword_count = 1;
@@ -1405,24 +1437,25 @@ static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, flo
 
 			char abuf[20];
 			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, qaddr);
-			dl->AddText(code_font, code_font->FontSize,
-				ImVec2(x + 8.f, ry + (row_h - code_font->FontSize) * 0.5f),
+			dl->AddText(code_font, code_font_size,
+				ImVec2(x + 8.f, ry + (row_h - code_font_size) * 0.5f),
 				with_a(is_top ? t.accent_hover : t.text_address, alpha), abuf);
 
 			char vbuf[20];
 			std::snprintf(vbuf, sizeof(vbuf), "%016" PRIX64, qval);
 			ImU32 vcol = cpu_view_detail::is_likely_pointer(qval) ? t.syn_function
 				: (qval == 0 ? t.text_dim : t.syn_number);
-			dl->AddText(code_font, code_font->FontSize,
-				ImVec2(x + 180.f, ry + (row_h - code_font->FontSize) * 0.5f),
+			dl->AddText(code_font, code_font_size,
+				ImVec2(x + 180.f, ry + (row_h - code_font_size) * 0.5f),
 				with_a(vcol, alpha), vbuf);
 
 			if (cpu_view_detail::is_likely_pointer(qval)) {
 				ImFont* sf = aida::ui::fonts::caption();
 				if (!sf) sf = ImGui::GetFont();
+				const float sf_size = aida::ui::fonts::size_or(sf, 13.5f);
 				const char* hint = "ptr";
-				dl->AddText(sf, sf->FontSize,
-					ImVec2(x + 350.f, ry + (row_h - sf->FontSize) * 0.5f),
+				dl->AddText(sf, sf_size,
+					ImVec2(x + 350.f, ry + (row_h - sf_size) * 0.5f),
 					with_a(t.text_dim, alpha * 0.85f), hint);
 			}
 
@@ -1588,7 +1621,6 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 	float disasm_y0 = top_y;
 	float disasm_y1 = disasm_y0 + disasm_h;
 	float stack_y0 = disasm_y1 + pad;
-	float stack_y1 = stack_y0 + stack_h;
 
 	draw_glass_card(dl, ImVec2(left_x, reg_y0),
 		ImVec2(left_x + left_w, reg_y1), 10.f, a);
@@ -1727,23 +1759,26 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 
 		ImFont* fnt = aida::ui::fonts::body_em();
 		if (!fnt) fnt = ImGui::GetFont();
-		dl->AddText(fnt, fnt->FontSize,
-			ImVec2(bx + 28.f, by + (fchip_h - fnt->FontSize) * 0.5f),
+		const float fnt_size = aida::ui::fonts::size_or(fnt, 16.5f);
+		dl->AddText(fnt, fnt_size,
+			ImVec2(bx + 28.f, by + (fchip_h - fnt_size) * 0.5f),
 			with_a(set_bit ? t.text_primary : t.text_secondary, a),
 			flag_defs[i].short_name);
 
 		ImFont* sf = aida::ui::fonts::caption();
 		if (!sf) sf = ImGui::GetFont();
+		const float sf_size = aida::ui::fonts::size_or(sf, 13.5f);
 		float full_x = bx + 60.f;
-		dl->AddText(sf, sf->FontSize,
-			ImVec2(full_x, by + (fchip_h - sf->FontSize) * 0.5f),
+		dl->AddText(sf, sf_size,
+			ImVec2(full_x, by + (fchip_h - sf_size) * 0.5f),
 			with_a(t.text_dim, a * 0.95f), flag_defs[i].full_name);
 
 		ImFont* cf = aida::ui::fonts::code();
 		if (!cf) cf = ImGui::GetFont();
+		const float cf_size = aida::ui::fonts::size_or(cf, 14.5f);
 		const char* bit_str = set_bit ? "1" : "0";
-		ImVec2 bs = cf->CalcTextSizeA(cf->FontSize, FLT_MAX, 0.f, bit_str);
-		dl->AddText(cf, cf->FontSize,
+		ImVec2 bs = cf->CalcTextSizeA(cf_size, FLT_MAX, 0.f, bit_str);
+		dl->AddText(cf, cf_size,
 			ImVec2(bx + fchip_w - bs.x - 10.f, by + (fchip_h - bs.y) * 0.5f),
 			with_a(set_bit ? t.success : t.text_dim, a), bit_str);
 
@@ -2280,10 +2315,8 @@ static void render_seh_overlay(ImDrawList* dl, float ox, float oy, float w, floa
 }
 
 
-static void render_breakpoint_actions(ImDrawList* dl, float ox, float oy, float w, float a) {
-	const auto& t = aida::ui::resolved();
+static void render_breakpoint_actions(float ox, float oy, float w) {
 	auto& ui = g_ui;
-	(void)dl; (void)t;
 
 	float bar_h = 40.f;
 	float pad = 8.f;
@@ -2393,7 +2426,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 	}
 
 	float bar_h = 40.f;
-	render_breakpoint_actions(dl, ox, oy, w, a);
+	render_breakpoint_actions(ox, oy, w);
 
 	float table_y = oy + bar_h;
 	{
@@ -2422,6 +2455,8 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, 16.5f);
+	const float code_font_size = aida::ui::fonts::size_or(code_font, 14.5f);
 
 	ImGuiListClipper clipper;
 	clipper.Begin(total_n, ROW_HEIGHT);
@@ -2445,7 +2480,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 
 			char ibuf[8];
 			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 5.f),
 			            with_a(t.text_dim, a), ibuf);
 
 			bool enabled = (bp.state == debugger_engine::bp_state_t::enabled);
@@ -2458,7 +2493,7 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 
 			const char* state_str = enabled ? "ON" : "OFF";
 			ImU32 pcol = enabled ? t.info : t.text_secondary;
-			ImVec2 sts = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, state_str);
+			ImVec2 sts = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, state_str);
 			float pw = sts.x + 14.f;
 			float ph = 16.f;
 			float pyy = ry + (ROW_HEIGHT - ph) * 0.5f;
@@ -2468,13 +2503,13 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 			dl->AddRect(ImVec2(ox + 50.f, pyy),
 			            ImVec2(ox + 50.f + pw, pyy + ph),
 			            with_a(pcol, a * 0.55f), ph * 0.5f, 0, 1.f);
-			dl->AddText(body_font, body_font->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(ox + 57.f, pyy + (ph - 11.f) * 0.5f),
 				with_a(pcol, a), state_str);
 
 			char abuf[20];
 			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, bp.address);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 130.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 130.f, ry + 5.f),
 			            with_a(t.text_address, a), abuf);
 
 			static const char* type_names[] = {"SW", "HW_EXEC", "HW_WRITE", "HW_READ", "MEM"};
@@ -2489,24 +2524,24 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 				case 4: type_col = t.success;        break;
 			}
 			const char* lbl = type_names[ti];
-			ImVec2 tssz = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, lbl);
+			ImVec2 tssz = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, lbl);
 			float bw = tssz.x + 12.f;
 			float bh = 16.f;
 			float bx = ox + 300.f;
 			float by = ry + (ROW_HEIGHT - bh) * 0.5f;
 			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
 			                  with_a(type_col, a * 0.85f), 4.f);
-			dl->AddText(body_font, body_font->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(bx + 6.f, by + (bh - 11.f) * 0.5f),
 				with_a(IM_COL32(255, 255, 255, 245), a), lbl);
 
 			char hits_buf[16];
 			std::snprintf(hits_buf, sizeof(hits_buf), "%d", bp.hit_count);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 420.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 420.f, ry + 5.f),
 			            with_a(t.text_secondary, a), hits_buf);
 
 			if (!bp.name.empty())
-				dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 490.f, ry + 5.f),
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 490.f, ry + 5.f),
 				            with_a(t.text_primary, a), bp.name.c_str());
 
 			float bp_act_btn_h = 18.f;
@@ -2764,12 +2799,13 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	                  with_a(t.panel_header, a));
 	ImFont* cap_font = aida::ui::fonts::caption();
 	if (!cap_font) cap_font = ImGui::GetFont();
-	dl->AddText(cap_font, cap_font->FontSize, ImVec2(ox + 12.f, oy + (HEADER_H - cap_font->FontSize) * 0.5f),
+	const float cap_font_size = aida::ui::fonts::size_or(cap_font, 13.5f);
+	dl->AddText(cap_font, cap_font_size, ImVec2(ox + 12.f, oy + (HEADER_H - cap_font_size) * 0.5f),
 	            with_a(t.text_dim, a), "CALL STACK");
 	const char* hint = "double-click to jump, right-click to copy address";
-	ImVec2 hs = cap_font->CalcTextSizeA(cap_font->FontSize, FLT_MAX, 0.f, hint);
-	dl->AddText(cap_font, cap_font->FontSize,
-		ImVec2(ox + w - hs.x - 12.f, oy + (HEADER_H - cap_font->FontSize) * 0.5f),
+	ImVec2 hs = cap_font->CalcTextSizeA(cap_font_size, FLT_MAX, 0.f, hint);
+	dl->AddText(cap_font, cap_font_size,
+		ImVec2(ox + w - hs.x - 12.f, oy + (HEADER_H - cap_font_size) * 0.5f),
 		with_a(t.text_dim, a * 0.8f), hint);
 	dl->AddLine(ImVec2(ox, oy + HEADER_H - 0.5f),
 	            ImVec2(ox + w, oy + HEADER_H - 0.5f),
@@ -2804,6 +2840,9 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 	if (!code_font) code_font = ImGui::GetFont();
 	ImFont* dim_font = aida::ui::fonts::caption();
 	if (!dim_font) dim_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, 16.5f);
+	const float code_font_size = aida::ui::fonts::size_or(code_font, 14.5f);
+	const float dim_font_size = aida::ui::fonts::size_or(dim_font, 13.5f);
 
 	ImGuiListClipper clipper;
 	clipper.Begin(total_n, row_h);
@@ -2855,23 +2894,23 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 
 			char idx_buf[12];
 			std::snprintf(idx_buf, sizeof(idx_buf), "#%d", i);
-			dl->AddText(dim_font, dim_font->FontSize, ImVec2(ca.x + 12.f, ca.y + 8.f),
+			dl->AddText(dim_font, dim_font_size, ImVec2(ca.x + 12.f, ca.y + 8.f),
 			            with_a(t.text_dim, a), idx_buf);
 
 			std::string mod_label = f.module_name.empty() ? std::string("<unknown>") : f.module_name;
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 6.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ca.x + 44.f, ca.y + 6.f),
 			            with_a(t.text_primary, a), mod_label.c_str());
 
 			std::string func = f.function_name.empty() ? std::string("?") : f.function_name;
 			char fn_buf[256];
 			std::snprintf(fn_buf, sizeof(fn_buf), "%s + 0x%" PRIX64,
 				func.c_str(), f.module_offset);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 24.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ca.x + 44.f, ca.y + 24.f),
 			            with_a(t.syn_function, a), fn_buf);
 
 			char abuf[24];
 			std::snprintf(abuf, sizeof(abuf), "0x%016" PRIX64, f.address);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ca.x + 44.f, ca.y + 40.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ca.x + 44.f, ca.y + 40.f),
 			            with_a(t.text_address, a), abuf);
 
 			std::string key = f.module_name + "!" + f.function_name;
@@ -2879,19 +2918,20 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 			if (rec > 1) {
 				char rec_buf[24];
 				std::snprintf(rec_buf, sizeof(rec_buf), "x%d recursive", rec);
-				ImVec2 rs = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, rec_buf);
+				ImVec2 rs = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, rec_buf);
 				float rx = cb.x - rs.x - 22.f;
 				float ry2 = ca.y + 6.f;
 				dl->AddRectFilled(ImVec2(rx - 6.f, ry2 - 1.f),
 				                  ImVec2(rx + rs.x + 6.f, ry2 + 14.f),
 				                  with_a(t.warning, a * 0.18f), 4.f);
-				dl->AddText(body_font, body_font->FontSize, ImVec2(rx, ry2),
+				dl->AddText(body_font, body_font_size, ImVec2(rx, ry2),
 				            with_a(t.warning, a), rec_buf);
 			}
 
 			if (clicked) ui.callstack_panel.selected = i;
 			if (dclicked) {
-				diag::log_tagged_fmt("dbg_view", "callstack double-click: jump to frame addr=0x%llX module='%s'", (unsigned long long)f.address, f.module_name.c_str());
+				diag::log_tagged_fmt("dbg_view", "callstack double-click: jump to frame addr=0x%llX module='%s'",
+					static_cast<unsigned long long>(f.address), f.module_name.c_str());
 				jump_to_disasm(f.address);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
@@ -2961,6 +3001,8 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	float row_h = ROW_HEIGHT + 4.f;
 
@@ -2982,21 +3024,26 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			draw_row_bg(dl, ox, ry, w, row_h, sel, hov, ti, 1.f, a);
 
-			if (ti < 256 && th.state != ui.prev_thread_state[ti]) {
-				ui.thread_state_flash[ti] = 1.f;
-				ui.prev_thread_state[ti] = th.state;
+			float thread_state_flash = 0.f;
+			const bool has_thread_state_slot = ti >= 0 && ti < 256;
+			if (has_thread_state_slot) {
+				const size_t state_index = static_cast<size_t>(ti);
+				if (th.state != ui.prev_thread_state[state_index]) {
+					ui.thread_state_flash[state_index] = 1.f;
+					ui.prev_thread_state[state_index] = th.state;
+				}
+				ui_anim::decay_flash(ui.thread_state_flash[state_index], 1.5f, dt);
+				thread_state_flash = ui.thread_state_flash[state_index];
 			}
-			if (ti < 256)
-				ui_anim::decay_flash(ui.thread_state_flash[ti], 1.5f, dt);
 
 			char tbuf[12];
 			std::snprintf(tbuf, sizeof(tbuf), "%u", th.tid);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 7.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 8.f, ry + 7.f),
 			            with_a(t.text_address, a), tbuf);
 
 			char prbuf[12];
 			std::snprintf(prbuf, sizeof(prbuf), "%d", th.priority);
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 100.f, ry + 7.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 100.f, ry + 7.f),
 			            with_a(t.text_secondary, a), prbuf);
 
 			const char* state_str;
@@ -3011,7 +3058,7 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 				case 6: state_str = "TRANSITION";  pcol = t.warning; break;
 				default: state_str = "UNKNOWN";    pcol = t.text_secondary; break;
 			}
-			ImVec2 ss = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, state_str);
+			ImVec2 ss = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, state_str);
 			float pw = ss.x + 22.f;
 			float ph = 16.f;
 			float pyy = ry + (row_h - ph) * 0.5f;
@@ -3020,19 +3067,19 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 			                  with_a(pcol, a * 0.22f), ph * 0.5f);
 			dl->AddRect(ImVec2(px, pyy), ImVec2(px + pw, pyy + ph),
 			            with_a(pcol, a * 0.55f), ph * 0.5f, 0, 1.f);
-			float dot_pulse = (ti < 256) ? (0.5f + ui.thread_state_flash[ti] * 0.5f) : 0.55f;
+			float dot_pulse = has_thread_state_slot ? (0.5f + thread_state_flash * 0.5f) : 0.55f;
 			dot_pulse += aida::ui::clock::pulse(1.6f, 0.f, 0.4f);
 			if (dot_pulse > 1.f) dot_pulse = 1.f;
 			dl->AddCircleFilled(ImVec2(px + 9.f, pyy + ph * 0.5f), 3.f,
 			                    with_a(pcol, a * dot_pulse), 14);
-			dl->AddText(body_font, body_font->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(px + 16.f, pyy + (ph - 11.f) * 0.5f),
 				with_a(pcol, a), state_str);
 
 			if (th.rip != 0) {
 				char rbuf[20];
 				std::snprintf(rbuf, sizeof(rbuf), "0x%016" PRIX64, th.rip);
-				dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 300.f, ry + 7.f),
+				dl->AddText(code_font, code_font_size, ImVec2(ox + 300.f, ry + 7.f),
 				            with_a(t.text_address, a * 0.85f), rbuf);
 			}
 
@@ -3264,6 +3311,8 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	float row_h = ROW_HEIGHT + 4.f;
 	ImGuiListClipper clipper;
@@ -3283,7 +3332,7 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			draw_row_bg(dl, ox, ry, w, row_h, sel, hov, i, 1.f, a);
 
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 10.f, ry + 7.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 10.f, ry + 7.f),
 			            with_a(t.text_primary, a), w_entry.expression.c_str());
 
 			bool deref = false;
@@ -3296,14 +3345,14 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 			} else {
 				std::snprintf(addr_buf, sizeof(addr_buf), "?");
 			}
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 230.f, ry + 7.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 230.f, ry + 7.f),
 			            with_a(t.text_address, a), addr_buf);
 
 			ImU32 vcol = w_entry.valid ? t.success : t.error;
 			const char* value_text = w_entry.valid
 				? w_entry.value.c_str()
 				: (w_entry.error.empty() ? "<error>" : w_entry.error.c_str());
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 410.f, ry + 7.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 410.f, ry + 7.f),
 			            with_a(vcol, a), value_text);
 
 			float btn_x = ox + w - 84.f;
@@ -3491,7 +3540,8 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		ImU32 pcol = tracing ? t.error : t.text_secondary;
 		ImFont* sf = aida::ui::fonts::body_em();
 		if (!sf) sf = ImGui::GetFont();
-		ImVec2 sts = sf->CalcTextSizeA(sf->FontSize, FLT_MAX, 0.f, status);
+		const float sf_size = aida::ui::fonts::size_or(sf, ImGui::GetFontSize());
+		ImVec2 sts = sf->CalcTextSizeA(sf_size, FLT_MAX, 0.f, status);
 		float pw = sts.x + 32.f;
 		float ph = 18.f;
 		float px = ox + w - pw - 10.f;
@@ -3512,7 +3562,7 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 			dl->PathStroke(with_a(pcol, a), 0, 1.5f);
 		}
 		dl->AddCircleFilled(dc, 3.5f, with_a(pcol, a * dot_a), 16);
-		dl->AddText(sf, sf->FontSize,
+		dl->AddText(sf, sf_size,
 			ImVec2(px + 22.f, py + (ph - 11.f) * 0.5f),
 			with_a(pcol, a), status);
 	}
@@ -3553,6 +3603,8 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	ImGuiListClipper clipper;
 	clipper.Begin(total_n, ROW_HEIGHT);
@@ -3572,14 +3624,14 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 			char ibuf[12];
 			std::snprintf(ibuf, sizeof(ibuf), "%d", tr.index);
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 5.f),
 			            with_a(t.text_dim, a), ibuf);
 
 			char abuf[20];
 			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, tr.address);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 70.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 70.f, ry + 5.f),
 			            with_a(t.text_address, a), abuf);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 240.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 240.f, ry + 5.f),
 			            with_a(t.text_primary, a), tr.disasm_text.c_str());
 
 			if (clicked) ui.trace_panel.selected = i;
@@ -3695,6 +3747,8 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	ImGuiListClipper clipper;
 	clipper.Begin(total_n, ROW_HEIGHT);
@@ -3714,16 +3768,16 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			char abuf[20];
 			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, sr.address);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 8.f, ry + 5.f),
 			            with_a(t.text_address, a), abuf);
 
 			std::string display = sr.value;
 			if (display.size() > 96) display = display.substr(0, 96) + "...";
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 180.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 180.f, ry + 5.f),
 			            with_a(t.syn_string, a), display.c_str());
 
 			if (!sr.module_name.empty())
-				dl->AddText(body_font, body_font->FontSize, ImVec2(ox + w - 150.f, ry + 5.f),
+				dl->AddText(body_font, body_font_size, ImVec2(ox + w - 150.f, ry + 5.f),
 				            with_a(t.text_dim, a), sr.module_name.c_str());
 
 			if (clicked) ui.strings_panel.selected = i;
@@ -3758,14 +3812,12 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 			"Scanning %llu pages... %llu strings found so far",
 			static_cast<unsigned long long>(pages),
 			static_cast<unsigned long long>(found_count));
-		ImFont* body_font = aida::ui::fonts::body();
-		if (!body_font) body_font = ImGui::GetFont();
-		ImVec2 hdr_sz = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, hdr_buf);
-		ImVec2 prog_sz = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, prog_buf);
-		dl->AddText(body_font, body_font->FontSize,
+		ImVec2 hdr_sz = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, hdr_buf);
+		ImVec2 prog_sz = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, prog_buf);
+		dl->AddText(body_font, body_font_size,
 			ImVec2(region_cx - hdr_sz.x * 0.5f, region_cy + 6.f),
 			with_a(t.text_primary, a), hdr_buf);
-		dl->AddText(body_font, body_font->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(region_cx - prog_sz.x * 0.5f, region_cy + 6.f + hdr_sz.y + 4.f),
 			with_a(t.text_dim, a), prog_buf);
 	} else if (snapshot.empty()) {
@@ -3859,6 +3911,8 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	float row_h = ROW_HEIGHT + 4.f;
 	ImGuiListClipper clipper;
@@ -3881,14 +3935,14 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 			char ibuf[8], abuf[20];
 			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
 			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, addr);
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 7.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 7.f),
 			            with_a(t.text_dim, a), ibuf);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 46.f, ry + 7.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 46.f, ry + 7.f),
 			            with_a(t.text_address, a), abuf);
 
 			auto it = labels_snapshot.find(addr);
 			if (it != labels_snapshot.end())
-				dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 246.f, ry + 7.f),
+				dl->AddText(body_font, body_font_size, ImVec2(ox + 246.f, ry + 7.f),
 				            with_a(t.text_primary, a), it->second.c_str());
 
 			float btn_x = ox + w - 84.f;
@@ -4019,6 +4073,8 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	ImGuiListClipper clipper;
 	clipper.Begin(total_n, ROW_HEIGHT);
@@ -4038,32 +4094,32 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 
 			char hbuf[12];
 			std::snprintf(hbuf, sizeof(hbuf), "0x%X", static_cast<unsigned>(he.handle));
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 8.f, ry + 5.f),
 			            with_a(t.text_primary, a), hbuf);
 
 			ImU32 type_col = handle_type_color(he.type_name, t);
-			ImVec2 ts = body_font->CalcTextSizeA(body_font->FontSize, FLT_MAX, 0.f, he.type_name.c_str());
+			ImVec2 ts = body_font->CalcTextSizeA(body_font_size, FLT_MAX, 0.f, he.type_name.c_str());
 			float bw = ts.x + 12.f;
 			float bh = 16.f;
 			float bx = ox + 120.f;
 			float by = ry + (ROW_HEIGHT - bh) * 0.5f;
 			dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
 			                  with_a(type_col, a * 0.85f), 4.f);
-			dl->AddText(body_font, body_font->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(bx + 6.f, by + (bh - 11.f) * 0.5f),
 				with_a(IM_COL32(255, 255, 255, 245), a),
 				he.type_name.c_str());
 
 			char acc_buf[16];
 			std::snprintf(acc_buf, sizeof(acc_buf), "0x%08X", he.access);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 280.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 280.f, ry + 5.f),
 			            with_a(t.text_secondary, a), acc_buf);
 
 			float name_clip_w = w - 484.f;
 			if (name_clip_w < 80.f) name_clip_w = 80.f;
 			dl->PushClipRect(ImVec2(ox + 390.f, ry),
 				ImVec2(ox + 390.f + name_clip_w, ry + ROW_HEIGHT), true);
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 390.f, ry + 5.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 390.f, ry + 5.f),
 			            with_a(t.text_primary, a), he.name.c_str());
 			dl->PopClipRect();
 
@@ -4179,6 +4235,18 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 	(void)t;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
+		if (code_patcher::g_state.patches.empty()) {
+			code_patcher::g_state.patches = {
+				{0x00007FF7A4C16A32, {0x75, 0x14}, {0x90, 0x90}, "Bypass conditional branch", true, 1720946700},
+				{0x00007FF7A4C1B420, {0x48, 0x85, 0xC0}, {0xB0, 0x01, 0x90}, "Force decrypt success", false, 1720946760},
+				{0x00007FF7A4C208F0, {0x74, 0x05}, {0xEB, 0x05}, "Follow unpacked path", true, 1720946820}
+			};
+		}
+	}
+#endif
 
 	{
 		static bool s_logged_once = false;
@@ -4227,9 +4295,10 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 			sn = code_patcher::g_state.patches;
 		}
 		size_t reverted = 0;
-		for (int i = static_cast<int>(sn.size()) - 1; i >= 0; --i) {
-			if (sn[static_cast<size_t>(i)].active) {
-				if (code_patcher::toggle_patch(i)) reverted++;
+		for (size_t remaining = sn.size(); remaining > 0; --remaining) {
+			const size_t index = remaining - 1;
+			if (sn[index].active) {
+				if (code_patcher::toggle_patch(static_cast<int>(index))) reverted++;
 			}
 		}
 		diag::log_tagged_critical_fmt("patches",
@@ -4371,6 +4440,8 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	if (!body_font) body_font = ImGui::GetFont();
 	ImFont* code_font = aida::ui::fonts::code();
 	if (!code_font) code_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	ImGuiListClipper clipper;
 	clipper.Begin(total_n, ROW_HEIGHT);
@@ -4391,9 +4462,9 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 			char ibuf[8], abuf[20];
 			std::snprintf(ibuf, sizeof(ibuf), "%d", i);
 			std::snprintf(abuf, sizeof(abuf), "%016" PRIX64, p.address);
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 8.f, ry + 5.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 8.f, ry + 5.f),
 			            with_a(t.text_dim, a), ibuf);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(ox + 36.f, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(ox + 36.f, ry + 5.f),
 			            with_a(t.text_address, a), abuf);
 
 			std::string oh = code_patcher::format_bytes(p.original_bytes);
@@ -4401,25 +4472,25 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 			if (oh.size() > 22) oh = oh.substr(0, 22) + "...";
 			if (ph.size() > 22) ph = ph.substr(0, 22) + "...";
 
-			ImVec2 osz = code_font->CalcTextSizeA(code_font->FontSize, FLT_MAX, 0.f, oh.c_str());
+			ImVec2 osz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, oh.c_str());
 			float bx = ox + 200.f;
 			float by = ry + 3.f;
 			dl->AddRectFilled(ImVec2(bx - 4.f, by),
 			                  ImVec2(bx + osz.x + 8.f, by + 16.f),
 			                  with_a(t.text_dim, a * 0.18f), 4.f);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(bx, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(bx, ry + 5.f),
 			            with_a(t.text_secondary, a), oh.c_str());
 
-			ImVec2 psz = code_font->CalcTextSizeA(code_font->FontSize, FLT_MAX, 0.f, ph.c_str());
+			ImVec2 psz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, ph.c_str());
 			float bx2 = ox + 400.f;
 			ImU32 pc = p.active ? t.success : t.warning;
 			dl->AddRectFilled(ImVec2(bx2 - 4.f, by),
 			                  ImVec2(bx2 + psz.x + 8.f, by + 16.f),
 			                  with_a(pc, a * 0.20f), 4.f);
-			dl->AddText(code_font, code_font->FontSize, ImVec2(bx2, ry + 5.f),
+			dl->AddText(code_font, code_font_size, ImVec2(bx2, ry + 5.f),
 			            with_a(pc, a), ph.c_str());
 
-			dl->AddText(body_font, body_font->FontSize, ImVec2(ox + 600.f, ry + 5.f),
+			dl->AddText(body_font, body_font_size, ImVec2(ox + 600.f, ry + 5.f),
 			            with_a(t.text_primary, a), p.description.c_str());
 
 			bool active_state = p.active;
@@ -4569,6 +4640,9 @@ static void render_debugger_status_bar(ImVec2 pos, float width,
 
 void render(float pos_x, float pos_y, float width, float height,
 			float alpha, float accent_r, float accent_g, float accent_b) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::debugger::initialize_fixture();
+#endif
 	(void)accent_r; (void)accent_g; (void)accent_b;
 
 	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
@@ -4842,7 +4916,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		ui.active_tab != sub_tab_t::cfg;
 	float panel_offset = 0.f;
 	if (tab_uses_toolbar) {
-		draw_run_toolbar(dl, ox, toolbar_y, inner_width, alpha);
+		draw_run_toolbar(dl, ox, toolbar_y, alpha);
 		panel_offset = TOOLBAR_H + aida::ui::metrics::spacing::sm;
 	}
 

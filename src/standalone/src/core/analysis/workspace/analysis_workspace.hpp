@@ -164,6 +164,14 @@ public:
                           std::shared_ptr<const workspace_image_t> image,
                           std::optional<workspace_provider_binding_t> binding = {},
                           const cancellation_token_t& cancel = {});
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static workspace_result_t<std::shared_ptr<analysis_workspace_t>>
+        create_preview(std::shared_ptr<const workspace_identity_t> identity,
+                       std::shared_ptr<const byte_provider_t> provider,
+                       std::shared_ptr<const workspace_image_t> normalized_image,
+                       std::shared_ptr<const pe_image_t> image,
+                       std::shared_ptr<const analysis_snapshot_t> snapshot);
+#endif
 
     ~analysis_workspace_t();
     analysis_workspace_t(const analysis_workspace_t&) = delete;

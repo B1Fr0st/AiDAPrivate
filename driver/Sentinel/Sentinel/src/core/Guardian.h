@@ -247,6 +247,14 @@ namespace guardian {
             return;
         }
 
+        UINT64 jitter_ms = __rdtsc() % 2000;
+        if (jitter_ms > 0 && KeGetCurrentIrql() == PASSIVE_LEVEL && _KeDelayExecutionThread) {
+            LARGE_INTEGER jitter_wait;
+            jitter_wait.QuadPart = -static_cast<LONGLONG>(jitter_ms) * 10000LL;
+            _KeDelayExecutionThread(KernelMode, FALSE, &jitter_wait);
+        }
+        SN_LOG("guardian::jitter_applied ms=%llu", jitter_ms);
+
         LONG cycle = 0;
         perf_stamp_t cycle_mark = perf_mark();
         session_state_t session = {};

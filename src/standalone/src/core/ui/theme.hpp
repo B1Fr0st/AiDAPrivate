@@ -615,8 +615,10 @@ namespace aida::ui {
 		c[ImGuiCol_TabActive]            = to_v4(t.panel_header);
 		c[ImGuiCol_TabUnfocused]         = to_v4(t.title_bar);
 		c[ImGuiCol_TabUnfocusedActive]   = to_v4(t.panel_header);
+	#ifdef IMGUI_HAS_DOCK
 		c[ImGuiCol_DockingPreview]       = to_v4(t.accent_glow);
 		c[ImGuiCol_DockingEmptyBg]       = to_v4(t.bg_base);
+	#endif
 		c[ImGuiCol_PlotLines]            = t.accent;
 		c[ImGuiCol_PlotLinesHovered]     = to_v4(t.accent_hover);
 		c[ImGuiCol_PlotHistogram]        = t.accent;

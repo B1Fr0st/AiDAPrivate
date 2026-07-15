@@ -1,5 +1,6 @@
 #pragma once
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -12,26 +13,37 @@
 #include <ShlObj.h>
 #include <shellapi.h>
 #include <objbase.h>
+#endif
 #ifdef small
 #undef small
 #endif
 
 #include <cstring>
 #include <cstdio>
-#include <filesystem>
 #include <string>
 #include <utility>
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include <filesystem>
+#endif
 
 #include "imgui/imgui.h"
 #include "../ui/components.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/fonts.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
+#endif
 #include "../runtime/run_target.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../runtime/vm_guest_bridge.hpp"
+#endif
 #include "../ui/toast_notification.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../auth/auth_browser_launch.hpp"
+#else
+#include "../../preview/debugger_preview_runtime.hpp"
+#endif
 
 extern HWND g_hwnd;
 
@@ -209,20 +221,32 @@ inline void reset_inputs() {
 
 inline std::wstring widen_utf8(const char* utf8) {
 	if (!utf8 || !*utf8) return std::wstring();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	std::wstring out;
+	while (*utf8) out.push_back(static_cast<unsigned char>(*utf8++));
+	return out;
+#else
 	int needed = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
 	if (needed <= 1) return std::wstring();
 	std::wstring out(static_cast<size_t>(needed - 1), L'\0');
 	MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out.data(), needed);
 	return out;
+#endif
 }
 
 inline std::string narrow_utf8(const wchar_t* w) {
 	if (!w || !*w) return std::string();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	std::string out;
+	while (*w) out.push_back(static_cast<char>(*w++ & 0xFF));
+	return out;
+#else
 	int needed = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
 	if (needed <= 1) return std::string();
 	std::string out(static_cast<size_t>(needed - 1), '\0');
 	WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), needed, nullptr, nullptr);
 	return out;
+#endif
 }
 
 inline std::string parent_dir(const std::string& path) {
@@ -251,6 +275,9 @@ inline std::string trim(const char* s) {
 }
 
 inline std::wstring resolve_guest_agent_exe() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	return L"C:/Preview/AiDAGuestAgent.exe";
+#else
 	wchar_t module_path[MAX_PATH] = {};
 	DWORD n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
 	if (n == 0 || n >= MAX_PATH) return {};
@@ -259,6 +286,7 @@ inline std::wstring resolve_guest_agent_exe() {
 	std::error_code ec;
 	if (!std::filesystem::exists(agent, ec) || ec) return {};
 	return agent.wstring();
+#endif
 }
 
 inline std::string join_guest_path(std::string base, const std::string& leaf) {
@@ -287,6 +315,9 @@ inline std::string custom_guest_command() {
 }
 
 inline void open_custom_vm_guide() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::debugger::record("open_guide", "custom-vm-bridge-guide.md");
+#else
 	std::filesystem::path rel = L"docs\\custom-vm-bridge-guide.md";
 	std::error_code ec;
 	std::filesystem::path candidates[4];
@@ -307,9 +338,16 @@ inline void open_custom_vm_guide() {
 		}
 	}
 	toast_notification::push("Custom VM guide is in docs\\custom-vm-bridge-guide.md.", toast_notification::toast_type_t::info, 5.0f);
+#endif
 }
 
 inline bool activate_custom_bridge() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::debugger::record("activate_vm_bridge", trim(custom_guest_bridge_buf()));
+	last_custom_bridge_dir() = widen_utf8(trim(custom_bridge_buf()).c_str());
+	toast_notification::push("Custom VM bridge preview activated.", toast_notification::toast_type_t::success, 5.0f);
+	return true;
+#else
 	std::string host_bridge_trim = trim(custom_bridge_buf());
 	std::string guest_bridge_trim = trim(custom_guest_bridge_buf());
 	std::string exe_trim = trim(exe_buf());
@@ -393,10 +431,14 @@ inline bool activate_custom_bridge() {
 		args_trim.size());
 	toast_notification::push("Custom VM bridge activated. Start the guest command inside the VM.", toast_notification::toast_type_t::success, 5.0f);
 	return true;
+#endif
 }
 
 inline void open_url(const wchar_t* url) {
 	if (!url || !*url) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::debugger::record("open_url", narrow_utf8(url));
+#else
 	const int len = WideCharToMultiByte(CP_UTF8, 0, url, -1, nullptr, 0, nullptr, nullptr);
 	if (len <= 1) return;
 	std::string utf8(static_cast<size_t>(len), '\0');
@@ -407,6 +449,7 @@ inline void open_url(const wchar_t* url) {
 		toast_notification::push("Camoufox could not queue the requested page",
 			toast_notification::toast_type_t::error, 5.0f);
 	}
+#endif
 }
 
 inline bool prepare_launch_result(bool host_mode) {
@@ -461,6 +504,11 @@ inline bool prepare_launch_result(bool host_mode) {
 }
 
 inline void browse_executable() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	std::snprintf(exe_buf(), 1024, "%s", "C:/Preview/Samples/sample.exe");
+	std::snprintf(cwd_buf(), 1024, "%s", "C:/Preview/Samples");
+	aida::preview::debugger::record("browse_executable", exe_buf());
+#else
 	diag::log_tagged_critical("file_dialog", "spawn_target.browse_executable invoking show_open_file_dialog_w");
 	wchar_t path_buf[1024] = {};
 	std::string current = trim(exe_buf());
@@ -521,9 +569,14 @@ inline void browse_executable() {
 		"spawn_target.browse_executable ok path='%s'", sel.c_str());
 	diag::log_tagged_critical_fmt("dialog",
 		"spawn_browse_exe_selected path='%s'", sel.c_str());
+#endif
 }
 
 inline void browse_working_dir() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	std::snprintf(cwd_buf(), 1024, "%s", "C:/Preview/Samples");
+	aida::preview::debugger::record("browse_working_directory", cwd_buf());
+#else
 	diag::log_tagged_critical("file_dialog", "spawn_target.browse_working_dir invoking show_open_folder_dialog_ex");
 	std::string current = trim(cwd_buf());
 	std::wstring initial = current.empty() ? std::wstring() : widen_utf8(current.c_str());
@@ -546,9 +599,14 @@ inline void browse_working_dir() {
 		"spawn_target.browse_working_dir ok path='%s'", picked.c_str());
 	diag::log_tagged_critical_fmt("dialog",
 		"spawn_browse_cwd_selected path='%s'", picked.c_str());
+#endif
 }
 
 inline void browse_custom_bridge_dir() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	std::snprintf(custom_bridge_buf(), 1024, "%s", "C:/Preview/VMBridge");
+	aida::preview::debugger::record("browse_vm_bridge", custom_bridge_buf());
+#else
 	diag::log_tagged_critical("file_dialog", "spawn_target.browse_custom_bridge invoking show_open_folder_dialog_ex");
 	std::string current = trim(custom_bridge_buf());
 	std::wstring initial = current.empty() ? std::wstring() : widen_utf8(current.c_str());
@@ -566,6 +624,7 @@ inline void browse_custom_bridge_dir() {
 	custom_bridge_buf()[1023] = '\0';
 	diag::log_tagged_critical_fmt("dialog",
 		"spawn_browse_custom_bridge_selected path='%s'", picked.c_str());
+#endif
 }
 
 }
@@ -849,8 +908,12 @@ inline void render() {
 			                     aida::ui::button_kind_t::secondary,
 			                     aida::ui::size_t_::sm,
 			                     ImVec2(110.f, 28.f), false, nullptr, false)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::debugger::record("open_sandbox_folder", sb_utf8);
+#else
 				ShellExecuteW(g_hwnd, L"open", detail::last_sandbox_dir().c_str(),
 				              nullptr, nullptr, SW_SHOWNORMAL);
+#endif
 			}
 		}
 
@@ -865,8 +928,8 @@ inline void render() {
 			ImFont* warn_font = aida::ui::fonts::body_em();
 			if (!warn_font) warn_font = ImGui::GetFont();
 			ImFont* base = ImGui::GetFont();
-			float fs_title = warn_font->FontSize;
-			float fs_body = base->FontSize;
+			float fs_title = aida::ui::fonts::size_or(warn_font, ImGui::GetFontSize());
+			float fs_body = aida::ui::fonts::size_or(base, ImGui::GetFontSize());
 
 			const bool host_mode = detail::run_mode_choice() == 2;
 			const bool custom_mode = detail::run_mode_choice() == 1;

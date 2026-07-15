@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -13,13 +14,37 @@
 
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "pe_parser.hpp"
+#else
+#include "../../preview/debugger_preview_runtime.hpp"
+namespace pe_parser {
+struct export_entry_t { uint16_t ordinal = 0; std::string name; uint32_t rva = 0; uint64_t address = 0; bool is_forwarded = false; std::string forward_name; };
+struct import_entry_t { std::string module_name; std::string function_name; uint16_t ordinal = 0; uint16_t hint = 0; uint64_t iat_address = 0; uint64_t bound_address = 0; };
+struct pe_info_t { std::vector<export_entry_t> exports; std::vector<import_entry_t> imports; };
+inline bool parse(uint64_t base, pe_info_t& out, bool = true) {
+	out.exports = {{1, "validate_license", 0x16A32, base + 0x16A32, false, {}}, {2, "decrypt_stage", 0x1B420, base + 0x1B420, false, {}}, {3, "dispatch_command", 0x208F0, base + 0x208F0, false, {}}};
+	out.imports = {{"KERNEL32.dll", "VirtualProtect", 0, 0, base + 0xC1020, 0}, {"ntdll.dll", "NtQueryInformationProcess", 0, 0, base + 0xC1088, 0}, {"ADVAPI32.dll", "BCryptDecrypt", 0, 0, base + 0xC10F0, 0}};
+	aida::preview::debugger::record("module_details", std::to_string(base));
+	return true;
+}
+}
+namespace aida::events {
+struct subscription_handle_t { uint64_t id = 0; std::string type_name; bool valid() const { return id != 0; } };
+}
+#endif
 #include "ui_anim.hpp"
 #include "motion.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "event_bus.hpp"
+#endif
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#else
+#include "../../preview/ui_task_executor.hpp"
+#endif
 
 namespace module_view {
 
@@ -175,6 +200,9 @@ inline void ensure_subscriptions()
 	if (!g_ui.subscriptions_initialized.compare_exchange_strong(expected, true))
 		return;
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::debugger::record("module_subscriptions", "preview state source");
+#else
 	g_ui.dll_loaded_sub = aida::events::subscribe(
 		aida::events::event_dll_loaded,
 		[](const aida::events::dll_loaded_t& evt) {
@@ -197,6 +225,7 @@ inline void ensure_subscriptions()
 			g_ui.last_event_refresh_ms.store(now_ms, std::memory_order_release);
 			refresh();
 		});
+#endif
 }
 
 inline void load_module_details_by_base(uint64_t base)
@@ -273,9 +302,12 @@ inline void load_module_details(int index)
 	uint64_t base = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
-		if (index < 0 || index >= static_cast<int>(g_ui.modules.size()))
+		if (index < 0)
 			return;
-		base = g_ui.modules[index].base;
+		const size_t module_index = static_cast<size_t>(index);
+		if (module_index >= g_ui.modules.size())
+			return;
+		base = g_ui.modules[module_index].base;
 	}
 
 	load_module_details_by_base(base);
@@ -401,8 +433,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ui_anim::render_table_header(dl, pos_x + row_left_pad - 8.f, mod_table_y,
 			left_w - (row_left_pad - 8.f), col_header_h, cols, 3, ar, ag, ab, alpha);
 	}
-	ImU32 hdr_col = _ta(_t.text_secondary);
-
 	float mod_list_y = mod_table_y + col_header_h;
 	float mod_list_h = height - header_h - col_header_h;
 	if (mod_list_h <= 0.f) return;
@@ -434,19 +464,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (mod_first < 0) mod_first = 0;
 	int mod_vis = static_cast<int>(mod_list_h / row_h) + 2;
 	int selected_filtered_idx = -1;
-	for (int i = 0; i < static_cast<int>(mods_snapshot.size()); ++i) {
+	for (size_t i = 0; i < mods_snapshot.size(); ++i) {
 		if (mods_snapshot[i].base == selected_base) {
-			selected_filtered_idx = i;
+			if (i <= static_cast<size_t>(std::numeric_limits<int>::max()))
+				selected_filtered_idx = static_cast<int>(i);
 			break;
 		}
 	}
 
 	for (int vi = 0; vi < mod_vis; ++vi) {
 		int idx = mod_first + vi;
-		if (idx >= static_cast<int>(mods_snapshot.size())) break;
+		const size_t module_index = static_cast<size_t>(idx);
+		if (module_index >= mods_snapshot.size()) break;
 
-		auto& m = mods_snapshot[idx];
-		float ry = mod_list_y + idx * row_h - g_ui.module_scroll_y;
+		auto& m = mods_snapshot[module_index];
+		float ry = mod_list_y + static_cast<float>(idx) * row_h - g_ui.module_scroll_y;
 		if (ry + row_h < mod_list_y || ry > mod_list_y + mod_list_h) continue;
 
 		bool clicked = ui_anim::row_hover_select(dl, pos_x, ry, left_w - 12.f, row_h,
@@ -593,10 +625,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		for (int vi = 0; vi < det_vis; ++vi) {
 			int idx = det_first + vi;
-			if (idx >= static_cast<int>(filtered.size())) break;
+			const size_t detail_index = static_cast<size_t>(idx);
+			if (detail_index >= filtered.size()) break;
 
-			auto& exp = filtered[idx];
-			float ry = det_list_y + idx * row_h - g_ui.detail_scroll_y;
+			auto& exp = filtered[detail_index];
+			float ry = det_list_y + static_cast<float>(idx) * row_h - g_ui.detail_scroll_y;
 			if (ry + row_h < det_list_y || ry > det_list_y + det_list_h) continue;
 
 			ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,
@@ -663,10 +696,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		for (int vi = 0; vi < det_vis; ++vi) {
 			int idx = det_first + vi;
-			if (idx >= static_cast<int>(filtered.size())) break;
+			const size_t detail_index = static_cast<size_t>(idx);
+			if (detail_index >= filtered.size()) break;
 
-			auto& imp = filtered[idx];
-			float ry = det_list_y + idx * row_h - g_ui.detail_scroll_y;
+			auto& imp = filtered[detail_index];
+			float ry = det_list_y + static_cast<float>(idx) * row_h - g_ui.detail_scroll_y;
 			if (ry + row_h < det_list_y || ry > det_list_y + det_list_h) continue;
 
 			ui_anim::row_hover_select(dl, right_x, ry, right_w - 12.f, row_h,

@@ -7,7 +7,9 @@
 #include "ui_anim.hpp"
 
 #include "../session/analysis_session.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#endif
 #include "../../helpers/globals.h"
 
 #include <algorithm>

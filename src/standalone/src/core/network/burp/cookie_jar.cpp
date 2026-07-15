@@ -1,6 +1,10 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlobj.h>
+#endif
 
 #ifdef small
 #undef small
@@ -14,8 +18,16 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../infra/event_bus.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
 #include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -69,12 +81,14 @@ state_t& s()
     return st;
 }
 
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 void set_err(const std::string& msg)
 {
     auto& st = s();
     std::lock_guard<std::mutex> lk(st.err_mtx);
     st.last_err = msg;
 }
+#endif
 
 std::string ascii_lower(const std::string& v)
 {
@@ -213,14 +227,6 @@ bool path_matches(const std::string& cookie_path, const std::string& request_pat
     if (cookie_path.back() == '/') return true;
     if (request_path[cookie_path.size()] == '/') return true;
     return false;
-}
-
-std::string default_path_for(const std::string& request_path)
-{
-    if (request_path.empty() || request_path[0] != '/') return "/";
-    const size_t last_slash = request_path.rfind('/');
-    if (last_slash == 0) return "/";
-    return request_path.substr(0, last_slash);
 }
 
 void handle_exchange_observed(const exchange_observed_t& e)
@@ -499,6 +505,9 @@ void clear_all()
 
 std::string storage_path()
 {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return "/aida-preview/state/cookies.json";
+#else
     PWSTR appdata = nullptr;
     std::string base;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata)) && appdata) {
@@ -521,6 +530,7 @@ std::string storage_path()
     std::filesystem::create_directories(base, ec);
     base += "\\cookies.json";
     return base;
+#endif
 }
 
 bool save_to_disk()
@@ -548,6 +558,9 @@ bool save_to_disk()
             }
         }
     }
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return !root.is_discarded();
+#else
     const std::string path = storage_path();
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -557,10 +570,14 @@ bool save_to_disk()
     const std::string dump = root.dump(2);
     out.write(dump.data(), static_cast<std::streamsize>(dump.size()));
     return true;
+#endif
 }
 
 bool load_from_disk()
 {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return !list_all().empty();
+#else
     auto& st = s();
     const std::string path = storage_path();
     std::ifstream in(path, std::ios::binary);
@@ -601,10 +618,14 @@ bool load_from_disk()
         st.jars = std::move(loaded);
     }
     return true;
+#endif
 }
 
 bool export_netscape(const std::string& file_path)
 {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return !file_path.empty();
+#else
     std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
     if (!out) { set_err("export: failed to open file"); return false; }
     out << "# Netscape HTTP Cookie File\n";
@@ -620,10 +641,25 @@ bool export_netscape(const std::string& file_path)
             << expires << '\t' << c.name << '\t' << c.value << '\n';
     }
     return true;
+#endif
 }
 
 bool import_netscape(const std::string& file_path)
 {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    if (file_path.empty()) return false;
+    parsed_cookie_t cookie;
+    cookie.created_unix_ms = now_ms();
+    cookie.domain = "portal.aidapro.net";
+    cookie.path = "/";
+    cookie.secure = true;
+    cookie.http_only = true;
+    cookie.host_only = true;
+    cookie.name = "aida_preview_session";
+    cookie.value = "studio-fixture";
+    set_cookie(cookie.domain, cookie);
+    return true;
+#else
     std::ifstream in(file_path, std::ios::binary);
     if (!in) { set_err("import: failed to open file"); return false; }
     std::string line;
@@ -657,6 +693,7 @@ bool import_netscape(const std::string& file_path)
     }
     diag::log_tagged_fmt("burp", "cookie_import_netscape file=%s added=%zu", file_path.c_str(), added);
     return true;
+#endif
 }
 
 std::string last_error()
@@ -801,6 +838,7 @@ void render_table(state_t& st, const ImVec2& origin, float width, float height, 
         dl->AddText(ImVec2(c_org.x + (c_sz.x - sz.x) * 0.5f, c_org.y + (c_sz.y - sz.y) * 0.5f),
                     aida::ui::with_alpha(th.text_dim, alpha * 0.85f), msg);
     }
+    ImGui::Dummy(ImVec2(0.f, 0.f));
     (void)height;
 }
 

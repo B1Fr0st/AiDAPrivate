@@ -6,7 +6,12 @@
 #include "../analysis/workspace/analysis_workspace.hpp"
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../infra/executor.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#include "../../preview/workbench_preview_adapter.hpp"
+#else
 #include "../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +43,39 @@ workbench_error_t shell_error(workbench_error_code_t code,
                               std::uint64_t subject = 0) noexcept
 {
     return {code, subject};
+}
+
+workbench_error_t inspector_shell_error(
+    const inspector::inspector_error_t& error) noexcept
+{
+    using inspector_code_t = inspector::inspector_error_code_t;
+    switch (error.code) {
+    case inspector_code_t::none:
+        return {};
+    case inspector_code_t::workspace_mismatch:
+        return shell_error(workbench_error_code_t::workspace_mismatch, error.subject);
+    case inspector_code_t::stale_generation:
+    case inspector_code_t::selection_changed:
+        return shell_error(workbench_error_code_t::revision_mismatch, error.subject);
+    case inspector_code_t::invalid_panel:
+        return shell_error(workbench_error_code_t::invalid_panel, error.subject);
+    case inspector_code_t::invalid_layout:
+    case inspector_code_t::layout_growth:
+        return shell_error(workbench_error_code_t::invalid_layout, error.subject);
+    case inspector_code_t::identifier_overflow:
+        return shell_error(workbench_error_code_t::revision_overflow, error.subject);
+    case inspector_code_t::invalid_context:
+        return shell_error(workbench_error_code_t::invalid_view, error.subject);
+    case inspector_code_t::invalid_query:
+    case inspector_code_t::query_capacity:
+    case inspector_code_t::duplicate_query:
+    case inspector_code_t::query_not_found:
+    case inspector_code_t::invalid_result:
+    case inspector_code_t::result_limit_exceeded:
+    case inspector_code_t::payload_mismatch:
+        return shell_error(workbench_error_code_t::adapter_rejected, error.subject);
+    }
+    return shell_error(workbench_error_code_t::adapter_rejected, error.subject);
 }
 
 bool checked_add(std::uint64_t lhs, std::uint64_t rhs,
@@ -851,7 +889,7 @@ private:
         std::uint64_t hash = k_shell_fnv_offset;
         hash ^= static_cast<std::uint8_t>(domain);
         hash *= k_shell_fnv_prime;
-        for (std::uint32_t shift = 0; shift != 64; shift += 8) {
+        for (std::uint32_t shift = 0; shift != 64U; shift += 8U) {
             hash ^= static_cast<std::uint8_t>(value >> shift);
             hash *= k_shell_fnv_prime;
         }
@@ -973,7 +1011,8 @@ public:
                 ordinal >= lease_.publication->snapshot->instructions.size())
                 return false;
             const auto& snapshot = *lease_.publication->snapshot;
-            const auto& instruction = snapshot.instructions[ordinal];
+            const auto& instruction =
+                snapshot.instructions[static_cast<std::size_t>(ordinal)];
             if (instruction.length == 0)
                 return false;
             output.id = {ordinal + 1U};
@@ -1076,7 +1115,8 @@ public:
         std::uint64_t ordinal = 0;
         if (!row_by_address(generation, address, row, ordinal))
             return false;
-        output = lease_.publication->snapshot->instructions[ordinal].address;
+        output = lease_.publication->snapshot->instructions[
+            static_cast<std::size_t>(ordinal)].address;
         output.value = address;
         return true;
     }
@@ -1160,7 +1200,7 @@ public:
         const auto projected = entries(generation);
         if (ordinal >= projected.size())
             return false;
-        output = projected[ordinal];
+        output = projected[static_cast<std::size_t>(ordinal)];
         return true;
     }
 
@@ -1184,7 +1224,7 @@ public:
 
     workbench_error_t apply_overlay(
         std::uint64_t generation,
-        const disasm_document::disasm_overlay_entry_t& entry) override
+        const disasm_document::disasm_overlay_entry_t& entry) const override
     {
         if (!rows_->generation_current(generation))
             return shell_error(workbench_error_code_t::revision_mismatch,
@@ -1222,7 +1262,7 @@ public:
     }
 
     workbench_error_t remove_overlay(std::uint64_t generation,
-                                     std::uint64_t address) override
+                                     std::uint64_t address) const override
     {
         analysis::overlay_snapshot_t snapshot;
         if (!source_->current_overlay_snapshot(generation, snapshot))
@@ -1571,7 +1611,7 @@ public:
         const auto projected = entries(generation);
         if (ordinal >= projected.size())
             return false;
-        output = projected[ordinal];
+        output = projected[static_cast<std::size_t>(ordinal)];
         return true;
     }
 
@@ -1593,7 +1633,7 @@ public:
 
     workbench_error_t apply_overlay(
         std::uint64_t generation,
-        const hex_document::hex_overlay_entry_t& entry) override
+        const hex_document::hex_overlay_entry_t& entry) const override
     {
         if (!rows_->generation_current(generation))
             return shell_error(workbench_error_code_t::revision_mismatch,
@@ -1627,7 +1667,7 @@ public:
     }
 
     workbench_error_t remove_overlay(std::uint64_t generation,
-                                     std::uint64_t address) override
+                                     std::uint64_t address) const override
     {
         analysis::overlay_snapshot_t snapshot;
         if (!source_->current_overlay_snapshot(generation, snapshot))
@@ -3581,6 +3621,7 @@ private:
                                  std::shared_ptr<diff_materialization_t>>> cache_;
 };
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 struct pseudocode_job_payload_t final {
     bool succeeded = false;
     analysis::decompiler_document_t document;
@@ -4109,6 +4150,14 @@ private:
     std::shared_ptr<analysis::decompiler_ui_integration_t> decompiler_;
     std::shared_ptr<job_registry_t> jobs_;
 };
+#endif
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+using workbench_pseudocode_source_t =
+    aida::preview::synchronous_pseudocode_source_adapter_t;
+#else
+using workbench_pseudocode_source_t = production_pseudocode_source_t;
+#endif
 
 class production_pseudocode_navigation_t final
     : public pseudocode_document::pseudocode_navigation_adapter_t {
@@ -4200,7 +4249,12 @@ public:
           hex_overlay_(source_, hex_source_),
           hex_navigation_(bridge_),
           hex_model_(hex_source_, &hex_overlay_, &hex_navigation_),
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+          pseudocode_source_(lease.source
+              ? lease.source->analysis_workspace() : nullptr),
+#else
           pseudocode_source_(lease),
+#endif
           pseudocode_navigation_(),
           pseudocode_model_(pseudocode_source_, &pseudocode_navigation_),
           graph_source_(lease, config.cached_graph_scope_limit),
@@ -4278,7 +4332,7 @@ private:
     production_hex_overlay_t hex_overlay_;
     production_hex_navigation_t hex_navigation_;
     hex_document::hex_document_model_t hex_model_;
-    production_pseudocode_source_t pseudocode_source_;
+    workbench_pseudocode_source_t pseudocode_source_;
     production_pseudocode_navigation_t pseudocode_navigation_;
     pseudocode_document::pseudocode_document_model_t pseudocode_model_;
     production_graph_source_t graph_source_;
@@ -4742,7 +4796,7 @@ workbench_shell_integration_t::integrate_inspector(
         session = std::make_shared<inspector::inspector_query_session_t>();
     auto activate = session->activate(context);
     if (!activate.ok())
-        return activate;
+        return inspector_shell_error(activate);
     {
         std::lock_guard<std::mutex> lock(ws_state->mutex);
         ws_state->inspector_context = context;
@@ -5198,7 +5252,7 @@ void persist_runtime_binding(
         binding->dirty_revision.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> persistence_lock(binding->persistence_mutex);
     bool allow_reschedule = true;
-    for (std::uint32_t attempt = 0; attempt != 16; ++attempt) {
+    for (std::uint32_t attempt = 0; attempt != 16U; ++attempt) {
         workbench_shell_workspace_context_t context;
         {
             std::lock_guard<std::mutex> lifecycle_lock(binding->lifecycle_mutex);
@@ -5261,6 +5315,12 @@ void persist_runtime_binding(
 void schedule_runtime_persistence(
     const std::shared_ptr<workbench_runtime_binding_t>& binding)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    binding->persisted_revision.store(
+        binding->dirty_revision.load(std::memory_order_acquire),
+        std::memory_order_release);
+    binding->persistence_scheduled.store(false, std::memory_order_release);
+#else
     bool expected = false;
     if (!binding->persistence_scheduled.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel,
@@ -5288,6 +5348,7 @@ void schedule_runtime_persistence(
             static_cast<unsigned long long>(binding->workspace.value),
             submitted.reject_reason.c_str());
     }
+#endif
 }
 
 void mark_runtime_dirty(
@@ -5428,8 +5489,12 @@ struct workbench_shell_runtime_t::impl_t {
             binding->model->create_workspace(initial, initial_snapshot);
         if (!created)
             return created;
+        workbench_shell_integration_config_t config;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        config.integrate_persistence = false;
+#endif
         binding->shell =
-            workbench_shell_integration_t::create(*binding->model);
+            workbench_shell_integration_t::create(*binding->model, config);
         if (!binding->shell)
             return shell_error(workbench_error_code_t::adapter_rejected,
                                binding->workspace.value);

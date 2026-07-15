@@ -1,6 +1,10 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #ifdef small
 #undef small
@@ -14,7 +18,11 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "../../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -181,7 +189,6 @@ void render(float pos_x, float pos_y, float width, float height,
     const float col_target = 130.f;
     const float col_match  = 220.f;
     const float col_hits   = 60.f;
-    const float col_active = 60.f;
 
     tdl->AddRectFilled(ImVec2(t_org.x, t_org.y), ImVec2(t_org.x + left_w, t_org.y + row_h),
                        aida::ui::with_alpha(th.panel_header, alpha));

@@ -1,3 +1,184 @@
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "auth_copilot.hpp"
+#include "auth_store.hpp"
+#include "auth_preview_platform.hpp"
+
+#include <ctime>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace aida {
+namespace auth {
+namespace copilot {
+
+namespace {
+
+	std::mutex& preview_error_mutex()
+	{
+		static std::mutex value;
+		return value;
+	}
+
+	std::string& preview_error()
+	{
+		static std::string value;
+		return value;
+	}
+
+	void set_preview_error(std::string value)
+	{
+		std::lock_guard<std::mutex> lock(preview_error_mutex());
+		preview_error() = std::move(value);
+	}
+
+}
+
+bool start_login(copilot_login_state_t& state,
+	std::optional<std::string> enterprise_url,
+	std::uint64_t absolute_deadline_ms)
+{
+	if (state.cancelled.load(std::memory_order_acquire)) {
+		set_preview_error("login cancelled before start");
+		return false;
+	}
+	if (absolute_deadline_ms != 0 && aida::infra::executor::now_ms() >= absolute_deadline_ms) {
+		set_preview_error("login startup timed out");
+		return false;
+	}
+	const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		state.device_code = "aida-studio-copilot-device";
+		state.user_code = "AIDA-RE42";
+		state.verification_uri = enterprise_url && !enterprise_url->empty()
+			? *enterprise_url + "/login/device"
+			: "https://github.com/login/device";
+		state.interval = 1;
+		state.expires_unix = now + 900;
+		state.enterprise_url = std::move(enterprise_url);
+		state.error.clear();
+		state.last_poll_unix = 0;
+		state.next_poll_unix = 0;
+	}
+	state.done.store(false, std::memory_order_release);
+	set_preview_error({});
+	return true;
+}
+
+bool poll_login(copilot_login_state_t& state)
+{
+	if (state.cancelled.load(std::memory_order_acquire)) {
+		set_preview_error("login cancelled");
+		return false;
+	}
+	const copilot_login_snapshot_t current = snapshot(state);
+	if (current.device_code.empty()) {
+		set_preview_error("device flow is not initialized");
+		state.done.store(true, std::memory_order_release);
+		return false;
+	}
+	auth_info_t info;
+	info.kind = auth_kind_t::oauth;
+	info.access = "aida-studio-copilot-access";
+	info.refresh = "aida-studio-copilot-refresh";
+	info.account_id = "studio-github";
+	info.email = "reverse.engineer@preview.aida";
+	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+	info.enterprise_url = current.enterprise_url.value_or(std::string{});
+	info.metadata["preview_receipt"] = "oauth:github-copilot:accepted";
+	if (!store::set("github-copilot", info)) {
+		set_preview_error(store::last_error());
+		state.done.store(true, std::memory_order_release);
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		state.last_poll_unix = static_cast<std::int64_t>(std::time(nullptr));
+		state.next_poll_unix = state.last_poll_unix;
+		state.error.clear();
+	}
+	state.done.store(true, std::memory_order_release);
+	set_preview_error({});
+	return true;
+}
+
+bool cancel_login(copilot_login_state_t& state)
+{
+	state.cancelled.store(true, std::memory_order_release);
+	state.done.store(true, std::memory_order_release);
+	return true;
+}
+
+bool refresh_token()
+{
+	auth_info_t info;
+	if (!store::get("github-copilot", info) || info.kind != auth_kind_t::oauth) {
+		set_preview_error("no github-copilot oauth credentials");
+		return false;
+	}
+	info.access = "aida-studio-copilot-access-refreshed";
+	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+	info.metadata["preview_receipt"] = "oauth:github-copilot:refreshed";
+	const bool result = store::set("github-copilot", info);
+	set_preview_error(result ? std::string{} : store::last_error());
+	return result;
+}
+
+bool revoke_tokens(const std::string& access_token,
+	const std::string& refresh_token_value,
+	const std::string&)
+{
+	if (access_token.empty() && refresh_token_value.empty()) {
+		set_preview_error("revoke_tokens: no tokens provided");
+		return false;
+	}
+	set_preview_error({});
+	return true;
+}
+
+bool revoke_token()
+{
+	auth_info_t info;
+	if (!store::get("github-copilot", info) || info.kind != auth_kind_t::oauth) {
+		set_preview_error("no github-copilot oauth credentials");
+		return false;
+	}
+	return revoke_tokens(info.access, info.refresh, info.custom_client_id);
+}
+
+copilot_login_snapshot_t snapshot(const copilot_login_state_t& state)
+{
+	copilot_login_snapshot_t value;
+	std::lock_guard<std::mutex> lock(state.mutex);
+	value.device_code = state.device_code;
+	value.user_code = state.user_code;
+	value.verification_uri = state.verification_uri;
+	value.interval = state.interval;
+	value.expires_unix = state.expires_unix;
+	value.enterprise_url = state.enterprise_url;
+	value.done = state.done.load(std::memory_order_acquire);
+	value.cancelled = state.cancelled.load(std::memory_order_acquire);
+	value.error = state.error;
+	value.last_poll_unix = state.last_poll_unix;
+	value.next_poll_unix = state.next_poll_unix;
+	return value;
+}
+
+std::string last_error()
+{
+	std::lock_guard<std::mutex> lock(preview_error_mutex());
+	return preview_error();
+}
+
+}
+}
+}
+
+#else
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "auth_copilot.hpp"
@@ -456,3 +637,5 @@ namespace copilot {
 }
 }
 }
+
+#endif

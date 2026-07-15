@@ -47,6 +47,16 @@ namespace aida::ui::clock {
 	}
 	inline float time_scale() { return detail::s_time_scale; }
 
+	inline void reset() {
+		detail::s_frame_index.store(0, std::memory_order_relaxed);
+		detail::s_last_imgui_frame = -1;
+		detail::s_seconds = 0.f;
+		detail::s_dt = 0.f;
+		detail::s_dt_unscaled = 0.f;
+		detail::s_time_scale = 1.f;
+		detail::s_first_tick = true;
+	}
+
 	inline float pulse(float frequency_hz, float lo = 0.f, float hi = 1.f) {
 		float two_pi = 6.2831853f;
 		float v = (sinf(detail::s_seconds * two_pi * frequency_hz) * 0.5f) + 0.5f;

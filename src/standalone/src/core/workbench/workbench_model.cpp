@@ -795,7 +795,9 @@ workbench_command_result_t workbench_model_t::execute(const workbench_command_t&
                 break;
             split_node_id_t leaf;
             split_tree_dto_t provisional = working.split_tree;
-            provisional.nodes.push_back({branch});
+            split_node_dto_t provisional_branch;
+            provisional_branch.id = branch;
+            provisional.nodes.push_back(provisional_branch);
             operation_result = next_split_identifier(provisional, leaf);
             if (!operation_result)
                 break;

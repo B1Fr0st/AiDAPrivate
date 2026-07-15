@@ -22,9 +22,13 @@
 #include "disasm_view.hpp"
 #include "hex_view.hpp"
 #include "ui_anim.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #include "../anti-tamper/webhook.hpp"
-#include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
+#endif
+#include "../helpers/globals.h"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -33,6 +37,11 @@
 #include "../ui/skeleton.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/fonts.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/scan_preview_runtime.hpp"
+#else
+#include "../infra/taskflow_runtime.hpp"
+#endif
 
 namespace crypto_scanner_view {
 
@@ -170,9 +179,10 @@ inline void glyph_aes(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 	float t = aida::ui::clock::seconds();
 	for (int row = 0; row < 4; ++row) {
 		for (int co = 0; co < 4; ++co) {
-			float ph = sinf(t * 1.6f + (float)(row * 4 + co) * 0.4f) * 0.5f + 0.5f;
+			float ph = sinf(t * 1.6f + static_cast<float>(row * 4 + co) * 0.4f) * 0.5f + 0.5f;
 			ImU32 fill = aida::ui::with_alpha(col, 0.18f + ph * 0.30f);
-			ImVec2 ca(a.x + cell * co + 1.f, a.y + cell * row + 1.f);
+			ImVec2 ca(a.x + cell * static_cast<float>(co) + 1.f,
+				a.y + cell * static_cast<float>(row) + 1.f);
 			ImVec2 cb(ca.x + cell - 2.f, ca.y + cell - 2.f);
 			dl->AddRectFilled(ca, cb, fill, 1.5f);
 		}
@@ -184,17 +194,17 @@ inline void glyph_aes(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 inline void glyph_sha(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 	float w = r * 1.8f;
 	int n = 4;
-	float gap = w / (float)(n + 1);
+	float gap = w / static_cast<float>(n + 1);
 	float t = aida::ui::clock::seconds();
 	for (int i = 0; i < n; ++i) {
-		float lx = c.x - w * 0.5f + gap * (float)(i + 1);
-		float ph = (float)i * 0.4f;
+		float lx = c.x - w * 0.5f + gap * static_cast<float>(i + 1);
+		float ph = static_cast<float>(i) * 0.4f;
 		float vy = sinf(t * 1.4f + ph) * 1.5f;
 		dl->AddCircle(ImVec2(lx, c.y + vy), r * 0.32f,
 			aida::ui::with_alpha(col, 0.85f), 18, 1.5f);
 		if (i + 1 < n) {
-			float lx2 = c.x - w * 0.5f + gap * (float)(i + 2);
-			float vy2 = sinf(t * 1.4f + (float)(i + 1) * 0.4f) * 1.5f;
+			float lx2 = c.x - w * 0.5f + gap * static_cast<float>(i + 2);
+			float vy2 = sinf(t * 1.4f + static_cast<float>(i + 1) * 0.4f) * 1.5f;
 			dl->AddLine(
 				ImVec2(lx + r * 0.32f, c.y + vy),
 				ImVec2(lx2 - r * 0.32f, c.y + vy2),
@@ -229,9 +239,9 @@ inline void glyph_md(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 	float h_each = (r * 1.6f) / 5.f;
 	float t = aida::ui::clock::seconds();
 	for (int i = 0; i < 5; ++i) {
-		float y0 = c.y + r * 0.8f - h_each * (float)(i + 1);
+		float y0 = c.y + r * 0.8f - h_each * static_cast<float>(i + 1);
 		float y1 = y0 + h_each - 1.5f;
-		float ph = sinf(t * 1.4f + (float)i * 0.55f) * 0.5f + 0.5f;
+		float ph = sinf(t * 1.4f + static_cast<float>(i) * 0.55f) * 0.5f + 0.5f;
 		ImU32 fill = aida::ui::with_alpha(col, 0.20f + ph * 0.45f);
 		dl->AddRectFilled(ImVec2(c.x - w * 0.5f, y0),
 			ImVec2(c.x + w * 0.5f, y1), fill, 2.f);
@@ -241,12 +251,12 @@ inline void glyph_md(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 inline void glyph_stream(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 	float t = aida::ui::clock::seconds();
 	for (int i = 0; i < 3; ++i) {
-		ImVec2 prev = ImVec2(c.x - r * 0.9f, c.y + (float)(i - 1) * r * 0.45f);
+		ImVec2 prev = ImVec2(c.x - r * 0.9f, c.y + static_cast<float>(i - 1) * r * 0.45f);
 		for (int s = 1; s <= 16; ++s) {
-			float fx = (float)s / 16.f;
-			float wave = sinf(t * 2.f + fx * 7.5f + (float)i * 1.0f) * r * 0.18f;
+			float fx = static_cast<float>(s) / 16.f;
+			float wave = sinf(t * 2.f + fx * 7.5f + static_cast<float>(i) * 1.0f) * r * 0.18f;
 			ImVec2 nx = ImVec2(c.x - r * 0.9f + fx * r * 1.8f,
-			                   c.y + (float)(i - 1) * r * 0.45f + wave);
+			                   c.y + static_cast<float>(i - 1) * r * 0.45f + wave);
 			dl->AddLine(prev, nx, aida::ui::with_alpha(col, 0.65f), 1.4f);
 			prev = nx;
 		}
@@ -268,7 +278,7 @@ inline void glyph_checksum(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 inline void glyph_encode(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 	const char* glyphs[3] = { "01", "AB", "+/" };
 	float t = aida::ui::clock::seconds();
-	int idx = ((int)floorf(t * 1.0f)) % 3;
+	int idx = static_cast<int>(floorf(t * 1.0f)) % 3;
 	if (idx < 0) idx += 3;
 	const char* lbl = glyphs[idx];
 	dl->AddRectFilled(ImVec2(c.x - r * 0.7f, c.y - r * 0.5f),
@@ -278,14 +288,20 @@ inline void glyph_encode(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 		ImVec2(c.x + r * 0.7f, c.y + r * 0.5f),
 		aida::ui::with_alpha(col, 0.7f), 4.f, 0, 1.f);
 	ImVec2 ts = ImGui::CalcTextSize(lbl);
-	dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	const float code_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
+	dl->AddText(code_font, code_size,
 		ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f),
 		aida::ui::with_alpha(col, 1.f), lbl);
 }
 
 inline void glyph_hex(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
 	dl->AddCircle(c, r * 0.7f, aida::ui::with_alpha(col, 0.7f), 24, 1.5f);
-	dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	const float code_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
+	dl->AddText(code_font, code_size,
 		ImVec2(c.x - 5.f, c.y - 5.f),
 		aida::ui::with_alpha(col, 1.f), "??");
 }
@@ -518,14 +534,13 @@ inline void open_hit_in_hex(const disasm_view::workspace_context_t& context,
 	std::uint64_t address)
 {
 	if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
-		hex_view::read_from_process(context, address, 256);
+		hex_view::read_live_memory(context, address, 256);
 		return;
 	}
-	const auto typed = disasm_view::typed_address(context, address);
-	if (!typed) return;
-	auto bytes = disasm_view::read_bytes(context, *typed, 256);
-	if (bytes) hex_view::set_data(context, bytes.value(), address,
-		context.workspace->identity().bin_name());
+	hex_view::activate(context);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::scan::record("crypto.open_hex", std::to_string(address));
+#endif
 }
 
 inline std::string lowercase(std::string value)
@@ -634,6 +649,12 @@ inline void export_results(const disasm_view::workspace_context_t& context,
 	std::string path,
 	bool csv)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const std::size_t count = snapshot ? snapshot->results.size() : 0;
+	aida::preview::scan::record(csv ? "crypto.export.csv" : "crypto.export.json",
+		context.workspace->identity().bin_name() + ": " + std::to_string(count) + " results");
+	(void)path;
+#else
 	aida::infra::taskflow_runtime::task_descriptor_t descriptor;
 	descriptor.owner_subsystem = "scanner";
 	descriptor.label = csv ? "scanner.crypto.export.csv" : "scanner.crypto.export.json";
@@ -678,11 +699,12 @@ inline void export_results(const disasm_view::workspace_context_t& context,
 		stream << output.dump(2);
 	};
 	aida::infra::taskflow_runtime::submit(std::move(descriptor));
+#endif
 }
 
 }
 
-inline void render(float pos_x, float pos_y, float width, float height,
+inline void render(float, float, float width, float height,
                    float alpha, float, float, float,
 				   const disasm_view::workspace_context_t& context)
 {
@@ -698,6 +720,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::EndChild();
 		return;
 	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lock(view_state->mutex);
+		if (!view_state->snapshot) {
+			const auto make_address = [&](std::uint64_t offset) {
+				aida::analysis::address_t address;
+				address.space = aida::analysis::address_space_id_t::virtual_address;
+				address.value = context.workspace->identity().image_base() + offset;
+				return address;
+			};
+			auto snapshot = std::make_shared<crypto_scanner::workspace_scan_snapshot_t>();
+			snapshot->results = {
+				{"AES S-box", "AES", crypto_scanner::crypto_category_t::symmetric,
+					make_address(0x5200), context.workspace->identity().bin_name(), 0x5200, {}},
+				{"SHA-256 IV", "SHA-256", crypto_scanner::crypto_category_t::hash,
+					make_address(0x87A0), context.workspace->identity().bin_name(), 0x87A0, {}},
+				{"ChaCha constant", "ChaCha20", crypto_scanner::crypto_category_t::stream_cipher,
+					make_address(0xC180), context.workspace->identity().bin_name(), 0xC180, {}}
+			};
+			snapshot->entropy_map = {
+				{make_address(0x12000), 7.84f, 256, context.workspace->identity().bin_name()}
+			};
+			view_state->snapshot = std::move(snapshot);
+			view_state->total_hits.store(3);
+			view_state->cipher_hits.store(2);
+			view_state->hash_hits.store(1);
+			view_state->referenced_hits.store(0);
+		}
+	}
+#endif
 	std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t> scan_snapshot;
 	{
 		std::lock_guard<std::mutex> lock(view_state->mutex);
@@ -780,6 +832,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("JSON", aida::ui::button_kind_t::ghost,
 				aida::ui::size_t_::md)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			detail::export_results(context, scan_snapshot, {}, false);
+#else
 			char* appdata = nullptr;
 			size_t len = 0;
 			_dupenv_s(&appdata, &len, "APPDATA");
@@ -789,6 +844,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				free(appdata);
 				detail::export_results(context, scan_snapshot, path, false);
 			}
+#endif
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
@@ -796,6 +852,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("CSV", aida::ui::button_kind_t::ghost,
 				aida::ui::size_t_::md)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			detail::export_results(context, scan_snapshot, {}, true);
+#else
 			char* appdata = nullptr;
 			size_t len = 0;
 			_dupenv_s(&appdata, &len, "APPDATA");
@@ -805,6 +864,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				free(appdata);
 				detail::export_results(context, scan_snapshot, path, true);
 			}
+#endif
 		}
 	}
 
@@ -931,7 +991,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImU32 lc = hov ? aida::ui::with_alpha(t.text_primary, alpha)
 		               : aida::ui::with_alpha(t.text_dim, alpha);
 		ImFont* hdr_fn = aida::ui::fonts::body();
-		float hdr_fs = hdr_fn ? hdr_fn->FontSize : ImGui::GetFontSize();
+		if (!hdr_fn) hdr_fn = ImGui::GetFont();
+		float hdr_fs = aida::ui::fonts::size_or(hdr_fn, ImGui::GetFontSize());
 		dl->AddText(hdr_fn, hdr_fs,
 			ImVec2(hx + 4.f, cy + (hdr_h - hdr_fs) * 0.5f), lc, col_names[c]);
 		ImVec2 ts = ImGui::CalcTextSize(col_names[c]);
@@ -980,6 +1041,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	char addr_buf[32];
 	char offset_buf[96];
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
 	for (int i = first_visible; i < last_visible; ++i) {
 		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
@@ -1023,20 +1090,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		rx += col_widths[0];
 
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, alpha * entrance), hit.signature_name.c_str());
 		rx += col_widths[1];
 
 		std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX", static_cast<unsigned long long>(hit.address));
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, alpha * entrance), addr_buf);
 		rx += col_widths[2];
 
 		std::snprintf(offset_buf, sizeof(offset_buf), "%s+0x%llX",
 		              hit.module_name.c_str(), static_cast<unsigned long long>(hit.module_offset));
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, alpha * entrance), offset_buf);
 		rx += col_widths[3];
@@ -1052,7 +1119,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (!hit.referencing_functions.empty()) {
 			char ref_buf[32];
 			std::snprintf(ref_buf, sizeof(ref_buf), "%zu refs", hit.referencing_functions.size());
-			dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+			dl->AddText(body_font, body_font_size,
 				ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
 				aida::ui::with_alpha(t.accent_u32, alpha * entrance), ref_buf);
 		}
@@ -1154,7 +1221,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::snprintf(count_buf, sizeof(count_buf), "%zu results", filtered.size());
 		}
 		ImVec2 fts = ImGui::CalcTextSize(count_buf);
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(ox + width - fts.x - 18.f, fy + (footer_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, alpha), count_buf);
 	}

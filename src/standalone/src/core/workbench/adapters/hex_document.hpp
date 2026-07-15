@@ -178,9 +178,9 @@ public:
     virtual bool overlay_by_address(std::uint64_t generation, std::uint64_t address,
                                     hex_overlay_entry_t& output) const = 0;
     virtual workbench_error_t apply_overlay(std::uint64_t generation,
-                                            const hex_overlay_entry_t& entry) = 0;
+                                             const hex_overlay_entry_t& entry) const = 0;
     virtual workbench_error_t remove_overlay(std::uint64_t generation,
-                                             std::uint64_t address) = 0;
+                                              std::uint64_t address) const = 0;
 };
 
 class hex_navigation_adapter_t {

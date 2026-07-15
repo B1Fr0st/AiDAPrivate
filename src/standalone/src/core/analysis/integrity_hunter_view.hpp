@@ -4,7 +4,11 @@
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #include "../helpers/diag_log.hpp"
+#endif
 #include "pseudocode_view.hpp"
 #include "../disasm/disasm_view.hpp"
 #include "disasm_view.hpp"
@@ -22,7 +26,6 @@ struct local_state_t {
 	int   selected_node = -1;
 	uint64_t selected_rip = 0;
 	bool  show_event_log = false;
-	float log_scroll_y = 0.f;
 	bool  scrollbar_dragging = false;
 	float scrollbar_drag_offset = 0.f;
 	float anim_time = 0.f;
@@ -30,9 +33,16 @@ struct local_state_t {
 
 inline local_state_t s_state;
 
-inline void render(float pos_x, float pos_y, float width, float height,
+inline void render(float, float, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static bool seeded = false;
+	if (!seeded) {
+		integrity_hunter::start_hunt(0x00007FF7A4C12000ULL, 0x4000);
+		seeded = true;
+	}
+#endif
 	const auto workspace_context = disasm_view::capture_selected_workspace();
 	ImGui::BeginChild("##integrity_hunter_view", ImVec2(width, height), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -56,11 +66,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const ImU32 dim_col   = _ta(_t.text_dim);
 	const ImU32 accent    = IM_COL32(static_cast<int>(accent_r * 255), static_cast<int>(accent_g * 255),
 	                                  static_cast<int>(accent_b * 255), static_cast<int>(alpha * 255));
-	const ImU32 header_bg = _ta(_t.panel_header);
-	const ImU32 row_even  = _ta(_t.panel_bg);
-	const ImU32 row_odd   = _ta(ui_anim::lighten(_t.panel_bg, 8));
-	const ImU32 row_hover = _ta(ui_anim::lighten(_t.panel_header, 14));
-	const ImU32 sel_col   = _ta(ui_anim::lighten(_t.panel_header, 10));
 	const ImU32 red_col   = _ta(_t.error);
 	const ImU32 green_col = _ta(_t.success);
 	const ImU32 yellow_col = _ta(_t.warning);
@@ -201,8 +206,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const float col_reads_w = 80.f;
 	const float col_rps_w = 70.f;
 	const float col_status_w = 80.f;
-	const float col_actions_w = (std::max)(0.f, width - col_rip_w - col_module_w - col_compare_w -
-	                             col_reads_w - col_rps_w - col_status_w - pad * 2.f);
 
 	{
 		ui_anim::table_col_t hdr_cols[] = {

@@ -1,12 +1,16 @@
 #include "image_view.hpp"
 
 #include "imgui/imgui.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/stb_image.h"
 #include "../../helpers/diag_log.hpp"
+#endif
 #include "theme.hpp"
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <windows.h>
 #include <d3d11.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -14,7 +18,9 @@
 #include <cstring>
 #include <thread>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 extern ID3D11Device* g_pd3dDevice;
+#endif
 
 namespace image_view {
 
@@ -38,10 +44,14 @@ bool is_image_extension(const std::string& ext_lower)
 static void release_srv()
 {
 	state_t& s = g_state();
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	if (s.srv) {
 		s.srv->Release();
 		s.srv = nullptr;
 	}
+#else
+	s.srv = nullptr;
+#endif
 	s.pixels.clear();
 	s.pixels.shrink_to_fit();
 	s.width = 0;
@@ -65,9 +75,16 @@ void clear()
 	s.fit_to_view = true;
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 static bool upload_to_gpu(const uint8_t* pixels, int w, int h)
 {
 	state_t& s = g_state();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (!pixels || w <= 0 || h <= 0) return false;
+	s.width = w;
+	s.height = h;
+	return true;
+#else
 	if (!g_pd3dDevice || !pixels || w <= 0 || h <= 0) return false;
 
 	D3D11_TEXTURE2D_DESC desc = {};
@@ -108,7 +125,9 @@ static bool upload_to_gpu(const uint8_t* pixels, int w, int h)
 	s.width = w;
 	s.height = h;
 	return true;
+#endif
 }
+#endif
 
 bool load_from_file(const std::string& path)
 {
@@ -122,9 +141,34 @@ bool load_from_file(const std::string& path)
 	s.loading.store(true, std::memory_order_release);
 	s.active.store(true, std::memory_order_release);
 
-	diag::log_tagged_fmt("image_view", "load_begin path=%s", path.c_str());
-
 	int w = 0, h = 0, ch = 0;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	w = 960;
+	h = 540;
+	ch = 4;
+	s.pixels.resize(64u * 36u * 4u);
+	for (int py = 0; py < 36; ++py) {
+		for (int px = 0; px < 64; ++px) {
+			const std::size_t offset = static_cast<std::size_t>(py * 64 + px) * 4u;
+			const float nx = static_cast<float>(px) / 63.f;
+			const float ny = static_cast<float>(py) / 35.f;
+			const float glow = (std::max)(0.f, 1.f - std::sqrt((nx - 0.56f) * (nx - 0.56f) + (ny - 0.46f) * (ny - 0.46f)) * 2.4f);
+			s.pixels[offset + 0] = static_cast<std::uint8_t>(12.f + glow * 32.f);
+			s.pixels[offset + 1] = static_cast<std::uint8_t>(20.f + glow * 76.f);
+			s.pixels[offset + 2] = static_cast<std::uint8_t>(34.f + glow * 154.f);
+			s.pixels[offset + 3] = 255;
+		}
+	}
+	s.width = w;
+	s.height = h;
+	s.channels = ch;
+	s.last_load_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+	s.loading.store(false, std::memory_order_release);
+	s.ready.store(true, std::memory_order_release);
+	return true;
+#else
+	diag::log_tagged_fmt("image_view", "load_begin path=%s", path.c_str());
 	unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 4);
 	if (!px) {
 		s.err = stbi_failure_reason() ? stbi_failure_reason() : "stbi_load failed";
@@ -154,6 +198,7 @@ bool load_from_file(const std::string& path)
 		"load_done path=%s w=%d h=%d ch=%d uploaded=%d",
 		path.c_str(), w, h, ch, uploaded ? 1 : 0);
 	return uploaded;
+#endif
 }
 
 void render(float x, float y, float w, float h, float alpha,
@@ -183,7 +228,12 @@ void render(float x, float y, float w, float h, float alpha,
 		return;
 	}
 
-	if (!ready || !s.srv || s.width <= 0 || s.height <= 0) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const bool drawable = ready && !s.pixels.empty() && s.width > 0 && s.height > 0;
+#else
+	const bool drawable = ready && s.srv != nullptr && s.width > 0 && s.height > 0;
+#endif
+	if (!drawable) {
 		std::string msg = s.err.empty() ? "Unable to display image" : ("Image error: " + s.err);
 		ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
 		dl->AddText(ImVec2(pmin.x + (w - ts.x) * 0.5f, pmin.y + (h - ts.y) * 0.5f),
@@ -259,10 +309,27 @@ void render(float x, float y, float w, float h, float alpha,
 	float cy = cmin.y + (ch_avail - disp_h) * 0.5f + s.pan_y;
 
 	dl->PushClipRect(cmin, cmax, true);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const int preview_w = 64;
+	const int preview_h = 36;
+	const float cell_w = disp_w / static_cast<float>(preview_w);
+	const float cell_h = disp_h / static_cast<float>(preview_h);
+	for (int py = 0; py < preview_h; ++py) {
+		for (int px = 0; px < preview_w; ++px) {
+			const std::size_t offset = static_cast<std::size_t>(py * preview_w + px) * 4u;
+			const ImU32 color = IM_COL32(s.pixels[offset], s.pixels[offset + 1], s.pixels[offset + 2], static_cast<int>(255.f * alpha));
+			dl->AddRectFilled(
+				ImVec2(cx + cell_w * static_cast<float>(px), cy + cell_h * static_cast<float>(py)),
+				ImVec2(cx + cell_w * static_cast<float>(px + 1), cy + cell_h * static_cast<float>(py + 1)),
+				color);
+		}
+	}
+#else
 	dl->AddImage(reinterpret_cast<ImTextureID>(s.srv),
 		ImVec2(cx, cy), ImVec2(cx + disp_w, cy + disp_h),
 		ImVec2(0, 0), ImVec2(1, 1),
 		IM_COL32(255, 255, 255, (int)(255 * alpha)));
+#endif
 	dl->PopClipRect();
 }
 

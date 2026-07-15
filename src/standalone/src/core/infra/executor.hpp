@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "../../preview/executor_preview.hpp"
+
+#else
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -716,3 +722,5 @@ struct shutdown_guard_t {
 inline shutdown_guard_t g_shutdown_guard;
 
 }
+
+#endif

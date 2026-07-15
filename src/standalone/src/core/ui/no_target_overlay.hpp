@@ -8,9 +8,15 @@
 #include "components.hpp"
 #include "empty_state.hpp"
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/workspace_preview_fixture.hpp"
+#else
 #include "../disasm/zydis_disasm.hpp"
+#endif
 #include "../../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#endif
 #include "../debugger/spawn_target_dialog.hpp"
 
 #include <string>
@@ -89,7 +95,11 @@ namespace aida::ui::no_target_overlay {
 	inline void dispatch_default_action(action_t action) {
 		if (action == action_t::open_file) {
 			diag::log_tagged_critical("file_dialog", "no_target_overlay.open_clicked invoking_open_file_dialog");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			std::string fpath = aida::preview::workspace_preview_fixture().source_path;
+#else
 			std::string fpath = disasm::open_file_dialog(g_hwnd);
+#endif
 			if (!fpath.empty()) {
 				diag::log_tagged_critical_fmt("file_dialog",
 					"no_target_overlay.open ok path=%s", fpath.c_str());

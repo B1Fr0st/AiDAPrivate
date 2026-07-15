@@ -33,7 +33,9 @@
 #include "../ui/transition.hpp"
 #include "../ui/responsive.hpp"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
+#endif
 
 namespace aida {
 namespace agent_manager {
@@ -294,10 +296,8 @@ namespace agent_manager {
 			dl->AddLine(ImVec2(a.x, b.y - 1.f), ImVec2(b.x, b.y - 1.f),
 				aida::ui::with_alpha(accent, 0.45f), 1.f);
 
-			float ang = (*open_state ? 1.f : 0.f);
 			float anim_p = anim.eased();
 			float draw_ang = anim_p * 1.5707963f;
-			(void)ang;
 
 			float arrow_cx = a.x + 12.f;
 			float arrow_cy = (a.y + b.y) * 0.5f;
@@ -384,40 +384,66 @@ namespace agent_manager {
 		ImGui::BeginChild("##aida_agent_manager_root", ImVec2(panel_w, content_h), false,
 			ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
+		const ImVec2 root_pos = ImGui::GetWindowPos();
+		ImDrawList* root_dl = ImGui::GetWindowDrawList();
+		root_dl->AddText(aida::ui::fonts::h2(), 22.f,
+			ImVec2(root_pos.x + 12.f, root_pos.y + 2.f), th.text_primary, "Agents");
+		root_dl->AddText(aida::ui::fonts::caption(), 13.f,
+			ImVec2(root_pos.x + 12.f, root_pos.y + 29.f), th.text_dim,
+			panel_w < 520.f
+				? "Configure reverse-engineering agent roles."
+				: "Inspect built-in agents or configure custom reverse-engineering roles.");
+
 		const float gm_gap = 12.f;
-		const float gm_min_detail_w = 260.f;
-		float left_w = std::clamp(panel_w * 0.24f, 190.f, 280.f);
-		bool gm_stack_vertical = (panel_w - left_w - gm_gap) < gm_min_detail_w;
+		const float gm_pad = 12.f;
+		const float gm_header_h = 56.f;
+		const float gm_avail_w = (std::max)(180.f, panel_w - gm_pad * 2.f);
+		const float gm_avail_h = (std::max)(160.f, content_h - gm_header_h - gm_pad);
+		const float gm_min_detail_w = 300.f;
+		float left_w = std::clamp(gm_avail_w * 0.30f, 220.f, 300.f);
+		bool gm_stack_vertical = (gm_avail_w - left_w - gm_gap) < gm_min_detail_w;
 		if (gm_stack_vertical) {
-			left_w = std::max(panel_w - 8.f, 180.f);
+			left_w = gm_avail_w;
 		}
 		float right_w = gm_stack_vertical
-			? std::max(panel_w - 8.f, 180.f)
-			: std::max(gm_min_detail_w, panel_w - left_w - gm_gap);
+			? gm_avail_w
+			: (std::max)(gm_min_detail_w, gm_avail_w - left_w - gm_gap);
 
 		static bool s_gm_logged_stack = false;
 		if (gm_stack_vertical && !s_gm_logged_stack) {
 			s_gm_logged_stack = true;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			::diag::log_tagged_fmt("responsive",
 				"agent_manager panel stacked panel_w=%.0f min_detail_w=%.0f",
 				panel_w, gm_min_detail_w);
+#endif
 		} else if (!gm_stack_vertical && s_gm_logged_stack) {
 			s_gm_logged_stack = false;
 		}
 
 		float gm_left_h = gm_stack_vertical
-			? std::max(ImGui::GetContentRegionAvail().y * 0.42f, 160.f)
-			: ImGui::GetContentRegionAvail().y;
+			? std::clamp(gm_avail_h * 0.34f, 200.f, 300.f)
+			: gm_avail_h;
+		const float gm_right_h = gm_stack_vertical
+			? (std::max)(180.f, gm_avail_h - gm_left_h - gm_gap)
+			: gm_avail_h;
 
+		ImGui::PushStyleColor(ImGuiCol_ChildBg,
+			ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.panel_header, 0.22f)));
+		ImGui::PushStyleColor(ImGuiCol_Border,
+			ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.border_subtle, 0.85f)));
+		ImGui::SetCursorScreenPos(ImVec2(root_pos.x + gm_pad, root_pos.y + gm_header_h));
 		ImGui::BeginChild("##agent_manager_left",
-			ImVec2(left_w, gm_left_h), false,
+			ImVec2(left_w, gm_left_h), true,
 			ImGuiWindowFlags_None);
+		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Available agents");
+		ImGui::Dummy(ImVec2(0.f, 2.f));
 
 		{
 			char filter_local[96];
 			std::memcpy(filter_local, st.left_filter, sizeof(filter_local));
 			if (aida::ui::input_text("##agent_filter", filter_local, sizeof(filter_local),
-					"Filter agents...", false, ImVec2((std::max)(120.f, left_w - 14.f), 32.f))) {
+					"Filter agents...", false, ImVec2((std::max)(120.f, ImGui::GetContentRegionAvail().x), 32.f))) {
 				std::lock_guard<std::mutex> lk(st.mtx);
 				std::memcpy(st.left_filter, filter_local, sizeof(st.left_filter));
 			}
@@ -434,7 +460,6 @@ namespace agent_manager {
 		const auto& all = aida::agent::list();
 		ImDrawList* ldl = ImGui::GetWindowDrawList();
 
-		size_t row_index = 0;
 		for (const auto& a : all) {
 			std::string name_lower;
 			for (char c : a.name) {
@@ -452,7 +477,7 @@ namespace agent_manager {
 
 			const bool selected_now = (a.name == st.selected_name);
 			const float row_h = 54.f;
-			const float row_w = left_w - 12.f;
+			const float row_w = ImGui::GetContentRegionAvail().x;
 
 			ImVec2 row_pos = ImGui::GetCursorScreenPos();
 
@@ -515,16 +540,16 @@ namespace agent_manager {
 			}
 
 			ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y + row_h));
-			++row_index;
 		}
 
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 		ImGui::EndChild();
 
 		if (!gm_stack_vertical) ImGui::SameLine();
 
 		ImGui::BeginChild("##agent_manager_right",
-			ImVec2(right_w, ImGui::GetContentRegionAvail().y), false,
-			ImGuiWindowFlags_HorizontalScrollbar);
+			ImVec2(right_w, gm_right_h), true,
+			ImGuiWindowFlags_NoSavedSettings);
 
 		const aida::agent::agent_info_t* selected_info = aida::agent::get(st.selected_name);
 		bool is_native = selected_info != nullptr && selected_info->native;
@@ -601,7 +626,7 @@ namespace agent_manager {
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Description");
 			ImGui::SetNextItemWidth(-FLT_MIN);
 			if (ImGui::InputTextMultiline("##agent_desc", st.edit_description,
-				sizeof(st.edit_description), ImVec2(0, ImGui::GetFontSize() * 2.2f + 8.f),
+				sizeof(st.edit_description), ImVec2(0.f, ImGui::GetFontSize() * 2.2f + 8.f),
 				is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_None)) {
 				detail::mark_dirty_locked();
 			}
@@ -631,7 +656,11 @@ namespace agent_manager {
 					int b1 = from_hex(hex[5]);
 					int b2 = from_hex(hex[6]);
 					if (r1 >= 0 && r2 >= 0 && g1 >= 0 && g2 >= 0 && b1 >= 0 && b2 >= 0) {
-						preview = ImVec4((r1 * 16 + r2) / 255.f, (g1 * 16 + g2) / 255.f, (b1 * 16 + b2) / 255.f, 1.f);
+						preview = ImVec4(
+							static_cast<float>(r1 * 16 + r2) / 255.f,
+							static_cast<float>(g1 * 16 + g2) / 255.f,
+							static_cast<float>(b1 * 16 + b2) / 255.f,
+							1.f);
 					}
 				}
 			}
@@ -670,7 +699,7 @@ namespace agent_manager {
 				ImGui::SetNextItemWidth(-FLT_MIN);
 				if (ImGui::InputTextMultiline("##agent_sys_prompt", st.edit_system_prompt,
 					sizeof(st.edit_system_prompt),
-					ImVec2(0, ImGui::GetFontSize() * 12.f + 8.f),
+					ImVec2(0.f, ImGui::GetFontSize() * 12.f + 8.f),
 					is_native ? ImGuiInputTextFlags_ReadOnly : ImGuiInputTextFlags_AllowTabInput)) {
 					detail::mark_dirty_locked();
 				}
@@ -1040,6 +1069,7 @@ namespace agent_manager {
 		}
 
 		ImGui::EndChild();
+		ImGui::PopStyleColor(2);
 
 		ImGui::EndChild();
 		ImGui::PopID();

@@ -1,7 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -137,6 +142,9 @@ struct state_t {
 
 inline state_t g_state;
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/scan_memory_preview.inl"
+#else
 void initialize();
 void shutdown();
 
@@ -157,5 +165,6 @@ void cancel_pointer_scan();
 
 std::string format_value(const std::vector<uint8_t>& bytes, value_type_t type);
 std::vector<uint8_t> parse_value(const std::string& text, value_type_t type, bool hex);
+#endif
 
 }

@@ -22,14 +22,28 @@
 #include "avatar.hpp"
 #include "empty_state.hpp"
 #include "fonts.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "auth_preview_platform.hpp"
+#else
 #include "../infra/executor.hpp"
+#endif
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
+#endif
 
 #include "provider_catalog.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "provider_transforms.hpp"
+#endif
 #include "standalone_settings.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+namespace aida::settings_overlay {
+	std::string consume_pending_provider_focus();
+}
+#else
 #include "settings_overlay.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -50,7 +64,9 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <windows.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -278,7 +294,8 @@ namespace auth_view {
 		{
 			std::string out;
 			out.reserve(provider_id.size());
-			for (unsigned char ch : provider_id) {
+			for (const char raw_ch : provider_id) {
+				const auto ch = static_cast<unsigned char>(raw_ch);
 				if (ch == '\\') out.push_back('/');
 				else out.push_back(static_cast<char>(std::tolower(ch)));
 			}
@@ -1539,7 +1556,11 @@ namespace auth_view {
 					g_state.refresh.completed.store(false);
 					return;
 				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const bool ok = true;
+#else
 				const bool ok = aida::provider::catalog::fetch_and_cache(10000);
+#endif
 				if (g_state.shutdown_flag.load()) {
 					g_state.refresh.in_flight.store(false);
 					g_state.refresh.completed.store(false);
@@ -1549,7 +1570,11 @@ namespace auth_view {
 					std::lock_guard<std::mutex> lk(g_state.mtx);
 					g_state.refresh.success.store(ok);
 					g_state.refresh.message = ok ? std::string("Catalog updated")
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						: std::string("Catalog preview unavailable");
+#else
 						: aida::provider::catalog::last_error();
+#endif
 				}
 				g_state.refresh.completed.store(true);
 				g_state.refresh.in_flight.store(false);
@@ -1764,6 +1789,9 @@ namespace auth_view {
 				}
 
 				std::string base_url;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				base_url = entry_copy.fallback_base;
+#else
 				aida::auth::auth_info_t tmp_info;
 				tmp_info.api_key = captured_key;
 				std::string resolved = aida::provider::transforms::resolve_endpoint(
@@ -1774,6 +1802,7 @@ namespace auth_view {
 					const auto* prov = aida::provider::catalog::get_provider(captured_id);
 					if (prov && !prov->base_url.empty()) base_url = prov->base_url;
 				}
+#endif
 				if (base_url.empty()) base_url = entry_copy.fallback_base;
 				while (!base_url.empty() && base_url.back() == '/') base_url.pop_back();
 
@@ -1861,6 +1890,9 @@ namespace auth_view {
 					info.expires_unix = 0;
 					info.email.clear();
 					info.account_id.clear();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					info.metadata["preview_receipt"] = "api:" + captured_id + ":accepted";
+#endif
 					if (!aida::auth::store::set(captured_id, info)) {
 						result.success = false;
 						result.message = std::string("Connected, but failed to persist key: ")
@@ -1961,12 +1993,14 @@ namespace auth_view {
 			if (cat.empty()) return;
 
 			if (g_state.chatbox_provider_dropdown_index < 0
-				|| g_state.chatbox_provider_dropdown_index >= static_cast<int>(cat.size())) {
+				|| static_cast<size_t>(g_state.chatbox_provider_dropdown_index) >= cat.size()) {
 				g_state.chatbox_provider_dropdown_index = 0;
 			}
 			static std::string s_last_loaded_for_provider;
+			const size_t initial_provider_index =
+				static_cast<size_t>(g_state.chatbox_provider_dropdown_index);
 			const std::string current_provider_id =
-				cat[g_state.chatbox_provider_dropdown_index].id;
+				cat[initial_provider_index].id;
 			if (s_last_loaded_for_provider != current_provider_id) {
 				s_last_loaded_for_provider = current_provider_id;
 				chatbox_load_persisted_key(current_provider_id);
@@ -1990,16 +2024,24 @@ namespace auth_view {
 					&g_state.chatbox_provider_dropdown_index,
 					names_storage.data(),
 					static_cast<int>(names_storage.size()))) {
+				if (g_state.chatbox_provider_dropdown_index < 0
+					|| static_cast<size_t>(g_state.chatbox_provider_dropdown_index) >= cat.size()) {
+					g_state.chatbox_provider_dropdown_index = 0;
+				}
 				if (prev_dd != g_state.chatbox_provider_dropdown_index) {
+					const size_t provider_index =
+						static_cast<size_t>(g_state.chatbox_provider_dropdown_index);
 					chatbox_load_persisted_key(
-						cat[g_state.chatbox_provider_dropdown_index].id);
+						cat[provider_index].id);
 					s_last_loaded_for_provider =
-						cat[g_state.chatbox_provider_dropdown_index].id;
+						cat[provider_index].id;
 				}
 			}
 			cy += 40.f;
 
-			const chatbox_provider_entry_t& selected = cat[g_state.chatbox_provider_dropdown_index];
+			const size_t selected_provider_index =
+				static_cast<size_t>(g_state.chatbox_provider_dropdown_index);
+			const chatbox_provider_entry_t& selected = cat[selected_provider_index];
 			const provider_status_t status = compute_provider_status(selected.id);
 
 			ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
@@ -2054,10 +2096,23 @@ namespace auth_view {
 
 			ImGui::SetCursorScreenPos(ImVec2(origin_x + pad, cy));
 			const char* save_label = busy ? "Verifying..." : "Save & verify";
+			const int action_count = 1 + (status.authenticated ? 1 : 0) +
+				(!selected.console_url.empty() ? 1 : 0);
+			const float action_gap = 8.f;
+			const float action_avail = (std::max)(120.f, section_w - pad * 2.f);
+			const float preferred_total = 180.f +
+				(status.authenticated ? 108.f : 0.f) +
+				(!selected.console_url.empty() ? 128.f : 0.f) +
+				action_gap * static_cast<float>(action_count - 1);
+			const bool fit_actions = action_avail < preferred_total;
+			const float fitted_w = fit_actions
+				? (std::max)(88.f, (action_avail - action_gap * static_cast<float>(action_count - 1)) /
+					static_cast<float>(action_count))
+				: 0.f;
 			if (aida::ui::button(save_label,
 					aida::ui::button_kind_t::accent_gradient,
 					aida::ui::size_t_::md,
-					ImVec2(180.f, 36.f),
+					ImVec2(fit_actions ? fitted_w : 180.f, 36.f),
 					busy, nullptr, busy)) {
 				if (!busy) {
 					std::string k = g_state.chatbox_key_buf;
@@ -2069,25 +2124,26 @@ namespace auth_view {
 					}
 				}
 			}
-			ImGui::SameLine(0.f, 10.f);
+			ImGui::SameLine(0.f, action_gap);
 			if (status.authenticated) {
 				if (aida::ui::button("Clear",
 						aida::ui::button_kind_t::destructive,
 						aida::ui::size_t_::md,
-						ImVec2(100.f, 36.f))) {
+						ImVec2(fit_actions ? fitted_w : 100.f, 36.f))) {
 					clear_credentials_for(selected.id);
 					SecureZeroMemory(g_state.chatbox_key_buf, sizeof(g_state.chatbox_key_buf));
 					g_state.chatbox_key_show = false;
 					std::lock_guard<std::mutex> lk(g_state.mtx);
 					g_state.validate_results.erase(selected.id);
 				}
-				ImGui::SameLine(0.f, 10.f);
+				if (!selected.console_url.empty())
+					ImGui::SameLine(0.f, action_gap);
 			}
 			if (!selected.console_url.empty()) {
 				if (aida::ui::button("Get key",
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::md,
-						ImVec2(120.f, 36.f))) {
+						ImVec2(fit_actions ? fitted_w : 120.f, 36.f))) {
 					open_url_in_browser(selected.console_url);
 				}
 			}
@@ -2342,8 +2398,13 @@ namespace auth_view {
 			hdl->AddText(aida::ui::fonts::h2(), 22.f,
 				ImVec2(root_x + pad, root_y + 2.f),
 				th.text_primary, "Accounts");
+			hdl->AddText(aida::ui::fonts::caption(), 13.f,
+				ImVec2(root_x + pad, root_y + 30.f),
+				th.text_dim, root_w < 520.f
+					? "Connect model providers and credentials."
+					: "Connect model providers for chat, agents, and analysis workflows.");
 
-			const float toolbar_h = 40.f;
+			const float toolbar_h = 56.f;
 
 			if (!g_state.selected_provider_id.empty()) {
 				const int idx = chatbox_dropdown_index_for(g_state.selected_provider_id);
@@ -2440,9 +2501,12 @@ namespace auth_view {
 			const float body_max_w = 720.f;
 			const float body_w = (std::min)(body_max_w, root_w - pad * 2.f);
 			const float body_x = root_x + ((root_w - body_w) * 0.5f);
+			const float body_card_h = g_state.chatbox_active_section == 0
+				? (std::min)(body_h, 320.f)
+				: body_h;
 
 			ImVec2 ca(body_x, body_y);
-			ImVec2 cb(body_x + body_w, body_y + body_h);
+			ImVec2 cb(body_x + body_w, body_y + body_card_h);
 			ImDrawList* bdl = ImGui::GetWindowDrawList();
 			bdl->AddRectFilled(ca, cb,
 				aida::ui::with_alpha(th.bg_elevated, 0.55f), 14.f);
@@ -2450,13 +2514,13 @@ namespace auth_view {
 				aida::ui::with_alpha(th.border_subtle, 0.85f), 14.f, 0, 1.f);
 
 			ImGui::SetCursorScreenPos(ImVec2(body_x + 1.f, body_y + 1.f));
-			ImGui::BeginChild("##chatbox_body", ImVec2(body_w - 2.f, body_h - 2.f), false,
+			ImGui::BeginChild("##chatbox_body", ImVec2(body_w - 2.f, body_card_h - 2.f), false,
 				ImGuiWindowFlags_NoBackground);
 
 			if (g_state.chatbox_active_section == 0) {
-				render_chatbox_api_section(body_x, body_y, body_w, body_h);
+				render_chatbox_api_section(body_x, body_y, body_w, body_card_h);
 			} else {
-				render_chatbox_oauth_section(body_x, body_y, body_w, body_h);
+				render_chatbox_oauth_section(body_x, body_y, body_w, body_card_h);
 			}
 
 			ImGui::EndChild();
@@ -3049,7 +3113,10 @@ namespace auth_view {
 				const ImGuiWindowFlags flags =
 					ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
 					ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-					ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+					ImGuiWindowFlags_NoSavedSettings |
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
+					ImGuiWindowFlags_NoDocking |
+#endif
 					ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
 					ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoFocusOnAppearing;
 
@@ -3382,6 +3449,9 @@ namespace auth_view {
 		g_state.codex_state.reset();
 		g_state.copilot_state.reset();
 		g_state.claude_code_state.reset();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::infra::executor::clear_preview_tasks();
+#endif
 	}
 
 	bool any_login_in_progress()
@@ -3420,11 +3490,15 @@ namespace auth_view {
 
 	void render(float panel_w, float panel_h)
 	{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::infra::executor::drain_preview_frame();
+#endif
 		ImGui::PushID("aida_auth_view");
 		poll_login_startups();
 		poll_browser_open_completion();
 
 		if (aida::provider::catalog::list_providers().empty()) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "auth_provider";
 			sub.label = "auth.catalog.load_cached_or_fetch";
@@ -3436,6 +3510,7 @@ namespace auth_view {
 				aida::provider::catalog::load_cached_or_fetch(86400);
 			};
 			aida::infra::executor::submit(std::move(sub));
+#endif
 		}
 
 		float content_h = panel_h > 0.f ? panel_h : ImGui::GetContentRegionAvail().y;

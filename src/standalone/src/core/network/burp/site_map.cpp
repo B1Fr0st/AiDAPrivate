@@ -1,12 +1,20 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "site_map.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_burp_core.hpp"
+#else
 #include "burp_logger.hpp"
+#endif
 #include "scope.hpp"
 
 #include "imgui/imgui.h"
@@ -14,8 +22,16 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../infra/event_bus.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
 #include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -97,21 +113,6 @@ void split_path_segments(const std::string& path, std::vector<std::string>& out)
     }
 }
 
-std::string find_resp_header(const exchange_observed_t& e, const std::string& name)
-{
-    for (const auto& kv : e.resp_headers) {
-        if (kv.first.size() != name.size()) continue;
-        bool match = true;
-        for (size_t i = 0; i < name.size(); ++i) {
-            const char a = static_cast<char>(kv.first[i] | 0x20);
-            const char b = static_cast<char>(name[i] | 0x20);
-            if (a != b) { match = false; break; }
-        }
-        if (match) return kv.second;
-    }
-    return {};
-}
-
 void insert_into_tree(state_t& st, const exchange_observed_t& e)
 {
     host_key_t key{e.host, e.port, e.scheme == "https" || e.scheme == "wss"};
@@ -157,7 +158,8 @@ void insert_into_tree(state_t& st, const exchange_observed_t& e)
 
     cur->exchanges.push_back(e);
     if (cur->exchanges.size() > 512) {
-        cur->exchanges.erase(cur->exchanges.begin(), cur->exchanges.begin() + (cur->exchanges.size() - 512));
+        const auto erase_count = static_cast<decltype(cur->exchanges)::difference_type>(cur->exchanges.size() - 512);
+        cur->exchanges.erase(cur->exchanges.begin(), cur->exchanges.begin() + erase_count);
     }
     st.by_id[e.id] = e;
     if (st.by_id.size() > 65536) {
@@ -525,7 +527,7 @@ void render_tree_node(state_t& st, const std::shared_ptr<path_node_t>& node, con
                               aida::ui::with_alpha(th.selection, r_alpha), 4.f);
         }
 
-        const float indent = depth * 14.f;
+        const float indent = static_cast<float>(depth) * 14.f;
         const float caret_x = cursor_screen.x + indent + 4.f;
         const float text_x = caret_x + 14.f;
 

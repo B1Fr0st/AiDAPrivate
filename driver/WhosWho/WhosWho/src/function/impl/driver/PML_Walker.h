@@ -3,6 +3,7 @@
 #include "../../../imports/Defs.h"
 #include "za.h"
 #include "Strong.h"
+#include "../../KernelLayout.h"
 
 namespace pml4
 {
@@ -32,6 +33,34 @@ namespace pml4
     inline void* g_mmonp_MmPfnDatabase = nullptr;
     inline volatile LONG g_pfndb_initialized = 0;
     inline volatile LONG g_pfndb_summary_logged = 0;
+
+    __forceinline UINT64 pteframe_mask()
+    {
+        static volatile LONG g_pteframe_mask_resolved = 0;
+        static volatile UINT64 g_pteframe_mask_value = 0xFFFFFFFFFULL;
+
+        if (_InterlockedCompareExchange(&g_pteframe_mask_resolved, 0, 0) == 2)
+            return g_pteframe_mask_value;
+
+        LONG prev = _InterlockedCompareExchange(&g_pteframe_mask_resolved, 1, 0);
+        if (prev == 2)
+            return g_pteframe_mask_value;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_pteframe_mask_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_pteframe_mask_value;
+        }
+
+        ULONG build = whoswho_kernel_layout::build_number();
+        if (build >= 22000)
+            g_pteframe_mask_value = 0xFFFFFFFFFFULL;
+        else
+            g_pteframe_mask_value = 0xFFFFFFFFFULL;
+
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_pteframe_mask_resolved, 2);
+        return g_pteframe_mask_value;
+    }
 
     inline NTSTATUS InitializeMmPfnDatabase()
     {
@@ -161,7 +190,7 @@ namespace pml4
 
         uintptr_t result = 0;
 
-        const ULONGLONG MAX_TOTAL_PAGES = 0x100000;
+        const ULONGLONG MAX_TOTAL_PAGES = 0x400000;
         ULONGLONG total_pages_checked = 0;
 
         for (int i = 0; ; i++) {
@@ -185,7 +214,7 @@ namespace pml4
 
                 _MMPFN* pnfinfo = (_MMPFN*)((uintptr_t)g_mmonp_MmPfnDatabase + (current_phys_address >> 12) * sizeof(_MMPFN));
 
-                if (pnfinfo->u4.PteFrame != (current_phys_address >> 12)) {
+                if ((pnfinfo->u4.PteFrame & pteframe_mask()) != ((current_phys_address >> 12) & pteframe_mask())) {
                     continue;
                 }
 

@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "stealth_engine_preview.hpp"
+
+#else
+
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -915,3 +921,5 @@ inline void stop_protection_scan()
 }
 
 }
+
+#endif

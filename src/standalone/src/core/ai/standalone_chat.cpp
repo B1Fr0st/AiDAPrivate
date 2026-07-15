@@ -1,4 +1,24 @@
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "standalone_chat.hpp"
+#include "theme.hpp"
+#include "mcp_client.hpp"
+#include "mcp_marketplace.hpp"
+#include "standalone_settings.hpp"
+#include "agent_registry.hpp"
+#include "agent_picker_view.hpp"
+#include "settings_overlay.hpp"
+#include "event_bus.hpp"
+#include "auth_view.hpp"
+#include "provider_catalog.hpp"
+#include "skills.hpp"
+#include "../ui/components.hpp"
+#include "../ui/fonts.hpp"
+#include "../helpers/globals.h"
+
+#else
+
 #include <windows.h>
 #include <intrin.h>
 
@@ -62,6 +82,7 @@
 #include <sstream>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <exception>
@@ -70,6 +91,24 @@
 #include <nlohmann/json.hpp>
 
 #include "../helpers/diag_log.hpp"
+
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "../../preview/standalone_chat_preview.inl"
+
+#else
 
 using json = nlohmann::json;
 
@@ -2295,10 +2334,11 @@ bool find_exe_code_section(HMODULE mod, std::uint64_t& out_base, std::uint32_t& 
 
     const auto* section = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        if ((section[i].Characteristics & IMAGE_SCN_CNT_CODE) != 0
-            && section[i].Misc.VirtualSize > 0) {
-            out_base = reinterpret_cast<std::uint64_t>(mod) + section[i].VirtualAddress;
-            out_size = section[i].Misc.VirtualSize;
+        const auto& current_section = section[static_cast<std::size_t>(i)];
+        if ((current_section.Characteristics & IMAGE_SCN_CNT_CODE) != 0
+            && current_section.Misc.VirtualSize > 0) {
+            out_base = reinterpret_cast<std::uint64_t>(mod) + current_section.VirtualAddress;
+            out_size = current_section.Misc.VirtualSize;
             return true;
         }
     }
@@ -2456,7 +2496,7 @@ void init_standalone_chat()
     bool settings_loaded = false;
     DWORD seh_load = seh_settings_load(g_sa_settings, settings_loaded);
     if (seh_load != 0)
-        diag::log_tagged_fmt("init_chat", "settings_load_seh code=0x%08X last_err=%lu", seh_load, GetLastError());
+        diag::log_tagged_fmt("init_chat", "settings_load_seh code=0x%08lX last_err=%lu", seh_load, GetLastError());
     diag::log_tagged_fmt("init_chat", "settings_load_done loaded=%d", settings_loaded ? 1 : 0);
 
 
@@ -2492,7 +2532,7 @@ void init_standalone_chat()
         } catch (...) {}
     }
     custom_themes::active_custom = g_sa_settings.active_custom_theme_idx;
-    if (custom_themes::active_custom >= (int)custom_themes::list.size())
+    if (custom_themes::active_custom >= static_cast<int>(custom_themes::list.size()))
         custom_themes::active_custom = -1;
 
 
@@ -2518,7 +2558,7 @@ void init_standalone_chat()
     bool license_ok = false;
     DWORD seh_lic = seh_standalone_license_initialize(g_sa_settings, license_ok);
     if (seh_lic != 0)
-        diag::log_tagged_fmt("init_chat", "license_initialize_seh code=0x%08X last_err=%lu elapsed_ms=%llu",
+        diag::log_tagged_fmt("init_chat", "license_initialize_seh code=0x%08lX last_err=%lu elapsed_ms=%llu",
             seh_lic,
             GetLastError(),
             static_cast<unsigned long long>(GetTickCount64() - license_init_start_ms));
@@ -2651,13 +2691,13 @@ void init_standalone_chat()
     diag::log_tagged("init_chat", "register_standalone_protection_start");
     DWORD seh_rsp = seh_register_standalone_protection_call();
     if (seh_rsp != 0)
-        diag::log_tagged_fmt("init_chat", "register_standalone_protection_seh code=0x%08X last_err=%lu", seh_rsp, GetLastError());
+        diag::log_tagged_fmt("init_chat", "register_standalone_protection_seh code=0x%08lX last_err=%lu", seh_rsp, GetLastError());
     diag::log_tagged("init_chat", "register_standalone_protection_done");
 
     diag::log_tagged("init_chat", "restore_workspace_state_start");
     DWORD seh_rws = seh_restore_workspace_state();
     if (seh_rws != 0)
-        diag::log_tagged_fmt("init_chat", "restore_workspace_state_seh code=0x%08X last_err=%lu", seh_rws, GetLastError());
+        diag::log_tagged_fmt("init_chat", "restore_workspace_state_seh code=0x%08lX last_err=%lu", seh_rws, GetLastError());
     diag::log_tagged("init_chat", "restore_workspace_state_done");
 
     output_log::push(bottom_tab_t::output, "[init] AiDA Standalone initialized");
@@ -2994,7 +3034,8 @@ void tick_ai_chat()
 
 
     std::vector<std::pair<std::string, std::string>> history;
-    for (int i = 0; i < (int)g_chat_messages.size() - 2; ++i) {
+    const std::size_t history_end = g_chat_messages.size() > 2 ? g_chat_messages.size() - 2 : 0;
+    for (std::size_t i = 0; i < history_end; ++i) {
         auto& m = g_chat_messages[i];
         if (!m.text.empty())
             history.emplace_back(m.is_user ? "User" : "Assistant", m.text);
@@ -3238,6 +3279,7 @@ std::string start_new_conversation()
     return new_id;
 }
 
+#endif
 
 void render_tool_approval_dialog()
 {
@@ -3263,7 +3305,7 @@ void render_tool_approval_dialog()
 
     ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::resolved().bg_elevated);
     ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::resolved().border_strong);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 12));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.f, 12.f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 
     if (ImGui::BeginPopupModal("##tool_approval", nullptr,
@@ -3286,7 +3328,7 @@ void render_tool_approval_dialog()
         if (!args_preview.empty()) {
             ImGui::Text("Arguments:");
             ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(aida::ui::resolved().bg_base, 0.78f));
-            ImGui::BeginChild("##tool_args", ImVec2(-1, 100.f), ImGuiChildFlags_Borders);
+            ImGui::BeginChild("##tool_args", ImVec2(-1.f, 100.f), ImGuiChildFlags_Borders);
             ImGui::TextWrapped("%s", args_preview.c_str());
             ImGui::EndChild();
             ImGui::PopStyleColor();
@@ -3335,6 +3377,7 @@ void render_settings_inline(float panel_w, float panel_h)
     aida::settings_overlay::render_inline(panel_w, panel_h);
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 mcp_client::manager_t& get_mcp_client_manager()
 {
@@ -3412,6 +3455,8 @@ unsigned long get_attached_pid()
     return driver_bridge::attached_pid();
 }
 
+#endif
+
 namespace {
 
 ImU32 hex_to_imu32_or_default(const std::string& hex, ImU32 fallback)
@@ -3455,7 +3500,9 @@ void plan_build_pill_meta(std::string& label, std::string& glyph, ImU32& bg, ImU
     int rr = (col >> 0) & 0xFF;
     int gg = (col >> 8) & 0xFF;
     int bb = (col >> 16) & 0xFF;
-    float lum = 0.299f * (rr / 255.f) + 0.587f * (gg / 255.f) + 0.114f * (bb / 255.f);
+    float lum = 0.299f * (static_cast<float>(rr) / 255.f) +
+        0.587f * (static_cast<float>(gg) / 255.f) +
+        0.114f * (static_cast<float>(bb) / 255.f);
     fg = lum < 0.5f ? IM_COL32(245, 246, 252, 245) : IM_COL32(20, 22, 30, 245);
 }
 
@@ -3552,7 +3599,8 @@ void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
     int br = (bg >> 0) & 0xFF;
     int bg_g = (bg >> 8) & 0xFF;
     int bb_v = (bg >> 16) & 0xFF;
-    ImU32 dot_col = IM_COL32(br, bg_g, bb_v, static_cast<int>(((bg >> 24) & 0xFF) * alpha));
+    ImU32 dot_col = IM_COL32(br, bg_g, bb_v,
+        static_cast<int>(static_cast<float>((bg >> 24) & 0xFF) * alpha));
     aida::ui::status_dot(ImVec2(dot_cx, dot_cy), dot_r, dot_col, false, 1.4f);
 
     ImU32 text_col = aida::ui::with_alpha(th.text_primary,
@@ -3845,14 +3893,14 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
         const float popup_inner_w = 380.f;
 
         ImFont* seg_font = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
-        float seg_font_size = seg_font->FontSize > 0.f ? seg_font->FontSize : 14.f;
+        const float seg_font_size = aida::ui::fonts::size_or(seg_font, 14.f);
         const float seg_h = 26.f;
         const float seg_pad_x = 12.f;
         const float seg_gap = 6.f;
 
         if (authenticated_providers.empty()) {
             ImFont* cf_es = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
-            float cf_es_size = cf_es->FontSize > 0.f ? cf_es->FontSize : 12.f;
+            const float cf_es_size = aida::ui::fonts::size_or(cf_es, 12.f);
             const char* es_label = "No providers signed in yet";
             ImVec2 es_ts = cf_es->CalcTextSizeA(cf_es_size, FLT_MAX, 0.f, es_label);
 
@@ -4043,8 +4091,8 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
 
                 ImFont* nf = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
                 ImFont* cf = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
-                float nf_size = nf->FontSize > 0.f ? nf->FontSize : 14.f;
-                float cf_size = cf->FontSize > 0.f ? cf->FontSize : 12.f;
+                const float nf_size = aida::ui::fonts::size_or(nf, 14.f);
+                const float cf_size = aida::ui::fonts::size_or(cf, 12.f);
 
                 rdl->AddText(nf, nf_size,
                     ImVec2(ra.x + 10.f, ra.y + 4.f),
@@ -4105,7 +4153,7 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
         if (!any_model_match) {
             ImGui::Spacing();
             ImFont* cf = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
-            float cf_size = cf->FontSize > 0.f ? cf->FontSize : 12.f;
+            const float cf_size = aida::ui::fonts::size_or(cf, 12.f);
             ImVec2 cur = ImGui::GetCursorScreenPos();
             ImGui::GetWindowDrawList()->AddText(cf, cf_size,
                 ImVec2(cur.x + 8.f, cur.y + 4.f),
@@ -4287,8 +4335,8 @@ void chat_render_skills_pill(float anchor_x, float anchor_y, float alpha, char* 
         ImDrawList* sdl = ImGui::GetWindowDrawList();
         ImFont* nf = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
         ImFont* cf = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
-        float nf_size = nf->FontSize > 0.f ? nf->FontSize : 14.f;
-        float cf_size = cf->FontSize > 0.f ? cf->FontSize : 12.f;
+        const float nf_size = aida::ui::fonts::size_or(nf, 14.f);
+        const float cf_size = aida::ui::fonts::size_or(cf, 12.f);
 
         if (matching.empty()) {
             ImVec2 cur = ImGui::GetCursorScreenPos();
@@ -4396,19 +4444,19 @@ void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha)
 
     auto& mgr = get_mcp_client_manager();
     auto statuses = mgr.get_status();
-    int connected = 0;
-    int total = static_cast<int>(statuses.size());
-    int tools_count = 0;
+    std::size_t connected = 0;
+    const std::size_t total = statuses.size();
+    std::size_t tools_count = 0;
     for (const auto& s : statuses) {
         if (s.state == mcp_client::connection_state_t::connected) {
             connected++;
-            tools_count += static_cast<int>(s.tool_count);
+            tools_count += s.tool_count;
         }
     }
 
     char label_buf[32];
     if (total == 0) std::snprintf(label_buf, sizeof(label_buf), "MCP");
-    else std::snprintf(label_buf, sizeof(label_buf), "MCP %d/%d", connected, total);
+    else std::snprintf(label_buf, sizeof(label_buf), "MCP %zu/%zu", connected, total);
 
     ImVec2 ts = ImGui::CalcTextSize(label_buf);
     float pill_h = 22.f;
@@ -4452,7 +4500,7 @@ void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha)
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         char tip[160];
         std::snprintf(tip, sizeof(tip),
-            "MCP servers connected: %d / %d\nTotal remote tools: %d\nClick to view details",
+            "MCP servers connected: %zu / %zu\nTotal remote tools: %zu\nClick to view details",
             connected, total, tools_count);
         ImGui::SetTooltip("%s", tip);
     }
@@ -4500,8 +4548,8 @@ void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha)
     {
         ImFont* hf = aida::ui::fonts::body_strong() ? aida::ui::fonts::body_strong() : ImGui::GetFont();
         ImFont* cf = aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont();
-        float hf_size = hf->FontSize > 0.f ? hf->FontSize : 14.f;
-        float cf_size = cf->FontSize > 0.f ? cf->FontSize : 12.f;
+        const float hf_size = aida::ui::fonts::size_or(hf, 14.f);
+        const float cf_size = aida::ui::fonts::size_or(cf, 12.f);
 
         ImDrawList* pdl = ImGui::GetWindowDrawList();
         ImVec2 cur = ImGui::GetCursorScreenPos();
@@ -4539,7 +4587,7 @@ void chat_render_mcp_pill(float anchor_x, float anchor_y, float alpha)
                     aida::ui::with_alpha(th.text_primary, 1.f), s.name.c_str());
 
                 char meta[96];
-                std::snprintf(meta, sizeof(meta), "%s  |  %d tools", state_label, static_cast<int>(s.tool_count));
+                std::snprintf(meta, sizeof(meta), "%s  |  %zu tools", state_label, s.tool_count);
                 pdl->AddText(cf, cf_size,
                     ImVec2(ra.x + 24.f, ra.y + 3.f + hf_size + 1.f),
                     aida::ui::with_alpha(th.text_dim, 0.92f), meta);

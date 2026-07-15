@@ -1,5 +1,10 @@
 #include "upstream_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/network_preview_burp_core.hpp"
+#else
 #include "upstream_chain.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -47,12 +52,6 @@ view_state_t& vs()
 }
 
 const char* hop_types[] = { "http_connect", "socks5" };
-
-int type_to_idx(const std::string& s)
-{
-    if (s == "socks5" || s == "socks" || s == "socks5h") return 1;
-    return 0;
-}
 
 }
 
@@ -139,7 +138,8 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Remove")) {
-            st.new_hops.erase(st.new_hops.begin() + static_cast<int>(i));
+            const auto hop_offset = static_cast<decltype(st.new_hops)::difference_type>(i);
+            st.new_hops.erase(st.new_hops.begin() + hop_offset);
             ImGui::PopID();
             break;
         }

@@ -1,7 +1,9 @@
 #pragma once
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -17,11 +19,18 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/debugger_preview_runtime.hpp"
+#endif
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#else
+#include "../../preview/ui_task_executor.hpp"
+#endif
 
 namespace seh_view {
 
@@ -112,6 +121,26 @@ inline uint64_t resolve_thread_teb(uint32_t tid)
 
 inline void refresh()
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lock(g_ui.mutex);
+		g_ui.entries = {
+			{0x00007FFDA193AF28, 0, 0x0000007C52CFF430, "ntdll.dll", "KiUserExceptionDispatcher", 0},
+			{0x00007FF7A4C16A32, 0x00007FF7A4C169D0, 0x0000007C52CFF4C0, "sample.exe", "sample_exception_filter", 1},
+			{0x00007FF7A4C1B420, 0, 0x0000007C52CFF540, "sample.exe", "decrypt_stage", 2}
+		};
+		g_ui.diagnostics.target_pid = 6420;
+		g_ui.diagnostics.active_tid = 6872;
+		g_ui.diagnostics.teb_query_attempted = true;
+		g_ui.diagnostics.teb_query_ok = true;
+		g_ui.diagnostics.teb_va = 0x0000007C52CFF000;
+		g_ui.diagnostics.chain_entries = static_cast<uint32_t>(g_ui.entries.size());
+		g_ui.diagnostics.chain_stop_reason = "Preview fixture chain complete";
+	}
+	g_ui.refreshing.store(false);
+	aida::preview::debugger::record("refresh_seh", "3 handlers");
+	return;
+#endif
 	bool expected = false;
 	if (!g_ui.refreshing.compare_exchange_strong(expected, true))
 		return;
@@ -341,6 +370,10 @@ inline void refresh()
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float ar, float ag, float ab)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (g_ui.entries.empty())
+		refresh();
+#endif
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	float dt = ImGui::GetIO().DeltaTime;
 	const auto& _t = aida::ui::resolved();
@@ -494,10 +527,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	for (int vi = 0; vi < visible_count; ++vi) {
 		int idx = first_visible + vi;
-		if (idx >= static_cast<int>(snapshot.size())) break;
+		if (idx < 0) continue;
+		const std::size_t snapshot_index = static_cast<std::size_t>(idx);
+		if (snapshot_index >= snapshot.size()) break;
 
-		auto& e = snapshot[idx];
-		float ry = list_y + idx * row_h - g_ui.scroll_y;
+		auto& e = snapshot[snapshot_index];
+		float ry = list_y + static_cast<float>(idx) * row_h - g_ui.scroll_y;
 		if (ry + row_h < list_y || ry > list_y + list_h) continue;
 
 		float row_alpha = ui_anim::render_row_entrance(idx, static_cast<float>(first_visible), dt, alpha);
@@ -536,21 +571,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 									 g_ui.scrollbar_dragging, g_ui.scrollbar_drag_offset);
 
 	if (ImGui::BeginPopup("##seh_ctx")) {
-		if (g_ui.selected >= 0 && g_ui.selected < static_cast<int>(snapshot.size())) {
-			if (ImGui::MenuItem("Go to Handler")) {
-				diag::log_tagged_fmt("seh",
-					"seh_go_handler idx=%d handler=0x%llx",
-					g_ui.selected,
-					static_cast<unsigned long long>(snapshot[g_ui.selected].handler_addr));
-				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(snapshot[g_ui.selected].handler_addr,
-					disasm_view::capture_selected_workspace());
-			}
-			if (ImGui::MenuItem("Copy Address")) {
-				char abuf[24];
-				snprintf(abuf, sizeof(abuf), "%016llX",
-						 static_cast<unsigned long long>(snapshot[g_ui.selected].handler_addr));
-				ImGui::SetClipboardText(abuf);
+		if (g_ui.selected >= 0) {
+			const std::size_t selected_index = static_cast<std::size_t>(g_ui.selected);
+			if (selected_index < snapshot.size()) {
+				const std::uint64_t handler_address = snapshot[selected_index].handler_addr;
+				if (ImGui::MenuItem("Go to Handler")) {
+					diag::log_tagged_fmt("seh",
+						"seh_go_handler idx=%d handler=0x%llx",
+						g_ui.selected,
+						static_cast<unsigned long long>(handler_address));
+					globals::ui::active_center_view = center_view_t::disassembly;
+					disasm_view::goto_address(handler_address,
+						disasm_view::capture_selected_workspace());
+				}
+				if (ImGui::MenuItem("Copy Address")) {
+					char abuf[24];
+					snprintf(abuf, sizeof(abuf), "%016llX",
+							 static_cast<unsigned long long>(handler_address));
+					ImGui::SetClipboardText(abuf);
+				}
 			}
 		}
 		ImGui::EndPopup();

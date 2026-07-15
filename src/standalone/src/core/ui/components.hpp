@@ -776,7 +776,6 @@ namespace aida::ui::components {
 
 		if (count_label) {
 			char buf[64]; snprintf(buf, sizeof(buf), "  %s", count_label);
-			ImVec2 sz = font->CalcTextSizeA(fs, FLT_MAX, 0.f, buf);
 			dl->AddText(font, fs, ImVec2(a.x + content_w, a.y + (h - fs) * 0.5f),
 			             t.text_dim, buf);
 		}
@@ -798,6 +797,7 @@ namespace aida::ui::components {
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + h + 6.f));
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 	}
 
 	inline bool toggle_switch(const char* label, bool* state, size_t_ size = size_t_::sm) {
@@ -1129,6 +1129,7 @@ namespace aida::ui::components {
 		}
 		ImGui::PopID();
 		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y + aida::ui::metrics::spacing::sm));
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 		return result;
 	}
 
@@ -1227,6 +1228,7 @@ namespace aida::ui::components {
 		}
 		if (cleared) *cleared = did_clear;
 		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y));
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 		ImGui::PopID();
 		return changed;
 	}
@@ -1264,6 +1266,7 @@ namespace aida::ui::components {
 			ImGui::PopID();
 		}
 		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y + aida::ui::metrics::spacing::sm));
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 		return clicked;
 	}
 
@@ -1453,10 +1456,11 @@ namespace aida::ui::components {
 			ImGui::PopID();
 		}
 		ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y + aida::ui::metrics::spacing::sm));
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 		return clicked;
 	}
 
-	inline bool empty_state(const char* id, const char* title, const char* message = nullptr,
+	inline bool compact_empty_state(const char* id, const char* title, const char* message = nullptr,
 		const char* action_label = nullptr, ImVec2 size = ImVec2(0.f, 0.f)) {
 		return presentation(id, presentation_kind_t::empty, title, message, action_label, size);
 	}
@@ -1523,7 +1527,7 @@ namespace aida::ui {
 	using components::end_status_bar;
 	using components::status_item;
 	using components::presentation;
-	using components::empty_state;
+	using components::compact_empty_state;
 	using components::loading_state;
 	using components::error_state;
 	using components::button_kind_t;

@@ -1,23 +1,35 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlobj.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "recon_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_routed.hpp"
+#else
 #include "crawler.hpp"
 #include "content_discovery.hpp"
 #include "subdomain_enum.hpp"
 #include "payload_library.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
 #include "../../ui/toast_notification.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -582,8 +594,11 @@ void render_subdomains(ui_state_t& st, float alpha)
         {
             ::diag::log_tagged_fmt("recon_v", "sub_enum_export_csv id=%llu", static_cast<unsigned long long>(st.sub_selected));
             std::string csv = subdomain_enum::export_csv(st.sub_selected);
-            PWSTR known = nullptr;
             std::string base;
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+            base = "/aida-preview/exports";
+#else
+            PWSTR known = nullptr;
             if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &known)) && known)
             {
                 const int needed = WideCharToMultiByte(CP_UTF8, 0, known, -1, nullptr, 0, nullptr, nullptr);
@@ -595,8 +610,12 @@ void render_subdomains(ui_state_t& st, float alpha)
                 CoTaskMemFree(known);
             }
             if (base.empty()) base = "C:\\Users\\Public\\Downloads";
+#endif
             char ts[32]; snprintf(ts, sizeof(ts), "%llu", static_cast<unsigned long long>(st.sub_selected));
             std::string path = base + "\\subdomains_" + ts + ".csv";
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+            toast_notification::push("CSV export staged at " + path, toast_notification::toast_type_t::success);
+#else
             std::ofstream f(path, std::ios::binary);
             if (f) {
                 f.write(csv.data(), static_cast<std::streamsize>(csv.size()));
@@ -606,6 +625,7 @@ void render_subdomains(ui_state_t& st, float alpha)
                 ::diag::log_tagged_fmt("recon_v", "sub_enum_csv_export_failed path='%s'", path.c_str());
                 toast_notification::push("CSV export failed", toast_notification::toast_type_t::error);
             }
+#endif
         }
     }
 
@@ -822,7 +842,6 @@ void render(float pos_x, float pos_y, float width, float height,
     auto& s = ui();
     if (!s.initialized.load()) initialize();
 
-    const auto& th = aida::ui::resolved();
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##recon_view", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
 

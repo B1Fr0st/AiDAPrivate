@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/re_hubs_preview_adapter.hpp"
+#endif
+
 #include "ui/hub_strip.hpp"
 #include "ui/clock.hpp"
 #include "ui/no_target_overlay.hpp"
@@ -41,7 +45,11 @@ inline state_t g_state;
 inline void set_sub_tab(sub_tab_t tab)
 {
 	int idx = static_cast<int>(tab);
+	if (idx < 0 || idx >= static_cast<int>(sub_tab_t::COUNT)) return;
 	aida::ui::hub_strip::notify_select(g_state.strip, idx);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::re_hubs::select(aida::preview::re_hubs::domain_t::scan, idx, nullptr);
+#endif
 }
 
 inline sub_tab_t active_sub_tab()
@@ -61,6 +69,10 @@ inline constexpr aida::ui::hub_strip::tab_t s_tabs[] = {
 
 inline void render_active(int idx, float cw, float ch, float fa, float ar, float ag, float ab)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (idx >= 0 && idx < static_cast<int>(sub_tab_t::COUNT))
+		aida::preview::re_hubs::rendered(aida::preview::re_hubs::domain_t::scan, idx, s_tabs[idx].label);
+#endif
 	switch (static_cast<sub_tab_t>(idx)) {
 		case sub_tab_t::value_scan:
 			memory_scanner_view::render(0.f, 0.f, cw, ch, fa, ar, ag, ab);

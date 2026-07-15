@@ -468,6 +468,7 @@ namespace aida::ui::empty_state {
 				x += sz.x + pad_x * 2.f + gap;
 			}
 		}
+		ImGui::Dummy(ImVec2(0.f, 0.f));
 		return result;
 	}
 

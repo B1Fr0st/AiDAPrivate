@@ -1,7 +1,9 @@
 #include "x86_decoder.hpp"
 
 #include "checked_range.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "live_snapshot_provider.hpp"
+#endif
 
 #include <Zydis/Zydis.h>
 #include <Zycore/Zycore.h>
@@ -153,6 +155,13 @@ workspace_result_t<std::uint64_t> instruction_provider_offset(
         return image.rva_to_file_offset(rva.value(), instruction.length);
     }
     case address_space_id_t::live_virtual: {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        static_cast<void>(provider);
+        return workspace_result_t<std::uint64_t>::failure(
+            make_workspace_error(workspace_error_code_t::unsupported_address_space,
+                                 "live instruction snapshots are unavailable in Studio preview",
+                                 "x86_format"));
+#else
         const auto* snapshot = dynamic_cast<const live_snapshot_provider_t*>(&provider);
         if (!snapshot || instruction.address.value < snapshot->metadata().capture_address)
             return workspace_result_t<std::uint64_t>::failure(
@@ -165,6 +174,7 @@ workspace_result_t<std::uint64_t> instruction_provider_offset(
         if (!range)
             return workspace_result_t<std::uint64_t>::failure(range.error());
         return workspace_result_t<std::uint64_t>::success(offset);
+#endif
     }
     }
     return workspace_result_t<std::uint64_t>::failure(
@@ -443,6 +453,7 @@ workspace_result_t<void> worker_owned_x86_decoder_t::decode_one(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "x86 decode provenance is invalid", "x86_decode"));
     const std::uint64_t available = request.available_bytes;
+    const ZyanUSize zydis_available = static_cast<ZyanUSize>(request.available_bytes);
     auto data_result = contained_view_data(view, view_provider_offset,
                                            request.provider_offset, available,
                                            "x86_decode");
@@ -451,7 +462,7 @@ workspace_result_t<void> worker_owned_x86_decoder_t::decode_one(
     ZydisDecodedInstruction decoded{};
     std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands{};
     const ZyanStatus status = ZydisDecoderDecodeFull(&impl_->decoder,
-                                                     data_result.value(), available,
+                                                     data_result.value(), zydis_available,
                                                      &decoded, operands.data());
     if (!ZYAN_SUCCESS(status))
         return workspace_result_t<void>::failure(

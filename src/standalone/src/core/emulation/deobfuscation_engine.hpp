@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "deobfuscation_engine_preview.hpp"
+
+#else
+
 #include "symbolic_engine.hpp"
 #include "cfg_view.hpp"
 #include "zydis_disasm.hpp"
@@ -679,3 +685,5 @@ inline std::string export_statistics(const deobfuscated_result_t& result) {
 }
 
 }
+
+#endif

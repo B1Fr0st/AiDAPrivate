@@ -1,5 +1,6 @@
 #pragma once
 #include <imports/Defs.h>
+#include <core/NtVersion.h>
 #include <core/TargetingLatch.h>
 
 namespace vad_text_guard {
@@ -7,7 +8,36 @@ namespace vad_text_guard {
     inline volatile UINT64 g_text_base = 0;
     inline volatile UINT64 g_text_size = 0;
 
-    constexpr ULONG_PTR VADROOT_OFFSET   = 0x7D8;
+    inline volatile ULONG_PTR g_vadroot_offset = 0;
+    inline volatile LONG      g_vadroot_state  = 0;
+
+    __forceinline ULONG_PTR vadroot_offset()
+    {
+        LONG state = _InterlockedCompareExchange(&g_vadroot_state, 0, 0);
+        if (state == 2)
+            return g_vadroot_offset;
+
+        LONG prev = _InterlockedCompareExchange(&g_vadroot_state, 1, 0);
+        if (prev == 2)
+            return g_vadroot_offset;
+        if (prev == 1) {
+            for (ULONG i = 0; i < 400; ++i) {
+                if (_InterlockedCompareExchange(&g_vadroot_state, 2, 2) == 2)
+                    return g_vadroot_offset;
+                nt_version::wait_brief();
+            }
+            return g_vadroot_offset;
+        }
+
+        ULONG build = nt_version::build_number();
+        ULONG_PTR off = (build >= 26100) ? 0x558 : 0x7D8;
+        g_vadroot_offset = off;
+        SN_LOG("vadroot_offset resolved build=%lu offset=0x%llx", build, (UINT64)off);
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_vadroot_state, 2);
+        return g_vadroot_offset;
+    }
+
     constexpr ULONG_PTR VAD_NODE_OFFSET  = 0x000;
     constexpr ULONG_PTR STARTING_VPN_OFF = 0x018;
     constexpr ULONG_PTR ENDING_VPN_OFF   = 0x01C;
@@ -105,7 +135,7 @@ namespace vad_text_guard {
 
         __try {
             PVOID vad_root_ptr = reinterpret_cast<PVOID>(
-                reinterpret_cast<ULONG_PTR>(proc) + VADROOT_OFFSET);
+                reinterpret_cast<ULONG_PTR>(proc) + vadroot_offset());
 
             ULONG_PTR root_val = safe_read_ptr(vad_root_ptr);
             if (root_val == 0 || root_val == reinterpret_cast<ULONG_PTR>(vad_root_ptr))

@@ -51,4 +51,20 @@ namespace nt_version {
     __forceinline bool is_windows_11_24h2_or_newer() {
         return build_number() >= 26100;
     }
+
+    __forceinline ULONG_PTR kthread_apc_state_offset() {
+        return 0x98;
+    }
+
+    __forceinline ULONG_PTR kthread_apc_state_process_offset() {
+        return 0x20;
+    }
+
+    __forceinline ULONG_PTR kthread_apc_state_process_absolute_offset() {
+        return 0xB8;
+    }
+
+    __forceinline ULONG_PTR kthread_apc_state_size() {
+        return 0x30;
+    }
 }

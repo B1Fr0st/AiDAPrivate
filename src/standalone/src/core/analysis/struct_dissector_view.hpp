@@ -1,8 +1,10 @@
 #pragma once
 
 #include "struct_dissector.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "memory_scanner.hpp"
 #include "standalone_driver.hpp"
+#endif
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
 #include "ui/motion.hpp"
@@ -16,11 +18,14 @@
 #include "ui/ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #include "../anti-tamper/webhook.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -152,6 +157,11 @@ inline field_anim_t& fanim(int idx) { return g_ui.field_anims[idx]; }
 
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	struct_dissector::ensure_preview_fixture();
+	if (struct_dissector::g_state.cached_values.empty())
+		struct_dissector::refresh_values();
+#else
 	{
 		static bool s_types_font_logged_dissector = false;
 		if (!s_types_font_logged_dissector) {
@@ -159,6 +169,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			anti_tamper::webhook::write_log("types_font", "[types_font] scaled struct_dissector_view");
 		}
 	}
+#endif
 
 	ImGui::SetCursorScreenPos(ImVec2(ImGui::GetWindowPos().x + pos_x,
 	                                 ImGui::GetWindowPos().y + pos_y));
@@ -341,14 +352,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float body_y = oy + top_bar_h + 4.f;
 	float body_h = height - top_bar_h - 4.f;
 
-	bool driver_loaded = driver_bridge::is_loaded();
+	bool driver_loaded = true;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	driver_loaded = driver_bridge::is_loaded();
+#endif
 	if (!driver_loaded) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		static bool s_no_driver_logged_diss = false;
 		if (!s_no_driver_logged_diss) {
 			s_no_driver_logged_diss = true;
 			anti_tamper::webhook::write_log("types_audit",
 				"[types_audit] dissector_view_no_driver reason='driver_not_loaded'");
 		}
+#endif
 		float callout_h = 36.f;
 		ui_anim::render_inline_callout(dl, ox + 8.f, body_y + 4.f, width - 16.f, callout_h,
 			"Dissector live values need an attached process. Attach via the debugger to enable Read/Write.",
@@ -428,7 +444,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		int active_struct_idx = -1;
 		std::string filter_lc;
 		filter_lc.reserve(64);
-		for (size_t i = 0; ui.list_filter[i] != '\0' && i < sizeof(ui.list_filter); ++i) {
+		for (std::size_t i = 0; i < sizeof(ui.list_filter) && ui.list_filter[i] != '\0'; ++i) {
 			char c = ui.list_filter[i];
 			if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
 			filter_lc.push_back(c);
@@ -438,7 +454,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			active_struct_idx = st.active_struct;
 			entries.reserve(st.structs.size());
 			entry_index.reserve(st.structs.size());
-			for (size_t i = 0; i < st.structs.size(); ++i) {
+			for (std::size_t i = 0; i < st.structs.size(); ++i) {
 				auto& sd = st.structs[i];
 				if (!filter_lc.empty()) {
 					std::string name_lc;
@@ -449,13 +465,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					}
 					if (name_lc.find(filter_lc) == std::string::npos) continue;
 				}
+				if (!struct_dissector::index_fits_int(i)) break;
 				entries.emplace_back(sd.name, sd.total_size);
 				entry_index.push_back(static_cast<int>(i));
 			}
 		}
-		int struct_count = static_cast<int>(entries.size());
+		const std::size_t struct_count = entries.size();
 
-		float content_h = struct_count * line_h;
+		float content_h = static_cast<float>(struct_count) * line_h;
 		if (ui.list_target_scroll_y < 0.f) ui.list_target_scroll_y = 0.f;
 		float ms = std::max(0.f, content_h - list_h);
 		if (ui.list_target_scroll_y > ms) ui.list_target_scroll_y = ms;
@@ -471,9 +488,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				ImVec2(lx + (lw - sz.x) * 0.5f, list_y + list_h * 0.5f - sz.y * 0.5f),
 				aida::ui::with_alpha(th.text_dim, alpha), msg);
 		}
-		for (int i = 0; i < struct_count; ++i) {
-			int sd_idx = entry_index[static_cast<size_t>(i)];
-			float ry = list_y + i * line_h - ui.list_scroll_y;
+		for (std::size_t i = 0; i < struct_count; ++i) {
+			int sd_idx = entry_index[i];
+			float ry = list_y + static_cast<float>(i) * line_h - ui.list_scroll_y;
 			if (ry + line_h < list_y || ry > list_y + list_h) continue;
 
 			ImVec2 a = ImVec2(lx + 4.f, ry);
@@ -497,8 +514,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				{
 					std::lock_guard<std::mutex> lk(st.mtx);
 					st.active_struct = sd_idx;
-					if (sd_idx >= 0 && sd_idx < static_cast<int>(st.structs.size())) {
-						sel_name = st.structs[sd_idx].name;
+					if (struct_dissector::valid_index(sd_idx, st.structs.size())) {
+						sel_name = st.structs[static_cast<std::size_t>(sd_idx)].name;
 					}
 					ui.selected_field = -1;
 					ui.editing_field = -1;
@@ -512,9 +529,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
 				fs_diss_base * 1.05f, ImVec2(a.x + 10.f, ry + 5.f),
 				aida::ui::with_alpha(th.text_primary, alpha),
-				entries[static_cast<size_t>(i)].first.c_str());
+				entries[i].first.c_str());
 			char sz_buf[32];
-			std::snprintf(sz_buf, sizeof(sz_buf), "(%u)", entries[static_cast<size_t>(i)].second);
+			std::snprintf(sz_buf, sizeof(sz_buf), "(%u)", entries[i].second);
 			ImFont* code_font = aida::ui::fonts::code();
 			if (!code_font) code_font = ImGui::GetFont();
 			const float fs_diss_count = fs_diss_base * 0.92f;
@@ -593,12 +610,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			int removed_idx = -1;
 			{
 				std::lock_guard<std::mutex> lk(st.mtx);
-				if (st.active_struct >= 0 && st.active_struct < static_cast<int>(st.structs.size())) {
+				if (struct_dissector::valid_index(st.active_struct, st.structs.size())) {
 					removed_idx = st.active_struct;
-					deleted_name = st.structs[st.active_struct].name;
-					st.structs.erase(st.structs.begin() + st.active_struct);
-					if (st.active_struct >= static_cast<int>(st.structs.size()))
-						st.active_struct = static_cast<int>(st.structs.size()) - 1;
+					const auto struct_index = static_cast<std::size_t>(st.active_struct);
+					deleted_name = st.structs[struct_index].name;
+					st.structs.erase(st.structs.begin() + static_cast<std::ptrdiff_t>(struct_index));
+					if (!struct_dissector::valid_index(st.active_struct, st.structs.size())) {
+						const std::size_t next_index = st.structs.empty() ? 0U : st.structs.size() - 1U;
+						st.active_struct = !st.structs.empty() && struct_dissector::index_fits_int(next_index)
+							? static_cast<int>(next_index)
+							: -1;
+					}
 					ui.selected_field = -1;
 					ui.editing_field = -1;
 					ui.edit_target = edit_target_t::none;
@@ -622,12 +644,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float rh = body_h;
 
 		int active_idx = -1;
-		int field_count = 0;
+		std::size_t field_count = 0;
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
 			active_idx = st.active_struct;
-			if (active_idx >= 0 && active_idx < static_cast<int>(st.structs.size()))
-				field_count = static_cast<int>(st.structs[active_idx].fields.size());
+			if (struct_dissector::valid_index(active_idx, st.structs.size()))
+				field_count = st.structs[static_cast<std::size_t>(active_idx)].fields.size();
 		}
 
 		if (active_idx < 0) {
@@ -683,7 +705,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (wheel != 0.f) ui.target_scroll_y -= wheel * line_h * 3.f;
 		}
 
-		float content_h = field_count * line_h;
+		float content_h = static_cast<float>(field_count) * line_h;
 		if (ui.target_scroll_y < 0.f) ui.target_scroll_y = 0.f;
 		float ms = std::max(0.f, content_h - table_h);
 		if (ui.target_scroll_y > ms) ui.target_scroll_y = ms;
@@ -699,10 +721,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::PushClipRect(ImVec2(rx, table_y), ImVec2(rx + rw, table_y + table_h), true);
 		{
 			std::lock_guard<std::mutex> lk(st.mtx);
-			if (active_idx >= 0 && active_idx < static_cast<int>(st.structs.size())) {
-				const auto& sd = st.structs[active_idx];
-				for (int fi = 0; fi < static_cast<int>(sd.fields.size()); ++fi) {
-					float row_y = table_y + fi * line_h - ui.scroll_y;
+			if (struct_dissector::valid_index(active_idx, st.structs.size())) {
+				const auto& sd = st.structs[static_cast<std::size_t>(active_idx)];
+				for (std::size_t field_index = 0; field_index < sd.fields.size(); ++field_index) {
+					if (!struct_dissector::index_fits_int(field_index)) break;
+					const int fi = static_cast<int>(field_index);
+					float row_y = table_y + static_cast<float>(field_index) * line_h - ui.scroll_y;
 					if (row_y + line_h < table_y || row_y > table_y + table_h) continue;
 
 					float entrance_delay = std::min(static_cast<float>(fi) * 0.008f, 0.240f);
@@ -719,7 +743,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					ImU32 row_fill;
 					if (row_sel) row_fill = aida::ui::with_alpha(th.selection, alpha);
 					else if (row_hov) row_fill = aida::ui::with_alpha(th.hover_wash, alpha);
-					else row_fill = (fi & 1)
+					else row_fill = ((field_index & 1U) != 0U)
 						? aida::ui::with_alpha(th.panel_bg, alpha * 0.55f * entrance)
 						: 0u;
 					if ((row_fill & 0xFF000000) != 0) {
@@ -753,7 +777,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						ctx_open_field = fi;
 					}
 
-					const auto& f = sd.fields[fi];
+					const auto& f = sd.fields[field_index];
 					float fx = rx + 8.f;
 					ImFont* code_font = aida::ui::fonts::code();
 					if (!code_font) code_font = ImGui::GetFont();
@@ -799,8 +823,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					}
 					fx += col_type_w;
 
-					if (fi < static_cast<int>(st.cached_values.size())) {
-						const auto& cv = st.cached_values[fi];
+					if (field_index < st.cached_values.size()) {
+						const auto& cv = st.cached_values[field_index];
 						bool changed_now = cv.changed && fa.has_last && fa.last_bytes != cv.raw_bytes;
 						if (changed_now) fa.change_flash.trigger();
 						fa.last_bytes = cv.raw_bytes;
@@ -833,6 +857,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							ImGui::PopStyleVar(2);
 							ImGui::PopStyleColor(2);
 							if (committed) {
+								bool wrote_ok = false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+								wrote_ok = struct_dissector::write_preview_value(fi, ui.edit_value_buf);
+#else
 								uint64_t write_addr = st.base_address + f.offset;
 								memory_scanner::value_type_t scanner_type = memory_scanner::value_type_t::int32_val;
 								bool hex_input = false;
@@ -867,13 +895,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								}
 								auto bytes = memory_scanner::parse_value(ui.edit_value_buf,
 									scanner_type, hex_input);
-								bool wrote_ok = false;
 								if (!bytes.empty()) {
 									wrote_ok = driver_bridge::write_memory(write_addr, bytes);
-									if (wrote_ok) {
-										fa.write_success.trigger();
-									}
 								}
+#endif
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 								diag::log_tagged_fmt("dissector",
 									"write_field addr=0x%llX type=%s input='%s' bytes=%zu ok=%d",
 									static_cast<unsigned long long>(write_addr),
@@ -881,6 +907,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 									ui.edit_value_buf,
 									bytes.size(),
 									wrote_ok ? 1 : 0);
+#endif
+								if (wrote_ok)
+									fa.write_success.trigger();
 								ui.editing_field = -1;
 							}
 							if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1010,10 +1039,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::string seed;
 				{
 					std::lock_guard<std::mutex> lk(st.mtx);
-					if (active_idx >= 0 && tgt_field >= 0 &&
-						active_idx < static_cast<int>(st.structs.size()) &&
-						tgt_field < static_cast<int>(st.structs[active_idx].fields.size())) {
-						seed = st.structs[active_idx].fields[tgt_field].name;
+					if (struct_dissector::valid_index(active_idx, st.structs.size())) {
+						const auto& fields = st.structs[static_cast<std::size_t>(active_idx)].fields;
+						if (struct_dissector::valid_index(tgt_field, fields.size()))
+							seed = fields[static_cast<std::size_t>(tgt_field)].name;
 					}
 				}
 				ui.edit_target = edit_target_t::field_name;
@@ -1032,10 +1061,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::string seed;
 				{
 					std::lock_guard<std::mutex> lk(st.mtx);
-					if (active_idx >= 0 && tgt_field >= 0 &&
-						active_idx < static_cast<int>(st.structs.size()) &&
-						tgt_field < static_cast<int>(st.structs[active_idx].fields.size())) {
-						seed = st.structs[active_idx].fields[tgt_field].description;
+					if (struct_dissector::valid_index(active_idx, st.structs.size())) {
+						const auto& fields = st.structs[static_cast<std::size_t>(active_idx)].fields;
+						if (struct_dissector::valid_index(tgt_field, fields.size()))
+							seed = fields[static_cast<std::size_t>(tgt_field)].description;
 					}
 				}
 				ui.edit_target = edit_target_t::field_comment;
@@ -1051,10 +1080,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				"ASCII String", "UTF-16 String", "Byte Array", "Padding", "Struct"
 			};
 			if (ImGui::BeginMenu("Change type")) {
-				for (int t = 0; t < static_cast<int>(struct_dissector::field_type_t::COUNT); ++t) {
-					if (ImGui::MenuItem(k_type_names[t])) {
+				const auto type_count = static_cast<std::size_t>(struct_dissector::field_type_t::COUNT);
+				for (std::size_t type_index = 0; type_index < type_count; ++type_index) {
+					if (ImGui::MenuItem(k_type_names[type_index])) {
 						struct_dissector::retype_field(active_idx, tgt_field,
-							static_cast<struct_dissector::field_type_t>(t));
+							static_cast<struct_dissector::field_type_t>(type_index));
 					}
 				}
 				ImGui::EndMenu();
@@ -1127,7 +1157,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				uint32_t off = 0;
 				std::sscanf(ui.offset_buf, "%x", &off);
 				fd.offset = off;
-				size_t ts = struct_dissector::field_type_size(fd.type);
+				std::size_t ts = struct_dissector::field_type_size(fd.type);
 				fd.size = static_cast<uint32_t>(ts > 0 ? ts : 1);
 				struct_dissector::add_field(active_idx, fd);
 				ui.field_name_buf[0] = '\0';

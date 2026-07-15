@@ -99,7 +99,7 @@ namespace aida::ui::hub_strip {
 
 		ImFont* font = aida::ui::fonts::body_em();
 		if (!font) font = ImGui::GetFont();
-		const float font_size = (font->FontSize > 0.f) ? font->FontSize : 13.f;
+		const float font_size = aida::ui::fonts::size_or(font, 13.f);
 
 		float widths[max_tabs] = {};
 		float offsets[max_tabs] = {};

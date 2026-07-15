@@ -16,13 +16,16 @@
 #include "../ui/brand.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/toast_notification.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -156,6 +159,18 @@ inline void start_taint_trace(local_state_t& st) {
 		static_cast<uint32_t>(st.max_insns));
 
 	symbolic_engine::g_state.processing.store(true);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	{
+		std::lock_guard<std::mutex> lk(symbolic_engine::g_state.mutex);
+		symbolic_engine::g_state.last_taint = symbolic_engine::taint_trace(
+			addr, end, static_cast<uint32_t>(st.max_insns), regs, mem_ranges);
+	}
+	symbolic_engine::g_state.progress_current.store(symbolic_engine::g_state.last_taint.tainted_count);
+	symbolic_engine::g_state.progress_total.store(symbolic_engine::g_state.last_taint.total_processed);
+	symbolic_engine::g_state.processing.store(false);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 1,
+		"taint.trace", "deterministic propagation complete");
+#else
 	auto t0 = std::chrono::steady_clock::now();
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "emulation";
@@ -199,6 +214,7 @@ inline void start_taint_trace(local_state_t& st) {
 			"taint_trace_post_failed entry=0x%llX",
 			static_cast<unsigned long long>(addr));
 	}
+#endif
 }
 
 inline std::vector<taint_node_t> build_taint_flow(const symbolic_engine::taint_result_t& res,
@@ -258,23 +274,26 @@ inline std::vector<taint_node_t> build_taint_flow(const symbolic_engine::taint_r
 
 inline std::vector<int> downstream_of(const std::vector<taint_node_t>& nodes, int from_idx) {
 	std::vector<int> hits;
-	if (from_idx < 0 || from_idx >= static_cast<int>(nodes.size())) return hits;
+	if (from_idx < 0 || static_cast<size_t>(from_idx) >= nodes.size()) return hits;
+	const size_t from_index = static_cast<size_t>(from_idx);
 	std::unordered_set<std::string> live;
-	for (auto& wr : nodes[from_idx].dest_regs) live.insert(lower_copy(wr));
+	for (auto& wr : nodes[from_index].dest_regs) live.insert(lower_copy(wr));
 	if (live.empty()) {
-		for (auto& rd : nodes[from_idx].source_regs) live.insert(lower_copy(rd));
+		for (auto& rd : nodes[from_index].source_regs) live.insert(lower_copy(rd));
 	}
 
-	for (int i = from_idx + 1; i < static_cast<int>(nodes.size()); ++i) {
+	const size_t representable_count = (std::min)(nodes.size(),
+		static_cast<size_t>((std::numeric_limits<int>::max)()) + 1);
+	for (size_t node_index = from_index + 1; node_index < representable_count; ++node_index) {
 		bool consumed = false;
-		for (auto& rd : nodes[i].source_regs) {
+		for (auto& rd : nodes[node_index].source_regs) {
 			if (live.count(lower_copy(rd))) { consumed = true; break; }
 		}
 		if (consumed) {
-			hits.push_back(i);
-			for (auto& wr : nodes[i].dest_regs) live.insert(lower_copy(wr));
-		} else if (!nodes[i].dest_regs.empty()) {
-			for (auto& wr : nodes[i].dest_regs) {
+			hits.push_back(static_cast<int>(node_index));
+			for (auto& wr : nodes[node_index].dest_regs) live.insert(lower_copy(wr));
+		} else if (!nodes[node_index].dest_regs.empty()) {
+			for (auto& wr : nodes[node_index].dest_regs) {
 				auto lw = lower_copy(wr);
 				auto it = live.find(lw);
 				if (it != live.end()) live.erase(it);
@@ -584,7 +603,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	auto source_regs = detail::parse_list(st.taint_regs_buf);
 	auto nodes = detail::build_taint_flow(res, source_regs);
-	int total = static_cast<int>(nodes.size());
+	const int total = nodes.size() > static_cast<size_t>((std::numeric_limits<int>::max)())
+		? (std::numeric_limits<int>::max)()
+		: static_cast<int>(nodes.size());
 
 	float card_h = 56.f;
 	float card_w = (width - pad * 2.f - 18.f) / 5.f;
@@ -640,7 +661,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		for (int i = 0; i < total; ++i) {
 			float fx = track_a_x + (static_cast<float>(i) / static_cast<float>(total - (total > 1 ? 1 : 0))) * track_w;
-			ImU32 tick_col = detail::type_color(t, nodes[i]);
+			ImU32 tick_col = detail::type_color(t, nodes[static_cast<size_t>(i)]);
 			float th = 5.f;
 			dl->AddRectFilled(ImVec2(fx - 1.f, track_y - th * 0.5f),
 				ImVec2(fx + 1.f, track_y + th * 0.5f),
@@ -745,7 +766,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		row_acc += dt;
 
 		for (int i = start; i < total && i < start + visible + 1; ++i) {
-			auto& n = nodes[i];
+			auto& n = nodes[static_cast<size_t>(i)];
 			float ry = list_y + static_cast<float>(i - start) * row_h
 				- (st.scroll_y - static_cast<float>(start) * row_h);
 			if (ry + row_h < list_y || ry > list_y + list_h) continue;
@@ -872,25 +893,29 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		st.hovered_row = -1;
 
-		std::vector<ImVec2> centers(total, ImVec2(0.f, 0.f));
-		std::vector<bool> visible_flag(total, false);
+		std::vector<ImVec2> centers(static_cast<size_t>(total), ImVec2(0.f, 0.f));
+		std::vector<bool> visible_flag(static_cast<size_t>(total), false);
 
 		for (int i = start; i < total && i < start + max_vis; ++i) {
+			const size_t node_index = static_cast<size_t>(i);
 			float ny = flow_y + static_cast<float>(i - start) * (node_h + node_spacing);
 			float nx = flow_x + (flow_w - node_w) * 0.5f;
-			centers[i] = ImVec2(nx + node_w * 0.5f, ny + node_h * 0.5f);
-			visible_flag[i] = true;
+			centers[node_index] = ImVec2(nx + node_w * 0.5f, ny + node_h * 0.5f);
+			visible_flag[node_index] = true;
 		}
 
 		auto find_consumer_indices = [&](int from_idx) -> std::vector<int> {
 			std::vector<int> outs;
-			if (nodes[from_idx].dest_regs.empty()) return outs;
+			if (from_idx < 0 || from_idx >= total) return outs;
+			const size_t from_index = static_cast<size_t>(from_idx);
+			if (nodes[from_index].dest_regs.empty()) return outs;
 			std::unordered_set<std::string> live;
-			for (auto& wr : nodes[from_idx].dest_regs)
+			for (auto& wr : nodes[from_index].dest_regs)
 				live.insert(detail::lower_copy(wr));
-			for (int j = from_idx + 1; j < total && j < from_idx + 8; ++j) {
+			for (int j = from_idx + 1; j < total && j - from_idx < 8; ++j) {
+				const size_t consumer_index = static_cast<size_t>(j);
 				bool consumed = false;
-				for (auto& rd : nodes[j].source_regs) {
+				for (auto& rd : nodes[consumer_index].source_regs) {
 					if (live.count(detail::lower_copy(rd))) { consumed = true; break; }
 				}
 				if (consumed) {
@@ -898,7 +923,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					if (outs.size() >= 3) break;
 				}
 				bool overwrites = false;
-				for (auto& wr : nodes[j].dest_regs) {
+				for (auto& wr : nodes[consumer_index].dest_regs) {
 					if (live.count(detail::lower_copy(wr))) { overwrites = true; break; }
 				}
 				if (overwrites) break;
@@ -907,23 +932,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		};
 
 		for (int i = start; i < total && i < start + max_vis; ++i) {
+			const size_t node_index = static_cast<size_t>(i);
 			auto outs = find_consumer_indices(i);
-			ImU32 ec = detail::type_color(tt, nodes[i]);
-			ImVec2 from = ImVec2(centers[i].x, centers[i].y + node_h * 0.5f);
-			int fan = static_cast<int>(outs.size());
-			for (int oi = 0; oi < fan; ++oi) {
+			ImU32 ec = detail::type_color(tt, nodes[node_index]);
+			ImVec2 from = ImVec2(centers[node_index].x, centers[node_index].y + node_h * 0.5f);
+			const size_t fan = outs.size();
+			for (size_t oi = 0; oi < fan; ++oi) {
 				int target_idx = outs[oi];
-				if (target_idx >= total) continue;
+				if (target_idx < 0 || target_idx >= total) continue;
 				if (target_idx >= start + max_vis) continue;
+				const size_t target_index = static_cast<size_t>(target_idx);
 				ImVec2 to;
-				if (visible_flag[target_idx]) {
-					to = ImVec2(centers[target_idx].x, centers[target_idx].y - node_h * 0.5f);
+				if (visible_flag[target_index]) {
+					to = ImVec2(centers[target_index].x, centers[target_index].y - node_h * 0.5f);
 				} else {
 					float ny = flow_y + static_cast<float>(target_idx - start) * (node_h + node_spacing);
-					to = ImVec2(centers[i].x, ny);
+					to = ImVec2(centers[node_index].x, ny);
 				}
 				float fan_off = (fan > 1)
-					? (static_cast<float>(oi) - (static_cast<float>(fan - 1)) * 0.5f) * 60.f
+					? (static_cast<float>(oi) - static_cast<float>(fan - 1) * 0.5f) * 60.f
 					: 0.f;
 				detail::render_flow_edge(dl, from, to, ec, alpha, fan_off, false);
 				if (fan > 0 && hovered_downstream.count(target_idx)) {
@@ -932,7 +959,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				detail::render_arrow_head(dl, to, ec, alpha);
 			}
 			if (outs.empty() && i + 1 < total && i + 1 < start + max_vis) {
-				ImVec2 to = ImVec2(centers[i + 1].x, centers[i + 1].y - node_h * 0.5f);
+				const size_t next_index = static_cast<size_t>(i + 1);
+				ImVec2 to = ImVec2(centers[next_index].x, centers[next_index].y - node_h * 0.5f);
 				detail::render_flow_edge(dl, from, to,
 					aida::ui::with_alpha(tt.text_dim, 0.6f * alpha), alpha, 0.f, false);
 			}
@@ -942,7 +970,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		entrance_acc += dt;
 
 		for (int i = start; i < total && i < start + max_vis; ++i) {
-			auto& n = nodes[i];
+			auto& n = nodes[static_cast<size_t>(i)];
 			float ny = flow_y + static_cast<float>(i - start) * (node_h + node_spacing);
 			float nx = flow_x + (flow_w - node_w) * 0.5f;
 			float row_t = ui_anim::render_row_entrance(i - start, entrance_acc, 0.012f);

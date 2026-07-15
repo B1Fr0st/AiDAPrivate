@@ -1,12 +1,15 @@
 ﻿#pragma once
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <shlobj.h>
 #include <objbase.h>
+#endif
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -19,8 +22,13 @@
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/source_reconstructor_preview.hpp"
+#else
 #include "../helpers/win32_dialog.hpp"
 #include "source_reconstructor.hpp"
+#endif
+#include "fonts.hpp"
 #include "ui_anim.hpp"
 #include "theme.hpp"
 #include "../disasm/disasm_view.hpp"
@@ -94,6 +102,11 @@ inline bool is_open() {
 inline void apply_default_output_dir(view_state_t& st) {
 	if (st.output_dir[0] != '\0') return;
 	char home[MAX_PATH] = {};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const char* fallback = std::getenv("USERPROFILE");
+	if (fallback && *fallback)
+		std::strncpy(home, fallback, MAX_PATH - 1);
+#else
 	DWORD got = GetEnvironmentVariableA("USERPROFILE", home, MAX_PATH);
 	if (got == 0 || got >= MAX_PATH) {
 		const char* fallback = std::getenv("USERPROFILE");
@@ -101,6 +114,7 @@ inline void apply_default_output_dir(view_state_t& st) {
 			std::strncpy(home, fallback, MAX_PATH - 1);
 		}
 	}
+#endif
 	if (home[0] == '\0') {
 		std::strncpy(st.output_dir, "C:\\AiDA_Reconstruction", sizeof(st.output_dir) - 1);
 		return;
@@ -128,15 +142,22 @@ inline void close(const disasm_view::workspace_context_t& context) {
 	st->open = false;
 }
 
-inline bool pick_output_directory(HWND owner, char* buf, size_t buf_size) {
+inline bool pick_output_directory(HWND owner, char* buf, std::size_t buf_size) {
 	if (!buf || buf_size < 4) return false;
 	std::string picked;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	(void)owner;
+	picked = "C:/Preview/ReverseEngineering/reconstructed";
+	aida::preview::record(aida::preview::shell_action_t::source_reconstruct,
+		"source_reconstruction_output_directory");
+#else
 	if (!win32_dialog::show_open_folder_dialog(owner,
 			L"Select Output Directory",
 			picked,
 			"source_reconstruct_view::pick_output_directory")) {
 		return false;
 	}
+#endif
 	if (picked.empty() || picked.size() + 1 > buf_size) return false;
 	std::memcpy(buf, picked.data(), picked.size());
 	buf[picked.size()] = '\0';
@@ -175,8 +196,10 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 		ImGuiWindowFlags_NoScrollbar |
 		ImGuiWindowFlags_NoScrollWithMouse |
 		ImGuiWindowFlags_NoBackground |
-		ImGuiWindowFlags_NoSavedSettings |
-		ImGuiWindowFlags_NoDocking;
+		ImGuiWindowFlags_NoSavedSettings;
+#ifdef IMGUI_HAS_DOCK
+	modal_flags |= ImGuiWindowFlags_NoDocking;
+#endif
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
 	bool window_open = ImGui::Begin("##source_reconstruct_modal", nullptr, modal_flags);
@@ -258,8 +281,9 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 		ImFont* title_font = aida::ui::fonts::body_strong();
 		if (!title_font) title_font = ImGui::GetFont();
 		const char* title = "Reconstruct Source";
-		ImVec2 tsz = title_font->CalcTextSizeA(title_font->FontSize, FLT_MAX, 0.f, title);
-		dl->AddText(title_font, title_font->FontSize,
+		const float title_font_size = aida::ui::fonts::size_or(title_font, ImGui::GetFontSize());
+		ImVec2 tsz = title_font->CalcTextSizeA(title_font_size, FLT_MAX, 0.f, title);
+		dl->AddText(title_font, title_font_size,
 			ImVec2(icon_x + icon_sz + 10.f, icon_y + (icon_sz - tsz.y) * 0.5f),
 			text_primary, title);
 
@@ -285,9 +309,10 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 	{
 		ImFont* lbl_font = aida::ui::fonts::body_em();
 		if (!lbl_font) lbl_font = ImGui::GetFont();
-		dl->AddText(lbl_font, lbl_font->FontSize,
+		const float lbl_font_size = aida::ui::fonts::size_or(lbl_font, ImGui::GetFontSize());
+		dl->AddText(lbl_font, lbl_font_size,
 			ImVec2(dx + pad, cur_y), text_secondary, "Output Directory");
-		cur_y += lbl_font->FontSize + 10.f;
+		cur_y += lbl_font_size + 10.f;
 
 		float browse_w = 92.f;
 		float gap = 8.f;
@@ -338,8 +363,9 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 		ImFont* br_font = aida::ui::fonts::body_em();
 		if (!br_font) br_font = ImGui::GetFont();
 		const char* br_lbl = "Browse...";
-		ImVec2 bsz = br_font->CalcTextSizeA(br_font->FontSize, FLT_MAX, 0.f, br_lbl);
-		dl->AddText(br_font, br_font->FontSize,
+		const float br_font_size = aida::ui::fonts::size_or(br_font, ImGui::GetFontSize());
+		ImVec2 bsz = br_font->CalcTextSizeA(br_font_size, FLT_MAX, 0.f, br_lbl);
+		dl->AddText(br_font, br_font_size,
 			ImVec2(browse_x + (browse_w - bsz.x) * 0.5f,
 			       cur_y + (input_h - bsz.y) * 0.5f),
 			br_hov ? aida::ui::with_alpha(IM_COL32(255, 255, 255, 250), fa)
@@ -388,7 +414,6 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 			if (recon_stage == stage_values[i]) active_stage_idx = i;
 		}
 		bool is_done = (recon_stage == source_reconstructor::stage_t::done);
-		bool is_failed = (recon_stage == source_reconstructor::stage_t::failed);
 
 		float line_target = 0.f;
 		if (active_stage_idx >= 0)
@@ -416,7 +441,7 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 		}
 
 		for (int i = 0; i < num_stages; ++i) {
-			float dot_x = pipeline_x + dot_spacing * i;
+			float dot_x = pipeline_x + dot_spacing * static_cast<float>(i);
 			float dot_y = pipeline_y;
 
 			bool completed = false;
@@ -521,7 +546,7 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 		st.total_display = total;
 		st.done_display = done;
 
-		size_t est_bytes = static_cast<size_t>(done) * 4000;
+		std::size_t est_bytes = static_cast<std::size_t>(done) * 4000;
 
 		char counter[256];
 		if (est_bytes >= 1024 * 1024) {
@@ -585,11 +610,12 @@ inline void render_impl(float alpha, float ar, float ag, float ab,
 			const char* start_lbl = "Start";
 			ImFont* st_font = aida::ui::fonts::body_em();
 			if (!st_font) st_font = ImGui::GetFont();
-			ImVec2 slsz = st_font->CalcTextSizeA(st_font->FontSize, FLT_MAX, 0.f, start_lbl);
+			const float start_font_size = aida::ui::fonts::size_or(st_font, ImGui::GetFontSize());
+			ImVec2 slsz = st_font->CalcTextSizeA(start_font_size, FLT_MAX, 0.f, start_lbl);
 			ImU32 tc_idle = aida::ui::with_alpha(_t.text_primary, 0.92f);
 			ImU32 tc_hov  = aida::ui::with_alpha(IM_COL32(255, 255, 255, 255), 0.96f);
 			ImU32 start_text_col = aida::ui::with_alpha(aida::ui::mix(tc_idle, tc_hov, bhov_f), button_alpha);
-			dl->AddText(st_font, st_font->FontSize,
+			dl->AddText(st_font, start_font_size,
 				ImVec2(btn_x + (btn_w - slsz.x) * 0.5f,
 				       btn_y + (btn_h - slsz.y) * 0.5f),
 				start_text_col, start_lbl);

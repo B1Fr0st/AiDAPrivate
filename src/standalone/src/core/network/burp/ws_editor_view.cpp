@@ -1,19 +1,35 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "ws_editor_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_routed.hpp"
+#else
 #include "ws_editor.hpp"
+#endif
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
 #include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include "imgui/imgui.h"
 
@@ -219,8 +235,9 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SetCursorPos(ImVec2(left_w + 8.f, content_y));
     ImGui::BeginChild("##wse_right", ImVec2(right_w, content_h), false);
 
-    if (s_state.selected_conn_index >= 0 && s_state.selected_conn_index < static_cast<int>(conns.size())) {
-        const auto& c = conns[s_state.selected_conn_index];
+    const size_t selected_conn_index = static_cast<size_t>(s_state.selected_conn_index);
+    if (s_state.selected_conn_index >= 0 && selected_conn_index < conns.size()) {
+        const auto& c = conns[selected_conn_index];
         uint64_t cid = c.id;
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
                            "%s [id=%llu]", c.url.c_str(), static_cast<unsigned long long>(cid));

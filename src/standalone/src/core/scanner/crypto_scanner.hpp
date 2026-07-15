@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/scan_crypto_preview.hpp"
+#else
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -1576,3 +1580,5 @@ inline void load_custom_signatures()
 }
 
 }
+
+#endif

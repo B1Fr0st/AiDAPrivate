@@ -89,6 +89,28 @@ public:
         std::uint64_t chunk_limit = 4ULL * 1024ULL * 1024ULL) const;
 };
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+class memory_provider_t final : public byte_provider_t {
+public:
+    static std::shared_ptr<memory_provider_t> create(
+        std::string normalized_source, std::vector<std::uint8_t> bytes,
+        sha256_digest_t content_hash);
+
+    const byte_provider_identity_t& identity() const noexcept override;
+    std::uint64_t size() const noexcept override;
+    workspace_result_t<byte_view_t> lease(
+        std::uint64_t offset, std::uint64_t size,
+        const cancellation_token_t& cancel = {}) const override;
+
+private:
+    memory_provider_t(std::shared_ptr<const std::vector<std::uint8_t>> bytes,
+                      byte_provider_identity_t identity);
+
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes_;
+    byte_provider_identity_t identity_;
+};
+#endif
+
 struct mapped_file_provider_options_t {
     std::uint64_t max_lease_size = 64ULL * 1024ULL * 1024ULL;
     std::uint64_t read_chunk_size = 4ULL * 1024ULL * 1024ULL;

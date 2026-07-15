@@ -1,19 +1,23 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <Windows.h>
+#include "../../helpers/diag_log.hpp"
+#endif
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
-
-#include "../../helpers/diag_log.hpp"
 
 namespace aida::diagnostics {
 namespace metadata_ring = ::aida::diagnostics;
@@ -22,6 +26,31 @@ inline constexpr std::size_t kMetadataRingCapacity = 512;
 inline constexpr std::size_t kMetadataRingMaxLabelLen = 96;
 inline constexpr std::size_t kMetadataRingMaxReasonLen = 128;
 inline constexpr std::size_t kMetadataRingRateLimitMs = 200;
+
+inline std::uint64_t platform_tick_ms() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+#else
+    return static_cast<std::uint64_t>(GetTickCount64());
+#endif
+}
+
+inline DWORD platform_process_id() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    return 0;
+#else
+    return GetCurrentProcessId();
+#endif
+}
+
+inline DWORD platform_thread_id() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    return 0;
+#else
+    return GetCurrentThreadId();
+#endif
+}
 
 enum class breadcrumb_category_t : std::uint8_t {
     startup_shutdown = 0,
@@ -108,7 +137,7 @@ struct ring_t {
     std::uint64_t category_counts[static_cast<std::size_t>(breadcrumb_category_t::count)] = {};
 
     ring_t() {
-        monotonic_start.store(static_cast<std::uint64_t>(GetTickCount64()), std::memory_order_release);
+        monotonic_start.store(platform_tick_ms(), std::memory_order_release);
         std::memset(entries, 0, sizeof(entries));
         std::memset(last_emit_per_category, 0, sizeof(last_emit_per_category));
         std::memset(category_counts, 0, sizeof(category_counts));
@@ -121,7 +150,7 @@ inline ring_t& global_ring() {
 }
 
 inline std::uint64_t now_ms() {
-    return static_cast<std::uint64_t>(GetTickCount64());
+    return platform_tick_ms();
 }
 
 inline std::uint64_t elapsed_ms() {
@@ -190,8 +219,8 @@ inline void emit(breadcrumb_options_t&& opts) {
     entry.monotonic_start_ms = ring.monotonic_start.load(std::memory_order_acquire);
     entry.category = opts.category;
     entry.priority = opts.priority;
-    entry.pid = GetCurrentProcessId();
-    entry.tid = GetCurrentThreadId();
+    entry.pid = platform_process_id();
+    entry.tid = platform_thread_id();
     entry.lease_token = opts.lease_token;
     entry.generation = opts.generation;
     entry.status_code = opts.status_code;
@@ -296,7 +325,7 @@ inline void dump_to_log(std::size_t max_entries = 64) {
         snap.capacity,
         snap.valid_entries,
         static_cast<unsigned long long>(snap.monotonic_start_ms),
-        static_cast<unsigned long>(GetCurrentProcessId()));
+        static_cast<unsigned long>(platform_process_id()));
 
     for (std::size_t i = 0; i < snap.valid_entries; ++i) {
         const auto& e = snap.entries[i];

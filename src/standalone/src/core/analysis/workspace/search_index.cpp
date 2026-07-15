@@ -10,8 +10,10 @@
 #include "checked_range.hpp"
 #include "pe_image.hpp"
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <windows.h>
 #include <bcrypt.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -23,7 +25,9 @@
 #include <unordered_map>
 #include <utility>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #pragma comment(lib, "bcrypt.lib")
+#endif
 
 namespace aida::analysis {
 namespace {
@@ -746,6 +750,26 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
             impl->architecture = impl->snapshot->image->architecture();
             impl->architecture_mode = impl->snapshot->image->architecture_mode();
         }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        impl->cursor_integrity_key = {0xCBF29CE484222325ULL, 0x9E3779B97F4A7C15ULL};
+        const auto mix_cursor_byte = [&impl](std::uint8_t value) {
+            impl->cursor_integrity_key[0] ^= value;
+            impl->cursor_integrity_key[0] *= 0x100000001B3ULL;
+            impl->cursor_integrity_key[1] ^= impl->cursor_integrity_key[0] + value;
+            impl->cursor_integrity_key[1] *= 0x9E3779B185EBCA87ULL;
+        };
+        for (const auto value : impl->identity.binary_id.bytes)
+            mix_cursor_byte(value);
+        for (const auto value : impl->identity.load_profile_hash.bytes)
+            mix_cursor_byte(value);
+        for (std::size_t shift = 0; shift < 64; shift += 8) {
+            mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.generation >> shift));
+            mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.analysis_revision >> shift));
+            mix_cursor_byte(static_cast<std::uint8_t>(impl->identity.overlay_revision >> shift));
+        }
+        if (impl->cursor_integrity_key[0] == 0 && impl->cursor_integrity_key[1] == 0)
+            impl->cursor_integrity_key[1] = 1;
+#else
         const auto random_status = BCryptGenRandom(nullptr,
             reinterpret_cast<PUCHAR>(impl->cursor_integrity_key.data()),
             static_cast<ULONG>(sizeof(impl->cursor_integrity_key)),
@@ -756,6 +780,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::build(
                 make_workspace_error(workspace_error_code_t::integrity_failure,
                     "search cursor integrity entropy is unavailable", "search_index"));
         }
+#endif
         impl->data_candidates = std::move(data_candidates);
         impl->switches = std::move(switches);
         impl->types = std::move(types);
@@ -1163,7 +1188,7 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::restore(
     const cancellation_token_t& cancel) {
     try {
         if (!snapshot || serialized.empty() ||
-            serialized.size() > kSerializedSearchMaximumBytes ||
+            static_cast<std::uint64_t>(serialized.size()) > kSerializedSearchMaximumBytes ||
             serialized.size() > limits.max_index_bytes ||
             (!snapshot->normalized_image && !snapshot->image) ||
             limits.max_entries == 0 ||
@@ -1485,17 +1510,22 @@ workspace_result_t<std::shared_ptr<search_index_t>> search_index_t::restore(
         std::uint64_t next_posting = 0;
         std::optional<std::uint32_t> previous_trigram;
         for (const auto& span : impl->trigram_spans) {
+            const auto posting_begin_index = static_cast<std::size_t>(span.begin);
+            const auto posting_count = static_cast<std::size_t>(span.count);
             if ((previous_trigram && *previous_trigram >= span.key) ||
                 span.begin != next_posting || span.count == 0 ||
-                span.begin > impl->trigram_postings.size() ||
-                span.count > impl->trigram_postings.size() - span.begin ||
-                !std::is_sorted(
-                    impl->trigram_postings.begin() + span.begin,
-                    impl->trigram_postings.begin() + span.begin + span.count) ||
-                std::adjacent_find(
-                    impl->trigram_postings.begin() + span.begin,
-                    impl->trigram_postings.begin() + span.begin + span.count) !=
-                    impl->trigram_postings.begin() + span.begin + span.count) {
+                posting_begin_index > impl->trigram_postings.size() ||
+                posting_count > impl->trigram_postings.size() - posting_begin_index) {
+                trigram_valid = false;
+                break;
+            }
+            using posting_difference_t = std::vector<std::uint32_t>::difference_type;
+            const auto posting_begin = impl->trigram_postings.cbegin() +
+                static_cast<posting_difference_t>(posting_begin_index);
+            const auto posting_end = posting_begin +
+                static_cast<posting_difference_t>(posting_count);
+            if (!std::is_sorted(posting_begin, posting_end) ||
+                std::adjacent_find(posting_begin, posting_end) != posting_end) {
                 trigram_valid = false;
                 break;
             }

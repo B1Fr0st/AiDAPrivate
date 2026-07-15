@@ -52,6 +52,11 @@ public:
     const std::optional<process_identity_t>& process() const noexcept { return process_; }
     const std::optional<module_identity_t>& module() const noexcept { return module_; }
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static std::shared_ptr<const workspace_identity_t> create_preview(
+        binary_id_t binary_id, workspace_identity_input_t input);
+#endif
+
 private:
     workspace_identity_t(binary_id_t binary_id, workspace_identity_input_t input,
                          std::string normalized_source_path,

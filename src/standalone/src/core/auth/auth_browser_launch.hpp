@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "auth_browser_launch_preview.hpp"
+
+#else
+
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -881,7 +887,10 @@ inline void inject_browser_fixture_failure(unsigned failure)
 {
     detail::g_browser_fixture_failure.store(failure, std::memory_order_release);
 }
+
 #endif
 
 }
 }
+
+#endif

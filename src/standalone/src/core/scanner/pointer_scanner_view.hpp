@@ -9,12 +9,18 @@
 #include "imgui/imgui.h"
 #include "pointer_scanner.hpp"
 #include "disasm_view.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "function_index.hpp"
+#endif
 #include "hex_view.hpp"
 #include "ui_anim.hpp"
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #include "../anti-tamper/webhook.hpp"
-#include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
+#endif
+#include "../helpers/globals.h"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -45,10 +51,21 @@ inline view_state_t g_view;
 
 namespace detail {
 
+inline uint64_t offset_magnitude(int64_t offset) {
+	return offset < 0
+		? static_cast<uint64_t>(-(offset + 1)) + 1
+		: static_cast<uint64_t>(offset);
+}
+
+inline uint64_t apply_offset(uint64_t address, int64_t offset) {
+	const uint64_t magnitude = offset_magnitude(offset);
+	return offset < 0 ? address - magnitude : address + magnitude;
+}
+
 inline std::string format_offset(int64_t off) {
 	char buf[32];
-	if (off >= 0) snprintf(buf, sizeof(buf), "+0x%llX", static_cast<unsigned long long>(off));
-	else          snprintf(buf, sizeof(buf), "-0x%llX", static_cast<unsigned long long>(-off));
+	if (off >= 0) snprintf(buf, sizeof(buf), "+0x%llX", static_cast<unsigned long long>(offset_magnitude(off)));
+	else          snprintf(buf, sizeof(buf), "-0x%llX", static_cast<unsigned long long>(offset_magnitude(off)));
 	return buf;
 }
 
@@ -56,19 +73,26 @@ inline uint64_t resolve_step_address(const pointer_scanner::pointer_chain_t& cha
 	auto& st = pointer_scanner::g_state;
 	uint64_t base_addr = 0;
 	if (chain.is_static && chain.module_index >= 0 &&
-		chain.module_index < static_cast<int>(st.cached_modules.size())) {
-		base_addr = st.cached_modules[chain.module_index].base + chain.base_offset;
+		static_cast<size_t>(chain.module_index) < st.cached_modules.size()) {
+		base_addr = st.cached_modules[static_cast<size_t>(chain.module_index)].base + chain.base_offset;
 	} else {
 		base_addr = chain.base_offset;
 	}
 	if (step <= 0) return base_addr;
 	uint64_t current = base_addr;
-	for (int i = 0; i < step && i < static_cast<int>(chain.offsets.size()); ++i) {
+	for (int i = 0; i < step && static_cast<size_t>(i) < chain.offsets.size(); ++i) {
+		const size_t offset_index = static_cast<size_t>(i);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		current = apply_offset(
+			current ^ (0x1000ULL + static_cast<std::uint64_t>(i) * 0x230ULL),
+			chain.offsets[offset_index]);
+#else
 		std::vector<uint8_t> buf;
 		if (!driver_bridge::read_memory(current, 8, buf) || buf.size() < 8) return current;
 		uint64_t ptr = 0;
 		std::memcpy(&ptr, buf.data(), 8);
-		current = ptr + chain.offsets[i];
+		current = apply_offset(ptr, chain.offsets[offset_index]);
+#endif
 	}
 	return current;
 }
@@ -79,7 +103,10 @@ inline void render_step_box(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 fill, ImU3
 	dl->AddRectFilled(a, b, fill, radius);
 	dl->AddRect(a, b, border, radius, 0, 1.f);
 	ImVec2 ts = ImGui::CalcTextSize(label);
-	dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+	ImFont* code_font = aida::ui::fonts::code();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
+	if (!code_font) code_font = ImGui::GetFont();
+	dl->AddText(code_font, code_font_size,
 		ImVec2(a.x + (b.x - a.x - ts.x) * 0.5f, a.y + (b.y - a.y - 12.f) * 0.5f),
 		text_col, label);
 }
@@ -92,8 +119,8 @@ inline void render_arrow(ImDrawList* dl, ImVec2 from, ImVec2 to, ImU32 col, floa
 	int segments = 24;
 	float clip_t = reveal;
 	for (int i = 0; i < segments; ++i) {
-		float t1 = (float)i / (float)segments;
-		float t2 = (float)(i + 1) / (float)segments;
+		float t1 = static_cast<float>(i) / static_cast<float>(segments);
+		float t2 = static_cast<float>(i + 1) / static_cast<float>(segments);
 		if (t2 > clip_t) t2 = clip_t;
 		if (t1 >= clip_t) break;
 		auto bez = [&](float tt) {
@@ -125,14 +152,16 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 	int chain_idx, pointer_scanner::pointer_chain_t& chain, float a, chain_anim_t& anim)
 {
 	const auto& t = aida::ui::resolved();
+	ImFont* code_font = aida::ui::fonts::code();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
+	if (!code_font) code_font = ImGui::GetFont();
 
 	float pad = 14.f;
 	float row_y = oy + h * 0.5f - 18.f;
 	float box_h = 32.f;
 	float gap_w = 56.f;
 
-	int total_steps = 1 + static_cast<int>(chain.offsets.size());
-	if (total_steps < 1) return;
+	const size_t total_steps = chain.offsets.size() + 1;
 
 	std::vector<float> box_w_arr;
 	box_w_arr.reserve(total_steps * 2);
@@ -141,7 +170,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 	{
 		char base_lbl[96];
 		if (chain.is_static && chain.module_index >= 0 &&
-			chain.module_index < static_cast<int>(pointer_scanner::g_state.cached_modules.size())) {
+			static_cast<size_t>(chain.module_index) < pointer_scanner::g_state.cached_modules.size()) {
 			snprintf(base_lbl, sizeof(base_lbl), "%s+0x%llX",
 				chain.module_name.c_str(), static_cast<unsigned long long>(chain.base_offset));
 		} else {
@@ -216,7 +245,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 
 		char lbl[96];
 		if (chain.is_static && chain.module_index >= 0 &&
-			chain.module_index < static_cast<int>(pointer_scanner::g_state.cached_modules.size())) {
+			static_cast<size_t>(chain.module_index) < pointer_scanner::g_state.cached_modules.size()) {
 			snprintf(lbl, sizeof(lbl), "%s+0x%llX",
 				chain.module_name.c_str(), static_cast<unsigned long long>(chain.base_offset));
 		} else {
@@ -229,7 +258,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 	}
 
 	for (size_t i = 0; i < chain.offsets.size(); ++i) {
-		float reveal_offset = (float)(i + 1) * 0.16f;
+		float reveal_offset = static_cast<float>(i + 1) * 0.16f;
 		float local_t = (anim.reveal - reveal_offset) / (1.f - reveal_offset + 0.0001f);
 		if (local_t < 0.f) local_t = 0.f;
 		if (local_t > 1.f) local_t = 1.f;
@@ -280,10 +309,9 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		float dot_cy = (ba.y + bb.y) * 0.5f;
 		dl->AddCircleFilled(ImVec2(dot_cx, dot_cy), 3.f, dot_col, 12);
 
-		ImVec2 ts = ImGui::CalcTextSize(off.c_str());
 		dl->AddRectFilled(ba, bb, fill, 8.f);
 		dl->AddRect(ba, bb, border, 8.f, 0, 1.f);
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(dot_cx + 8.f, dot_cy - 6.f),
 			aida::ui::with_alpha(t.text_primary, a * local_t), off.c_str());
 
@@ -321,7 +349,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		dl->AddRect(ImVec2(tp.x - 6.f, tp.y - 4.f),
 			ImVec2(tp.x + ts.x + 6.f, tp.y + ts.y + 4.f),
 			aida::ui::with_alpha(t.border_subtle, 1.f), 6.f, 0, 1.f);
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize, tp,
+		dl->AddText(code_font, code_font_size, tp,
 			aida::ui::with_alpha(t.text_primary, 1.f), tip);
 	}
 }
@@ -331,6 +359,14 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float, float, float)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static bool seeded = false;
+	if (!seeded) {
+		pointer_scanner::build_reverse_map();
+		pointer_scanner::start_scan();
+		seeded = true;
+	}
+#endif
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wp = ImGui::GetWindowPos();
 	float a = alpha;
@@ -338,6 +374,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	auto& view = g_view;
 
 	const auto& t = aida::ui::resolved();
+	ImFont* body_font = aida::ui::fonts::body();
+	const float body_font_size = aida::ui::fonts::size_or(body_font, ImGui::GetFontSize());
+	if (!body_font) body_font = ImGui::GetFont();
+	ImFont* code_font = aida::ui::fonts::code();
+	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
+	if (!code_font) code_font = ImGui::GetFont();
 	float dt = aida::ui::clock::dt();
 	view.anim_clock += dt;
 
@@ -358,7 +400,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	{
 		ImFont* hdr_fn = aida::ui::fonts::body_em();
-		float hdr_fs = hdr_fn ? hdr_fn->FontSize : 16.f;
+		float hdr_fs = aida::ui::fonts::size_or(hdr_fn, 16.f);
+		if (!hdr_fn) hdr_fn = ImGui::GetFont();
 		dl->AddText(hdr_fn, hdr_fs,
 			ImVec2(x0 + 16.f, y0 + (toolbar_h - hdr_fs) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a), "Pointer Chain Scanner");
@@ -377,11 +420,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			res_count = st.results.size();
 		}
 		snprintf(status_buf, sizeof(status_buf), "Map: %zu  ·  Chains: %zu", entries, res_count);
-		ImFont* sf = aida::ui::fonts::body();
-		float sfs = sf ? sf->FontSize : ImGui::GetFontSize();
 		ImVec2 ts = ImGui::CalcTextSize(status_buf);
-		dl->AddText(sf, sfs,
-			ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - sfs) * 0.5f),
+		dl->AddText(body_font, body_font_size,
+			ImVec2(x0 + width - ts.x - 16.f, y0 + (toolbar_h - body_font_size) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a), status_buf);
 	}
 
@@ -394,8 +435,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	dl->AddLine(ImVec2(cfg_x + config_panel_w, cfg_y), ImVec2(cfg_x + config_panel_w, cfg_y + cfg_h),
 		aida::ui::with_alpha(t.border_subtle, a), 1.f);
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	bool live_now = true;
+	bool static_pe_now = false;
+#else
 	bool live_now = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 	bool static_pe_now = function_index::detail::static_pe_active();
+#endif
 	float cy = cfg_y + 18.f;
 	float cx = cfg_x + 18.f;
 	float field_w = config_panel_w - 36.f;
@@ -409,18 +455,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	{
 		ImFont* hfn = aida::ui::fonts::body_em();
-		float hfs = hfn ? hfn->FontSize : 14.f;
+		float hfs = aida::ui::fonts::size_or(hfn, 14.f);
+		if (!hfn) hfn = ImGui::GetFont();
 		dl->AddText(hfn, hfs,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_primary, a), "Configuration");
 		cy += hfs + 12.f;
 	}
 
 	{
-		ImFont* lblf = aida::ui::fonts::body();
-		float lblfs = lblf ? lblf->FontSize : ImGui::GetFontSize();
-		dl->AddText(lblf, lblfs,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Target Address");
-		cy += lblfs + 6.f;
+		cy += body_font_size + 6.f;
 	}
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -430,11 +475,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	auto draw_label_and_value = [&](const char* lbl, int value) {
 		ImFont* lblf = aida::ui::fonts::body();
-		if (!lblf) lblf = ImGui::GetFont();
 		ImFont* valf = aida::ui::fonts::body_em();
+		const float lblfs = aida::ui::fonts::size_or(lblf, ImGui::GetFontSize());
+		const float valfs = aida::ui::fonts::size_or(valf, ImGui::GetFontSize());
+		if (!lblf) lblf = ImGui::GetFont();
 		if (!valf) valf = ImGui::GetFont();
-		float lblfs = lblf->FontSize;
-		float valfs = valf->FontSize;
 		dl->AddText(lblf, lblfs,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), lbl);
 		char vbuf[32];
@@ -526,7 +571,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (building) {
 		float prog = st.map_progress.load();
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Building reverse map...");
 		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
 		cy += 34.f;
@@ -549,7 +594,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (scanning) {
 		float prog = st.scan_progress.load();
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(cx, cy), aida::ui::with_alpha(t.text_dim, a), "Scanning chains...");
 		aida::ui::render_progress_bar(ImVec2(cx, cy + 18.f), field_w, 6.f, prog, false, true);
 		cy += 34.f;
@@ -582,7 +627,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (validating) {
 		float prog = st.validate_progress.load();
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(cx, cy - 16.f), aida::ui::with_alpha(t.text_dim, a), "Validating chains...");
 		aida::ui::render_progress_bar(ImVec2(cx, cy + 4.f), field_w, 6.f, prog, false, true);
 	} else {
@@ -634,7 +679,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float col_widths[5] = { col_depth_w, col_module_w, col_base_w, col_chain_w, col_status_w };
 	float hx = table_x + 16.f;
 	for (int c = 0; c < 5; ++c) {
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(hx, table_y + (hdr_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_dim, a), col_names[c]);
 		hx += col_widths[c];
@@ -649,32 +694,40 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	                   ImGuiWindowFlags_NoScrollbar);
 
 	std::lock_guard<std::mutex> lk(st.results_mutex);
-	int total = static_cast<int>(st.results.size());
+	const size_t total = st.results.size();
 	int visible_count = static_cast<int>(body_h / row_h);
+	const size_t visible_rows = visible_count > 0 ? static_cast<size_t>(visible_count) : 0;
 
 	float wheel = ImGui::GetIO().MouseWheel;
 	ImVec2 mp = ImGui::GetMousePos();
 	if (mp.x >= table_x && mp.x <= table_x + table_w && mp.y >= body_y && mp.y <= body_y + body_h) {
 		st.target_scroll_y -= wheel * row_h * 3.f;
 		if (st.target_scroll_y < 0.f) st.target_scroll_y = 0.f;
-		float max_scroll = (total > visible_count) ? (total - visible_count) * row_h : 0.f;
+		float max_scroll = (total > visible_rows)
+			? static_cast<float>(total - visible_rows) * row_h
+			: 0.f;
 		if (st.target_scroll_y > max_scroll) st.target_scroll_y = max_scroll;
 	}
 	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 20.f, dt);
 
 	int start_row = static_cast<int>(st.scroll_y / row_h);
 	if (start_row < 0) start_row = 0;
+	const size_t start_index = static_cast<size_t>(start_row);
+	const size_t rendered_row_count = visible_rows + 2;
 
-	for (int i = start_row; i < total && i < start_row + visible_count + 2; ++i) {
+	for (size_t i = start_index; i < total && i - start_index < rendered_row_count; ++i) {
 		auto& chain = st.results[i];
-		float ry = body_y + (i - start_row) * row_h - (st.scroll_y - start_row * row_h);
+		const int visible_row = static_cast<int>(i - start_index);
+		float ry = body_y + static_cast<float>(visible_row) * row_h
+			- (st.scroll_y - static_cast<float>(start_row) * row_h);
 		if (ry + row_h < body_y || ry > body_y + body_h) continue;
 
 		bool hovered = (mp.x >= table_x && mp.x <= table_x + table_w &&
 		                mp.y >= ry && mp.y < ry + row_h);
-		bool selected = (i == st.selected_result);
+		bool selected = st.selected_result >= 0 &&
+			i == static_cast<size_t>(st.selected_result);
 
-		float row_a = ui_anim::render_row_entrance(i - start_row, view.anim_clock, 0.012f);
+		float row_a = ui_anim::render_row_entrance(visible_row, view.anim_clock, 0.012f);
 
 		if (selected) {
 			dl->AddRectFilled(ImVec2(table_x, ry), ImVec2(table_x + table_w, ry + row_h),
@@ -690,18 +743,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		if (hovered && ImGui::IsMouseClicked(0))
-			st.selected_result = i;
+			st.selected_result = static_cast<int>(i);
 
 		float rx = table_x + 16.f;
 		char buf[32];
 
 		snprintf(buf, sizeof(buf), "%d", chain.depth);
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_primary, a * row_a), buf);
 		rx += col_depth_w;
 
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			chain.is_static ? aida::ui::with_alpha(t.accent_u32, a * row_a)
 			                 : aida::ui::with_alpha(t.text_dim, a * row_a),
@@ -709,7 +762,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		rx += col_module_w;
 
 		snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(chain.base_offset));
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(rx, ry + (row_h - 12.f) * 0.5f),
 			aida::ui::with_alpha(t.text_address, a * row_a), buf);
 		rx += col_base_w;
@@ -733,13 +786,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 			}
 		}
-		dl->AddText(aida::ui::fonts::code(), aida::ui::fonts::code()->FontSize,
+		dl->AddText(code_font, code_font_size,
 			ImVec2(rx, ry + (row_h - 11.f) * 0.5f),
 			aida::ui::with_alpha(t.text_secondary, a * row_a), chain_str.c_str());
 		rx += col_chain_w;
 
 		ImGui::SetCursorScreenPos(ImVec2(rx, ry + (row_h - 18.f) * 0.5f));
-		ImGui::PushID(i + 32768);
+		ImGui::PushID(static_cast<int>(i) + 32768);
 		aida::ui::pill_kind(chain.validated ? "valid" : "?",
 			chain.validated ? aida::ui::components::pill_kind_t::success
 			                : aida::ui::components::pill_kind_t::neutral,
@@ -784,8 +837,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2(det_x + det_w, det_y + detail_h),
 		aida::ui::with_alpha(t.panel_bg, a));
 
-	if (st.selected_result >= 0 && st.selected_result < total) {
-		auto& chain = st.results[st.selected_result];
+	if (st.selected_result >= 0 && static_cast<size_t>(st.selected_result) < total) {
+		auto& chain = st.results[static_cast<size_t>(st.selected_result)];
 		auto& anim = view.chain_anims[st.selected_result];
 		if (view.last_selected != st.selected_result) {
 			anim.reveal = 0.f;
@@ -815,8 +868,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					aida::ui::size_t_::sm)) {
 				uint64_t addr = 0;
 				if (chain.is_static && chain.module_index >= 0 &&
-				    chain.module_index < static_cast<int>(st.cached_modules.size()))
-					addr = st.cached_modules[chain.module_index].base + chain.base_offset;
+				    static_cast<size_t>(chain.module_index) < st.cached_modules.size())
+					addr = st.cached_modules[static_cast<size_t>(chain.module_index)].base + chain.base_offset;
 				else
 					addr = chain.base_offset;
 				if (addr != 0) {
@@ -832,7 +885,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		snprintf(info_buf, sizeof(info_buf), "Depth %d  ·  %s  ·  %s",
 			chain.depth, chain.is_static ? "Static" : "Dynamic",
 			chain.validated ? "Validated" : "Not validated");
-		dl->AddText(aida::ui::fonts::body(), aida::ui::fonts::body()->FontSize,
+		dl->AddText(body_font, body_font_size,
 			ImVec2(det_x + 16.f, info_y),
 			aida::ui::with_alpha(t.text_secondary, a), info_buf);
 

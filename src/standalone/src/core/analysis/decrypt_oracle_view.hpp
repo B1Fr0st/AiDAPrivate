@@ -15,6 +15,7 @@
 #include "../helpers/globals.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -48,6 +49,13 @@ static local_state_t s_state;
 inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static bool seeded = false;
+	if (!seeded) {
+		decrypt_oracle::scan_and_decrypt(0x00007FF7A4C31000ULL, 0x4000);
+		seeded = true;
+	}
+#endif
 	const auto workspace_context = disasm_view::capture_selected_workspace();
 	(void)pos_x; (void)pos_y;
 	(void)accent_r; (void)accent_g; (void)accent_b;
@@ -262,7 +270,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (static_cast<int>(results_copy.size()) > st.prev_result_count) {
 		for (int i = st.prev_result_count; i < static_cast<int>(results_copy.size()); ++i) {
-			uint64_t key = results_copy[static_cast<size_t>(i)].xref_addr;
+			uint64_t key = results_copy[static_cast<std::size_t>(i)].xref_addr;
 			auto& ra = st.row_anims[key];
 			ra.spawned_at = st.anim_time;
 			ra.conf_anim.start(aida::motion::dur::lg, aida::motion::ease::out_cubic);
@@ -291,7 +299,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ry = hy + static_cast<float>(i - start_row) * row_h;
 		if (ry > cy + height) break;
 
-		auto& r = results_copy[static_cast<size_t>(i)];
+		auto& r = results_copy[static_cast<std::size_t>(i)];
 		auto& ra = st.row_anims[r.xref_addr];
 		ra.conf_anim.tick(dt);
 
@@ -431,7 +439,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	if (total_rows * row_h > table_h - row_h && table_h - row_h > 0.f) {
+	if (static_cast<float>(total_rows) * row_h > table_h - row_h && table_h - row_h > 0.f) {
 		float bar_x = cx + width - 10.f;
 		float bar_y = table_top + row_h;
 		float bar_h = table_h - row_h;

@@ -3,6 +3,17 @@
 #include <intrin.h>
 #include <imports/Defs.h>
 #include "../KernelLayout.h"
+#include "../SentinelBridge.h"
+#include "../TargetingLatch.h"
+#include "../DmaDefense.h"
+
+#ifndef POOL_FLAG_NON_PAGED_EXECUTE
+#define POOL_FLAG_NON_PAGED_EXECUTE 0x00000040
+#endif
+
+namespace anti_dump_kernel { PVOID pattern_scan_ntoskrnl(const UINT8*, const bool*, SIZE_T); }
+
+#include "PhysMemGuard.h"
 
 namespace anti_dump_kernel {
 
@@ -22,6 +33,224 @@ namespace anti_dump_kernel {
     inline volatile LONG g_mmcopy_resolved = 0;
     inline volatile UINT32 g_canary_crc32 = 0;
     inline volatile LONG g_kernel_dump_detected = 0;
+
+    inline PVOID g_resolved_kestackattach = nullptr;
+    inline PVOID g_resolved_keunstackdetach = nullptr;
+    inline volatile LONG g_kestack_resolved = 0;
+    inline volatile LONG g_keunstack_resolved = 0;
+
+    inline volatile LONG g_foreign_attach_strike_pid = 0;
+    inline volatile LONG g_foreign_attach_strike_count = 0;
+    inline volatile LONG g_foreign_attach_detected = 0;
+    inline volatile UINT64 g_foreign_attach_scan_count = 0;
+
+    using fn_MmCopyVirtualMemory_t = NTSTATUS(*)(PEPROCESS, PVOID, PEPROCESS, PVOID, SIZE_T, PSIZE_T);
+
+    inline PVOID g_original_MmCopyVirtualMemory = nullptr;
+    inline UINT8 g_saved_bytes_MmCopyVirtual[16] = {};
+    inline PVOID g_trampoline_MmCopyVirtual = nullptr;
+    inline volatile LONG g_mmcopy_hook_installed = 0;
+    inline volatile LONG g_mmcopy_reentrancy_guard[MAXIMUM_PROCESSORS] = {};
+
+    inline volatile LONG g_mmcopy_strike_pid = 0;
+    inline volatile LONG g_mmcopy_strike_count = 0;
+
+    constexpr ULONG MMCOPY_HOOK_COPY_SIZE  = 16;
+    constexpr ULONG MMCOPY_HOOK_PATCH_SIZE = 14;
+    constexpr ULONG MMCOPY_JUMP_BACK_SIZE  = 14;
+    constexpr ULONG MMCOPY_TRAMPOLINE_SIZE = MMCOPY_HOOK_COPY_SIZE + MMCOPY_JUMP_BACK_SIZE;
+    constexpr ULONG MMCOPY_TRAMPOLINE_TAG  = 'TCmM';
+
+    PVOID pattern_scan_ntoskrnl(const UINT8* pattern, const bool* wildcard, SIZE_T pattern_len);
+
+    typedef VOID (NTAPI* fn_ke_stack_attach)(PEPROCESS, PKAPC_STATE);
+    typedef VOID (NTAPI* fn_ke_unstack_detach)(PKAPC_STATE);
+
+    __forceinline PVOID resolve_kestackattachprocess_fallback()
+    {
+        if (_KeStackAttachProcess)
+            return (PVOID)_KeStackAttachProcess;
+
+        if (_InterlockedCompareExchange(&g_kestack_resolved, 0, 0) == 2)
+            return g_resolved_kestackattach;
+
+        LONG prev = _InterlockedCompareExchange(&g_kestack_resolved, 1, 0);
+        if (prev == 2)
+            return g_resolved_kestackattach;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_kestack_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_resolved_kestackattach;
+        }
+
+        static const UINT8 pat1[] = {
+            0x40, 0x53, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x30,
+            0x65, 0x48, 0x8B, 0x3C, 0x25
+        };
+        static const bool wc1[] = {
+            false, false, false, false, false, false, false, false,
+            false, false, false, false, false
+        };
+        PVOID found = pattern_scan_ntoskrnl(pat1, wc1, sizeof(pat1));
+        if (found) {
+            g_resolved_kestackattach = found;
+            WW_LOG("anti_dump: KeStackAttachProcess resolved via pattern variant 1 (Win10) at %p", found);
+        }
+
+        if (!found) {
+            static const UINT8 pat2[] = {
+                0x48, 0x83, 0xEC, 0x28, 0x4C, 0x8B, 0xC2, 0x33,
+                0xD2, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x83,
+                0xC4, 0x28, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+                0x48, 0x89, 0x5C, 0x24, 0x00, 0x57
+            };
+            static const bool wc2[] = {
+                false, false, false, false, false, false, false, false,
+                false, false, true,  true,  true,  true,  false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, true,  false
+            };
+            found = pattern_scan_ntoskrnl(pat2, wc2, sizeof(pat2));
+            if (found) {
+                g_resolved_kestackattach = found;
+                WW_LOG("anti_dump: KeStackAttachProcess resolved via pattern variant 2 (Win11 24H2+) at %p", found);
+            }
+        }
+
+        if (!found) {
+            static const UINT8 pat3[] = {
+                0x48, 0x83, 0xEC, 0x28, 0x4C, 0x8B, 0xC2, 0x33,
+                0xD2, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x83,
+                0xC4, 0x28, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+                0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+                0x40, 0x53, 0x48, 0x83, 0xEC, 0x20
+            };
+            static const bool wc3[] = {
+                false, false, false, false, false, false, false, false,
+                false, false, true,  true,  true,  true,  false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false
+            };
+            found = pattern_scan_ntoskrnl(pat3, wc3, sizeof(pat3));
+            if (found) {
+                g_resolved_kestackattach = found;
+                WW_LOG("anti_dump: KeStackAttachProcess resolved via pattern variant 3 (Win11 23H2) at %p", found);
+            }
+        }
+
+        if (!found) {
+            WW_LOG("anti_dump: KeStackAttachProcess fallback resolution failed");
+        }
+
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_kestack_resolved, 2);
+        return g_resolved_kestackattach;
+    }
+
+    __forceinline PVOID resolve_keunstackdetachprocess_fallback()
+    {
+        if (_KeUnstackDetachProcess)
+            return (PVOID)_KeUnstackDetachProcess;
+
+        if (_InterlockedCompareExchange(&g_keunstack_resolved, 0, 0) == 2)
+            return g_resolved_keunstackdetach;
+
+        LONG prev = _InterlockedCompareExchange(&g_keunstack_resolved, 1, 0);
+        if (prev == 2)
+            return g_resolved_keunstackdetach;
+        if (prev == 1) {
+            while (_InterlockedCompareExchange(&g_keunstack_resolved, 0, 0) == 1)
+                YieldProcessor();
+            return g_resolved_keunstackdetach;
+        }
+
+        static const UINT8 pat1[] = {
+            0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x00,
+            0x48, 0x83, 0xF8, 0x01
+        };
+        static const bool wc1[] = {
+            false, false, false, false, false, false, false, true,
+            false, false, false, false
+        };
+        PVOID found = pattern_scan_ntoskrnl(pat1, wc1, sizeof(pat1));
+        if (found) {
+            g_resolved_keunstackdetach = found;
+            WW_LOG("anti_dump: KeUnstackDetachProcess resolved via pattern variant 1 (Win10) at %p", found);
+        }
+
+        if (!found) {
+            static const UINT8 pat2[] = {
+                0x4C, 0x8B, 0xDC, 0x48, 0x83, 0xEC, 0x68, 0x48,
+                0x8B, 0x41
+            };
+            static const bool wc2[] = {
+                false, false, false, false, false, false, false, false,
+                false, false
+            };
+            found = pattern_scan_ntoskrnl(pat2, wc2, sizeof(pat2));
+            if (found) {
+                g_resolved_keunstackdetach = found;
+                WW_LOG("anti_dump: KeUnstackDetachProcess resolved via pattern variant 2 (Win11 24H2+) at %p", found);
+            }
+        }
+
+        if (!found) {
+            static const UINT8 pat3[] = {
+                0x48, 0x83, 0xEC, 0x28, 0x33, 0xD2, 0xE8, 0x00,
+                0x00, 0x00, 0x00, 0x48, 0x83, 0xC4, 0x28, 0xC3,
+                0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+                0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+                0x44, 0x89, 0x01
+            };
+            static const bool wc3[] = {
+                false, false, false, false, false, false, false, true,
+                true,  true,  true,  false, false, false, false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false, false, false, false, false, false,
+                false, false, false
+            };
+            found = pattern_scan_ntoskrnl(pat3, wc3, sizeof(pat3));
+            if (found) {
+                g_resolved_keunstackdetach = found;
+                WW_LOG("anti_dump: KeUnstackDetachProcess resolved via pattern variant 3 (Win11 23H2) at %p", found);
+            }
+        }
+
+        if (!found) {
+            WW_LOG("anti_dump: KeUnstackDetachProcess fallback resolution failed");
+        }
+
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_keunstack_resolved, 2);
+        return g_resolved_keunstackdetach;
+    }
+
+    __forceinline fn_ke_stack_attach get_kestackattachprocess()
+    {
+        if (_KeStackAttachProcess)
+            return (fn_ke_stack_attach)_KeStackAttachProcess;
+        return (fn_ke_stack_attach)resolve_kestackattachprocess_fallback();
+    }
+
+    __forceinline fn_ke_unstack_detach get_keunstackdetachprocess()
+    {
+        if (_KeUnstackDetachProcess)
+            return (fn_ke_unstack_detach)_KeUnstackDetachProcess;
+        return (fn_ke_unstack_detach)resolve_keunstackdetachprocess_fallback();
+    }
+
+    __forceinline void ke_stack_attach(PEPROCESS proc, PKAPC_STATE apc)
+    {
+        auto fn = get_kestackattachprocess();
+        if (fn) fn(proc, apc);
+    }
+
+    __forceinline void ke_unstack_detach(PKAPC_STATE apc)
+    {
+        auto fn = get_keunstackdetachprocess();
+        if (fn) fn(apc);
+    }
 
     __forceinline char lowercase_ascii_char(char ch)
     {
@@ -271,7 +500,7 @@ namespace anti_dump_kernel {
         }
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
@@ -306,7 +535,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
 
         WW_LOG("anti_dump: erased PE headers for pid=%u", pid);
@@ -336,7 +565,7 @@ namespace anti_dump_kernel {
         }
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
@@ -369,7 +598,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
         return status;
     }
@@ -396,7 +625,7 @@ namespace anti_dump_kernel {
         }
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
@@ -430,7 +659,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
         return status;
     }
@@ -444,7 +673,7 @@ namespace anti_dump_kernel {
         if (!NT_SUCCESS(status)) return status;
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PVOID peb_raw = _PsGetProcessPeb(process);
@@ -458,6 +687,27 @@ namespace anti_dump_kernel {
                         if (!_MmIsAddressValid(entry)) break;
                         if (skip++ < 2) continue;
                         UINT8* ldr_entry = (UINT8*)entry;
+
+                        PUNICODE_STRING full_name = (PUNICODE_STRING)(ldr_entry + 0x48);
+                        if (_MmIsAddressValid(full_name) &&
+                            full_name->Buffer &&
+                            _MmIsAddressValid(full_name->Buffer) &&
+                            full_name->Length > 0) {
+                            for (USHORT i = 0; i < full_name->Length / sizeof(WCHAR); ++i) {
+                                full_name->Buffer[i] = L'\0';
+                            }
+                        }
+
+                        PVOID* dll_base_ptr = (PVOID*)(ldr_entry + 0x30);
+                        if (_MmIsAddressValid(dll_base_ptr)) {
+                            *dll_base_ptr = nullptr;
+                        }
+
+                        ULONG* size_of_image_ptr = (ULONG*)(ldr_entry + 0x40);
+                        if (_MmIsAddressValid(size_of_image_ptr)) {
+                            *size_of_image_ptr = 0;
+                        }
+
                         PUNICODE_STRING base_name = (PUNICODE_STRING)(ldr_entry + 0x58);
                         if (_MmIsAddressValid(base_name) &&
                             base_name->Buffer &&
@@ -474,11 +724,477 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
         return status;
     }
 
+
+    __forceinline bool mmcopy_create_trampoline(PVOID target, PVOID* out_trampoline, UINT8* saved_bytes, ULONG saved_size)
+    {
+        if (!target || !out_trampoline || !saved_bytes || saved_size < MMCOPY_HOOK_COPY_SIZE)
+            return false;
+        if (!_MmIsAddressValid || !_MmIsAddressValid(target))
+            return false;
+
+        __try {
+            RtlCopyMemory(saved_bytes, target, saved_size);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            WW_LOG("anti_dump: mmcopy trampoline failed to save bytes at %p", target);
+            return false;
+        }
+
+        PVOID trampoline = ExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE, MMCOPY_TRAMPOLINE_SIZE, MMCOPY_TRAMPOLINE_TAG);
+        if (!trampoline) {
+            WW_LOG("anti_dump: mmcopy trampoline alloc failed size=%lu", MMCOPY_TRAMPOLINE_SIZE);
+            return false;
+        }
+
+        RtlCopyMemory(trampoline, saved_bytes, saved_size);
+
+        UINT8* jump_back = (UINT8*)trampoline + saved_size;
+        UINT64 return_addr = (UINT64)target + saved_size;
+        jump_back[0]  = 0x48;
+        jump_back[1]  = 0xB8;
+        *(UINT64*)(jump_back + 2) = return_addr;
+        jump_back[10] = 0xFF;
+        jump_back[11] = 0xE0;
+        jump_back[12] = 0x90;
+        jump_back[13] = 0x90;
+
+        *out_trampoline = trampoline;
+
+        WW_LOG("anti_dump: mmcopy trampoline created target=%p trampoline=%p return_addr=0x%llx",
+            target, trampoline, return_addr);
+        return true;
+    }
+
+    __forceinline bool mmcopy_write_inline_hook(PVOID target, PVOID hook_func)
+    {
+        if (!target || !hook_func)
+            return false;
+        if (!_MmIsAddressValid || !_MmIsAddressValid(target))
+            return false;
+
+        UINT8 hook_bytes[MMCOPY_HOOK_PATCH_SIZE];
+        hook_bytes[0]  = 0x48;
+        hook_bytes[1]  = 0xB8;
+        *(UINT64*)(hook_bytes + 2) = (UINT64)hook_func;
+        hook_bytes[10] = 0xFF;
+        hook_bytes[11] = 0xE0;
+        hook_bytes[12] = 0x90;
+        hook_bytes[13] = 0x90;
+
+        KIRQL old_irql = KeRaiseIrqlToDpcLevel();
+
+        UINT64 cr0 = 0;
+        __try {
+            cr0 = __readcr0();
+            __writecr0(cr0 & ~0x10000ULL);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            KeLowerIrql(old_irql);
+            WW_LOG("anti_dump: mmcopy hook failed to disable CR0.WP for target %p", target);
+            return false;
+        }
+
+        __try {
+            RtlCopyMemory(target, hook_bytes, MMCOPY_HOOK_PATCH_SIZE);
+            KeMemoryBarrier();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            __try { __writecr0(cr0); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            KeLowerIrql(old_irql);
+            WW_LOG("anti_dump: mmcopy hook failed to write bytes at %p", target);
+            return false;
+        }
+
+        __try {
+            __writecr0(cr0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        KeLowerIrql(old_irql);
+
+        __try {
+            __wbinvd();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        WW_LOG("anti_dump: mmcopy inline hook written at %p -> %p", target, hook_func);
+        return true;
+    }
+
+    __forceinline bool mmcopy_remove_inline_hook(PVOID target, const UINT8* saved_bytes, ULONG saved_size)
+    {
+        if (!target || !saved_bytes || saved_size == 0)
+            return false;
+        if (!_MmIsAddressValid || !_MmIsAddressValid(target))
+            return false;
+
+        KIRQL old_irql = KeRaiseIrqlToDpcLevel();
+
+        UINT64 cr0 = 0;
+        __try {
+            cr0 = __readcr0();
+            __writecr0(cr0 & ~0x10000ULL);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            KeLowerIrql(old_irql);
+            WW_LOG("anti_dump: mmcopy unhook failed to disable CR0.WP for target %p", target);
+            return false;
+        }
+
+        __try {
+            RtlCopyMemory(target, saved_bytes, MMCOPY_HOOK_PATCH_SIZE);
+            KeMemoryBarrier();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            __try { __writecr0(cr0); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            KeLowerIrql(old_irql);
+            WW_LOG("anti_dump: mmcopy unhook failed to restore bytes at %p", target);
+            return false;
+        }
+
+        __try {
+            __writecr0(cr0);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        KeLowerIrql(old_irql);
+
+        __try {
+            __wbinvd();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        WW_LOG("anti_dump: mmcopy inline hook removed at %p", target);
+        return true;
+    }
+
+    inline NTSTATUS NTAPI Hook_MmCopyVirtualMemory(
+        PEPROCESS SourceProcess,
+        PVOID SourceAddress,
+        PEPROCESS TargetProcess,
+        PVOID TargetAddress,
+        SIZE_T Size,
+        PSIZE_T Result)
+    {
+        ULONG cpu = KeGetCurrentProcessorNumber();
+        if (cpu < MAXIMUM_PROCESSORS) {
+            if (_InterlockedCompareExchange(&g_mmcopy_reentrancy_guard[cpu], 1, 0) != 0) {
+                if (g_trampoline_MmCopyVirtual)
+                    return ((fn_MmCopyVirtualMemory_t)g_trampoline_MmCopyVirtual)(
+                        SourceProcess, SourceAddress, TargetProcess, TargetAddress, Size, Result);
+                return STATUS_UNSUCCESSFUL;
+            }
+        }
+
+        bool violation_detected = false;
+        UINT64 violation_source_addr = 0;
+        UINT32 violation_size = 0;
+        UINT32 caller_pid_u32 = 0;
+        const UCHAR* caller_img_ptr = nullptr;
+        bool caller_is_re_tool = false;
+
+        UINT32 prot_pid = g_protected_pid;
+        if (prot_pid != 0 && SourceProcess) {
+            PEPROCESS protected_proc = nullptr;
+            NTSTATUS lookup_st = PsLookupProcessByProcessId(
+                (HANDLE)(ULONG_PTR)prot_pid, &protected_proc);
+            if (NT_SUCCESS(lookup_st) && protected_proc) {
+                __try {
+                    if (SourceProcess == protected_proc) {
+                        PEPROCESS caller_proc = PsGetCurrentProcess();
+                        HANDLE caller_pid = PsGetProcessId(caller_proc);
+                        caller_pid_u32 = (UINT32)(ULONG_PTR)caller_pid;
+
+                        if (caller_pid_u32 == prot_pid) {
+                        } else if (caller_pid_u32 <= 4) {
+                        } else {
+                            UCHAR* caller_img = nullptr;
+                            __try {
+                                caller_img = PsGetProcessImageFileName(caller_proc);
+                            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                                caller_img = nullptr;
+                            }
+
+                            bool caller_allowlisted = false;
+                            if (caller_img && _MmIsAddressValid(caller_img)) {
+                                caller_img_ptr = caller_img;
+                                static const char* const mmc_allowlist[] = {
+                                    "csrss", "services", "wininit", "lsass",
+                                    "msmpeng", "securityheal", "werfault"
+                                };
+                                for (int a = 0; a < 7; ++a) {
+                                    if (image_file_name_equals_ascii(caller_img, mmc_allowlist[a])) {
+                                        caller_allowlisted = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (!caller_allowlisted && is_permitted_pid(caller_pid_u32)) {
+                                caller_allowlisted = true;
+                            }
+
+                            if (!caller_allowlisted) {
+                                if (process_guard::is_known_re_tool_pid(caller_pid)) {
+                                    caller_is_re_tool = true;
+                                }
+                                violation_detected = true;
+                                violation_source_addr = (UINT64)(UINT_PTR)SourceAddress;
+                                violation_size = (UINT32)Size;
+                            }
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    violation_detected = false;
+                }
+                ObDereferenceObject(protected_proc);
+            }
+        }
+
+        if (cpu < MAXIMUM_PROCESSORS) {
+            _InterlockedExchange(&g_mmcopy_reentrancy_guard[cpu], 0);
+        }
+
+        if (violation_detected) {
+            LONG prev_pid = _InterlockedCompareExchange(&g_mmcopy_strike_pid, 0, 0);
+            if (prev_pid != (LONG)caller_pid_u32) {
+                _InterlockedExchange(&g_mmcopy_strike_pid, (LONG)caller_pid_u32);
+                _InterlockedExchange(&g_mmcopy_strike_count, 0);
+            }
+
+            LONG strike = _InterlockedIncrement(&g_mmcopy_strike_count);
+
+            const char* img_log = "<null>";
+            __try {
+                if (caller_img_ptr && _MmIsAddressValid(const_cast<UCHAR*>(caller_img_ptr))) {
+                    img_log = (const char*)caller_img_ptr;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                img_log = "<fault>";
+            }
+
+            if (strike == 1) {
+                WW_LOG("anti_dump: MMCOPY_STRIKE_1 caller_pid=%u src_addr=%p size=%llu image=%.15s re_tool=%d prot_pid=%u",
+                    caller_pid_u32, (PVOID)violation_source_addr, (UINT64)violation_size,
+                    img_log, caller_is_re_tool ? 1 : 0, prot_pid);
+            } else if (strike == 2) {
+                WW_LOG("anti_dump: MMCOPY_STRIKE_2 latch_targeting caller_pid=%u src_addr=%p size=%llu image=%.15s re_tool=%d prot_pid=%u",
+                    caller_pid_u32, (PVOID)violation_source_addr, (UINT64)violation_size,
+                    img_log, caller_is_re_tool ? 1 : 0, prot_pid);
+
+                ULONG latch_cmd = sentinel_bridge::BRIDGE_CMD_LATCH_TARGETING;
+                ULONG latch_param = caller_pid_u32;
+                sentinel_bridge::bridge_encrypt_cmd(latch_cmd, latch_param);
+                _InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                    static_cast<LONG>(latch_cmd));
+                _InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                    static_cast<LONG>(latch_param));
+
+                targeting_latch::latch_targeting(
+                    0x02,
+                    static_cast<UINT64>(caller_pid_u32),
+                    violation_source_addr,
+                    static_cast<UINT64>(violation_size),
+                    0);
+            } else {
+                WW_LOG("anti_dump: MMCOPY_STRIKE_3 scrub_keys_bsod caller_pid=%u strike=%ld src_addr=%p size=%llu re_tool=%d prot_pid=%u",
+                    caller_pid_u32, strike, (PVOID)violation_source_addr, (UINT64)violation_size,
+                    caller_is_re_tool ? 1 : 0, prot_pid);
+
+                anti_dma::countermeasure::scrub_keys_then_bsod(
+                    0xA1DA0005u, violation_source_addr, violation_size, (UINT64)caller_pid_u32);
+            }
+        }
+
+        if (g_trampoline_MmCopyVirtual)
+            return ((fn_MmCopyVirtualMemory_t)g_trampoline_MmCopyVirtual)(
+                SourceProcess, SourceAddress, TargetProcess, TargetAddress, Size, Result);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    inline NTSTATUS install_mmcopy_hook()
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return STATUS_INVALID_DEVICE_STATE;
+
+        if (_InterlockedCompareExchange(&g_mmcopy_hook_installed, 1, 0) != 0) {
+            WW_LOG("anti_dump: mmcopy hook already installed");
+            return STATUS_ALREADY_REGISTERED;
+        }
+
+        PVOID target = g_pMmCopyVirtualMemory;
+        if (!target) {
+            _InterlockedExchange(&g_mmcopy_hook_installed, 0);
+            WW_LOG("anti_dump: mmcopy hook aborted - g_pMmCopyVirtualMemory is null");
+            return STATUS_NOT_FOUND;
+        }
+
+        if (!_MmIsAddressValid || !_MmIsAddressValid(target)) {
+            _InterlockedExchange(&g_mmcopy_hook_installed, 0);
+            WW_LOG("anti_dump: mmcopy hook aborted - target address invalid %p", target);
+            return STATUS_INVALID_ADDRESS;
+        }
+
+        g_original_MmCopyVirtualMemory = target;
+
+        if (!mmcopy_create_trampoline(target, &g_trampoline_MmCopyVirtual,
+                                       g_saved_bytes_MmCopyVirtual, MMCOPY_HOOK_COPY_SIZE)) {
+            _InterlockedExchange(&g_mmcopy_hook_installed, 0);
+            g_original_MmCopyVirtualMemory = nullptr;
+            WW_LOG("anti_dump: mmcopy hook failed to create trampoline");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        if (!mmcopy_write_inline_hook(target, (PVOID)Hook_MmCopyVirtualMemory)) {
+            if (g_trampoline_MmCopyVirtual) {
+                ExFreePoolWithTag(g_trampoline_MmCopyVirtual, MMCOPY_TRAMPOLINE_TAG);
+                g_trampoline_MmCopyVirtual = nullptr;
+            }
+            _InterlockedExchange(&g_mmcopy_hook_installed, 0);
+            g_original_MmCopyVirtualMemory = nullptr;
+            WW_LOG("anti_dump: mmcopy hook failed to write inline hook");
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        WW_LOG("anti_dump: mmcopy hook installed target=%p trampoline=%p hook=%p",
+            target, g_trampoline_MmCopyVirtual, (PVOID)Hook_MmCopyVirtualMemory);
+        return STATUS_SUCCESS;
+    }
+
+    inline NTSTATUS uninstall_mmcopy_hook()
+    {
+        if (_InterlockedCompareExchange(&g_mmcopy_hook_installed, 0, 1) != 1) {
+            WW_LOG("anti_dump: mmcopy hook not installed, nothing to uninstall");
+            return STATUS_NOT_FOUND;
+        }
+
+        if (g_original_MmCopyVirtualMemory) {
+            mmcopy_remove_inline_hook(g_original_MmCopyVirtualMemory,
+                                       g_saved_bytes_MmCopyVirtual, MMCOPY_HOOK_COPY_SIZE);
+        }
+
+        if (g_trampoline_MmCopyVirtual) {
+            ExFreePoolWithTag(g_trampoline_MmCopyVirtual, MMCOPY_TRAMPOLINE_TAG);
+            g_trampoline_MmCopyVirtual = nullptr;
+        }
+
+        g_original_MmCopyVirtualMemory = nullptr;
+
+        WW_LOG("anti_dump: mmcopy hook uninstalled");
+        return STATUS_SUCCESS;
+    }
+
+    inline NTSTATUS pre_protection_handle_sweep(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (pid == 0) return STATUS_INVALID_PARAMETER;
+
+        PEPROCESS protected_proc = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &protected_proc);
+        if (!NT_SUCCESS(status)) return status;
+
+        ULONG buf_size = 4 * 1024 * 1024;
+        PVOID buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'hSPW');
+        if (!buf) {
+            ObDereferenceObject(protected_proc);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        ULONG ret_len = 0;
+        status = ZwQuerySystemInformation(
+            (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+            buf, buf_size, &ret_len);
+
+        if (status == STATUS_INFO_LENGTH_MISMATCH && ret_len > buf_size) {
+            ExFreePoolWithTag(buf, 'hSPW');
+            buf_size = ret_len + 65536;
+            buf = ExAllocatePool2(POOL_FLAG_PAGED, buf_size, 'hSPW');
+            if (!buf) {
+                ObDereferenceObject(protected_proc);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            status = ZwQuerySystemInformation(
+                (SYSTEM_INFORMATION_CLASS_INTERNAL)64,
+                buf, buf_size, &ret_len);
+        }
+
+        if (!NT_SUCCESS(status)) {
+            ExFreePoolWithTag(buf, 'hSPW');
+            ObDereferenceObject(protected_proc);
+            return status;
+        }
+
+        auto* info = (SYSTEM_HANDLE_INFORMATION_EX_AD*)buf;
+
+        static const char* const sweep_allowlist[] = {
+            "csrss", "services", "wininit", "lsass",
+            "msmpeng", "securityheal", "werfault"
+        };
+        constexpr int sweep_allowlist_count = sizeof(sweep_allowlist) / sizeof(sweep_allowlist[0]);
+
+        __try {
+            for (ULONG_PTR i = 0; i < info->NumberOfHandles && i < 500000; ++i) {
+                auto& h = info->Handles[i];
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId == pid) continue;
+                if ((ULONG_PTR)(HANDLE)h.UniqueProcessId <= 4) continue;
+
+                if (!_MmIsAddressValid || !_MmIsAddressValid(h.Object)) continue;
+                if (h.Object != protected_proc) continue;
+
+                if (h.GrantedAccess & PROCESS_VM_READ) {
+                    UINT32 owner_pid = (UINT32)h.UniqueProcessId;
+
+                    if (is_permitted_pid(owner_pid)) continue;
+
+                    bool is_allowlisted = false;
+                    PEPROCESS owner_proc = nullptr;
+                    NTSTATUS lookup_st = PsLookupProcessByProcessId(
+                        (HANDLE)(ULONG_PTR)owner_pid, &owner_proc);
+                    if (NT_SUCCESS(lookup_st) && owner_proc) {
+                        UCHAR* img_name = nullptr;
+                        __try {
+                            img_name = PsGetProcessImageFileName(owner_proc);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            img_name = nullptr;
+                        }
+
+                        if (img_name && _MmIsAddressValid(img_name)) {
+                            for (int a = 0; a < sweep_allowlist_count; ++a) {
+                                if (image_file_name_equals_ascii(img_name, sweep_allowlist[a])) {
+                                    is_allowlisted = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        ObDereferenceObject(owner_proc);
+                    }
+
+                    if (is_allowlisted) continue;
+
+                    if (_ZwOpenProcess && _ZwTerminateProcess && _ZwClose) {
+                        OBJECT_ATTRIBUTES oa;
+                        InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+                        CLIENT_ID cid = {};
+                        cid.UniqueProcess = (HANDLE)h.UniqueProcessId;
+                        HANDLE hProc = nullptr;
+                        if (NT_SUCCESS(_ZwOpenProcess(&hProc, PROCESS_TERMINATE, &oa, &cid)) && hProc) {
+                            _ZwTerminateProcess(hProc, STATUS_ACCESS_DENIED);
+                            _ZwClose(hProc);
+                            WW_LOG("anti_dump: pre_protection_handle_sweep killed pid=%u vm_read_handle_to_protected=%u",
+                                owner_pid, pid);
+                        }
+                    }
+                    InterlockedIncrement64((volatile LONG64*)&g_blocks_count);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ExFreePoolWithTag(buf, 'hSPW');
+        ObDereferenceObject(protected_proc);
+        WW_LOG("anti_dump: pre_protection_handle_sweep complete pid=%u", pid);
+        return status;
+    }
 
     inline NTSTATUS place_canary_page(UINT32 pid);
     inline NTSTATUS check_canary_page(UINT32 pid, bool& canary_intact, bool& canary_accessed);
@@ -490,6 +1206,11 @@ namespace anti_dump_kernel {
         if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
 
         NTSTATUS status;
+
+        status = pre_protection_handle_sweep(pid);
+        if (!NT_SUCCESS(status)) {
+            WW_LOG("anti_dump: pre-protection handle sweep failed 0x%08x pid=%u", status, pid);
+        }
 
         status = register_handle_filter(pid);
         if (!NT_SUCCESS(status) && status != STATUS_ALREADY_REGISTERED) {
@@ -513,6 +1234,15 @@ namespace anti_dump_kernel {
 
         place_canary_page(pid);
 
+        detect_mmcopyvirtualmemory(pid);
+
+        NTSTATUS mmcopy_hook_st = install_mmcopy_hook();
+        if (!NT_SUCCESS(mmcopy_hook_st) && mmcopy_hook_st != STATUS_ALREADY_REGISTERED) {
+            WW_LOG("anti_dump: mmcopy hook install failed 0x%08x pid=%u", mmcopy_hook_st, pid);
+        } else if (NT_SUCCESS(mmcopy_hook_st)) {
+            WW_LOG("anti_dump: mmcopy hook installed pid=%u", pid);
+        }
+
         return STATUS_SUCCESS;
     }
 
@@ -525,7 +1255,7 @@ namespace anti_dump_kernel {
         if (!NT_SUCCESS(status)) return status;
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PVOID canary = nullptr;
@@ -559,7 +1289,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
         return status;
     }
@@ -581,7 +1311,7 @@ namespace anti_dump_kernel {
         if (!NT_SUCCESS(status)) return status;
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PVOID canary = g_canary_page_addr;
@@ -614,7 +1344,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
         return status;
     }
@@ -629,7 +1359,7 @@ namespace anti_dump_kernel {
         if (!NT_SUCCESS(status)) return status;
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             for (UINT32 i = 0; i < count; ++i) {
@@ -654,7 +1384,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
         return status;
     }
@@ -672,6 +1402,7 @@ namespace anti_dump_kernel {
 
     inline void cleanup()
     {
+        uninstall_mmcopy_hook();
         unlock_all_pages();
         if (g_ob_handle && _ObUnRegisterCallbacks) {
             _ObUnRegisterCallbacks(g_ob_handle);
@@ -683,6 +1414,10 @@ namespace anti_dump_kernel {
         _InterlockedExchange(&g_mmcopy_resolved, 0);
         _InterlockedExchange((volatile LONG*)&g_canary_crc32, 0);
         _InterlockedExchange(&g_kernel_dump_detected, 0);
+        g_resolved_kestackattach = nullptr;
+        _InterlockedExchange(&g_kestack_resolved, 0);
+        g_resolved_keunstackdetach = nullptr;
+        _InterlockedExchange(&g_keunstack_resolved, 0);
     }
 
     inline NTSTATUS scan_and_kill_readers(UINT32 pid)
@@ -951,26 +1686,61 @@ namespace anti_dump_kernel {
         if (_InterlockedCompareExchange(&g_mmcopy_resolved, 0, 0) == 0) {
             LONG prev = _InterlockedCompareExchange(&g_mmcopy_resolved, 1, 0);
             if (prev == 0) {
-                const UINT8 pattern[] = {
-                    0x48, 0x89, 0x5C, 0x24, 0x00,
-                    0x48, 0x89, 0x6C, 0x24, 0x00,
-                    0x48, 0x89, 0x74, 0x24, 0x00,
-                    0x57, 0x48, 0x81, 0xEC
+                static const UINT8 pat_v1[] = {
+                    0x40, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,
+                    0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x10,
+                    0x04, 0x00, 0x00
                 };
-                const bool wildcard[] = {
-                    false, false, false, false, true,
-                    false, false, false, false, true,
-                    false, false, false, false, true,
-                    false, false, false, false
+                static const bool wc_v1[] = {
+                    false, false, false, false, false, false, false, false,
+                    false, false, false, false, false, false, false, false,
+                    false, false, false
                 };
-                constexpr SIZE_T pattern_len = sizeof(pattern);
 
-                PVOID found = pattern_scan_ntoskrnl(pattern, wildcard, pattern_len);
+                static const UINT8 pat_v2[] = {
+                    0x48, 0x83, 0xEC, 0x48, 0x83, 0x64, 0x24, 0x00,
+                    0x00, 0x48, 0x8B, 0x84, 0x24
+                };
+                static const bool wc_v2[] = {
+                    false, false, false, false, false, false, false, true,
+                    true,  false, false, false, false
+                };
+
+                static const UINT8 pat_v3[] = {
+                    0x48, 0x83, 0xEC, 0x48, 0x48, 0x8B, 0x84, 0x24,
+                    0x00, 0x00, 0x00, 0x00, 0xC7, 0x44, 0x24
+                };
+                static const bool wc_v3[] = {
+                    false, false, false, false, false, false, false, false,
+                    true,  true,  true,  true,  false, false, false
+                };
+
+                PVOID found = nullptr;
+
+                found = pattern_scan_ntoskrnl(pat_v1, wc_v1, sizeof(pat_v1));
                 if (found) {
                     g_pMmCopyVirtualMemory = found;
-                    WW_LOG("anti_dump: MmCopyVirtualMemory resolved at %p", found);
-                } else {
-                    WW_LOG("anti_dump: MmCopyVirtualMemory pattern not found");
+                    WW_LOG("anti_dump: MmCopyVirtualMemory resolved via variant 1 (Win10 22H2) at %p", found);
+                }
+
+                if (!found) {
+                    found = pattern_scan_ntoskrnl(pat_v2, wc_v2, sizeof(pat_v2));
+                    if (found) {
+                        g_pMmCopyVirtualMemory = found;
+                        WW_LOG("anti_dump: MmCopyVirtualMemory resolved via variant 2 (Win11 24H2/25H2) at %p", found);
+                    }
+                }
+
+                if (!found) {
+                    found = pattern_scan_ntoskrnl(pat_v3, wc_v3, sizeof(pat_v3));
+                    if (found) {
+                        g_pMmCopyVirtualMemory = found;
+                        WW_LOG("anti_dump: MmCopyVirtualMemory resolved via variant 3 (Win11 23H2) at %p", found);
+                    }
+                }
+
+                if (!found) {
+                    WW_LOG("anti_dump: MmCopyVirtualMemory pattern not found across all 3 variants");
                 }
                 KeMemoryBarrier();
                 _InterlockedExchange(&g_mmcopy_resolved, 2);
@@ -988,7 +1758,7 @@ namespace anti_dump_kernel {
         if (!NT_SUCCESS(status)) return status;
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PVOID canary = g_canary_page_addr;
@@ -1011,7 +1781,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
         return status;
     }
@@ -1029,7 +1799,7 @@ namespace anti_dump_kernel {
         if (!NT_SUCCESS(status)) return status;
 
         KAPC_STATE apc;
-        _KeStackAttachProcess(process, &apc);
+        ke_stack_attach(process, &apc);
 
         __try {
             PVOID peb_raw = _PsGetProcessPeb(process);
@@ -1051,7 +1821,7 @@ namespace anti_dump_kernel {
             status = STATUS_UNSUCCESSFUL;
         }
 
-        _KeUnstackDetachProcess(&apc);
+        ke_unstack_detach(&apc);
         ObDereferenceObject(process);
 
         WW_LOG("anti_dump: TIER2_BSOD kernel_dump pid=%u", pid);
@@ -1294,6 +2064,176 @@ namespace anti_dump_kernel {
         if (any_non_allowlisted) return 2;
         return 1;
     }
+
+    inline NTSTATUS scan_for_foreign_attaches(UINT32 pid)
+    {
+        if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+        if (pid == 0) return STATUS_INVALID_PARAMETER;
+        if (!_PsGetNextProcessThread) return STATUS_NOT_SUPPORTED;
+
+        SIZE_T active_links_offset = whoswho_kernel_layout::eprocess_active_process_links_offset();
+        if (active_links_offset == 0) return STATUS_NOT_SUPPORTED;
+
+        SIZE_T apc_state_abs_offset = whoswho_kernel_layout::kthread_apc_state_process_absolute_offset();
+        if (apc_state_abs_offset == 0) return STATUS_NOT_SUPPORTED;
+
+        PEPROCESS protected_proc = nullptr;
+        NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &protected_proc);
+        if (!NT_SUCCESS(status)) return status;
+
+        _InterlockedIncrement64((volatile LONG64*)&g_foreign_attach_scan_count);
+
+        static const char* const allowlist[] = {
+            "csrss", "services", "wininit", "lsass",
+            "msmpeng", "securityheal", "werfault", "svchost"
+        };
+        constexpr int allowlist_count = sizeof(allowlist) / sizeof(allowlist[0]);
+
+        bool detection_this_scan = false;
+
+        __try {
+            PEPROCESS initial = PsInitialSystemProcess;
+            if (!initial || !_MmIsAddressValid(initial)) {
+                ObDereferenceObject(protected_proc);
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            PLIST_ENTRY list_head = (PLIST_ENTRY)((UINT8*)initial + active_links_offset);
+            if (!_MmIsAddressValid(list_head)) {
+                ObDereferenceObject(protected_proc);
+                return STATUS_UNSUCCESSFUL;
+            }
+            PLIST_ENTRY entry = list_head->Flink;
+
+            for (int iter = 0; iter < 2048 && entry != list_head && !detection_this_scan; ++iter, entry = entry->Flink) {
+                if (!_MmIsAddressValid(entry)) break;
+
+                PEPROCESS proc = (PEPROCESS)((UINT8*)entry - active_links_offset);
+                if (!_MmIsAddressValid(proc)) continue;
+
+                HANDLE proc_pid_h = PsGetProcessId(proc);
+                UINT32 pid_u32 = (UINT32)(ULONG_PTR)proc_pid_h;
+                if (pid_u32 == 0 || pid_u32 <= 4 || pid_u32 == pid) continue;
+
+                PETHREAD thread = nullptr;
+                while ((thread = _PsGetNextProcessThread(proc, thread)) != nullptr) {
+                    if (!_MmIsAddressValid(thread)) continue;
+
+                    UINT64 apc_state_process = 0;
+                    __try {
+                        apc_state_process = *(volatile UINT64*)((UINT8*)thread + apc_state_abs_offset);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        continue;
+                    }
+
+                    if ((PVOID)apc_state_process != (PVOID)protected_proc) continue;
+
+                    UCHAR* img_name = nullptr;
+                    __try {
+                        img_name = PsGetProcessImageFileName(proc);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        img_name = nullptr;
+                    }
+
+                    bool is_allowlisted = false;
+                    if (img_name && _MmIsAddressValid(img_name)) {
+                        for (int a = 0; a < allowlist_count; ++a) {
+                            if (image_file_name_equals_ascii(img_name, allowlist[a])) {
+                                is_allowlisted = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!is_allowlisted) {
+                        if (is_permitted_pid(pid_u32)) {
+                            is_allowlisted = true;
+                            WW_LOG("anti_dump: foreign_attach_permitted_pid_exempted owner_pid=%u protected_pid=%u image=%.15s",
+                                pid_u32, pid, img_name ? (const char*)img_name : "<null>");
+                        }
+                    }
+
+                    if (is_allowlisted) continue;
+
+                    detection_this_scan = true;
+                    _InterlockedExchange(&g_foreign_attach_detected, 1);
+
+                    HANDLE tid = nullptr;
+                    if (_PsGetThreadId) {
+                        __try {
+                            tid = _PsGetThreadId(thread);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            tid = nullptr;
+                        }
+                    }
+
+                    UINT64 tid_u64 = (UINT64)(ULONG_PTR)tid;
+
+                    WW_LOG("anti_dump: FOREIGN_ATTACH_DETECTED protected_pid=%u owner_pid=%u tid=%llu owner_image=%.15s apc_state_process=0x%llX protected_eprocess=%p",
+                        pid, pid_u32, tid_u64,
+                        img_name ? (const char*)img_name : "<null>",
+                        (unsigned long long)apc_state_process,
+                        (PVOID)protected_proc);
+
+                    LONG prev_pid = _InterlockedCompareExchange(&g_foreign_attach_strike_pid, 0, 0);
+                    if (prev_pid != (LONG)pid_u32) {
+                        _InterlockedExchange(&g_foreign_attach_strike_pid, (LONG)pid_u32);
+                        _InterlockedExchange(&g_foreign_attach_strike_count, 0);
+                    }
+
+                    LONG strike = _InterlockedIncrement(&g_foreign_attach_strike_count);
+
+                    if (strike == 1) {
+                        WW_LOG("anti_dump: FOREIGN_ATTACH_STRIKE_1 protected_pid=%u owner_pid=%u tid=%llu owner_image=%.15s apc_state_proc=0x%llX",
+                            pid, pid_u32, tid_u64,
+                            img_name ? (const char*)img_name : "<null>",
+                            (unsigned long long)apc_state_process);
+                    } else if (strike == 2) {
+                        WW_LOG("anti_dump: FOREIGN_ATTACH_STRIKE_2 latch_targeting protected_pid=%u owner_pid=%u tid=%llu owner_image=%.15s",
+                            pid, pid_u32, tid_u64,
+                            img_name ? (const char*)img_name : "<null>");
+
+                        ULONG latch_cmd = sentinel_bridge::BRIDGE_CMD_LATCH_TARGETING;
+                        ULONG latch_param = pid_u32;
+                        sentinel_bridge::bridge_encrypt_cmd(latch_cmd, latch_param);
+                        _InterlockedExchange(
+                            reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd),
+                            static_cast<LONG>(latch_cmd));
+                        _InterlockedExchange(
+                            reinterpret_cast<volatile LONG*>(&sentinel_bridge::g_bridge.sentinel_cmd_param),
+                            static_cast<LONG>(latch_param));
+
+                        targeting_latch::latch_targeting(
+                            0x01,
+                            static_cast<UINT64>(pid_u32),
+                            tid_u64,
+                            apc_state_process,
+                            static_cast<UINT64>(reinterpret_cast<UINT_PTR>(protected_proc)));
+                    } else {
+                        WW_LOG("anti_dump: FOREIGN_ATTACH_STRIKE_3 scrub_keys_bsod protected_pid=%u owner_pid=%u tid=%llu strike=%ld",
+                            pid, pid_u32, tid_u64, strike);
+
+                        anti_dma::countermeasure::scrub_keys();
+
+                        if (_KeBugCheckEx) {
+                            _KeBugCheckEx(0xA1DA0003u,
+                                static_cast<ULONG_PTR>(pid),
+                                static_cast<ULONG_PTR>(pid_u32),
+                                static_cast<ULONG_PTR>(tid_u64),
+                                static_cast<ULONG_PTR>(apc_state_process));
+                        }
+                    }
+
+                    break;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = STATUS_UNSUCCESSFUL;
+        }
+
+        ObDereferenceObject(protected_proc);
+        return status;
+    }
 }
 
 namespace continuous_anti_dump {
@@ -1315,6 +2255,14 @@ namespace continuous_anti_dump {
             return;
         }
 
+        UINT64 jitter_ms = __rdtsc() % 2000;
+        if (jitter_ms > 0 && KeGetCurrentIrql() == PASSIVE_LEVEL && _KeDelayExecutionThread) {
+            LARGE_INTEGER jitter_wait;
+            jitter_wait.QuadPart = -static_cast<LONGLONG>(jitter_ms) * 10000LL;
+            _KeDelayExecutionThread(KernelMode, FALSE, &jitter_wait);
+        }
+        WW_LOG("continuous_admp: jitter_applied ms=%llu", jitter_ms);
+
         __try {
             UINT32 pid = g_target_pid;
             if (pid == 0) {
@@ -1330,6 +2278,7 @@ namespace continuous_anti_dump {
             if ((cycle % 3) == 0) {
                 anti_dump_kernel::hide_all_threads(pid);
                 anti_dump_kernel::monitor_kernel_reads(pid);
+                anti_dump_kernel::scan_for_foreign_attaches(pid);
             }
 
             if ((cycle % 10) == 0) {

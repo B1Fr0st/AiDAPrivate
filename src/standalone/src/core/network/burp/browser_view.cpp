@@ -1,8 +1,15 @@
 #include "browser_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#include "../../../preview/network_preview_browser.hpp"
+#include "../../../preview/network_preview_certificates.hpp"
+#include "../mitm_proxy.hpp"
+#else
 #include "browser_launch.hpp"
 #include "camoufox_bridge.hpp"
 #include "../mitm_proxy.hpp"
 #include "../cert_generator.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"

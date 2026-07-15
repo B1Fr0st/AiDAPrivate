@@ -19,6 +19,7 @@ namespace process_guard {
 
     inline PVOID g_ob_handle = nullptr;
     inline PVOID g_bridge_ob_handle = nullptr;
+    inline PVOID g_thread_ob_handle = nullptr;
     inline volatile LONG g_initialized = 0;
     inline volatile UINT64 g_bridge_region_start = 0;
     inline volatile UINT64 g_bridge_region_end = 0;
@@ -1529,6 +1530,7 @@ namespace process_guard {
             hostile_check |= PROCESS_VM_READ;
 
         if (granted & hostile_check) {
+            record_behavioral_attempt(caller_pid, granted);
             targeting_latch::latch_targeting(
                 sentinel_bridge::RE_REASON_FOREIGN_HND,
                 (UINT64)(ULONG_PTR)caller_pid,
@@ -1537,6 +1539,67 @@ namespace process_guard {
                 (UINT64)(ULONG_PTR)caller_pid,
                 (UINT64)(ULONG_PTR)target_pid,
                 (UINT32)granted, (UINT32)hostile_check,
+                (ULONG)(Info->KernelHandle ? 1 : 0));
+        }
+    }
+
+    inline VOID NTAPI thread_post_callback(
+        PVOID,
+        POB_POST_OPERATION_INFORMATION Info)
+    {
+        if (!Info || !Info->Object)
+            return;
+
+        HANDLE client_pid = caller_validation::g_registered_client_pid;
+        if (!client_pid)
+            return;
+
+        PEPROCESS owner = nullptr;
+        __try {
+            owner = IoThreadToProcess(static_cast<PETHREAD>(Info->Object));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return;
+        }
+
+        if (!owner)
+            return;
+
+        HANDLE thread_owner_pid = PsGetProcessId(owner);
+        if (thread_owner_pid != client_pid)
+            return;
+
+        HANDLE caller_pid = PsGetCurrentProcessId();
+        if (caller_pid == client_pid)
+            return;
+        if (reinterpret_cast<UINT64>(caller_pid) == 4)
+            return;
+
+        if (is_werfault_caller(caller_pid))
+            return;
+
+        ACCESS_MASK granted = 0;
+        __try {
+            if (Info->Operation == OB_OPERATION_HANDLE_CREATE)
+                granted = Info->Parameters->CreateHandleInformation.GrantedAccess;
+            else if (Info->Operation == OB_OPERATION_HANDLE_DUPLICATE)
+                granted = Info->Parameters->DuplicateHandleInformation.GrantedAccess;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return;
+        }
+
+        constexpr ACCESS_MASK THREAD_HOSTILE_GRANTED =
+            THREAD_GET_CONTEXT | THREAD_SET_CONTEXT;
+
+        if (granted & THREAD_HOSTILE_GRANTED) {
+            record_behavioral_attempt(caller_pid, granted);
+            targeting_latch::latch_targeting(
+                sentinel_bridge::RE_REASON_OB_SUSPEND,
+                (UINT64)(ULONG_PTR)caller_pid,
+                (UINT64)granted, 0, 0);
+            WW_LOG("[THREAT] thread_post_callback hostile_granted caller=%llu target=%llu granted=0x%08X thread_hostile=0x%08X kernel_handle=%lu",
+                (UINT64)(ULONG_PTR)caller_pid,
+                (UINT64)(ULONG_PTR)thread_owner_pid,
+                (UINT32)granted, (UINT32)THREAD_HOSTILE_GRANTED,
                 (ULONG)(Info->KernelHandle ? 1 : 0));
         }
     }
@@ -1845,29 +1908,24 @@ namespace process_guard {
             return STATUS_NOT_SUPPORTED;
         }
 
-        OB_OPERATION_REGISTRATION op_reg[2] = {};
+        OB_OPERATION_REGISTRATION proc_op_reg[1] = {};
 
-        op_reg[0].ObjectType = PsProcessType;
-        op_reg[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-        op_reg[0].PreOperation = process_pre_callback;
-        op_reg[0].PostOperation = process_post_callback;
+        proc_op_reg[0].ObjectType = PsProcessType;
+        proc_op_reg[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+        proc_op_reg[0].PreOperation = process_pre_callback;
+        proc_op_reg[0].PostOperation = process_post_callback;
 
-        op_reg[1].ObjectType = PsThreadType;
-        op_reg[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-        op_reg[1].PreOperation = thread_pre_callback;
-        op_reg[1].PostOperation = nullptr;
+        UNICODE_STRING proc_altitude;
+        RtlInitUnicodeString(&proc_altitude, L"321124");
 
-        UNICODE_STRING altitude;
-        RtlInitUnicodeString(&altitude, L"321124");
+        OB_CALLBACK_REGISTRATION proc_cb_reg = {};
+        proc_cb_reg.Version = OB_FLT_REGISTRATION_VERSION;
+        proc_cb_reg.OperationRegistrationCount = 1;
+        proc_cb_reg.Altitude = proc_altitude;
+        proc_cb_reg.RegistrationContext = nullptr;
+        proc_cb_reg.OperationRegistration = proc_op_reg;
 
-        OB_CALLBACK_REGISTRATION cb_reg = {};
-        cb_reg.Version = OB_FLT_REGISTRATION_VERSION;
-        cb_reg.OperationRegistrationCount = 2;
-        cb_reg.Altitude = altitude;
-        cb_reg.RegistrationContext = nullptr;
-        cb_reg.OperationRegistration = op_reg;
-
-        NTSTATUS status = _ObRegisterCallbacks(&cb_reg, &g_ob_handle);
+        NTSTATUS status = _ObRegisterCallbacks(&proc_cb_reg, &g_ob_handle);
 
         if (!NT_SUCCESS(status)) {
             WW_LOG("process_guard::init: ObRegisterCallbacks FAILED status=0x%08lx", status);
@@ -1875,6 +1933,35 @@ namespace process_guard {
             _InterlockedExchange(&g_initialized, 0);
         } else {
             WW_LOG("process_guard::init: ObRegisterCallbacks OK handle=%p", g_ob_handle);
+        }
+
+        if (NT_SUCCESS(status) && PsThreadType) {
+            OB_OPERATION_REGISTRATION thread_op_reg[1] = {};
+
+            thread_op_reg[0].ObjectType = PsThreadType;
+            thread_op_reg[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+            thread_op_reg[0].PreOperation = thread_pre_callback;
+            thread_op_reg[0].PostOperation = thread_post_callback;
+
+            UNICODE_STRING thread_altitude;
+            RtlInitUnicodeString(&thread_altitude, L"321126");
+
+            OB_CALLBACK_REGISTRATION thread_cb_reg = {};
+            thread_cb_reg.Version = OB_FLT_REGISTRATION_VERSION;
+            thread_cb_reg.OperationRegistrationCount = 1;
+            thread_cb_reg.Altitude = thread_altitude;
+            thread_cb_reg.RegistrationContext = nullptr;
+            thread_cb_reg.OperationRegistration = thread_op_reg;
+
+            NTSTATUS thread_st = _ObRegisterCallbacks(&thread_cb_reg, &g_thread_ob_handle);
+            if (!NT_SUCCESS(thread_st)) {
+                WW_LOG("process_guard::init: thread ObRegisterCallbacks FAILED status=0x%08lx", thread_st);
+                g_thread_ob_handle = nullptr;
+            } else {
+                WW_LOG("process_guard::init: thread ObRegisterCallbacks OK handle=%p", g_thread_ob_handle);
+            }
+        } else if (NT_SUCCESS(status) && !PsThreadType) {
+            WW_LOG("process_guard::init: PsThreadType unavailable, skipping thread OB registration");
         }
 
         if (NT_SUCCESS(status) && g_bridge_region_start != 0)
@@ -1960,6 +2047,10 @@ namespace process_guard {
         if (g_ob_handle && _ObUnRegisterCallbacks) {
             _ObUnRegisterCallbacks(g_ob_handle);
             g_ob_handle = nullptr;
+        }
+        if (g_thread_ob_handle && _ObUnRegisterCallbacks) {
+            _ObUnRegisterCallbacks(g_thread_ob_handle);
+            g_thread_ob_handle = nullptr;
         }
         if (g_bridge_ob_handle && _ObUnRegisterCallbacks) {
             _ObUnRegisterCallbacks(g_bridge_ob_handle);

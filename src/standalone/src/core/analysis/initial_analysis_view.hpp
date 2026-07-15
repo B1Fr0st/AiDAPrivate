@@ -1,5 +1,8 @@
 #pragma once
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/initial_analysis_preview_adapter.hpp"
+#else
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -8,19 +11,24 @@
 #endif
 
 #include <windows.h>
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "initial_analysis.hpp"
 #include "symbol_store.hpp"
+#endif
 #include "../disasm/disasm_view.hpp"
 #include "../session/analysis_session.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/blur_layer.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/win32_dialog.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -33,7 +41,9 @@
 #include <string>
 #include <unordered_map>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 extern HWND g_hwnd;
+#endif
 
 namespace initial_analysis_view {
 
@@ -103,7 +113,12 @@ inline void sync_pdb_prompt_state(
     const std::shared_ptr<view_state_t>& state)
 {
     if (!context.workspace || !state) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    auto snapshot = aida::preview::initial_analysis::pdb_prompt_snapshot(
+        context.workspace);
+#else
     auto snapshot = analysis_session::pdb_prompt_snapshot(context.workspace);
+#endif
     if (!snapshot) {
         state->pdb_prompt.visible = false;
         state->pdb_prompt.status = pdb_prompt_status_t::pending;
@@ -160,14 +175,32 @@ inline bool target_matches(const disasm_view::workspace_context_t& context)
 inline void suppress_automated_prompts(
 	const disasm_view::workspace_context_t& context)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const bool pdb_skip_active = aida::preview::initial_analysis::pdb_skip_active();
+#else
 	const auto automation = symbol_store::pdb_automation_context();
-	if (!automation.pdb_skip_active || !context.workspace) return;
+	const bool pdb_skip_active = automation.pdb_skip_active;
+#endif
+	if (!pdb_skip_active || !context.workspace) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	auto snapshot = aida::preview::initial_analysis::pdb_prompt_snapshot(
+		context.workspace);
+#else
 	auto snapshot = analysis_session::pdb_prompt_snapshot(context.workspace);
+#endif
 	if (!snapshot) return;
 	if (snapshot.value().remote_pending)
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		(void)aida::preview::initial_analysis::decline_remote_pdb(context.workspace);
+#else
 		(void)analysis_session::decline_remote_pdb(context.workspace);
+#endif
 	if (snapshot.value().local_pending)
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		(void)aida::preview::initial_analysis::decline_local_pdb(context.workspace);
+#else
 		(void)analysis_session::decline_local_pdb(context.workspace);
+#endif
 }
 
 inline float progress_fraction(const aida::analysis::workspace_progress_t& progress)
@@ -186,6 +219,11 @@ inline float progress_fraction(const aida::analysis::workspace_progress_t& progr
 inline std::string browse_for_pdb(const disasm_view::workspace_context_t& context,
 	const std::string& initial_name)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(context);
+	static_cast<void>(initial_name);
+	return aida::preview::initial_analysis::browse_for_pdb();
+#else
 	if (symbol_store::pdb_automation_context().pdb_skip_active) {
 		if (context.workspace)
 			(void)analysis_session::decline_local_pdb(context.workspace);
@@ -200,13 +238,19 @@ inline std::string browse_for_pdb(const disasm_view::workspace_context_t& contex
 	if (!win32_dialog::show_open_file_dialog(g_hwnd, "Select PDB file", filter,
 		path.data(), path.size(), "initial_analysis_view::browse_for_pdb")) return {};
 	return path.data();
+#endif
 }
 
 inline void render_progress(const disasm_view::workspace_context_t& context,
 	const std::shared_ptr<view_state_t>& state)
 {
 	if (!context.workspace || !state || state->dismissed) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const auto progress = aida::preview::initial_analysis::progress_snapshot(
+		context.workspace);
+#else
 	const auto progress = context.workspace->progress();
+#endif
 	using aida::analysis::workspace_readiness_t;
 	const bool visible = progress.readiness == workspace_readiness_t::analyzing ||
 		progress.readiness == workspace_readiness_t::baseline_ready ||
@@ -256,12 +300,21 @@ inline void render_progress(const disasm_view::workspace_context_t& context,
 		if (aida::ui::button(progress.readiness == workspace_readiness_t::cancelling
 			? "Cancelling" : "Cancel", aida::ui::button_kind_t::destructive,
 			aida::ui::size_t_::sm, ImVec2(), progress.cancellation_requested))
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::initial_analysis::request_cancel(context.workspace);
+#else
 			context.workspace->request_cancel();
+#endif
 	} else if (progress.readiness != workspace_readiness_t::baseline_ready) {
 		if (aida::ui::button("Retry", aida::ui::button_kind_t::primary,
 			aida::ui::size_t_::sm)) {
 			state->dismissed = false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			auto started = aida::preview::initial_analysis::run_initial_analysis(
+				context.workspace);
+#else
 			auto started = initial_analysis::run_initial_analysis(context.workspace);
+#endif
 			if (started) {
 				state->analysis_error.clear();
 			} else {
@@ -285,7 +338,12 @@ inline void render_remote_pdb(const disasm_view::workspace_context_t& context,
 {
 	if (!state || !target_matches(context)) return;
 	suppress_automated_prompts(context);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	auto prompt = aida::preview::initial_analysis::pdb_prompt_snapshot(
+		context.workspace);
+#else
 	auto prompt = analysis_session::pdb_prompt_snapshot(context.workspace);
+#endif
 	if (!prompt || !prompt.value().remote_pending) return;
 	const std::string popup = "Debug information available##" +
 		context.workspace->identity().binary_id().to_hex();
@@ -311,8 +369,13 @@ inline void render_remote_pdb(const disasm_view::workspace_context_t& context,
 	aida::ui::toggle_switch("Load names", &state->load_names, aida::ui::size_t_::md);
 	if (aida::ui::button("Yes, download", aida::ui::button_kind_t::primary,
 		aida::ui::size_t_::md, ImVec2(), !state->load_types && !state->load_names)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		auto accepted = aida::preview::initial_analysis::approve_remote_pdb(
+			context.workspace, state->load_types, state->load_names);
+#else
 		auto accepted = analysis_session::approve_remote_pdb(context.workspace,
 			state->load_types, state->load_names);
+#endif
 		if (accepted) {
 			state->pdb_error.clear();
 			ImGui::CloseCurrentPopup();
@@ -324,7 +387,12 @@ inline void render_remote_pdb(const disasm_view::workspace_context_t& context,
 	ImGui::SameLine();
 	if (aida::ui::button("No, skip", aida::ui::button_kind_t::secondary,
 		aida::ui::size_t_::md) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		auto declined = aida::preview::initial_analysis::decline_remote_pdb(
+			context.workspace);
+#else
 		auto declined = analysis_session::decline_remote_pdb(context.workspace);
+#endif
 		if (declined) {
 			state->pdb_error.clear();
 			ImGui::CloseCurrentPopup();
@@ -341,7 +409,12 @@ inline void render_local_pdb(const disasm_view::workspace_context_t& context,
 {
 	if (!state || !target_matches(context)) return;
 	suppress_automated_prompts(context);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	auto prompt = aida::preview::initial_analysis::pdb_prompt_snapshot(
+		context.workspace);
+#else
 	auto prompt = analysis_session::pdb_prompt_snapshot(context.workspace);
+#endif
 	if (!prompt || !prompt.value().local_pending) return;
 	if (state->local_pdb_path[0] == '\0' && !prompt.value().local_candidate.empty())
 		std::strncpy(state->local_pdb_path.data(), prompt.value().local_candidate.c_str(),
@@ -382,8 +455,14 @@ inline void render_local_pdb(const disasm_view::workspace_context_t& context,
 	if (aida::ui::button("Load this PDB", aida::ui::button_kind_t::primary,
 		aida::ui::size_t_::md, ImVec2(), !valid ||
 			(!state->load_types && !state->load_names))) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		auto accepted = aida::preview::initial_analysis::approve_local_pdb(
+			context.workspace, state->local_pdb_path.data(), state->load_types,
+			state->load_names);
+#else
 		auto accepted = analysis_session::approve_local_pdb(context.workspace,
 			state->local_pdb_path.data(), state->load_types, state->load_names);
+#endif
 		if (accepted) {
 			state->pdb_error.clear();
 			ImGui::CloseCurrentPopup();
@@ -395,7 +474,12 @@ inline void render_local_pdb(const disasm_view::workspace_context_t& context,
 	ImGui::SameLine();
 	if (aida::ui::button("No, skip", aida::ui::button_kind_t::secondary,
 		aida::ui::size_t_::md) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		auto declined = aida::preview::initial_analysis::decline_local_pdb(
+			context.workspace);
+#else
 		auto declined = analysis_session::decline_local_pdb(context.workspace);
+#endif
 		if (declined) {
 			state->pdb_error.clear();
 			ImGui::CloseCurrentPopup();
@@ -411,7 +495,12 @@ inline void render_pdb_status(const disasm_view::workspace_context_t& context,
 	const std::shared_ptr<view_state_t>& state)
 {
 	if (!state || !target_matches(context)) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	auto prompt = aida::preview::initial_analysis::pdb_prompt_snapshot(
+		context.workspace);
+#else
 	auto prompt = analysis_session::pdb_prompt_snapshot(context.workspace);
+#endif
 	if (!prompt || !prompt.value().loading) return;
 	const auto& theme = aida::ui::resolved();
 	const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -443,7 +532,12 @@ inline void render_pdb_status(const disasm_view::workspace_context_t& context,
 	ImGui::ProgressBar(fraction, ImVec2(-1.0f, 8.0f), "");
 	if (aida::ui::button("Cancel PDB", aida::ui::button_kind_t::destructive,
 		aida::ui::size_t_::sm)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		auto cancelled = aida::preview::initial_analysis::cancel_pdb(
+			context.workspace);
+#else
 		auto cancelled = analysis_session::cancel_pdb(context.workspace);
+#endif
 		if (!cancelled) state->pdb_error = cancelled.error().stable_code() + ": " +
 			cancelled.error().message;
 	}

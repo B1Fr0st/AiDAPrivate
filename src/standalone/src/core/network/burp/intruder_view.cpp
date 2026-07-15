@@ -1,21 +1,33 @@
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_platform.hpp"
+#else
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlobj.h>
+#endif
 
 #ifdef small
 #undef small
 #endif
 
 #include "intruder_view.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_routed.hpp"
+#else
 #include "intruder_engine.hpp"
 #include "payload_library.hpp"
+#endif
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
 #include "../../ui/ui_anim.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_services.hpp"
+#else
 #include "helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -236,7 +248,6 @@ void render(float pos_x, float pos_y, float width, float height,
         float c_st = 60.f;
         float c_len = 80.f;
         float c_lat = 80.f;
-        float c_err = 220.f;
         float head_y = org.y + ImGui::GetCursorPosY();
         dl->AddRectFilled(ImVec2(org.x, head_y - 2.f),
                           ImVec2(org.x + ImGui::GetWindowWidth(), head_y + row_h - 2.f),

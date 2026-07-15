@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -17,20 +20,19 @@
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
 #include "cfg_layout.hpp"
+#include "disasm_theme.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "function_index.hpp"
 #include "standalone_driver.hpp"
 #include "symbol_classifier.hpp"
-#include "disasm_theme.hpp"
 #include "zydis_disasm.hpp"
 #include "debugger_engine.hpp"
-#include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../analysis/pdb_events.hpp"
 #include "../analysis/symbol_store.hpp"
 #include "../anti-tamper/webhook.hpp"
 #include "../infra/executor.hpp"
 #include "../infra/event_bus.hpp"
-#include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/transition.hpp"
@@ -39,10 +41,43 @@
 #include "../ui/empty_state.hpp"
 #include "../ui/skeleton.hpp"
 #include "../ui/fonts.hpp"
+#else
+#include "../../preview/debugger_preview_runtime.hpp"
+#include "ui_anim.hpp"
+#include "../ui/motion.hpp"
+#include "../ui/clock.hpp"
+#include "../ui/transition.hpp"
+#include "../ui/components.hpp"
+#include "../ui/blur_layer.hpp"
+#include "../ui/empty_state.hpp"
+#include "../ui/skeleton.hpp"
+#include "../ui/fonts.hpp"
+#endif
+#include "disasm_view.hpp"
+#include "../ui/theme.hpp"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#endif
 
 namespace cfg_view {
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+namespace preview_support {
+enum class injection_t { function_banner, attributes_line, prototype_line, proc_header, var_decl, proc_endp, endp_separator, label_line, spacer_line, noreturn_separator };
+struct injection_row_t { injection_t kind = injection_t::spacer_line; std::string text; uint64_t addr = 0; };
+}
+}
+namespace function_index {
+using injection_t = cfg_view::preview_support::injection_t;
+using injection_row_t = cfg_view::preview_support::injection_row_t;
+}
+namespace symbol_classifier {
+enum class kind_t { unknown, external_import };
+template <typename... T> inline kind_t classify(T&&...) { return kind_t::unknown; }
+}
+namespace cfg_view {
+#endif
 
 struct instruction_line_t {
 	uint64_t    addr = 0;
@@ -159,6 +194,7 @@ inline bool safe_decode_for_cfg(const uint8_t* code, int avail, uint64_t va,
 #endif
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 inline std::atomic<bool>&                    pdb_subscription_armed_flag()
 {
 	static std::atomic<bool> armed{false};
@@ -199,6 +235,9 @@ inline void ensure_pdb_subscription()
 		armed.store(false, std::memory_order_release);
 	}
 }
+#else
+inline void ensure_pdb_subscription() {}
+#endif
 
 }
 
@@ -410,7 +449,7 @@ inline std::string substitute_branch_operand(
 	}
 	char hex_buf[32];
 	std::snprintf(hex_buf, sizeof(hex_buf), "0x%llX", static_cast<unsigned long long>(target));
-	size_t pos = ops.find(hex_buf);
+	std::size_t pos = ops.find(hex_buf);
 	if (pos == std::string::npos) {
 		std::snprintf(hex_buf, sizeof(hex_buf), "0x%llx", static_cast<unsigned long long>(target));
 		pos = ops.find(hex_buf);
@@ -459,24 +498,25 @@ inline void center_on_address(uint64_t addr)
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	if (!g_state.built)
 		return;
-	for (int i = 0; i < static_cast<int>(g_state.blocks.size()); ++i) {
+	for (std::size_t i = 0; i < g_state.blocks.size(); ++i) {
 		auto& b = g_state.blocks[i];
 		if (addr >= b.start_addr && addr < b.end_addr) {
-			int node_idx = -1;
-			for (int ni = 0; ni < static_cast<int>(g_state.graph.nodes.size()); ++ni) {
-				if (g_state.graph.nodes[ni].id == i) { node_idx = ni; break; }
+			std::size_t node_idx = g_state.graph.nodes.size();
+			for (std::size_t ni = 0; ni < g_state.graph.nodes.size(); ++ni) {
+				if (g_state.graph.nodes[ni].id == static_cast<int>(i)) { node_idx = ni; break; }
 			}
-			if (node_idx >= 0) {
+			if (node_idx < g_state.graph.nodes.size()) {
 				auto& n = g_state.graph.nodes[node_idx];
 				g_state.target_pan_x = -n.x;
 				g_state.target_pan_y = -(n.y + n.height * 0.5f);
-				g_state.selected_block = i;
+				g_state.selected_block = static_cast<int>(i);
 			}
 			return;
 		}
 	}
 }
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
                       uint64_t entry_address)
 {
@@ -517,8 +557,8 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 		} build_guard;
 
 		auto t_start = std::chrono::steady_clock::now();
-		const size_t max_bytes = 0x10000;
-		const size_t max_insns = 4096;
+		const std::size_t max_bytes = 0x10000;
+		const std::size_t max_insns = 4096;
 
 		std::vector<uint8_t> mem;
 		bool have_data = false;
@@ -555,13 +595,12 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 		all_insns.reserve(max_insns);
 
 		const uint8_t* data = mem.data();
-		int sz = static_cast<int>(mem.size());
-		int pos = 0;
+		const std::size_t sz = mem.size();
+		std::size_t pos = 0;
 
 		while (pos < sz && all_insns.size() < max_insns) {
-			int avail = sz - pos;
-			if (avail > 15) avail = 15;
-			uint64_t va = entry_address + pos;
+			int avail = static_cast<int>((std::min)(std::size_t{15}, sz - pos));
+			uint64_t va = entry_address + static_cast<uint64_t>(pos);
 			AsmInstr ins = {};
 			const bool is_64bit = !workspace_context.image ||
 				workspace_context.image->architecture() == aida::analysis::architecture_id_t::x86_64;
@@ -590,7 +629,7 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 			if (ins.is_ret)
 				break;
 
-			pos += ins.len;
+			pos += static_cast<std::size_t>(ins.len);
 		}
 
 		if (all_insns.empty()) {
@@ -625,7 +664,7 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 			if (leaders.count(d.ins.addr)) {
 				cur_block = detail::find_or_create_block(addr_to_block, blocks, d.ins.addr);
 				if (d.ins.addr == entry_address)
-					blocks[cur_block].is_entry = true;
+					blocks[static_cast<std::size_t>(cur_block)].is_entry = true;
 			}
 			if (cur_block < 0)
 				cur_block = detail::find_or_create_block(addr_to_block, blocks, d.ins.addr);
@@ -641,8 +680,8 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 			line.text.assign(d.ins.mnem);
 			line.text.push_back(' ');
 			line.text.append(ops_text);
-			blocks[cur_block].instructions.push_back(std::move(line));
-			blocks[cur_block].end_addr = d.ins.addr + d.ins.len;
+			blocks[static_cast<std::size_t>(cur_block)].instructions.push_back(std::move(line));
+			blocks[static_cast<std::size_t>(cur_block)].end_addr = d.ins.addr + d.ins.len;
 
 			if (d.ins.is_ret)
 				continue;
@@ -652,10 +691,10 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 				if (target_in_range) {
 					auto it_target = addr_to_block.find(d.branch_target);
 					if (it_target != addr_to_block.end())
-						blocks[cur_block].successors.push_back(it_target->second);
+						blocks[static_cast<std::size_t>(cur_block)].successors.push_back(it_target->second);
 					else {
 						int tidx = detail::find_or_create_block(addr_to_block, blocks, d.branch_target);
-						blocks[cur_block].successors.push_back(tidx);
+						blocks[static_cast<std::size_t>(cur_block)].successors.push_back(tidx);
 					}
 				}
 
@@ -664,10 +703,10 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 					uint64_t fall = d.ins.addr + d.ins.len;
 					auto it_fall = addr_to_block.find(fall);
 					if (it_fall != addr_to_block.end())
-						blocks[cur_block].successors.push_back(it_fall->second);
+						blocks[static_cast<std::size_t>(cur_block)].successors.push_back(it_fall->second);
 					else {
 						int fidx = detail::find_or_create_block(addr_to_block, blocks, fall);
-						blocks[cur_block].successors.push_back(fidx);
+						blocks[static_cast<std::size_t>(cur_block)].successors.push_back(fidx);
 					}
 				}
 
@@ -704,7 +743,8 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 		const float max_node_w = 1200.f;
 
 		std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
-		for (int bi = 0; bi < static_cast<int>(blocks.size()); ++bi) {
+		for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+			const int block_id = static_cast<int>(bi);
 			if (!blocks[bi].is_entry) continue;
 			std::vector<function_index::injection_row_t> rows;
 			if (workspace_context) {
@@ -719,19 +759,20 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 				char log_buf[160];
 				std::snprintf(log_buf, sizeof(log_buf),
 					"[cfg] entry block=%d addr=0x%llX inj_rows=%zu",
-					bi,
+					block_id,
 					static_cast<unsigned long long>(blocks[bi].start_addr),
 					rows.size());
 				anti_tamper::webhook::write_log("cfg_view", log_buf);
-				entry_injections.emplace(bi, std::move(rows));
+				entry_injections.emplace(block_id, std::move(rows));
 			}
 		}
 
 		cfg_layout::graph_t graph;
 		graph.nodes.reserve(blocks.size());
-		for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
+		for (std::size_t i = 0; i < blocks.size(); ++i) {
+			const int block_id = static_cast<int>(i);
 			cfg_layout::node_t n;
-			n.id = i;
+			n.id = block_id;
 			n.is_entry = blocks[i].is_entry;
 
 			float addr_w = 0.f;
@@ -748,8 +789,8 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 				}
 			}
 
-			size_t inj_lines = 0;
-			auto it_inj = entry_injections.find(i);
+			std::size_t inj_lines = 0;
+			auto it_inj = entry_injections.find(block_id);
 			if (it_inj != entry_injections.end()) {
 				inj_lines = it_inj->second.size();
 				for (const auto& r : it_inj->second) {
@@ -770,7 +811,7 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 					fname = detail::resolve_branch_symbol_for_cfg(
 						workspace_context, blocks[i].start_addr);
 				if (!fname.empty()) {
-					size_t avail = sizeof(header_buf) - 12;
+					std::size_t avail = sizeof(header_buf) - 12;
 					std::string fn_short = fname.size() > avail
 						? fname.substr(0, avail - 2) + ".." : fname;
 					std::snprintf(header_buf, sizeof(header_buf), "%s  %s",
@@ -794,18 +835,19 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 			if (w > max_node_w) w = max_node_w;
 			n.width = w;
 
-			size_t total_lines = blocks[i].instructions.size() + inj_lines;
+			std::size_t total_lines = blocks[i].instructions.size() + inj_lines;
 			n.height = header_h + padding * 2.f + static_cast<float>(total_lines) * line_h;
 			float min_h = header_h + line_h + padding * 2.f;
 			if (n.height < min_h) n.height = min_h;
 			graph.nodes.push_back(n);
 		}
 
-		for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
+		for (std::size_t i = 0; i < blocks.size(); ++i) {
+			const int block_id = static_cast<int>(i);
 			auto& succs = blocks[i].successors;
-			for (int j = 0; j < static_cast<int>(succs.size()); ++j) {
+			for (std::size_t j = 0; j < succs.size(); ++j) {
 				cfg_layout::edge_t e;
-				e.from = i;
+				e.from = block_id;
 				e.to = succs[j];
 				e.is_true_branch = (j == 0 && succs.size() > 1);
 				graph.edges.push_back(e);
@@ -882,6 +924,46 @@ inline void build_cfg(uint64_t entry_address)
 {
 	build_cfg(disasm_view::capture_selected_workspace(), entry_address);
 }
+#else
+inline void build_cfg(const disasm_view::workspace_context_t&, uint64_t entry_address)
+{
+	std::lock_guard<std::mutex> lock(g_state.mutex);
+	g_state.entry_addr = entry_address ? entry_address : 0x00007FF7A4C16A10;
+	g_state.current_rip = debugger_engine::cached_registers().rip;
+	g_state.blocks = {
+		{g_state.entry_addr, g_state.entry_addr + 0x0D, {{g_state.entry_addr, "mov rax, qword ptr [rbx+18h]"}, {g_state.entry_addr + 4, "test rax, rax"}, {g_state.entry_addr + 7, "je loc_7FF7A4C16A32"}}, {1, 2}, true, false},
+		{g_state.entry_addr + 0x10, g_state.entry_addr + 0x1D, {{g_state.entry_addr + 0x10, "call decrypt_stage"}, {g_state.entry_addr + 0x15, "test al, al"}, {g_state.entry_addr + 0x17, "jne loc_7FF7A4C16A48"}}, {3, 2}, false, false},
+		{g_state.entry_addr + 0x22, g_state.entry_addr + 0x28, {{g_state.entry_addr + 0x22, "xor eax, eax"}, {g_state.entry_addr + 0x24, "jmp loc_7FF7A4C16A52"}}, {4}, false, true},
+		{g_state.entry_addr + 0x38, g_state.entry_addr + 0x42, {{g_state.entry_addr + 0x38, "mov eax, 1"}, {g_state.entry_addr + 0x3D, "mov [rdi+40h], al"}}, {4}, false, false},
+		{g_state.entry_addr + 0x48, g_state.entry_addr + 0x4D, {{g_state.entry_addr + 0x48, "add rsp, 30h"}, {g_state.entry_addr + 0x4C, "ret"}}, {}, false, false}
+	};
+	g_state.graph = {};
+	for (std::size_t i = 0; i < g_state.blocks.size(); ++i) {
+		const int block_id = static_cast<int>(i);
+		cfg_layout::node_t node;
+		node.id = block_id;
+		node.width = 286.f;
+		node.height = 72.f + static_cast<float>(g_state.blocks[i].instructions.size()) * 20.f;
+		node.addr_col_w = 116.f;
+		node.is_entry = i == 0;
+		g_state.graph.nodes.push_back(node);
+		for (int successor : g_state.blocks[i].successors)
+			g_state.graph.edges.push_back({block_id, successor, i == 0 && successor == 1});
+	}
+	cfg_layout::layout(g_state.graph, 92.f, 76.f);
+	g_state.entry_injections.clear();
+	g_state.entry_injections[0] = {{function_index::injection_t::function_banner, "; validate_license", g_state.entry_addr}, {function_index::injection_t::prototype_line, "bool __fastcall validate_license(session_t* session)", g_state.entry_addr}};
+	g_state.built = true;
+	g_state.fit_request = true;
+	g_state.rebuild_anim = 0.f;
+	aida::preview::debugger::record("build_cfg", std::to_string(g_state.entry_addr));
+}
+
+inline void build_cfg(uint64_t entry_address)
+{
+	build_cfg(disasm_view::capture_selected_workspace(), entry_address);
+}
+#endif
 
 inline bool handle_view_keys(float view_width, float view_height)
 {
@@ -942,6 +1024,10 @@ inline bool handle_view_keys(float view_width, float view_height)
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b)
 {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (!g_state.built)
+		build_cfg(debugger_engine::cached_registers().rip);
+#endif
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 clip_min(pos_x, pos_y);
 	ImVec2 clip_max(pos_x + width, pos_y + height);
@@ -1090,12 +1176,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	for (auto& e : edges) {
-		int from_idx = -1, to_idx = -1;
-		for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
+		std::size_t from_idx = nodes.size();
+		std::size_t to_idx = nodes.size();
+		for (std::size_t i = 0; i < nodes.size(); ++i) {
 			if (nodes[i].id == e.from) from_idx = i;
 			if (nodes[i].id == e.to) to_idx = i;
 		}
-		if (from_idx < 0 || to_idx < 0) continue;
+		if (from_idx == nodes.size() || to_idx == nodes.size()) continue;
 
 		auto& fn = nodes[from_idx];
 		auto& tn = nodes[to_idx];
@@ -1110,7 +1197,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 p2(p1.x, mid_y);
 		ImVec2 p3(p4.x, mid_y);
 
-		bool two_succ = (e.from < static_cast<int>(blocks.size()) && blocks[e.from].successors.size() > 1);
+		bool two_succ = e.from >= 0 && static_cast<std::size_t>(e.from) < blocks.size()
+			&& blocks[static_cast<std::size_t>(e.from)].successors.size() > 1;
 		ImU32 edge_col;
 		if (two_succ) {
 			edge_col = e.is_true_branch
@@ -1160,14 +1248,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (card_font_scale > 3.00f) card_font_scale = 3.00f;
 	ImFont* header_font = aida::ui::fonts::body_em();
 	if (!header_font) header_font = ImGui::GetFont();
-	float header_base = header_font && header_font->FontSize > 0.f
-		? header_font->FontSize : 13.f;
+	float header_base = aida::ui::fonts::size_or(header_font, 13.f);
 	const float header_strip_h = (header_base + 8.f) * card_font_scale;
 
 	{
 		ImFont* log_font = aida::ui::fonts::code();
 		if (!log_font) log_font = ImGui::GetFont();
-		float log_base = log_font->FontSize > 0.f ? log_font->FontSize : ImGui::GetFontSize();
+		float log_base = aida::ui::fonts::size_or(log_font, ImGui::GetFontSize());
 		if (log_base <= 0.f) log_base = 13.f;
 		float log_raw = log_base * z;
 		float log_final = log_raw < 6.f ? 6.f : log_raw;
@@ -1184,12 +1271,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	for (int ni = 0; ni < static_cast<int>(nodes.size()); ++ni) {
+	for (std::size_t ni = 0; ni < nodes.size(); ++ni) {
 		auto& n = nodes[ni];
-		if (n.id < 0 || n.id >= static_cast<int>(blocks.size()))
+		if (n.id < 0 || static_cast<std::size_t>(n.id) >= blocks.size())
 			continue;
 
-		auto& blk = blocks[n.id];
+		auto& blk = blocks[static_cast<std::size_t>(n.id)];
 		auto& mm = g_state.block_motion[n.id];
 
 		float nw = n.width * z;
@@ -1226,7 +1313,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (fname.empty() && g_state.entry_addr != blk.start_addr)
 				fname = detail::resolve_branch_symbol_for_cfg(blk.start_addr);
 			if (!fname.empty()) {
-				size_t avail = sizeof(header_buf) - 12;
+				std::size_t avail = sizeof(header_buf) - 12;
 				std::string fn_short = fname.size() > avail
 					? fname.substr(0, avail - 2) + ".." : fname;
 				snprintf(header_buf, sizeof(header_buf), "%s  %s",
@@ -1280,8 +1367,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			ImFont* node_font = aida::ui::fonts::code();
 			if (!node_font) node_font = ImGui::GetFont();
-			float base_font_size = node_font->FontSize > 0.f
-				? node_font->FontSize : ImGui::GetFontSize();
+			float base_font_size = aida::ui::fonts::size_or(node_font, ImGui::GetFontSize());
 			if (base_font_size <= 0.f) base_font_size = 13.f;
 
 			float raw_size = base_font_size * z;
@@ -1312,10 +1398,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (it_inj != g_state.entry_injections.end() && !it_inj->second.empty())
 					injs = &it_inj->second;
 			}
-			int inj_count = injs ? static_cast<int>(injs->size()) : 0;
+			std::size_t inj_count = injs ? injs->size() : 0;
 
 			float inj_y = body_top_y;
-			for (int ii = 0; ii < inj_count; ++ii) {
+			for (std::size_t ii = 0; ii < inj_count; ++ii) {
 				if (inj_y + scaled_line_h > br.y - 2.f) break;
 				const auto& r = (*injs)[ii];
 				float inj_text_y = inj_y + row_text_dy;
@@ -1329,7 +1415,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							if (sk != symbol_classifier::kind_t::unknown)
 								name_base = disasm_theme::color_for_kind(static_cast<int>(sk));
 							const std::string& t = r.text;
-							size_t name_end = 0;
+							std::size_t name_end = 0;
 							while (name_end < t.size()
 								&& t[name_end] != ' ' && t[name_end] != '\t') ++name_end;
 							std::string name_part = t.substr(0, name_end);
@@ -1361,7 +1447,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			float instr_top_y = body_top_y + static_cast<float>(inj_count) * scaled_line_h;
 
-			for (int li = 0; li < static_cast<int>(blk.instructions.size()); ++li) {
+			for (std::size_t li = 0; li < blk.instructions.size(); ++li) {
+				const int line_index = static_cast<int>(li);
 				auto& line = blk.instructions[li];
 				float line_y = instr_top_y + scaled_line_h * static_cast<float>(li);
 				float line_bottom = line_y + scaled_line_h;
@@ -1375,10 +1462,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (block_hov && io.MousePos.x >= line_a.x && io.MousePos.x <= line_b.x
 					&& io.MousePos.y >= line_a.y && io.MousePos.y <= line_b.y)
 				{
-					hovered_line_idx = li;
+					hovered_line_idx = line_index;
 				}
 
-				bool line_selected = (sel_lo >= 0 && li >= sel_lo && li <= sel_hi);
+				bool line_selected = sel_lo >= 0 && line_index >= sel_lo && line_index <= sel_hi;
 
 				char addr_buf[24];
 				snprintf(addr_buf, sizeof(addr_buf), "%llX", static_cast<unsigned long long>(line.addr));
@@ -1419,10 +1506,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				g_state.selected_block = n.id;
 				g_state.last_cursor_addr = blk.start_addr;
 				if (in_body && hovered_line_idx >= 0) {
-					if (hovered_line_idx >= 0
-						&& hovered_line_idx < static_cast<int>(blk.instructions.size()))
+					if (static_cast<std::size_t>(hovered_line_idx) < blk.instructions.size())
 					{
-						g_state.last_cursor_addr = blk.instructions[hovered_line_idx].addr;
+						g_state.last_cursor_addr = blk.instructions[static_cast<std::size_t>(hovered_line_idx)].addr;
 					}
 					g_state.text_sel_block = n.id;
 					if (io.KeyShift && g_state.text_sel_block == n.id
@@ -1459,9 +1545,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 				uint64_t go_addr = blk.start_addr;
 				if (in_body && hovered_line_idx >= 0
-					&& hovered_line_idx < static_cast<int>(blk.instructions.size()))
+					&& static_cast<std::size_t>(hovered_line_idx) < blk.instructions.size())
 				{
-					go_addr = blk.instructions[hovered_line_idx].addr;
+					go_addr = blk.instructions[static_cast<std::size_t>(hovered_line_idx)].addr;
 				}
 				g_state.last_cursor_addr = go_addr;
 				globals::ui::active_center_view = center_view_t::disassembly;
@@ -1500,21 +1586,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			|| g_state.text_sel_line_anchor < 0
 			|| g_state.text_sel_line_extent < 0)
 			return std::string();
-		if (g_state.text_sel_block >= static_cast<int>(g_state.blocks.size()))
+		if (static_cast<std::size_t>(g_state.text_sel_block) >= g_state.blocks.size())
 			return std::string();
-		const auto& sblk = g_state.blocks[g_state.text_sel_block];
+		const auto& sblk = g_state.blocks[static_cast<std::size_t>(g_state.text_sel_block)];
 		int lo = g_state.text_sel_line_anchor < g_state.text_sel_line_extent
 			? g_state.text_sel_line_anchor : g_state.text_sel_line_extent;
 		int hi = g_state.text_sel_line_anchor > g_state.text_sel_line_extent
 			? g_state.text_sel_line_anchor : g_state.text_sel_line_extent;
 		if (lo < 0) lo = 0;
-		if (hi >= static_cast<int>(sblk.instructions.size()))
+		if (static_cast<std::size_t>(hi) >= sblk.instructions.size())
 			hi = static_cast<int>(sblk.instructions.size()) - 1;
 		std::string out;
-		out.reserve(static_cast<size_t>(hi - lo + 1) * 64);
+		out.reserve(static_cast<std::size_t>(hi - lo + 1) * 64);
 		char buf[256];
 		for (int i = lo; i <= hi; ++i) {
-			const auto& ln = sblk.instructions[i];
+			const auto& ln = sblk.instructions[static_cast<std::size_t>(i)];
 			if (include_address) {
 				snprintf(buf, sizeof(buf), ".text:%016llX  %s\n",
 					static_cast<unsigned long long>(ln.addr), ln.text.c_str());
@@ -1537,9 +1623,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		&& io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
 	{
 		if (g_state.selected_block >= 0
-			&& g_state.selected_block < static_cast<int>(g_state.blocks.size()))
+			&& static_cast<std::size_t>(g_state.selected_block) < g_state.blocks.size())
 		{
-			const auto& sblk = g_state.blocks[g_state.selected_block];
+			const auto& sblk = g_state.blocks[static_cast<std::size_t>(g_state.selected_block)];
 			g_state.text_sel_block = g_state.selected_block;
 			g_state.text_sel_line_anchor = 0;
 			g_state.text_sel_line_extent = static_cast<int>(sblk.instructions.size()) - 1;
@@ -1550,14 +1636,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool has_sel = (g_state.text_sel_block >= 0
 			&& g_state.text_sel_line_anchor >= 0
 			&& g_state.text_sel_line_extent >= 0
-			&& g_state.text_sel_block < static_cast<int>(g_state.blocks.size()));
+			&& static_cast<std::size_t>(g_state.text_sel_block) < g_state.blocks.size());
 		uint64_t ctx_addr = 0;
 		if (g_state.text_ctx_block >= 0
-			&& g_state.text_ctx_block < static_cast<int>(g_state.blocks.size())
+			&& static_cast<std::size_t>(g_state.text_ctx_block) < g_state.blocks.size()
 			&& g_state.text_ctx_line >= 0
-			&& g_state.text_ctx_line < static_cast<int>(g_state.blocks[g_state.text_ctx_block].instructions.size()))
+			&& static_cast<std::size_t>(g_state.text_ctx_line) <
+				g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)].instructions.size())
 		{
-			ctx_addr = g_state.blocks[g_state.text_ctx_block].instructions[g_state.text_ctx_line].addr;
+			ctx_addr = g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)]
+				.instructions[static_cast<std::size_t>(g_state.text_ctx_line)].addr;
 		}
 		if (ImGui::MenuItem("Copy text", "Ctrl+C", false, has_sel)) {
 			std::string txt = build_sel_text(false);
@@ -1582,9 +1670,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::Separator();
 		if (ImGui::MenuItem("Select all in block", "Ctrl+A", false,
 			g_state.text_ctx_block >= 0
-			&& g_state.text_ctx_block < static_cast<int>(g_state.blocks.size())))
+			&& static_cast<std::size_t>(g_state.text_ctx_block) < g_state.blocks.size()))
 		{
-			const auto& sblk = g_state.blocks[g_state.text_ctx_block];
+			const auto& sblk = g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)];
 			g_state.text_sel_block = g_state.text_ctx_block;
 			g_state.text_sel_line_anchor = 0;
 			g_state.text_sel_line_extent = static_cast<int>(sblk.instructions.size()) - 1;
@@ -1717,18 +1805,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		if (home_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			if (g_state.entry_addr != 0) {
-				for (int i = 0; i < static_cast<int>(g_state.blocks.size()); ++i) {
+				for (std::size_t i = 0; i < g_state.blocks.size(); ++i) {
 					auto& b = g_state.blocks[i];
 					if (g_state.entry_addr >= b.start_addr && g_state.entry_addr < b.end_addr) {
-						int node_idx = -1;
-						for (int ni = 0; ni < static_cast<int>(g_state.graph.nodes.size()); ++ni) {
-							if (g_state.graph.nodes[ni].id == i) { node_idx = ni; break; }
+						std::size_t node_idx = g_state.graph.nodes.size();
+						for (std::size_t ni = 0; ni < g_state.graph.nodes.size(); ++ni) {
+							if (g_state.graph.nodes[ni].id == static_cast<int>(i)) { node_idx = ni; break; }
 						}
-						if (node_idx >= 0) {
+						if (node_idx < g_state.graph.nodes.size()) {
 							auto& nd = g_state.graph.nodes[node_idx];
 							g_state.target_pan_x = -nd.x;
 							g_state.target_pan_y = -(nd.y + nd.height * 0.5f);
-							g_state.selected_block = i;
+							g_state.selected_block = static_cast<int>(i);
 						}
 						break;
 					}
@@ -1782,10 +1870,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			              oy + (wy - wmin_y) * scale);
 		};
 
-		for (int ni = 0; ni < static_cast<int>(g_state.graph.nodes.size()); ++ni) {
+		for (std::size_t ni = 0; ni < g_state.graph.nodes.size(); ++ni) {
 			auto& n = g_state.graph.nodes[ni];
-			if (n.id < 0 || n.id >= static_cast<int>(g_state.blocks.size())) continue;
-			auto& blk = g_state.blocks[n.id];
+			if (n.id < 0 || static_cast<std::size_t>(n.id) >= g_state.blocks.size()) continue;
+			auto& blk = g_state.blocks[static_cast<std::size_t>(n.id)];
 
 			ImVec2 t1 = wts(n.x - n.width * 0.5f, n.y);
 			ImVec2 t2 = wts(n.x + n.width * 0.5f, n.y + n.height);
@@ -1917,7 +2005,7 @@ inline const aida::analysis::function_record_t* workspace_graph_function(
 	return &functions.front();
 }
 
-inline void render(float pos_x, float pos_y, float width, float height,
+inline void render(float, float, float width, float height,
 	float alpha, float, float, float,
 	const disasm_view::workspace_context_t& context)
 {

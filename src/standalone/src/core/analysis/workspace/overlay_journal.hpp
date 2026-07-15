@@ -136,6 +136,10 @@ public:
         std::shared_ptr<analysis_workspace_t> workspace,
         std::shared_ptr<workspace_database_t> database,
         overlay_limits_t limits = {});
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    static workspace_result_t<std::shared_ptr<overlay_journal_t>> open_preview(
+        std::shared_ptr<analysis_workspace_t> workspace);
+#endif
 
     ~overlay_journal_t() override;
     overlay_journal_t(const overlay_journal_t&) = delete;

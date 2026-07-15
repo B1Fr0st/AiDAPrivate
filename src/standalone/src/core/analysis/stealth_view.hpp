@@ -13,7 +13,9 @@
 #include "ui/hub_strip.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -21,13 +23,15 @@
 #include <string>
 #include <vector>
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/re_hubs_preview_adapter.hpp"
+#endif
+
 namespace stealth_view {
 
 struct local_state_t {
 	float scroll_y = 0.f;
 	float target_scroll_y = 0.f;
-	bool  scrollbar_dragging = false;
-	float scrollbar_drag_offset = 0.f;
 	int   selected_finding = -1;
 	int   category_filter = -1;
 	int   severity_filter = -1;
@@ -77,6 +81,10 @@ inline void set_sub_tab(int idx)
 	if (idx < 0 || idx >= sub_tab_count())
 		return;
 	aida::ui::hub_strip::notify_select(s_state.strip, idx);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::re_hubs::select(aida::preview::re_hubs::domain_t::protection,
+		idx, s_subtabs[idx].label);
+#endif
 }
 
 inline int active_sub_tab()
@@ -136,6 +144,10 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 		stealth_engine::g_scan.findings.clear();
 		stealth_engine::g_scan.scan_status.clear();
 		st.selected_finding = -1;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::protection, 0,
+			"protection.clear", std::to_string(cleared) + " findings cleared");
+#endif
 		diag::log_tagged_fmt("stealth", "view_findings_cleared count=%zu", cleared);
 	}
 	ImGui::SameLine();
@@ -355,14 +367,14 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 	}
 
 	if (!scanning && !filtered.empty()) {
-		int crit = 0, hi = 0, med = 0, lo = 0, inf = 0;
+		int crit = 0, hi = 0, med = 0, lo = 0;
 		for (auto& f : filtered) {
 			switch (f.severity) {
 				case stealth_engine::finding_severity_t::critical: ++crit; break;
 				case stealth_engine::finding_severity_t::high:     ++hi; break;
 				case stealth_engine::finding_severity_t::medium:   ++med; break;
 				case stealth_engine::finding_severity_t::low:      ++lo; break;
-				case stealth_engine::finding_severity_t::info:     ++inf; break;
+				case stealth_engine::finding_severity_t::info:     break;
 			}
 		}
 
@@ -435,7 +447,11 @@ inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,
 		aida::ui::with_alpha(th.border_subtle, alpha));
 
 	bool stealth_active = stealth_engine::is_active();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const uint32_t attached_pid = 4242;
+#else
 	const uint32_t attached_pid = driver_bridge::attached_pid();
+#endif
 	const std::string status_str = stealth_engine::get_status();
 
 	ImFont* status_font = aida::ui::fonts::body_em();
@@ -637,6 +653,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	int prev_idx = st.strip.prev;
 	int new_idx  = st.strip.active;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (new_idx >= 0 && new_idx < subtab_count)
+		aida::preview::re_hubs::rendered(aida::preview::re_hubs::domain_t::protection,
+			new_idx, s_subtabs[new_idx].label);
+#endif
 
 	auto render_tab = [&](int idx) {
 		if (idx == 0) render_protection_scan(pos_x, content_pos_y, w, content_h, alpha, dl, wp);

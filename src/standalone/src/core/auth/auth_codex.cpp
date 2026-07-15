@@ -1,3 +1,181 @@
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+
+#include "auth_codex.hpp"
+#include "auth_store.hpp"
+#include "auth_browser_launch.hpp"
+
+#include <ctime>
+#include <mutex>
+#include <string>
+#include <utility>
+
+namespace aida {
+namespace auth {
+namespace codex {
+
+namespace {
+
+	std::mutex& preview_error_mutex()
+	{
+		static std::mutex value;
+		return value;
+	}
+
+	std::string& preview_error()
+	{
+		static std::string value;
+		return value;
+	}
+
+	void set_preview_error(std::string value)
+	{
+		std::lock_guard<std::mutex> lock(preview_error_mutex());
+		preview_error() = std::move(value);
+	}
+
+}
+
+bool start_login(codex_login_state_t& state, std::uint64_t absolute_deadline_ms)
+{
+	if (state.cancelled.load(std::memory_order_acquire)) {
+		set_preview_error("login cancelled before start");
+		return false;
+	}
+	if (absolute_deadline_ms != 0 && aida::infra::executor::now_ms() >= absolute_deadline_ms) {
+		set_preview_error("login startup timed out");
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		state.verifier = "aida-studio-codex-verifier";
+		state.challenge = "aida-studio-codex-challenge";
+		state.state = "aida-studio-codex-state";
+		state.port = CODEX_OAUTH_PORT;
+		state.started_unix = static_cast<std::int64_t>(std::time(nullptr));
+		state.auth_url = std::string(CODEX_ISSUER)
+			+ "/oauth/authorize?client_id=" + CODEX_CLIENT_ID
+			+ "&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"
+			+ "&code_challenge=" + state.challenge + "&state=" + state.state;
+		state.received_code = "aida-studio-codex-code";
+		state.received_state = state.state;
+		state.error.clear();
+		state.listener_handle = std::shared_ptr<void>(&state, [](void*) {});
+	}
+	state.done.store(true, std::memory_order_release);
+	set_preview_error({});
+	return true;
+}
+
+bool poll_login(codex_login_state_t& state)
+{
+	if (state.cancelled.load(std::memory_order_acquire)) {
+		set_preview_error("login cancelled");
+		return false;
+	}
+	const codex_login_snapshot_t current = snapshot(state);
+	if (!current.done || current.received_code.empty()
+		|| current.received_state != current.state) {
+		set_preview_error("waiting for browser callback");
+		return false;
+	}
+	auth_info_t info;
+	info.kind = auth_kind_t::oauth;
+	info.access = "aida-studio-openai-access";
+	info.refresh = "aida-studio-openai-refresh";
+	info.account_id = "studio-openai";
+	info.email = "reverse.engineer@preview.aida";
+	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+	info.metadata["preview_receipt"] = "oauth:openai:accepted";
+	if (!store::set("openai", info)) {
+		set_preview_error(store::last_error());
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		state.listener_handle.reset();
+		state.error.clear();
+	}
+	set_preview_error({});
+	return true;
+}
+
+bool cancel_login(codex_login_state_t& state)
+{
+	state.cancelled.store(true, std::memory_order_release);
+	state.done.store(true, std::memory_order_release);
+	std::lock_guard<std::mutex> lock(state.mutex);
+	state.listener_handle.reset();
+	return true;
+}
+
+bool refresh_token()
+{
+	auth_info_t info;
+	if (!store::get("openai", info) || info.kind != auth_kind_t::oauth) {
+		set_preview_error("no openai oauth credentials");
+		return false;
+	}
+	info.access = "aida-studio-openai-access-refreshed";
+	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+	info.metadata["preview_receipt"] = "oauth:openai:refreshed";
+	const bool result = store::set("openai", info);
+	set_preview_error(result ? std::string{} : store::last_error());
+	return result;
+}
+
+bool revoke_tokens(const std::string& access_token,
+	const std::string& refresh_token_value,
+	const std::string&)
+{
+	if (access_token.empty() && refresh_token_value.empty()) {
+		set_preview_error("revoke_tokens: no tokens provided");
+		return false;
+	}
+	set_preview_error({});
+	return true;
+}
+
+bool revoke_token()
+{
+	auth_info_t info;
+	if (!store::get("openai", info) || info.kind != auth_kind_t::oauth) {
+		set_preview_error("no openai oauth credentials");
+		return false;
+	}
+	return revoke_tokens(info.access, info.refresh, info.custom_client_id);
+}
+
+codex_login_snapshot_t snapshot(const codex_login_state_t& state)
+{
+	codex_login_snapshot_t value;
+	std::lock_guard<std::mutex> lock(state.mutex);
+	value.verifier = state.verifier;
+	value.challenge = state.challenge;
+	value.state = state.state;
+	value.auth_url = state.auth_url;
+	value.port = state.port;
+	value.done = state.done.load(std::memory_order_acquire);
+	value.cancelled = state.cancelled.load(std::memory_order_acquire);
+	value.received_code = state.received_code;
+	value.received_state = state.received_state;
+	value.error = state.error;
+	value.listener_active = static_cast<bool>(state.listener_handle);
+	value.started_unix = state.started_unix;
+	return value;
+}
+
+std::string last_error()
+{
+	std::lock_guard<std::mutex> lock(preview_error_mutex());
+	return preview_error();
+}
+
+}
+}
+}
+
+#else
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "auth_codex.hpp"
@@ -1043,3 +1221,5 @@ namespace codex {
 }
 }
 }
+
+#endif
