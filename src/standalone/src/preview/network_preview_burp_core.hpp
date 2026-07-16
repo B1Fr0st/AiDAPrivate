@@ -83,6 +83,11 @@ inline std::vector<log_row_t>& rows() {
     return value;
 }
 
+inline uint64_t& row_generation() {
+    static uint64_t value = 1;
+    return value;
+}
+
 inline bool match_regex(const std::string& value, const std::string& pattern) {
     if (pattern.empty()) return true;
     try { return std::regex_search(value, std::regex(pattern, std::regex::icase)); }
@@ -107,8 +112,9 @@ inline std::vector<log_row_t> query(const log_filter_t& filter, size_t limit) {
 }
 
 inline size_t total_rows() { return rows().size(); }
+inline uint64_t generation() { return row_generation(); }
 inline size_t capacity() { return 10000; }
-inline void clear() { rows().clear(); aida::preview::network::record_receipt("Burp logger", "cleared"); }
+inline void clear() { rows().clear(); ++row_generation(); aida::preview::network::record_receipt("Burp logger", "cleared"); }
 
 inline bool export_csv(const std::string& path, const log_filter_t& filter) {
     const auto exported = query(filter, capacity());

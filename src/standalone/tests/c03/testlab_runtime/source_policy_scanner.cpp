@@ -213,6 +213,7 @@ std::size_t occurrence_count(const std::string_view bytes,
 void require_contains(const std::string_view bytes, const std::string_view token,
 	const std::string_view label)
 {
+	require(!token.empty(), std::string(label) + " required token is nonempty");
 	require(bytes.find(token) != std::string_view::npos,
 		std::string(label) + " contains required token: " + std::string(token));
 }
@@ -965,15 +966,18 @@ void verify_surface_authority(const std::filesystem::path& root,
 		"every exact replacement has source hash evidence");
 }
 
-void verify_manifest_registration(const std::string_view cmake_manifest)
+void verify_manifest_registration(const std::string_view cmake_manifest,
+                                  const std::string_view path_policy,
+                                  const std::string_view path_identity,
+                                  const std::string_view package_integration)
 {
 	require_exact_count(cmake_manifest,
 		"aida_c03_register_manifest_entry(", 57,
 		"safe-headless manifest entry inventory");
 	require_exact_count(cmake_manifest,
-		"aida_c03_register_direct_test(", 13,
+		"aida_c03_register_direct_test(", 15,
 		"safe-headless direct-test inventory");
-	require_exact_count(cmake_manifest, "add_test(NAME", 3,
+	require_exact_count(cmake_manifest, "add_test(NAME", 4,
 		"safe-headless explicit CTest declarations");
 	require_exact_count(cmake_manifest,
 		"add_test(NAME aida_c03_authority_surface_reproduction", 1,
@@ -985,7 +989,7 @@ void verify_manifest_registration(const std::string_view cmake_manifest)
 		"retired split contract reproduction CTest");
 	const auto authority_test = slice_between(cmake_manifest,
 		"add_test(NAME aida_c03_authority_surface_reproduction",
-		"get_property(_aida_compiler_harness_inputs",
+		"add_test(NAME aida_c03_package_distribution_policy",
 		"combined authority reproduction CTest");
 	for (const auto token : std::array<std::string_view, 12>{
 		"COMMAND \"${_aida_python_executable}\"",
@@ -1004,56 +1008,56 @@ void verify_manifest_registration(const std::string_view cmake_manifest)
 			"combined authority reproduction exact command and properties");
 	require_absent(authority_test, "${Python3_EXECUTABLE}",
 		"combined authority reproduction validated interpreter command");
-	for (const auto token : std::array<std::string_view, 7>{
-		"set(_aida_lexical_candidate \"${input_path}\")",
-		"file(TO_CMAKE_PATH \"${_aida_lexical_candidate}\" _aida_candidate)",
-		"set(_aida_normalized_candidate \"${_aida_candidate}\")",
-		"cmake_path(NORMAL_PATH _aida_normalized_candidate)",
-		"string(TOLOWER \"${_aida_candidate}\" _aida_candidate_comparison)",
-		"string(TOLOWER \"${_aida_normalized_candidate}\" _aida_normalized_comparison)",
-		"if(NOT _aida_candidate_comparison STREQUAL _aida_normalized_comparison)"})
-		require_exact_count(cmake_manifest, token, 2,
-			"canonical path validators preserve and reject lexical normalization transitions");
-	require_exact_count(cmake_manifest,
-		"must use its canonical lexical path spelling", 2,
-		"canonical path validator rejection diagnostics");
 	require_exact_count(cmake_manifest,
 		"COMMAND \"${Python3_EXECUTABLE}\"", 0,
 		"raw unvalidated Python command absence");
-	const auto canonical_file_validator = slice_between(cmake_manifest,
-		"function(aida_c03_validate_canonical_regular_file",
-		"function(aida_c03_validate_canonical_directory",
-		"canonical regular-file validator");
-	const auto canonical_directory_validator = slice_between(cmake_manifest,
-		"function(aida_c03_validate_canonical_directory",
-		"function(aida_c03_register_safe_headless_targets",
-		"canonical directory validator");
-	for (const auto token : std::array<std::string_view, 10>{
-		"NOT IS_ABSOLUTE \"${input_path}\"", "NOT EXISTS \"${input_path}\"",
-		"IS_DIRECTORY \"${input_path}\"", "IS_SYMLINK \"${input_path}\"",
-		"cmake_path(NORMAL_PATH _aida_normalized_candidate)",
-		"if(NOT _aida_candidate_comparison STREQUAL _aida_normalized_comparison)",
-		"get_filename_component(_aida_real_path \"${_aida_normalized_candidate}\" REALPATH)",
-		"if(NOT _aida_normalized_comparison STREQUAL _aida_real_comparison)",
-		"file(SHA256 \"${_aida_real_candidate}\" _aida_sha256)",
-		"set(${output_path} \"${_aida_real_candidate}\" PARENT_SCOPE)"})
-		require_contains(canonical_file_validator, token,
-			"canonical regular-file adverse path and identity policy");
+	for (const auto token : std::array<std::string_view, 18>{
+		"function(_aida_c03_validate_raw_windows_path_shape",
+		"input_path MATCHES \"\\\\\\\\\"",
+		"NOT input_path MATCHES \"^[A-Z]:/\"",
+		"input_path MATCHES \"//\"",
+		"input_path MATCHES \"(^|/)\\\\.(/|$)\"",
+		"input_path MATCHES \"(^|/)[^/]*[. ](/|$)\"",
+		"input_path MATCHES \"[^ -~]\"",
+		"file(REAL_PATH \"${input_path}\" _aida_c03_real_path)",
+		"if(NOT input_path STREQUAL _aida_c03_real_path)",
+		"IS_SYMLINK \"${input_path}\"",
+		"file(SHA256 \"${input_path}\" _aida_c03_sha256)",
+		"function(aida_c03_validate_no_reparse_chain",
+		"COMMAND \"${powershell_executable}\"",
+		"-File \"${policy_script}\" -Path \"${input_path}\"",
+		"function(aida_c03_require_detached_roots",
+		"file(REAL_PATH \"$ENV{TEMP}\" _aida_c03_temp_root)",
+		"cmake_path(IS_PREFIX _aida_c03_temp_root",
+		"stage roots must remain outside TEMP"})
+		require_contains(path_policy, token,
+			"canonical CMake path identity, reparse, and detached-root policy");
+	for (const auto token : std::array<std::string_view, 12>{
+		"CreateFileW", "GetFileInformationByHandleEx", "GetFinalPathNameByHandleW",
+		"0x02200000", "AIDA_C03_PATH_IDENTITY_REPARSE",
+		"AIDA_C03_PATH_IDENTITY_CASE", "[StringComparison]::Ordinal",
+		"$Path.Length -gt 32767", "$Path.Contains('\\')", "$Path.Contains('//')",
+		"$segment.EndsWith('.', [StringComparison]::Ordinal)",
+		"$segment.EndsWith(' ', [StringComparison]::Ordinal)"})
+		require_contains(path_identity, token,
+			"handle-walk path identity policy");
 	for (const auto token : std::array<std::string_view, 8>{
-		"NOT IS_ABSOLUTE \"${input_path}\"", "NOT EXISTS \"${input_path}\"",
-		"NOT IS_DIRECTORY \"${input_path}\"", "IS_SYMLINK \"${input_path}\"",
-		"cmake_path(NORMAL_PATH _aida_normalized_candidate)",
-		"if(NOT _aida_candidate_comparison STREQUAL _aida_normalized_comparison)",
-		"get_filename_component(_aida_real_path \"${_aida_normalized_candidate}\" REALPATH)",
-		"if(NOT _aida_normalized_comparison STREQUAL _aida_real_comparison)"})
-		require_contains(canonical_directory_validator, token,
-			"canonical directory adverse path policy");
-	for (const auto retired : std::array<std::string_view, 3>{
-		"cmake_path(SET _aida_candidate NORMALIZE",
-		"cmake_path(NORMAL_PATH _aida_candidate)",
-		"get_filename_component(_aida_real_path \"${_aida_candidate}\" REALPATH)"})
-		require_absent(cmake_manifest, retired,
-			"normalize-in-place authority path acceptance");
+		"AIDA_C03_VALIDATED_PYTHON_EXECUTABLE",
+		"AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE",
+		"_aida_c03_package_require_python(_aida_c03_python)",
+		"COMMAND \"${_aida_c03_python}\"",
+		"aida_c03_require_detached_roots(",
+		"aida_c03_validate_no_reparse_chain(",
+		"_aida_c03_validate_raw_windows_path_shape(",
+		"StageCustomerPackage"})
+		require_contains(package_integration, token,
+			"validated package tool and detached distribution policy");
+	require_exact_count(package_integration, "COMMAND \"${_aida_c03_python}\"", 8,
+		"validated Python package command inventory");
+	require_absent(package_integration, "COMMAND \"${Python3_EXECUTABLE}\"",
+		"raw Python package command absence");
+	require_absent(package_integration, "find_program(",
+		"unvalidated package interpreter discovery absence");
 
 	const std::array<std::string_view, 11> authority_inputs = {
 		"tools/c03_authority/verify_authority_surface_ledger.py",
@@ -1097,16 +1101,29 @@ void verify_manifest_registration(const std::string_view cmake_manifest)
 	for (const auto input : authority_inputs)
 		require_exact_count(authority_file_inventory, input, 1,
 			"authority repository file inventory");
+	for (const auto input : std::array<std::string_view, 2>{
+			"${AIDA_C03_PATH_POLICY_MODULE}", "${AIDA_C03_PATH_IDENTITY_POLICY}"})
+		require_exact_count(authority_file_inventory, input, 1,
+			"authority path-policy repository file inventory");
 	const auto policy_runtime = slice_between(cmake_manifest,
 		"set(_aida_policy_runtime", "foreach(_aida_relative IN LISTS _aida_policy_runtime)",
 		"source policy staged runtime inventory");
 	for (const auto input : authority_inputs)
 		require_exact_count(policy_runtime, input, 1,
 			"source policy authority runtime inventory");
-	for (const auto input : std::array<std::string_view, 3>{
+	for (const auto input : std::array<std::string_view, 12>{
+		"CMakeLists.txt",
 		"packaging/c03_distribution_manifest.ps1",
+		"src/standalone/tools/c03_package_verifier/main.cpp",
+		"src/standalone/tests/c03/package_distribution_policy/policy_stage_spec.json",
 		"src/standalone/src/core/analysis/build_worker_packaging_integration.cpp",
-		"src/standalone/tests/c03/build_packaging_integration_harness.cpp"})
+		"src/standalone/tests/c03/build_packaging_integration_harness.cpp",
+		"src/standalone/tests/c03/package_distribution_policy/package_distribution_policy_harness.ps1",
+		"src/standalone/tests/c03/auth_browser_dispatch/auth_browser_dispatch_harness.hpp",
+		"src/standalone/tests/c03/auth_browser_dispatch/auth_browser_dispatch_harness.cpp",
+		"cmake/aida_c03_package_integration.cmake",
+		"cmake/c03_safe_headless/package_policy_fixture/aida_c03_path_policy.cmake",
+		"cmake/c03_safe_headless/package_policy_fixture/aida_c03_path_identity.ps1"})
 		require_exact_count(policy_runtime, input, 1,
 			"source policy package-boundary runtime inventory");
 	const auto production_sources = slice_between(cmake_manifest,
@@ -1121,23 +1138,110 @@ void verify_manifest_registration(const std::string_view cmake_manifest)
 		"set(AIDA_C03_COMPILER_MATRIX_CM_15",
 		"set(AIDA_C03_COMPILER_MATRIX_UNION)",
 		"C03 CM-15 compiler matrix");
+	const auto compiler_matrix_cm13 = slice_between(cmake_manifest,
+		"set(AIDA_C03_COMPILER_MATRIX_CM_13",
+		"set(AIDA_C03_COMPILER_MATRIX_CM_14",
+		"C03 CM-13 compiler matrix");
+	for (const auto input : std::array<std::string_view, 6>{
+			"core/auth/auth_store.cpp", "core/auth/auth_http.cpp",
+			"core/auth/auth_codex.cpp", "core/auth/auth_copilot.cpp",
+			"core/auth/auth_claude_code.cpp", "core/ai/provider_catalog.cpp"}) {
+		require_exact_count(production_sources, input, 1,
+			"normal auth implementation source registration");
+		require_exact_count(compiler_matrix_cm15, input, 1,
+			"normal and preview auth CM-15 translation-unit coverage");
+	}
+	for (const auto token : std::array<std::string_view, 8>{
+			"set(_aida_auth_implementation_sources",
+			"add_library(aida_c03_auth_preview_implementation STATIC",
+			"AIDA_IMGUI_STUDIO_PREVIEW=1",
+			"AIDA_C03_IMPLEMENTATION_VARIANT \"preview\"",
+			"AIDA_C03_AUTH_IMPLEMENTATION_VARIANT \"normal\"",
+			"NO_SHARED_RUNTIME",
+			"TARGET aida_c03_auth_browser_dispatch_preview_harness",
+			"LINK_LIBRARIES aida_c03_auth_preview_implementation"})
+		require_contains(cmake_manifest, token,
+			"independent normal and preview auth implementation graph");
+	for (const auto input : std::array<std::string_view, 5>{
+			"core/debugger/debugger_interaction_context.cpp",
+			"core/ui/application_action_registry.cpp",
+			"core/ui/application_ui_runtime.cpp",
+			"core/ui/analysis_context_menu.cpp",
+			"core/ui/imgui_capability_guard.cpp"}) {
+		require_exact_count(production_sources, input, 1,
+			"C03 production integration source registration");
+		require_exact_count(compiler_matrix_cm13, input, 1,
+			"C03 production integration CM-13 coverage");
+	}
 	require_absent(production_sources, "surface_reconciliation.cpp",
 		"application production source registration");
 	require_exact_count(harness_support_sources, "surface_reconciliation.cpp", 1,
 		"harness-only surface reconciliation support registration");
 	require_exact_count(compiler_matrix_cm15, "surface_reconciliation.cpp", 1,
 		"surface reconciliation CM-15 retention");
+	for (const auto input : std::array<std::string_view, 15>{
+		"tools/c03_package_verifier/main.cpp",
+		"build_worker_packaging_integration.hpp",
+		"build_worker_packaging_integration.cpp",
+		"build_packaging_integration_harness.cpp",
+		"testlab_runtime/source_policy_scanner.cpp",
+		"auth_browser_dispatch/auth_browser_dispatch_harness.cpp",
+		"cmake/aida_c03_dependencies.cmake",
+		"cmake/aida_c03_package_integration.cmake",
+		"${AIDA_C03_SAFE_HEADLESS_CMAKE_MODULE}",
+		"${AIDA_C03_PATH_POLICY_MODULE}", "${AIDA_C03_PATH_IDENTITY_POLICY}",
+		"packaging/c03_distribution_manifest.ps1",
+		"packaging/c03_distribution_fixture/path_byte_policy.json",
+		"package_distribution_policy/package_distribution_policy_harness.ps1",
+		"package_distribution_policy/policy_stage_spec.json"})
+		require_exact_count(compiler_matrix_cm15, input, 1,
+			"package policy CM-15 graph coverage");
 	require_exact_count(cmake_manifest, "surface_reconciliation.cpp", 2,
 		"surface reconciliation harness-only source classification");
-	for (const auto target : std::array<std::string_view, 6>{
+	for (const auto target : std::array<std::string_view, 8>{
 		"TARGET aida_c03_a00_authority_surface_harness",
 		"TARGET aida_c03_c08_c19_mcp_compatibility_harness",
 		"TARGET aida_c03_surface_reconciliation_harness",
 		"TARGET aida_c03_source_policy_scanner",
 		"TARGET aida_c03_mcp_production_core_harness",
+		"TARGET aida_c03_auth_browser_dispatch_harness",
+		"TARGET aida_c03_auth_browser_dispatch_preview_harness",
 		"TARGET aida_c03_a06_decompiler_quality_scorer_harness"})
 		require_exact_count(cmake_manifest, target, 1,
 			"safe-headless canonical target registration");
+	const auto preview_auth_registration = slice_between(cmake_manifest,
+		"TARGET aida_c03_auth_browser_dispatch_preview_harness",
+		"TARGET aida_c03_fixture_materializer_direct",
+		"preview auth browser safe-headless registration");
+	for (const auto token : std::array<std::string_view, 4>{
+			"PACKAGE D08 TIMEOUT 300",
+			"auth_browser_dispatch/auth_browser_dispatch_harness.cpp",
+			"COMPILE_DEFINITIONS AIDA_IMGUI_STUDIO_PREVIEW=1",
+			"TARGET aida_c03_auth_browser_dispatch_preview_harness"})
+		require_exact_count(preview_auth_registration, token, 1,
+			"preview auth browser exact target source and definition");
+	const auto package_policy_test = slice_between(cmake_manifest,
+		"add_test(NAME aida_c03_package_distribution_policy",
+		"get_property(_aida_compiler_harness_inputs",
+		"package distribution executable parity fixture registration");
+	for (const auto token : std::array<std::string_view, 15>{
+		"add_test(NAME aida_c03_package_distribution_policy",
+		"COMMAND \"${_aida_system_powershell}\"",
+		"package_distribution_policy_harness.ps1",
+		"-Producer \"${CMAKE_SOURCE_DIR}/packaging/c03_distribution_manifest.ps1\"",
+		"-ContractVerifier \"$<TARGET_FILE:aida_c03_build_packaging_integration_harness>\"",
+		"-ProductionVerifier \"$<TARGET_FILE:aida_c03_package_verifier>\"",
+		"-StageSpec \"${AIDA_C03_TEST_ROOT}/package_distribution_policy/policy_stage_spec.json\"",
+		"-PathBytePolicy \"${CMAKE_SOURCE_DIR}/packaging/c03_distribution_fixture/path_byte_policy.json\"",
+		"-AuthorityLock \"${AIDA_C03_WORKER_MANIFEST_LOCK}\"",
+		"-ProtectorTool \"$<TARGET_FILE:AiDAProtector>\"",
+		"-ProtectorVerifier \"$<TARGET_FILE:AiDAProtectorVerify>\"",
+		"-ScratchRoot \"${AIDA_C03_DEVELOPER_ROOT}/scratch/package-policy/$<CONFIG>\"",
+		"TIMEOUT 1200",
+		"LABELS \"c03;c03_safe_headless;safe-headless;package;distribution;policy\"",
+		"RESOURCE_LOCK \"aida_c03_package_distribution_policy\""})
+		require_exact_count(package_policy_test, token, 1,
+			"package distribution executable parity fixture registration");
 	for (const auto source : std::array<std::string_view, 16>{
 		"generated_entrypoints.cpp", "protocol_core_harness.cpp",
 		"workspace_adapter_harness.cpp", "contract_generation_harness.cpp",
@@ -1180,7 +1284,10 @@ void verify_manifest_registration(const std::string_view cmake_manifest)
 
 void verify_distribution_source_leak_policy(const std::string_view producer,
 	const std::string_view verifier, const std::string_view harness,
-	const std::string_view cmake_manifest)
+	const std::string_view policy_harness, const std::string_view cmake_manifest,
+	const std::string_view package_integration, const std::string_view root_cmake,
+	const std::string_view package_verifier, const std::string_view dependency_cmake,
+	const std::string_view path_byte_policy)
 {
 	constexpr std::string_view forbidden_extensions[]{
 		".a", ".asm", ".bash", ".bat", ".c", ".c++", ".cc", ".cmake", ".cmd", ".cpp",
@@ -1253,12 +1360,12 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 		expected_directories.emplace(directory);
 	require(quoted_source_literals(slice_between(producer,
 		"$script:ForbiddenCustomerDirectoryNames",
-		"function Test-ForbiddenCustomerRelativePath",
+		"$script:StockBrowserNames",
 		"distribution producer forbidden directory policy"), '\'',
 		"distribution producer forbidden directory policy") == expected_directories &&
 		quoted_source_literals(slice_between(verifier,
 			"constexpr std::string_view forbidden_directories[]{",
-			"const auto forbidden_extension =",
+			"constexpr std::string_view stock_browsers[]{",
 			"distribution verifier forbidden directory policy"), '"',
 			"distribution verifier forbidden directory policy") == expected_directories,
 		"distribution forbidden directory policy is exact across producer and verifier");
@@ -1270,33 +1377,49 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 		require_contains(lowered_harness, std::string(directory),
 			"distribution forbidden directory production fixture");
 	}
-	for (const auto token : std::array<std::string_view, 12>{
+	for (const auto token : std::array<std::string_view, 14>{
 		"function Test-ForbiddenCustomerRelativePath",
+		"function Get-Utf8PathByteCount",
 		"$script:ForbiddenCustomerExtensions",
 		"$script:ForbiddenCustomerFileNames",
 		"$script:ForbiddenCustomerDirectoryNames",
-		"$RelativePath.Length -gt 32768",
-		"$lower.EndsWith('.dist-info', [StringComparison]::Ordinal)",
-		"$lower.EndsWith('.egg-info', [StringComparison]::Ordinal)",
-		"$lower[$after] -eq '.'", "$lower[$after] -eq '-'",
-		"$lower[$after] -eq '_'",
+		"(Get-Utf8PathByteCount -Value $RelativePath) -gt $script:MaximumRelativePathBytes",
+		"$code -lt 0x21 -or $code -gt 0x7e",
+		"$character -in @('\\', ':', '<', '>', '\"', '|', '?', '*')",
+		"$lower.IndexOf('.dist-info', [StringComparison]::Ordinal)",
+		"$lower.IndexOf('.egg-info', [StringComparison]::Ordinal)",
+		"-not (Test-AsciiAlphaNumeric -Character $lower[$after])",
+		"Test-PolicyNameMatch -Segment $lower -Forbidden $name",
 		"'stock-firefox', 'stock-firefox.exe'",
 		"if (Test-ForbiddenCustomerRelativePath -RelativePath $RelativePath)"})
 		require_contains(producer, token,
 			"distribution producer fail-closed customer path policy");
-	for (const auto token : std::array<std::string_view, 13>{
+	for (const auto token : std::array<std::string_view, 16>{
 		"bool unexpected_customer_file(std::string_view relative)",
 		"forbidden_extensions[]", "forbidden_names[]", "forbidden_directories[]",
-		"lower.size() > 32768",
-		"segment[after] == '.'", "segment[after] == '-'", "segment[after] == '_'",
+		"bool safe_relative_path(std::string_view value)",
+		"character < 0x21U || character > 0x7eU",
+		"character == '\\\\'", "character == ':'", "part.back() == '.'",
+		"!ascii_alphanumeric(segment[after])",
+		"policy_name_match(segment, value)",
 		".dist-info", ".egg-info", "stock-firefox.exe",
 		"if (unexpected_customer_file(artifact.relative_path))",
 		"if (unexpected_customer_file(text))"})
 		require_contains(verifier, token,
 			"distribution verifier fail-closed customer path policy");
-	for (const auto token : std::array<std::string_view, 15>{
+	for (const auto token : std::array<std::string_view, 42>{
+		"verify_utf8_path_policy_table();",
+		"verify_utf8_path_budget_boundaries(fixture, integration, manifest_hash);",
+		"verify_cancellation_deadline_policy(fixture, integration, manifest_hash);",
 		"verify_allowed_customer_path_neighbors(fixture, integration);",
 		"verify_forbidden_customer_path_policy(fixture, integration);",
+		"verify_actual_path_stream_and_resource_policy(fixture, integration, manifest_hash);",
+		"verify_immutable_generation_mutation_policy(fixture, integration, manifest_hash);",
+		"verify_build_bound_link_graph_mutations(fixture, integration);",
+		"package_verification_checkpoint_t::immutable_generation_captured",
+		"package_verification_checkpoint_t::immutable_generation_precommit",
+		"CreateFileMappingW", "MapViewOfFile", "FlushViewOfFile",
+		"same-size mapped mutation escaped immutable-generation verification",
 		"integration.verify_distribution_package(request_for(fixture, digest))",
 		"nested/payload.CpP", "nested/payload.PS1.backup",
 		"nested/payload.HPP_copy", "nested/payload.CMAKE-old",
@@ -1305,9 +1428,368 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 		"unlisted developer safe-headless source payload was accepted",
 		"reject(std::string(32769, 'x'))",
 		"resources/runtime-policy.json", "resources/runtime-policy.sha256",
-		"resources/LICENSE.txt", "resources/NOTICE.md"})
+		"resources/LICENSE.txt", "resources/NOTICE.md",
+		"CreateSymbolicLinkW", "named-stream package artifact was accepted",
+		"maximum_inventory_path_bytes = 1",
+		"repeated production verifier results are not deterministic",
+		"payload-\\xce\\x94.bin",
+		"production-link-graph", "aida.c03.production-link-graph.v3",
+		"strict_roots", "host_direct_edges", "host_preexisting_exemptions",
+		"AiDAStandalone|LINK_LIBRARIES|unicorn",
+		"strict-link-forbidden.json", "host-link-forbidden.json",
+		"hardlink_forbidden", "verified package contract fixtures"})
 		require_contains(harness, token,
 			"distribution production-shaped package-boundary fixtures");
+	for (const auto token : std::array<std::string_view, 40>{
+		"Invoke-Child -Executable $ContractVerifier",
+		"Invoke-Child -Executable $ProductionVerifier",
+		"producer policy report is not repeatable",
+		"AIDA_C03_PACKAGE_POLICY_RAW_ABSOLUTE_PATH",
+		"payload-' + [char]0x394 + '.bin",
+		"payload`t.bin", "payload.cpp.backup", "CMakeLists.TxT", "SDK/runtime.dll",
+		"$adsFile + ':aida-policy'", "AIDA_C03_PACKAGE_POLICY_NAMED_STREAM_FORBIDDEN",
+		"FixtureMaximumFiles", "FixtureMaximumDirectories", "FixtureMaximumEntries",
+		"FixtureMaximumDepth", "FixtureMaximumRelativePathBytes",
+		"FixtureMaximumInventoryPathBytes",
+		"FixtureMaximumEntryBytes", "FixtureMaximumAggregateBytes",
+		"New-Item -ItemType HardLink",
+		"New-Item -ItemType Junction", "New-Item -ItemType SymbolicLink",
+		"-StageCustomerPackage", "-StagePolicyFixture",
+		"Read-CompleteGeneration -PointerPath $generationPointer",
+		".generation-pointer.json",
+		"foreach ($checkpoint in @('prepared', 'package-ready', 'evidence-ready', 'before-commit'))",
+		"FixturePublicationFailure", "after-commit",
+		"Start-Process -FilePath $PowerShellExecutable",
+		"$readerGenerations", "--generation-pointer",
+		"inspect-generation",
+		"external-authority-not-provisioned/signer-policy.json",
+		"customer restage atomicity or repeatability violated the detached source boundary",
+		"AIDA_C03_PACKAGE_POLICY_CANONICAL_PATH_OPEN",
+		"failed stage prevalidation changed the prior complete generation",
+		"concurrent readers observed a torn or mixed generation",
+		"$concurrentFinal.id -cne $postCommitGeneration.id",
+		"@($pathPolicy.cases).Count -eq 12"})
+		require_contains(policy_harness, token,
+			"executable package producer and verifier parity fixtures");
+	for (const auto token : std::array<std::string_view, 14>{
+			"New-PePostProcessFixture", "inspect-pe-post-process",
+			"'coff-symbols'", "'rich'", "'dans'", "'codeview-path'",
+			"'malformed-debug'", "'truncated-debug'",
+			"run-signing-provider", "signing authority point-of-use identity mismatch",
+			"immutable signing provider returned failure", "provider-hardlink",
+			"policy-hardlink", "policy-reparse"})
+		require_contains(policy_harness, token,
+			"artifact measurement and point-of-use signing authority negative fixtures");
+	for (const auto token : std::array<std::string_view, 5>{
+			"generation-identity-hardlink-", "customer-anchor-reparse",
+			"evidence-root-reparse", "stage-owner-reparse",
+			"path component identity is invalid"})
+		require_contains(policy_harness, token,
+			"detached authority component and evidence identity negative fixtures");
+	for (const auto token : std::array<std::string_view, 8>{
+			"unauthorized_signer_thumbprint_sha256", "signature_verifier_result",
+			"trusted_timestamp", "unauthorized_actual_signer_thumbprint_sha256",
+			"signer_receipt_identity_mismatch", "zero trusted timestamp",
+			"mismatched authorized actual signer",
+			"invalid-signature-timestamp-status.json"})
+		require_contains(harness, token,
+			"signer receipt and timestamp semantic negative fixtures");
+	for (const auto token : std::array<std::string_view, 23>{
+		"[Collections.Generic.Queue[object]]::new()",
+		"Sort-Object -Property relative_path -CaseSensitive",
+		"$script:MaximumPackageFiles = 250000",
+		"$script:MaximumPackageDirectories = 65536",
+		"$script:MaximumPackageEntries = 300000",
+		"$script:MaximumPackageDepth = 64",
+		"$script:MaximumRelativePathBytes = 32768",
+		"$script:MaximumInventoryPathBytes = [Int64]268435456",
+		"RESOURCE_PATH_BUFFER_LIMIT", "Assert-NoNamedStreams", "Get-Utf8PathByteCount",
+		"Assert-SingleLinkFile", "NumberOfLinks", "HARDLINK_FORBIDDEN",
+		"Get-DirectoryIdentity", "DIRECTORY_CYCLE", "DUPLICATE_CASE_PATH",
+		"Stage-SanitizedCustomerPackage", "[IO.File]::Copy",
+		"STAGE_COPY_IDENTITY", "STAGE_EXACT_INVENTORY",
+		"Get-ExactExistingPath", "GetFinalPathNameByHandleW"})
+		require_contains(producer, token,
+			"bounded deterministic copy-only package producer policy");
+	const auto customer_stage = slice_between(producer,
+		"function Stage-SanitizedCustomerPackage",
+		"function Start-ImmutableGeneration",
+		"sanitized customer stage implementation");
+	require_ordered(customer_stage, {
+		"Read-StrictJson -Path $SpecificationPath",
+		"$copyPlan = [Collections.Generic.List[object]]::new()",
+		"Get-LockedIdentity -Path $sourcePath",
+		"'.aida-c03-candidate-'",
+		"[IO.File]::Copy([string]$copyEntry.source_path, $candidatePath, $false)",
+		"Get-BoundedTreeInventory -Root $candidateFull",
+		"Assert-ImmutableGeneration",
+		"$retainCandidate = $true",
+		"candidate_identity = $candidateDirectoryIdentity"
+	}, "prevalidated deferred customer generation ordering");
+	require_absent(customer_stage, "Publish-PackageDirectory",
+		"legacy non-generation customer directory publication");
+	require_absent(customer_stage, "$DeferPublication",
+		"optional non-generation customer publication mode");
+	require_absent(customer_stage, "[IO.Directory]::Delete($destinationFull, $true)",
+		"destructive customer destination replacement");
+	const auto complete_generation = slice_between(producer,
+		"function Publish-CompleteGeneration",
+		"function Stage-SanitizedCustomerPackage",
+		"complete package and evidence publication transaction");
+	require_ordered(complete_generation, {
+		"$publicationLock = [AidaC03PackageNative]::CreateFileW(",
+		"Recover-PublicationJournal -Path $publicationJournalPath",
+		"Remove-OwnedGenerationDirectory -Path $stalePackage",
+		"Write-PublicationJournal -Path $publicationJournalPath -Value $journal",
+		"Invoke-PublicationCheckpoint -Name 'prepared'",
+		"[IO.Directory]::Move([string]$Stage.candidate_path, $packageGeneration)",
+		"Set-ImmutableGenerationExpectedPathPrefix -OldRoot ([string]$Stage.candidate_path) -NewRoot $packageGeneration",
+		"Get-BoundedTreeInventory -Root $packageGeneration",
+		"Invoke-PublicationCheckpoint -Name 'package-ready'",
+		"[IO.Directory]::Move($EvidenceCandidate, $evidenceGeneration)",
+		"Set-ImmutableGenerationExpectedPathPrefix -OldRoot $EvidenceCandidate -NewRoot $evidenceGeneration",
+		"Assert-ImmutableGeneration",
+		"Invoke-PublicationCheckpoint -Name 'before-commit'",
+		"Write-AtomicBytes -Path $pointerPath -Bytes $pointerBytes -Replace:$Replace",
+		"$pointerCommitted = $true"
+	}, "atomic complete-generation pointer publication ordering");
+	for (const auto token : std::array<std::string_view, 19>{
+		"aida.c03.complete-generation-pointer", ".aida-c03-generation-",
+		".aida-c03-publication.lock", ".aida-c03-publication-journal.json",
+		"aida.c03.publication-journal", "Recover-PublicationJournal",
+		"Write-PublicationJournal", "if (-not $pointerCommitted)",
+		"[IO.Directory]::Move($evidenceGeneration, $EvidenceCandidate)",
+		"Set-ImmutableGenerationExpectedPathPrefix -OldRoot $evidenceGeneration -NewRoot $EvidenceCandidate",
+		"[IO.Directory]::Move($packageGeneration, [string]$Stage.candidate_path)",
+		"Set-ImmutableGenerationExpectedPathPrefix -OldRoot $packageGeneration -NewRoot ([string]$Stage.candidate_path)",
+		"CloseHandle($publicationLock)", "FixturePublicationFailure",
+		"FixturePublicationTermination", "Stop-Process -Id $PID -Force",
+		"prepared", "evidence-ready", "after-commit"})
+		require_contains(complete_generation, token,
+			"complete generation cleanup rollback and failure policy");
+	require_absent(complete_generation, "[IO.File]::Move($ManifestCandidate, $ManifestDestination)",
+		"sequential manifest publication");
+	require_absent(complete_generation, "[IO.File]::Move($DigestCandidate, $DigestDestination)",
+		"sequential digest publication");
+	for (const auto token : std::array<std::string_view, 25>{
+		"Start-ImmutableGeneration", "Stop-ImmutableGeneration",
+		"function Get-LockedIdentity", "function Get-LockedBytes",
+		"function Get-LockedFinalPath", "function Assert-ImmutableGeneration",
+		"Get-LockedFinalPath -Entry $entry",
+		"STAGE_OWNERSHIP", "STAGE_ROOT_OVERLAP", "STAGE_SOURCE_OVERLAP",
+		"foreach ($ownedRoot in @($productionCandidateAnchor, $stageAnchor, $evidenceRootPath))",
+		"Get-Utf8PathByteCount -Value $relative",
+		"Get-Utf8PathByteCount -Value $entryFull",
+		"Set-ImmutableGenerationExpectedPathPrefix",
+		"expected_final_path", "HARDLINK_FORBIDDEN",
+		"EVIDENCE_GENERATION_LIMIT", "function Test-GenerationReclaimable",
+		"EVIDENCE_GENERATION_RECLAIM",
+		"$fixtureDigestPath = $fixtureReportPath + '.sha256'",
+		"Publish-CompleteGeneration -Stage $productionStage",
+		"-EvidencePublicationAnchor $evidencePublicationAnchor",
+		".generation-pointer.json", "-Transient -CaptureBytes",
+		"$journalFinal = Get-LockedIdentity"})
+		require_contains(producer, token,
+			"immutable UTF-8 package and fixture generation contract");
+	for (const auto token : std::array<std::string_view, 17>{
+		"std::queue<pending_directory_t>", "std::vector<discovered_entry_t>",
+		"std::sort(discovered.begin(), discovered.end()",
+		"maximum_total_entry_count", "maximum_directory_count", "maximum_depth",
+		"maximum_relative_path_bytes", "maximum_inventory_path_bytes",
+		"maximum_artifact_bytes", "maximum_total_artifact_bytes",
+		"verify_stream_inventory", "directory_identities", "directory_cycle",
+		"FILE_FLAG_OPEN_REPARSE_POINT", "GetFinalPathNameByHandleW",
+		"case-colliding path", "inventory_path_bytes"})
+		require_contains(verifier, token,
+			"bounded deterministic package verifier policy");
+	for (const auto token : std::array<std::string_view, 11>{
+		"immutable_generation_context_t", "immutable_generation_scope_t",
+		"rehash_locked_generation_file", "immutable_generation_hash",
+		"package_verification_checkpoint_t::immutable_generation_captured",
+		"package_verification_checkpoint_t::immutable_generation_precommit",
+		"revalidate_immutable_generation(immutable_generation)",
+		"auto final_inventory = enumerate_package_tree(package_root, request)",
+		"relative.generic_u8string()", "iterator->path().generic_u8string()",
+		"final_inventory.value().path_bytes != bounded_inventory.value().path_bytes"})
+		require_contains(verifier, token,
+			"immutable UTF-8 production package verification contract");
+	for (const auto token : std::array<std::string_view, 24>{
+		"hardlink_forbidden", "nNumberOfLinks", "poll_verification_control",
+		"deadline_exceeded", "cancelled", "request.protector_verifier",
+		"request.signature_verifier", "direct_protector_verifier",
+		"signer_policy_sha256", "signing_provider_sha256",
+		"production-link-graph", "build_evidence",
+		"aida.c03.production-link-graph.v3", "link_denylist",
+		"strict_roots", "strict_targets", "strict_edges",
+		"host_direct_edges", "host_preexisting_exemptions",
+		"AiDAStandalone|LINK_LIBRARIES|unicorn",
+		"AiDAStandalone", "forbidden_link_token",
+		"production_link_graph_verified",
+		"result.deny_link_policy = production_link_graph_verified"})
+		require_contains(verifier, token,
+			"hardlink cancellation signer protector and deny-link verification contract");
+	const auto root_contract = slice_between(cmake_manifest,
+		"if(NOT DEFINED ENV{LOCALAPPDATA}",
+		"set(AIDA_C03_SAFE_HEADLESS_INVENTORY",
+		"detached application developer and customer root contract");
+	for (const auto token : std::array<std::string_view, 15>{
+		"if(NOT DEFINED ENV{LOCALAPPDATA} OR NOT IS_ABSOLUTE \"$ENV{LOCALAPPDATA}\")",
+		"string(SHA256 AIDA_C03_STAGE_AUTHORITY_ID",
+		"${_aida_c03_local_app_data}/AiDA/C03/${AIDA_C03_STAGE_AUTHORITY_ID}",
+		"set(AIDA_C03_APPLICATION_BUILD_ROOT \"${AIDA_C03_STAGE_OWNER_ROOT}/application\")",
+		"set(AIDA_C03_DEVELOPER_ROOT \"${AIDA_C03_STAGE_OWNER_ROOT}/developer\")",
+		"set(AIDA_C03_CUSTOMER_STAGE_ANCHOR \"${AIDA_C03_STAGE_OWNER_ROOT}/customer\")",
+		"set(AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT \"${AIDA_C03_STAGE_OWNER_ROOT}/evidence\")",
+		".aida-c03-stage-owner.json",
+		"external stage root is owned by a different source/binary authority",
+		"file(MAKE_DIRECTORY",
+		"\"${AIDA_C03_DEVELOPER_ROOT}\"",
+		"\"${AIDA_C03_CUSTOMER_STAGE_ANCHOR}\"",
+		"aida_c03_require_detached_roots(",
+		"set(AIDA_C03_SAFE_HEADLESS_STAGE_ROOT \"${AIDA_C03_DEVELOPER_ROOT}/suite/$<CONFIG>\")",
+		"set(AIDA_C03_CUSTOMER_PACKAGE_ROOT \"${AIDA_C03_CUSTOMER_STAGE_ANCHOR}/$<CONFIG>\")"})
+		require_contains(root_contract, token,
+			"detached sibling stage root policy");
+	require_absent(root_contract, "$ENV{TEMP}",
+		"TEMP-backed developer or customer stage root");
+	for (const auto token : std::array<std::string_view, 10>{
+		"APPLICATION_ROOT \"${AIDA_C03_APPLICATION_BUILD_ROOT}\"",
+		"SOURCE_ROOT \"$<TARGET_FILE_DIR:${application_target}>\"",
+		"DEVELOPER_ROOT \"${AIDA_C03_DEVELOPER_ROOT}\"",
+		"CUSTOMER_STAGE_ANCHOR \"${AIDA_C03_CUSTOMER_STAGE_ANCHOR}\"",
+		"EVIDENCE_ROOT \"${AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT}\"",
+		"STAGE_OWNER_ROOT \"${AIDA_C03_STAGE_OWNER_ROOT}\"",
+		"PACKAGE_ROOT \"${AIDA_C03_CUSTOMER_PACKAGE_ROOT}\"",
+		"file(MAKE_DIRECTORY \"${_aida_c03_distribution_output_root}\")",
+		"PACKAGE_VERIFIER_TARGET aida_c03_package_verifier",
+		"aida_c03_validate_no_reparse_chain("})
+		require_contains(cmake_manifest, token,
+			"copy-only detached distribution registration");
+	for (const auto token : std::array<std::string_view, 19>{
+		"-StageCustomerPackage", "-SourceRoot", "-ApplicationStageAnchor",
+		"-CustomerStageAnchor", "-EvidenceRoot", "-StageOwnerRoot",
+		"COMMAND \"$<TARGET_FILE:${_aida_c03_PACKAGE_VERIFIER_TARGET}>\" verify-package",
+		"--generation-pointer", "--customer-stage-anchor", "--evidence-root",
+		"--stage-owner-root", "--authority-lock", "--protector-verifier",
+		"--signature-verifier", "--signer-policy", "--expected-signer-policy-sha256",
+		"--signing-provider", "--expected-signing-provider-sha256",
+		"--deadline-ms 900000"})
+		require_contains(package_integration, token,
+			"detached generation and strict production verifier command");
+	for (const auto token : std::array<std::string_view, 36>{
+		"int emit_receipts(const parsed_arguments_t& parsed)",
+		"int inspect_generation(const parsed_arguments_t& parsed)",
+		"int verify_package(const parsed_arguments_t& parsed)",
+		"arguments.mode == L\"inspect-generation\"",
+		"lock_file(arguments.at(L\"artifact\")",
+		"verifier::verify_report(artifact.path.string(), profile)",
+		"verify_authenticode(artifact.path)", "WTD_CACHE_ONLY_URL_RETRIEVAL",
+		"WTD_REVOKE_WHOLECHAIN", "WTHelperProvDataFromStateData",
+		"WTHelperGetProvSignerFromChain", "WTHelperGetProvCertFromChain",
+		"wintrust_provider_counter_signer", "measure_pe_post_process",
+		"FlushFileBuffers", "ReplaceFileW", "MOVEFILE_WRITE_THROUGH",
+		"verifier.verify_distribution_package(request)",
+		"request.verification_checkpoint", "fixed_time_equal(file.sha256, observed.sha256)",
+		"load_complete_generation", "aida.c03.complete-generation-pointer",
+		"FILE_SHARE_DELETE", "replacement_tolerant", "generation.package_root",
+		"publication_lock_path", "FILE_READ_ATTRIBUTES", "lock_directory",
+		"strict_descendant",
+		"generation.manifest_path", "generation.manifest_sha256",
+		"request.protector_verifier", "verifier::verify_report(path.string(), profile)",
+		"request.signature_verifier", "authorized_signers", "cancellation_requested"})
+		require_contains(package_verifier, token,
+			"strict production package verifier and receipt producer");
+	for (const auto token : std::array<std::string_view, 18>{
+			"arguments.mode == L\"inspect-pe-post-process\"",
+			"arguments.mode == L\"run-signing-provider\"",
+			"WTHelperGetProvSignerFromChain(provider, 0, TRUE, index)",
+			"counter_signer->sftVerifyAsOf", "counter_signer->pChainContext",
+			"CERT_CONFIDENCE_SIG", "CertVerifyTimeValidity",
+			"coff_symbol_table_pointer", "coff_symbol_count",
+			"unscrubbed_debug_paths", "rich_signature_count",
+			"dans_signature_count", "final PE artifact failed measured scrub policy",
+			"copy_locked_authority", "immutable signing authority copy identity mismatch",
+			"CreateProcessW(immutable_provider.path.c_str()",
+			"revalidate(immutable_provider)", "revalidate(immutable_policy)"})
+		require_contains(package_verifier, token,
+			"provider-backed timestamp PE measurement and immutable signer execution");
+	require_absent(package_verifier, "szOID_RSA_counterSign",
+		"raw Authenticode countersignature OID inference");
+	require_absent(package_verifier, "szOID_RFC3161_counterSign",
+		"raw RFC3161 countersignature OID inference");
+	for (const auto token : std::array<std::string_view, 24>{
+		"AIDA_C03_SIGNER_POLICY_FILE", "AIDA_C03_SIGNING_PROVIDER",
+		"AIDA_C03_SIGNING_PROVIDER_SHA256", "AIDA_C03_SIGNING_AUTHORITY_BLOCKER",
+		"function(aida_c03_configure_signing_authority)",
+		"aida.c03.authorized-signer-policy", "authorized_signer_thumbprints_sha256",
+		"require_trusted_timestamp",
+		"function(aida_c03_emit_production_link_graph_evidence output_path integration_host)",
+		"aida_c03_reject_forbidden_target_links(${_aida_c03_strict_roots})",
+		"LINK_LIBRARIES", "INTERFACE_LINK_LIBRARIES",
+		"IMPORTED_LINK_DEPENDENT_LIBRARIES_RELEASE",
+		"aida.c03.production-link-graph.v3", "AiDAStandalone",
+		"_aida_c03_host_exemptions", "AiDAStandalone|LINK_LIBRARIES|unicorn",
+		"manifest_root_count",
+		"AIDA_C03_LOCKED_PRODUCTION_LINK_DENYLIST", "AIDA_C03_PRODUCTION_LINK_DENY_TOKENS",
+		"_aida_c03_namespaced_link_tokens", "_aida_c03_plain_link_tokens",
+		"file(SHA256",
+		"AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE_SHA256"})
+		require_contains(dependency_cmake, token,
+			"production build-bound deny-link evidence generator");
+	for (const auto token : std::array<std::string_view, 10>{
+		"aida_c03_emit_production_link_graph_evidence(",
+		"AiDAStandalone", "aida_c03_b14_native_decompiler_worker",
+		"aida_c03_package_verifier",
+		"aida_c03_production_link_graph_package_evidence",
+		"deps/evidence/production-link-graph.json",
+		"add_dependencies(aida_c03_distribution_manifest",
+		"AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE",
+		"production-target-link-graph-evidence-v3",
+		"copy_if_different"})
+		require_contains(root_cmake, token,
+			"production target graph distribution binding");
+	const auto standalone_link_binding = slice_between(root_cmake,
+		"target_link_directories(AiDAStandalone PRIVATE",
+		"set_target_properties(AiDAStandalone PROPERTIES",
+		"final standalone link and C03 evidence binding");
+	require_ordered(standalone_link_binding, {
+		"target_link_libraries(AiDAStandalone PRIVATE",
+		"target_link_libraries(AiDAStandalone PRIVATE aida_hardening)",
+		"aida_c03_emit_production_link_graph_evidence(",
+		"add_custom_target(aida_c03_production_link_graph_package_evidence"
+	}, "post-link C03 graph evidence generation");
+	require_contains(dependency_cmake,
+		"string(JOIN \"\\\",\\\"\" _aida_c03_denylist ${AIDA_C03_PRODUCTION_LINK_DENY_TOKENS})",
+		"complete production graph deny-list evidence");
+	require_contains(verifier, "\"lief\", \"lmdb\", \"unicorn\", \"remill\"",
+		"complete production graph deny-list enforcement");
+	require_contains(harness, "unicorn_static",
+		"forbidden underscore-suffix build-bound link fixture");
+	for (const auto token : std::array<std::string_view, 8>{
+		"aida.c03.utf8-path-byte-policy.v1", "maximum_relative_path_bytes",
+		"maximum_inventory_path_bytes", "customer_path_allowed",
+		"utf8_bytes", "payload.cpp.backup", "CMakeLists.TxT", "cases"})
+		require_contains(path_byte_policy, token,
+			"canonical UTF-8 path byte policy table");
+	for (const auto token : std::array<std::string_view, 17>{
+		"add_custom_target(aida_c03_standalone_security_receipts",
+		"COMMAND \"$<TARGET_FILE:aida_c03_package_verifier>\" emit-receipts",
+		"_aida_c03_package_signing_step(",
+		"--protector-profile \"standalone-no-imports\"",
+		"--signer-policy \"${AIDA_C03_SIGNER_POLICY_FILE}\"",
+		"--signing-provider \"${AIDA_C03_SIGNING_PROVIDER}\"",
+		"--deadline-ms 900000",
+		"standalone-protector-signature-receipts-v4",
+		"standalone.protector.json", "standalone.signature.json",
+		"DEPENDS AiDAStandaloneNoIATVerify AiDAProtector AiDAProtectorVerify",
+		"AIDA_C03_FINAL_BYTE_ORDERING \"link;scrub;protect;direct-protector-verify;offline-wintrust-receipts\"",
+		"aida_c03_b14_native_worker_package_manifest",
+		"aida_c03_b16_managed_worker_package_manifest",
+		"add_dependencies(aida_c03_distribution_manifest",
+		"aida_c03_standalone_security_receipts",
+		"AIDA_C03_STANDALONE_RECEIPT_TARGET aida_c03_standalone_security_receipts"})
+		require_contains(root_cmake, token,
+			"protected standalone and worker receipt dependency graph");
 	const auto materializer_command = slice_between(cmake_manifest,
 		"add_custom_command(OUTPUT \"${AIDA_C03_SAFE_HEADLESS_MANIFEST}\"",
 		"add_custom_command(OUTPUT \"${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}\"",
@@ -1323,7 +1805,7 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 		"safe-headless developer manifest identity");
 	for (const auto token : std::array<std::string_view, 5>{
 		"AIDA_C03_DEVELOPER_ONLY TRUE",
-		"AIDA_C03_DEVELOPER_SUITE_OUTPUTS \"c03-safe-headless/manifest.json;c03-safe-headless/manifest.sha256\"",
+		"AIDA_C03_DEVELOPER_SUITE_OUTPUTS \"suite/$<CONFIG>/manifest.json;suite/$<CONFIG>/manifest.sha256\"",
 		"${AIDA_C03_SAFE_HEADLESS_MANIFEST}", "${AIDA_C03_SAFE_HEADLESS_DIGEST}",
 		"${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"})
 		require_contains(developer_manifest, token,
@@ -1334,8 +1816,7 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 		"add_custom_target(aida_c03_safe_headless_application_package",
 		"add_executable(aida_c03_safe_headless_manifest_suite",
 		"safe-headless application package boundary");
-	for (const auto token : std::array<std::string_view, 7>{
-		"COMMAND ${CMAKE_COMMAND} -E rm -rf \"$<TARGET_FILE_DIR:${application_target}>/c03-safe-headless\"",
+	for (const auto token : std::array<std::string_view, 6>{
 		"DEPENDS aida_c03_safe_headless_manifest",
 		"AIDA_C03_CUSTOMER_PAYLOAD_FORBIDDEN TRUE",
 		"add_dependencies(${application_target} aida_c03_safe_headless_application_package)",
@@ -1344,9 +1825,9 @@ void verify_distribution_source_leak_policy(const std::string_view producer,
 		"/FI${AIDA_C03_SAFE_HEADLESS_DIGEST_HEADER}"})
 		require_exact_count(application_package, token, 1,
 			"application manifest identity and developer-payload exclusion");
-	for (const auto token : std::array<std::string_view, 4>{
+	for (const auto token : std::array<std::string_view, 6>{
 		"copy_directory", "copy_if_different", "make_directory",
-		"${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}"})
+		"${AIDA_C03_SAFE_HEADLESS_STAGE_ROOT}", "rm -rf", "$<TARGET_FILE_DIR:${application_target}>/c03-safe-headless"})
 		require_absent(application_package, token,
 			"customer application developer-payload copy path");
 }
@@ -1449,6 +1930,23 @@ int main(int argc, char** argv)
 		const auto cmake_manifest = read_bounded(root,
 			"cmake/aida_c03_safe_headless_manifest.cmake",
 			8ULL * 1024ULL * 1024ULL);
+		const auto root_cmake = read_bounded(root,
+			"CMakeLists.txt", 16ULL * 1024ULL * 1024ULL);
+		const auto package_integration = read_bounded(root,
+			"cmake/aida_c03_package_integration.cmake",
+			4ULL * 1024ULL * 1024ULL);
+		const auto dependency_cmake = read_bounded(root,
+			"cmake/aida_c03_dependencies.cmake",
+			4ULL * 1024ULL * 1024ULL);
+		const auto package_verifier = read_bounded(root,
+			"src/standalone/tools/c03_package_verifier/main.cpp",
+			2ULL * 1024ULL * 1024ULL);
+		const auto path_policy = read_bounded(root,
+			"cmake/c03_safe_headless/package_policy_fixture/aida_c03_path_policy.cmake",
+			512ULL * 1024ULL);
+		const auto path_identity = read_bounded(root,
+			"cmake/c03_safe_headless/package_policy_fixture/aida_c03_path_identity.ps1",
+			512ULL * 1024ULL);
 		const auto distribution_producer = read_bounded(root,
 			"packaging/c03_distribution_manifest.ps1",
 			4ULL * 1024ULL * 1024ULL);
@@ -1458,6 +1956,15 @@ int main(int argc, char** argv)
 		const auto distribution_harness = read_bounded(root,
 			"src/standalone/tests/c03/build_packaging_integration_harness.cpp",
 			4ULL * 1024ULL * 1024ULL);
+		const auto package_policy_harness = read_bounded(root,
+			"src/standalone/tests/c03/package_distribution_policy/package_distribution_policy_harness.ps1",
+			2ULL * 1024ULL * 1024ULL);
+		const auto package_policy_stage_spec = read_bounded(root,
+			"src/standalone/tests/c03/package_distribution_policy/policy_stage_spec.json",
+			256ULL * 1024ULL);
+		const auto path_byte_policy = read_bounded(root,
+			"packaging/c03_distribution_fixture/path_byte_policy.json",
+			256ULL * 1024ULL);
 		const auto resource_cases = read_bounded(root,
 			"cmake/c03_safe_headless/target_resource_policy_cases.json",
 			256ULL * 1024ULL);
@@ -1483,9 +1990,17 @@ int main(int argc, char** argv)
 		verify_contract_source(contracts);
 		verify_browser_policy(browser);
 		verify_customer_launch_policy(deploy);
-		verify_manifest_registration(cmake_manifest);
+		verify_manifest_registration(cmake_manifest, path_policy, path_identity,
+			package_integration);
 		verify_distribution_source_leak_policy(distribution_producer,
-			distribution_verifier, distribution_harness, cmake_manifest);
+			distribution_verifier, distribution_harness, package_policy_harness,
+			cmake_manifest, package_integration, root_cmake, package_verifier,
+			dependency_cmake, path_byte_policy);
+		for (const auto token : std::array<std::string_view, 5>{
+				"aida.c03.package-policy-stage-fixture.v1", "AiDAStandalone.exe",
+				"allowlisted_files_v1", "resources/runtime.bin", "inventory_sources"})
+			require_contains(package_policy_stage_spec, token,
+				"copy-only package stage fixture specification");
 		verify_safe_headless_runtime(safe_headless, materializer,
 			cmake_manifest, resource_cases);
 		verify_quality_pipeline(quality_pipeline, cmake_manifest);
@@ -1496,9 +2011,16 @@ int main(int argc, char** argv)
 		require_clean_source(browser, "browser policy source");
 		require_clean_source(safe_headless, "safe-headless runtime source");
 		require_clean_source(cmake_manifest, "safe-headless CMake source");
+		require_clean_source(package_integration, "package integration CMake source");
+		require_clean_source(dependency_cmake, "dependency CMake source");
+		require_clean_source(package_verifier, "production package verifier source");
+		require_clean_source(path_policy, "path policy CMake source");
+		require_clean_source(path_identity, "path identity PowerShell source");
 		require_clean_source(distribution_producer, "distribution producer source");
 		require_clean_source(distribution_verifier, "distribution verifier source");
 		require_clean_source(distribution_harness, "distribution harness source");
+		require_clean_source(package_policy_harness, "package policy harness source");
+		require_clean_source(path_byte_policy, "path byte policy source");
 		require_clean_source(quality_pipeline, "quality pipeline source");
 		require_clean_source(authority_verifier, "authority reproduction verifier");
 		return 0;

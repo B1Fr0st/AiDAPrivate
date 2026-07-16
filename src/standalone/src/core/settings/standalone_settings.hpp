@@ -363,12 +363,9 @@ struct workspace_state_t
     int         active_tab = -1;
     std::string last_active_path;
     std::string active_view = "editor";
-    float       left_width = 220.0f;
     float       right_width = 350.0f;
-    float       bottom_height = 180.0f;
-    bool        left_visible = true;
     bool        right_visible = true;
-    bool        bottom_visible = false;
+    bool        legacy_bottom_visible = false;
 };
 
 struct sandbox_settings_t
@@ -428,6 +425,12 @@ struct settings_sa_t
     int         theme_icon_index = 3;
     std::string custom_icon_path;
     std::string custom_themes_json;
+    int         ui_density = 0;
+    bool        ui_reduced_motion = false;
+    bool        ui_diagnostics_mode = false;
+    std::string ui_table_preferences_json;
+    std::string ui_filter_preferences_json;
+    std::string debugger_definitions_json;
 
 
     bool        enable_reasoning    = false;
@@ -923,6 +926,12 @@ struct settings_sa_t
         return openai_models();
     }
 
+    settings_sa_t ai_runtime_snapshot() const
+    {
+        std::lock_guard<std::recursive_mutex> lock(sa_settings_detail::io_mutex());
+        return *this;
+    }
+
     provider_profile_t* get_active_profile()
     {
         ensure_default_profiles();
@@ -1397,6 +1406,13 @@ struct settings_sa_t
         integer("theme_icon_index", theme_icon_index);
         str("custom_icon_path", custom_icon_path);
         str("custom_themes_json", custom_themes_json);
+        integer("ui_density", ui_density);
+        boolean("ui_reduced_motion", ui_reduced_motion);
+        boolean("ui_diagnostics_mode", ui_diagnostics_mode);
+        str("ui_table_preferences_json", ui_table_preferences_json);
+        str("ui_filter_preferences_json", ui_filter_preferences_json);
+        str("debugger_definitions_json", debugger_definitions_json);
+        ui_density = ui_density == 1 ? 1 : 0;
         if (root.contains("editor_font_size") && root["editor_font_size"].is_number())
             editor_font_size = root["editor_font_size"].get<float>();
         if (root.contains("chat_font_size") && root["chat_font_size"].is_number())
@@ -1530,15 +1546,10 @@ struct settings_sa_t
             workspace.active_tab = json_get_int(ws, "active_tab", -1);
             workspace.last_active_path = json_get_string(ws, "last_active_path", "");
             workspace.active_view = json_get_string(ws, "active_view", "editor");
-            if (ws.contains("left_width") && ws["left_width"].is_number())
-                workspace.left_width = ws["left_width"].get<float>();
             if (ws.contains("right_width") && ws["right_width"].is_number())
                 workspace.right_width = ws["right_width"].get<float>();
-            if (ws.contains("bottom_height") && ws["bottom_height"].is_number())
-                workspace.bottom_height = ws["bottom_height"].get<float>();
-            workspace.left_visible   = json_get_bool(ws, "left_visible", true);
             workspace.right_visible  = json_get_bool(ws, "right_visible", true);
-            workspace.bottom_visible = json_get_bool(ws, "bottom_visible", false);
+            workspace.legacy_bottom_visible = json_get_bool(ws, "bottom_visible", false);
         }
 
         if (root.contains("sandbox") && root["sandbox"].is_object()) {
@@ -1684,6 +1695,12 @@ struct settings_sa_t
         root["theme_icon_index"] = theme_icon_index;
         root["custom_icon_path"] = custom_icon_path;
         root["custom_themes_json"] = custom_themes_json;
+        root["ui_density"] = ui_density == 1 ? 1 : 0;
+        root["ui_reduced_motion"] = ui_reduced_motion;
+        root["ui_diagnostics_mode"] = ui_diagnostics_mode;
+        root["ui_table_preferences_json"] = ui_table_preferences_json;
+        root["ui_filter_preferences_json"] = ui_filter_preferences_json;
+        root["debugger_definitions_json"] = debugger_definitions_json;
 
         root["enable_reasoning"] = enable_reasoning;
         root["reasoning_budget"] = reasoning_budget;
@@ -1800,13 +1817,7 @@ struct settings_sa_t
             {"open_tabs_json", workspace.open_tabs_json},
             {"active_tab", workspace.active_tab},
             {"last_active_path", workspace.last_active_path},
-            {"active_view", workspace.active_view},
-            {"left_width", workspace.left_width},
-            {"right_width", workspace.right_width},
-            {"bottom_height", workspace.bottom_height},
-            {"left_visible", workspace.left_visible},
-            {"right_visible", workspace.right_visible},
-            {"bottom_visible", workspace.bottom_visible}
+            {"active_view", workspace.active_view}
         };
 
         root["sandbox"] = {

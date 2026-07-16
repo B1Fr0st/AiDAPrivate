@@ -14,7 +14,11 @@
 #include "provider_catalog.hpp"
 #include "skills.hpp"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/fonts.hpp"
+#include "../ui/task_center.hpp"
+#include "../ui/application_view_registry.hpp"
+#include "../ui/chat_render.hpp"
 #include "../helpers/globals.h"
 
 #else
@@ -64,13 +68,18 @@
 #include "../anti-tamper/state.hpp"
 #include "../testlab/test_all_features.hpp"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/fonts.hpp"
+#include "../ui/task_center.hpp"
+#include "../ui/application_view_registry.hpp"
+#include "../ui/chat_render.hpp"
 
 #include "../helpers/globals.h"
 #include "../session/analysis_session.hpp"
 
 #include <thread>
 #include <mutex>
+#include <sstream>
 #include <condition_variable>
 #include <atomic>
 #include <deque>
@@ -79,11 +88,13 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "../editor/code_editor.hpp"
 #include <sstream>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <exception>
 #include <utility>
@@ -94,14 +105,21 @@
 
 #endif
 
+#include "../editor/code_editor.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -186,7 +204,21 @@ bool submit_chat_task(const char* label,
     sub.domain = domain;
     sub.priority = priority;
     sub.body = std::move(body);
-    return aida::infra::executor::submit(std::move(sub)).submitted;
+    const auto submitted = aida::infra::executor::submit(std::move(sub));
+    if (submitted.submitted && submitted.task_id != 0) {
+        aida::ui::task_center::task_registration_t registration;
+        registration.owner = "automation";
+        registration.owner_view = "view.ai_chat";
+        registration.owner_action = label ? label : "ai_chat.task";
+        registration.label = label ? label : "AI Chat task";
+        registration.stage = "Queued";
+        registration.cancellation_is_safe = false;
+        registration.callbacks.focus = [] {
+            (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.ai_chat"));
+        };
+        (void)aida::ui::task_center::register_executor_job(submitted.task_id, std::move(registration));
+    }
+    return submitted.submitted;
 }
 
 void log_shutdown_queue_snapshot(const char* phase)
@@ -294,6 +326,7 @@ struct tool_approval_t {
     bool                pending   = false;
     bool                approved  = false;
     bool                answered  = false;
+    std::uint64_t       generation = 0;
     std::string         tool_name;
     std::string         tool_args_preview;
 };
@@ -792,6 +825,8 @@ bool request_tool_approval(const std::string& name, const json& arguments)
         s_tool_approval.tool_name = name;
         try { s_tool_approval.tool_args_preview = arguments.dump(2).substr(0, 500); }
         catch (...) { s_tool_approval.tool_args_preview = "(unable to display)"; }
+        ++s_tool_approval.generation;
+        if (s_tool_approval.generation == 0) ++s_tool_approval.generation;
         s_tool_approval.pending = true;
         s_tool_approval.answered = false;
         s_tool_approval.approved = false;
@@ -1699,14 +1734,22 @@ void run_agentic(std::string user_message,
                  std::vector<std::pair<std::string, std::string>> history)
 {
 
+    settings_sa_t settings_snapshot;
+    try {
+        settings_snapshot = g_sa_settings.ai_runtime_snapshot();
+    } catch (...) {
+        post_update(ai_update_t::ERR, "Unable to snapshot AI settings.");
+        return;
+    }
+
     reset_approval_counters();
 
     workflow_tools::get_repetition_detector().reset();
 
     diag::log_tagged_fmt("chat",
         "run_agentic_enter provider=%.40s model=%.80s user_len=%zu history=%zu",
-        g_sa_settings.selected_provider_id().c_str(),
-        g_sa_settings.selected_model_id().c_str(),
+        settings_snapshot.selected_provider_id().c_str(),
+        settings_snapshot.selected_model_id().c_str(),
         user_message.size(),
         history.size());
 
@@ -1735,10 +1778,10 @@ void run_agentic(std::string user_message,
     post_update(ai_update_t::THINKING);
     output_log::push(bottom_tab_t::output, "[ai] New request: " + user_message.substr(0, 120) + (user_message.size() > 120 ? "..." : ""));
 
-    const bool force_xml = g_sa_settings.force_xml_tools;
+    const bool force_xml = settings_snapshot.force_xml_tools;
     std::string system_prompt = build_system_prompt(force_xml);
 
-    const int max_turns = (std::max)(g_sa_settings.max_agentic_rounds, 1);
+    const int max_turns = (std::max)(settings_snapshot.max_agentic_rounds, 1);
     int64_t budget_used = 0;
 
 
@@ -1770,8 +1813,7 @@ void run_agentic(std::string user_message,
             if (turn > 0)
                 post_update(ai_update_t::THINKING, "Processing tool results...");
 
-            int64_t pre_in = cost_tracking::session_input_tokens;
-            int64_t pre_out = cost_tracking::session_output_tokens;
+            const auto pre_usage = cost_tracking::snapshot();
 
             std::string response;
             try {
@@ -1783,8 +1825,9 @@ void run_agentic(std::string user_message,
             }
 
 
-            budget_used += (cost_tracking::session_input_tokens - pre_in) +
-                           (cost_tracking::session_output_tokens - pre_out);
+            const auto post_usage = cost_tracking::snapshot();
+            budget_used += (post_usage.input_tokens - pre_usage.input_tokens) +
+                           (post_usage.output_tokens - pre_usage.output_tokens);
 
             if (s_cancel.load()) {
                 post_update(ai_update_t::COMPLETE);
@@ -2016,7 +2059,7 @@ void run_agentic(std::string user_message,
 
 
         {
-            std::string active_model = g_sa_settings.get_active_model();
+            std::string active_model = settings_snapshot.get_active_model();
             auto& model_info = context_mgmt::get_model_info(active_model);
             int ctx_window = model_info.context_window;
 
@@ -2034,7 +2077,7 @@ void run_agentic(std::string user_message,
             estimated_tokens += static_cast<int>(context_mgmt::estimate_token_count(system_prompt));
 
             double usage_fraction = static_cast<double>(estimated_tokens) / static_cast<double>(ctx_window);
-            if (usage_fraction > g_sa_settings.condense_threshold && messages.size() > 4) {
+            if (usage_fraction > settings_snapshot.condense_threshold && messages.size() > 4) {
                 output_log::push(bottom_tab_t::output,
                     "[ai] Context at " + std::to_string(static_cast<int>(usage_fraction * 100)) +
                     "% — condensing conversation...");
@@ -2132,8 +2175,8 @@ void run_agentic(std::string user_message,
         {
             std::string sid = get_chat_session_id_locked();
             if (!sid.empty()) {
-                std::string active_model_id = g_sa_settings.get_active_model();
-                std::string provider_id     = g_sa_settings.selected_provider_id();
+                std::string active_model_id = settings_snapshot.get_active_model();
+                std::string provider_id     = settings_snapshot.selected_provider_id();
                 const aida::provider::model_info_t* mi =
                     aida::provider::catalog::get_model(provider_id, active_model_id);
                 aida::session::usage_tokens_t usage;
@@ -2255,32 +2298,94 @@ void restore_workspace_state()
     else
         file_browser::refresh();
 
-    const float restored_left_w = g_sa_settings.workspace.left_width;
-    const float restored_right_w = g_sa_settings.workspace.right_width;
-    aida::ui_thread::post([restored_left_w, restored_right_w]() {
-            globals::ui::panel_left_w = restored_left_w;
-            globals::ui::panel_right_w = restored_right_w;
-        },
-        "chat", "restore_workspace_widths", "bg_init");
-
     if (!g_sa_settings.workspace.open_tabs_json.empty()) {
         try {
-            auto tabs = json::parse(g_sa_settings.workspace.open_tabs_json);
-            if (tabs.is_array()) {
-                for (const auto& item : tabs) {
-                    if (!item.is_string())
+            const auto document = json::parse(g_sa_settings.workspace.open_tabs_json);
+            const json* tab_items = document.is_array() ? &document : nullptr;
+            if (document.is_object()) {
+                const bool supported = document.value("schema", std::string{}) ==
+                        "aida.programming-documents" &&
+                    document.value("version", 0) == 1;
+                const auto found = document.find("tabs");
+                if (supported && found != document.end() && found->is_array())
+                    tab_items = &*found;
+            }
+            if (tab_items) {
+                std::size_t restored_tab_count = 0;
+                for (const auto& item : *tab_items) {
+                    if (restored_tab_count >= 4096)
+                        break;
+                    const bool legacy = item.is_string();
+                    if (!legacy && !item.is_object())
                         continue;
-                    const std::string path = item.get<std::string>();
+                    const std::string path = legacy
+                        ? item.get<std::string>()
+                        : item.value("path", std::string{});
+                    if (path.empty())
+                        continue;
                     std::ifstream ifs(path, std::ios::binary);
                     if (!ifs.is_open())
                         continue;
                     std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
                     const auto filename = std::filesystem::path(path).filename().string();
                     file_tabs::open_or_focus(path, filename, content);
+                    ++restored_tab_count;
+                    if (!legacy && file_tabs::is_valid_tab_index(file_tabs::active_tab)) {
+                        auto& restored = file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)];
+                        restored.document_id = item.value("document_id", std::uint64_t{0});
+                        restored.group_id = item.value("group_id", std::uint32_t{0});
+                        restored.pinned = item.value("pinned", false);
+                        restored.caret_line = item.value("caret_line", 0);
+                        restored.caret_column = item.value("caret_column", 0);
+                    }
                 }
-                if (g_sa_settings.workspace.active_tab >= 0 &&
-                    g_sa_settings.workspace.active_tab < static_cast<int>(file_tabs::tabs.size()))
-                    file_tabs::active_tab = g_sa_settings.workspace.active_tab;
+                file_tabs::normalize_document_identities();
+                if (document.is_object()) {
+                    const auto groups = document.find("groups");
+                    if (groups != document.end() && groups->is_array()) {
+                        std::size_t restored_group_count = 0;
+                        for (const auto& group_item : *groups) {
+                            if (restored_group_count >= 256) break;
+                            if (!group_item.is_object()) continue;
+                            ++restored_group_count;
+                            const auto group = group_item.value("group_id", std::uint32_t{0});
+                            const auto active_document = group_item.value(
+                                "active_document_id", std::uint64_t{0});
+                            const int active_index = file_tabs::find_document(active_document);
+                            if (active_index >= 0 &&
+                                file_tabs::tabs[file_tabs::tab_index(active_index)].group_id == group)
+                                file_tabs::active_document_by_group[group] = active_document;
+                            auto& history = file_tabs::navigation_by_group[group];
+                            const auto restore_history = [&](const char* name,
+                                                             std::deque<file_tabs::navigation_entry_t>& output) {
+                                const auto values = group_item.find(name);
+                                if (values == group_item.end() || !values->is_array()) return;
+                                for (const auto& value : *values) {
+                                    if (output.size() >= 128) break;
+                                    if (!value.is_object()) continue;
+                                    file_tabs::navigation_entry_t entry;
+                                    entry.document_id = value.value("document_id", std::uint64_t{0});
+                                    entry.caret_line = (std::max)(value.value("line", 0), 0);
+                                    entry.caret_column = (std::max)(value.value("column", 0), 0);
+                                    const int index = file_tabs::find_document(entry.document_id);
+                                    if (index >= 0 &&
+                                        file_tabs::tabs[file_tabs::tab_index(index)].group_id == group)
+                                        output.push_back(entry);
+                                }
+                            };
+                            restore_history("back", history.back);
+                            restore_history("forward", history.forward);
+                        }
+                    }
+                    const auto active_document = document.value(
+                        "active_document_id", std::uint64_t{0});
+                    const int active_index = file_tabs::find_document(active_document);
+                    if (active_index >= 0)
+                        file_tabs::switch_to(active_index, false);
+                } else if (g_sa_settings.workspace.active_tab >= 0 &&
+                    g_sa_settings.workspace.active_tab < static_cast<int>(file_tabs::tabs.size())) {
+                    file_tabs::switch_to(g_sa_settings.workspace.active_tab, false);
+                }
             }
         } catch (...) {
         }
@@ -2296,14 +2401,62 @@ void restore_workspace_state()
 void persist_workspace_state()
 {
     g_sa_settings.workspace.root_path = file_browser::current_dir;
-    g_sa_settings.workspace.left_width = globals::ui::panel_left_w;
-    g_sa_settings.workspace.right_width = globals::ui::panel_right_w;
     g_sa_settings.workspace.active_tab = file_tabs::active_tab;
 
-    json tabs = json::array();
-    for (const auto& tab : file_tabs::tabs)
-        tabs.push_back(tab.filepath);
-    g_sa_settings.workspace.open_tabs_json = tabs.dump();
+    file_tabs::snapshot_active_to_tab();
+    json document = {
+        {"schema", "aida.programming-documents"},
+        {"version", 1},
+        {"tabs", json::array()},
+        {"groups", json::array()},
+        {"active_document_id", std::uint64_t{0}}
+    };
+    file_tabs::normalize_document_identities();
+    if (file_tabs::is_valid_tab_index(file_tabs::active_tab))
+        document["active_document_id"] =
+            file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)].document_id;
+    for (const auto& tab : file_tabs::tabs) {
+        if (tab.filepath.empty())
+            continue;
+        document["tabs"].push_back({
+            {"path", tab.filepath},
+            {"document_id", tab.document_id},
+            {"group_id", tab.group_id},
+            {"pinned", tab.pinned},
+            {"caret_line", tab.caret_line},
+            {"caret_column", tab.caret_column}
+        });
+    }
+    std::vector<std::uint32_t> persisted_groups;
+    for (const auto& tab : file_tabs::tabs) {
+        if (tab.filepath.empty() ||
+            std::find(persisted_groups.begin(), persisted_groups.end(), tab.group_id) !=
+                persisted_groups.end())
+            continue;
+        persisted_groups.push_back(tab.group_id);
+        json group = {
+            {"group_id", tab.group_id},
+            {"active_document_id", file_tabs::active_document_by_group[tab.group_id]},
+            {"back", json::array()},
+            {"forward", json::array()}
+        };
+        const auto history = file_tabs::navigation_by_group.find(tab.group_id);
+        if (history != file_tabs::navigation_by_group.end()) {
+            const auto append_history = [](json& target,
+                                           const std::deque<file_tabs::navigation_entry_t>& source) {
+                for (const auto& entry : source)
+                    target.push_back({
+                        {"document_id", entry.document_id},
+                        {"line", entry.caret_line},
+                        {"column", entry.caret_column}
+                    });
+            };
+            append_history(group["back"], history->second.back);
+            append_history(group["forward"], history->second.forward);
+        }
+        document["groups"].push_back(std::move(group));
+    }
+    g_sa_settings.workspace.open_tabs_json = document.dump();
 
     if (code_editor::active && !code_editor::filepath.empty()) {
         g_sa_settings.workspace.last_active_path = code_editor::filepath;
@@ -2438,7 +2591,6 @@ void register_standalone_protection() {
 }
 
 
-bool g_settings_open = false;
 
 
 __declspec(noinline) static DWORD seh_settings_load(settings_sa_t& s, bool& out_ok)
@@ -2498,6 +2650,13 @@ void init_standalone_chat()
     if (seh_load != 0)
         diag::log_tagged_fmt("init_chat", "settings_load_seh code=0x%08lX last_err=%lu", seh_load, GetLastError());
     diag::log_tagged_fmt("init_chat", "settings_load_done loaded=%d", settings_loaded ? 1 : 0);
+
+    aida::ui::design::set_preferences({
+        g_sa_settings.ui_density == 1
+            ? aida::ui::design::density_t::comfortable
+            : aida::ui::design::density_t::compact,
+        g_sa_settings.ui_reduced_motion
+    });
 
 
     themes::active = std::clamp(g_sa_settings.active_theme_idx, 0, themes::count - 1);
@@ -2585,8 +2744,14 @@ void init_standalone_chat()
     diag::log_tagged("init_chat", "ai_client_create_done");
 
     diag::log_tagged("init_chat", "auth_store_load_start");
-    (void)aida::auth::store::load();
-    diag::log_tagged("init_chat", "auth_store_load_done");
+    const bool auth_store_loaded = aida::auth::store::load();
+    if (auth_store_loaded) {
+        diag::log_tagged("init_chat", "auth_store_load_done ok=1");
+    } else {
+        const std::string auth_store_error = aida::auth::store::last_error();
+        diag::log_tagged_fmt("init_chat", "auth_store_load_done ok=0 error=%s",
+            auth_store_error.empty() ? "auth_store_load_failed" : auth_store_error.c_str());
+    }
 
     diag::log_tagged("init_chat", "session_store_init_start");
     (void)aida::session::initialize();
@@ -3012,8 +3177,9 @@ void tick_ai_chat()
     ai.thinking_text  = "";
     ai.text           = "";
     {
-        const std::string sel_provider = g_sa_settings.selected_provider_id();
-        const std::string sel_model    = g_sa_settings.selected_model_id();
+        const auto settings = g_sa_settings.ai_runtime_snapshot();
+        const std::string sel_provider = settings.selected_provider_id();
+        const std::string sel_model    = settings.selected_model_id();
         std::string m_disp = sel_model;
         if (!sel_provider.empty() && !sel_model.empty()) {
             const auto* m = aida::provider::catalog::get_model(sel_provider, sel_model);
@@ -3021,7 +3187,7 @@ void tick_ai_chat()
                 m_disp = m->name;
         }
         if (m_disp.empty()) {
-            auto* prof = g_sa_settings.get_active_profile();
+            const auto* prof = settings.get_active_profile();
             if (prof) m_disp = prof->model;
         }
         ai.model_id = m_disp;
@@ -3065,7 +3231,8 @@ void tick_ai_chat()
             }
             if (user_count == 1) {
                 std::string first_user_text = user_text;
-                std::string provider_id     = g_sa_settings.selected_provider_id();
+                std::string provider_id =
+                    g_sa_settings.ai_runtime_snapshot().selected_provider_id();
                 (void)submit_chat_task(
                     "chat.auto_title",
                     aida::infra::executor::domain_t::general,
@@ -3281,6 +3448,1232 @@ std::string start_new_conversation()
 
 #endif
 
+namespace aida::automation_ui {
+
+namespace {
+
+constexpr std::size_t max_evidence_bytes = 64U * 1024U;
+constexpr std::size_t max_rendered_messages = 256U;
+constexpr std::size_t max_evidence_items = 256U;
+std::mutex s_evidence_mutex;
+std::deque<evidence_envelope_t> s_evidence;
+std::atomic<std::uint64_t> s_evidence_sequence{1};
+std::string s_loaded_evidence_session;
+std::mutex s_editor_proposal_mutex;
+editor_proposal_snapshot_t s_editor_proposal;
+
+std::uint64_t hash_append(std::uint64_t hash, std::string_view text)
+{
+    for (const char character : text) {
+        const auto value = static_cast<unsigned char>(character);
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::string bounded_metadata_string(std::string value, std::size_t limit)
+{
+    if (value.size() > limit) value.resize(limit);
+    return value;
+}
+
+std::string evidence_session_id()
+{
+    std::string session = chat_active_session();
+    if (session.empty()) session = conversations::current_id;
+    return bounded_metadata_string(std::move(session), 256U);
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::filesystem::path evidence_metadata_path(const std::string& session)
+{
+    const std::string directory = conversations::get_storage_dir();
+    if (directory.empty() || session.empty()) return {};
+    std::uint64_t hash = hash_append(14695981039346656037ULL, session);
+    return std::filesystem::path(directory) /
+        ("evidence-" + std::to_string(hash) + ".json");
+}
+
+nlohmann::json evidence_metadata_json(const evidence_envelope_t& item)
+{
+    return {
+        {"id", item.id},
+        {"project_id", item.project_id},
+        {"workspace_id", item.workspace_id},
+        {"session_id", item.session_id},
+        {"source_view_id", item.source_view_id},
+        {"source_kind", item.source_kind},
+        {"entity_id", item.entity_id},
+        {"display_label", item.display_label},
+        {"return_target", item.return_target},
+        {"address", item.address},
+        {"revision", item.revision},
+        {"generation", item.generation},
+        {"snapshot_hash", item.snapshot_hash},
+        {"content_hash", item.content_hash},
+        {"created_ms", item.created_ms},
+        {"truncated", item.truncated},
+        {"sensitive", item.sensitive}
+	};
+}
+#endif
+
+void persist_evidence_metadata(const std::string& session,
+                               const std::vector<evidence_envelope_t>& items)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    (void)session;
+    (void)items;
+#else
+    if (session.empty()) return;
+    try {
+        const auto path = evidence_metadata_path(session);
+        if (path.empty()) return;
+        std::filesystem::create_directories(path.parent_path());
+        nlohmann::json document;
+        document["schema"] = "aida.conversation.evidence-metadata";
+        document["version"] = 1;
+        document["conversation_id"] = session;
+        document["items"] = nlohmann::json::array();
+        const std::size_t first = items.size() > max_evidence_items
+            ? items.size() - max_evidence_items : 0U;
+        for (std::size_t index = first; index < items.size(); ++index)
+            document["items"].push_back(evidence_metadata_json(items[index]));
+        const auto temporary = path.wstring() + L".tmp";
+        {
+            std::ofstream stream(std::filesystem::path(temporary), std::ios::binary | std::ios::trunc);
+            if (!stream.is_open()) return;
+            const std::string encoded = document.dump(2);
+            stream.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+            stream.flush();
+            if (!stream.good()) return;
+        }
+        if (!MoveFileExW(temporary.c_str(), path.wstring().c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            std::error_code ignored;
+            std::filesystem::remove(std::filesystem::path(temporary), ignored);
+        }
+    } catch (...) {
+    }
+#endif
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::string json_metadata_string(const nlohmann::json& object, const char* key,
+                                 std::size_t limit)
+{
+    const auto found = object.find(key);
+    if (found == object.end() || !found->is_string()) return {};
+    return bounded_metadata_string(found->get<std::string>(), limit);
+}
+
+std::uint64_t json_metadata_u64(const nlohmann::json& object, const char* key)
+{
+    const auto found = object.find(key);
+    if (found == object.end()) return 0;
+    if (found->is_number_unsigned()) return found->get<std::uint64_t>();
+    if (found->is_number_integer()) {
+        const auto value = found->get<std::int64_t>();
+        return value > 0 ? static_cast<std::uint64_t>(value) : 0;
+    }
+    return 0;
+}
+
+bool json_metadata_bool(const nlohmann::json& object, const char* key)
+{
+    const auto found = object.find(key);
+	return found != object.end() && found->is_boolean() && found->get<bool>();
+}
+#endif
+
+std::deque<evidence_envelope_t> load_evidence_metadata(const std::string& session)
+{
+    std::deque<evidence_envelope_t> loaded;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    (void)session;
+#else
+    if (session.empty()) return loaded;
+    try {
+        std::ifstream stream(evidence_metadata_path(session), std::ios::binary);
+        if (!stream.is_open()) return loaded;
+        const auto document = nlohmann::json::parse(stream, nullptr, false);
+        if (document.is_discarded() || !document.is_object()) return loaded;
+        const auto schema = document.find("schema");
+        const auto version = document.find("version");
+        const auto conversation = document.find("conversation_id");
+        const auto items = document.find("items");
+        if (schema == document.end() || !schema->is_string() ||
+            schema->get<std::string>() != "aida.conversation.evidence-metadata" ||
+            version == document.end() || !version->is_number_integer() || version->get<int>() != 1 ||
+            conversation == document.end() || !conversation->is_string() ||
+            conversation->get<std::string>() != session ||
+            items == document.end() || !items->is_array()) return loaded;
+        for (const auto& object : *items) {
+            if (loaded.size() >= max_evidence_items) break;
+            if (!object.is_object()) continue;
+            evidence_envelope_t item;
+            item.id = json_metadata_string(object, "id", 256U);
+            item.project_id = json_metadata_string(object, "project_id", 256U);
+            item.workspace_id = json_metadata_string(object, "workspace_id", 256U);
+            item.session_id = json_metadata_string(object, "session_id", 256U);
+            item.source_view_id = json_metadata_string(object, "source_view_id", 256U);
+            item.source_kind = json_metadata_string(object, "source_kind", 128U);
+            item.entity_id = json_metadata_string(object, "entity_id", 512U);
+            item.display_label = json_metadata_string(object, "display_label", 512U);
+            item.return_target = json_metadata_string(object, "return_target", 512U);
+            item.address = json_metadata_u64(object, "address");
+            item.revision = json_metadata_u64(object, "revision");
+            item.generation = json_metadata_u64(object, "generation");
+            item.snapshot_hash = json_metadata_u64(object, "snapshot_hash");
+            item.content_hash = json_metadata_u64(object, "content_hash");
+            item.created_ms = json_metadata_u64(object, "created_ms");
+            item.truncated = json_metadata_bool(object, "truncated");
+            item.sensitive = json_metadata_bool(object, "sensitive");
+            item.stale = true;
+            item.stale_reason = "Snapshot content is not persisted; return to source and recapture.";
+            if (item.id.empty() || item.source_view_id.empty() || item.source_kind.empty() ||
+                item.entity_id.empty() || item.content_hash == 0) continue;
+            if (item.session_id.empty()) item.session_id = session;
+            if (item.session_id != session) continue;
+            loaded.push_back(std::move(item));
+        }
+    } catch (...) {
+    }
+#endif
+    return loaded;
+}
+
+void synchronize_evidence_session()
+{
+    const std::string session = evidence_session_id();
+    {
+        std::lock_guard<std::mutex> lock(s_evidence_mutex);
+        if (session == s_loaded_evidence_session) return;
+    }
+    auto loaded = load_evidence_metadata(session);
+    std::lock_guard<std::mutex> lock(s_evidence_mutex);
+    s_evidence = std::move(loaded);
+    s_loaded_evidence_session = session;
+}
+
+void remove_evidence_metadata(const std::string& session)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    (void)session;
+#else
+    try {
+        std::error_code ignored;
+        std::filesystem::remove(evidence_metadata_path(session), ignored);
+    } catch (...) {
+    }
+#endif
+    std::lock_guard<std::mutex> lock(s_evidence_mutex);
+    if (s_loaded_evidence_session == session) {
+        s_evidence.clear();
+        s_loaded_evidence_session.clear();
+    }
+}
+
+std::uint64_t message_fingerprint(const ChatMessage& message)
+{
+    std::uint64_t hash = 14695981039346656037ULL;
+    hash = hash_append(hash, message.text);
+    hash = hash_append(hash, message.thinking_text);
+    hash = hash_append(hash, message.tool_name);
+    hash = hash_append(hash, message.model_id);
+    hash ^= static_cast<std::uint64_t>(message.timestamp);
+    hash *= 1099511628211ULL;
+    hash ^= message.is_user ? 1ULL : 0ULL;
+    hash *= 1099511628211ULL;
+    hash ^= message.is_tool_result ? 1ULL : 0ULL;
+    return hash;
+}
+
+const ChatMessage* resolve_message(const message_identity_t& identity, std::string& reason)
+{
+    const std::string session = chat_active_session();
+    if (identity.session_id != session) {
+        reason = "The conversation changed; reopen the message menu.";
+        return nullptr;
+    }
+    if (identity.index >= g_chat_messages.size()) {
+        reason = "The message no longer exists.";
+        return nullptr;
+    }
+    const auto& message = g_chat_messages[identity.index];
+    if (message.timestamp != identity.timestamp || message_fingerprint(message) != identity.fingerprint) {
+        reason = "The message changed after this menu was opened; reopen it.";
+        return nullptr;
+    }
+    reason.clear();
+    return &message;
+}
+
+action_result_t failed(std::string reason)
+{
+    action_result_t result;
+    result.detail = std::move(reason);
+    return result;
+}
+
+action_result_t completed(std::string detail = {})
+{
+    action_result_t result;
+    result.succeeded = true;
+    result.detail = std::move(detail);
+    return result;
+}
+
+}
+
+std::size_t message_count()
+{
+    return g_chat_messages.size();
+}
+
+message_identity_t message_identity(std::size_t index)
+{
+    message_identity_t result;
+    result.session_id = chat_active_session();
+    result.index = index;
+    if (index >= g_chat_messages.size()) return result;
+    const auto& message = g_chat_messages[index];
+    result.timestamp = message.timestamp;
+    result.fingerprint = message_fingerprint(message);
+    return result;
+}
+
+bool message_selection(const message_identity_t& identity, message_selection_t& selection, std::string& reason)
+{
+    const ChatMessage* message = resolve_message(identity, reason);
+    if (!message) return false;
+    selection = message_selection_t{};
+    selection.identity = identity;
+    selection.text = message->text;
+    selection.reasoning = message->thinking_text;
+    selection.tool_name = message->tool_name;
+    selection.model_id = message->model_id;
+    selection.is_user = message->is_user;
+    selection.is_tool_result = message->is_tool_result;
+    selection.streaming = message->streaming;
+    return true;
+}
+
+bool open_message_context(const message_identity_t& identity, context_open_origin_t origin, message_context_request_t& request, std::string& reason)
+{
+    request = message_context_request_t{};
+    request.origin = origin;
+    return message_selection(identity, request.selection, reason);
+}
+
+action_result_t stage_editor_proposal(const message_identity_t& source,
+                                      const std::string& proposed_content)
+{
+    std::string reason;
+    if (!resolve_message(source, reason)) return failed(std::move(reason));
+    if (proposed_content.empty()) return failed("The proposed editor content is empty.");
+    const std::uint64_t base_hash = code_editor_widget::document_content_fingerprint();
+    const std::string origin = "chat:" + source.session_id + ":" + std::to_string(source.fingerprint);
+    if (!code_editor_widget::begin_agent_edit(origin))
+        return failed(code_editor_widget::last_error());
+    if (!code_editor_widget::propose_full_content(proposed_content)) {
+        code_editor_widget::cancel_agent_edit();
+        return failed(code_editor_widget::last_error());
+    }
+    std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+    s_editor_proposal = editor_proposal_snapshot_t{};
+    s_editor_proposal.id = "proposal.editor." + std::to_string(source.fingerprint);
+    s_editor_proposal.source = source;
+    s_editor_proposal.target_document_id = "document.code";
+    s_editor_proposal.base_content_hash = base_hash;
+    s_editor_proposal.generation = source.fingerprint;
+    s_editor_proposal.pending = true;
+    s_editor_proposal.detail = "Review every editor hunk before applying.";
+    action_result_t result = completed("Editor proposal staged for per-hunk review.");
+    result.target_view_id = "document.code";
+    return result;
+}
+
+editor_proposal_snapshot_t editor_proposal_snapshot()
+{
+    std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+    editor_proposal_snapshot_t result = s_editor_proposal;
+    if (result.pending && code_editor_widget::document_content_fingerprint() != result.base_content_hash) {
+        result.stale = true;
+        result.detail = "The code document changed after the proposal was staged; reject or regenerate it.";
+    }
+    return result;
+}
+
+action_capability_t message_action_capability(const message_identity_t& identity, message_action_t action)
+{
+    action_capability_t result;
+    std::string reason;
+    const ChatMessage* message = resolve_message(identity, reason);
+    if (!message) {
+        result.disabled_reason = std::move(reason);
+        return result;
+    }
+    const bool busy = is_ai_busy();
+    switch (action) {
+        case message_action_t::copy_text:
+            result.enabled = !message->text.empty();
+            result.disabled_reason = result.enabled ? "" : "This message has no response text to copy.";
+            break;
+        case message_action_t::copy_reasoning:
+            result.enabled = message->has_thinking && !message->thinking_text.empty();
+            result.disabled_reason = result.enabled ? "" : "This message has no displayed reasoning text.";
+            break;
+        case message_action_t::copy_tool_name:
+            result.enabled = !message->tool_name.empty();
+            result.disabled_reason = result.enabled ? "" : "This message is not associated with a named tool.";
+            break;
+        case message_action_t::send_to_chat_input:
+        case message_action_t::create_evidence_handoff:
+            result.enabled = !message->text.empty();
+            result.disabled_reason = result.enabled ? "" : "This message has no text that can be handed off.";
+            break;
+        case message_action_t::edit_message:
+            result.enabled = message->is_user && !message->streaming && !busy;
+            result.disabled_reason = !message->is_user ? "Only user messages can be edited." :
+                message->streaming ? "Wait for the streaming message to finish." :
+                busy ? "Cancel or wait for the active AI operation before editing history." : "";
+            break;
+        case message_action_t::retry_from_here:
+            if (message->is_user) {
+                result.disabled_reason = "Choose an assistant response to retry from.";
+                break;
+            }
+            if (busy) {
+                result.disabled_reason = "Cancel or wait for the active AI operation before retrying.";
+                break;
+            }
+            for (std::size_t index = identity.index; index > 0; --index) {
+                if (g_chat_messages[index - 1U].is_user && !g_chat_messages[index - 1U].text.empty()) {
+                    result.enabled = true;
+                    break;
+                }
+            }
+            if (!result.enabled) result.disabled_reason = "No earlier user message is available to retry.";
+            break;
+        case message_action_t::delete_message:
+            result.enabled = !message->streaming && !busy;
+            result.disabled_reason = message->streaming ? "Wait for the streaming message to finish." :
+                busy ? "Cancel or wait for the active AI operation before deleting history." : "";
+            break;
+        case message_action_t::inspect_tool_activity:
+            result.enabled = message->is_tool_result || !message->tool_name.empty();
+            result.disabled_reason = result.enabled ? "" : "This message has no MCP tool activity to inspect.";
+            break;
+        case message_action_t::review_change:
+        case message_action_t::apply_change:
+        case message_action_t::reject_change: {
+            const auto proposal = editor_proposal_snapshot();
+            const bool linked = proposal.pending && proposal.source.session_id == identity.session_id &&
+                proposal.source.fingerprint == identity.fingerprint;
+            if (!linked) {
+                result.disabled_reason = "No staged change identity is linked to this chat message.";
+                break;
+            }
+            if (proposal.stale) {
+                result.disabled_reason = proposal.detail;
+                break;
+            }
+            if (action == message_action_t::apply_change && code_editor_widget::pending_hunk_count() == 0) {
+                result.disabled_reason = "The staged change has no pending editor hunks to apply.";
+                break;
+            }
+            result.enabled = true;
+            break;
+        }
+            break;
+        case message_action_t::cancel_active_operation:
+            result.enabled = busy;
+            result.disabled_reason = busy ? "" : "No AI operation is currently running.";
+            break;
+    }
+    return result;
+}
+
+action_result_t execute_message_action(const message_identity_t& identity, message_action_t action)
+{
+    const auto capability = message_action_capability(identity, action);
+    if (!capability.enabled) return failed(capability.disabled_reason);
+    std::string reason;
+    const ChatMessage* message = resolve_message(identity, reason);
+    if (!message) return failed(std::move(reason));
+    const std::string text = message->text;
+    switch (action) {
+        case message_action_t::copy_text:
+            ImGui::SetClipboardText(text.c_str());
+            return completed("Message text copied.");
+        case message_action_t::copy_reasoning:
+            ImGui::SetClipboardText(message->thinking_text.c_str());
+            return completed("Reasoning text copied.");
+        case message_action_t::copy_tool_name:
+            ImGui::SetClipboardText(message->tool_name.c_str());
+            return completed("Tool name copied.");
+        case message_action_t::send_to_chat_input:
+            if (text.size() <= 3800U) {
+                chat_inject::post(text);
+                return completed("Message text added to the chat input.");
+            }
+            chat_inject::post(text.substr(0, 3760U) + "\n[Message truncated for chat input]");
+            return completed("A bounded excerpt was added to the chat input.");
+        case message_action_t::create_evidence_handoff: {
+            action_result_t result = completed("Evidence handoff created.");
+            result.evidence.source = identity;
+            result.evidence.source_kind = message->is_tool_result ? "tool_result" :
+                message->is_user ? "user_message" : "assistant_message";
+            result.evidence.tool_name = message->tool_name;
+            result.evidence.truncated = text.size() > max_evidence_bytes;
+            result.evidence.text.assign(text.data(), (std::min)(text.size(), max_evidence_bytes));
+            evidence_envelope_t envelope;
+            envelope.id = "evidence.chat." + std::to_string(identity.fingerprint);
+            envelope.session_id = identity.session_id;
+            envelope.source_view_id = "view.ai_chat";
+            envelope.source_kind = result.evidence.source_kind;
+            envelope.entity_id = "message." + std::to_string(identity.index) + "." +
+                std::to_string(identity.timestamp);
+            envelope.display_label = message->is_tool_result ? "Tool result" :
+                message->is_user ? "User message" : "Assistant response";
+            envelope.return_target = envelope.entity_id;
+            envelope.excerpt = result.evidence.text;
+            envelope.revision = identity.fingerprint;
+            envelope.generation = static_cast<std::uint64_t>(identity.timestamp);
+            envelope.snapshot_hash = identity.fingerprint;
+            envelope.content_hash = identity.fingerprint;
+            envelope.truncated = result.evidence.truncated;
+            result.evidence.evidence_id = register_evidence(std::move(envelope));
+            if (result.evidence.evidence_id.empty())
+                return failed("The message evidence identity could not be registered.");
+            return result;
+        }
+        case message_action_t::edit_message:
+            chat_edit::active = true;
+            chat_edit::msg_idx = static_cast<int>(identity.index);
+            std::snprintf(chat_edit::buf, sizeof(chat_edit::buf), "%s", text.c_str());
+            return completed("Message editor opened.");
+        case message_action_t::delete_message:
+            g_chat_messages.erase(g_chat_messages.begin() + static_cast<std::ptrdiff_t>(identity.index));
+            conversations::save_current();
+            return completed("Message deleted.");
+        case message_action_t::inspect_tool_activity: {
+            action_result_t result = completed("Open the MCP Log view for the complete activity record.");
+            result.target_view_id = "view.mcp_log";
+            return result;
+        }
+        case message_action_t::cancel_active_operation:
+            chat_request_cancel();
+            return completed("Cancellation requested.");
+        case message_action_t::retry_from_here:
+            for (std::size_t index = identity.index; index > 0; --index) {
+                const auto& candidate = g_chat_messages[index - 1U];
+                if (!candidate.is_user || candidate.text.empty()) continue;
+                ChatMessage retry;
+                retry.text = candidate.text;
+                retry.is_user = true;
+                retry.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                g_chat_messages.push_back(std::move(retry));
+                g_chat_scroll_to_bottom = true;
+                conversations::save_current();
+                return completed("Retry request queued from the selected response.");
+            }
+            return failed("No earlier user message is available to retry.");
+        case message_action_t::review_change: {
+            action_result_t result = completed("Editor proposal opened for per-hunk review.");
+            result.target_view_id = "document.code";
+            return result;
+        }
+        case message_action_t::apply_change: {
+            const auto proposal = editor_proposal_snapshot();
+            if (!proposal.pending || proposal.source.fingerprint != identity.fingerprint)
+                return failed("The staged proposal is no longer linked to this message.");
+            if (proposal.stale || code_editor_widget::document_content_fingerprint() != proposal.base_content_hash)
+                return failed("The code document changed after review began; apply is blocked until the proposal is regenerated.");
+            {
+                std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+                if (!s_editor_proposal.pending || s_editor_proposal.generation != proposal.generation)
+                    return failed("The proposal generation changed; review the current proposal.");
+                s_editor_proposal.applying = true;
+                s_editor_proposal.detail = "Applying reviewed editor hunks.";
+            }
+            code_editor_widget::accept_all();
+            if (!code_editor_widget::commit_resolved_diff()) {
+                std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+                s_editor_proposal.applying = false;
+                s_editor_proposal.detail = "The code editor rejected the resolved diff; no completion was recorded.";
+                return failed(s_editor_proposal.detail);
+            }
+            {
+                std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+                if (s_editor_proposal.generation != proposal.generation)
+                    return failed("The proposal generation changed during apply; inspect the editor and diagnostics.");
+                s_editor_proposal.pending = false;
+                s_editor_proposal.applying = false;
+                s_editor_proposal.applied = true;
+                s_editor_proposal.detail = "All reviewed hunks were applied through the code editor backend.";
+            }
+            return completed("All reviewed editor hunks applied.");
+        }
+        case message_action_t::reject_change: {
+            const auto proposal = editor_proposal_snapshot();
+            if (!proposal.pending || proposal.source.fingerprint != identity.fingerprint)
+                return failed("The staged proposal is no longer linked to this message.");
+            code_editor_widget::cancel_agent_edit();
+            std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+            if (s_editor_proposal.generation != proposal.generation)
+                return failed("The proposal generation changed; review the current proposal.");
+            s_editor_proposal.pending = false;
+            s_editor_proposal.rejected = true;
+            s_editor_proposal.detail = "The proposal was rejected without changing the document.";
+            return completed("Editor proposal rejected without writes.");
+        }
+    }
+    return failed("The action has no executable provider.");
+}
+
+message_window_t bounded_message_window(std::size_t first_visible, std::size_t visible_count, std::size_t overscan)
+{
+    message_window_t result;
+    result.total = g_chat_messages.size();
+    if (result.total == 0) return result;
+    const std::size_t safe_overscan = (std::min)(overscan, std::size_t{32});
+    result.first = first_visible > safe_overscan ? first_visible - safe_overscan : 0;
+    const std::size_t requested = visible_count + safe_overscan * 2U;
+    const std::size_t bounded_count = (std::min)(requested, max_rendered_messages);
+    result.last = (std::min)(result.total, result.first + bounded_count);
+    if (result.last == result.total && result.last - result.first < bounded_count)
+        result.first = result.last > bounded_count ? result.last - bounded_count : 0;
+    result.bounded = result.first != 0 || result.last != result.total;
+    return result;
+}
+
+tool_approval_snapshot_t tool_approval_snapshot()
+{
+    tool_approval_snapshot_t result;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::lock_guard<std::mutex> lock(s_tool_approval.mtx);
+    result.pending = s_tool_approval.pending && !s_tool_approval.answered;
+    if (result.pending) {
+        result.tool_name = s_tool_approval.tool_name;
+        result.arguments_preview = s_tool_approval.tool_args_preview;
+        result.identity = s_tool_approval.generation;
+    }
+#endif
+    return result;
+}
+
+action_result_t respond_to_tool_approval(std::uint64_t identity, bool approve)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    (void)identity;
+    (void)approve;
+    return failed("Tool approval execution is unavailable in the Studio compatibility target.");
+#else
+    std::lock_guard<std::mutex> lock(s_tool_approval.mtx);
+    if (!s_tool_approval.pending || s_tool_approval.answered)
+        return failed("The tool approval request is no longer pending.");
+    if (identity == 0 || identity != s_tool_approval.generation)
+        return failed("The tool approval request changed; review the current request before responding.");
+    s_tool_approval.approved = approve;
+    s_tool_approval.answered = true;
+    s_tool_approval.cv.notify_one();
+    return completed(approve ? "Tool execution approved." : "Tool execution denied.");
+#endif
+}
+
+surface_capabilities_t surface_capabilities()
+{
+    surface_capabilities_t result;
+    result.evidence_pane = true;
+    result.background_tasks_pane = true;
+    result.evidence_reason.clear();
+    result.mcp_activity_reason = "MCP activity is exposed by the existing MCP Log output view; no separate activity renderer exists.";
+    result.scripts_reason = "Isolated script execution exists as an approval-gated MCP tool, but no standalone Scripts pane exists.";
+    result.background_tasks_reason.clear();
+    return result;
+}
+
+std::string register_evidence(evidence_envelope_t envelope)
+{
+    synchronize_evidence_session();
+    if (envelope.source_view_id.empty() || envelope.source_kind.empty() ||
+        envelope.entity_id.empty() || envelope.content_hash == 0)
+        return {};
+    if (envelope.session_id.empty()) envelope.session_id = evidence_session_id();
+    envelope.id = bounded_metadata_string(std::move(envelope.id), 256U);
+    envelope.project_id = bounded_metadata_string(std::move(envelope.project_id), 256U);
+    envelope.workspace_id = bounded_metadata_string(std::move(envelope.workspace_id), 256U);
+    envelope.session_id = bounded_metadata_string(std::move(envelope.session_id), 256U);
+    envelope.source_view_id = bounded_metadata_string(std::move(envelope.source_view_id), 256U);
+    envelope.source_kind = bounded_metadata_string(std::move(envelope.source_kind), 128U);
+    envelope.entity_id = bounded_metadata_string(std::move(envelope.entity_id), 512U);
+    envelope.display_label = bounded_metadata_string(std::move(envelope.display_label), 512U);
+    envelope.return_target = bounded_metadata_string(std::move(envelope.return_target), 512U);
+    envelope.stale_reason = bounded_metadata_string(std::move(envelope.stale_reason), 1024U);
+    if (envelope.excerpt.size() > max_evidence_bytes) {
+        envelope.excerpt.resize(max_evidence_bytes);
+        envelope.truncated = true;
+    }
+    if (envelope.created_ms == 0)
+        envelope.created_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    if (envelope.id.empty())
+        envelope.id = "evidence." + std::to_string(envelope.created_ms) + "." +
+            std::to_string(s_evidence_sequence.fetch_add(1, std::memory_order_relaxed));
+    const std::string result_id = envelope.id;
+    const std::string session = envelope.session_id;
+    std::vector<evidence_envelope_t> persisted;
+    {
+        std::lock_guard<std::mutex> lock(s_evidence_mutex);
+        const auto duplicate = std::find_if(s_evidence.begin(), s_evidence.end(), [&](const evidence_envelope_t& current) {
+            return current.id == envelope.id;
+        });
+        if (duplicate != s_evidence.end()) *duplicate = std::move(envelope);
+        else s_evidence.push_back(std::move(envelope));
+        while (s_evidence.size() > max_evidence_items) s_evidence.pop_front();
+        if (!session.empty()) {
+            for (const auto& item : s_evidence) {
+                if (item.session_id == session) persisted.push_back(item);
+            }
+        }
+    }
+    if (!session.empty()) persist_evidence_metadata(session, persisted);
+    return result_id;
+}
+
+std::vector<evidence_envelope_t> evidence_snapshot()
+{
+    synchronize_evidence_session();
+    std::lock_guard<std::mutex> lock(s_evidence_mutex);
+    return {s_evidence.begin(), s_evidence.end()};
+}
+
+static bool evidence_payload(const std::string& evidence_id, evidence_envelope_t& envelope, std::string& reason)
+{
+    std::lock_guard<std::mutex> lock(s_evidence_mutex);
+    const auto found = std::find_if(s_evidence.begin(), s_evidence.end(), [&](const evidence_envelope_t& current) {
+        return current.id == evidence_id;
+    });
+    if (found == s_evidence.end()) {
+        reason = "The evidence item is no longer retained; capture it again from the source view.";
+        return false;
+    }
+    if (found->stale) {
+        reason = found->stale_reason.empty()
+            ? "The evidence source changed; capture a current snapshot."
+            : found->stale_reason;
+        return false;
+    }
+    envelope = *found;
+    reason.clear();
+    return true;
+}
+
+static bool queue_evidence(const std::string& evidence_id, bool agent, std::string& reason)
+{
+    evidence_envelope_t envelope;
+    if (!evidence_payload(evidence_id, envelope, reason)) return false;
+    std::ostringstream payload;
+    payload << "[Evidence " << envelope.id << "]\nSource: " << envelope.source_view_id
+            << " / " << envelope.entity_id << "\nRevision: " << envelope.revision
+            << "  Generation: " << envelope.generation << "\nSnapshot hash: 0x" << std::hex
+            << envelope.snapshot_hash << "  Content hash: 0x" << envelope.content_hash << std::dec
+            << "\n\n" << envelope.excerpt;
+    if (envelope.truncated)
+        payload << "\n[Evidence excerpt is bounded; return to the source for the complete artifact]";
+    chat_inject::post(payload.str());
+    (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(
+        agent ? "view.ai.agents" : "view.ai_chat"));
+    return true;
+}
+
+bool queue_evidence_for_chat(const std::string& evidence_id, std::string& reason)
+{
+    return queue_evidence(evidence_id, false, reason);
+}
+
+bool queue_evidence_for_agent(const std::string& evidence_id, std::string& reason)
+{
+    return queue_evidence(evidence_id, true, reason);
+}
+
+bool navigate_to_evidence_source(const std::string& evidence_id, std::string& reason)
+{
+    synchronize_evidence_session();
+    evidence_envelope_t envelope;
+    {
+        std::lock_guard<std::mutex> lock(s_evidence_mutex);
+        const auto found = std::find_if(s_evidence.begin(), s_evidence.end(), [&](const evidence_envelope_t& current) {
+            return current.id == evidence_id;
+        });
+        if (found == s_evidence.end()) {
+            reason = "The evidence item is no longer retained; capture it again from the source view.";
+            return false;
+        }
+        envelope = *found;
+    }
+    const auto opened = aida::ui::application_views::open_or_focus(
+        aida::ui::stable_view_id_t(envelope.source_view_id));
+    if (!opened.ok()) {
+        reason = opened.detail.empty() ? "The source view is unavailable." : opened.detail;
+        return false;
+    }
+    return true;
+}
+
+void render_chat_view(float width, float height)
+{
+    static std::size_t page_start = 0;
+    static std::size_t previous_total = 0;
+    static bool follow_latest = true;
+    static std::string rendered_session;
+    static message_identity_t context_identity;
+    static message_identity_t keyboard_identity;
+    static std::string context_feedback;
+    static char history_filter[128] = {};
+
+    const std::string conversation_session = conversations::current_id;
+    if (!conversation_session.empty() && conversation_session != chat_active_session()) {
+        chat_bind_session(conversation_session);
+        synchronize_evidence_session();
+    }
+    const std::string current_session = chat_active_session();
+    if (rendered_session != current_session) {
+        rendered_session = current_session;
+        page_start = 0;
+        previous_total = 0;
+        follow_latest = true;
+        context_identity = {};
+        keyboard_identity = {};
+        synchronize_evidence_session();
+    }
+
+    chat_inject::drain_into_buffer();
+    ImGui::BeginChild("##registry_chat_surface", ImVec2(width, height), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    auto open_view = [](const char* id) {
+        (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(id));
+    };
+    if (ImGui::Button("New Chat")) {
+        conversations::new_chat();
+        chat_bind_session({});
+        synchronize_evidence_session();
+        rendered_session.clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(conversations::browser_open ? "Hide History" : "History")) {
+        conversations::browser_open = !conversations::browser_open;
+        if (conversations::browser_open) conversations::refresh_history();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Providers")) open_view("view.ai.providers");
+    ImGui::SameLine();
+    if (ImGui::Button("Agents")) open_view("view.ai.agents");
+    ImGui::SameLine();
+    if (ImGui::Button("Skills")) open_view("view.ai.skills");
+    ImGui::SameLine();
+    if (ImGui::Button("Evidence")) open_view("view.ai.evidence");
+    ImGui::SameLine();
+    if (ImGui::Button("MCP Log")) open_view("view.mcp_log");
+    ImGui::SameLine();
+    if (ImGui::Button("Settings")) open_view("view.settings");
+
+    ImGui::Separator();
+    const float input_height = 84.f;
+    const float content_height = (std::max)(80.f, ImGui::GetContentRegionAvail().y - input_height - 8.f);
+    const bool history_visible = conversations::browser_open && ImGui::GetContentRegionAvail().x >= 620.f;
+    std::string delete_conversation_id;
+
+    if (history_visible) {
+        const float history_width = (std::min)(260.f,
+            (std::max)(190.f, ImGui::GetContentRegionAvail().x * 0.28f));
+        ImGui::BeginChild("##registry_chat_history", ImVec2(history_width, content_height), true);
+        ImGui::TextUnformatted("Conversations");
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::InputTextWithHint("##registry_chat_history_filter", "Filter conversations...",
+            history_filter, sizeof(history_filter));
+        std::string filter = history_filter;
+        std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        for (const auto& conversation : conversations::history) {
+            std::string title = conversation.title.empty() ? "Untitled" : conversation.title;
+            std::string searchable = title;
+            std::transform(searchable.begin(), searchable.end(), searchable.begin(), [](unsigned char value) {
+                return static_cast<char>(std::tolower(value));
+            });
+            if (!filter.empty() && searchable.find(filter) == std::string::npos) continue;
+            ImGui::PushID(conversation.id.c_str());
+            const bool selected = conversation.id == conversations::current_id;
+            if (ImGui::Selectable(title.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick,
+                    ImVec2(0.f, ImGui::GetTextLineHeightWithSpacing() * 1.7f)) && !selected) {
+                conversations::save_current();
+                conversations::load_conversation(conversation.id);
+                chat_bind_session(conversations::current_id);
+                synchronize_evidence_session();
+                rendered_session.clear();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%d messages\n%s", conversation.msg_count, conversation.id.c_str());
+            if (ImGui::BeginPopupContextItem("##conversation_context")) {
+                if (ImGui::MenuItem("Open Conversation", nullptr, false, !selected)) {
+                    conversations::save_current();
+                    conversations::load_conversation(conversation.id);
+                    chat_bind_session(conversations::current_id);
+                    synchronize_evidence_session();
+                    rendered_session.clear();
+                }
+                if (ImGui::MenuItem("Copy Conversation ID"))
+                    ImGui::SetClipboardText(conversation.id.c_str());
+                ImGui::Separator();
+                if (ImGui::MenuItem("Delete Conversation"))
+                    delete_conversation_id = conversation.id;
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+    } else if (conversations::browser_open) {
+        ImGui::TextDisabled("Conversation history requires a wider dock. Enlarge this view or float it.");
+    }
+
+    if (!delete_conversation_id.empty()) {
+        const bool deleting_current = delete_conversation_id == conversations::current_id;
+        remove_evidence_metadata(delete_conversation_id);
+        conversations::delete_conversation(delete_conversation_id);
+        if (deleting_current) {
+            chat_bind_session({});
+            rendered_session.clear();
+        }
+        conversations::refresh_history();
+    }
+
+    const float chat_width = (std::max)(220.f, ImGui::GetContentRegionAvail().x);
+    ImGui::BeginChild("##registry_chat_messages", ImVec2(chat_width, content_height), true,
+        ImGuiWindowFlags_HorizontalScrollbar);
+    const std::size_t total = message_count();
+    if (total > previous_total && follow_latest)
+        page_start = total > max_rendered_messages ? total - max_rendered_messages : 0U;
+    if (page_start >= total)
+        page_start = total > max_rendered_messages ? total - max_rendered_messages : 0U;
+    previous_total = total;
+    auto window = bounded_message_window(page_start, max_rendered_messages, 0U);
+    page_start = window.first;
+    if (window.bounded) {
+        const bool older = window.first > 0;
+        const bool newer = window.last < window.total;
+        ImGui::BeginDisabled(!older);
+        if (ImGui::SmallButton("Older")) {
+            page_start = window.first > max_rendered_messages
+                ? window.first - max_rendered_messages : 0U;
+            follow_latest = false;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!newer);
+        if (ImGui::SmallButton("Newer")) {
+            page_start = (std::min)(window.total - 1U, window.first + max_rendered_messages);
+            follow_latest = page_start + max_rendered_messages >= window.total;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Latest")) {
+            page_start = window.total > max_rendered_messages
+                ? window.total - max_rendered_messages : 0U;
+            follow_latest = true;
+            g_chat_scroll_to_bottom = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu-%zu of %zu", window.first + 1U, window.last, window.total);
+        ImGui::Separator();
+    }
+
+    auto open_message_menu = [&](std::size_t index, context_open_origin_t origin) {
+        const auto identity = message_identity(index);
+        message_context_request_t request;
+        std::string reason;
+        if (!open_message_context(identity, origin, request, reason)) {
+            context_feedback = std::move(reason);
+            return;
+        }
+        context_identity = identity;
+        keyboard_identity = identity;
+        context_feedback.clear();
+        ImGui::OpenPopup("##registry_chat_message_context");
+    };
+
+    bool message_deleted = false;
+    if (total == 0) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Start an analysis conversation");
+        ImGui::TextWrapped("Ask about the current binary, debugger state, memory findings, network evidence, code, or automation tasks. Source views can attach immutable evidence here.");
+    }
+    for (std::size_t index = window.first; index < window.last && index < g_chat_messages.size(); ++index) {
+        auto& message = g_chat_messages[index];
+        ImGui::PushID(static_cast<int>(index));
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        const float available_width = (std::max)(120.f, ImGui::GetContentRegionAvail().x - 10.f);
+        if (message.is_user && chat_edit::active && chat_edit::msg_idx == static_cast<int>(index)) {
+            ImGui::TextDisabled("EDITING USER MESSAGE");
+            ImGui::SetNextItemWidth(-1.f);
+            ImGui::InputTextMultiline("##registry_chat_edit", chat_edit::buf, sizeof(chat_edit::buf),
+                ImVec2(-1.f, 84.f), ImGuiInputTextFlags_CtrlEnterForNewLine);
+            if (ImGui::Button("Save and Resend")) {
+                const std::string replacement = chat_edit::buf;
+                if (!replacement.empty()) {
+                    g_chat_messages.erase(g_chat_messages.begin() + static_cast<std::ptrdiff_t>(index),
+                        g_chat_messages.end());
+                    ChatMessage edited;
+                    edited.text = replacement;
+                    edited.is_user = true;
+                    edited.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    g_chat_messages.push_back(std::move(edited));
+                    conversations::save_current();
+                    g_chat_scroll_to_bottom = true;
+                    message_deleted = true;
+                }
+                chat_edit::active = false;
+                chat_edit::msg_idx = -1;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                chat_edit::active = false;
+                chat_edit::msg_idx = -1;
+            }
+        } else if (message.is_user) {
+            ImGui::TextDisabled("YOU");
+            ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::resolved().text_primary);
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + available_width);
+            ImGui::TextUnformatted(message.text.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        } else {
+            if (!message.tool_name.empty()) {
+                ImGui::TextDisabled("TOOL  %s", message.tool_name.c_str());
+            } else if (!message.model_id.empty()) {
+                ImGui::TextDisabled("ASSISTANT  %s", message.model_id.c_str());
+            } else {
+                ImGui::TextDisabled("ASSISTANT");
+            }
+            if (message.has_thinking && !message.thinking_text.empty() &&
+                ImGui::TreeNode("Reasoning")) {
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + available_width - 18.f);
+                ImGui::TextDisabled("%s", message.thinking_text.c_str());
+                ImGui::PopTextWrapPos();
+                ImGui::TreePop();
+            }
+            const ImVec2 response_origin = ImGui::GetCursorScreenPos();
+            const auto rich = chat_render::render_rich_message(ImGui::GetWindowDrawList(),
+                response_origin, available_width, message.text, 1.f,
+                globals::ui::accent.x, globals::ui::accent.y, globals::ui::accent.z,
+                static_cast<int>(index), ImGui::GetIO().DeltaTime, !message.streaming);
+            ImGui::Dummy(ImVec2(available_width, (std::max)(rich.height, ImGui::GetTextLineHeightWithSpacing())));
+            if (rich.action == chat_render::action_t::retry) {
+                (void)execute_message_action(message_identity(index), message_action_t::retry_from_here);
+            } else if (rich.action == chat_render::action_t::delete_msg) {
+                const auto result = execute_message_action(message_identity(index), message_action_t::delete_message);
+                message_deleted = result.succeeded;
+            } else if (rich.action == chat_render::action_t::edit_msg) {
+                (void)execute_message_action(message_identity(index), message_action_t::edit_message);
+            } else if (rich.action == chat_render::action_t::copy) {
+                (void)execute_message_action(message_identity(index), message_action_t::copy_text);
+            }
+        }
+        const ImVec2 end = ImGui::GetCursorScreenPos();
+        const ImVec2 hit_max(start.x + available_width,
+            (std::max)(end.y, start.y + ImGui::GetTextLineHeightWithSpacing()));
+        const bool hovered = ImGui::IsMouseHoveringRect(start, hit_max, true);
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            keyboard_identity = message_identity(index);
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            open_message_menu(index, context_open_origin_t::pointer);
+        ImGui::Separator();
+        ImGui::PopID();
+        if (message_deleted) break;
+    }
+
+    if (keyboard_identity.fingerprint == 0 && window.last > window.first)
+        keyboard_identity = message_identity(window.last - 1U);
+    const bool menu_key = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+    const bool shift_f10 = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+    if ((menu_key || shift_f10) && keyboard_identity.fingerprint != 0) {
+        message_context_request_t request;
+        std::string reason;
+        const auto origin = menu_key ? context_open_origin_t::menu_key : context_open_origin_t::shift_f10;
+        if (open_message_context(keyboard_identity, origin, request, reason)) {
+            context_identity = keyboard_identity;
+            context_feedback.clear();
+            ImGui::OpenPopup("##registry_chat_message_context");
+        } else {
+            context_feedback = std::move(reason);
+        }
+    }
+
+    if (ImGui::BeginPopup("##registry_chat_message_context")) {
+        auto action = [&](const char* label, message_action_t value) {
+            const auto capability = message_action_capability(context_identity, value);
+            ImGui::BeginDisabled(!capability.enabled);
+            const bool activated = ImGui::MenuItem(label);
+            ImGui::EndDisabled();
+            if (!capability.enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+                !capability.disabled_reason.empty())
+                ImGui::SetTooltip("%s", capability.disabled_reason.c_str());
+            if (!activated || !capability.enabled) return;
+            auto result = execute_message_action(context_identity, value);
+            if (result.succeeded && value == message_action_t::create_evidence_handoff) {
+                std::string reason;
+                if (!queue_evidence_for_chat(result.evidence.evidence_id, reason))
+                    result.detail = std::move(reason);
+            }
+            if (result.succeeded && !result.target_view_id.empty()) open_view(result.target_view_id.c_str());
+            if (result.succeeded && value == message_action_t::delete_message) {
+                context_identity = {};
+                keyboard_identity = {};
+            }
+            context_feedback = std::move(result.detail);
+        };
+        action("Copy Message", message_action_t::copy_text);
+        action("Copy Reasoning", message_action_t::copy_reasoning);
+        action("Copy Tool Name", message_action_t::copy_tool_name);
+        ImGui::Separator();
+        action("Edit Message", message_action_t::edit_message);
+        action("Retry From Here", message_action_t::retry_from_here);
+        action("Delete Message", message_action_t::delete_message);
+        ImGui::Separator();
+        action("Add to Chat Input", message_action_t::send_to_chat_input);
+        action("Add as Evidence", message_action_t::create_evidence_handoff);
+        action("Inspect Tool Activity", message_action_t::inspect_tool_activity);
+        ImGui::Separator();
+        action("Review Staged Change", message_action_t::review_change);
+        action("Apply Staged Change", message_action_t::apply_change);
+        action("Reject Staged Change", message_action_t::reject_change);
+        action("Cancel Active Operation", message_action_t::cancel_active_operation);
+        if (!context_feedback.empty()) {
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", context_feedback.c_str());
+        }
+        ImGui::EndPopup();
+    }
+
+    if (g_chat_scroll_to_bottom) {
+        ImGui::SetScrollHereY(1.f);
+        g_chat_scroll_to_bottom = false;
+    }
+    ImGui::EndChild();
+
+    const bool busy = is_ai_busy();
+    if (busy) ImGui::TextDisabled("AI operation in progress");
+    else ImGui::TextDisabled("Enter sends  |  Ctrl+Enter inserts a line break");
+    const float button_width = busy ? 74.f : 64.f;
+    ImGui::SetNextItemWidth((std::max)(80.f, ImGui::GetContentRegionAvail().x - button_width - 8.f));
+    const bool enter = ImGui::InputTextMultiline("##registry_chat_input", g_chat_buf, sizeof(g_chat_buf),
+        ImVec2(0.f, 56.f), ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    bool submit = false;
+    if (busy) {
+        if (ImGui::Button("Cancel", ImVec2(button_width, 56.f))) chat_request_cancel();
+    } else {
+        const bool has_text = g_chat_buf[0] != '\0';
+        ImGui::BeginDisabled(!has_text);
+        submit = ImGui::Button("Send", ImVec2(button_width, 56.f));
+        ImGui::EndDisabled();
+        submit = (submit || enter) && has_text;
+    }
+    if (submit) {
+        std::string prompt = g_chat_buf;
+        const auto first = prompt.find_first_not_of(" \t\r\n");
+        const auto last = prompt.find_last_not_of(" \t\r\n");
+        if (first != std::string::npos) {
+            prompt = prompt.substr(first, last - first + 1U);
+            ChatMessage message;
+            message.text = std::move(prompt);
+            message.is_user = true;
+            message.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            g_chat_messages.push_back(std::move(message));
+            g_chat_buf[0] = '\0';
+            g_chat_scroll_to_bottom = true;
+            follow_latest = true;
+            conversations::save_current();
+            if (chat_active_session() != conversations::current_id) {
+                chat_bind_session(conversations::current_id);
+                synchronize_evidence_session();
+            }
+        }
+    }
+
+    ImGui::EndChild();
+}
+
+void render_evidence_view(float width, float height)
+{
+    const auto items = evidence_snapshot();
+    if (items.empty()) {
+        ImGui::TextWrapped("No evidence has been collected. Use Add to Chat or Assign to Agent from a source context menu.");
+        return;
+    }
+    static std::string selected_id;
+    ImGui::BeginChild("##automation_evidence_list", ImVec2(width, height), false,
+        ImGuiWindowFlags_HorizontalScrollbar);
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(items.size()), ImGui::GetTextLineHeightWithSpacing() * 2.5f);
+    while (clipper.Step()) {
+        for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+            const auto& item = items[static_cast<std::size_t>(index)];
+            ImGui::PushID(item.id.c_str());
+            const bool selected = selected_id == item.id;
+            const char* label = item.display_label.empty() ? item.entity_id.c_str() : item.display_label.c_str();
+            if (ImGui::Selectable(label, selected, ImGuiSelectableFlags_AllowDoubleClick,
+                    ImVec2(0.f, ImGui::GetTextLineHeightWithSpacing() * 2.25f))) {
+                selected_id = item.id;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    std::string reason;
+                    (void)navigate_to_evidence_source(item.id, reason);
+                }
+            }
+            const bool keyboard_context = selected && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right) || keyboard_context)
+                ImGui::OpenPopup("##evidence_context");
+            if (ImGui::BeginPopup("##evidence_context")) {
+                std::string reason;
+                if (ImGui::MenuItem("Return to Source"))
+                    (void)navigate_to_evidence_source(item.id, reason);
+                if (ImGui::MenuItem("Add to Chat", nullptr, false, !item.stale))
+                    (void)queue_evidence_for_chat(item.id, reason);
+                if (ImGui::MenuItem("Assign to Agent", nullptr, false, !item.stale))
+                    (void)queue_evidence_for_agent(item.id, reason);
+                if (ImGui::MenuItem("Copy Evidence ID"))
+                    ImGui::SetClipboardText(item.id.c_str());
+                if (item.stale) {
+                    ImGui::BeginDisabled();
+                    ImGui::MenuItem("Evidence is stale");
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("%s", item.stale_reason.c_str());
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s%s", item.source_kind.c_str(), item.truncated ? "  bounded" : "");
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+}
+
+}
+
 void render_tool_approval_dialog()
 {
     bool show = false;
@@ -3371,11 +4764,6 @@ void render_tool_approval_dialog()
     ImGui::PopStyleColor(2);
 }
 
-
-void render_settings_inline(float panel_w, float panel_h)
-{
-    aida::settings_overlay::render_inline(panel_w, panel_h);
-}
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
@@ -3662,10 +5050,10 @@ std::string compose_provider_display_name(const std::string& provider_id)
     return provider_id;
 }
 
-std::string compose_model_label()
+std::string compose_model_label_for(
+    const std::string& provider_id,
+    const std::string& model_id)
 {
-    const std::string provider_id = g_sa_settings.selected_provider_id();
-    const std::string model_id    = g_sa_settings.selected_model_id();
     if (provider_id.empty() || model_id.empty())
         return std::string("Select model");
     const auto* model = aida::provider::catalog::get_model(provider_id, model_id);
@@ -3697,12 +5085,13 @@ std::string format_context_brief(int64_t ctx)
 
 float chat_model_pill_width()
 {
-    std::string lbl = compose_model_label();
+    const auto settings = g_sa_settings.ai_runtime_snapshot();
+    const std::string provider_id = settings.selected_provider_id();
+    std::string lbl = compose_model_label_for(provider_id, settings.selected_model_id());
     float max_lbl_w = 240.f;
     lbl = truncate_to_width(lbl, max_lbl_w);
     ImVec2 ts = ImGui::CalcTextSize(lbl.c_str());
     float dot_block = 8.f + 6.f;
-    const std::string provider_id = g_sa_settings.selected_provider_id();
     const bool authed = !provider_id.empty() && aida::auth_view::is_provider_authenticated(provider_id);
     float trailing = authed ? (6.f + 10.f) : (8.f + 56.f + 6.f + 10.f);
     return 12.f + dot_block + ts.x + trailing + 12.f;
@@ -3716,9 +5105,10 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
     auto& anim = model_picker_anim();
     float dt = ImGui::GetIO().DeltaTime;
 
-    const std::string current_provider = g_sa_settings.selected_provider_id();
-    const std::string current_model    = g_sa_settings.selected_model_id();
-    std::string label = compose_model_label();
+    const auto settings = g_sa_settings.ai_runtime_snapshot();
+    const std::string current_provider = settings.selected_provider_id();
+    const std::string current_model    = settings.selected_model_id();
+    std::string label = compose_model_label_for(current_provider, current_model);
     const float max_label_w = 240.f;
     label = truncate_to_width(label, max_label_w);
     ImVec2 ts = ImGui::CalcTextSize(label.c_str());
@@ -3999,10 +5389,20 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
                     ImGui::SetTooltip("%s\nauthenticated", label.c_str());
                 }
                 if (ch_click) {
-                    g_sa_settings.default_provider_id = p->id;
-                    g_sa_settings.save();
-                    active_provider = p->id;
-                    s_filter[0] = '\0';
+                    bool saved = false;
+                    {
+                        std::lock_guard<std::recursive_mutex> settings_lock(
+                            sa_settings_detail::io_mutex());
+                        settings_sa_t settings_before = g_sa_settings;
+                        g_sa_settings.default_provider_id = p->id;
+                        saved = g_sa_settings.save();
+                        if (!saved)
+                            g_sa_settings = std::move(settings_before);
+                    }
+                    if (saved) {
+                        active_provider = p->id;
+                        s_filter[0] = '\0';
+                    }
                 }
 
                 ImGui::PopID();
@@ -4131,19 +5531,29 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
 
                 if (row_hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 if (row_click) {
-                    g_sa_settings.set_selection(active_p->id, m->id);
-                    auto* prof = g_sa_settings.get_active_profile();
-                    if (prof != nullptr) {
-                        prof->model = m->id;
-                        g_sa_settings.sync_legacy_fields_from_active_profile();
+                    bool saved = false;
+                    {
+                        std::lock_guard<std::recursive_mutex> settings_lock(
+                            sa_settings_detail::io_mutex());
+                        settings_sa_t settings_before = g_sa_settings;
+                        g_sa_settings.set_selection(active_p->id, m->id);
+                        auto* prof = g_sa_settings.get_active_profile();
+                        if (prof != nullptr) {
+                            prof->model = m->id;
+                            g_sa_settings.sync_legacy_fields_from_active_profile();
+                        }
+                        saved = g_sa_settings.save();
+                        if (!saved)
+                            g_sa_settings = std::move(settings_before);
                     }
-                    g_sa_settings.save();
-                    aida::events::model_changed_t evt;
-                    evt.session_id = chat_active_session();
-                    evt.provider_id = active_p->id;
-                    evt.model_id    = m->id;
-                    aida::events::publish(aida::events::event_model_changed, evt);
-                    ImGui::CloseCurrentPopup();
+                    if (saved) {
+                        aida::events::model_changed_t evt;
+                        evt.session_id = chat_active_session();
+                        evt.provider_id = active_p->id;
+                        evt.model_id    = m->id;
+                        aida::events::publish(aida::events::event_model_changed, evt);
+                        ImGui::CloseCurrentPopup();
+                    }
                 }
                 ImGui::PopID();
                 ImGui::PopID();

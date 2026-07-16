@@ -257,6 +257,78 @@ namespace detail_kp {
             kat_dbg_log("run_kat: WB-AES table hash PASS");
         }
 
+        {
+            kat_dbg_log("run_kat: WB-GCM round-trip KAT calling");
+
+            bool tv_all_zeros = true;
+            for (int i = 0; i < 32; ++i)
+            {
+                if (wbaes::kWbaesTestVector[i] != 0)
+                {
+                    tv_all_zeros = false;
+                    break;
+                }
+            }
+
+            if (tv_all_zeros)
+            {
+                kat_dbg_log("run_kat: WB-GCM KAT skipped (dev mode, all-zeros test vector)");
+            }
+            else
+            {
+                uint8_t gcm_nonce[12] = {0};
+                uint8_t gcm_pt[16];
+                uint8_t gcm_ct[16];
+                uint8_t gcm_tag[16];
+                uint8_t gcm_dec[16];
+
+                std::memcpy(gcm_pt, wbaes::kWbaesTestVector, 16);
+
+                bool gcm_enc_ok = wb_crypto::gcm_encrypt(
+                    gcm_pt, 16, nullptr, 0, gcm_nonce, gcm_ct, gcm_tag);
+                if (!gcm_enc_ok)
+                {
+                    set_last_error("kat_wb_gcm_encrypt_failed");
+                    kat_dbg_log("run_kat: FAIL kat_wb_gcm_encrypt_failed");
+                    SecureZeroMemory(gcm_pt, sizeof(gcm_pt));
+                    SecureZeroMemory(gcm_ct, sizeof(gcm_ct));
+                    SecureZeroMemory(gcm_tag, sizeof(gcm_tag));
+                    SecureZeroMemory(gcm_dec, sizeof(gcm_dec));
+                    return false;
+                }
+
+                bool gcm_dec_ok = wb_crypto::gcm_decrypt(
+                    gcm_ct, 16, nullptr, 0, gcm_nonce, gcm_tag, gcm_dec);
+                if (!gcm_dec_ok)
+                {
+                    set_last_error("kat_wb_gcm_decrypt_failed");
+                    kat_dbg_log("run_kat: FAIL kat_wb_gcm_decrypt_failed");
+                    SecureZeroMemory(gcm_pt, sizeof(gcm_pt));
+                    SecureZeroMemory(gcm_ct, sizeof(gcm_ct));
+                    SecureZeroMemory(gcm_tag, sizeof(gcm_tag));
+                    SecureZeroMemory(gcm_dec, sizeof(gcm_dec));
+                    return false;
+                }
+
+                if (!ct_equal(gcm_pt, gcm_dec, 16))
+                {
+                    set_last_error("kat_wb_gcm_roundtrip_mismatch");
+                    kat_dbg_log("run_kat: FAIL kat_wb_gcm_roundtrip_mismatch");
+                    SecureZeroMemory(gcm_pt, sizeof(gcm_pt));
+                    SecureZeroMemory(gcm_ct, sizeof(gcm_ct));
+                    SecureZeroMemory(gcm_tag, sizeof(gcm_tag));
+                    SecureZeroMemory(gcm_dec, sizeof(gcm_dec));
+                    return false;
+                }
+
+                SecureZeroMemory(gcm_pt, sizeof(gcm_pt));
+                SecureZeroMemory(gcm_ct, sizeof(gcm_ct));
+                SecureZeroMemory(gcm_tag, sizeof(gcm_tag));
+                SecureZeroMemory(gcm_dec, sizeof(gcm_dec));
+                kat_dbg_log("run_kat: WB-GCM round-trip KAT PASS");
+            }
+        }
+
         kat_dbg_log("run_kat: ALL PASS, returning true");
         return true;
     }

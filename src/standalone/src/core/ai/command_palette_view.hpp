@@ -21,6 +21,8 @@
 #include "theme.hpp"
 #include "transition.hpp"
 #include "toast_notification.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../../preview/studio_semantics.hpp"
 
 #include "../helpers/globals.h"
 
@@ -31,14 +33,15 @@ namespace command_palette {
 
 	namespace detail {
 
-		enum class category_t : int {
+			enum class category_t : int {
 			commands  = 0,
-			files     = 1,
-			agents    = 2,
-			skills    = 3,
-			mcp       = 4,
-			ai_actions= 5,
-			count     = 6,
+			ide_actions = 1,
+			files     = 2,
+			agents    = 3,
+			skills    = 4,
+			mcp       = 5,
+			ai_actions= 6,
+			count     = 7,
 		};
 
 		struct preview_state_t {
@@ -66,6 +69,7 @@ namespace command_palette {
 
 		inline category_t classify(const commands::command_t& c)
 		{
+			if (!c.application_action_id.empty()) return category_t::ide_actions;
 			switch (c.source) {
 			case commands::command_source_t::agent:   return category_t::agents;
 			case commands::command_source_t::skill:   return category_t::skills;
@@ -82,6 +86,7 @@ namespace command_palette {
 		{
 			switch (cat) {
 			case category_t::commands:   return "COMMANDS";
+			case category_t::ide_actions:return "IDE ACTIONS";
 			case category_t::files:      return "FILES";
 			case category_t::agents:     return "AGENTS";
 			case category_t::skills:     return "SKILLS";
@@ -235,6 +240,24 @@ namespace command_palette {
 
 		inline void execute_selection(const commands::command_t& cmd)
 		{
+			if (!cmd.enabled) {
+				toast_notification::push(
+					cmd.disabled_reason.empty() ? "This action is unavailable" : cmd.disabled_reason,
+					toast_notification::toast_type_t::warning, 6.0f);
+				return;
+			}
+			if (!cmd.application_action_id.empty()) {
+				const auto result = ui::application_ui::execute_action(
+					cmd.application_action_id.c_str(), ui::action_invocation_source_t::command_palette);
+				if (!result.executed()) {
+					toast_notification::push(
+						result.message.empty() ? "The action could not be completed" : result.message,
+						toast_notification::toast_type_t::error, 6.0f);
+					return;
+				}
+				begin_close();
+				return;
+			}
 			std::vector<std::string> args;
 			std::string out;
 			const bool ok = commands::execute(cmd.name, args, out);
@@ -388,18 +411,19 @@ namespace command_palette {
 			const float text_x = a.x + inner_pad + icon_size + 12.f;
 
 			ImU32 name_col = ui::with_alpha(
-				is_selected ? t.text_primary : ui::mix(t.text_primary, t.text_secondary, 0.25f),
+				!c.enabled ? t.text_dim : is_selected ? t.text_primary : ui::mix(t.text_primary, t.text_secondary, 0.25f),
 				alpha);
 			ImU32 desc_col = ui::with_alpha(t.text_secondary, alpha * 0.85f);
 
-			const std::string display_name = std::string("/") + c.name;
+			const std::string display_name = c.display_name.empty()
+				? std::string("/") + c.name : c.display_name;
 			ImVec2 name_sz = name_font->CalcTextSizeA(name_fs, FLT_MAX, 0.f, display_name.c_str());
 			dl->AddText(name_font, name_fs,
 				ImVec2(text_x, (a.y + b.y) * 0.5f - name_fs * 0.5f),
 				name_col, display_name.c_str());
 
 			float right_reserve = 0.f;
-			if (is_selected && show_kbd_chips) right_reserve = 150.f;
+			if (is_selected && show_kbd_chips) right_reserve = c.shortcut.empty() ? 150.f : 230.f;
 
 			if (!c.description.empty()) {
 				const float desc_x = text_x + name_sz.x + 14.f;
@@ -442,6 +466,16 @@ namespace command_palette {
 					dl->AddText(sf, kfs, ImVec2(kb.x + 4.f, ka.y + (16.f - kfs) * 0.5f),
 						ui::with_alpha(t.text_dim, alpha), chip.lbl);
 					right_x -= total + 8.f;
+				}
+				if (!c.shortcut.empty()) {
+					ImVec2 kts = sf->CalcTextSizeA(kfs, FLT_MAX, 0.f, c.shortcut.c_str());
+					float kw = kts.x + 10.f;
+					ImVec2 ka(right_x - kw, (a.y + b.y) * 0.5f - 8.f);
+					ImVec2 kb(ka.x + kw, ka.y + 16.f);
+					dl->AddRectFilled(ka, kb, ui::with_alpha(t.panel_header, 0.95f * alpha), 4.f);
+					dl->AddRect(ka, kb, ui::with_alpha(t.border_subtle, 0.95f * alpha), 4.f, 0, 1.f);
+					dl->AddText(sf, kfs, ImVec2(ka.x + 5.f, ka.y + (16.f - kfs) * 0.5f),
+						ui::with_alpha(t.text_secondary, alpha), c.shortcut.c_str());
 				}
 			}
 		}
@@ -504,13 +538,27 @@ namespace command_palette {
 			float y = a.y + pad;
 
 			ImFont* hf = ui::fonts::caption();
+			const char* heading = c.application_action_id.empty() ? "TEMPLATE" : "APPLICATION ACTION";
 			dl->AddText(hf, 13.f, ImVec2(a.x + pad, y),
-				ui::with_alpha(t.text_dim, alpha), "TEMPLATE");
+				ui::with_alpha(t.text_dim, alpha), heading);
 			y += 18.f;
 
-			std::string body = c.template_text.empty()
-				? std::string("(programmatic command)")
-				: c.template_text;
+			std::string body;
+			if (!c.application_action_id.empty()) {
+				body = c.display_name;
+				if (!c.category.empty())
+					body += "\nCategory: " + c.category;
+				if (!c.shortcut.empty())
+					body += "\nShortcut: " + c.shortcut;
+				if (c.enabled) {
+					body += "\nAvailable now";
+				} else {
+					body += "\nUnavailable: ";
+					body += c.disabled_reason.empty() ? "No capability provider" : c.disabled_reason;
+				}
+			} else {
+				body = c.template_text.empty() ? std::string("(programmatic command)") : c.template_text;
+			}
 
 			float max_w = b.x - a.x - pad * 2.f;
 			ImU32 base = ui::with_alpha(t.text_secondary, alpha);
@@ -746,7 +794,7 @@ namespace command_palette {
 		const std::string current_query(globals::ui::command_palette_buf);
 		const bool query_changed = (current_query != last_query());
 
-		std::vector<commands::command_t> hits = commands::fuzzy_search(current_query, 50);
+		std::vector<commands::command_t> hits = commands::fuzzy_search(current_query, 256);
 
 		std::sort(hits.begin(), hits.end(), [](const commands::command_t& a, const commands::command_t& b) {
 			category_t ca = classify(a);
@@ -891,6 +939,10 @@ namespace command_palette {
 			globals::ui::command_palette_buf,
 			sizeof(globals::ui::command_palette_buf),
 			ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		aida::preview::semantics::register_last_item(
+			"aida.palette.search", "command-palette-input");
+#endif
 
 		if (globals::ui::command_palette_buf[0] == '\0') {
 			ImFont* placeholder_font = ui::fonts::lg();
@@ -997,6 +1049,14 @@ namespace command_palette {
 			ImGui::InvisibleButton("##row", ImVec2(win_avail.x, row_h));
 			const bool hovered = ImGui::IsItemHovered();
 			const bool clicked = ImGui::IsItemClicked();
+			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			if (!c.application_action_id.empty()) {
+				const std::string semantic_id = aida::preview::semantics::stable_id(
+					"aida.palette.action", c.application_action_id);
+				aida::preview::semantics::register_last_item(
+					semantic_id, "command-palette-action");
+			}
+			#endif
 			ImGui::PopID();
 
 			if (hovered) selected_index() = row_index;

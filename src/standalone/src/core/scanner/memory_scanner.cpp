@@ -6,6 +6,7 @@
 #include "../anti-tamper/state.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#include "scanner_task_center.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 #include <algorithm>
@@ -1507,12 +1508,19 @@ bool first_scan(const scan_config_t& config) {
 			}
 			g_state.scan_thread_done.store(true, std::memory_order_release);
 		};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted) {
 			diag::log_tagged("mem_scanner", "first_scan worker_post_failed");
 			st.scan_thread_done.store(true, std::memory_order_release);
 			st.scanning.store(false);
 			return false;
 		}
+		scanner_task_center::register_executor_task(submitted,
+			"view.memory.scanner", "memory.first_scan", "Initial memory scan",
+			driver_bridge::attached_pid(), true, []() {
+				g_state.scanning.store(false, std::memory_order_release);
+				return true;
+			});
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-RELEASE first_scan_dispatch token=%llu reason=dispatched",
 			static_cast<unsigned long long>(fs_admission.token()));
@@ -1612,12 +1620,19 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 			}
 			g_state.scan_thread_done.store(true, std::memory_order_release);
 		};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted) {
 			diag::log_tagged("mem_scanner", "next_scan worker_post_failed");
 			st.scan_thread_done.store(true, std::memory_order_release);
 			st.scanning.store(false);
 			return false;
 		}
+		scanner_task_center::register_executor_task(submitted,
+			"view.memory.scanner", "memory.next_scan", "Refine memory scan",
+			driver_bridge::attached_pid(), true, []() {
+				g_state.scanning.store(false, std::memory_order_release);
+				return true;
+			});
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-RELEASE next_scan_dispatch token=%llu reason=dispatched",
 			static_cast<unsigned long long>(ns_admission.token()));
@@ -1849,13 +1864,20 @@ bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, 
 			pointer_scan_thread(target_address, max_depth, max_offset, scan_base, scan_size);
 			g_state.pointer_thread_done.store(true, std::memory_order_release);
 		};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted)
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted)
 	{
 		diag::log_tagged("pointer_scan", "start_pointer_scan worker_post_failed");
 		st.pointer_thread_done.store(true, std::memory_order_release);
 		st.pointer_scanning.store(false);
 		return false;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.pointer_scan", "memory.pointer_scan", "Pointer scan",
+		driver_bridge::attached_pid(), true, []() {
+			cancel_pointer_scan();
+			return true;
+		});
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-RELEASE pointer_scan_dispatch token=%llu reason=dispatched",
 		static_cast<unsigned long long>(ps_admission.token()));

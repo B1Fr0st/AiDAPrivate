@@ -2,12 +2,13 @@
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #include "zydis_disasm.hpp"
 #include "disasm_view.hpp"
-#include "symbol_store.hpp"
 #include "../infra/executor.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#endif
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
 #include "ui/motion.hpp"
@@ -15,6 +16,7 @@
 #include "ui/empty_state.hpp"
 #include "ui/fonts.hpp"
 #include "ui/ui_anim.hpp"
+#include "../ui/analysis_context_menu.hpp"
 #include "workspace/overlay_journal.hpp"
 #include "workspace/workspace_registry.hpp"
 #include "../session/analysis_session.hpp"
@@ -33,8 +35,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <Windows.h>
 
 namespace cfg_view {
 	void build_cfg(const disasm_view::workspace_context_t& context,
@@ -134,6 +134,19 @@ namespace functions_panel {
 			return out;
 		}
 
+		inline int compare_case_insensitive(const std::string& lhs, const std::string& rhs) {
+			const std::size_t shared = (std::min)(lhs.size(), rhs.size());
+			for (std::size_t index = 0; index < shared; ++index) {
+				const int left = std::tolower(static_cast<unsigned char>(lhs[index]));
+				const int right = std::tolower(static_cast<unsigned char>(rhs[index]));
+				if (left < right) return -1;
+				if (left > right) return 1;
+			}
+			if (lhs.size() < rhs.size()) return -1;
+			if (lhs.size() > rhs.size()) return 1;
+			return 0;
+		}
+
 		inline std::string make_synthetic_name(uint64_t addr) {
 			char buf[32];
 			std::snprintf(buf, sizeof(buf), "sub_%llX",
@@ -169,9 +182,12 @@ namespace functions_panel {
 			}
 			{
 				std::lock_guard<std::mutex> lock(state_handle->mtx);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				const uint64_t symbol_revision = 0;
+#else
 				const auto current_symbols = analysis_session::symbols_for_workspace(workspace);
-				const uint64_t symbol_revision = current_symbols
-					? current_symbols->revision() : 0;
+				const uint64_t symbol_revision = current_symbols ? current_symbols->revision() : 0;
+#endif
 				if (state_handle->cached_generation == publication->generation &&
 					state_handle->cached_analysis_revision == publication->analysis_revision &&
 					state_handle->cached_overlay_revision == publication->overlay_revision &&
@@ -185,9 +201,13 @@ namespace functions_panel {
 			state_handle->ready.store(false, std::memory_order_release);
 			const auto snapshot = publication->snapshot;
 			const auto overlay = workspace->overlay();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			std::shared_ptr<symbol_store::workspace_state_t> debug_symbols;
+			uint64_t debug_symbol_revision = 0;
+#else
 			const auto debug_symbols = analysis_session::symbols_for_workspace(workspace);
-			const uint64_t debug_symbol_revision = debug_symbols
-				? debug_symbols->revision() : 0;
+			const uint64_t debug_symbol_revision = debug_symbols ? debug_symbols->revision() : 0;
+#endif
 			aida::infra::executor::submission_t submission;
 			submission.owner_subsystem = "analysis";
 			submission.label = "analysis.functions_panel.workspace_projection";
@@ -204,6 +224,7 @@ namespace functions_panel {
 				}
 				const auto image = snapshot->image;
 				std::unordered_map<uint64_t, std::string> debug_symbol_names;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 				if (debug_symbols) {
 					const auto mode = image ? image->architecture_mode() :
 						(workspace->identity().architecture() ==
@@ -222,6 +243,9 @@ namespace functions_panel {
 								std::move(entry.name));
 					}
 				}
+#else
+				(void)debug_symbols;
+#endif
 				std::unordered_map<uint64_t, std::string> overlay_names;
 				if (overlay) {
 					const auto overlay_snapshot = overlay->snapshot();
@@ -405,7 +429,7 @@ namespace functions_panel {
 
 			char addr_buf[32];
 			for (int i = 0; i < static_cast<int>(s.entries.size()); ++i) {
-				const auto& e = s.entries[i];
+				const auto& e = s.entries[static_cast<std::size_t>(i)];
 				bool matched = false;
 
 				std::snprintf(addr_buf, sizeof(addr_buf), "%llx",
@@ -449,14 +473,14 @@ namespace functions_panel {
 						else if (a.address > b.address) c = 1;
 						break;
 					case 1:
-						c = _stricmp(a.name.c_str(), b.name.c_str());
+						c = compare_case_insensitive(a.name, b.name);
 						break;
 					case 2:
 						if (a.size < b.size) c = -1;
 						else if (a.size > b.size) c = 1;
 						break;
 					case 3:
-						c = _stricmp(a.section.c_str(), b.section.c_str());
+						c = compare_case_insensitive(a.section, b.section);
 						break;
 					case 4: {
 						uint64_t ax = static_cast<uint64_t>(a.calls_in)
@@ -486,8 +510,15 @@ namespace functions_panel {
 			if (addr == 0) return;
 			auto context = disasm_view::capture_workspace(render_workspace());
 			if (!context) return;
-			globals::ui::active_center_view = center_view_t::disassembly;
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(addr, context);
+		}
+
+		inline void select_function(uint64_t addr) {
+			if (addr == 0) return;
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
+			disasm_view::select_address(addr, context);
 		}
 
 		inline void open_in_graph(uint64_t addr) {
@@ -495,14 +526,14 @@ namespace functions_panel {
 			auto context = disasm_view::capture_workspace(render_workspace());
 			if (!context) return;
 			cfg_view::build_cfg(context, addr);
-			globals::ui::active_center_view = center_view_t::graph_view;
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.graph"));
 		}
 
 		inline void show_xrefs_to(uint64_t addr) {
 			if (addr == 0) return;
 			auto context = disasm_view::capture_workspace(render_workspace());
 			if (!context) return;
-			globals::ui::active_center_view = center_view_t::disassembly;
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(addr, context);
 			disasm_view::open_xrefs(addr, context);
 		}
@@ -955,6 +986,7 @@ namespace functions_panel {
 					if (clicked) {
 						s.selected_row = row_idx;
 						s.selected_addr = e.address;
+						detail::select_function(e.address);
 					}
 					if (dbl_clicked) {
 						detail::jump_to_disasm(e.address);
@@ -1038,6 +1070,7 @@ namespace functions_panel {
 					{
 						s.selected_row = row_idx;
 						s.selected_addr = e.address;
+						detail::select_function(e.address);
 						if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 							detail::jump_to_disasm(e.address);
 						}
@@ -1167,8 +1200,50 @@ namespace functions_panel {
 		ImGui::PopStyleColor(5);
 		ImGui::PopStyleVar();
 
-		if (ctx_menu_request) {
-			ImGui::OpenPopup("##fn_ctx_menu");
+		aida::ui::context_menu_open_origin_t function_origin{};
+		const bool function_keyboard = s.selected_addr != 0 &&
+			ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			aida::ui::analysis_context_menu::keyboard_request(function_origin);
+		if (ctx_menu_request || function_keyboard) {
+			using namespace aida::ui::analysis_context_menu;
+			using aida::ui::action_handler_result_t;
+			const auto target = ctx_menu_request ? s.ctx_addr : s.selected_addr;
+			auto workspace = render_workspace();
+			if (workspace) {
+				context_t menu;
+				menu.kind = menu_kind_t::function;
+				const auto generation = workspace->generation();
+				const auto revision = workspace->analysis_revision();
+				menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
+					(generation << 6u) + (generation >> 2u));
+				menu.live_generation = [workspace]() {
+					const auto current = workspace->generation();
+					const auto current_revision = workspace->analysis_revision();
+					return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
+						(current << 6u) + (current >> 2u));
+				};
+				menu.actions["analysis.navigate.disassembly"].invoke = [target]() {
+					detail::jump_to_disasm(target);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.graph"].invoke = [target]() {
+					detail::open_in_graph(target);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.xrefs"].invoke = [target]() {
+					detail::show_xrefs_to(target);
+					return action_handler_result_t::completed();
+				};
+				char address[32]{};
+				std::snprintf(address, sizeof(address), "0x%llX",
+					static_cast<unsigned long long>(target));
+				menu.actions["analysis.copy.address"].invoke = [value = std::string(address)]() {
+					ImGui::SetClipboardText(value.c_str());
+					return action_handler_result_t::completed();
+				};
+				open(std::move(menu), ctx_menu_request
+					? aida::ui::context_menu_open_origin_t::pointer : function_origin);
+			}
 		}
 
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 6.f));
@@ -1176,21 +1251,9 @@ namespace functions_panel {
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.f, 4.f));
 		ImGui::PushStyleColor(ImGuiCol_PopupBg, th.bg_overlay);
 		ImGui::PushStyleColor(ImGuiCol_Border, th.border_subtle);
-		if (ImGui::BeginPopup("##fn_ctx_menu")) {
-			uint64_t target = s.ctx_addr;
-			if (ImGui::MenuItem("Goto in disassembly")) {
-				detail::jump_to_disasm(target);
-			}
-			if (ImGui::MenuItem("Show xrefs to", "X")) {
-				detail::show_xrefs_to(target);
-			}
-			if (ImGui::MenuItem("Open in graph view", "Space")) {
-				detail::open_in_graph(target);
-			}
-			ImGui::EndPopup();
-		}
 		ImGui::PopStyleColor(2);
 		ImGui::PopStyleVar(3);
+		aida::ui::analysis_context_menu::render();
 
 		if (ready && !building && total_count == 0) {
 			ImVec2 cp = ImVec2(wp.x + pad, wp.y + header_h + 8.f);

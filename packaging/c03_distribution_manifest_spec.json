@@ -20,6 +20,7 @@
   "artifacts": [
     { "id": "standalone-protector", "kind": "protector_receipt", "relative_path": "deps/evidence/standalone.protector.json", "owner": "standalone", "license_ids": ["aida-proprietary"] },
     { "id": "standalone-signature", "kind": "signature_receipt", "relative_path": "deps/evidence/standalone.signature.json", "owner": "standalone", "license_ids": ["aida-proprietary"] },
+    { "id": "production-link-graph", "kind": "build_evidence", "relative_path": "deps/evidence/production-link-graph.json", "owner": "standalone", "license_ids": ["aida-proprietary"] },
     { "id": "native-worker-executable", "kind": "worker_executable", "relative_path": "deps/AiDA_NativeDecompilerWorker.exe", "owner": "native_decompiler", "license_ids": ["aida-proprietary", "apache-2.0"] },
     { "id": "native-worker-manifest", "kind": "worker_manifest", "relative_path": "deps/AiDA_NativeDecompilerWorker.manifest.bin", "owner": "native_decompiler", "license_ids": ["aida-proprietary"] },
     { "id": "native-worker-manifest-digest", "kind": "manifest_digest", "relative_path": "deps/AiDA_NativeDecompilerWorker.manifest.sha256", "owner": "native_decompiler", "license_ids": ["aida-proprietary"] },

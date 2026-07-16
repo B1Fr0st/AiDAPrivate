@@ -1,10 +1,15 @@
 include_guard(GLOBAL)
 
 function(_aida_c03_validate_raw_windows_path_shape input_path descriptor)
-    if(NOT ARGC EQUAL 2 OR NOT input_path OR input_path MATCHES ";" OR
+    string(LENGTH "${input_path}" _aida_c03_input_length)
+    if(NOT ARGC EQUAL 2 OR _aida_c03_input_length LESS 3 OR
+       _aida_c03_input_length GREATER 32767 OR NOT input_path OR input_path MATCHES ";" OR
        input_path MATCHES "\\\\" OR NOT input_path MATCHES "^[A-Z]:/" OR
        input_path MATCHES "//" OR input_path MATCHES "(^|/)\\.(/|$)" OR
-       input_path MATCHES "(^|/)\\.\\.(/|$)" OR input_path MATCHES "/$")
+       input_path MATCHES "(^|/)\\.\\.(/|$)" OR
+       input_path MATCHES "(^|/)[^/]*[. ](/|$)" OR
+       input_path MATCHES "/[^/]*:" OR input_path MATCHES "[^ -~]" OR
+       input_path MATCHES "/$")
         message(FATAL_ERROR "AiDA C03 ${descriptor} must use an exact uppercase-drive canonical forward-slash path: ${input_path}")
     endif()
 endfunction()
@@ -65,11 +70,25 @@ function(aida_c03_validate_no_reparse_chain powershell_executable policy_script 
     endif()
 endfunction()
 
-function(aida_c03_require_detached_roots application_root developer_root customer_root)
-    if(NOT ARGC EQUAL 3)
+function(aida_c03_require_detached_roots repository_root binary_root source_root
+         application_root developer_root customer_root evidence_root stage_owner_root)
+    if(NOT ARGC EQUAL 8)
         message(FATAL_ERROR "AiDA C03 detached-root validation arguments are malformed")
     endif()
-    foreach(_aida_c03_root IN ITEMS "${application_root}" "${developer_root}" "${customer_root}")
+    foreach(_aida_c03_input_root IN ITEMS "${repository_root}" "${binary_root}" "${source_root}")
+        _aida_c03_validate_raw_windows_path_shape("${_aida_c03_input_root}" "detached input root")
+        if(NOT IS_DIRECTORY "${_aida_c03_input_root}" OR IS_SYMLINK "${_aida_c03_input_root}")
+            message(FATAL_ERROR "AiDA C03 detached input root must be an existing non-reparse directory: ${_aida_c03_input_root}")
+        endif()
+        file(REAL_PATH "${_aida_c03_input_root}" _aida_c03_real_input_root)
+        file(TO_CMAKE_PATH "${_aida_c03_real_input_root}" _aida_c03_real_input_root)
+        if(NOT _aida_c03_real_input_root STREQUAL _aida_c03_input_root)
+            message(FATAL_ERROR "AiDA C03 detached input root has noncanonical case or final spelling: ${_aida_c03_input_root}")
+        endif()
+    endforeach()
+    foreach(_aida_c03_root IN ITEMS
+            "${application_root}" "${developer_root}" "${customer_root}"
+            "${evidence_root}" "${stage_owner_root}")
         _aida_c03_validate_raw_windows_path_shape("${_aida_c03_root}" "detached root")
         if(NOT IS_DIRECTORY "${_aida_c03_root}" OR IS_SYMLINK "${_aida_c03_root}")
             message(FATAL_ERROR "AiDA C03 detached root must be an existing non-reparse directory: ${_aida_c03_root}")
@@ -80,17 +99,54 @@ function(aida_c03_require_detached_roots application_root developer_root custome
             message(FATAL_ERROR "AiDA C03 detached root has noncanonical case or final spelling: ${_aida_c03_root}")
         endif()
     endforeach()
+    if(DEFINED ENV{TEMP} AND IS_DIRECTORY "$ENV{TEMP}")
+        file(REAL_PATH "$ENV{TEMP}" _aida_c03_temp_root)
+        file(TO_CMAKE_PATH "${_aida_c03_temp_root}" _aida_c03_temp_root)
+        foreach(_aida_c03_non_temp_root IN ITEMS
+                "${application_root}" "${developer_root}" "${customer_root}"
+                "${evidence_root}" "${stage_owner_root}")
+            cmake_path(IS_PREFIX _aida_c03_temp_root "${_aida_c03_non_temp_root}"
+                NORMALIZE _aida_c03_root_inside_temp)
+            if(_aida_c03_root_inside_temp)
+                message(FATAL_ERROR "AiDA C03 stage roots must remain outside TEMP: ${_aida_c03_non_temp_root}")
+            endif()
+        endforeach()
+    endif()
+    foreach(_aida_c03_stage_root IN ITEMS
+            "${application_root}" "${developer_root}" "${customer_root}"
+            "${evidence_root}" "${stage_owner_root}")
+        foreach(_aida_c03_input_root IN ITEMS
+                "${repository_root}" "${binary_root}" "${source_root}")
+            cmake_path(IS_PREFIX _aida_c03_input_root "${_aida_c03_stage_root}"
+                NORMALIZE _aida_c03_stage_inside_input)
+            cmake_path(IS_PREFIX _aida_c03_stage_root "${_aida_c03_input_root}"
+                NORMALIZE _aida_c03_input_inside_stage)
+            if(_aida_c03_stage_inside_input OR _aida_c03_input_inside_stage)
+                message(FATAL_ERROR "AiDA C03 stage roots must remain detached from repository, binary, and application source roots: ${_aida_c03_stage_root} ${_aida_c03_input_root}")
+            endif()
+        endforeach()
+    endforeach()
     foreach(_aida_c03_pair IN ITEMS
             "${application_root}|${developer_root}"
             "${application_root}|${customer_root}"
-            "${developer_root}|${customer_root}")
+            "${application_root}|${evidence_root}"
+            "${developer_root}|${customer_root}"
+            "${developer_root}|${evidence_root}"
+            "${customer_root}|${evidence_root}")
         string(REPLACE "|" ";" _aida_c03_pair_fields "${_aida_c03_pair}")
         list(GET _aida_c03_pair_fields 0 _aida_c03_left)
         list(GET _aida_c03_pair_fields 1 _aida_c03_right)
         cmake_path(IS_PREFIX _aida_c03_left "${_aida_c03_right}" NORMALIZE _aida_c03_left_contains_right)
         cmake_path(IS_PREFIX _aida_c03_right "${_aida_c03_left}" NORMALIZE _aida_c03_right_contains_left)
         if(_aida_c03_left_contains_right OR _aida_c03_right_contains_left)
-            message(FATAL_ERROR "AiDA C03 application, developer, and customer roots must be pairwise detached: ${_aida_c03_left} ${_aida_c03_right}")
+            message(FATAL_ERROR "AiDA C03 application, developer, customer, and evidence roots must be pairwise detached: ${_aida_c03_left} ${_aida_c03_right}")
+        endif()
+    endforeach()
+    foreach(_aida_c03_child IN ITEMS
+            "${application_root}" "${developer_root}" "${customer_root}" "${evidence_root}")
+        cmake_path(IS_PREFIX stage_owner_root "${_aida_c03_child}" NORMALIZE _aida_c03_owned_child)
+        if(NOT _aida_c03_owned_child OR _aida_c03_child STREQUAL stage_owner_root)
+            message(FATAL_ERROR "AiDA C03 stage subroot is not owned by the exact stage authority: ${_aida_c03_child}")
         endif()
     endforeach()
 endfunction()

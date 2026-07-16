@@ -3,7 +3,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const pool = require('../db/pool');
-const { signPayload, dualSignPayload, signWithKid, getActiveKidInfo } = require('../crypto/signing');
+const { signPayload, dualSignPayload, signWithKid, getActiveKidInfo, getSigningPrivateKey } = require('../crypto/signing');
 const { deriveKeySeed } = require('../crypto/arc-encrypt');
 const kwWrap = require('../crypto/kw_wrap');
 const arcLicenseBind = require('../crypto/arc-license-bind');
@@ -22,6 +22,7 @@ const replayCounter = require('../middleware/replay_counter');
 const killSwitchModule = require('../middleware/kill_switch');
 const peerCodeHash = require('../crypto/peer_code_hash');
 const sessionRatchet = require('../middleware/session_ratchet');
+const { verifyHeartbeatHmac } = require('./build');
 
 const SESSION_RATCHET_AUTHENTICATED_ACTIONS = new Set([
     'heartbeat',
@@ -52,6 +53,36 @@ async function getBuildTextHash(buildId) {
         console.warn('[license] getBuildTextHash failed:', err && err.message ? err.message : err);
         return null;
     }
+}
+
+async function getBuildWbaesTableHash(buildId) {
+    if (!buildId || typeof buildId !== 'string' || buildId.length < 4 || buildId.length > 128) {
+        return null;
+    }
+    try {
+        const { rows } = await pool.query(
+            'SELECT expected_wbaes_table_hash, retired FROM builds WHERE build_id = $1',
+            [buildId]
+        );
+        if (rows.length === 0) return null;
+        const row = rows[0];
+        const hash = typeof row.expected_wbaes_table_hash === 'string' ? row.expected_wbaes_table_hash.trim().toLowerCase() : '';
+        if (!/^[0-9a-f]{64}$/.test(hash)) return null;
+        return { hash, retired: !!row.retired };
+    } catch (err) {
+        console.warn('[license] getBuildWbaesTableHash failed:', err && err.message ? err.message : err);
+        return null;
+    }
+}
+
+function signFallbackToken(sessionToken, timestamp, mismatchedHash) {
+    const message = Buffer.concat([
+        Buffer.from(String(sessionToken || ''), 'utf8'),
+        Buffer.from(String(timestamp || ''), 'utf8'),
+        Buffer.from(String(mismatchedHash || ''), 'utf8'),
+    ]);
+    const privateKey = getSigningPrivateKey();
+    return crypto.sign(null, message, privateKey).toString('hex');
 }
 
 function hkdfExpandSha256(prk, info, length) {
@@ -3039,6 +3070,28 @@ async function handleHeartbeat(body, clientIp) {
         return collapseHeartbeatDeny('invalid_heartbeat_nonce', license_key, hwid, clientIp);
     }
 
+    const hbWatermarkId = typeof body.watermark_id === 'string' ? body.watermark_id.trim() : '';
+    const hbTemplateVersion = typeof body.template_version === 'number' ? body.template_version : (typeof body.template_version === 'string' ? Number(body.template_version) : 0);
+    const hbHeartbeatHmac = typeof body.heartbeat_hmac === 'string' ? body.heartbeat_hmac.trim().toLowerCase() : '';
+    if (hbWatermarkId && hbHeartbeatHmac) {
+        const hbHwidHash = computeHwidHash(hwid || '');
+        const hbNonce = typeof body.heartbeat_nonce === 'string' ? body.heartbeat_nonce : '';
+        let hbVerified = false;
+        try {
+            hbVerified = verifyHeartbeatHmac(hbWatermarkId, hbTemplateVersion, hbNonce, hbHwidHash, hbHeartbeatHmac);
+        } catch (err) {
+            dbgHb('heartbeat_hmac_error', { err: err && err.message ? err.message : 'unknown' });
+        }
+        dbgHb('heartbeat_hmac_check', {
+            watermark_id: hbWatermarkId.slice(0, 16),
+            template_version: hbTemplateVersion,
+            verified: hbVerified,
+        });
+        if (!hbVerified) {
+            return collapseHeartbeatDeny('heartbeat_hmac_failed', license_key, hwid, clientIp);
+        }
+    }
+
     if (typeof body.echoed_server_nonce === 'string' && body.echoed_server_nonce.length > 0) {
         const echoed = body.echoed_server_nonce.trim().toLowerCase();
         if (!/^[0-9a-f]{16,128}$/.test(echoed)) {
@@ -3362,6 +3415,44 @@ async function handleHeartbeat(body, clientIp) {
         }
     }
 
+    const clientWbaesTableHash = typeof body.wbaes_table_hash === 'string' ? body.wbaes_table_hash.trim().toLowerCase() : '';
+    const clientFallbackMode = body.fallback_mode === 1 || body.fallback_mode === true;
+    let fallbackTokenHex = '';
+    if (clientWbaesTableHash && /^[0-9a-f]{64}$/.test(clientWbaesTableHash)) {
+        const wbaesBuildInfo = clientBuildId ? await getBuildWbaesTableHash(clientBuildId) : null;
+        if (wbaesBuildInfo) {
+            const wbaesHashMatch = compareHexConstantTime(wbaesBuildInfo.hash, clientWbaesTableHash);
+            if (!wbaesHashMatch) {
+                if (clientFallbackMode) {
+                    fallbackTokenHex = signFallbackToken(session_token, now, clientWbaesTableHash);
+                    try {
+                        await pool.query(
+                            `UPDATE sessions SET fallback_count = fallback_count + 1, fallback_mode = 1, wbaes_table_hash = $1 WHERE license_key = $2`,
+                            [clientWbaesTableHash, license_key]
+                        );
+                    } catch (_) {}
+                } else {
+                    violationReasons.push('wbaes_table_hash_mismatch');
+                    violationEvidence.wbaes_table_hash_expected = wbaesBuildInfo.hash.slice(0, 16);
+                    violationEvidence.wbaes_table_hash_received = clientWbaesTableHash.slice(0, 16);
+                }
+            } else {
+                if (clientFallbackMode) {
+                    violationReasons.push('wbaes_fallback_inconsistent');
+                    violationEvidence.wbaes_table_hash_match = true;
+                    violationEvidence.fallback_mode = 1;
+                } else {
+                    try {
+                        await pool.query(
+                            `UPDATE sessions SET wbaes_table_hash = $1, fallback_mode = 0 WHERE license_key = $2`,
+                            [clientWbaesTableHash, license_key]
+                        );
+                    } catch (_) {}
+                }
+            }
+        }
+    }
+
 
     const prevGateBitmap = Number(session.last_gate_bitmap || 0);
     const rawGateBitmap = Number(body.gate_bitmap || 0);
@@ -3593,6 +3684,9 @@ async function handleHeartbeat(body, clientIp) {
         auth_hmac_key_b64: sessionAuthHmacKeyBase64(session),
         session_key_fingerprint: session.session_key_fingerprint || '',
     };
+    if (fallbackTokenHex) {
+        sigPayload.fallback_token = fallbackTokenHex;
+    }
     if (nextChallenge) {
         sigPayload.next_challenge_id = nextChallenge.challenge_id;
         sigPayload.next_challenge_nonce = nextChallenge.challenge_nonce;

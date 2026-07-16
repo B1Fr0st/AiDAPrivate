@@ -14,7 +14,7 @@
 #include "debugger_engine.hpp"
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 
@@ -401,7 +401,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				debugger_engine::invalidate_cache();
 			}
 			if (ImGui::MenuItem("Go to RIP in Disasm")) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(snapshot[g_ui.context_idx].rip,
 					disasm_view::capture_selected_workspace());
 			}

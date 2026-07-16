@@ -38,8 +38,12 @@ namespace aida::infra::win_thread {
 
 inline DWORD run_function_seh_guarded(const std::function<void()>& body)
 {
-	if (body) body();
-	return 0;
+	try {
+		if (body) body();
+		return 0;
+	} catch (...) {
+		return 0xE06D7363u;
+	}
 }
 
 }

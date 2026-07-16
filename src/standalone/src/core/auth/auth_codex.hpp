@@ -1,5 +1,7 @@
 #pragma once
 
+#include "auth_http.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -26,6 +28,7 @@ namespace codex {
 		int port = CODEX_OAUTH_PORT;
 		std::atomic<bool> done{ false };
 		std::atomic<bool> cancelled{ false };
+		std::atomic<std::uint8_t> terminal_phase{ 0 };
 		std::string received_code;
 		std::string received_state;
 		std::string error;
@@ -45,6 +48,7 @@ namespace codex {
 		int port = CODEX_OAUTH_PORT;
 		bool done = false;
 		bool cancelled = false;
+		std::uint8_t terminal_phase = 0;
 		std::string received_code;
 		std::string received_state;
 		std::string error;
@@ -54,8 +58,9 @@ namespace codex {
 
 	bool start_login(codex_login_state_t& state, std::uint64_t absolute_deadline_ms = 0);
 	bool poll_login(codex_login_state_t& state);
+	bool request_cancel(codex_login_state_t& state) noexcept;
 	bool cancel_login(codex_login_state_t& state);
-	bool refresh_token();
+	bool refresh_token(const http::cancel_cb_t& cancelled = {}, int timeout_sec = 30);
 	bool revoke_token();
 	bool revoke_tokens(const std::string& access_token,
 		const std::string& refresh_token_value,

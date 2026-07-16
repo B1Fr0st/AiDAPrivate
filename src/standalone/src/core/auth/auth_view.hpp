@@ -9,7 +9,7 @@ namespace auth_view {
 	void shutdown();
 	void render(float panel_w, float panel_h);
 	bool any_login_in_progress();
-	const std::string& last_error();
+	std::string last_error();
 
 	void focus_provider(const std::string& provider_id);
 	bool is_provider_authenticated(const std::string& provider_id);

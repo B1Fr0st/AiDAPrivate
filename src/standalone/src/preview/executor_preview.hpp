@@ -4,8 +4,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -166,11 +164,6 @@ struct active_snapshot_t {
 
 using preview_submission_observer_t = void (*)(const submission_t&);
 
-struct queued_preview_submission_t {
-    std::uint64_t task_id = 0;
-    submission_t submission;
-};
-
 inline std::atomic<std::uint64_t> total_submits{0};
 inline std::atomic<std::uint64_t> total_rejected{0};
 inline std::atomic<std::uint64_t> total_ui_wait_rejected{0};
@@ -188,9 +181,6 @@ inline constexpr std::size_t kMaxRejectReasonEntries = 32;
 inline std::mutex g_deadline_reported_mutex;
 inline std::map<std::uint64_t, bool> g_deadline_reported;
 inline std::atomic<preview_submission_observer_t> g_preview_submission_observer{nullptr};
-inline std::atomic<std::uint64_t> g_preview_deferred_task_id{1ULL << 63};
-inline std::mutex g_preview_deferred_mutex;
-inline std::deque<queued_preview_submission_t> g_preview_deferred_submissions;
 
 inline std::size_t domain_index(domain_t domain) {
     return static_cast<std::size_t>(domain);
@@ -233,10 +223,6 @@ inline std::uint64_t now_ms() {
 
 inline void set_preview_submission_observer(preview_submission_observer_t observer) {
     g_preview_submission_observer.store(observer);
-}
-
-inline bool preview_deferred_owner(const char* owner) {
-    return owner && (std::strncmp(owner, "auth_", 5) == 0 || std::strcmp(owner, "auth_view") == 0);
 }
 
 inline void emit_breadcrumb(domain_t domain, const char* event, const submission_t& submission,
@@ -350,46 +336,11 @@ inline submit_result_t submit_immediate(submission_t&& submission, bool count_at
 }
 
 inline submit_result_t submit(submission_t&& submission) {
-    if (!preview_deferred_owner(submission.owner_subsystem))
-        return submit_immediate(std::move(submission));
-    total_submits.fetch_add(1);
-    if (!submission.owner_subsystem || submission.owner_subsystem[0] == '\0')
-        return reject_submission(submission, "missing_owner_subsystem");
-    if (!submission.label || submission.label[0] == '\0')
-        return reject_submission(submission, "missing_label");
-    if (!submission.body)
-        return reject_submission(submission, "missing_body");
-    if (g_shutdown_requested.load())
-        return reject_submission(submission, "executor_shutdown_requested");
-    const auto task_id = g_preview_deferred_task_id.fetch_add(1);
-    {
-        std::lock_guard<std::mutex> lock(g_preview_deferred_mutex);
-        g_preview_deferred_submissions.push_back({task_id, std::move(submission)});
-    }
-    return {true, task_id, {}};
+    return submit_immediate(std::move(submission));
 }
 
 inline void drain_preview_frame() {
-    std::deque<queued_preview_submission_t> ready;
-    {
-        std::lock_guard<std::mutex> lock(g_preview_deferred_mutex);
-        ready.swap(g_preview_deferred_submissions);
-    }
-    for (auto& task : ready)
-        static_cast<void>(submit_immediate(std::move(task.submission), false));
-}
-
-inline void clear_preview_tasks() {
-    std::deque<queued_preview_submission_t> pending;
-    {
-        std::lock_guard<std::mutex> lock(g_preview_deferred_mutex);
-        pending.swap(g_preview_deferred_submissions);
-    }
-    for (auto& task : pending) {
-        if (task.submission.cancel_hook)
-            task.submission.cancel_hook();
-        total_cancels.fetch_add(1);
-    }
+    taskflow_runtime::check_deadlines();
 }
 
 inline active_snapshot_t active_snapshot() {
@@ -409,22 +360,6 @@ inline active_snapshot_t active_snapshot() {
          ++index) {
         result.active_per_domain[index] = runtime.active_per_domain[index];
     }
-    std::lock_guard<std::mutex> lock(g_preview_deferred_mutex);
-    for (const auto& task : g_preview_deferred_submissions) {
-        switch (task.submission.domain) {
-        case domain_t::service:
-        case domain_t::long_running:
-            ++result.service_queue_pending;
-            break;
-        case domain_t::critical:
-        case domain_t::security_liveness:
-            ++result.critical_queue_pending;
-            break;
-        default:
-            ++result.work_queue_pending;
-            break;
-        }
-    }
     return result;
 }
 
@@ -432,15 +367,6 @@ inline wait_result_t wait_for(std::uint64_t task_id, std::uint32_t timeout_ms) {
     if (is_ui_thread()) {
         total_ui_wait_rejected.fetch_add(1);
         return {false, false, true};
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_preview_deferred_mutex);
-        const auto pending = std::find_if(g_preview_deferred_submissions.begin(),
-            g_preview_deferred_submissions.end(), [task_id](const queued_preview_submission_t& task) {
-                return task.task_id == task_id;
-            });
-        if (pending != g_preview_deferred_submissions.end())
-            return {false, false, false};
     }
     const auto runtime = taskflow_runtime::wait_for(task_id, timeout_ms);
     if (runtime.timed_out)
@@ -453,26 +379,6 @@ inline wait_result_t wait_for(std::uint64_t task_id, std::uint32_t timeout_ms) {
 }
 
 inline bool cancel(std::uint64_t task_id) {
-    std::function<void()> deferred_cancel_hook;
-    bool deferred_found = false;
-    {
-        std::lock_guard<std::mutex> lock(g_preview_deferred_mutex);
-        const auto found = std::find_if(g_preview_deferred_submissions.begin(),
-            g_preview_deferred_submissions.end(), [task_id](const queued_preview_submission_t& task) {
-                return task.task_id == task_id;
-            });
-        if (found != g_preview_deferred_submissions.end()) {
-            deferred_found = true;
-            deferred_cancel_hook = std::move(found->submission.cancel_hook);
-            g_preview_deferred_submissions.erase(found);
-        }
-    }
-    if (deferred_found) {
-        if (deferred_cancel_hook)
-            deferred_cancel_hook();
-        total_cancels.fetch_add(1);
-        return true;
-    }
     if (task_id == 0 || !taskflow_runtime::cancel(task_id))
         return false;
     total_cancels.fetch_add(1);
@@ -481,26 +387,6 @@ inline bool cancel(std::uint64_t task_id) {
 
 inline void check_deadlines() {
     const auto current = now_ms();
-    std::deque<queued_preview_submission_t> deferred_expired;
-    {
-        std::lock_guard<std::mutex> lock(g_preview_deferred_mutex);
-        auto iterator = g_preview_deferred_submissions.begin();
-        while (iterator != g_preview_deferred_submissions.end()) {
-            if (iterator->submission.deadline_ms == 0 || current < iterator->submission.deadline_ms) {
-                ++iterator;
-                continue;
-            }
-            deferred_expired.push_back(std::move(*iterator));
-            iterator = g_preview_deferred_submissions.erase(iterator);
-        }
-    }
-    for (auto& task : deferred_expired) {
-        if (task.submission.cancel_hook)
-            task.submission.cancel_hook();
-        total_timeouts.fetch_add(1);
-        emit_simple_breadcrumb(task.submission.domain, task.submission.label,
-            task.submission.owner_subsystem, "EXECUTOR-TIMEOUT", 4);
-    }
     const auto snapshot = taskflow_runtime::active_snapshot(128);
     std::map<std::uint64_t, taskflow_runtime::active_job_snapshot_t> expired;
     {
@@ -521,11 +407,8 @@ inline void check_deadlines() {
     }
 }
 
-inline void shutdown() {
-    bool expected = false;
-    if (!g_shutdown_requested.compare_exchange_strong(expected, true))
-        return;
-    clear_preview_tasks();
+inline bool shutdown() {
+    g_shutdown_requested.store(true, std::memory_order_release);
     diagnostics::breadcrumb_options_t options;
     options.category = diagnostics::breadcrumb_category_t::startup_shutdown;
     options.label = "executor_shutdown";
@@ -533,7 +416,7 @@ inline void shutdown() {
     options.owner_subsystem = "executor";
     options.status_code = 5;
     diagnostics::emit(std::move(options));
-    taskflow_runtime::shutdown();
+    return taskflow_runtime::shutdown();
 }
 
 inline void json_append_escaped(std::string& output, const std::string& value) {
@@ -604,7 +487,7 @@ inline std::string snapshot_json_string() {
 }
 
 struct shutdown_guard_t {
-    ~shutdown_guard_t() { shutdown(); }
+    ~shutdown_guard_t() noexcept { try { static_cast<void>(shutdown()); } catch (...) {} }
 };
 
 inline shutdown_guard_t g_shutdown_guard;

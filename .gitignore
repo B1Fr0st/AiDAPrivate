@@ -34,6 +34,11 @@
 !/packaging/c03_distribution_manifest.schema.json
 !/packaging/c03_distribution_manifest.ps1
 !/packaging/c03_distribution_manifest_spec.json
+!/packaging/c03_distribution_fixture/
+!/packaging/c03_distribution_fixture/**
+**/.aida-c03-publication-journal.json
+**/.aida-c03-signing-provider-*.exe
+**/.aida-c03-signer-policy-*.json
 !/packaging/c03_worker_runtime/
 !/packaging/c03_worker_runtime/**
 !/packaging/c03_camoufox_reverse_mcp_build.lock.json

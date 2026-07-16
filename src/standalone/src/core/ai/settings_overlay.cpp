@@ -5,6 +5,7 @@
 #endif
 
 #include "settings_overlay.hpp"
+#include "../ui/application_view_registry.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -23,6 +25,7 @@
 #include "auth_view.hpp"
 #include "agent_manager_view.hpp"
 #include "skill_manager_view.hpp"
+#include "../ui/application_view_registry.hpp"
 
 #include "mcp_client.hpp"
 #include "mcp_marketplace.hpp"
@@ -35,6 +38,7 @@
 #include "../ui/brand.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/motion.hpp"
@@ -93,6 +97,9 @@ namespace settings_overlay {
 
 			std::mutex pending_focus_mtx;
 			std::string pending_provider_focus;
+			std::mutex mcp_oauth_mtx;
+			std::unordered_map<std::string, std::uint64_t> mcp_oauth_generations;
+			std::uint64_t mcp_oauth_generation = 0;
 		};
 
 
@@ -100,6 +107,39 @@ namespace settings_overlay {
 		{
 			static overlay_state_t s;
 			return s;
+		}
+
+
+		inline std::uint64_t begin_mcp_oauth_generation(const std::string& server_name)
+		{
+			auto& s = state();
+			std::lock_guard<std::mutex> lock(s.mcp_oauth_mtx);
+			if (s.mcp_oauth_generation == (std::numeric_limits<std::uint64_t>::max)())
+				return 0;
+			const std::uint64_t generation = ++s.mcp_oauth_generation;
+			s.mcp_oauth_generations[server_name] = generation;
+			return generation;
+		}
+
+
+		inline bool complete_mcp_oauth_generation(const std::string& server_name,
+			std::uint64_t generation)
+		{
+			auto& s = state();
+			std::lock_guard<std::mutex> lock(s.mcp_oauth_mtx);
+			const auto it = s.mcp_oauth_generations.find(server_name);
+			if (it == s.mcp_oauth_generations.end() || it->second != generation)
+				return false;
+			s.mcp_oauth_generations.erase(it);
+			return true;
+		}
+
+
+		inline void cancel_mcp_oauth_generation(const std::string& server_name)
+		{
+			auto& s = state();
+			std::lock_guard<std::mutex> lock(s.mcp_oauth_mtx);
+			s.mcp_oauth_generations.erase(server_name);
 		}
 
 
@@ -413,13 +453,33 @@ namespace settings_overlay {
 
 		inline void render_tab_agents(float content_w, float content_h)
 		{
-			aida::agent_manager::render(content_w, content_h);
+			const auto& th = aida::ui::resolved();
+			ImGui::Dummy(ImVec2(0.f, (std::max)(20.f, content_h * 0.18f)));
+			ImGui::SetCursorPosX((std::max)(0.f, (content_w - 360.f) * 0.5f));
+			ImGui::BeginGroup();
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary), "Agents are an independent IDE view");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
+				"Dock, float, close, and reopen the Agents view without duplicating its renderer in Settings.");
+			if (aida::ui::button("Open Agents", aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::md, ImVec2(140.f, 36.f)))
+				(void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.ai.agents"));
+			ImGui::EndGroup();
 		}
 
 
 		inline void render_tab_skills(float content_w, float content_h)
 		{
-			aida::skill_manager::render(content_w, content_h);
+			const auto& th = aida::ui::resolved();
+			ImGui::Dummy(ImVec2(0.f, (std::max)(20.f, content_h * 0.18f)));
+			ImGui::SetCursorPosX((std::max)(0.f, (content_w - 360.f) * 0.5f));
+			ImGui::BeginGroup();
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary), "Skills are an independent IDE view");
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary),
+				"Manage installed and remote skills in one dockable owner with no duplicate Settings renderer.");
+			if (aida::ui::button("Open Skills", aida::ui::button_kind_t::primary,
+					aida::ui::size_t_::md, ImVec2(140.f, 36.f)))
+				(void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.ai.skills"));
+			ImGui::EndGroup();
 		}
 
 
@@ -862,7 +922,6 @@ namespace settings_overlay {
 				ImGui::PopStyleVar(2);
 				ImGui::PopFont();
 				ImGui::PopID();
-				aida::mcp_marketplace_view::render_modal_if_open();
 				return;
 			}
 			float left_w = 280.f;
@@ -984,27 +1043,57 @@ namespace settings_overlay {
 
 				if (oauth == mcp_client::oauth_status_t::needs_auth ||
 					oauth == mcp_client::oauth_status_t::needs_client_registration ||
-					oauth == mcp_client::oauth_status_t::failed)
+					oauth == mcp_client::oauth_status_t::failed ||
+					oauth == mcp_client::oauth_status_t::authenticating)
 				{
 					float btn_x = b.x - 96.f;
 					float btn_y = a.y + (row_h - 4.f - 28.f) * 0.5f;
 					ImGui::SetCursorScreenPos(ImVec2(btn_x, btn_y));
-					if (aida::ui::button("Sign in",
+					const bool authenticating = oauth == mcp_client::oauth_status_t::authenticating;
+					if (aida::ui::button(authenticating ? "Cancel" : "Sign in",
 							aida::ui::button_kind_t::primary,
 							aida::ui::size_t_::md,
 							ImVec2(88.f, 28.f))) {
 						std::string srv_name = srv.name;
-						mcp_client::trigger_auth_flow(srv_name,
-							[](const std::string& nm, mcp_client::oauth_status_t final_status,
-								const std::string& err) {
-								(void)final_status;
-								if (!err.empty())
-									toast_notification::push(std::string("MCP auth ") + nm + ": " + err,
-										toast_notification::toast_type_t::error);
-								else
-									toast_notification::push(std::string("MCP auth ") + nm + ": OK",
-										toast_notification::toast_type_t::info);
-							});
+						if (authenticating) {
+							cancel_mcp_oauth_generation(srv_name);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+							const bool cancelled = true;
+#else
+							const bool cancelled = mcp_client::cancel_auth(srv_name);
+#endif
+							if (cancelled) {
+								toast_notification::push(std::string("MCP auth ") + srv_name + ": cancelled",
+									toast_notification::toast_type_t::info);
+							} else {
+								toast_notification::push(std::string("MCP auth ") + srv_name + ": "
+									+ mcp_client::last_error(), toast_notification::toast_type_t::error);
+							}
+						} else {
+							const std::uint64_t generation = begin_mcp_oauth_generation(srv_name);
+							if (generation == 0) {
+								toast_notification::push(std::string("MCP auth ") + srv_name
+									+ ": UI authorization generation exhausted; restart is required",
+									toast_notification::toast_type_t::error);
+							} else {
+								const bool accepted = mcp_client::trigger_auth_flow(srv_name,
+									[generation](const std::string& nm, mcp_client::oauth_status_t final_status,
+										const std::string& err) {
+										if (!complete_mcp_oauth_generation(nm, generation))
+											return;
+										if (!err.empty())
+											toast_notification::push(std::string("MCP auth ") + nm + ": " + err,
+												toast_notification::toast_type_t::error);
+										else if (final_status == mcp_client::oauth_status_t::authenticated)
+											toast_notification::push(std::string("MCP auth ") + nm + ": OK",
+												toast_notification::toast_type_t::info);
+									});
+								if (!accepted && complete_mcp_oauth_generation(srv_name, generation)) {
+									toast_notification::push(std::string("MCP auth ") + srv_name + ": "
+										+ mcp_client::last_error(), toast_notification::toast_type_t::error);
+								}
+							}
+						}
 					}
 				}
 
@@ -1304,7 +1393,8 @@ namespace settings_overlay {
 					aida::ui::button_kind_t::accent_gradient,
 					aida::ui::size_t_::md,
 					ImVec2(w_market, 36.f))) {
-				aida::mcp_marketplace_view::open();
+				(void)aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.ai.mcp_marketplace"));
 			}
 
 			if (ImGui::BeginPopupModal("Remove MCP server##mcp_remove_confirm",
@@ -1355,7 +1445,6 @@ namespace settings_overlay {
 			ImGui::PopFont();
 			ImGui::PopID();
 
-			aida::mcp_marketplace_view::render_modal_if_open();
 		}
 
 
@@ -1437,7 +1526,9 @@ namespace settings_overlay {
 
 			ImGui::Dummy(ImVec2(0.f, gap));
 			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad);
-			ImGui::BeginChild("##editor_theme_card", ImVec2(avail_w, 170.f), true,
+			const float appearance_card_height = aida::ui::scale_px(
+				g_sa_settings.ui_density == 1 ? 312.f : 284.f, aida::ui::dpi_scale());
+			ImGui::BeginChild("##editor_theme_card", ImVec2(avail_w, appearance_card_height), true,
 				ImGuiWindowFlags_NoSavedSettings);
 			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary), "Appearance");
 			ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + (std::max)(120.f, avail_w - 24.f));
@@ -1457,6 +1548,37 @@ namespace settings_overlay {
 					g_sa_settings.save();
 				}
 			}
+			ImGui::Dummy(ImVec2(0.f, 8.f));
+			ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_secondary), "Interface density");
+			static const char* density_names[] = { "Compact", "Comfortable" };
+			ImGui::SetNextItemWidth((std::min)(280.f, (std::max)(140.f, avail_w - 24.f)));
+			if (ImGui::Combo("##ui_density", &g_sa_settings.ui_density, density_names,
+				IM_ARRAYSIZE(density_names))) {
+				g_sa_settings.ui_density = g_sa_settings.ui_density == 1 ? 1 : 0;
+				aida::ui::design::set_preferences({
+					g_sa_settings.ui_density == 1
+						? aida::ui::design::density_t::comfortable
+						: aida::ui::design::density_t::compact,
+					g_sa_settings.ui_reduced_motion
+				});
+				g_sa_settings.save();
+			}
+			if (ImGui::Checkbox("Reduce interface motion##ui_reduced_motion",
+				&g_sa_settings.ui_reduced_motion)) {
+				aida::ui::design::set_preferences({
+					g_sa_settings.ui_density == 1
+						? aida::ui::design::density_t::comfortable
+						: aida::ui::design::density_t::compact,
+					g_sa_settings.ui_reduced_motion
+				});
+				g_sa_settings.save();
+			}
+			aida::ui::design::tooltip_for_last_item(
+				"Disable decorative transitions and animated progress where a static equivalent is available",
+				nullptr, nullptr);
+			if (ImGui::Checkbox("Show frame diagnostics in status bar##ui_diagnostics_mode",
+				&g_sa_settings.ui_diagnostics_mode))
+				g_sa_settings.save();
 			ImGui::EndChild();
 			ImGui::PopStyleColor(2);
 			ImGui::EndChild();
@@ -1489,30 +1611,48 @@ namespace settings_overlay {
 	{
 		auto& s = detail::state();
 		s.initialized.store(false);
+		std::vector<std::string> active_oauth;
+		{
+			std::lock_guard<std::mutex> lock(s.mcp_oauth_mtx);
+			active_oauth.reserve(s.mcp_oauth_generations.size());
+			for (const auto& entry : s.mcp_oauth_generations)
+				active_oauth.push_back(entry.first);
+			s.mcp_oauth_generations.clear();
+		}
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		for (const auto& server_name : active_oauth)
+			(void)mcp_client::cancel_auth(server_name);
+#endif
 	}
 
 
 	void open()
 	{
-		g_settings_open = true;
+		static_cast<void>(aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.settings")));
 	}
 
 
 	void close()
 	{
-		g_settings_open = false;
+		static_cast<void>(aida::ui::application_views::close(
+			aida::ui::stable_view_id_t("view.settings")));
 	}
 
 
 	void toggle()
 	{
-		g_settings_open = !g_settings_open;
+		if (is_open())
+			close();
+		else
+			open();
 	}
 
 
 	bool is_open()
 	{
-		return g_settings_open;
+		return aida::ui::application_views::is_open(
+			aida::ui::stable_view_id_t("view.settings"));
 	}
 
 
@@ -1544,7 +1684,7 @@ namespace settings_overlay {
 			s.pending_provider_focus = provider_id;
 		}
 		set_active_tab(tab_accounts);
-		g_settings_open = true;
+		open();
 	}
 
 
@@ -1591,7 +1731,7 @@ namespace settings_overlay {
 				aida::ui::button_kind_t::ghost,
 				aida::ui::size_t_::sm,
 				ImVec2(28.f, 26.f))) {
-			g_settings_open = false;
+			close();
 		}
 		ImGui::SameLine();
 		dl->AddText(aida::ui::fonts::h2(), 16.f,

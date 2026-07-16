@@ -2,11 +2,12 @@
 
 #include "comment_dialog.hpp"
 #include "rename_dialog.hpp"
+#include "../ui/analysis_context_menu.hpp"
+#include "../ui/application_view_registry.hpp"
 #include "../ui/components.hpp"
 #include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
-#include "../../helpers/globals.h"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/disasm_preview_adapter.hpp"
 #endif
@@ -363,7 +364,8 @@ void navigate_to_disassembly(
                 aida::workbench::document_kind_t::disassembly,
                 std::nullopt, selection, cursor, workbench));
     disasm_view::goto_address(target, context);
-    globals::ui::active_center_view = center_view_t::disassembly;
+    aida::ui::application_views::open_or_focus(
+        aida::ui::stable_view_id_t("document.disassembly"));
 }
 
 void persist_line_selection(
@@ -1131,6 +1133,11 @@ void render(float, float, float width, float height,
                                 workbench.pseudocode_document->select(selection));
                         persist_line_selection(context, active_tab.address,
                             active_tab.entity_locator, line, source_address);
+                        if (source_address) {
+                            const auto typed = typed_source_address(context, *source_address);
+                            if (typed)
+                                disasm_view::select_address(*typed, context, false);
+                        }
                         if (source_address &&
                             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                             navigate_to_disassembly(context, *source_address);
@@ -1139,19 +1146,64 @@ void render(float, float, float width, float height,
                     ImGui::TextDisabled("%4u", line.line_number);
                     ImGui::SameLine(64.0f);
                     ImGui::TextUnformatted(line.text.c_str());
-                    if (ImGui::BeginPopupContextItem("##pseudocode_actions")) {
-                        if (ImGui::MenuItem("Copy line"))
-                            ImGui::SetClipboardText(line.text.c_str());
-                        if (source_address && ImGui::MenuItem("Go to disassembly"))
-                            navigate_to_disassembly(context, *source_address);
+                    const bool typed_pointer_request = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                    aida::ui::context_menu_open_origin_t menu_origin{};
+                    const bool pointer_menu = typed_pointer_request;
+                    const bool keyboard_menu = selected_line == line_index &&
+                        aida::ui::analysis_context_menu::keyboard_request(menu_origin);
+                    if (pointer_menu || keyboard_menu) {
+                        using namespace aida::ui::analysis_context_menu;
+                        using aida::ui::action_handler_result_t;
+                        context_t menu;
+                        menu.kind = menu_kind_t::pseudocode;
+                        const auto generation = context.workspace->generation();
+                        const auto revision = context.workspace->analysis_revision();
+                        menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
+                            (generation << 6u) + (generation >> 2u));
+                        menu.live_generation = [workspace = context.workspace]() {
+                            const auto current = workspace->generation();
+                            const auto current_revision = workspace->analysis_revision();
+                            return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
+                                (current << 6u) + (current >> 2u));
+                        };
+                        menu.actions["analysis.copy.line"].invoke = [text = line.text]() {
+                            ImGui::SetClipboardText(text.c_str());
+                            return action_handler_result_t::completed();
+                        };
+                        menu.actions["analysis.copy.text"] = menu.actions["analysis.copy.line"];
                         const auto typed = source_address
-                            ? typed_source_address(context, *source_address)
-                            : std::nullopt;
-                        if (typed && ImGui::MenuItem("Rename"))
-                            rename_dialog::open(context, *typed);
-                        if (typed && ImGui::MenuItem("Edit comment"))
-                            comment_dialog::open(context, *typed);
-                        ImGui::EndPopup();
+                            ? typed_source_address(context, *source_address) : std::nullopt;
+                        if (source_address) {
+                            menu.actions["analysis.navigate.disassembly"].invoke =
+                                [context, source = *source_address]() {
+                                    navigate_to_disassembly(context, source);
+                                    return action_handler_result_t::completed();
+                                };
+                            char address[32]{};
+                            std::snprintf(address, sizeof(address), "%016llX",
+                                static_cast<unsigned long long>(*source_address));
+                            menu.actions["analysis.copy.address"].invoke = [value = std::string(address)]() {
+                                ImGui::SetClipboardText(value.c_str());
+                                return action_handler_result_t::completed();
+                            };
+                        }
+                        if (typed) {
+                            menu.actions["analysis.modify.rename"].invoke = [context, value = *typed]() {
+                                rename_dialog::open(context, value);
+                                return action_handler_result_t::completed();
+                            };
+                            menu.actions["analysis.modify.comment"].invoke = [context, value = *typed]() {
+                                comment_dialog::open(context, value);
+                                return action_handler_result_t::completed();
+                            };
+                            const auto runtime = disasm_view::runtime_address(context, *typed).value_or(typed->value);
+                            menu.actions["analysis.navigate.xrefs"].invoke = [context, runtime]() {
+                                disasm_view::open_xrefs(runtime, context);
+                                return action_handler_result_t::completed();
+                            };
+                        }
+                        open(std::move(menu), pointer_menu
+                            ? aida::ui::context_menu_open_origin_t::pointer : menu_origin);
                     }
                     ImGui::PopID();
                 }
@@ -1160,6 +1212,7 @@ void render(float, float, float width, float height,
         }
         ImGui::EndChild();
     }
+    aida::ui::analysis_context_menu::render();
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         ImGui::IsKeyPressed(ImGuiKey_F5, false))
         refresh_active_tab(context);

@@ -6,6 +6,8 @@
 #include "../helpers/globals.h"
 #include "command_registry_preview.inl"
 
+#include <limits>
+
 namespace {
 
 std::atomic<bool> s_preview_cancel{false};
@@ -240,7 +242,57 @@ std::vector<provider_info_t> s_preview_providers = {
 
 bool fetch_and_cache(int) { return true; }
 bool load_cached_or_fetch(int) { return true; }
-void initialize_async(int) {}
+model_list_validation_t validate_provider_model_list_response(
+    const std::string& provider_id, const std::string& body)
+{
+    model_list_validation_t result;
+    if (body.empty()) {
+        result.error = "Provider returned an empty response";
+        return result;
+    }
+    try {
+        const auto json = nlohmann::json::parse(body);
+        if (!json.is_object()) {
+            result.error = "Provider response root is not an object";
+            return result;
+        }
+        if (json.contains("error") && !json["error"].is_null()) {
+            result.error = "Provider returned an error payload";
+            return result;
+        }
+        const char* collection = provider_id == "google" ? "models" : "data";
+        const char* identifier = provider_id == "google" ? "name" : "id";
+        if (!json.contains(collection) || !json[collection].is_array()) {
+            result.error = std::string("Provider response is missing the ") + collection + " array";
+            return result;
+        }
+        const auto& models = json[collection];
+        if (models.empty()) {
+            result.error = "Provider returned no models";
+            return result;
+        }
+        for (const auto& model : models) {
+            if (!model.is_object() || !model.contains(identifier)
+                || !model[identifier].is_string()
+                || model[identifier].get_ref<const std::string&>().empty()) {
+                result.model_count = 0;
+                result.error = "Provider returned a malformed model entry";
+                return result;
+            }
+            if (result.model_count == (std::numeric_limits<int>::max)()) {
+                result.model_count = 0;
+                result.error = "Provider model count exceeds the supported limit";
+                return result;
+            }
+            ++result.model_count;
+        }
+        result.valid = true;
+    } catch (...) {
+        result.error = "Provider response JSON is malformed";
+    }
+    return result;
+}
+bool initialize_async(int) { return true; }
 const std::vector<provider_info_t>& list_providers() { return s_preview_providers; }
 
 const provider_info_t* get_provider(const std::string& id)
@@ -487,10 +539,9 @@ bool trigger_auth_flow(const std::string& server_name, auth_completion_callback_
     return true;
 }
 
-const std::string& last_error()
+std::string last_error()
 {
-    static const std::string value;
-    return value;
+    return {};
 }
 
 }
@@ -600,7 +651,6 @@ void shutdown() {}
 
 }
 
-bool g_settings_open = false;
 
 void init_standalone_chat()
 {

@@ -2,6 +2,8 @@
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
+#include "../core/ui/application_view_registry.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -47,7 +49,8 @@ namespace aida::preview::hex
 
 	inline void opened_disassembly(std::uint64_t address)
 	{
-		globals::ui::active_center_view = center_view_t::disassembly;
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("document.disassembly"));
 		receipts.push_back({ "open_disassembly", address });
 	}
 }

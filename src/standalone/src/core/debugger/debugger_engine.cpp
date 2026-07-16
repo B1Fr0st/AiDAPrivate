@@ -1455,12 +1455,14 @@ void handle_process_exited(const aida::events::process_exited_t& evt) {
 		for (auto& ibp : st.internal_breakpoints) {
 			ibp.active = false;
 		}
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	}
 
 	{
 		std::lock_guard<std::mutex> lk(st.cache_mtx);
 		st.cached_regs = register_set_t{};
 		st.cached_threads.clear();
+		st.cached_threads_generation.fetch_add(1, std::memory_order_release);
 		st.cached_stack.clear();
 		st.cached_stack_addr = 0;
 		st.cached_dump.clear();
@@ -1669,6 +1671,7 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 
 	int new_index = static_cast<int>(st.breakpoints.size());
 	st.breakpoints.push_back(std::move(bp));
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	diag::log_tagged_fmt("bp",
 		"add_breakpoint_ok addr=0x%llx type=%d size=%d idx=%d hwbp=%d",
 		static_cast<unsigned long long>(address),
@@ -1720,6 +1723,7 @@ bool remove_breakpoint(int index) {
 	uint64_t removed_addr = bp.address;
 	int       removed_type = static_cast<int>(bp.type);
 	st.breakpoints.erase(st.breakpoints.begin() + index);
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	diag::log_tagged_fmt("bp",
 		"remove_breakpoint_ok idx=%d addr=0x%llx type=%d",
 		index,
@@ -1812,6 +1816,7 @@ bool toggle_breakpoint(int index) {
 	}
 
 	bp.state = will_enable ? bp_state_t::enabled : bp_state_t::disabled;
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	diag::log_tagged_fmt("dbg_engine", "toggle_breakpoint: index=%d addr=0x%llX now=%s", index, (unsigned long long)bp.address, will_enable ? "enabled" : "disabled");
 	return true;
 }
@@ -1854,6 +1859,7 @@ void clear_all_breakpoints() {
 		}
 	}
 	st.internal_breakpoints.clear();
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	diag::log_tagged_fmt("dbg_engine", "clear_all_breakpoints: done");
 }
 
@@ -2326,7 +2332,9 @@ bool step_into() {
 				tr.disasm_text = std::string(ins.mnem) + " " + ins.ops;
 			}
 			st.trace_log.push_back(std::move(tr));
-		}
+			st.trace_generation.fetch_add(1, std::memory_order_release);
+		} else
+			st.trace_dropped.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	{
@@ -2555,6 +2563,7 @@ bool step_into() {
 				st.breakpoints[static_cast<size_t>(rearm_bp_index)].address == rearm_bp_address) {
 				st.breakpoints[static_cast<size_t>(rearm_bp_index)].byte_written = true;
 				st.breakpoints[static_cast<size_t>(rearm_bp_index)].original_byte = rearm_bp_original;
+				st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 			}
 		}
 	}
@@ -2903,6 +2912,7 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 		bp.original_byte = orig_buf[0];
 		bp.byte_written = true;
 		st.breakpoints.push_back(std::move(bp));
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	}
 
 	{
@@ -3117,6 +3127,8 @@ bool run_to_address(uint64_t address, bool wait_for_completion, uint32_t timeout
 				++it;
 			}
 		}
+		if (public_removed != 0)
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	}
 	diag::log_tagged_fmt("debugger",
 		"run_to_address_breakpoint_cleanup pid=%u active_tid=%u addr=0x%llx restore_attempted=%d restore_ok=%d restore_gle=%lu internal_removed=%d public_removed=%d",
@@ -3512,6 +3524,7 @@ std::vector<stack_frame_t> get_call_stack() {
 	{
 		std::lock_guard<std::mutex> lk(st.stack_mutex);
 		st.call_stack = frames;
+		st.call_stack_generation.fetch_add(1, std::memory_order_release);
 	}
 	publish_call_stack_resolutions(resolution_records);
 
@@ -3583,7 +3596,9 @@ int add_watch(const std::string& expression) {
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
 	watch_entry_t w;
 	w.expression = expression;
+	w.persistent_expression = expression;
 	st.watches.push_back(std::move(w));
+	st.watches_generation.fetch_add(1, std::memory_order_release);
 	int idx = static_cast<int>(st.watches.size()) - 1;
 	diag::log_tagged_fmt("dbg_engine", "add_watch: added at index=%d", idx);
 	return idx;
@@ -3598,6 +3613,7 @@ bool remove_watch(int index) {
 		return false;
 	}
 	st.watches.erase(st.watches.begin() + index);
+	st.watches_generation.fetch_add(1, std::memory_order_release);
 	diag::log_tagged_fmt("dbg_engine", "remove_watch: removed index=%d", index);
 	return true;
 }
@@ -3610,6 +3626,14 @@ void refresh_watches() {
 	std::lock_guard<std::mutex> lk(st.watch_mutex);
 
 	for (auto& w : st.watches) {
+		if (w.persistent_definition && !w.definition_resolved) {
+			w.value.clear();
+			w.type.clear();
+			w.valid = false;
+			if (w.error.empty())
+				w.error = "Persisted watch binding is unresolved";
+			continue;
+		}
 		if (w.expression.empty()) {
 			w.value.clear();
 			w.type.clear();
@@ -3634,6 +3658,7 @@ void refresh_watches() {
 		w.error.clear();
 		w.valid = true;
 	}
+	st.watches_generation.fetch_add(1, std::memory_order_release);
 }
 
 
@@ -3648,7 +3673,9 @@ bool start_trace(int max_records) {
 	{
 		std::lock_guard<std::mutex> lk(st.trace_mutex);
 		st.trace_log.clear();
+		st.trace_generation.fetch_add(1, std::memory_order_release);
 	}
+	st.trace_dropped.store(0, std::memory_order_release);
 	st.tracing.store(true);
 	diag::log_tagged_fmt("trace",
 		"start_trace_ok max_records=%d", max_records);
@@ -3775,6 +3802,7 @@ void enumerate_handles() {
 
 	std::lock_guard<std::mutex> lk(st.handle_mutex);
 	st.handles = std::move(result);
+	st.handles_generation.fetch_add(1, std::memory_order_release);
 	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - started).count();
 	diag::log_tagged_fmt("handles",
@@ -3958,6 +3986,7 @@ void find_strings(size_t min_length) {
 	{
 		std::lock_guard<std::mutex> lk(st.strings_mutex);
 		st.strings = std::move(found);
+		st.strings_generation.fetch_add(1, std::memory_order_release);
 	}
 	diag::log_tagged_fmt("debugger_strings",
 		"find_strings_complete pid=%u regions=%zu retries=%zu modules=%zu pages_scanned=%llu found=%zu cancelled=%d",
@@ -4107,6 +4136,7 @@ bool set_breakpoint_condition(int index, const std::string& condition) {
 		return false;
 	}
 	st.breakpoints[static_cast<size_t>(index)].condition = condition;
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	diag::log_tagged_fmt("dbg_engine", "set_breakpoint_condition: index=%d condition set ok", index);
 	return true;
 }
@@ -4123,6 +4153,7 @@ bool set_breakpoint_log(int index, const std::string& log_text, bool auto_contin
 	auto& bp = st.breakpoints[static_cast<size_t>(index)];
 	bp.log_text = log_text;
 	bp.auto_continue = auto_continue;
+	st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	diag::log_tagged_fmt("dbg_engine", "set_breakpoint_log: index=%d addr=0x%llX log set ok", index, (unsigned long long)bp.address);
 	return true;
 }
@@ -4188,6 +4219,8 @@ bp_hit_action_t handle_breakpoint_hit(uint64_t address) {
 		if (has_bp && bp_is_one_shot) {
 			st.breakpoints.erase(st.breakpoints.begin() + bp_index);
 		}
+		if (has_bp)
+			st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	}
 
 	if (has_bp && bp_address_matched == address - 1 && st.active_tid != 0) {
@@ -4341,6 +4374,7 @@ void sync_attached_state() {
 		std::lock_guard<std::mutex> lk(st.cache_mtx);
 		st.cached_regs = register_set_t{};
 		st.cached_threads.clear();
+		st.cached_threads_generation.fetch_add(1, std::memory_order_release);
 		st.cached_stack.clear();
 		st.cached_stack_addr = 0;
 		st.cached_dump.clear();
@@ -4470,6 +4504,7 @@ void request_thread_refresh(uint32_t max_age_ms) {
 				{
 					std::lock_guard<std::mutex> lk(s.cache_mtx);
 					s.cached_threads = std::move(entries);
+					s.cached_threads_generation.fetch_add(1, std::memory_order_release);
 				}
 				s.last_thread_refresh_ms.store(now_ms());
 			} catch (const std::exception& ex) {
@@ -4805,6 +4840,7 @@ void restore_breakpoints_and_watches(std::vector<breakpoint_t> bps,
 	{
 		std::lock_guard<std::mutex> lk(st.bp_mutex);
 		st.breakpoints = std::move(bps);
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 		int max_id = 0;
 		for (const auto& b : st.breakpoints) {
 			(void)b;
@@ -4816,6 +4852,7 @@ void restore_breakpoints_and_watches(std::vector<breakpoint_t> bps,
 	{
 		std::lock_guard<std::mutex> lk(st.watch_mutex);
 		st.watches = std::move(ws);
+		st.watches_generation.fetch_add(1, std::memory_order_release);
 	}
 }
 
@@ -4826,10 +4863,12 @@ void clear_breakpoints_and_watches() {
 		st.breakpoints.clear();
 		st.internal_breakpoints.clear();
 		st.next_bp_id = 1;
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	}
 	{
 		std::lock_guard<std::mutex> lk(st.watch_mutex);
 		st.watches.clear();
+		st.watches_generation.fetch_add(1, std::memory_order_release);
 	}
 }
 

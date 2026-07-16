@@ -1,10 +1,6 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 #include "auth_copilot.hpp"
-#include "auth_store.hpp"
-#include "auth_preview_platform.hpp"
-
-#include <ctime>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -34,119 +30,99 @@ namespace {
 		preview_error() = std::move(value);
 	}
 
+	bool claim_preview_terminal(copilot_login_state_t& state, std::uint8_t phase) noexcept
+	{
+		std::uint8_t expected = 0;
+		return state.terminal_phase.compare_exchange_strong(expected, phase,
+			std::memory_order_acq_rel, std::memory_order_acquire);
+	}
+
 }
 
 bool start_login(copilot_login_state_t& state,
-	std::optional<std::string> enterprise_url,
-	std::uint64_t absolute_deadline_ms)
+	std::optional<std::string>,
+	std::uint64_t)
 {
-	if (state.cancelled.load(std::memory_order_acquire)) {
-		set_preview_error("login cancelled before start");
-		return false;
-	}
-	if (absolute_deadline_ms != 0 && aida::infra::executor::now_ms() >= absolute_deadline_ms) {
-		set_preview_error("login startup timed out");
-		return false;
-	}
-	const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+	state.done.store(false, std::memory_order_release);
+	state.terminal_phase.store(0, std::memory_order_release);
+	const bool cancelled = state.cancelled.load(std::memory_order_acquire);
+	const char* error = cancelled
+		? "preview_auth_cancelled" : "preview_auth_unavailable";
 	{
 		std::lock_guard<std::mutex> lock(state.mutex);
-		state.device_code = "aida-studio-copilot-device";
-		state.user_code = "AIDA-RE42";
-		state.verification_uri = enterprise_url && !enterprise_url->empty()
-			? *enterprise_url + "/login/device"
-			: "https://github.com/login/device";
-		state.interval = 1;
-		state.expires_unix = now + 900;
-		state.enterprise_url = std::move(enterprise_url);
-		state.error.clear();
+		if (!claim_preview_terminal(state, cancelled ? 3 : 2)) return false;
+		state.device_code.clear();
+		state.user_code.clear();
+		state.verification_uri.clear();
+		state.interval = 5;
+		state.expires_unix = 0;
+		state.enterprise_url.reset();
+		state.error = error;
 		state.last_poll_unix = 0;
 		state.next_poll_unix = 0;
+		state.done.store(true, std::memory_order_release);
 	}
-	state.done.store(false, std::memory_order_release);
-	set_preview_error({});
-	return true;
+	set_preview_error(error);
+	return false;
 }
 
 bool poll_login(copilot_login_state_t& state)
 {
-	if (state.cancelled.load(std::memory_order_acquire)) {
-		set_preview_error("login cancelled");
-		return false;
-	}
-	const copilot_login_snapshot_t current = snapshot(state);
-	if (current.device_code.empty()) {
-		set_preview_error("device flow is not initialized");
-		state.done.store(true, std::memory_order_release);
-		return false;
-	}
-	auth_info_t info;
-	info.kind = auth_kind_t::oauth;
-	info.access = "aida-studio-copilot-access";
-	info.refresh = "aida-studio-copilot-refresh";
-	info.account_id = "studio-github";
-	info.email = "reverse.engineer@preview.aida";
-	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
-	info.enterprise_url = current.enterprise_url.value_or(std::string{});
-	info.metadata["preview_receipt"] = "oauth:github-copilot:accepted";
-	if (!store::set("github-copilot", info)) {
-		set_preview_error(store::last_error());
-		state.done.store(true, std::memory_order_release);
-		return false;
-	}
+	const bool cancelled = state.cancelled.load(std::memory_order_acquire);
+	const char* error = cancelled
+		? "preview_auth_cancelled" : "preview_auth_unavailable";
 	{
 		std::lock_guard<std::mutex> lock(state.mutex);
-		state.last_poll_unix = static_cast<std::int64_t>(std::time(nullptr));
-		state.next_poll_unix = state.last_poll_unix;
-		state.error.clear();
+		if (!claim_preview_terminal(state, cancelled ? 3 : 2)) return false;
+		state.error = error;
+		state.done.store(true, std::memory_order_release);
 	}
+	set_preview_error(error);
+	return false;
+}
+
+bool request_cancel(copilot_login_state_t& state) noexcept
+{
+	std::uint8_t phase = state.terminal_phase.load(std::memory_order_acquire);
+	while (phase == 0 || phase == 4) {
+		if (state.terminal_phase.compare_exchange_weak(phase, 3,
+			std::memory_order_acq_rel, std::memory_order_acquire)) break;
+	}
+	if (phase != 0 && phase != 4) return false;
+	state.cancelled.store(true, std::memory_order_release);
 	state.done.store(true, std::memory_order_release);
-	set_preview_error({});
+	try {
+		std::lock_guard<std::mutex> lock(state.mutex);
+		state.error = "preview_auth_cancelled";
+	} catch (...) {
+	}
+	try { set_preview_error("preview_auth_cancelled"); } catch (...) {}
 	return true;
 }
 
 bool cancel_login(copilot_login_state_t& state)
 {
-	state.cancelled.store(true, std::memory_order_release);
-	state.done.store(true, std::memory_order_release);
-	return true;
+	return request_cancel(state);
 }
 
-bool refresh_token()
+bool refresh_token(const http::cancel_cb_t&, int)
 {
-	auth_info_t info;
-	if (!store::get("github-copilot", info) || info.kind != auth_kind_t::oauth) {
-		set_preview_error("no github-copilot oauth credentials");
-		return false;
-	}
-	info.access = "aida-studio-copilot-access-refreshed";
-	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
-	info.metadata["preview_receipt"] = "oauth:github-copilot:refreshed";
-	const bool result = store::set("github-copilot", info);
-	set_preview_error(result ? std::string{} : store::last_error());
-	return result;
+	set_preview_error("preview_auth_unavailable");
+	return false;
 }
 
-bool revoke_tokens(const std::string& access_token,
-	const std::string& refresh_token_value,
+bool revoke_tokens(const std::string&,
+	const std::string&,
 	const std::string&)
 {
-	if (access_token.empty() && refresh_token_value.empty()) {
-		set_preview_error("revoke_tokens: no tokens provided");
-		return false;
-	}
-	set_preview_error({});
-	return true;
+	set_preview_error("preview_auth_unavailable");
+	return false;
 }
 
 bool revoke_token()
 {
-	auth_info_t info;
-	if (!store::get("github-copilot", info) || info.kind != auth_kind_t::oauth) {
-		set_preview_error("no github-copilot oauth credentials");
-		return false;
-	}
-	return revoke_tokens(info.access, info.refresh, info.custom_client_id);
+	set_preview_error("preview_auth_unavailable");
+	return false;
 }
 
 copilot_login_snapshot_t snapshot(const copilot_login_state_t& state)
@@ -161,6 +137,7 @@ copilot_login_snapshot_t snapshot(const copilot_login_state_t& state)
 	value.enterprise_url = state.enterprise_url;
 	value.done = state.done.load(std::memory_order_acquire);
 	value.cancelled = state.cancelled.load(std::memory_order_acquire);
+	value.terminal_phase = state.terminal_phase.load(std::memory_order_acquire);
 	value.error = state.error;
 	value.last_poll_unix = state.last_poll_unix;
 	value.next_poll_unix = state.next_poll_unix;
@@ -226,6 +203,32 @@ namespace copilot {
 			}
 		}
 
+		bool claim_login_terminal(copilot_login_state_t& state, std::uint8_t phase) noexcept
+		{
+			std::uint8_t expected = 0;
+			return state.terminal_phase.compare_exchange_strong(expected, phase,
+				std::memory_order_acq_rel, std::memory_order_acquire);
+		}
+
+		bool publish_login_terminal_failure(copilot_login_state_t& state,
+			const std::string& failure, std::uint8_t phase = 2) noexcept
+		{
+			bool claimed = false;
+			try {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				claimed = claim_login_terminal(state, phase);
+				if (!claimed) return false;
+				try { state.error = failure; } catch (...) {}
+				state.done.store(true, std::memory_order_release);
+			} catch (...) {
+				if (claimed) state.done.store(true, std::memory_order_release);
+			}
+			if (claimed) {
+				try { set_last_error(failure); } catch (...) {}
+			}
+			return false;
+		}
+
 		std::string normalize_domain(const std::string& url)
 		{
 			std::string out = url;
@@ -254,7 +257,9 @@ namespace copilot {
 		}
 
 		bool github_post(const std::string& host, const std::string& path,
-			const std::string& json_body, nlohmann::json& json_out, std::string& err_out)
+			const std::string& json_body, nlohmann::json& json_out,
+			std::string& err_out,
+			const aida::auth::http::cancel_cb_t& cancelled = {})
 		{
 			const aida::auth::http::header_list_t headers = {
 				{ "Accept", "application/json" },
@@ -263,7 +268,8 @@ namespace copilot {
 				{ "Editor-Plugin-Version", "copilot-aida/1.0.0" },
 			};
 			const aida::auth::http::response_t res = aida::auth::http::request(
-				"POST", host + path, headers, json_body, "application/json", 30);
+				"POST", host + path, headers, json_body, "application/json", 30,
+				cancelled);
 			if (!res.ok) {
 				err_out = "request to " + host + path + " failed: " + res.error;
 				return false;
@@ -288,7 +294,9 @@ namespace copilot {
 
 		bool fetch_internal_token(const std::string& long_lived_token,
 			const std::optional<std::string>& enterprise_url,
-			std::string& token_out, int64_t& expires_out, std::string& err_out)
+			std::string& token_out, int64_t& expires_out, std::string& err_out,
+			const aida::auth::http::cancel_cb_t& cancelled = {},
+			int timeout_sec = 30)
 		{
 			std::string host;
 			std::string path;
@@ -308,8 +316,13 @@ namespace copilot {
 				{ "Editor-Plugin-Version", "copilot-aida/1.0.0" },
 			};
 			const aida::auth::http::response_t res = aida::auth::http::request(
-				"GET", host + path, headers, std::string(), std::string(), 30);
-			if (!res.ok) {
+				"GET", host + path, headers, std::string(), std::string(), timeout_sec,
+				cancelled);
+			if (res.cancelled || (cancelled && cancelled())) {
+				err_out = host + path + " request cancelled";
+				return false;
+			}
+			if (!res.ok || !res.complete || res.truncated) {
 				err_out = host + path + " unreachable: " + res.error;
 				return false;
 			}
@@ -343,10 +356,10 @@ namespace copilot {
 		std::optional<std::string> enterprise_url,
 		std::uint64_t absolute_deadline_ms)
 	{
-		state.done.store(false);
+		state.terminal_phase.store(0, std::memory_order_release);
+		state.done.store(false, std::memory_order_release);
 		if (state.cancelled.load(std::memory_order_acquire)) {
-			set_last_error("login cancelled before start");
-			return false;
+			return publish_login_terminal_failure(state, "login cancelled before start", 3);
 		}
 		{
 			std::lock_guard<std::mutex> lock(state.mutex);
@@ -371,15 +384,15 @@ namespace copilot {
 
 		nlohmann::json resp;
 		std::string err;
-		if (!github_post(host, "/login/device/code", req_body.dump(), resp, err)) {
-			set_last_error(err);
-			std::lock_guard<std::mutex> lock(state.mutex);
-			state.error = err;
-			return false;
+		if (!github_post(host, "/login/device/code", req_body.dump(), resp, err,
+				[&state]() noexcept {
+					return state.cancelled.load(std::memory_order_acquire);
+				})) {
+			return publish_login_terminal_failure(state, err);
 		}
 		if (state.cancelled.load(std::memory_order_acquire)) {
-			set_last_error("login cancelled during device authorization");
-			return false;
+			return publish_login_terminal_failure(state,
+				"login cancelled during device authorization", 3);
 		}
 
 		const std::string device_code = resp.value("device_code", std::string{});
@@ -390,10 +403,7 @@ namespace copilot {
 		const int64_t now = static_cast<int64_t>(std::time(nullptr));
 
 		if (device_code.empty() || user_code.empty() || verification_uri.empty()) {
-			set_last_error("device code response incomplete");
-			std::lock_guard<std::mutex> lock(state.mutex);
-			state.error = "device code response incomplete";
-			return false;
+			return publish_login_terminal_failure(state, "device code response incomplete");
 		}
 		{
 			std::lock_guard<std::mutex> lock(state.mutex);
@@ -405,13 +415,13 @@ namespace copilot {
 			state.next_poll_unix = now + interval + (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
 		}
 		if (state.cancelled.load(std::memory_order_acquire)) {
-			set_last_error("login cancelled before browser navigation");
-			return false;
+			return publish_login_terminal_failure(state,
+				"login cancelled before browser navigation", 3);
 		}
 
 		if (!aida::auth::open_url_external_until(verification_uri, absolute_deadline_ms))
-			anti_tamper::webhook::write_log("auth.copilot",
-				"[aida.auth.copilot] open browser failed; user must open verification_uri manually");
+			return publish_login_terminal_failure(state,
+				"Camoufox authorization navigation failed");
 
 		set_last_error({});
 		return true;
@@ -425,12 +435,7 @@ namespace copilot {
 		const int64_t now = static_cast<int64_t>(std::time(nullptr));
 		copilot_login_snapshot_t current = snapshot(state);
 		if (current.expires_unix > 0 && now > current.expires_unix) {
-			{
-				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = "device code expired";
-			}
-			set_last_error("device code expired");
-			return false;
+			return publish_login_terminal_failure(state, "device code expired");
 		}
 		if (current.next_poll_unix > 0 && now < current.next_poll_unix)
 			return false;
@@ -452,7 +457,11 @@ namespace copilot {
 
 		nlohmann::json resp;
 		std::string err;
-		if (!github_post(host, "/login/oauth/access_token", req_body.dump(), resp, err)) {
+		const aida::auth::http::cancel_cb_t cancelled = [&state]() noexcept {
+			return state.cancelled.load(std::memory_order_acquire);
+		};
+		if (!github_post(host, "/login/oauth/access_token", req_body.dump(), resp, err,
+				cancelled)) {
 			std::lock_guard<std::mutex> lock(state.mutex);
 			state.next_poll_unix = now + state.interval + (COPILOT_POLLING_SAFETY_MARGIN_MS / 1000);
 			return false;
@@ -464,12 +473,8 @@ namespace copilot {
 			int64_t expires_at = 0;
 			std::string fetch_err;
 			if (!fetch_internal_token(access_token, current.enterprise_url,
-					short_token, expires_at, fetch_err)) {
-				set_last_error(fetch_err);
-				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = fetch_err;
-				state.done.store(true);
-				return false;
+					short_token, expires_at, fetch_err, cancelled)) {
+				return publish_login_terminal_failure(state, fetch_err);
 			}
 
 			auth_info_t info;
@@ -486,17 +491,62 @@ namespace copilot {
 				info.custom_redirect_uri = prev.custom_redirect_uri;
 				info.custom_scopes = prev.custom_scopes;
 			}
-
-			if (!store::set("github-copilot", info)) {
-				set_last_error("store::set github-copilot failed: " + store::last_error());
+			{
 				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = "store::set github-copilot failed";
-				state.done.store(true);
-				return false;
+				if (!claim_login_terminal(state, 4)) return false;
 			}
-			state.done.store(true);
-			set_last_error({});
-			return true;
+			bool stored = false;
+			const char* exception_failure = nullptr;
+			std::string store_failure;
+			try {
+				stored = store::set_if("github-copilot", info, [&state]() noexcept {
+					std::uint8_t expected = 4;
+					return state.terminal_phase.compare_exchange_strong(expected, 1,
+						std::memory_order_acq_rel, std::memory_order_acquire);
+				});
+				if (!stored) {
+					store_failure = store::last_error();
+					if (store_failure.empty()) store_failure = "store::set_if github-copilot failed";
+					std::uint8_t expected = 1;
+					state.terminal_phase.compare_exchange_strong(expected, 4,
+						std::memory_order_acq_rel, std::memory_order_acquire);
+				}
+			} catch (...) {
+				exception_failure = "store::set_if github-copilot exception";
+			}
+			try {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				const std::uint8_t phase = state.terminal_phase.load(std::memory_order_acquire);
+				if (stored && phase != 1) stored = false;
+				if (!stored && phase == 4) {
+					std::uint8_t expected = 4;
+					state.terminal_phase.compare_exchange_strong(expected, 2,
+						std::memory_order_acq_rel, std::memory_order_acquire);
+				}
+				if (state.terminal_phase.load(std::memory_order_acquire) == 3) return false;
+				try {
+					if (stored) state.error.clear();
+					else state.error = store_failure.empty()
+						? (exception_failure ? exception_failure : "store::set_if github-copilot failed")
+						: store_failure;
+				} catch (...) {
+				}
+				state.done.store(true, std::memory_order_release);
+			} catch (...) {
+				std::uint8_t expected = 4;
+				state.terminal_phase.compare_exchange_strong(expected, 2,
+					std::memory_order_acq_rel, std::memory_order_acquire);
+				state.done.store(true, std::memory_order_release);
+				stored = false;
+				exception_failure = "credential publication failed";
+			}
+			try {
+				set_last_error(stored ? std::string{} : !store_failure.empty()
+					? store_failure : std::string(exception_failure
+						? exception_failure : "store::set_if github-copilot failed"));
+			} catch (...) {
+			}
+			return stored;
 		}
 
 		const std::string err_field = resp.value("error", std::string{});
@@ -518,13 +568,7 @@ namespace copilot {
 		}
 		if (err_field == "expired_token" || err_field == "access_denied") {
 			const std::string failure = "device flow " + err_field;
-			{
-				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = failure;
-			}
-			set_last_error(failure);
-			state.done.store(true);
-			return false;
+			return publish_login_terminal_failure(state, failure);
 		}
 		if (!err_field.empty()) {
 			const std::string failure = "device flow error: " + err_field;
@@ -545,15 +589,40 @@ namespace copilot {
 		return false;
 	}
 
-	bool cancel_login(copilot_login_state_t& state)
+	bool request_cancel(copilot_login_state_t& state) noexcept
 	{
-		state.cancelled.store(true);
-		state.done.store(true);
+		std::uint8_t phase = state.terminal_phase.load(std::memory_order_acquire);
+		bool claimed = false;
+		while (phase == 0 || phase == 4) {
+			if (state.terminal_phase.compare_exchange_weak(phase, 3,
+				std::memory_order_acq_rel, std::memory_order_acquire)) {
+				claimed = true;
+				break;
+			}
+		}
+		if (!claimed) return false;
+		state.cancelled.store(true, std::memory_order_release);
+		state.done.store(true, std::memory_order_release);
+		try {
+			std::lock_guard<std::mutex> lock(state.mutex);
+			try { state.error = "login cancelled"; } catch (...) {}
+		} catch (...) {
+		}
+		try { set_last_error("login cancelled"); } catch (...) {}
 		return true;
 	}
 
-	bool refresh_token()
+	bool cancel_login(copilot_login_state_t& state)
 	{
+		return request_cancel(state);
+	}
+
+	bool refresh_token(const http::cancel_cb_t& cancelled, int timeout_sec)
+	{
+		if (timeout_sec <= 0 || (cancelled && cancelled())) {
+			set_last_error("refresh cancelled or timed out");
+			return false;
+		}
 		auth_info_t info;
 		if (!store::get("github-copilot", info) || info.kind != auth_kind_t::oauth) {
 			set_last_error("no github-copilot oauth credentials");
@@ -571,12 +640,18 @@ namespace copilot {
 		std::string short_token;
 		int64_t expires_at = 0;
 		std::string err;
-		if (!fetch_internal_token(info.refresh, enterprise, short_token, expires_at, err)) {
+		if (!fetch_internal_token(
+				info.refresh, enterprise, short_token, expires_at, err,
+				cancelled, timeout_sec)) {
 			set_last_error(err);
 			return false;
 		}
 		info.access = short_token;
 		info.expires_unix = expires_at;
+		if (cancelled && cancelled()) {
+			set_last_error("refresh cancelled");
+			return false;
+		}
 		if (!store::set("github-copilot", info)) {
 			set_last_error("store::set github-copilot failed: " + store::last_error());
 			return false;
@@ -622,6 +697,7 @@ namespace copilot {
 		value.enterprise_url = state.enterprise_url;
 		value.done = state.done.load(std::memory_order_acquire);
 		value.cancelled = state.cancelled.load(std::memory_order_acquire);
+		value.terminal_phase = state.terminal_phase.load(std::memory_order_acquire);
 		value.error = state.error;
 		value.last_poll_unix = state.last_poll_unix;
 		value.next_poll_unix = state.next_poll_unix;

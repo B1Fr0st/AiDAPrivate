@@ -39,6 +39,8 @@
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
 
+#include "wb_crypto.hpp"
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "dnsapi.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -298,77 +300,51 @@ inline bool derive_protocol_key(const std::string& session_token,
     return ok;
 }
 
-inline bool chacha20_poly1305_encrypt(const uint8_t key[32],
-                                      const uint8_t nonce[12],
-                                      const uint8_t* aad, size_t aad_len,
-                                      const uint8_t* plaintext, size_t plaintext_len,
-                                      std::vector<uint8_t>& ciphertext_out,
-                                      uint8_t tag_out[16])
+inline bool protocol_encrypt(const uint8_t key[32],
+                             const uint8_t nonce[12],
+                             const uint8_t* aad, size_t aad_len,
+                             const uint8_t* plaintext, size_t plaintext_len,
+                             std::vector<uint8_t>& ciphertext_out,
+                             uint8_t tag_out[16])
 {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return false;
-    bool ok = false;
-    do {
-        if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr) != 1) break;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) break;
-        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, nonce) != 1) break;
-        int outlen = 0;
-        if (aad_len > 0)
-        {
-            if (EVP_EncryptUpdate(ctx, nullptr, &outlen, aad, static_cast<int>(aad_len)) != 1) break;
-        }
-        ciphertext_out.resize(plaintext_len);
-        if (plaintext_len > 0)
-        {
-            if (EVP_EncryptUpdate(ctx, ciphertext_out.data(), &outlen,
-                                  plaintext, static_cast<int>(plaintext_len)) != 1) break;
-        }
-        int finlen = 0;
-        if (EVP_EncryptFinal_ex(ctx, ciphertext_out.data() + outlen, &finlen) != 1) break;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag_out) != 1) break;
-        ok = true;
-    } while (false);
-    EVP_CIPHER_CTX_free(ctx);
+    std::vector<uint8_t> masked(plaintext_len);
+    for (size_t i = 0; i < plaintext_len; ++i)
+        masked[i] = static_cast<uint8_t>(plaintext[i] ^ key[i & 31]);
+
+    ciphertext_out.resize(plaintext_len);
+    bool ok = wb_crypto::gcm_encrypt(
+        masked.data(), masked.size(),
+        aad, aad_len, nonce,
+        ciphertext_out.data(), tag_out);
+
+    if (!masked.empty())
+        SecureZeroMemory(masked.data(), masked.size());
     return ok;
 }
 
-inline bool chacha20_poly1305_decrypt(const uint8_t key[32],
-                                      const uint8_t nonce[12],
-                                      const uint8_t* aad, size_t aad_len,
-                                      const uint8_t* ciphertext, size_t ciphertext_len,
-                                      const uint8_t tag[16],
-                                      std::vector<uint8_t>& plaintext_out)
+inline bool protocol_decrypt(const uint8_t key[32],
+                             const uint8_t nonce[12],
+                             const uint8_t* aad, size_t aad_len,
+                             const uint8_t* ciphertext, size_t ciphertext_len,
+                             const uint8_t tag[16],
+                             std::vector<uint8_t>& plaintext_out)
 {
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return false;
-    bool ok = false;
-    do {
-        if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr) != 1) break;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr) != 1) break;
-        if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, nonce) != 1) break;
-        int outlen = 0;
-        if (aad_len > 0)
-        {
-            if (EVP_DecryptUpdate(ctx, nullptr, &outlen, aad, static_cast<int>(aad_len)) != 1) break;
-        }
-        plaintext_out.resize(ciphertext_len);
-        if (ciphertext_len > 0)
-        {
-            if (EVP_DecryptUpdate(ctx, plaintext_out.data(), &outlen,
-                                  ciphertext, static_cast<int>(ciphertext_len)) != 1) break;
-        }
-        int finlen = 0;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16,
-                                const_cast<uint8_t*>(tag)) != 1) break;
-        if (EVP_DecryptFinal_ex(ctx, plaintext_out.data() + outlen, &finlen) != 1)
-        {
-            plaintext_out.clear();
-            break;
-        }
-        ok = true;
-    } while (false);
-    EVP_CIPHER_CTX_free(ctx);
-    return ok;
+    plaintext_out.resize(ciphertext_len);
+    bool ok = wb_crypto::gcm_decrypt(
+        ciphertext, ciphertext_len,
+        aad, aad_len, nonce,
+        tag, plaintext_out.data());
+
+    if (!ok)
+    {
+        plaintext_out.clear();
+        return false;
+    }
+
+    for (size_t i = 0; i < ciphertext_len; ++i)
+        plaintext_out[i] = static_cast<uint8_t>(plaintext_out[i] ^ key[i & 31]);
+
+    return true;
 }
 
 inline uint64_t make_session_nonce(const std::string& session_token)
@@ -390,7 +366,7 @@ inline uint64_t make_session_nonce(const std::string& session_token)
     return siphash24_keyed(buf, sizeof(buf), k);
 }
 
-inline void nonce_to_chacha_iv(uint64_t session_nonce, uint8_t out[12])
+inline void nonce_to_gcm_iv(uint64_t session_nonce, uint8_t out[12])
 {
     std::memset(out, 0, 12);
     std::memcpy(out, &session_nonce, 8);
@@ -836,8 +812,8 @@ inline bool send_request(uint16_t op,
     }
 
     uint64_t session_nonce = detail::make_session_nonce(session_token);
-    uint8_t chacha_iv[12];
-    detail::nonce_to_chacha_iv(session_nonce, chacha_iv);
+    uint8_t gcm_iv[12];
+    detail::nonce_to_gcm_iv(session_nonce, gcm_iv);
 
     binary_request_header_t aad = {};
     aad.magic = BINARY_REQUEST_MAGIC;
@@ -849,8 +825,8 @@ inline bool send_request(uint16_t op,
 
     std::vector<uint8_t> ciphertext;
     uint8_t tag[16] = {};
-    bool enc_ok = detail::chacha20_poly1305_encrypt(
-        key, chacha_iv,
+    bool enc_ok = detail::protocol_encrypt(
+        key, gcm_iv,
         reinterpret_cast<const uint8_t*>(&aad), sizeof(aad) - 8,
         raw_body.data(), raw_body.size(),
         ciphertext, tag);
@@ -1107,8 +1083,8 @@ inline bool send_request(uint16_t op,
     resp_aad.payload_len = 0;
 
     std::vector<uint8_t> plain_resp;
-    bool dec_ok = detail::chacha20_poly1305_decrypt(
-        resp_key, chacha_iv,
+    bool dec_ok = detail::protocol_decrypt(
+        resp_key, gcm_iv,
         reinterpret_cast<const uint8_t*>(&resp_aad), sizeof(resp_aad) - 8,
         enc_body, enc_len,
         recv_tag,

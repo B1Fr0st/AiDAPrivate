@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstddef>
+#include <vector>
 
 namespace anti_tamper {
 namespace blake3 {
@@ -25,11 +27,13 @@ constexpr uint8_t kMsgSchedule[7][16] = {
     {11,13, 7,14,12, 1, 3, 9, 5, 0,15, 4, 8, 6, 2,10},
 };
 
-constexpr uint32_t kFlags_ChunkStart    = 1u << 0;
-constexpr uint32_t kFlags_ChunkEnd      = 1u << 1;
-constexpr uint32_t kFlags_Tree          = 1u << 2;
-constexpr uint32_t kFlags_Parent        = 1u << 3;
-constexpr uint32_t kFlags_Root          = 1u << 4;
+constexpr uint32_t kFlag_ChunkStart        = 4;
+constexpr uint32_t kFlag_ChunkEnd          = 8;
+constexpr uint32_t kFlag_Parent            = 2;
+constexpr uint32_t kFlag_Root              = 1;
+constexpr uint32_t kFlag_KeyedHash         = 16;
+constexpr uint32_t kFlag_DeriveKeyContext  = 32;
+constexpr uint32_t kFlag_DeriveKeyMaterial = 64;
 
 __forceinline uint32_t rotr32(uint32_t x, int n)
 {
@@ -53,15 +57,15 @@ __forceinline void compress(
     uint32_t out[16],
     const uint32_t chaining[8],
     const uint32_t block_words[16],
-    uint32_t counter,
+    uint64_t counter,
     uint32_t block_len,
     uint32_t flags)
 {
     uint32_t state[16];
     memcpy(state, chaining, 32);
     memcpy(state + 8, kIV, 32);
-    state[12] ^= counter & 0xFFFFFFFF;
-    state[13] ^= counter >> 32;
+    state[12] ^= static_cast<uint32_t>(counter);
+    state[13] ^= static_cast<uint32_t>(counter >> 32);
     state[14] ^= block_len;
     state[15] ^= flags;
 
@@ -108,14 +112,9 @@ __forceinline void chunk_state_init(chunk_state_t& cs, const uint32_t key[8],
     cs.flags = flags;
 }
 
-__forceinline size_t chunk_state_len(const chunk_state_t& cs)
-{
-    return cs.blocks_compressed * kBlockSize + cs.block_len;
-}
-
 __forceinline uint32_t chunk_start_flag(const chunk_state_t& cs)
 {
-    return cs.blocks_compressed == 0 ? kFlags_ChunkStart : 0;
+    return cs.blocks_compressed == 0 ? kFlag_ChunkStart : 0;
 }
 
 __forceinline void chunk_state_update(chunk_state_t& cs, const uint8_t* input,
@@ -127,14 +126,12 @@ __forceinline void chunk_state_update(chunk_state_t& cs, const uint8_t* input,
         {
             uint32_t words[16];
             for (int i = 0; i < 16; ++i)
-            {
                 memcpy(&words[i], cs.block + i * 4, 4);
-            }
 
             uint32_t out_cv[16];
             uint32_t flags = cs.flags | chunk_start_flag(cs);
             compress(out_cv, cs.cv, words,
-                     static_cast<uint32_t>(cs.chunk_counter),
+                     cs.chunk_counter,
                      kBlockSize, flags);
 
             memcpy(cs.cv, out_cv, 32);
@@ -151,8 +148,8 @@ __forceinline void chunk_state_update(chunk_state_t& cs, const uint8_t* input,
     }
 }
 
-__forceinline void chunk_state_finalize(const chunk_state_t& cs,
-                                         uint32_t out[8])
+__forceinline void chunk_state_finalize_cv(const chunk_state_t& cs,
+                                            uint32_t out[8])
 {
     uint8_t block[kBlockSize];
     memcpy(block, cs.block, cs.block_len);
@@ -163,32 +160,30 @@ __forceinline void chunk_state_finalize(const chunk_state_t& cs,
         memcpy(&words[i], block + i * 4, 4);
 
     uint32_t out16[16];
-    uint32_t flags = cs.flags | chunk_start_flag(cs) | kFlags_ChunkEnd;
+    uint32_t flags = cs.flags | chunk_start_flag(cs) | kFlag_ChunkEnd;
     compress(out16, cs.cv, words,
-             static_cast<uint32_t>(cs.chunk_counter),
+             cs.chunk_counter,
              static_cast<uint32_t>(cs.block_len), flags);
     memcpy(out, out16, 32);
 }
 
-__forceinline void parent_output(const uint32_t left_cv[8],
-                                  const uint32_t right_cv[8],
-                                  const uint32_t key[8],
-                                  uint32_t flags,
-                                  uint32_t out[8])
+__forceinline void parent_cv(const uint32_t left[8], const uint32_t right[8],
+                              const uint32_t key[8], uint32_t flags,
+                              uint32_t out[8])
 {
     uint32_t block_words[16];
-    memcpy(block_words, left_cv, 32);
-    memcpy(block_words + 8, right_cv, 32);
+    memcpy(block_words, left, 32);
+    memcpy(block_words + 8, right, 32);
 
     uint32_t out16[16];
     compress(out16, key, block_words, 0, kBlockSize,
-             flags | kFlags_Parent);
+             flags | kFlag_Parent);
     memcpy(out, out16, 32);
 }
 
-__forceinline void root_output(const uint32_t cv[8],
+__forceinline void root_output(const uint32_t chaining[8],
                                 const uint8_t* block, size_t block_len,
-                                uint64_t chunk_counter, uint32_t flags,
+                                uint64_t counter, uint32_t flags,
                                 uint8_t out[32])
 {
     uint8_t padded[kBlockSize];
@@ -200,72 +195,86 @@ __forceinline void root_output(const uint32_t cv[8],
         memcpy(&words[i], padded + i * 4, 4);
 
     uint32_t out16[16];
-    compress(out16, cv, words,
-             static_cast<uint32_t>(chunk_counter),
+    compress(out16, chaining, words, counter,
              static_cast<uint32_t>(block_len),
-             flags | kFlags_Root);
+             flags | kFlag_Root);
 
-    for (int i = 0; i < 8; ++i)
-    {
-        out[i * 4]     = static_cast<uint8_t>((out16[i] >> 24) & 0xFF);
-        out[i * 4 + 1] = static_cast<uint8_t>((out16[i] >> 16) & 0xFF);
-        out[i * 4 + 2] = static_cast<uint8_t>((out16[i] >> 8) & 0xFF);
-        out[i * 4 + 3] = static_cast<uint8_t>(out16[i] & 0xFF);
-    }
+    memcpy(out, out16, 32);
 }
 
-__declspec(noinline) void hash(const void* data, size_t len, uint8_t out[32])
+inline void hash_with_iv(const uint8_t* data, size_t len,
+                         const uint32_t iv[8], uint8_t out[32])
 {
-    const auto* input = static_cast<const uint8_t*>(data);
-    const uint32_t key[8] = {
-        kIV[0], kIV[1], kIV[2], kIV[3],
-        kIV[4], kIV[5], kIV[6], kIV[7]
-    };
-    const uint32_t flags = 0;
-
-    if (len <= kChunkSize)
+    if (len <= static_cast<size_t>(kChunkSize))
     {
         chunk_state_t cs;
-        chunk_state_init(cs, key, flags);
-        chunk_state_update(cs, input, len);
-        uint32_t cv[8];
-        chunk_state_finalize(cs, cv);
-        root_output(cv, cs.block, cs.block_len, cs.chunk_counter,
-                    cs.flags | chunk_start_flag(cs) | kFlags_ChunkEnd, out);
+        chunk_state_init(cs, iv, 0);
+        if (len > 0)
+            chunk_state_update(cs, data, len);
+
+        root_output(cs.cv, cs.block, cs.block_len, cs.chunk_counter,
+                    chunk_start_flag(cs) | kFlag_ChunkEnd, out);
         return;
     }
 
-    size_t chunks_remaining = (len + kChunkSize - 1) / kChunkSize;
-    chunk_state_t cs;
-    chunk_state_init(cs, key, flags);
+    struct cv_t { uint32_t v[8]; };
+    std::vector<cv_t> cvs;
+
     size_t pos = 0;
-
-    while (chunks_remaining > 1)
+    while (pos < len)
     {
-        size_t take = kChunkSize - chunk_state_len(cs);
-        if (take > len - pos) take = len - pos;
+        size_t chunk_len = static_cast<size_t>(kChunkSize);
+        if (chunk_len > len - pos)
+            chunk_len = len - pos;
 
-        chunk_state_update(cs, input + pos, take);
-        pos += take;
+        chunk_state_t cs;
+        chunk_state_init(cs, iv, 0);
+        chunk_state_update(cs, data + pos, chunk_len);
 
-        if (chunk_state_len(cs) == kChunkSize)
-        {
-            uint32_t cv[8];
-            chunk_state_finalize(cs, cv);
-            chunk_state_init(cs, key, flags);
-            cs.cv[0] = cv[0]; cs.cv[1] = cv[1]; cs.cv[2] = cv[2]; cs.cv[3] = cv[3];
-            cs.cv[4] = cv[4]; cs.cv[5] = cv[5]; cs.cv[6] = cv[6]; cs.cv[7] = cv[7];
-            cs.chunk_counter += 1;
-            chunks_remaining -= 1;
-        }
+        cv_t cv;
+        chunk_state_finalize_cv(cs, cv.v);
+        cvs.push_back(cv);
+
+        pos += chunk_len;
     }
 
-    uint32_t final_cv[8];
-    chunk_state_update(cs, input + pos, len - pos);
-    chunk_state_finalize(cs, final_cv);
+    while (cvs.size() > 2)
+    {
+        std::vector<cv_t> next;
+        for (size_t i = 0; i < cvs.size(); i += 2)
+        {
+            if (i + 1 < cvs.size())
+            {
+                cv_t parent;
+                parent_cv(cvs[i].v, cvs[i + 1].v, iv, 0, parent.v);
+                next.push_back(parent);
+            }
+            else
+            {
+                next.push_back(cvs[i]);
+            }
+        }
+        cvs = std::move(next);
+    }
 
-    root_output(final_cv, cs.block, cs.block_len, cs.chunk_counter,
-                cs.flags | chunk_start_flag(cs) | kFlags_ChunkEnd, out);
+    uint32_t block_words[16];
+    memcpy(block_words, cvs[0].v, 32);
+    memcpy(block_words + 8, cvs[1].v, 32);
+
+    uint32_t out16[16];
+    compress(out16, iv, block_words, 0, kBlockSize,
+             kFlag_Parent | kFlag_Root);
+    memcpy(out, out16, 32);
+}
+
+inline void hash(const uint8_t* data, size_t len, uint8_t out[32])
+{
+    hash_with_iv(data, len, kIV, out);
+}
+
+inline void hash(const void* data, size_t len, uint8_t out[32])
+{
+    hash_with_iv(static_cast<const uint8_t*>(data), len, kIV, out);
 }
 
 }

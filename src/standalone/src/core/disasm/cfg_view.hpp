@@ -21,6 +21,8 @@
 #include "imgui/imgui_internal.h"
 #include "cfg_layout.hpp"
 #include "disasm_theme.hpp"
+#include "../ui/analysis_context_menu.hpp"
+#include "../ui/application_view_registry.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "function_index.hpp"
 #include "standalone_driver.hpp"
@@ -55,7 +57,6 @@
 #endif
 #include "disasm_view.hpp"
 #include "../ui/theme.hpp"
-#include "../helpers/globals.h"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
@@ -124,6 +125,7 @@ struct cfg_state_t {
 	float                      rebuild_anim = 1.f;
 	bool                       fit_request = false;
 	std::unordered_map<int, block_motion_t> block_motion;
+	std::unordered_map<int, std::size_t> node_lookup;
 	std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
 	bool                       minimap_dragging = false;
 	int                        text_sel_block = -1;
@@ -250,6 +252,7 @@ inline void clear()
 	g_state.built = false;
 	g_state.selected_block = -1;
 	g_state.block_motion.clear();
+	g_state.node_lookup.clear();
 	g_state.entry_injections.clear();
 	g_state.rebuild_anim = 1.f;
 	g_state.text_sel_block = -1;
@@ -864,6 +867,10 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.blocks = std::move(blocks);
 			g_state.graph = std::move(graph);
+			g_state.node_lookup.clear();
+			g_state.node_lookup.reserve(g_state.graph.nodes.size());
+			for (std::size_t node_index = 0; node_index < g_state.graph.nodes.size(); ++node_index)
+				g_state.node_lookup.emplace(g_state.graph.nodes[node_index].id, node_index);
 			g_state.entry_injections = std::move(entry_injections);
 			g_state.entry_addr = entry_address;
 			g_state.built = true;
@@ -951,6 +958,10 @@ inline void build_cfg(const disasm_view::workspace_context_t&, uint64_t entry_ad
 			g_state.graph.edges.push_back({block_id, successor, i == 0 && successor == 1});
 	}
 	cfg_layout::layout(g_state.graph, 92.f, 76.f);
+	g_state.node_lookup.clear();
+	g_state.node_lookup.reserve(g_state.graph.nodes.size());
+	for (std::size_t node_index = 0; node_index < g_state.graph.nodes.size(); ++node_index)
+		g_state.node_lookup.emplace(g_state.graph.nodes[node_index].id, node_index);
 	g_state.entry_injections.clear();
 	g_state.entry_injections[0] = {{function_index::injection_t::function_banner, "; validate_license", g_state.entry_addr}, {function_index::injection_t::prototype_line, "bool __fastcall validate_license(session_t* session)", g_state.entry_addr}};
 	g_state.built = true;
@@ -993,7 +1004,8 @@ inline bool handle_view_keys(float view_width, float view_height)
 		uint64_t back_addr = g_state.last_cursor_addr != 0
 			? g_state.last_cursor_addr
 			: g_state.entry_addr;
-		globals::ui::active_center_view = center_view_t::disassembly;
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("document.disassembly"));
 		if (back_addr != 0)
 			disasm_view::goto_address(back_addr, disasm_view::capture_selected_workspace());
 		return true;
@@ -1002,7 +1014,8 @@ inline bool handle_view_keys(float view_width, float view_height)
 		uint64_t back_addr = g_state.last_cursor_addr != 0
 			? g_state.last_cursor_addr
 			: g_state.entry_addr;
-		globals::ui::active_center_view = center_view_t::disassembly;
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("document.disassembly"));
 		if (back_addr != 0)
 			disasm_view::goto_address(back_addr, disasm_view::capture_selected_workspace());
 		return true;
@@ -1176,13 +1189,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	for (auto& e : edges) {
-		std::size_t from_idx = nodes.size();
-		std::size_t to_idx = nodes.size();
-		for (std::size_t i = 0; i < nodes.size(); ++i) {
-			if (nodes[i].id == e.from) from_idx = i;
-			if (nodes[i].id == e.to) to_idx = i;
-		}
-		if (from_idx == nodes.size() || to_idx == nodes.size()) continue;
+		const auto from_found = g_state.node_lookup.find(e.from);
+		const auto to_found = g_state.node_lookup.find(e.to);
+		if (from_found == g_state.node_lookup.end() || to_found == g_state.node_lookup.end()) continue;
+		const std::size_t from_idx = from_found->second;
+		const std::size_t to_idx = to_found->second;
 
 		auto& fn = nodes[from_idx];
 		auto& tn = nodes[to_idx];
@@ -1196,6 +1207,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float mid_y = (p1.y + p4.y) * 0.5f;
 		ImVec2 p2(p1.x, mid_y);
 		ImVec2 p3(p4.x, mid_y);
+		const float edge_min_x = (std::min)(p1.x, p4.x);
+		const float edge_max_x = (std::max)(p1.x, p4.x);
+		const float edge_min_y = (std::min)(p1.y, p4.y);
+		const float edge_max_y = (std::max)(p1.y, p4.y);
+		if (edge_max_x < pos_x || edge_min_x > pos_x + width ||
+			edge_max_y < pos_y || edge_min_y > pos_y + height)
+			continue;
 
 		bool two_succ = e.from >= 0 && static_cast<std::size_t>(e.from) < blocks.size()
 			&& blocks[static_cast<std::size_t>(e.from)].successors.size() > 1;
@@ -1271,6 +1289,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
+	bool typed_context_requested = false;
 	for (std::size_t ni = 0; ni < nodes.size(); ++ni) {
 		auto& n = nodes[ni];
 		if (n.id < 0 || static_cast<std::size_t>(n.id) >= blocks.size())
@@ -1535,6 +1554,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					g_state.text_sel_line_extent = -1;
 					g_state.text_sel_dragging = false;
 				}
+				disasm_view::select_address(g_state.last_cursor_addr,
+					disasm_view::capture_selected_workspace());
 			}
 			if (g_state.text_sel_dragging && g_state.text_sel_block == n.id
 				&& ImGui::IsMouseDown(ImGuiMouseButton_Left)
@@ -1550,7 +1571,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					go_addr = blk.instructions[static_cast<std::size_t>(hovered_line_idx)].addr;
 				}
 				g_state.last_cursor_addr = go_addr;
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(go_addr, disasm_view::capture_selected_workspace());
 			}
 			if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)
@@ -1569,7 +1591,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					g_state.text_sel_line_anchor = hovered_line_idx;
 					g_state.text_sel_line_extent = hovered_line_idx;
 				}
-				ImGui::OpenPopup("##cfg_line_ctx");
+				typed_context_requested = true;
 			}
 		}
 
@@ -1612,6 +1634,76 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (!out.empty() && out.back() == '\n') out.pop_back();
 		return out;
 	};
+	aida::ui::analysis_context_menu::render();
+	aida::ui::context_menu_open_origin_t legacy_graph_origin{};
+	if (hovered && aida::ui::analysis_context_menu::keyboard_request(legacy_graph_origin))
+		typed_context_requested = g_state.last_cursor_addr != 0;
+	if (typed_context_requested) {
+		using namespace aida::ui::analysis_context_menu;
+		using aida::ui::action_handler_result_t;
+		context_t menu;
+		menu.kind = menu_kind_t::graph;
+		menu.generation = g_state.entry_addr;
+		menu.live_generation = []() { return g_state.entry_addr; };
+		const auto address = g_state.last_cursor_addr;
+		menu.actions["analysis.navigate.disassembly"].invoke = [address]() {
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.disassembly"));
+			disasm_view::goto_address(address, disasm_view::capture_selected_workspace());
+			return action_handler_result_t::completed();
+		};
+		char address_text[32]{};
+		std::snprintf(address_text, sizeof(address_text), "%016llX",
+			static_cast<unsigned long long>(address));
+		menu.actions["analysis.copy.address"].invoke = [value = std::string(address_text)]() {
+			ImGui::SetClipboardText(value.c_str());
+			return action_handler_result_t::completed();
+		};
+		const auto text = build_sel_text(false);
+		const auto addressed = build_sel_text(true);
+		if (!text.empty()) {
+			menu.actions["analysis.copy.block"].invoke = [text]() {
+				ImGui::SetClipboardText(text.c_str());
+				return action_handler_result_t::completed();
+			};
+			menu.actions["analysis.copy.block_addressed"].invoke = [addressed]() {
+				ImGui::SetClipboardText(addressed.c_str());
+				return action_handler_result_t::completed();
+			};
+		}
+		menu.actions["analysis.graph.fit"].invoke = []() {
+			g_state.fit_request = true;
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.graph.zoom_in"].invoke = []() {
+			g_state.target_zoom = (std::min)(5.0f, g_state.target_zoom * 1.18f);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.graph.zoom_out"].invoke = []() {
+			g_state.target_zoom = (std::max)(0.1f, g_state.target_zoom * 0.85f);
+			return action_handler_result_t::completed();
+		};
+		if (g_state.text_ctx_block >= 0 &&
+			static_cast<std::size_t>(g_state.text_ctx_block) < g_state.blocks.size()) {
+			menu.actions["analysis.graph.select_block"].invoke = []() {
+				const auto& block = g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)];
+				g_state.text_sel_block = g_state.text_ctx_block;
+				g_state.text_sel_line_anchor = 0;
+				g_state.text_sel_line_extent = static_cast<int>(block.instructions.size()) - 1;
+				return action_handler_result_t::completed();
+			};
+		}
+		if (!text.empty()) {
+			menu.actions["analysis.graph.clear_selection"].invoke = []() {
+				g_state.text_sel_block = -1;
+				g_state.text_sel_line_anchor = -1;
+				g_state.text_sel_line_extent = -1;
+				return action_handler_result_t::completed();
+			};
+		}
+		open(std::move(menu), typed_context_requested && ImGui::IsMouseClicked(ImGuiMouseButton_Right)
+			? aida::ui::context_menu_open_origin_t::pointer : legacy_graph_origin);
+	}
 
 	if (hovered && !io.WantTextInput && !io.WantCaptureKeyboard
 		&& io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
@@ -1630,59 +1722,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			g_state.text_sel_line_anchor = 0;
 			g_state.text_sel_line_extent = static_cast<int>(sblk.instructions.size()) - 1;
 		}
-	}
-
-	if (ImGui::BeginPopup("##cfg_line_ctx")) {
-		bool has_sel = (g_state.text_sel_block >= 0
-			&& g_state.text_sel_line_anchor >= 0
-			&& g_state.text_sel_line_extent >= 0
-			&& static_cast<std::size_t>(g_state.text_sel_block) < g_state.blocks.size());
-		uint64_t ctx_addr = 0;
-		if (g_state.text_ctx_block >= 0
-			&& static_cast<std::size_t>(g_state.text_ctx_block) < g_state.blocks.size()
-			&& g_state.text_ctx_line >= 0
-			&& static_cast<std::size_t>(g_state.text_ctx_line) <
-				g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)].instructions.size())
-		{
-			ctx_addr = g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)]
-				.instructions[static_cast<std::size_t>(g_state.text_ctx_line)].addr;
-		}
-		if (ImGui::MenuItem("Copy text", "Ctrl+C", false, has_sel)) {
-			std::string txt = build_sel_text(false);
-			if (!txt.empty()) ImGui::SetClipboardText(txt.c_str());
-		}
-		if (ImGui::MenuItem("Copy text with address", nullptr, false, has_sel)) {
-			std::string txt = build_sel_text(true);
-			if (!txt.empty()) ImGui::SetClipboardText(txt.c_str());
-		}
-		if (ImGui::MenuItem("Copy address", nullptr, false, ctx_addr != 0)) {
-			char addr_buf[32];
-			snprintf(addr_buf, sizeof(addr_buf), "%llX",
-				static_cast<unsigned long long>(ctx_addr));
-			ImGui::SetClipboardText(addr_buf);
-		}
-		ImGui::Separator();
-		if (ImGui::MenuItem("Go to in disassembly", "Dbl-Click", false, ctx_addr != 0)) {
-			g_state.last_cursor_addr = ctx_addr;
-			globals::ui::active_center_view = center_view_t::disassembly;
-			disasm_view::goto_address(ctx_addr, disasm_view::capture_selected_workspace());
-		}
-		ImGui::Separator();
-		if (ImGui::MenuItem("Select all in block", "Ctrl+A", false,
-			g_state.text_ctx_block >= 0
-			&& static_cast<std::size_t>(g_state.text_ctx_block) < g_state.blocks.size()))
-		{
-			const auto& sblk = g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)];
-			g_state.text_sel_block = g_state.text_ctx_block;
-			g_state.text_sel_line_anchor = 0;
-			g_state.text_sel_line_extent = static_cast<int>(sblk.instructions.size()) - 1;
-		}
-		if (ImGui::MenuItem("Clear selection", "Esc", false, has_sel)) {
-			g_state.text_sel_block = -1;
-			g_state.text_sel_line_anchor = -1;
-			g_state.text_sel_line_extent = -1;
-		}
-		ImGui::EndPopup();
 	}
 
 	{
@@ -2048,7 +2087,8 @@ inline void render(float, float, float width, float height,
 	ImGui::SameLine();
 	if (ImGui::Button("Disassembly")) {
 		disasm_view::goto_address(function_address, context);
-		globals::ui::active_center_view = center_view_t::disassembly;
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("document.disassembly"));
 	}
 	if (page_count > 1) {
 		ImGui::SameLine();
@@ -2167,25 +2207,83 @@ inline void render(float, float, float width, float height,
 		if (ImGui::InvisibleButton("##workspace_cfg_node",
 			ImVec2(node_width, node_height))) {
 			view->selected_block = block.id;
-			disasm_view::goto_address(block_address, context);
-			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-				globals::ui::active_center_view = center_view_t::disassembly;
-		}
-		if (ImGui::BeginPopupContextItem("##workspace_cfg_actions")) {
-			if (ImGui::MenuItem("Go to disassembly")) {
+			disasm_view::select_address(block_address, context);
+			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 				disasm_view::goto_address(block_address, context);
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("document.disassembly"));
 			}
-			if (ImGui::MenuItem("Copy block address")) {
-				char address[32]{};
-				std::snprintf(address, sizeof(address), "%016llX",
-					static_cast<unsigned long long>(block_address));
-				ImGui::SetClipboardText(address);
+		}
+		const bool typed_pointer_request = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+		aida::ui::context_menu_open_origin_t graph_origin{};
+		const bool graph_pointer = typed_pointer_request;
+		const bool graph_keyboard = selected &&
+			aida::ui::analysis_context_menu::keyboard_request(graph_origin);
+		if (graph_pointer || graph_keyboard) {
+			using namespace aida::ui::analysis_context_menu;
+			using aida::ui::action_handler_result_t;
+			context_t menu;
+			menu.kind = menu_kind_t::graph;
+			const auto generation = context.workspace->generation();
+			const auto revision = context.workspace->analysis_revision();
+			menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
+				(generation << 6u) + (generation >> 2u));
+			menu.live_generation = [workspace = context.workspace]() {
+				const auto current = workspace->generation();
+				const auto current_revision = workspace->analysis_revision();
+				return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
+					(current << 6u) + (current >> 2u));
+			};
+			menu.actions["analysis.navigate.disassembly"].invoke = [context, block_address]() {
+				disasm_view::goto_address(block_address, context);
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("document.disassembly"));
+				return action_handler_result_t::completed();
+			};
+			char address[32]{};
+			std::snprintf(address, sizeof(address), "%016llX",
+				static_cast<unsigned long long>(block_address));
+			menu.actions["analysis.copy.address"].invoke = [value = std::string(address)]() {
+				ImGui::SetClipboardText(value.c_str());
+				return action_handler_result_t::completed();
+			};
+			std::string block_text;
+			std::string addressed_text;
+			for (std::size_t index = instruction_begin; index < instruction_end; ++index) {
+				const auto& instruction = snapshot.instructions[index];
+				const auto formatted = disasm_view::formatted_instruction(context, instruction.id);
+				if (!formatted)
+					continue;
+				if (!block_text.empty()) {
+					block_text.push_back('\n');
+					addressed_text.push_back('\n');
+				}
+				block_text += formatted->text;
+				const auto runtime = disasm_view::runtime_address(context, instruction.address).value_or(
+					instruction.address.value);
+				char prefix[32]{};
+				std::snprintf(prefix, sizeof(prefix), "%016llX  ",
+					static_cast<unsigned long long>(runtime));
+				addressed_text += prefix;
+				addressed_text += formatted->text;
 			}
-			ImGui::EndPopup();
+			if (!block_text.empty()) {
+				menu.actions["analysis.copy.block"].invoke = [value = std::move(block_text)]() {
+					ImGui::SetClipboardText(value.c_str());
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.copy.block_addressed"].invoke =
+					[value = std::move(addressed_text)]() {
+						ImGui::SetClipboardText(value.c_str());
+						return action_handler_result_t::completed();
+					};
+			}
+			open(std::move(menu), graph_pointer
+				? aida::ui::context_menu_open_origin_t::pointer : graph_origin);
 		}
 		ImGui::PopID();
 	}
+	aida::ui::analysis_context_menu::render();
 	ImGui::EndChild();
 	ImGui::EndChild();
 	ImGui::PopID();

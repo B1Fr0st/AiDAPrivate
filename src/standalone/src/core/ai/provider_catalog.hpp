@@ -74,11 +74,20 @@ namespace provider {
 		std::vector<std::string> model_ids;
 	};
 
+	struct model_list_validation_t {
+		bool valid = false;
+		int model_count = 0;
+		std::string error;
+	};
+
 namespace catalog {
 
 	bool fetch_and_cache(int timeout_ms = 10000);
 	bool load_cached_or_fetch(int max_age_seconds = 3600);
-	void initialize_async(int max_age_seconds = 86400);
+	model_list_validation_t validate_provider_model_list_response(
+		const std::string& provider_id, const std::string& body);
+	bool initialize_async(int max_age_seconds = 86400);
+	void cancel_initialize() noexcept;
 	const std::vector<provider_info_t>& list_providers();
 	const provider_info_t* get_provider(const std::string& provider_id);
 	const model_info_t* get_model(const std::string& provider_id, const std::string& model_id);

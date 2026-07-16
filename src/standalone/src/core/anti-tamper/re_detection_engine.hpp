@@ -24,6 +24,7 @@
 #include "self_guard.hpp"
 #include "process_scan.hpp"
 #include "re_tool_preflight.hpp"
+#include "anti_hook.hpp"
 #include "../infra/win_thread.hpp"
 
 extern wchar_t g_aidaWindowTitle[128];
@@ -54,6 +55,8 @@ constexpr uint32_t SIGNAL_SELF_HOOK_DETECTED     = 1u << 25;
 constexpr uint32_t SIGNAL_PROLOGUE_SERVER_MISMATCH = 1u << 26;
 constexpr uint32_t SIGNAL_CE_BEHAVIORAL  = 1u << 27;
 constexpr uint32_t SIGNAL_WINDOW_ENUM    = 1u << 28;
+constexpr uint32_t SIGNAL_IAT_MODIFIED   = 1u << 29;
+constexpr uint32_t SIGNAL_INLINE_HOOK    = 1u << 30;
 
 constexpr uint32_t FAMILY_TARGET    = 0x01;
 constexpr uint32_t FAMILY_HANDLE    = 0x02;
@@ -114,6 +117,11 @@ inline const signal_desc_t& signals(uint32_t bit)
         { SIGNAL_KD_TARGETING_US, FAMILY_KDEBUG, "kernel_debug_targeting_us" },
         { SIGNAL_CE_BEHAVIORAL, FAMILY_HANDLE, "ce_behavioral_pattern" },
         { SIGNAL_WINDOW_ENUM, FAMILY_HANDLE, "window_enumeration" },
+        { SIGNAL_VTABLE_HOOKED, FAMILY_INJECTION, "vtable_hooked" },
+        { SIGNAL_SELF_HOOK_DETECTED, FAMILY_INJECTION, "self_hook_detected" },
+        { SIGNAL_PROLOGUE_SERVER_MISMATCH, FAMILY_INJECTION, "prologue_server_mismatch" },
+        { SIGNAL_IAT_MODIFIED, FAMILY_INJECTION, "iat_modified" },
+        { SIGNAL_INLINE_HOOK, FAMILY_INJECTION, "inline_hook" },
     };
     static const signal_desc_t zero = { 0, 0, "unknown" };
     for (const auto& d : table) {
@@ -1630,6 +1638,28 @@ namespace detail {
         if (detect_findwindow_probe())
             mask |= SIGNAL_WINDOW_ENUM;
 
+        std::string vtable_class;
+        if (anti_hook::vtable_check::detect_vtable_hooks(vtable_class))
+            mask |= SIGNAL_VTABLE_HOOKED;
+
+        std::string self_mismatch;
+        if (!anti_hook::verify_self_prologue_hashes(self_mismatch))
+            mask |= SIGNAL_SELF_HOOK_DETECTED;
+
+        std::string server_mismatch;
+        if (!anti_hook::server_hashes::verify_against_server_hashes(server_mismatch))
+            mask |= SIGNAL_PROLOGUE_SERVER_MISMATCH;
+
+        auto& rt_iat = state::get();
+        if (!rt_iat.iat_snap.empty() && !anti_hook::verify_iat_entries(rt_iat.iat_snap))
+            mask |= SIGNAL_IAT_MODIFIED;
+
+        std::string inline_hooked;
+        if (anti_hook::scan_inline_hooks_ntdll(inline_hooked))
+            mask |= SIGNAL_INLINE_HOOK;
+        else if (anti_hook::scan_inline_hooks_kernel32(inline_hooked))
+            mask |= SIGNAL_INLINE_HOOK;
+
         return mask;
     }
 
@@ -1838,6 +1868,31 @@ inline void tick()
 
     static std::atomic<uint32_t> s_tick_num{0};
     s_tick_num.fetch_add(1);
+    if ((s_tick_num.load(std::memory_order_relaxed) & 3u) == 0)
+    {
+        std::string prologue_mismatch;
+        if (!anti_hook::verify_prologue_hashes(prologue_mismatch))
+        {
+            mask |= SIGNAL_INLINE_HOOK;
+            s.last_mask.store(mask);
+            char db[256];
+            _snprintf_s(db, sizeof(db), _TRUNCATE,
+                "periodic_prologue_hash_mismatch func=%s",
+                prologue_mismatch.c_str());
+            webhook::write_log_critical("re_tick", db);
+        }
+        std::string self_mismatch;
+        if (!anti_hook::verify_self_prologue_hashes(self_mismatch))
+        {
+            mask |= SIGNAL_SELF_HOOK_DETECTED;
+            s.last_mask.store(mask);
+            char db[256];
+            _snprintf_s(db, sizeof(db), _TRUNCATE,
+                "periodic_self_prologue_mismatch func=%s",
+                self_mismatch.c_str());
+            webhook::write_log_critical("re_tick", db);
+        }
+    }
     if (detail::has_confirmed_signal(mask)) {
         uint64_t evidence = detail::hash_evidence(mask);
         std::string detail_str = detail::format_signal_detail(mask, evidence);

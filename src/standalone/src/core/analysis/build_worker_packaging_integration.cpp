@@ -15,6 +15,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <queue>
 #include <set>
 #include <system_error>
@@ -42,6 +43,7 @@ constexpr stable_code_entry_t k_stable_codes[] = {
     {build_worker_error_code_t::unsafe_path, "unsafe_path"},
     {build_worker_error_code_t::path_escape, "path_escape"},
     {build_worker_error_code_t::reparse_point, "reparse_point"},
+    {build_worker_error_code_t::hardlink_forbidden, "hardlink_forbidden"},
     {build_worker_error_code_t::duplicate_entry, "duplicate_entry"},
     {build_worker_error_code_t::file_missing, "file_missing"},
     {build_worker_error_code_t::file_type_invalid, "file_type_invalid"},
@@ -78,6 +80,8 @@ constexpr stable_code_entry_t k_stable_codes[] = {
     {build_worker_error_code_t::resource_stream_limit, "resource_stream_limit"},
     {build_worker_error_code_t::directory_cycle, "directory_cycle"},
     {build_worker_error_code_t::required_external_artifact_missing, "required_external_artifact_missing"},
+    {build_worker_error_code_t::cancelled, "cancelled"},
+    {build_worker_error_code_t::deadline_exceeded, "deadline_exceeded"},
     {build_worker_error_code_t::internal_error, "internal_error"},
 };
 
@@ -152,6 +156,84 @@ struct file_evidence_t final {
     std::uint64_t size = 0;
     std::string sha256;
     std::string content;
+    std::filesystem::path path;
+    BY_HANDLE_FILE_INFORMATION identity{};
+    std::shared_ptr<void> lock;
+};
+
+struct immutable_generation_context_t final {
+    std::map<std::wstring, file_evidence_t> files;
+    std::vector<std::shared_ptr<void>> directories;
+};
+
+thread_local immutable_generation_context_t* active_generation = nullptr;
+
+struct package_verification_control_t final {
+    const package_verification_request_t* request = nullptr;
+    std::chrono::steady_clock::time_point deadline;
+};
+
+thread_local package_verification_control_t* active_verification_control = nullptr;
+
+class package_verification_control_scope_t final {
+public:
+    explicit package_verification_control_scope_t(package_verification_control_t& control) noexcept
+        : previous_(active_verification_control) {
+        active_verification_control = &control;
+    }
+
+    ~package_verification_control_scope_t() {
+        active_verification_control = previous_;
+    }
+
+    package_verification_control_scope_t(const package_verification_control_scope_t&) = delete;
+    package_verification_control_scope_t& operator=(const package_verification_control_scope_t&) = delete;
+
+private:
+    package_verification_control_t* previous_ = nullptr;
+};
+
+build_worker_result_t<void> poll_verification_control(
+    const std::filesystem::path& path = {}, std::string detail = {}) {
+    if (!active_verification_control || !active_verification_control->request)
+        return build_worker_result_t<void>::success();
+    const auto& request = *active_verification_control->request;
+    if (request.cancellation_requested) {
+        try {
+            if (request.cancellation_requested())
+                return build_worker_result_t<void>::failure(
+                    error(build_worker_error_code_t::cancelled, path, std::move(detail)));
+        } catch (const std::exception& exception) {
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::internal_error, path, exception.what()));
+        } catch (...) {
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::internal_error, path,
+                      "cancellation_callback"));
+        }
+    }
+    if (std::chrono::steady_clock::now() >= active_verification_control->deadline)
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::deadline_exceeded, path, std::move(detail)));
+    return build_worker_result_t<void>::success();
+}
+
+class immutable_generation_scope_t final {
+public:
+    explicit immutable_generation_scope_t(immutable_generation_context_t& generation) noexcept
+        : previous_(active_generation) {
+        active_generation = &generation;
+    }
+
+    ~immutable_generation_scope_t() {
+        active_generation = previous_;
+    }
+
+    immutable_generation_scope_t(const immutable_generation_scope_t&) = delete;
+    immutable_generation_scope_t& operator=(const immutable_generation_scope_t&) = delete;
+
+private:
+    immutable_generation_context_t* previous_ = nullptr;
 };
 
 struct bcrypt_algorithm_t final {
@@ -224,14 +306,15 @@ build_worker_result_t<std::size_t> verify_stream_inventory(
     stream.handle = FindFirstStreamW(path.c_str(), FindStreamInfoStandard, &stream_data, 0);
     if (stream.handle == INVALID_HANDLE_VALUE) {
         const DWORD last_error = GetLastError();
-        if (last_error == ERROR_HANDLE_EOF)
-            return build_worker_result_t<std::size_t>::success(0);
         return build_worker_result_t<std::size_t>::failure(
             error(build_worker_error_code_t::file_read_failed, path,
                   "FindFirstStreamW", 0, last_error));
     }
     std::size_t count = 0;
     for (;;) {
+        auto control = poll_verification_control(path, "stream_inventory");
+        if (!control)
+            return build_worker_result_t<std::size_t>::failure(control.error());
         ++count;
         if (count > k_default_stream_count_limit)
             return build_worker_result_t<std::size_t>::failure(
@@ -252,6 +335,40 @@ build_worker_result_t<std::size_t> verify_stream_inventory(
     return build_worker_result_t<std::size_t>::success(count);
 }
 
+build_worker_result_t<void> retain_locked_content(file_evidence_t& evidence) {
+    if (!evidence.content.empty())
+        return build_worker_result_t<void>::success();
+    if (!evidence.lock || evidence.size == 0 ||
+        evidence.size > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)()))
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::file_read_failed, evidence.path,
+                  "immutable_generation_content"));
+    const auto handle = static_cast<HANDLE>(evidence.lock.get());
+    LARGE_INTEGER beginning{};
+    if (!SetFilePointerEx(handle, beginning, nullptr, FILE_BEGIN))
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::file_read_failed, evidence.path,
+                  "SetFilePointerEx", 0, GetLastError()));
+    evidence.content.resize(static_cast<std::size_t>(evidence.size));
+    std::uint64_t total = 0;
+    while (total < evidence.size) {
+        auto control = poll_verification_control(evidence.path, "retained_content");
+        if (!control)
+            return build_worker_result_t<void>::failure(control.error());
+        const DWORD requested = static_cast<DWORD>((std::min)(
+            evidence.size - total,
+            static_cast<std::uint64_t>((std::numeric_limits<DWORD>::max)())));
+        DWORD received = 0;
+        if (!ReadFile(handle, evidence.content.data() + static_cast<std::size_t>(total),
+                      requested, &received, nullptr) || received == 0)
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::file_changed, evidence.path,
+                      "ReadFile:immutable_generation", evidence.size, total));
+        total += received;
+    }
+    return build_worker_result_t<void>::success();
+}
+
 build_worker_result_t<file_evidence_t> inspect_regular_file(
     const std::filesystem::path& path, std::uint64_t maximum_bytes, bool retain_content) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -267,6 +384,21 @@ build_worker_result_t<file_evidence_t> inspect_regular_file(
     auto streams = verify_stream_inventory(path);
     if (!streams)
         return build_worker_result_t<file_evidence_t>::failure(streams.error());
+    if (active_generation) {
+        const auto cached = active_generation->files.find(path.native());
+        if (cached != active_generation->files.end()) {
+            if (cached->second.size > maximum_bytes)
+                return build_worker_result_t<file_evidence_t>::failure(
+                    error(build_worker_error_code_t::file_too_large, path, {},
+                          maximum_bytes, cached->second.size));
+            if (retain_content) {
+                auto retained = retain_locked_content(cached->second);
+                if (!retained)
+                    return build_worker_result_t<file_evidence_t>::failure(retained.error());
+            }
+            return build_worker_result_t<file_evidence_t>::success(cached->second);
+        }
+    }
 
     win_handle_t file;
     file.handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -295,6 +427,10 @@ build_worker_result_t<file_evidence_t> inspect_regular_file(
         return build_worker_result_t<file_evidence_t>::failure(
             error(build_worker_error_code_t::file_read_failed, path,
                   "GetFileInformationByHandle", 0, GetLastError()));
+    if (identity_before.nNumberOfLinks != 1)
+        return build_worker_result_t<file_evidence_t>::failure(
+            error(build_worker_error_code_t::hardlink_forbidden, path,
+                  "nNumberOfLinks", 1, identity_before.nNumberOfLinks));
 
     LARGE_INTEGER length{};
     if (!GetFileSizeEx(file.handle, &length) || length.QuadPart < 0)
@@ -318,7 +454,8 @@ build_worker_result_t<file_evidence_t> inspect_regular_file(
     status = BCryptGetProperty(algorithm.handle, BCRYPT_OBJECT_LENGTH,
                                reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size),
                                &returned, 0);
-    if (status < 0 || object_size == 0 || returned != sizeof(object_size))
+    if (status < 0 || object_size == 0 ||
+        returned != static_cast<DWORD>(sizeof(object_size)))
         return build_worker_result_t<file_evidence_t>::failure(
             error(build_worker_error_code_t::hash_failed, path, "BCryptGetProperty", 0,
                   static_cast<std::uint32_t>(status)));
@@ -343,6 +480,9 @@ build_worker_result_t<file_evidence_t> inspect_regular_file(
     std::vector<std::uint8_t> buffer(1024U * 1024U);
     std::uint64_t total = 0;
     while (total < size) {
+        auto control = poll_verification_control(path, "artifact_hash");
+        if (!control)
+            return build_worker_result_t<file_evidence_t>::failure(control.error());
         const DWORD requested = static_cast<DWORD>((std::min)(
             static_cast<std::uint64_t>(buffer.size()), size - total));
         DWORD received = 0;
@@ -372,6 +512,7 @@ build_worker_result_t<file_evidence_t> inspect_regular_file(
         identity_before.nFileIndexLow != identity_after.nFileIndexLow ||
         identity_before.nFileSizeHigh != identity_after.nFileSizeHigh ||
         identity_before.nFileSizeLow != identity_after.nFileSizeLow ||
+        identity_after.nNumberOfLinks != 1 ||
         identity_before.ftLastWriteTime.dwHighDateTime !=
             identity_after.ftLastWriteTime.dwHighDateTime ||
         identity_before.ftLastWriteTime.dwLowDateTime !=
@@ -380,7 +521,160 @@ build_worker_result_t<file_evidence_t> inspect_regular_file(
             error(build_worker_error_code_t::file_changed, path,
                   "GetFileInformationByHandle"));
     result.sha256 = hex_encode(digest);
+    result.path = path;
+    result.identity = identity_after;
+    result.lock = std::shared_ptr<void>(
+        file.handle, [](void* handle) {
+            if (handle && handle != INVALID_HANDLE_VALUE)
+                CloseHandle(static_cast<HANDLE>(handle));
+        });
+    file.handle = INVALID_HANDLE_VALUE;
+    if (active_generation) {
+        auto inserted = active_generation->files.emplace(path.native(), std::move(result));
+        if (!inserted.second)
+            return build_worker_result_t<file_evidence_t>::failure(
+                error(build_worker_error_code_t::internal_error, path,
+                      "immutable_generation_duplicate"));
+        return build_worker_result_t<file_evidence_t>::success(inserted.first->second);
+    }
     return build_worker_result_t<file_evidence_t>::success(std::move(result));
+}
+
+build_worker_result_t<std::string> rehash_locked_generation_file(
+    const file_evidence_t& evidence) {
+    if (!evidence.lock || evidence.size == 0)
+        return build_worker_result_t<std::string>::failure(
+            error(build_worker_error_code_t::internal_error, evidence.path,
+                  "immutable_generation_hash_lock"));
+    const auto handle = static_cast<HANDLE>(evidence.lock.get());
+    LARGE_INTEGER beginning{};
+    if (!SetFilePointerEx(handle, beginning, nullptr, FILE_BEGIN))
+        return build_worker_result_t<std::string>::failure(
+            error(build_worker_error_code_t::file_read_failed, evidence.path,
+                  "SetFilePointerEx:immutable_generation_hash", 0, GetLastError()));
+
+    bcrypt_algorithm_t algorithm;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm.handle, BCRYPT_SHA256_ALGORITHM,
+                                                   nullptr, 0);
+    if (status < 0)
+        return build_worker_result_t<std::string>::failure(
+            error(build_worker_error_code_t::hash_failed, evidence.path,
+                  "BCryptOpenAlgorithmProvider:immutable_generation", 0,
+                  static_cast<std::uint32_t>(status)));
+    DWORD object_size = 0;
+    DWORD returned = 0;
+    status = BCryptGetProperty(algorithm.handle, BCRYPT_OBJECT_LENGTH,
+                               reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size),
+                               &returned, 0);
+    if (status < 0 || object_size == 0 ||
+        returned != static_cast<DWORD>(sizeof(object_size)))
+        return build_worker_result_t<std::string>::failure(
+            error(build_worker_error_code_t::hash_failed, evidence.path,
+                  "BCryptGetProperty:immutable_generation", 0,
+                  static_cast<std::uint32_t>(status)));
+    std::vector<std::uint8_t> hash_object(object_size);
+    bcrypt_hash_t hash;
+    status = BCryptCreateHash(algorithm.handle, &hash.handle, hash_object.data(), object_size,
+                              nullptr, 0, 0);
+    if (status < 0)
+        return build_worker_result_t<std::string>::failure(
+            error(build_worker_error_code_t::hash_failed, evidence.path,
+                  "BCryptCreateHash:immutable_generation", 0,
+                  static_cast<std::uint32_t>(status)));
+
+    std::vector<std::uint8_t> buffer(1024U * 1024U);
+    std::uint64_t total = 0;
+    while (total < evidence.size) {
+        auto control = poll_verification_control(evidence.path, "immutable_hash");
+        if (!control)
+            return build_worker_result_t<std::string>::failure(control.error());
+        const DWORD requested = static_cast<DWORD>((std::min)(
+            static_cast<std::uint64_t>(buffer.size()), evidence.size - total));
+        DWORD received = 0;
+        if (!ReadFile(handle, buffer.data(), requested, &received, nullptr) || received == 0)
+            return build_worker_result_t<std::string>::failure(
+                error(build_worker_error_code_t::file_changed, evidence.path,
+                      "ReadFile:immutable_generation_hash", evidence.size, total));
+        status = BCryptHashData(hash.handle, buffer.data(), received, 0);
+        if (status < 0)
+            return build_worker_result_t<std::string>::failure(
+                error(build_worker_error_code_t::hash_failed, evidence.path,
+                      "BCryptHashData:immutable_generation", 0,
+                      static_cast<std::uint32_t>(status)));
+        total += received;
+    }
+    std::array<std::uint8_t, 32> digest{};
+    status = BCryptFinishHash(hash.handle, digest.data(), static_cast<ULONG>(digest.size()), 0);
+    if (status < 0)
+        return build_worker_result_t<std::string>::failure(
+            error(build_worker_error_code_t::hash_failed, evidence.path,
+                  "BCryptFinishHash:immutable_generation", 0,
+                  static_cast<std::uint32_t>(status)));
+    return build_worker_result_t<std::string>::success(hex_encode(digest));
+}
+
+build_worker_result_t<void> revalidate_immutable_generation(
+    const immutable_generation_context_t& generation) {
+    for (const auto& entry : generation.files) {
+        const auto& evidence = entry.second;
+        auto control = poll_verification_control(evidence.path,
+                                                 "immutable_revalidation");
+        if (!control)
+            return build_worker_result_t<void>::failure(control.error());
+        if (!evidence.lock)
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::internal_error, evidence.path,
+                      "immutable_generation_lock"));
+        BY_HANDLE_FILE_INFORMATION identity{};
+        const auto handle = static_cast<HANDLE>(evidence.lock.get());
+        if (!GetFileInformationByHandle(handle, &identity))
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::file_read_failed, evidence.path,
+                      "GetFileInformationByHandle:immutable_generation", 0,
+                      GetLastError()));
+        const auto& expected = evidence.identity;
+        if (identity.dwVolumeSerialNumber != expected.dwVolumeSerialNumber ||
+            identity.nFileIndexHigh != expected.nFileIndexHigh ||
+            identity.nFileIndexLow != expected.nFileIndexLow ||
+            identity.nFileSizeHigh != expected.nFileSizeHigh ||
+            identity.nFileSizeLow != expected.nFileSizeLow ||
+            identity.nNumberOfLinks != 1 || expected.nNumberOfLinks != 1 ||
+            identity.ftLastWriteTime.dwHighDateTime !=
+                expected.ftLastWriteTime.dwHighDateTime ||
+            identity.ftLastWriteTime.dwLowDateTime !=
+                expected.ftLastWriteTime.dwLowDateTime)
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::file_changed, evidence.path,
+                      "immutable_generation_identity"));
+        win_handle_t current;
+        current.handle = CreateFileW(
+            evidence.path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (current.handle == INVALID_HANDLE_VALUE)
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::file_changed, evidence.path,
+                      "CreateFileW:immutable_generation_path", 0, GetLastError()));
+        BY_HANDLE_FILE_INFORMATION current_identity{};
+        if (!GetFileInformationByHandle(current.handle, &current_identity) ||
+            current_identity.dwVolumeSerialNumber != expected.dwVolumeSerialNumber ||
+            current_identity.nFileIndexHigh != expected.nFileIndexHigh ||
+            current_identity.nFileIndexLow != expected.nFileIndexLow ||
+            current_identity.nNumberOfLinks != 1)
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::file_changed, evidence.path,
+                      "immutable_generation_path_identity"));
+        auto streams = verify_stream_inventory(evidence.path);
+        if (!streams)
+            return build_worker_result_t<void>::failure(streams.error());
+        auto current_hash = rehash_locked_generation_file(evidence);
+        if (!current_hash)
+            return build_worker_result_t<void>::failure(current_hash.error());
+        if (!fixed_time_equal(current_hash.value(), evidence.sha256))
+            return build_worker_result_t<void>::failure(
+                error(build_worker_error_code_t::file_changed, evidence.path,
+                      "immutable_generation_hash"));
+    }
+    return build_worker_result_t<void>::success();
 }
 
 build_worker_result_t<std::string> sha256_text(std::string_view text) {
@@ -397,7 +691,8 @@ build_worker_result_t<std::string> sha256_text(std::string_view text) {
     status = BCryptGetProperty(algorithm.handle, BCRYPT_OBJECT_LENGTH,
                                reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size),
                                &returned, 0);
-    if (status < 0 || object_size == 0 || returned != sizeof(object_size))
+    if (status < 0 || object_size == 0 ||
+        returned != static_cast<DWORD>(sizeof(object_size)))
         return build_worker_result_t<std::string>::failure(
             error(build_worker_error_code_t::hash_failed, {}, "BCryptGetProperty:text", 0,
                   static_cast<std::uint32_t>(status)));
@@ -429,24 +724,89 @@ build_worker_result_t<std::string> sha256_text(std::string_view text) {
     return build_worker_result_t<std::string>::success(hex_encode(digest));
 }
 
-build_worker_result_t<std::filesystem::path> canonical_directory(
-    const std::filesystem::path& path) {
-    const DWORD attributes = GetFileAttributesW(path.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES)
+build_worker_result_t<std::filesystem::path> exact_existing_path(
+    const std::filesystem::path& path, bool require_directory) {
+    const auto& input = path.native();
+    if (!path.is_absolute() || input.size() < 3 || input[1] != L':' ||
+        input[0] < L'A' || input[0] > L'Z' || input[2] != L'\\' ||
+        input.find(L'/') != std::wstring::npos || input.rfind(L"\\\\?\\", 0) == 0 ||
+        (input.size() > 3 && input.back() == L'\\'))
         return build_worker_result_t<std::filesystem::path>::failure(
-            error(build_worker_error_code_t::file_missing, path));
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            error(build_worker_error_code_t::unsafe_path, path, "raw_absolute_path"));
+    std::array<wchar_t, 32768> full_buffer{};
+    const DWORD full_length = GetFullPathNameW(path.c_str(),
+        static_cast<DWORD>(full_buffer.size()), full_buffer.data(), nullptr);
+    if (full_length == 0 || full_length >= full_buffer.size() ||
+        std::wstring_view(full_buffer.data(), full_length) !=
+            std::wstring_view(input.data(), input.size()))
+        return build_worker_result_t<std::filesystem::path>::failure(
+            error(build_worker_error_code_t::unsafe_path, path, "normalized_absolute_path"));
+    std::filesystem::path current = path.root_path();
+    std::vector<std::filesystem::path> components;
+    components.emplace_back(current);
+    for (const auto& component : path.relative_path()) {
+        const auto& text = component.native();
+        if (text.empty() || text == L"." || text == L".." ||
+            text.back() == L'.' || text.back() == L' ' || text.find(L':') != std::wstring::npos ||
+            std::any_of(text.begin(), text.end(), [](const wchar_t character) {
+                return character < 0x20 || character > 0x7e;
+            }))
+            return build_worker_result_t<std::filesystem::path>::failure(
+                error(build_worker_error_code_t::unsafe_path, path, "path_component"));
+        current /= component;
+        components.emplace_back(current);
+    }
+    DWORD final_attributes = 0;
+    for (const auto& component_path : components) {
+        win_handle_t handle;
+        handle.handle = CreateFileW(component_path.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle.handle == INVALID_HANDLE_VALUE)
+            return build_worker_result_t<std::filesystem::path>::failure(
+                error(build_worker_error_code_t::file_missing, component_path,
+                      "CreateFileW:canonical", 0, GetLastError()));
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        if (!GetFileInformationByHandleEx(handle.handle, FileAttributeTagInfo, &tag,
+                                           sizeof(tag)))
+            return build_worker_result_t<std::filesystem::path>::failure(
+                error(build_worker_error_code_t::file_read_failed, component_path,
+                      "FileAttributeTagInfo:canonical", 0, GetLastError()));
+        if ((tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || tag.ReparseTag != 0)
+            return build_worker_result_t<std::filesystem::path>::failure(
+                error(build_worker_error_code_t::reparse_point, component_path));
+        std::array<wchar_t, 32768> final_buffer{};
+        const DWORD final_length = GetFinalPathNameByHandleW(
+            handle.handle, final_buffer.data(), static_cast<DWORD>(final_buffer.size()), 0);
+        if (final_length == 0 || final_length >= final_buffer.size())
+            return build_worker_result_t<std::filesystem::path>::failure(
+                error(build_worker_error_code_t::file_read_failed, component_path,
+                      "GetFinalPathNameByHandleW", 0, GetLastError()));
+        std::wstring final_path(final_buffer.data(), final_length);
+        if (final_path.rfind(L"\\\\?\\UNC\\", 0) == 0)
+            return build_worker_result_t<std::filesystem::path>::failure(
+                error(build_worker_error_code_t::unsafe_path, component_path,
+                      "unc_path"));
+        if (final_path.rfind(L"\\\\?\\", 0) == 0)
+            final_path.erase(0, 4);
+        auto expected = component_path.native();
+        if (expected.size() == 2 && expected[1] == L':')
+            expected.push_back(L'\\');
+        if (final_path != expected)
+            return build_worker_result_t<std::filesystem::path>::failure(
+                error(build_worker_error_code_t::unsafe_path, component_path,
+                      "canonical_case"));
+        final_attributes = tag.FileAttributes;
+    }
+    if (require_directory != ((final_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0))
         return build_worker_result_t<std::filesystem::path>::failure(
             error(build_worker_error_code_t::file_type_invalid, path));
-    if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
-        return build_worker_result_t<std::filesystem::path>::failure(
-            error(build_worker_error_code_t::reparse_point, path));
-    std::error_code ec;
-    const auto canonical = std::filesystem::canonical(path, ec);
-    if (ec)
-        return build_worker_result_t<std::filesystem::path>::failure(
-            error(build_worker_error_code_t::unsafe_path, path, ec.message()));
-    return build_worker_result_t<std::filesystem::path>::success(canonical);
+    return build_worker_result_t<std::filesystem::path>::success(path);
+}
+
+build_worker_result_t<std::filesystem::path> canonical_directory(
+    const std::filesystem::path& path) {
+    return exact_existing_path(path, true);
 }
 
 bool safe_relative_path(std::string_view value) noexcept {
@@ -518,12 +878,11 @@ build_worker_result_t<std::filesystem::path> resolve_regular_under_root(
     if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
         return build_worker_result_t<std::filesystem::path>::failure(
             error(build_worker_error_code_t::file_type_invalid, current));
+    auto exact = exact_existing_path(current, false);
+    if (!exact)
+        return build_worker_result_t<std::filesystem::path>::failure(exact.error());
     std::error_code ec;
-    const auto canonical = std::filesystem::canonical(current, ec);
-    if (ec)
-        return build_worker_result_t<std::filesystem::path>::failure(
-            error(build_worker_error_code_t::unsafe_path, current, ec.message()));
-    const auto relative_check = std::filesystem::relative(canonical, canonical_root, ec);
+    const auto relative_check = std::filesystem::relative(current, canonical_root, ec);
     if (ec || relative_check.empty() || relative_check.is_absolute())
         return build_worker_result_t<std::filesystem::path>::failure(
             error(build_worker_error_code_t::path_escape, current));
@@ -532,7 +891,7 @@ build_worker_result_t<std::filesystem::path> resolve_regular_under_root(
             return build_worker_result_t<std::filesystem::path>::failure(
                 error(build_worker_error_code_t::path_escape, current));
     }
-    return build_worker_result_t<std::filesystem::path>::success(canonical);
+    return build_worker_result_t<std::filesystem::path>::success(current);
 }
 
 bool json_has_exact_keys(const json& value,
@@ -623,7 +982,7 @@ bool forbidden_link_token(std::string_view input) noexcept {
         while ((offset = text.find(forbidden, offset)) != std::string::npos) {
             const auto identifier = [](char character) {
                 return (character >= 'a' && character <= 'z') ||
-                       (character >= '0' && character <= '9') || character == '_';
+                       (character >= '0' && character <= '9');
             };
             const bool left = offset == 0 || !identifier(text[offset - 1]);
             const auto right_offset = offset + forbidden.size();
@@ -1169,7 +1528,14 @@ build_worker_result_t<void> verify_worker_acl_receipt(
 build_worker_result_t<void> verify_protector_receipt(
     const artifact_t& receipt, const artifact_t& executable,
     std::string_view expected_tool_sha256, std::string_view expected_verifier_sha256,
+    std::string_view expected_signer_policy_sha256,
+    std::string_view expected_signing_provider_sha256,
+    std::string_view expected_profile,
+    const std::function<bool(const std::filesystem::path&, std::string_view)>& verifier,
     std::uint64_t maximum_bytes) {
+    auto control = poll_verification_control(executable.path, "protector_receipt");
+    if (!control)
+        return build_worker_result_t<void>::failure(control.error());
     auto parsed = parse_json_file(receipt.path, maximum_bytes);
     if (!parsed)
         return build_worker_result_t<void>::failure(parsed.error());
@@ -1177,7 +1543,9 @@ build_worker_result_t<void> verify_protector_receipt(
     if (!json_has_exact_keys(value, {"schema", "schema_version", "status",
                                      "artifact_relative_path", "artifact_sha256",
                                      "artifact_size_bytes", "tool_sha256", "verifier_sha256",
-                                     "profile", "post_process", "production_flags"}))
+                                     "signer_policy_sha256", "signing_provider_sha256",
+                                     "profile", "post_process",
+                                     "production_flags"}))
         return build_worker_result_t<void>::failure(
             error(build_worker_error_code_t::protector_receipt_invalid, receipt.path));
     std::string schema;
@@ -1186,29 +1554,68 @@ build_worker_result_t<void> verify_protector_receipt(
     std::string digest;
     std::string tool_digest;
     std::string verifier_digest;
+    std::string signer_policy_digest;
+    std::string signing_provider_digest;
     std::string profile;
     std::uint32_t version = 0;
     std::uint64_t size = 0;
     if (!json_scalar(value, "schema", schema) || schema != "aida.protector.receipt" ||
-        !json_scalar(value, "schema_version", version) || version != 2 ||
+        !json_scalar(value, "schema_version", version) || version != 4 ||
         !json_scalar(value, "status", status) || status != "passed" ||
         !json_scalar(value, "artifact_relative_path", relative) ||
         !json_scalar(value, "artifact_sha256", digest) ||
         !json_scalar(value, "artifact_size_bytes", size) ||
         !json_scalar(value, "tool_sha256", tool_digest) || !valid_sha256(tool_digest) ||
         !json_scalar(value, "verifier_sha256", verifier_digest) || !valid_sha256(verifier_digest) ||
-        !json_scalar(value, "profile", profile) || profile != "production" ||
+        !json_scalar(value, "signer_policy_sha256", signer_policy_digest) ||
+        !valid_sha256(signer_policy_digest) ||
+        !json_scalar(value, "signing_provider_sha256", signing_provider_digest) ||
+        !valid_sha256(signing_provider_digest) ||
+        !json_scalar(value, "profile", profile) || profile != expected_profile ||
         !fixed_time_equal(tool_digest, expected_tool_sha256) ||
         !fixed_time_equal(verifier_digest, expected_verifier_sha256) ||
+        !fixed_time_equal(signer_policy_digest, expected_signer_policy_sha256) ||
+        !fixed_time_equal(signing_provider_digest, expected_signing_provider_sha256) ||
         relative != executable.relative_path || !fixed_time_equal(digest, executable.sha256) ||
         size != executable.size)
         return build_worker_result_t<void>::failure(
             error(build_worker_error_code_t::protector_receipt_invalid, receipt.path));
     const auto& post = value["post_process"];
-    if (!json_has_exact_keys(post, {"protection_verified", "symbols_scrubbed",
-                                    "debug_paths_scrubbed", "rich_header_scrubbed"}) ||
-        !bool_true(post, "protection_verified") || !bool_true(post, "symbols_scrubbed") ||
-        !bool_true(post, "debug_paths_scrubbed") || !bool_true(post, "rich_header_scrubbed"))
+    std::uint64_t protection_checks_total = 0;
+    std::uint64_t protection_checks_passed = 0;
+    std::uint64_t coff_symbol_table_pointer = 0;
+    std::uint64_t coff_symbol_count = 0;
+    std::uint64_t debug_directory_entries = 0;
+    std::uint64_t codeview_records = 0;
+    std::uint64_t unscrubbed_debug_paths = 0;
+    std::uint64_t rich_signature_count = 0;
+    std::uint64_t dans_signature_count = 0;
+    if (!json_has_exact_keys(post, {"protection_checks_total", "protection_checks_passed",
+                                    "coff_symbol_table_pointer", "coff_symbol_count",
+                                    "debug_directory_entries", "codeview_records",
+                                    "unscrubbed_debug_paths", "rich_signature_count",
+                                    "dans_signature_count", "pe_headers_complete",
+                                    "debug_directory_complete"}) ||
+        !json_scalar(post, "protection_checks_total", protection_checks_total) ||
+        protection_checks_total == 0 ||
+        !json_scalar(post, "protection_checks_passed", protection_checks_passed) ||
+        protection_checks_passed != protection_checks_total ||
+        !json_scalar(post, "coff_symbol_table_pointer", coff_symbol_table_pointer) ||
+        coff_symbol_table_pointer != 0 ||
+        !json_scalar(post, "coff_symbol_count", coff_symbol_count) ||
+        coff_symbol_count != 0 ||
+        !json_scalar(post, "debug_directory_entries", debug_directory_entries) ||
+        debug_directory_entries > 4096 ||
+        !json_scalar(post, "codeview_records", codeview_records) ||
+        codeview_records > debug_directory_entries ||
+        !json_scalar(post, "unscrubbed_debug_paths", unscrubbed_debug_paths) ||
+        unscrubbed_debug_paths != 0 ||
+        !json_scalar(post, "rich_signature_count", rich_signature_count) ||
+        rich_signature_count != 0 ||
+        !json_scalar(post, "dans_signature_count", dans_signature_count) ||
+        dans_signature_count != 0 ||
+        !bool_true(post, "pe_headers_complete") ||
+        !bool_true(post, "debug_directory_complete"))
         return build_worker_result_t<void>::failure(
             error(build_worker_error_code_t::protector_receipt_invalid, receipt.path));
     std::vector<std::string> flags;
@@ -1221,12 +1628,37 @@ build_worker_result_t<void> verify_protector_receipt(
     if (actual != required)
         return build_worker_result_t<void>::failure(
             error(build_worker_error_code_t::protector_receipt_invalid, receipt.path));
+    control = poll_verification_control(executable.path, "protector_verifier_enter");
+    if (!control)
+        return build_worker_result_t<void>::failure(control.error());
+    bool verified = false;
+    try {
+        verified = verifier(executable.path, profile);
+    } catch (...) {
+        verified = false;
+    }
+    control = poll_verification_control(executable.path, "protector_verifier_exit");
+    if (!control)
+        return build_worker_result_t<void>::failure(control.error());
+    if (!verified)
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::protector_receipt_invalid,
+                  executable.path, "direct_protector_verifier"));
     return build_worker_result_t<void>::success();
 }
 
 build_worker_result_t<void> verify_signature_receipt(
     const artifact_t& receipt, const artifact_t& executable,
-    std::string_view expected_verifier_sha256, std::uint64_t maximum_bytes) {
+    std::string_view expected_verifier_sha256,
+    std::string_view expected_signer_policy_sha256,
+    std::string_view expected_signing_provider_sha256,
+    const std::vector<std::string>& authorized_signers,
+    const std::function<std::optional<package_signature_identity_t>(
+        const std::filesystem::path&)>& verifier,
+    std::uint64_t maximum_bytes) {
+    auto control = poll_verification_control(executable.path, "signature_receipt");
+    if (!control)
+        return build_worker_result_t<void>::failure(control.error());
     auto parsed = parse_json_file(receipt.path, maximum_bytes);
     if (!parsed)
         return build_worker_result_t<void>::failure(parsed.error());
@@ -1235,7 +1667,9 @@ build_worker_result_t<void> verify_signature_receipt(
                                      "artifact_relative_path", "artifact_sha256",
                                      "artifact_size_bytes", "verification_mode",
                                      "signer_thumbprint_sha256", "verifier_sha256",
-                                     "chain_status", "timestamp_status"}))
+                                     "signer_policy_sha256", "signing_provider_sha256",
+                                     "chain_status", "timestamp_status",
+                                     "timestamp_validation", "timestamp_filetime"}))
         return build_worker_result_t<void>::failure(
             error(build_worker_error_code_t::signature_receipt_invalid, receipt.path));
     std::string schema;
@@ -1245,12 +1679,16 @@ build_worker_result_t<void> verify_signature_receipt(
     std::string mode;
     std::string thumbprint;
     std::string verifier_digest;
+    std::string signer_policy_digest;
+    std::string signing_provider_digest;
     std::string chain;
     std::string timestamp;
+    std::string timestamp_validation;
     std::uint32_t version = 0;
     std::uint64_t size = 0;
+    std::uint64_t timestamp_filetime = 0;
     if (!json_scalar(value, "schema", schema) || schema != "aida.signature.receipt" ||
-        !json_scalar(value, "schema_version", version) || version != 2 ||
+        !json_scalar(value, "schema_version", version) || version != 4 ||
         !json_scalar(value, "status", status) || status != "verified" ||
         !json_scalar(value, "artifact_relative_path", relative) ||
         !json_scalar(value, "artifact_sha256", digest) ||
@@ -1259,25 +1697,56 @@ build_worker_result_t<void> verify_signature_receipt(
         !json_scalar(value, "signer_thumbprint_sha256", thumbprint) || !valid_sha256(thumbprint) ||
         !json_scalar(value, "verifier_sha256", verifier_digest) || !valid_sha256(verifier_digest) ||
         !fixed_time_equal(verifier_digest, expected_verifier_sha256) ||
+        !json_scalar(value, "signer_policy_sha256", signer_policy_digest) ||
+        !valid_sha256(signer_policy_digest) ||
+        !fixed_time_equal(signer_policy_digest, expected_signer_policy_sha256) ||
+        !json_scalar(value, "signing_provider_sha256", signing_provider_digest) ||
+        !valid_sha256(signing_provider_digest) ||
+        !fixed_time_equal(signing_provider_digest, expected_signing_provider_sha256) ||
         !json_scalar(value, "chain_status", chain) || chain != "trusted" ||
         !json_scalar(value, "timestamp_status", timestamp) || timestamp != "trusted" ||
+        !json_scalar(value, "timestamp_validation", timestamp_validation) ||
+        timestamp_validation != "wintrust_provider_counter_signer" ||
+        !json_scalar(value, "timestamp_filetime", timestamp_filetime) ||
+        timestamp_filetime == 0 ||
         relative != executable.relative_path || !fixed_time_equal(digest, executable.sha256) ||
         size != executable.size)
         return build_worker_result_t<void>::failure(
             error(build_worker_error_code_t::signature_receipt_invalid, receipt.path));
-    LONG trust_status = TRUST_E_FAIL;
-    if (!offline_authenticode_valid(executable.path, trust_status))
-        return build_worker_result_t<void>::failure(
-            error(build_worker_error_code_t::authenticode_verification_failed,
-                  executable.path, "WinVerifyTrust", 0,
-                  static_cast<std::uint32_t>(trust_status)));
-    auto actual_signer = authenticode_signer_sha256(executable.path);
-    if (!actual_signer)
-        return build_worker_result_t<void>::failure(actual_signer.error());
-    if (!fixed_time_equal(actual_signer.value(), thumbprint))
+    if (!std::binary_search(authorized_signers.begin(), authorized_signers.end(), thumbprint))
         return build_worker_result_t<void>::failure(
             error(build_worker_error_code_t::signature_receipt_invalid,
-                  receipt.path, "signer_thumbprint_sha256"));
+                  receipt.path, "unauthorized_signer_thumbprint_sha256"));
+    control = poll_verification_control(executable.path, "signature_verifier_enter");
+    if (!control)
+        return build_worker_result_t<void>::failure(control.error());
+    std::optional<package_signature_identity_t> actual;
+    try {
+        actual = verifier(executable.path);
+    } catch (...) {
+        actual.reset();
+    }
+    control = poll_verification_control(executable.path, "signature_verifier_exit");
+    if (!control)
+        return build_worker_result_t<void>::failure(control.error());
+    if (!actual)
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::signature_receipt_invalid,
+                  receipt.path, "signature_verifier_result"));
+    if (!actual->trusted_timestamp || actual->trusted_timestamp_filetime == 0)
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::signature_receipt_invalid,
+                  receipt.path, "trusted_timestamp"));
+    if (!std::binary_search(authorized_signers.begin(), authorized_signers.end(),
+                            actual->signer_thumbprint_sha256))
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::signature_receipt_invalid,
+                  receipt.path, "unauthorized_actual_signer_thumbprint_sha256"));
+    if (!fixed_time_equal(actual->signer_thumbprint_sha256, thumbprint) ||
+        actual->trusted_timestamp_filetime != timestamp_filetime)
+        return build_worker_result_t<void>::failure(
+            error(build_worker_error_code_t::signature_receipt_invalid,
+                  receipt.path, "signer_receipt_identity_mismatch"));
     return build_worker_result_t<void>::success();
 }
 
@@ -1543,7 +2012,9 @@ build_worker_result_t<directory_identity_t> inspect_directory_identity(
     win_handle_t directory;
     directory.handle = CreateFileW(
         path.c_str(), FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        active_generation ? FILE_SHARE_READ
+                          : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (directory.handle == INVALID_HANDLE_VALUE)
         return build_worker_result_t<directory_identity_t>::failure(
@@ -1569,6 +2040,14 @@ build_worker_result_t<directory_identity_t> inspect_directory_identity(
     auto streams = verify_stream_inventory(path);
     if (!streams)
         return build_worker_result_t<directory_identity_t>::failure(streams.error());
+    if (active_generation) {
+        active_generation->directories.emplace_back(
+            directory.handle, [](void* handle) {
+                if (handle && handle != INVALID_HANDLE_VALUE)
+                    CloseHandle(static_cast<HANDLE>(handle));
+            });
+        directory.handle = INVALID_HANDLE_VALUE;
+    }
     return build_worker_result_t<directory_identity_t>::success({
         identity.dwVolumeSerialNumber,
         (static_cast<std::uint64_t>(identity.nFileIndexHigh) << 32U) |
@@ -1577,6 +2056,12 @@ build_worker_result_t<directory_identity_t> inspect_directory_identity(
 
 build_worker_result_t<std::uint64_t> inspect_file_size_only(
     const std::filesystem::path& path) {
+    if (active_generation) {
+        auto evidence = inspect_regular_file(path, k_default_artifact_limit, false);
+        if (!evidence)
+            return build_worker_result_t<std::uint64_t>::failure(evidence.error());
+        return build_worker_result_t<std::uint64_t>::success(evidence.value().size);
+    }
     win_handle_t file;
     file.handle = CreateFileW(
         path.c_str(), FILE_READ_ATTRIBUTES,
@@ -1597,6 +2082,15 @@ build_worker_result_t<std::uint64_t> inspect_file_size_only(
     if ((tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
         return build_worker_result_t<std::uint64_t>::failure(
             error(build_worker_error_code_t::file_type_invalid, path));
+    BY_HANDLE_FILE_INFORMATION identity{};
+    if (!GetFileInformationByHandle(file.handle, &identity))
+        return build_worker_result_t<std::uint64_t>::failure(
+            error(build_worker_error_code_t::file_read_failed, path,
+                  "GetFileInformationByHandle:size", 0, GetLastError()));
+    if (identity.nNumberOfLinks != 1)
+        return build_worker_result_t<std::uint64_t>::failure(
+            error(build_worker_error_code_t::hardlink_forbidden, path,
+                  "nNumberOfLinks", 1, identity.nNumberOfLinks));
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file.handle, &size) || size.QuadPart < 0)
         return build_worker_result_t<std::uint64_t>::failure(
@@ -1613,6 +2107,7 @@ struct bounded_package_inventory_t final {
     std::vector<std::string> files;
     std::size_t directories = 0;
     std::size_t entries = 0;
+    std::size_t path_bytes = 0;
     std::size_t stream_inventories = 0;
     std::uint64_t bytes = 0;
 };
@@ -1633,10 +2128,20 @@ build_worker_result_t<bounded_package_inventory_t> enumerate_package_tree(
         std::size_t depth = 0;
     };
     std::queue<pending_directory_t> pending;
+    std::set<std::string> folded_paths;
     pending.push({root, 0});
     while (!pending.empty()) {
+        auto control = poll_verification_control(root, "tree_queue");
+        if (!control)
+            return build_worker_result_t<bounded_package_inventory_t>::failure(
+                control.error());
         auto current = std::move(pending.front());
         pending.pop();
+        struct discovered_entry_t final {
+            std::filesystem::path path;
+            std::string relative;
+        };
+        std::vector<discovered_entry_t> discovered;
         std::error_code iteration_error;
         std::filesystem::directory_iterator iterator(
             current.path, std::filesystem::directory_options::none, iteration_error);
@@ -1646,6 +2151,10 @@ build_worker_result_t<bounded_package_inventory_t> enumerate_package_tree(
                 error(build_worker_error_code_t::file_read_failed, current.path,
                       iteration_error.message()));
         for (; iterator != end; iterator.increment(iteration_error)) {
+            control = poll_verification_control(current.path, "tree_enumeration");
+            if (!control)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    control.error());
             if (iteration_error)
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
                     error(build_worker_error_code_t::file_read_failed, current.path,
@@ -1653,24 +2162,13 @@ build_worker_result_t<bounded_package_inventory_t> enumerate_package_tree(
             ++result.entries;
             if (result.entries > request.maximum_total_entry_count)
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
-                    error(build_worker_error_code_t::resource_entry_limit, iterator->path(),
+                    error(build_worker_error_code_t::resource_entry_limit, root,
                           "total_entries", request.maximum_total_entry_count,
                           result.entries));
-            const DWORD attributes = GetFileAttributesW(iterator->path().c_str());
-            if (attributes == INVALID_FILE_ATTRIBUTES)
+            const auto relative = iterator->path().lexically_relative(root);
+            if (relative.empty() || relative.is_absolute())
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
-                    error(build_worker_error_code_t::file_read_failed, iterator->path(),
-                          "GetFileAttributesW", 0, GetLastError()));
-            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
-                return build_worker_result_t<bounded_package_inventory_t>::failure(
-                    error(build_worker_error_code_t::reparse_point, iterator->path()));
-            std::error_code relative_error;
-            const auto relative = std::filesystem::relative(
-                iterator->path(), root, relative_error);
-            if (relative_error || relative.empty() || relative.is_absolute())
-                return build_worker_result_t<bounded_package_inventory_t>::failure(
-                    error(build_worker_error_code_t::path_escape, iterator->path(),
-                          relative_error.message()));
+                    error(build_worker_error_code_t::path_escape, iterator->path()));
             std::string text;
             try {
                 text = relative.generic_u8string();
@@ -1684,73 +2182,114 @@ build_worker_result_t<bounded_package_inventory_t> enumerate_package_tree(
                     error(build_worker_error_code_t::resource_path_limit, iterator->path(),
                           "relative_path_bytes", request.maximum_relative_path_bytes,
                           text.size()));
-            if (unexpected_customer_file(text))
+            std::string absolute_text;
+            try {
+                absolute_text = iterator->path().generic_u8string();
+            } catch (const std::exception& exception) {
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::unsafe_path, iterator->path(),
+                          exception.what()));
+            }
+            const auto remaining_path_bytes =
+                request.maximum_inventory_path_bytes - result.path_bytes;
+            if (text.size() > remaining_path_bytes ||
+                absolute_text.size() > remaining_path_bytes - text.size())
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::resource_path_limit, root,
+                          "inventory_path_bytes", request.maximum_inventory_path_bytes,
+                          result.path_bytes + text.size()));
+            result.path_bytes += text.size() + absolute_text.size();
+            discovered.push_back({iterator->path(), std::move(text)});
+        }
+        if (iteration_error)
+            return build_worker_result_t<bounded_package_inventory_t>::failure(
+                error(build_worker_error_code_t::file_read_failed, current.path,
+                      iteration_error.message()));
+        std::sort(discovered.begin(), discovered.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.relative < right.relative;
+                  });
+        for (auto& entry : discovered) {
+            control = poll_verification_control(entry.path, "tree_entry");
+            if (!control)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    control.error());
+            const DWORD attributes = GetFileAttributesW(entry.path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::file_read_failed, entry.path,
+                          "GetFileAttributesW", 0, GetLastError()));
+            if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::reparse_point, entry.path));
+            if (unexpected_customer_file(entry.relative))
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
                     error(build_worker_error_code_t::package_policy_violation,
-                          iterator->path()));
+                          entry.path));
+            if (!folded_paths.emplace(lowercase(entry.relative)).second)
+                return build_worker_result_t<bounded_package_inventory_t>::failure(
+                    error(build_worker_error_code_t::duplicate_entry, entry.path,
+                          "case-colliding path"));
             if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
                 ++result.directories;
                 ++result.stream_inventories;
                 if (result.directories > request.maximum_directory_count)
                     return build_worker_result_t<bounded_package_inventory_t>::failure(
                         error(build_worker_error_code_t::resource_directory_limit,
-                              iterator->path(), "directories",
+                              entry.path, "directories",
                               request.maximum_directory_count, result.directories));
                 const auto depth = current.depth + 1;
                 if (depth > request.maximum_depth)
                     return build_worker_result_t<bounded_package_inventory_t>::failure(
                         error(build_worker_error_code_t::resource_depth_limit,
-                              iterator->path(), "depth", request.maximum_depth, depth));
-                auto identity = inspect_directory_identity(iterator->path());
+                              entry.path, "depth", request.maximum_depth, depth));
+                auto identity = inspect_directory_identity(entry.path);
                 if (!identity)
                     return build_worker_result_t<bounded_package_inventory_t>::failure(
                         identity.error());
                 if (!directory_identities.emplace(identity.value()).second)
                     return build_worker_result_t<bounded_package_inventory_t>::failure(
                         error(build_worker_error_code_t::directory_cycle,
-                              iterator->path()));
-                pending.push({iterator->path(), depth});
+                              entry.path));
+                pending.push({std::move(entry.path), depth});
                 continue;
             }
             ++result.stream_inventories;
             if (result.files.size() >= request.maximum_file_count)
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
                     error(build_worker_error_code_t::resource_file_limit,
-                          iterator->path(), "files", request.maximum_file_count,
+                          entry.path, "files", request.maximum_file_count,
                           result.files.size() + 1));
-            auto size = inspect_file_size_only(iterator->path());
+            auto size = inspect_file_size_only(entry.path);
             if (!size)
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
                     size.error());
             if (size.value() > request.maximum_artifact_bytes)
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
                     error(build_worker_error_code_t::resource_file_bytes_limit,
-                          iterator->path(), "file_bytes", request.maximum_artifact_bytes,
+                          entry.path, "file_bytes", request.maximum_artifact_bytes,
                           size.value()));
             if (size.value() > request.maximum_total_artifact_bytes - result.bytes)
                 return build_worker_result_t<bounded_package_inventory_t>::failure(
                     error(build_worker_error_code_t::resource_total_bytes_limit,
-                          iterator->path(), "aggregate_bytes",
+                          entry.path, "aggregate_bytes",
                           request.maximum_total_artifact_bytes,
                           result.bytes + size.value()));
             result.bytes += size.value();
-            result.files.emplace_back(std::move(text));
+            result.files.emplace_back(std::move(entry.relative));
         }
     }
     std::sort(result.files.begin(), result.files.end());
     if (std::adjacent_find(result.files.begin(), result.files.end()) != result.files.end())
         return build_worker_result_t<bounded_package_inventory_t>::failure(
             error(build_worker_error_code_t::duplicate_entry, root));
-    std::set<std::string> folded_paths;
-    for (const auto& path : result.files) {
-        if (!folded_paths.emplace(lowercase(path)).second)
-            return build_worker_result_t<bounded_package_inventory_t>::failure(
-                error(build_worker_error_code_t::duplicate_entry,
-                      std::filesystem::u8path(path), "case-colliding path"));
-    }
     return build_worker_result_t<bounded_package_inventory_t>::success(std::move(result));
 }
 
+}
+
+bool customer_package_relative_path_allowed(std::string_view value) noexcept {
+    return !unexpected_customer_file(value);
 }
 
 build_worker_error_t build_worker_packaging_integration_t::make_error(
@@ -1794,6 +2333,11 @@ build_worker_packaging_integration_t::verify_distribution_package(
         request.maximum_file_count == 0 || request.maximum_directory_count == 0 ||
         request.maximum_total_entry_count == 0 || request.maximum_depth == 0 ||
         request.maximum_relative_path_bytes == 0 ||
+        request.maximum_inventory_path_bytes == 0 ||
+        request.deadline.count() <= 0 || request.deadline.count() > 7200000 ||
+        !request.protector_verifier || !request.signature_verifier ||
+        request.authorized_signer_thumbprints_sha256.empty() ||
+        request.authorized_signer_thumbprints_sha256.size() > 16 ||
         request.maximum_manifest_bytes > k_default_manifest_limit ||
         request.maximum_receipt_bytes > k_default_receipt_limit ||
         request.maximum_artifact_bytes > k_default_artifact_limit ||
@@ -1802,21 +2346,49 @@ build_worker_packaging_integration_t::verify_distribution_package(
         request.maximum_directory_count > k_default_directory_count_limit ||
         request.maximum_total_entry_count > k_default_total_entry_count_limit ||
         request.maximum_depth > k_default_depth_limit ||
-        request.maximum_relative_path_bytes > k_default_relative_path_limit)
+        request.maximum_relative_path_bytes > k_default_relative_path_limit ||
+        request.maximum_inventory_path_bytes > k_default_inventory_path_bytes_limit)
         return build_worker_result_t<package_verification_result_t>::failure(
             make_error(build_worker_error_code_t::invalid_argument));
     if (!valid_sha256(request.expected_manifest_sha256) ||
         !valid_sha256(request.expected_source_authority_sha256) ||
         !valid_sha256(request.expected_protector_tool_sha256) ||
         !valid_sha256(request.expected_protector_verifier_sha256) ||
-        !valid_sha256(request.expected_signature_verifier_sha256))
+        !valid_sha256(request.expected_signature_verifier_sha256) ||
+        !valid_sha256(request.expected_signer_policy_sha256) ||
+        !valid_sha256(request.expected_signing_provider_sha256) ||
+        !std::is_sorted(request.authorized_signer_thumbprints_sha256.begin(),
+                        request.authorized_signer_thumbprints_sha256.end()) ||
+        std::adjacent_find(request.authorized_signer_thumbprints_sha256.begin(),
+                           request.authorized_signer_thumbprints_sha256.end()) !=
+            request.authorized_signer_thumbprints_sha256.end() ||
+        !std::all_of(request.authorized_signer_thumbprints_sha256.begin(),
+                     request.authorized_signer_thumbprints_sha256.end(),
+                     [](const auto& value) { return valid_sha256(value); }))
         return build_worker_result_t<package_verification_result_t>::failure(
             make_error(build_worker_error_code_t::invalid_argument, request.manifest_path));
 
+    package_verification_control_t verification_control{
+        &request, std::chrono::steady_clock::now() + request.deadline};
+    [[maybe_unused]] const package_verification_control_scope_t verification_control_scope(
+        verification_control);
+    auto initial_control = poll_verification_control(request.package_root,
+                                                     "verification_start");
+    if (!initial_control)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            initial_control.error());
+
+    immutable_generation_context_t immutable_generation;
+    [[maybe_unused]] const immutable_generation_scope_t immutable_generation_scope(
+        immutable_generation);
     auto root_result = canonical_directory(request.package_root);
     if (!root_result)
         return build_worker_result_t<package_verification_result_t>::failure(root_result.error());
     const auto package_root = root_result.value();
+    auto exact_manifest = exact_existing_path(request.manifest_path, false);
+    if (!exact_manifest)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            exact_manifest.error());
     auto manifest_evidence = inspect_regular_file(request.manifest_path,
                                                    request.maximum_manifest_bytes, true);
     if (!manifest_evidence)
@@ -1899,11 +2471,15 @@ build_worker_packaging_integration_t::verify_distribution_package(
                        request.manifest_path));
 
     const auto& artifact_array = manifest["artifacts"];
-    if (!artifact_array.is_array() || artifact_array.empty() ||
-        artifact_array.size() > request.maximum_file_count)
+    if (!artifact_array.is_array() || artifact_array.empty())
         return build_worker_result_t<package_verification_result_t>::failure(
             make_error(build_worker_error_code_t::artifact_inventory_mismatch,
                        request.manifest_path));
+    if (artifact_array.size() > request.maximum_file_count)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            make_error(build_worker_error_code_t::resource_file_limit,
+                       request.manifest_path, "manifest_files",
+                       request.maximum_file_count, artifact_array.size()));
     std::unordered_map<std::string, artifact_t> artifacts;
     std::unordered_set<std::string> paths;
     std::set<std::string> folded_paths;
@@ -1913,9 +2489,13 @@ build_worker_packaging_integration_t::verify_distribution_package(
         "application", "application_runtime", "worker_executable", "worker_runtime",
         "worker_manifest", "resource_manifest", "manifest_digest", "acl_receipt",
         "build_receipt", "protector_receipt", "signature_receipt", "browser",
-        "reverse_mcp", "license", "notice", "dependency", "resource"
+        "reverse_mcp", "license", "notice", "dependency", "resource", "build_evidence"
     };
     for (const auto& value : artifact_array) {
+        auto control = poll_verification_control(package_root, "artifact_inventory");
+        if (!control)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                control.error());
         if (!json_has_exact_keys(value, {"id", "kind", "relative_path", "size_bytes",
                                          "sha256", "owner", "license_ids"}))
             return build_worker_result_t<package_verification_result_t>::failure(
@@ -1987,6 +2567,163 @@ build_worker_packaging_integration_t::verify_distribution_package(
             make_error(build_worker_error_code_t::artifact_inventory_mismatch, package_root,
                        "bounded exact inventory", paths.size(), actual_paths.size()));
 
+    const auto production_link_graph = artifacts.find("production-link-graph");
+    if (production_link_graph == artifacts.end() ||
+        production_link_graph->second.kind != "build_evidence" ||
+        production_link_graph->second.relative_path !=
+            "deps/evidence/production-link-graph.json" ||
+        production_link_graph->second.owner != "standalone")
+        return build_worker_result_t<package_verification_result_t>::failure(
+            make_error(build_worker_error_code_t::artifact_inventory_mismatch,
+                       package_root, "production link graph evidence"));
+    auto production_link_document = parse_json_file(
+        production_link_graph->second.path, request.maximum_receipt_bytes,
+        production_link_graph->second.sha256);
+    if (!production_link_document)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            production_link_document.error());
+    const auto& link_document = production_link_document.value();
+    std::string link_schema;
+    std::uint32_t link_schema_version = 0;
+    std::string link_configuration;
+    std::string link_integration_host;
+    std::vector<std::string> link_denylist;
+    std::vector<std::string> link_roots;
+    std::vector<std::string> link_targets;
+    std::vector<std::string> link_edges;
+    std::vector<std::string> link_host_edges;
+    std::vector<std::string> link_host_exemptions;
+    std::uint64_t manifest_root_count = 0;
+    std::uint64_t direct_root_count = 0;
+    std::uint64_t strict_root_count = 0;
+    if (!json_has_exact_keys(link_document,
+                             {"schema", "schema_version", "configuration", "denylist",
+                              "manifest_root_count", "direct_root_count",
+                              "strict_root_count",
+                              "strict_roots", "strict_targets", "strict_edges",
+                              "integration_host", "host_direct_edges",
+                              "host_preexisting_exemptions"}) ||
+        !json_scalar(link_document, "schema", link_schema) ||
+        link_schema != "aida.c03.production-link-graph.v3" ||
+        !json_scalar(link_document, "schema_version", link_schema_version) ||
+        link_schema_version != 3 ||
+        !json_scalar(link_document, "configuration", link_configuration) ||
+        link_configuration.size() > 128 ||
+        !json_string_array(link_document["denylist"], link_denylist, 4) ||
+        link_denylist != std::vector<std::string>({"lief", "lmdb", "unicorn", "remill"}) ||
+        !json_scalar(link_document, "manifest_root_count", manifest_root_count) ||
+        manifest_root_count != 57 ||
+        !json_scalar(link_document, "direct_root_count", direct_root_count) ||
+        direct_root_count != 15 ||
+        !json_scalar(link_document, "strict_root_count", strict_root_count) ||
+        !json_string_array(link_document["strict_roots"], link_roots, 4096) ||
+        strict_root_count != link_roots.size() || strict_root_count < 78 ||
+        !json_string_array(link_document["strict_targets"], link_targets, 65536) ||
+        !json_string_array(link_document["strict_edges"], link_edges, 65536) ||
+        !json_scalar(link_document, "integration_host", link_integration_host) ||
+        link_integration_host != "AiDAStandalone" ||
+        !json_string_array(link_document["host_direct_edges"], link_host_edges, 65536) ||
+        !json_string_array(link_document["host_preexisting_exemptions"],
+                           link_host_exemptions, 16) ||
+        link_host_exemptions != std::vector<std::string>({
+            "AiDAStandalone|LINK_LIBRARIES|unicorn"}) ||
+        link_targets.empty() || link_edges.empty() || link_host_edges.empty() ||
+        !std::is_sorted(link_roots.begin(), link_roots.end()) ||
+        !std::is_sorted(link_targets.begin(), link_targets.end()) ||
+        !std::is_sorted(link_edges.begin(), link_edges.end()) ||
+        !std::is_sorted(link_host_edges.begin(), link_host_edges.end()) ||
+        !std::is_sorted(link_host_exemptions.begin(), link_host_exemptions.end()))
+        return build_worker_result_t<package_verification_result_t>::failure(
+            make_error(build_worker_error_code_t::schema_mismatch,
+                       production_link_graph->second.path,
+                       "production link graph contract"));
+    const std::set<std::string_view> link_properties{
+        "LINK_LIBRARIES", "LINK_INTERFACE_LIBRARIES", "INTERFACE_LINK_LIBRARIES",
+        "INTERFACE_LINK_LIBRARIES_DIRECT", "IMPORTED_LINK_INTERFACE_LIBRARIES",
+        "IMPORTED_LINK_INTERFACE_LIBRARIES_DEBUG",
+        "IMPORTED_LINK_INTERFACE_LIBRARIES_RELEASE",
+        "IMPORTED_LINK_INTERFACE_LIBRARIES_RELWITHDEBINFO",
+        "IMPORTED_LINK_INTERFACE_LIBRARIES_MINSIZEREL",
+        "IMPORTED_LINK_DEPENDENT_LIBRARIES",
+        "IMPORTED_LINK_DEPENDENT_LIBRARIES_DEBUG",
+        "IMPORTED_LINK_DEPENDENT_LIBRARIES_RELEASE",
+        "IMPORTED_LINK_DEPENDENT_LIBRARIES_RELWITHDEBINFO",
+        "IMPORTED_LINK_DEPENDENT_LIBRARIES_MINSIZEREL"};
+    const auto validate_link_edge = [&](const std::string& edge,
+                                         std::string_view required_source,
+                                         bool allow_preexisting_host_exemption) {
+        const auto first = edge.find('|');
+        const auto second = first == std::string::npos ? std::string::npos :
+            edge.find('|', first + 1);
+        if (first == 0 || second == std::string::npos || second == first + 1 ||
+            second + 1 >= edge.size() || edge.find('|', second + 1) != std::string::npos)
+            return false;
+        const auto source = std::string_view(edge).substr(0, first);
+        if ((!required_source.empty() && source != required_source) ||
+            (required_source.empty() &&
+             !std::binary_search(link_targets.begin(), link_targets.end(),
+                                 std::string(source))) ||
+            link_properties.find(std::string_view(edge).substr(
+                first + 1, second - first - 1)) == link_properties.end())
+            return false;
+        if (!forbidden_link_token(std::string_view(edge).substr(second + 1)))
+            return true;
+        return (allow_preexisting_host_exemption || source == "AiDAStandalone") &&
+            std::binary_search(link_host_exemptions.begin(),
+                               link_host_exemptions.end(), edge);
+    };
+    for (const auto& edge : link_edges) {
+        if (!validate_link_edge(edge, {}, false))
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::forbidden_link_detected,
+                           production_link_graph->second.path, edge));
+    }
+    for (const auto& edge : link_host_edges) {
+        if (!validate_link_edge(edge, link_integration_host, true))
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::forbidden_link_detected,
+                           production_link_graph->second.path, edge));
+    }
+    const bool production_link_graph_verified =
+        !link_edges.empty() && !link_host_edges.empty() &&
+        std::binary_search(link_roots.begin(), link_roots.end(), "AiDAStandalone") &&
+        std::binary_search(link_roots.begin(), link_roots.end(),
+                           "aida_c03_safe_headless_runtime") &&
+        std::binary_search(link_roots.begin(), link_roots.end(),
+                           "aida_c03_auth_preview_implementation") &&
+        std::binary_search(link_roots.begin(), link_roots.end(),
+                           "aida_c03_b14_native_decompiler_worker") &&
+        std::binary_search(link_roots.begin(), link_roots.end(),
+                           "aida_c03_package_verifier") &&
+        std::all_of(link_roots.begin(), link_roots.end(),
+                    [&](const auto& root) {
+                        return std::binary_search(link_targets.begin(), link_targets.end(), root);
+                    }) &&
+        std::all_of(link_host_exemptions.begin(), link_host_exemptions.end(),
+                    [&](const auto& exemption) {
+                        return std::binary_search(link_host_edges.begin(),
+                                                  link_host_edges.end(), exemption);
+                    });
+    if (!production_link_graph_verified)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            make_error(build_worker_error_code_t::schema_mismatch,
+                       production_link_graph->second.path,
+                       "production link graph root closure"));
+    if (request.verification_checkpoint) {
+        try {
+            request.verification_checkpoint(
+                package_verification_checkpoint_t::immutable_generation_captured);
+        } catch (const std::exception& exception) {
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::internal_error, package_root,
+                           exception.what()));
+        } catch (...) {
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::internal_error, package_root,
+                           "immutable_generation_checkpoint"));
+        }
+    }
+
     const auto managed_runtime_manifest = artifacts.find("managed-runtime-manifest");
     const auto managed_runtime_digest = artifacts.find("managed-runtime-manifest-digest");
     const auto ghidra_manifest = artifacts.find("ghidra-spec-manifest");
@@ -2019,6 +2756,11 @@ build_worker_packaging_integration_t::verify_distribution_package(
     std::size_t camoufox_files = 0;
     std::size_t customer_notice_files = 0;
     for (const auto& artifact : artifacts) {
+        auto control = poll_verification_control(artifact.second.path,
+                                                 "artifact_verification");
+        if (!control)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                control.error());
         if (artifact.second.relative_path.rfind(
                 "deps/camoufox-135.0.1-beta.24-win.x86_64/", 0) == 0) {
             if (artifact.second.kind != "browser" || artifact.second.owner != "camoufox")
@@ -2061,14 +2803,21 @@ build_worker_packaging_integration_t::verify_distribution_package(
     auto standalone_protector_check = verify_protector_receipt(
         standalone_protector->second, standalone->second,
         request.expected_protector_tool_sha256,
-        request.expected_protector_verifier_sha256, request.maximum_receipt_bytes);
+        request.expected_protector_verifier_sha256,
+        request.expected_signer_policy_sha256,
+        request.expected_signing_provider_sha256, "standalone-no-imports",
+        request.protector_verifier, request.maximum_receipt_bytes);
     if (!standalone_protector_check)
         return build_worker_result_t<package_verification_result_t>::failure(
             standalone_protector_check.error());
     ++protector_receipts;
     auto standalone_signature_check = verify_signature_receipt(
         standalone_signature->second, standalone->second,
-        request.expected_signature_verifier_sha256, request.maximum_receipt_bytes);
+        request.expected_signature_verifier_sha256,
+        request.expected_signer_policy_sha256,
+        request.expected_signing_provider_sha256,
+        request.authorized_signer_thumbprints_sha256,
+        request.signature_verifier, request.maximum_receipt_bytes);
     if (!standalone_signature_check)
         return build_worker_result_t<package_verification_result_t>::failure(
             standalone_signature_check.error());
@@ -2089,6 +2838,10 @@ build_worker_packaging_integration_t::verify_distribution_package(
     };
     std::unordered_map<std::string, dependency_t> dependencies;
     for (const auto& value : dependency_array) {
+        auto control = poll_verification_control(package_root, "dependency_inventory");
+        if (!control)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                control.error());
         if (!json_has_exact_keys(value, {"id", "version", "usage", "license",
                                          "artifact_ids", "notice_artifact_ids",
                                          "dependencies"}))
@@ -2192,6 +2945,10 @@ build_worker_packaging_integration_t::verify_distribution_package(
         expected_dependency_t{"unicorn", "not-selected", "non_use", "not-shipped"},
     };
     for (const auto& expected : expected_dependencies) {
+        auto control = poll_verification_control(package_root, "dependency_policy");
+        if (!control)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                control.error());
         const auto found = dependencies.find(std::string(expected.id));
         if (found == dependencies.end() || found->second.version != expected.version ||
             found->second.usage != expected.usage || found->second.license != expected.license)
@@ -2219,6 +2976,10 @@ build_worker_packaging_integration_t::verify_distribution_package(
         return true;
     };
     for (const auto& dependency : dependencies) {
+        auto control = poll_verification_control(package_root, "dependency_graph");
+        if (!control)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                control.error());
         if (!visit(dependency.first))
             return build_worker_result_t<package_verification_result_t>::failure(
                 make_error(build_worker_error_code_t::dependency_graph_invalid, {},
@@ -2277,6 +3038,10 @@ build_worker_packaging_integration_t::verify_distribution_package(
     };
     std::set<std::string> worker_ids;
     for (const auto& value : workers) {
+        auto control = poll_verification_control(package_root, "worker_inventory");
+        if (!control)
+            return build_worker_result_t<package_verification_result_t>::failure(
+                control.error());
         if (!json_has_exact_keys(value, {"id", "executable_artifact",
                                          "worker_manifest_artifact",
                                          "worker_manifest_digest_artifact",
@@ -2456,14 +3221,21 @@ build_worker_packaging_integration_t::verify_distribution_package(
         ++acl_receipts;
         auto protector_check = verify_protector_receipt(
             protector->second, executable->second, request.expected_protector_tool_sha256,
-            request.expected_protector_verifier_sha256, request.maximum_receipt_bytes);
+            request.expected_protector_verifier_sha256,
+            request.expected_signer_policy_sha256,
+            request.expected_signing_provider_sha256, "strict-no-imports",
+            request.protector_verifier, request.maximum_receipt_bytes);
         if (!protector_check)
             return build_worker_result_t<package_verification_result_t>::failure(
                 protector_check.error());
         ++protector_receipts;
         auto signature_check = verify_signature_receipt(
             signature->second, executable->second,
-            request.expected_signature_verifier_sha256, request.maximum_receipt_bytes);
+            request.expected_signature_verifier_sha256,
+            request.expected_signer_policy_sha256,
+            request.expected_signing_provider_sha256,
+            request.authorized_signer_thumbprints_sha256,
+            request.signature_verifier, request.maximum_receipt_bytes);
         if (!signature_check)
             return build_worker_result_t<package_verification_result_t>::failure(
                 signature_check.error());
@@ -2522,6 +3294,39 @@ build_worker_packaging_integration_t::verify_distribution_package(
     package_verification_result_t result;
     result.manifest_sha256 = manifest_evidence.value().sha256;
     result.manifest_size_bytes = manifest_evidence.value().size;
+    if (request.verification_checkpoint) {
+        try {
+            request.verification_checkpoint(
+                package_verification_checkpoint_t::immutable_generation_precommit);
+        } catch (const std::exception& exception) {
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::internal_error, package_root,
+                           exception.what()));
+        } catch (...) {
+            return build_worker_result_t<package_verification_result_t>::failure(
+                make_error(build_worker_error_code_t::internal_error, package_root,
+                           "immutable_generation_checkpoint"));
+        }
+    }
+    auto final_inventory = enumerate_package_tree(package_root, request);
+    if (!final_inventory)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            final_inventory.error());
+    if (final_inventory.value().files != bounded_inventory.value().files ||
+        final_inventory.value().bytes != bounded_inventory.value().bytes ||
+        final_inventory.value().directories != bounded_inventory.value().directories ||
+        final_inventory.value().entries != bounded_inventory.value().entries ||
+        final_inventory.value().path_bytes != bounded_inventory.value().path_bytes ||
+        final_inventory.value().stream_inventories !=
+            bounded_inventory.value().stream_inventories)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            make_error(build_worker_error_code_t::file_changed, package_root,
+                       "immutable_generation_inventory"));
+    auto immutable_check = revalidate_immutable_generation(immutable_generation);
+    if (!immutable_check)
+        return build_worker_result_t<package_verification_result_t>::failure(
+            immutable_check.error());
+
     result.artifacts_verified = artifacts.size();
     result.workers_verified = worker_ids.size();
     result.dependencies_verified = dependencies.size();
@@ -2536,7 +3341,7 @@ build_worker_packaging_integration_t::verify_distribution_package(
     result.stream_inventories_verified = bounded_inventory.value().stream_inventories;
     result.exact_package_inventory = true;
     result.no_network_fetch = true;
-    result.deny_link_policy = true;
+    result.deny_link_policy = production_link_graph_verified;
     result.disk_backed = true;
     result.arc_license_gates_required = true;
     result.camoufox_only = true;

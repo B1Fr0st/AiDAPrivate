@@ -12,7 +12,8 @@
 #endif
 #include "disasm_view.hpp"
 #include "hex_view.hpp"
-#include "../helpers/globals.h"
+#include "../debugger/debugger_view.hpp"
+#include "../ui/application_view_registry.hpp"
 #include "../helpers/helpers.h"
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
@@ -37,7 +38,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
-#include <unordered_set>
 
 namespace memory_scanner_view {
 
@@ -84,10 +84,6 @@ std::atomic<int> s_pending_edit_value_index{-1};
 char s_edit_value_buf[128] = {};
 std::atomic<int> s_pending_change_type_index{-1};
 int s_pending_change_type_value = 0;
-
-std::atomic<int>       s_view_owned_ctx_addr_row{-1};
-std::atomic<uint64_t>  s_view_owned_ctx_addr_value{0};
-std::atomic<uint64_t>  s_view_owned_ctx_result_addr{0};
 
 bool input_is_active() {
 	return ImGui::GetActiveID() != 0 && ImGui::IsAnyItemActive();
@@ -179,6 +175,60 @@ bool ctrl_held() {
 bool shift_held() {
 	ImGuiIO& io = ImGui::GetIO();
 	return io.KeyShift;
+}
+
+memory_interaction::runtime_t runtime_snapshot_locked(std::size_t result_count) {
+	memory_interaction::runtime_t runtime;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	runtime.driver_loaded = true;
+	runtime.live_attached = true;
+	runtime.static_loaded = true;
+	runtime.target_pid = 4242;
+#else
+	runtime.driver_loaded = driver_bridge::is_loaded();
+	runtime.target_pid = driver_bridge::attached_pid();
+	runtime.live_attached = runtime.driver_loaded && runtime.target_pid != 0;
+	runtime.static_loaded = function_index::detail::static_pe_active();
+#endif
+	const std::uint64_t count_component = static_cast<std::uint64_t>(result_count);
+	runtime.scan_revision =
+		(static_cast<std::uint64_t>(static_cast<std::uint32_t>(memory_scanner::g_state.scan_count)) << 32U) ^
+		count_component;
+	return runtime;
+}
+
+memory_interaction::runtime_t runtime_snapshot() {
+	auto& state = memory_scanner::g_state;
+	std::lock_guard<std::mutex> lock(state.results_mutex);
+	return runtime_snapshot_locked(state.results.size());
+}
+
+bool context_item(const char* label,
+	memory_interaction::capability_t capability,
+	const memory_interaction::context_t& context,
+	const memory_interaction::runtime_t& runtime,
+	const char* shortcut = nullptr) {
+	const auto result = memory_interaction::evaluate(capability, context, runtime);
+	const bool activated = ImGui::MenuItem(label, shortcut, false, result.enabled);
+	if (!result.enabled && result.disabled_reason != nullptr &&
+		ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+		ImGui::SetTooltip("%s", result.disabled_reason);
+	return activated;
+}
+
+void copy_address(std::uint64_t address) {
+	char buffer[24];
+	std::snprintf(buffer, sizeof(buffer), "0x%016" PRIX64, address);
+	ImGui::SetClipboardText(buffer);
+}
+
+int find_address_index(std::uint64_t address) {
+	auto& state = memory_scanner::g_state;
+	std::lock_guard<std::mutex> lock(state.address_mutex);
+	for (std::size_t index = 0; index < state.address_list.size(); ++index)
+		if (state.address_list[index].address == address)
+			return static_cast<int>(index);
+	return -1;
 }
 
 void interactive_scrollbar(scrollbar_state_t& sb,
@@ -341,6 +391,11 @@ void rebuild_sorted_indices(int total) {
 	auto& ui = g_ui;
 	auto& sc = memory_scanner::g_state;
 	const int safe_total = std::max(total, 0);
+	if (ui.result_sort_field == result_sort_t::by_index) {
+		ui.sorted_result_indices.clear();
+		ui.sorted_indices_dirty = false;
+		return;
+	}
 	ui.sorted_result_indices.resize(static_cast<std::size_t>(safe_total));
 	for (int i = 0; i < safe_total; ++i)
 		ui.sorted_result_indices[static_cast<std::size_t>(i)] = i;
@@ -618,7 +673,7 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 	bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 	bool static_pe = function_index::detail::static_pe_active();
 #endif
-	bool any_target = attached || static_pe;
+	bool any_target = attached;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (scanning) {
@@ -738,7 +793,7 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 	}
 
 	if (static_pe && !attached) {
-		const char* lbl = "Static PE scan";
+		const char* lbl = "Static source only";
 		ImFont* body_fn = aida::ui::fonts::body();
 		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
 		ImVec2 lsz = body_fn->CalcTextSizeA(body_fs, FLT_MAX, 0.f, lbl);
@@ -834,41 +889,28 @@ ImU32 value_color(const memory_scanner::scan_result_t& r, float a, const aida::u
 	return aida::ui::with_alpha(t.text_primary, a);
 }
 
-void update_results_diff_flash(int total) {
+void update_results_diff_flash(int total, std::uint64_t revision) {
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
-	if (static_cast<int>(ui.row_flash.size()) < total)
+	ui.flash_revision_age += aida::ui::clock::dt();
+	if (ui.last_flash_revision == revision)
+		return;
+	ui.last_flash_revision = revision;
+	ui.flash_revision_age = 0.f;
+	ui.last_result_count = static_cast<std::size_t>(total);
+	if (total > 250000) {
+		ui.row_flash.clear();
+		return;
+	}
+	if (static_cast<int>(ui.row_flash.size()) != total)
 		ui.row_flash.resize(static_cast<size_t>(total), 0.f);
-
-	std::unordered_set<uint64_t> current;
-	current.reserve(static_cast<size_t>(total));
-	for (auto& r : sc.results) current.insert(r.address);
-
-	bool changed = (current.size() != ui.prev_result_addresses.size());
-	if (!changed) {
-		for (auto a_addr : current) {
-			if (ui.prev_result_addresses.find(a_addr) == ui.prev_result_addresses.end()) {
-				changed = true; break;
-			}
-		}
-	}
-	if (changed) {
-		for (int i = 0; i < total; ++i) {
-			if (ui.prev_result_addresses.find(sc.results[static_cast<size_t>(i)].address) ==
-				ui.prev_result_addresses.end())
-			{
-				if (i < static_cast<int>(ui.row_flash.size()))
-					ui.row_flash[static_cast<size_t>(i)] = 1.f;
-			}
-		}
-		ui.prev_result_addresses = std::move(current);
-	}
-
-	for (auto& f : ui.row_flash) {
-		if (f > 0.f) {
-			f -= aida::ui::clock::dt() * 1.66f;
-			if (f < 0.f) f = 0.f;
-		}
+	for (int index = 0; index < total; ++index) {
+		const auto& result = sc.results[static_cast<std::size_t>(index)];
+		const bool initial = sc.scan_count <= 1;
+		const bool changed = !result.previous_value.empty() &&
+			result.current_value != result.previous_value;
+		ui.row_flash[static_cast<std::size_t>(index)] =
+			(initial || changed) ? 1.f : 0.f;
 	}
 }
 
@@ -913,6 +955,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		total = static_cast<int>(sc.results.size());
 	}
 	bool include_sb = total > 0;
+	const bool sort_allowed = total <= 250000;
 	compute_result_columns(ox, w, cols, content_w_total, include_sb);
 
 	ImFont* hdr_font = aida::ui::fonts::body_em();
@@ -969,7 +1012,10 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		}
 
 		if (clicked) {
-			if (ui.result_sort_field == field) {
+			if (!sort_allowed) {
+				toast_notification::push("Refine results below 250,000 rows before changing sort order.",
+					toast_notification::toast_type_t::warning, 4.f);
+			} else if (ui.result_sort_field == field) {
 				if (!ui.result_sort_desc) ui.result_sort_desc = true;
 				else { ui.result_sort_field = result_sort_t::by_index; ui.result_sort_desc = false; }
 			} else {
@@ -991,10 +1037,22 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 	std::lock_guard<std::mutex> lk(sc.results_mutex);
 	total = static_cast<int>(sc.results.size());
+	const auto runtime = runtime_snapshot_locked(sc.results.size());
 
-	update_results_diff_flash(total);
+	update_results_diff_flash(total, runtime.scan_revision);
 
-	if (ui.sorted_indices_dirty || static_cast<int>(ui.sorted_result_indices.size()) != total)
+	if (total > 250000 && ui.result_sort_field != result_sort_t::by_index) {
+		ui.result_sort_field = result_sort_t::by_index;
+		ui.result_sort_desc = false;
+		ui.sorted_result_indices.clear();
+		ui.sorted_indices_dirty = false;
+		toast_notification::push("Result sort returned to address order to keep the large scan responsive.",
+			toast_notification::toast_type_t::info, 4.f);
+	}
+	const bool indexed_sort = ui.result_sort_field != result_sort_t::by_index;
+	if (ui.sorted_indices_dirty ||
+		(indexed_sort && static_cast<int>(ui.sorted_result_indices.size()) != total) ||
+		(!indexed_sort && !ui.sorted_result_indices.empty()))
 		rebuild_sorted_indices(total);
 
 	{
@@ -1019,6 +1077,11 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		!ui_input_gate::popup_blocks_background_input();
 
 	if (body_hover) {
+		if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+			ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			ui.result_pane_focused = true;
+			ui.address_pane_focused = false;
+		}
 		float wheel = ImGui::GetIO().MouseWheel;
 		if (wheel != 0.f) {
 			ui.result_sb.target_scroll_y -= wheel * kResultRowHeight * 3.f;
@@ -1038,11 +1101,14 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	if (first_row < 0) first_row = 0;
 	int last_row = std::min(total, first_row + visible_rows + 2);
 
-	std::vector<region_cache_entry_t> regions_snapshot;
 	{
 		std::lock_guard<std::mutex> rgk(ui.region_cache.mtx);
-		regions_snapshot = ui.region_cache.entries;
+		if (ui.render_region_generation != ui.region_cache.generation) {
+			ui.render_region_snapshot = ui.region_cache.entries;
+			ui.render_region_generation = ui.region_cache.generation;
+		}
 	}
+	const auto& regions_snapshot = ui.render_region_snapshot;
 
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), true);
 
@@ -1094,7 +1160,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		}
 
 		float flash = (src_index < static_cast<int>(ui.row_flash.size()))
-			? ui.row_flash[static_cast<size_t>(src_index)] : 0.f;
+			? std::max(0.f, ui.row_flash[static_cast<size_t>(src_index)] -
+				ui.flash_revision_age * 1.66f) : 0.f;
 		if (flash > 0.f) {
 			dl->AddRectFilled(ImVec2(ox, ry),
 				ImVec2(ox + w, ry + kResultRowHeight),
@@ -1161,6 +1228,17 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	if (clicked_row >= 0) {
 		ui.selected_result = clicked_row;
 		handle_multi_select(ui.result_multi_sel, ui.last_result_anchor, clicked_row, total);
+		int source_index = clicked_row;
+		if (source_index < static_cast<int>(ui.sorted_result_indices.size()))
+			source_index = ui.sorted_result_indices[static_cast<std::size_t>(source_index)];
+		if (source_index >= 0 && source_index < total) {
+			const auto& result = sc.results[static_cast<std::size_t>(source_index)];
+			memory_interaction::select(memory_interaction::capture_result(runtime,
+				result.address, source_index,
+				memory_scanner::format_value(result.current_value, sc.config.value_type),
+				memory_scanner::format_value(result.previous_value, sc.config.value_type),
+				compose_module_label(result, regions_snapshot)));
+		}
 		diag_logf("results row_click idx=%d multi_count=%zu",
 			clicked_row, ui.result_multi_sel.size());
 	}
@@ -1181,17 +1259,39 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		if (src_index >= 0 && src_index < static_cast<int>(ui.sorted_result_indices.size()))
 			src_index = ui.sorted_result_indices[static_cast<size_t>(src_index)];
 		if (src_index >= 0 && src_index < total) {
-			uint64_t addr = sc.results[static_cast<size_t>(src_index)].address;
+			const auto& result = sc.results[static_cast<size_t>(src_index)];
+			uint64_t addr = result.address;
 			ui.selected_result = right_click_row;
 			if (ui.result_multi_sel.count(right_click_row) == 0) {
 				ui.result_multi_sel.clear();
 				ui.result_multi_sel.insert(right_click_row);
 				ui.last_result_anchor = right_click_row;
 			}
-			s_view_owned_ctx_result_addr.store(addr);
+			ui.result_context = memory_interaction::capture_result(runtime, addr,
+				src_index,
+				memory_scanner::format_value(result.current_value, sc.config.value_type),
+				memory_scanner::format_value(result.previous_value, sc.config.value_type),
+				compose_module_label(result, regions_snapshot));
+			memory_interaction::select(ui.result_context);
 			s_open_result_ctx.store(true);
 			diag_logf("results right_click row=%d addr=0x%llX",
 				right_click_row, static_cast<unsigned long long>(addr));
+		}
+	}
+
+	if (ui.result_pane_focused && memory_interaction::context_key_pressed() &&
+		ui.selected_result >= 0) {
+		int source_index = ui.selected_result;
+		if (source_index < static_cast<int>(ui.sorted_result_indices.size()))
+			source_index = ui.sorted_result_indices[static_cast<std::size_t>(source_index)];
+		if (source_index >= 0 && source_index < total) {
+			const auto& result = sc.results[static_cast<std::size_t>(source_index)];
+			ui.result_context = memory_interaction::capture_result(runtime,
+				result.address, source_index,
+				memory_scanner::format_value(result.current_value, sc.config.value_type),
+				memory_scanner::format_value(result.previous_value, sc.config.value_type),
+				compose_module_label(result, regions_snapshot));
+			s_open_result_ctx.store(true);
 		}
 	}
 
@@ -1411,7 +1511,8 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	int value_edit_request_idx = -1;
 	int change_type_request_idx = -1;
 	int ctx_addr_request_row = -1;
-	uint64_t ctx_addr_value = 0;
+	memory_interaction::context_t requested_context;
+	const auto runtime = runtime_snapshot();
 
 	std::unique_lock<std::mutex> lk(sc.address_mutex);
 	int total = static_cast<int>(sc.address_list.size());
@@ -1420,6 +1521,11 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), false) &&
 		!ui_input_gate::popup_blocks_background_input();
 	if (body_hover) {
+		if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+			ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			ui.address_pane_focused = true;
+			ui.result_pane_focused = false;
+		}
 		float wheel = ImGui::GetIO().MouseWheel;
 		if (wheel != 0.f) {
 			ui.address_sb.target_scroll_y -= wheel * kAddrRowHeight * 3.f;
@@ -1488,11 +1594,23 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			bool fzhov = ImGui::IsMouseHoveringRect(
 				ImVec2(bx, by), ImVec2(bx + box_w, by + box_h), false);
 			if (fz_clicked) {
-				freeze_toggle_idx = i;
-				freeze_toggle_val = !e.frozen;
-				diag_logf("address freeze_toggle idx=%d addr=0x%llX now=%d",
-					i, static_cast<unsigned long long>(e.address),
-					static_cast<int>(freeze_toggle_val));
+				const auto context = memory_interaction::capture_address(runtime,
+					e.address, i, e.frozen,
+					memory_scanner::format_value(e.last_value, e.value_type));
+				const auto capability = memory_interaction::evaluate(
+					e.frozen ? memory_interaction::capability_t::unfreeze :
+						memory_interaction::capability_t::freeze,
+					context, runtime);
+				if (capability.enabled) {
+					freeze_toggle_idx = i;
+					freeze_toggle_val = !e.frozen;
+					diag_logf("address freeze_toggle idx=%d addr=0x%llX now=%d",
+						i, static_cast<unsigned long long>(e.address),
+						static_cast<int>(freeze_toggle_val));
+				} else {
+					toast_notification::push(capability.disabled_reason,
+						toast_notification::toast_type_t::warning, 4.f);
+				}
 			}
 
 			bool is_on = e.frozen;
@@ -1590,6 +1708,9 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		if (hov && !in_freeze_col && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			ui.selected_address = i;
 			handle_multi_select(ui.address_multi_sel, ui.last_address_anchor, i, total);
+			memory_interaction::select(memory_interaction::capture_address(runtime,
+				e.address, i, e.frozen,
+				memory_scanner::format_value(e.last_value, e.value_type)));
 			diag_logf("address row_click idx=%d multi=%zu",
 				i, ui.address_multi_sel.size());
 		}
@@ -1600,8 +1721,18 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 				desc_edit_request_idx = i;
 				diag_logf("address desc_edit_request idx=%d", i);
 			} else if (mx >= cols[kColAddrValue].x0 && mx < cols[kColAddrValue].x1) {
-				value_edit_request_idx = i;
-				diag_logf("address value_edit_request idx=%d", i);
+				const auto context = memory_interaction::capture_address(runtime,
+					e.address, i, e.frozen,
+					memory_scanner::format_value(e.last_value, e.value_type));
+				const auto capability = memory_interaction::evaluate(
+					memory_interaction::capability_t::change_value, context, runtime);
+				if (capability.enabled) {
+					value_edit_request_idx = i;
+					diag_logf("address value_edit_request idx=%d", i);
+				} else {
+					toast_notification::push(capability.disabled_reason,
+						toast_notification::toast_type_t::warning, 4.f);
+				}
 			} else if (mx >= cols[kColAddrType].x0 && mx < cols[kColAddrType].x1) {
 				change_type_request_idx = i;
 				diag_logf("address change_type_request idx=%d", i);
@@ -1610,7 +1741,10 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 			ctx_addr_request_row = i;
-			ctx_addr_value = e.address;
+			requested_context = memory_interaction::capture_address(runtime,
+				e.address, i, e.frozen,
+				memory_scanner::format_value(e.last_value, e.value_type));
+			memory_interaction::select(requested_context);
 			ui.selected_address = i;
 			if (ui.address_multi_sel.count(i) == 0) {
 				ui.address_multi_sel.clear();
@@ -1627,6 +1761,16 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			diag_logf("address key_delete idx=%d", i);
 			break;
 		}
+	}
+
+	if (ui.address_pane_focused && memory_interaction::context_key_pressed() &&
+		ui.selected_address >= 0 && ui.selected_address < total) {
+		const int selected = ui.selected_address;
+		const auto& entry = sc.address_list[static_cast<std::size_t>(selected)];
+		ctx_addr_request_row = selected;
+		requested_context = memory_interaction::capture_address(runtime,
+			entry.address, selected, entry.frozen,
+			memory_scanner::format_value(entry.last_value, entry.value_type));
 	}
 
 	ImGui::PopClipRect();
@@ -1647,8 +1791,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	}
 
 	if (ctx_addr_request_row >= 0) {
-		s_view_owned_ctx_addr_row.store(ctx_addr_request_row);
-		s_view_owned_ctx_addr_value.store(ctx_addr_value);
+		ui.address_context = std::move(requested_context);
 		s_open_address_ctx.store(true);
 	}
 
@@ -2047,16 +2190,41 @@ void process_edit_value_dialog() {
 			s_ev_was_open = false;
 		} else if (write_clicked || enter_submit) {
 			std::string text(s_edit_value_buf);
-			memory_scanner::write_value(addr_v, vt, text, sc.config.hex_input);
-			diag_logf("dialog edit_value_write addr=0x%llX val='%s'",
-				static_cast<unsigned long long>(addr_v), text.c_str());
-			anti_tamper::webhook::write_log("scan_audit",
-				"[scan_audit] memory_scanner write_value");
-			toast_notification::push("Wrote value.",
-				toast_notification::toast_type_t::success, 2.f);
-			ImGui::CloseCurrentPopup();
-			s_pending_edit_value_index.store(-1);
-			s_ev_was_open = false;
+			const auto runtime = runtime_snapshot();
+			const auto context = memory_interaction::capture_address(runtime,
+				addr_v, idx, false, {});
+			const auto capability = memory_interaction::evaluate(
+				memory_interaction::capability_t::change_value, context, runtime);
+			if (!capability.enabled) {
+				toast_notification::push(capability.disabled_reason,
+					toast_notification::toast_type_t::warning, 4.f);
+			} else {
+				const auto expected_bytes = memory_scanner::parse_value(text, vt, sc.config.hex_input);
+				if (expected_bytes.empty()) {
+					toast_notification::push("Value is invalid for the selected type.",
+						toast_notification::toast_type_t::error, 4.f);
+				} else {
+					const std::string expected = memory_scanner::format_value(expected_bytes, vt);
+					memory_scanner::write_value(addr_v, vt, text, sc.config.hex_input);
+					const std::string observed = memory_scanner::read_value_string(addr_v, vt);
+					const bool verified = !observed.empty() && observed == expected;
+					diag_logf("dialog edit_value_write addr=0x%llX val='%s' verified=%d observed='%s'",
+						static_cast<unsigned long long>(addr_v), text.c_str(),
+						static_cast<int>(verified), observed.c_str());
+					anti_tamper::webhook::write_log("scan_audit",
+						"[scan_audit] memory_scanner write_value readback");
+					if (verified) {
+						toast_notification::push("Value written and verified.",
+							toast_notification::toast_type_t::success, 2.f);
+						ImGui::CloseCurrentPopup();
+						s_pending_edit_value_index.store(-1);
+						s_ev_was_open = false;
+					} else {
+						toast_notification::push("Write could not be verified; target memory may be stale or protected.",
+							toast_notification::toast_type_t::error, 5.f);
+					}
+				}
+			}
 		}
 		ImGui::EndPopup();
 	}
@@ -2171,7 +2339,9 @@ void process_result_context_menu() {
 		ImGui::OpenPopup("##value_scan_result_ctx");
 	}
 
-	uint64_t ctx_addr = s_view_owned_ctx_result_addr.load();
+	const auto runtime = runtime_snapshot();
+	const auto context = ui.result_context;
+	uint64_t ctx_addr = context.address;
 	const auto& t = aida::ui::resolved();
 	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
 	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, 1.f));
@@ -2186,7 +2356,13 @@ void process_result_context_menu() {
 			ImGui::TextDisabled("%s", hdr);
 			ImGui::Separator();
 		}
-		if (ImGui::MenuItem("Add to address list")) {
+		ImGui::TextDisabled("%s  |  %s",
+			context.source == memory_interaction::source_t::live_process ? "Live process" :
+				(context.source == memory_interaction::source_t::static_binary ? "Static binary" : "No source"),
+			context.module_offset.empty() ? "absolute address" : context.module_offset.c_str());
+		ImGui::Separator();
+		if (context_item("Add to address list", memory_interaction::capability_t::add_to_address_list,
+			context, runtime, "Enter")) {
 			diag_logf("ctx_result add_to_list count=%zu primary_addr=0x%llX",
 				multi_count, static_cast<unsigned long long>(ctx_addr));
 			std::vector<int> indices;
@@ -2220,22 +2396,24 @@ void process_result_context_menu() {
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] memory_scanner ctx add_to_list");
 		}
-		if (ImGui::MenuItem("Open in Hex view")) {
+		if (context_item("Open in Hex view", memory_interaction::capability_t::open_hex,
+			context, runtime)) {
 			diag_logf("ctx_result open_hex addr=0x%llX",
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
 				const auto context = disasm_view::capture_selected_workspace();
 				if (hex_view::read_live_memory(context, ctx_addr, 256))
-					globals::ui::active_center_view = center_view_t::hex_view;
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] memory_scanner ctx open_hex");
 			}
 		}
-		if (ImGui::MenuItem("Open in Disassembly")) {
+		if (context_item("Open in Disassembly", memory_interaction::capability_t::open_disassembly,
+			context, runtime)) {
 			diag_logf("ctx_result open_disasm addr=0x%llX",
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(ctx_addr,
 					disasm_view::capture_selected_workspace());
 				anti_tamper::webhook::write_log("scan_audit",
@@ -2243,13 +2421,34 @@ void process_result_context_menu() {
 			}
 		}
 		ImGui::Separator();
-		if (ImGui::MenuItem("Copy address")) {
-			char abuf[24];
-			snprintf(abuf, sizeof(abuf), "0x%016" PRIX64, ctx_addr);
-			ImGui::SetClipboardText(abuf);
+		if (context_item("Copy address", memory_interaction::capability_t::copy_address,
+			context, runtime, "Ctrl+C")) {
+			copy_address(ctx_addr);
 			diag_log("ctx_result copy_address");
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] memory_scanner ctx copy_address");
+		}
+		if (context_item("Copy current value", memory_interaction::capability_t::copy_value,
+			context, runtime))
+			ImGui::SetClipboardText(context.value.c_str());
+		if (context_item("Copy previous value", memory_interaction::capability_t::copy_previous_value,
+			context, runtime))
+			ImGui::SetClipboardText(context.previous_value.c_str());
+		if (context_item("Copy module + offset", memory_interaction::capability_t::copy_module_offset,
+			context, runtime))
+			ImGui::SetClipboardText(context.module_offset.c_str());
+		ImGui::Separator();
+		if (context_item("Stage patch in Patches view...", memory_interaction::capability_t::stage_patch,
+			context, runtime)) {
+			std::string error;
+			const auto extent = static_cast<std::uint64_t>(
+				memory_scanner::value_type_size(sc.config.value_type));
+			if (debugger_view::stage_patch_review(ctx_addr, extent,
+				"Staged from Value Scan result", &error))
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.debug.patches"));
+			else
+				toast_notification::push(error.c_str(), toast_notification::toast_type_t::warning, 4.f);
 		}
 		ImGui::EndPopup();
 	}
@@ -2266,8 +2465,12 @@ void process_address_context_menu() {
 		ImGui::OpenPopup("##value_scan_addr_ctx");
 	}
 
-	uint64_t ctx_addr = s_view_owned_ctx_addr_value.load();
-	int ctx_row = s_view_owned_ctx_addr_row.load();
+	const auto runtime = runtime_snapshot();
+	auto context = ui.address_context;
+	uint64_t ctx_addr = context.address;
+	int ctx_row = find_address_index(ctx_addr);
+	if (ctx_row < 0)
+		context.kind = memory_interaction::kind_t::none;
 	const auto& t = aida::ui::resolved();
 	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
 	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, 1.f));
@@ -2275,6 +2478,10 @@ void process_address_context_menu() {
 	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f);
 
 	if (ImGui::BeginPopup("##value_scan_addr_ctx")) {
+		ImGui::TextDisabled("Live watch  |  0x%016" PRIX64, ctx_addr);
+		if (ctx_row < 0)
+			ImGui::TextDisabled("Entry removed; select it again.");
+		ImGui::Separator();
 		size_t multi_count = ui.address_multi_sel.size();
 		if (multi_count > 1) {
 			char hdr[64];
@@ -2282,7 +2489,8 @@ void process_address_context_menu() {
 			ImGui::TextDisabled("%s", hdr);
 			ImGui::Separator();
 		}
-		if (ImGui::MenuItem("Edit description")) {
+		if (context_item("Edit description", memory_interaction::capability_t::edit_description,
+			context, runtime)) {
 			diag_logf("ctx_addr edit_description row=%d", ctx_row);
 			ui.desc_edit.active = true;
 			ui.desc_edit.address_index = ctx_row;
@@ -2295,7 +2503,8 @@ void process_address_context_menu() {
 				}
 			}
 		}
-		if (ImGui::MenuItem("Change type")) {
+		if (context_item("Change type", memory_interaction::capability_t::change_type,
+			context, runtime)) {
 			diag_logf("ctx_addr change_type row=%d", ctx_row);
 			s_pending_change_type_index.store(ctx_row);
 			{
@@ -2306,7 +2515,8 @@ void process_address_context_menu() {
 				}
 			}
 		}
-		if (ImGui::MenuItem("Change value")) {
+		if (context_item("Change value...", memory_interaction::capability_t::change_value,
+			context, runtime, "Enter")) {
 			diag_logf("ctx_addr change_value row=%d", ctx_row);
 			s_pending_edit_value_index.store(ctx_row);
 			std::lock_guard<std::mutex> lk(sc.address_mutex);
@@ -2317,23 +2527,33 @@ void process_address_context_menu() {
 					"%s", vs.c_str());
 			}
 		}
+		if (context_item(context.frozen ? "Unfreeze" : "Freeze",
+			context.frozen ? memory_interaction::capability_t::unfreeze :
+				memory_interaction::capability_t::freeze,
+			context, runtime)) {
+			memory_scanner::freeze_address(static_cast<std::size_t>(ctx_row), !context.frozen);
+			context.frozen = !context.frozen;
+			ui.address_context.frozen = context.frozen;
+		}
 		ImGui::Separator();
-		if (ImGui::MenuItem("Open in Hex view")) {
+		if (context_item("Open in Hex view", memory_interaction::capability_t::open_hex,
+			context, runtime)) {
 			diag_logf("ctx_addr open_hex addr=0x%llX",
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
 				const auto context = disasm_view::capture_selected_workspace();
 				if (hex_view::read_live_memory(context, ctx_addr, 256))
-					globals::ui::active_center_view = center_view_t::hex_view;
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] address_list ctx open_hex");
 			}
 		}
-		if (ImGui::MenuItem("Open in Disassembly")) {
+		if (context_item("Open in Disassembly", memory_interaction::capability_t::open_disassembly,
+			context, runtime)) {
 			diag_logf("ctx_addr open_disasm addr=0x%llX",
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(ctx_addr,
 					disasm_view::capture_selected_workspace());
 				anti_tamper::webhook::write_log("scan_audit",
@@ -2341,14 +2561,35 @@ void process_address_context_menu() {
 			}
 		}
 		ImGui::Separator();
-		if (ImGui::MenuItem("Copy address")) {
-			char abuf[24];
-			snprintf(abuf, sizeof(abuf), "0x%016" PRIX64, ctx_addr);
-			ImGui::SetClipboardText(abuf);
+		if (context_item("Copy address", memory_interaction::capability_t::copy_address,
+			context, runtime, "Ctrl+C")) {
+			copy_address(ctx_addr);
 			diag_log("ctx_addr copy_address");
 		}
+		if (context_item("Copy current value", memory_interaction::capability_t::copy_value,
+			context, runtime))
+			ImGui::SetClipboardText(context.value.c_str());
 		ImGui::Separator();
-		if (ImGui::MenuItem("Remove")) {
+		if (context_item("Stage patch in Patches view...", memory_interaction::capability_t::stage_patch,
+			context, runtime)) {
+			std::uint64_t extent = 1;
+			{
+				std::lock_guard<std::mutex> lock(sc.address_mutex);
+				if (ctx_row >= 0 && ctx_row < static_cast<int>(sc.address_list.size()))
+					extent = static_cast<std::uint64_t>(memory_scanner::value_type_size(
+						sc.address_list[static_cast<std::size_t>(ctx_row)].value_type));
+			}
+			std::string error;
+			if (debugger_view::stage_patch_review(ctx_addr, extent,
+				"Staged from Memory Address List", &error))
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.debug.patches"));
+			else
+				toast_notification::push(error.c_str(), toast_notification::toast_type_t::warning, 4.f);
+		}
+		ImGui::Separator();
+		if (context_item("Remove from address list", memory_interaction::capability_t::remove,
+			context, runtime, "Delete")) {
 			diag_logf("ctx_addr remove row=%d multi=%zu", ctx_row, multi_count);
 			std::vector<int> to_remove;
 			if (multi_count > 0) {
@@ -2413,7 +2654,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	bool attached_now = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
 	bool static_pe_now = function_index::detail::static_pe_active();
 #endif
-	bool any_target = attached_now || static_pe_now;
+	bool any_target = attached_now;
 
 	if (ui.auto_refresh && attached_now) {
 		ui.refresh_timer += aida::ui::clock::dt();
@@ -2448,7 +2689,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			std::lock_guard<std::mutex> lk(sc.results_mutex);
 			cur_total = sc.results.size();
 		}
-		if (static_cast<size_t>(ui.row_flash.size()) != cur_total) {
+		if (ui.last_result_count != cur_total) {
 			invalidate_sort();
 		}
 	}
@@ -2460,7 +2701,9 @@ void render(float pos_x, float pos_y, float width, float height,
 	if (callout_h > 0.f) {
 		ui_anim::render_inline_callout(dl, ox + 12.f, oy + kToolbarHeight + 4.f,
 			w - 24.f, 22.f,
-			"Value scan needs a live process. Attach a target from the Process Attach panel.",
+			static_pe_now
+				? "Static binary loaded. Value scans and watch mutations require a live process attach."
+				: "Value scan needs a live process. Attach a target from the Process Attach panel.",
 			ui_anim::callout_kind_t::warn, 0.85f, 0.6f, 0.2f, a);
 	}
 
@@ -2498,6 +2741,35 @@ void render(float pos_x, float pos_y, float width, float height,
 	process_edit_value_dialog();
 	process_change_type_dialog();
 	process_result_context_menu();
+	process_address_context_menu();
+}
+
+void render_results(float pos_x, float pos_y, float width, float height,
+	float alpha, float, float, float) {
+	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+	ImGui::BeginChild("##memory_scan_results_pane", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	ImDrawList* draw_list = ImGui::GetWindowDrawList();
+	const ImVec2 window = ImGui::GetWindowPos();
+	render_results_pane(draw_list, window.x, window.y, width, height, alpha);
+	ImGui::EndChild();
+	process_add_dialog();
+	process_result_context_menu();
+}
+
+void render_address_list(float pos_x, float pos_y, float width, float height,
+	float alpha, float, float, float) {
+	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+	ImGui::BeginChild("##memory_address_list_pane", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	ImDrawList* draw_list = ImGui::GetWindowDrawList();
+	const ImVec2 window = ImGui::GetWindowPos();
+	render_address_pane(draw_list, window.x, window.y, width, height, alpha);
+	ImGui::EndChild();
+	process_add_dialog();
+	process_edit_description_dialog();
+	process_edit_value_dialog();
+	process_change_type_dialog();
 	process_address_context_menu();
 }
 

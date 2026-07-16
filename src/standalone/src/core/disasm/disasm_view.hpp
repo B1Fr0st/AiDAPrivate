@@ -47,6 +47,12 @@ struct formatted_instruction_t {
     std::string error;
 };
 
+struct mutation_state_t {
+    std::uint32_t pending = 0;
+    std::uint64_t overlay_revision = 0;
+    std::string error;
+};
+
 struct state_t {
     addr_format_t addr_format = addr_format_t::va;
     bool show_bytes = true;
@@ -141,6 +147,12 @@ bool queue_type_application(const workspace_context_t& context,
                             std::string type);
 bool queue_type_declaration(const workspace_context_t& context,
                             std::string declaration);
+bool queue_type_declaration_and_application(
+    const workspace_context_t& context,
+    const aida::analysis::address_t& address,
+    std::string declaration,
+    std::string canonical_type);
+mutation_state_t mutation_state(const workspace_context_t& context);
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b,
@@ -149,6 +161,11 @@ void render(float pos_x, float pos_y, float width, float height,
 void goto_address(std::uint64_t address, const workspace_context_t& context);
 void goto_address(const aida::analysis::address_t& address,
                   const workspace_context_t& context);
+void select_address(std::uint64_t address, const workspace_context_t& context,
+                    bool record_history = true);
+void select_address(const aida::analysis::address_t& address,
+                    const workspace_context_t& context,
+                    bool record_history = true);
 void navigate_back(const workspace_context_t& context);
 void navigate_forward(const workspace_context_t& context);
 void open_xrefs(std::uint64_t address, const workspace_context_t& context);

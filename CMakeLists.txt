@@ -222,6 +222,23 @@ configure_file(
 )
 message(STATUS "AiDA: build_seed.bin materialized; commitment=${AIDA_BUILD_COMMITMENT}")
 
+set(AIDA_BUILD_ID "${AIDA_BUILD_COMMITMENT}")
+
+if(Python3_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/wbaes_gen/generate_wbaes_tables.py")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/wbaes_gen/generate_wbaes_tables.py"
+                --seed "${AIDA_BUILD_SEED}"
+                --output "${CMAKE_BINARY_DIR}/generated/wbaes_generated_tables.hpp"
+                --build-id "${AIDA_BUILD_ID}"
+        RESULT_VARIABLE _aida_wbaes_gen_rc
+    )
+    if(NOT _aida_wbaes_gen_rc EQUAL 0)
+        message(FATAL_ERROR "AiDA: wbaes table generation failed (rc=${_aida_wbaes_gen_rc})")
+    endif()
+    message(STATUS "AiDA: whitebox AES tables generated -> ${CMAKE_BINARY_DIR}/generated/wbaes_generated_tables.hpp")
+endif()
+
 if(MSVC AND AIDA_HARDEN_RELEASE)
     add_library(aida_hardening INTERFACE)
     target_compile_options(aida_hardening INTERFACE
@@ -1312,6 +1329,8 @@ endif()
 if(WIN32)
 
     set(imgui_SOURCE_DIR "${DEPS_DIR}/imgui-src")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/aida_imgui_dependency.cmake")
+    aida_configure_imgui_dependency("${imgui_SOURCE_DIR}")
 
     option(BUILD_DRIVER_TEST "Build WhosWho driver test application" ON)
 
@@ -1586,6 +1605,9 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/network/net_security_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/tools/emulation_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/editor/code_editor.cpp"
+            "${STANDALONE_ROOT}/core/analysis/analysis_budget.cpp"
+            "${STANDALONE_ROOT}/core/analysis/analysis_resource_metrics.cpp"
+            "${STANDALONE_ROOT}/core/analysis/analysis_scheduler.cpp"
             "${STANDALONE_ROOT}/core/disasm/disasm_view.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_pretty_xml_encode.cpp"
             "${STANDALONE_ROOT}/core/disasm/ghidra_adapters/aida_function_db.cpp"
@@ -1599,6 +1621,21 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/editor/hex_view.cpp"
             "${STANDALONE_ROOT}/core/editor/image_view.cpp"
             "${STANDALONE_ROOT}/core/ui/chat_render.cpp"
+              "${STANDALONE_ROOT}/core/ui/application_action_registry.cpp"
+              "${STANDALONE_ROOT}/core/ui/application_ui_runtime.cpp"
+              "${STANDALONE_ROOT}/core/ui/analysis_context_menu.cpp"
+            "${STANDALONE_ROOT}/core/ui/application_view_registry.cpp"
+            "${STANDALONE_ROOT}/core/ui/explorer_views.cpp"
+            "${STANDALONE_ROOT}/core/ui/output_views.cpp"
+            "${STANDALONE_ROOT}/core/ui/context_menu_contract.cpp"
+            "${STANDALONE_ROOT}/core/ui/context_menu_renderer.cpp"
+            "${STANDALONE_ROOT}/core/ui/design_system.cpp"
+            "${STANDALONE_ROOT}/core/ui/ide_shell.cpp"
+            "${STANDALONE_ROOT}/core/ui/interaction_context.cpp"
+            "${STANDALONE_ROOT}/core/ui/shortcut_resolver.cpp"
+            "${STANDALONE_ROOT}/core/ui/task_center.cpp"
+            "${STANDALONE_ROOT}/core/ui/view_registry.cpp"
+            "${STANDALONE_ROOT}/core/ui/workspace_layout.cpp"
             "${STANDALONE_ROOT}/core/mcp/mcp_client.cpp"
             "${STANDALONE_ROOT}/core/mcp/mcp_marketplace.cpp"
             "${STANDALONE_ROOT}/core/mcp/ida_compat_read.cpp"
@@ -1785,8 +1822,10 @@ if(WIN32)
             "${STANDALONE_ROOT}/core/tools/script_engine.cpp"
             "${STANDALONE_ROOT}/core/scanner/memory_scanner.cpp"
             "${STANDALONE_ROOT}/core/scanner/memory_scanner_view.cpp"
+            "${STANDALONE_ROOT}/core/scanner/memory_interaction_context.cpp"
             "${STANDALONE_ROOT}/core/scanner/scanner_tools_standalone.cpp"
             "${STANDALONE_ROOT}/core/debugger/debugger_engine.cpp"
+            "${STANDALONE_ROOT}/core/debugger/debugger_interaction_context.cpp"
             "${STANDALONE_ROOT}/core/debugger/debugger_view.cpp"
             "${STANDALONE_ROOT}/core/disasm/pseudocode_view.cpp"
             "${STANDALONE_ROOT}/core/analysis/struct_recon_view.cpp"
@@ -1967,6 +2006,7 @@ if(WIN32)
         )
 
         set(IMGUI_SOURCES
+            "${STANDALONE_ROOT}/core/ui/imgui_capability_guard.cpp"
             "${imgui_SOURCE_DIR}/imgui.cpp"
             "${imgui_SOURCE_DIR}/imgui_draw.cpp"
             "${imgui_SOURCE_DIR}/imgui_tables.cpp"
@@ -2138,6 +2178,10 @@ if(WIN32)
             GHIDRA_SPECS_DIR=${GHIDRA_SPECS_OUTPUT_DIR}
             AIDA_DEEP_STEAL=1
             AIDA_STANDALONE
+            AIDA_IMGUI_SOURCE_SHA256="${AIDA_IMGUI_SOURCE_SHA256}"
+            AIDA_IMGUI_LOCK_SHA256="${AIDA_IMGUI_LOCK_SHA256}"
+            AIDA_IMGUI_SOURCE_COMMIT="${AIDA_IMGUI_SOURCE_COMMIT}"
+            AIDA_IMGUI_SOURCE_TREE="${AIDA_IMGUI_SOURCE_TREE}"
         )
         if(NOT AIDA_DISABLE_LEGACY_DRIVER_MAPPER)
             target_compile_definitions(AiDAStandalone PRIVATE AIDA_LEGACY_DRIVER_MAPPER_AVAILABLE)
@@ -2156,11 +2200,6 @@ if(WIN32)
 
         enable_testing()
         aida_c03_register_safe_headless_targets(AiDAStandalone)
-        aida_c03_reject_forbidden_target_links(
-            aida_c03_safe_headless_runtime
-            aida_c03_b14_native_decompiler_worker
-            ${AIDA_C03_SAFE_HEADLESS_TARGETS}
-            ${AIDA_C03_SAFE_HEADLESS_DIRECT_TARGETS})
 
         aida_use_static_msvc_runtime(
             AiDAStandalone
@@ -2284,6 +2323,42 @@ if(WIN32)
 
         if(TARGET aida_hardening)
             target_link_libraries(AiDAStandalone PRIVATE aida_hardening)
+        endif()
+
+        set(AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE
+            "${CMAKE_BINARY_DIR}/c03_package_production/production_link_graph.json")
+        aida_c03_emit_production_link_graph_evidence(
+            "${AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE}"
+            AiDAStandalone
+            MANIFEST_ROOTS ${AIDA_C03_SAFE_HEADLESS_TARGETS}
+            DIRECT_ROOTS ${AIDA_C03_SAFE_HEADLESS_DIRECT_TARGETS}
+            OTHER_ROOTS
+                AiDAStandalone
+                aida_c03_safe_headless_runtime
+                aida_c03_auth_preview_implementation
+                aida_c03_safe_headless_manifest_suite
+                aida_c03_b14_native_decompiler_worker
+                aida_c03_package_verifier)
+        add_custom_target(aida_c03_production_link_graph_package_evidence
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE}"
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/production-link-graph.json"
+            DEPENDS AiDAStandalone
+                aida_c03_b14_native_decompiler_worker
+                aida_c03_package_verifier
+                "${AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE}"
+            VERBATIM)
+        set_target_properties(aida_c03_production_link_graph_package_evidence PROPERTIES
+            FOLDER "Packaging/C03"
+            AIDA_C03_PACKAGE_ROLE "production-target-link-graph-evidence-v3")
+        if(TARGET aida_c03_distribution_manifest)
+            add_dependencies(aida_c03_distribution_manifest
+                aida_c03_production_link_graph_package_evidence)
+            set_property(TARGET aida_c03_distribution_manifest APPEND PROPERTY
+                AIDA_C03_PACKAGE_OUTPUTS
+                "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/production-link-graph.json")
         endif()
 
         set_target_properties(AiDAStandalone PROPERTIES
@@ -3626,6 +3701,52 @@ if(BUILD_PROTECTOR)
                 COMMENT "Verifying AiDAStandalone.exe standalone no-imports profile..."
                 VERBATIM
             )
+            if(TARGET aida_c03_package_verifier)
+                _aida_c03_package_signing_step(
+                    _aida_c03_standalone_signing_commands
+                    _aida_c03_standalone_signing_dependencies
+                    "$<TARGET_FILE:AiDAStandalone>")
+                add_custom_target(aida_c03_standalone_security_receipts
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                        "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence"
+                    ${_aida_c03_standalone_signing_commands}
+                    COMMAND "$<TARGET_FILE:aida_c03_package_verifier>" emit-receipts
+                        --artifact "$<TARGET_FILE:AiDAStandalone>"
+                        --artifact-relative "AiDAStandalone.exe"
+                        --protector-tool "$<TARGET_FILE:AiDAProtector>"
+                        --protector-verifier "$<TARGET_FILE:AiDAProtectorVerify>"
+                        --protector-profile "standalone-no-imports"
+                        --protector-receipt "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/standalone.protector.json"
+                        --signature-receipt "$<TARGET_FILE_DIR:AiDAStandalone>/deps/evidence/standalone.signature.json"
+                        --signer-policy "${AIDA_C03_SIGNER_POLICY_FILE}"
+                        --expected-signer-policy-sha256 "${AIDA_C03_SIGNER_POLICY_SHA256}"
+                        --signing-provider "${AIDA_C03_SIGNING_PROVIDER}"
+                        --expected-signing-provider-sha256 "${AIDA_C03_SIGNING_PROVIDER_SHA256}"
+                        --deadline-ms 900000
+                    DEPENDS AiDAStandaloneNoIATVerify AiDAProtector AiDAProtectorVerify
+                        aida_c03_package_verifier
+                        ${_aida_c03_standalone_signing_dependencies}
+                    VERBATIM)
+                set_target_properties(aida_c03_standalone_security_receipts PROPERTIES
+                    FOLDER "Packaging/C03"
+                    AIDA_C03_PACKAGE_ROLE "standalone-protector-signature-receipts-v4"
+                    AIDA_C03_FINAL_BYTE_ORDERING "link;scrub;protect;direct-protector-verify;offline-wintrust-receipts")
+                foreach(_aida_c03_worker_package_target IN ITEMS
+                        aida_c03_b14_native_worker_package_manifest
+                        aida_c03_b16_managed_worker_package_manifest)
+                    if(TARGET "${_aida_c03_worker_package_target}")
+                        add_dependencies("${_aida_c03_worker_package_target}"
+                            AiDAProtector AiDAProtectorVerify aida_c03_package_verifier)
+                    endif()
+                endforeach()
+                if(TARGET aida_c03_distribution_manifest)
+                    add_dependencies(aida_c03_distribution_manifest
+                        aida_c03_standalone_security_receipts
+                        AiDAProtector AiDAProtectorVerify aida_c03_package_verifier)
+                    set_property(TARGET aida_c03_distribution_manifest PROPERTY
+                        AIDA_C03_STANDALONE_RECEIPT_TARGET aida_c03_standalone_security_receipts)
+                endif()
+            endif()
         endif()
     endif()
 

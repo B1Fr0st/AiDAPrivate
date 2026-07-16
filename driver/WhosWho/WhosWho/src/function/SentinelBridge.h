@@ -412,12 +412,13 @@ namespace sentinel_bridge {
         RtlCopyMemory(ct, &ciphertext_in, 8);
 
         UINT8 pt[8];
-        BOOLEAN ok = kernel_crypto::sw_aes256_gcm_decrypt(
+        NTSTATUS dec_st = kernel_crypto::bcrypt_aes256_gcm_decrypt(
             g_challenge_aes_key, nonce,
             aad, sizeof(aad),
             ct, 8,
             tag_in,
             pt);
+        BOOLEAN ok = NT_SUCCESS(dec_st) ? TRUE : FALSE;
         if (ok) {
             RtlCopyMemory(&plaintext_out, pt, 8);
         }

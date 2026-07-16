@@ -4140,24 +4140,13 @@ workspace_result_t<void> analysis_workspace_t::update_view_state(
                                  "view-state revision overflowed", "workspace_view"));
     workspace_view_state_t next = view_state_;
     mutation(next);
-    constexpr std::size_t maximum_navigation_entries = 16384;
     constexpr std::size_t maximum_bookmarks = 65536;
-    if (next.navigation_back.size() > maximum_navigation_entries ||
-        next.navigation_forward.size() > maximum_navigation_entries ||
-        next.bookmarks.size() > maximum_bookmarks)
+    if (next.bookmarks.size() > maximum_bookmarks)
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
                                  "workspace view state exceeds its limits",
                                  "workspace_view"));
     if ((next.selection && !valid_workspace_address(*next.selection, *identity_)) ||
-        !std::all_of(next.navigation_back.begin(), next.navigation_back.end(),
-                     [&](const auto& address) {
-                         return valid_workspace_address(address, *identity_);
-                     }) ||
-        !std::all_of(next.navigation_forward.begin(), next.navigation_forward.end(),
-                     [&](const auto& address) {
-                         return valid_workspace_address(address, *identity_);
-                     }) ||
         !std::all_of(next.bookmarks.begin(), next.bookmarks.end(),
                      [&](const auto& address) {
                          return valid_workspace_address(address, *identity_);

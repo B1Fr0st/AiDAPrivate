@@ -20,6 +20,7 @@
 #include "standalone_driver.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#include "scanner_task_center.hpp"
 #include "../mcp/downstream_producer_governor.hpp"
 
 namespace pointer_scanner {
@@ -396,11 +397,18 @@ inline void build_reverse_map()
 
 		g_state.map_building.store(false);
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		diag::log_tagged("pointer_scan", "build_reverse_map worker_queue_rejected");
 		g_state.map_building.store(false);
 		return;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.pointer_scan", "memory.build_pointer_map", "Build pointer map",
+		driver_bridge::attached_pid(), true, []() {
+			g_state.map_cancel.store(true, std::memory_order_release);
+			return true;
+		});
 
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-RELEASE build_reverse_map token=%llu reason=dispatched",
@@ -557,12 +565,19 @@ inline void start_scan()
 			g_state.scanning.store(false);
 		}
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		diag::log_tagged("pointer_scan", "start_scan worker_queue_rejected");
 		g_state.scan_progress.store(1.f);
 		g_state.scanning.store(false);
 		return;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.pointer_scan", "memory.scan_pointer_chains", "Scan pointer chains",
+		driver_bridge::attached_pid(), true, []() {
+			g_state.scan_cancel.store(true, std::memory_order_release);
+			return true;
+		});
 
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-RELEASE pointer_start_scan token=%llu reason=dispatched",
@@ -692,12 +707,19 @@ inline void validate_all_results()
 		g_state.validate_progress.store(1.f);
 		g_state.validating.store(false);
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		diag::log_tagged("pointer_scan", "validate_all_results worker_queue_rejected");
 		g_state.validate_progress.store(1.f);
 		g_state.validating.store(false);
 		return;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.pointer_scan", "memory.validate_pointer_chains", "Validate pointer chains",
+		driver_bridge::attached_pid(), true, []() {
+			g_state.scan_cancel.store(true, std::memory_order_release);
+			return true;
+		});
 
 	diag::log_tagged_fmt("pointer_scan",
 		"FEATURE-WORKER-GROUP-RELEASE validate_all_results token=%llu reason=dispatched",

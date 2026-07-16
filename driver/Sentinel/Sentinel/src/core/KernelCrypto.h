@@ -244,364 +244,6 @@ namespace kernel_crypto
         RtlSecureZeroMemory(t, sizeof(t));
     }
 
-    __forceinline UINT8 aes_gf_mul(UINT8 a, UINT8 b) {
-        UINT8 p = 0;
-        for (int i = 0; i < 8; ++i) {
-            if (b & 1u) p ^= a;
-            UINT8 hi = a & 0x80u;
-            a = static_cast<UINT8>(a << 1);
-            if (hi) a ^= 0x1Bu;
-            b >>= 1;
-        }
-        return p;
-    }
-
-    __forceinline UINT8 aes_gf_inv(UINT8 a) {
-        if (a == 0) return 0;
-        for (UINT8 b = 1; b != 0; ++b) {
-            if (aes_gf_mul(a, b) == 1) return b;
-        }
-        return 0;
-    }
-
-    __forceinline UINT8 compute_sbox_entry(UINT8 input) {
-        UINT8 inv = aes_gf_inv(input);
-        UINT8 result = 0;
-        for (int i = 0; i < 8; ++i) {
-            UINT8 bit = static_cast<UINT8>(
-                ((inv >> i) & 1u) ^
-                ((inv >> ((i + 4) % 8)) & 1u) ^
-                ((inv >> ((i + 5) % 8)) & 1u) ^
-                ((inv >> ((i + 6) % 8)) & 1u) ^
-                ((inv >> ((i + 7) % 8)) & 1u) ^
-                ((0x63u >> i) & 1u));
-            result |= static_cast<UINT8>(bit << i);
-        }
-        return result;
-    }
-
-    __forceinline void compute_sbox(UINT8 out[256]) {
-        for (ULONG i = 0; i < 256; ++i)
-            out[i] = compute_sbox_entry(static_cast<UINT8>(i));
-    }
-
-    __forceinline UINT8 compute_rcon(UINT8 round) {
-        if (round == 0) return 0;
-        UINT8 r = 1;
-        for (UINT8 j = 1; j < round; ++j) {
-            UINT8 hi = r & 0x80u;
-            r = static_cast<UINT8>(r << 1);
-            if (hi) r ^= 0x1Bu;
-        }
-        return r;
-    }
-
-    constexpr ULONG AES256_NR = 14;
-    constexpr ULONG AES256_NK = 8;
-    constexpr ULONG AES256_NB = 4;
-    constexpr ULONG AES256_RK_WORDS = AES256_NB * (AES256_NR + 1);
-
-    struct aes256_ctx_t {
-        UINT32 rk[AES256_RK_WORDS];
-    };
-
-    __forceinline UINT32 aes_subword(UINT32 x, const UINT8* sbox) {
-        return (static_cast<UINT32>(sbox[(x >> 24) & 0xFF]) << 24) |
-               (static_cast<UINT32>(sbox[(x >> 16) & 0xFF]) << 16) |
-               (static_cast<UINT32>(sbox[(x >> 8)  & 0xFF]) << 8)  |
-               (static_cast<UINT32>(sbox[x & 0xFF]));
-    }
-
-    __forceinline UINT32 aes_rotword(UINT32 x) {
-        return (x << 8) | (x >> 24);
-    }
-
-    __forceinline void aes256_set_encrypt_key(const UINT8 key[AES256_KEY_SIZE], aes256_ctx_t* ctx) {
-        UINT8 sbox[256];
-        compute_sbox(sbox);
-
-        UINT32* rk = ctx->rk;
-        for (ULONG i = 0; i < AES256_NK; ++i) {
-            rk[i] = (static_cast<UINT32>(key[i * 4 + 0]) << 24) |
-                    (static_cast<UINT32>(key[i * 4 + 1]) << 16) |
-                    (static_cast<UINT32>(key[i * 4 + 2]) << 8)  |
-                    (static_cast<UINT32>(key[i * 4 + 3]));
-        }
-        for (ULONG i = AES256_NK; i < AES256_RK_WORDS; ++i) {
-            UINT32 t = rk[i - 1];
-            if ((i % AES256_NK) == 0) {
-                t = aes_subword(aes_rotword(t), sbox) ^ (static_cast<UINT32>(compute_rcon(static_cast<UINT8>(i / AES256_NK))) << 24);
-            } else if (AES256_NK > 6 && (i % AES256_NK) == 4) {
-                t = aes_subword(t, sbox);
-            }
-            rk[i] = rk[i - AES256_NK] ^ t;
-        }
-
-        RtlSecureZeroMemory(sbox, sizeof(sbox));
-    }
-
-    __forceinline UINT8 aes_xtime(UINT8 x) {
-        return static_cast<UINT8>((x << 1) ^ (((x >> 7) & 1) * 0x1B));
-    }
-
-    __forceinline void aes256_encrypt_block(const aes256_ctx_t* ctx, const UINT8 in[16], UINT8 out[16]) {
-        UINT8 sbox[256];
-        compute_sbox(sbox);
-
-        UINT8 s[16];
-        for (ULONG i = 0; i < 16; ++i) s[i] = in[i];
-
-        for (ULONG i = 0; i < 4; ++i) {
-            UINT32 rk = ctx->rk[i];
-            s[i * 4 + 0] ^= static_cast<UINT8>(rk >> 24);
-            s[i * 4 + 1] ^= static_cast<UINT8>(rk >> 16);
-            s[i * 4 + 2] ^= static_cast<UINT8>(rk >> 8);
-            s[i * 4 + 3] ^= static_cast<UINT8>(rk);
-        }
-
-        for (ULONG round = 1; round < AES256_NR; ++round) {
-            UINT8 t[16];
-            for (ULONG i = 0; i < 16; ++i) t[i] = sbox[s[i]];
-
-            UINT8 r[16];
-            r[0]  = t[0];  r[1]  = t[5];  r[2]  = t[10]; r[3]  = t[15];
-            r[4]  = t[4];  r[5]  = t[9];  r[6]  = t[14]; r[7]  = t[3];
-            r[8]  = t[8];  r[9]  = t[13]; r[10] = t[2];  r[11] = t[7];
-            r[12] = t[12]; r[13] = t[1];  r[14] = t[6];  r[15] = t[11];
-
-            for (ULONG c = 0; c < 4; ++c) {
-                UINT8 a0 = r[c * 4 + 0];
-                UINT8 a1 = r[c * 4 + 1];
-                UINT8 a2 = r[c * 4 + 2];
-                UINT8 a3 = r[c * 4 + 3];
-                UINT8 t0 = a0 ^ a1 ^ a2 ^ a3;
-                s[c * 4 + 0] = a0 ^ t0 ^ aes_xtime(static_cast<UINT8>(a0 ^ a1));
-                s[c * 4 + 1] = a1 ^ t0 ^ aes_xtime(static_cast<UINT8>(a1 ^ a2));
-                s[c * 4 + 2] = a2 ^ t0 ^ aes_xtime(static_cast<UINT8>(a2 ^ a3));
-                s[c * 4 + 3] = a3 ^ t0 ^ aes_xtime(static_cast<UINT8>(a3 ^ a0));
-            }
-
-            for (ULONG i = 0; i < 4; ++i) {
-                UINT32 rk = ctx->rk[round * 4 + i];
-                s[i * 4 + 0] ^= static_cast<UINT8>(rk >> 24);
-                s[i * 4 + 1] ^= static_cast<UINT8>(rk >> 16);
-                s[i * 4 + 2] ^= static_cast<UINT8>(rk >> 8);
-                s[i * 4 + 3] ^= static_cast<UINT8>(rk);
-            }
-        }
-
-        UINT8 t[16];
-        for (ULONG i = 0; i < 16; ++i) t[i] = sbox[s[i]];
-
-        UINT8 r[16];
-        r[0]  = t[0];  r[1]  = t[5];  r[2]  = t[10]; r[3]  = t[15];
-        r[4]  = t[4];  r[5]  = t[9];  r[6]  = t[14]; r[7]  = t[3];
-        r[8]  = t[8];  r[9]  = t[13]; r[10] = t[2];  r[11] = t[7];
-        r[12] = t[12]; r[13] = t[1];  r[14] = t[6];  r[15] = t[11];
-
-        for (ULONG i = 0; i < 4; ++i) {
-            UINT32 rk = ctx->rk[AES256_NR * 4 + i];
-            r[i * 4 + 0] ^= static_cast<UINT8>(rk >> 24);
-            r[i * 4 + 1] ^= static_cast<UINT8>(rk >> 16);
-            r[i * 4 + 2] ^= static_cast<UINT8>(rk >> 8);
-            r[i * 4 + 3] ^= static_cast<UINT8>(rk);
-        }
-
-        for (ULONG i = 0; i < 16; ++i) out[i] = r[i];
-
-        RtlSecureZeroMemory(sbox, sizeof(sbox));
-    }
-
-    __forceinline void gcm_gf_mul(const UINT8 x[16], const UINT8 y[16], UINT8 z_out[16]) {
-        UINT8 z[16] = { 0 };
-        UINT8 v[16];
-        for (ULONG i = 0; i < 16; ++i) v[i] = y[i];
-
-        for (ULONG i = 0; i < 128; ++i) {
-            UINT8 bit = static_cast<UINT8>((x[i >> 3] >> (7 - (i & 7))) & 1);
-            if (bit) {
-                for (ULONG j = 0; j < 16; ++j) z[j] ^= v[j];
-            }
-            UINT8 lsb = static_cast<UINT8>(v[15] & 1);
-            for (int j = 15; j > 0; --j) {
-                v[j] = static_cast<UINT8>((v[j] >> 1) | ((v[j - 1] & 1) << 7));
-            }
-            v[0] >>= 1;
-            if (lsb) v[0] ^= 0xE1u;
-        }
-        for (ULONG i = 0; i < 16; ++i) z_out[i] = z[i];
-    }
-
-    __forceinline void gcm_inc32(UINT8 ctr[16]) {
-        UINT32 c = (static_cast<UINT32>(ctr[12]) << 24) |
-                   (static_cast<UINT32>(ctr[13]) << 16) |
-                   (static_cast<UINT32>(ctr[14]) << 8)  |
-                   (static_cast<UINT32>(ctr[15]));
-        c += 1;
-        ctr[12] = static_cast<UINT8>(c >> 24);
-        ctr[13] = static_cast<UINT8>(c >> 16);
-        ctr[14] = static_cast<UINT8>(c >> 8);
-        ctr[15] = static_cast<UINT8>(c);
-    }
-
-    __forceinline void ghash_update(const UINT8 H[16], const UINT8* data, ULONG len, UINT8 y[16]) {
-        ULONG full = len / 16;
-        for (ULONG i = 0; i < full; ++i) {
-            for (ULONG j = 0; j < 16; ++j) y[j] ^= data[i * 16 + j];
-            UINT8 t[16];
-            gcm_gf_mul(y, H, t);
-            for (ULONG j = 0; j < 16; ++j) y[j] = t[j];
-        }
-        ULONG rem = len % 16;
-        if (rem) {
-            UINT8 last[16] = { 0 };
-            for (ULONG j = 0; j < rem; ++j) last[j] = data[full * 16 + j];
-            for (ULONG j = 0; j < 16; ++j) y[j] ^= last[j];
-            UINT8 t[16];
-            gcm_gf_mul(y, H, t);
-            for (ULONG j = 0; j < 16; ++j) y[j] = t[j];
-        }
-    }
-
-    __forceinline void sw_aes256_gcm_encrypt(
-        const UINT8 key[AES256_KEY_SIZE],
-        const UINT8 nonce[GCM_NONCE_SIZE],
-        const UINT8* aad, ULONG aad_len,
-        const UINT8* plaintext, ULONG plaintext_len,
-        UINT8* ciphertext_out,
-        UINT8 tag_out[GCM_TAG_SIZE])
-    {
-        aes256_ctx_t ctx;
-        aes256_set_encrypt_key(key, &ctx);
-
-        UINT8 H[16] = { 0 };
-        UINT8 zero_block[16] = { 0 };
-        aes256_encrypt_block(&ctx, zero_block, H);
-
-        UINT8 j0[16] = { 0 };
-        for (ULONG i = 0; i < GCM_NONCE_SIZE; ++i) j0[i] = nonce[i];
-        j0[15] = 1;
-
-        UINT8 ctr[16];
-        for (ULONG i = 0; i < 16; ++i) ctr[i] = j0[i];
-        gcm_inc32(ctr);
-
-        ULONG full = plaintext_len / 16;
-        ULONG rem = plaintext_len % 16;
-        for (ULONG i = 0; i < full; ++i) {
-            UINT8 ks[16];
-            aes256_encrypt_block(&ctx, ctr, ks);
-            for (ULONG j = 0; j < 16; ++j)
-                ciphertext_out[i * 16 + j] = plaintext[i * 16 + j] ^ ks[j];
-            gcm_inc32(ctr);
-        }
-        if (rem) {
-            UINT8 ks[16];
-            aes256_encrypt_block(&ctx, ctr, ks);
-            for (ULONG j = 0; j < rem; ++j)
-                ciphertext_out[full * 16 + j] = plaintext[full * 16 + j] ^ ks[j];
-        }
-
-        UINT8 y[16] = { 0 };
-        if (aad_len) ghash_update(H, aad, aad_len, y);
-        if (plaintext_len) ghash_update(H, ciphertext_out, plaintext_len, y);
-
-        UINT8 length_block[16];
-        UINT64 aad_bits = static_cast<UINT64>(aad_len) * 8;
-        UINT64 ct_bits  = static_cast<UINT64>(plaintext_len) * 8;
-        for (int i = 7; i >= 0; --i) length_block[7 - i]     = static_cast<UINT8>(aad_bits >> (i * 8));
-        for (int i = 7; i >= 0; --i) length_block[15 - i]    = static_cast<UINT8>(ct_bits  >> (i * 8));
-        for (ULONG j = 0; j < 16; ++j) y[j] ^= length_block[j];
-        UINT8 t[16];
-        gcm_gf_mul(y, H, t);
-        for (ULONG j = 0; j < 16; ++j) y[j] = t[j];
-
-        UINT8 ej0[16];
-        aes256_encrypt_block(&ctx, j0, ej0);
-        for (ULONG j = 0; j < GCM_TAG_SIZE; ++j) tag_out[j] = y[j] ^ ej0[j];
-
-        RtlSecureZeroMemory(&ctx, sizeof(ctx));
-        RtlSecureZeroMemory(H, sizeof(H));
-        RtlSecureZeroMemory(j0, sizeof(j0));
-        RtlSecureZeroMemory(y, sizeof(y));
-    }
-
-    __forceinline BOOLEAN sw_aes256_gcm_decrypt(
-        const UINT8 key[AES256_KEY_SIZE],
-        const UINT8 nonce[GCM_NONCE_SIZE],
-        const UINT8* aad, ULONG aad_len,
-        const UINT8* ciphertext, ULONG ciphertext_len,
-        const UINT8 tag[GCM_TAG_SIZE],
-        UINT8* plaintext_out)
-    {
-        aes256_ctx_t ctx;
-        aes256_set_encrypt_key(key, &ctx);
-
-        UINT8 H[16] = { 0 };
-        UINT8 zero_block[16] = { 0 };
-        aes256_encrypt_block(&ctx, zero_block, H);
-
-        UINT8 j0[16] = { 0 };
-        for (ULONG i = 0; i < GCM_NONCE_SIZE; ++i) j0[i] = nonce[i];
-        j0[15] = 1;
-
-        UINT8 y[16] = { 0 };
-        if (aad_len) ghash_update(H, aad, aad_len, y);
-        if (ciphertext_len) ghash_update(H, ciphertext, ciphertext_len, y);
-
-        UINT8 length_block[16];
-        UINT64 aad_bits = static_cast<UINT64>(aad_len) * 8;
-        UINT64 ct_bits  = static_cast<UINT64>(ciphertext_len) * 8;
-        for (int i = 7; i >= 0; --i) length_block[7 - i]   = static_cast<UINT8>(aad_bits >> (i * 8));
-        for (int i = 7; i >= 0; --i) length_block[15 - i]  = static_cast<UINT8>(ct_bits  >> (i * 8));
-        for (ULONG j = 0; j < 16; ++j) y[j] ^= length_block[j];
-        UINT8 t[16];
-        gcm_gf_mul(y, H, t);
-        for (ULONG j = 0; j < 16; ++j) y[j] = t[j];
-
-        UINT8 ej0[16];
-        aes256_encrypt_block(&ctx, j0, ej0);
-        UINT8 expected_tag[GCM_TAG_SIZE];
-        for (ULONG j = 0; j < GCM_TAG_SIZE; ++j) expected_tag[j] = y[j] ^ ej0[j];
-
-        volatile UINT8 diff = 0;
-        for (ULONG j = 0; j < GCM_TAG_SIZE; ++j) diff |= expected_tag[j] ^ tag[j];
-
-        if (diff != 0) {
-            RtlSecureZeroMemory(&ctx, sizeof(ctx));
-            RtlSecureZeroMemory(H, sizeof(H));
-            RtlSecureZeroMemory(j0, sizeof(j0));
-            RtlSecureZeroMemory(y, sizeof(y));
-            return FALSE;
-        }
-
-        UINT8 ctr[16];
-        for (ULONG i = 0; i < 16; ++i) ctr[i] = j0[i];
-        gcm_inc32(ctr);
-
-        ULONG full = ciphertext_len / 16;
-        ULONG rem = ciphertext_len % 16;
-        for (ULONG i = 0; i < full; ++i) {
-            UINT8 ks[16];
-            aes256_encrypt_block(&ctx, ctr, ks);
-            for (ULONG j = 0; j < 16; ++j)
-                plaintext_out[i * 16 + j] = ciphertext[i * 16 + j] ^ ks[j];
-            gcm_inc32(ctr);
-        }
-        if (rem) {
-            UINT8 ks[16];
-            aes256_encrypt_block(&ctx, ctr, ks);
-            for (ULONG j = 0; j < rem; ++j)
-                plaintext_out[full * 16 + j] = ciphertext[full * 16 + j] ^ ks[j];
-        }
-
-        RtlSecureZeroMemory(&ctx, sizeof(ctx));
-        RtlSecureZeroMemory(H, sizeof(H));
-        RtlSecureZeroMemory(j0, sizeof(j0));
-        RtlSecureZeroMemory(y, sizeof(y));
-        return TRUE;
-    }
-
     __forceinline NTSTATUS hmac_sha256(
         const UINT8* key, ULONG key_len,
         const UINT8* data, ULONG data_len,
@@ -656,6 +298,118 @@ namespace kernel_crypto
         if (!NT_SUCCESS(status)) return status;
 
         status = BCryptGenRandom(alg, buf, len, 0);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return status;
+    }
+
+    __forceinline NTSTATUS bcrypt_aes256_gcm_encrypt(
+        const UINT8 key[AES256_KEY_SIZE],
+        const UINT8 nonce[GCM_NONCE_SIZE],
+        const UINT8* aad, ULONG aad_len,
+        const UINT8* plaintext, ULONG plaintext_len,
+        UINT8* ciphertext_out,
+        UINT8 tag_out[GCM_TAG_SIZE])
+    {
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        BCRYPT_KEY_HANDLE hk  = nullptr;
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+        if (!NT_SUCCESS(status)) return status;
+
+        status = BCryptSetProperty(
+            alg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+            static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_GCM) + 1) * sizeof(wchar_t)),
+            0);
+        if (!NT_SUCCESS(status)) {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return status;
+        }
+
+        status = BCryptGenerateSymmetricKey(
+            alg, &hk, nullptr, 0,
+            const_cast<PUCHAR>(key), AES256_KEY_SIZE, 0);
+        if (!NT_SUCCESS(status)) {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return status;
+        }
+
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+        BCRYPT_INIT_AUTH_MODE_INFO(info);
+        info.pbNonce       = const_cast<PUCHAR>(nonce);
+        info.cbNonce       = GCM_NONCE_SIZE;
+        info.pbAuthData    = const_cast<PUCHAR>(aad);
+        info.cbAuthData    = aad_len;
+        info.pbTag         = tag_out;
+        info.cbTag         = GCM_TAG_SIZE;
+
+        ULONG bytes_done = 0;
+        status = BCryptEncrypt(
+            hk,
+            const_cast<PUCHAR>(plaintext), plaintext_len,
+            &info,
+            nullptr, 0,
+            ciphertext_out, plaintext_len,
+            &bytes_done, 0);
+
+        BCryptDestroyKey(hk);
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return status;
+    }
+
+    __forceinline NTSTATUS bcrypt_aes256_gcm_decrypt(
+        const UINT8 key[AES256_KEY_SIZE],
+        const UINT8 nonce[GCM_NONCE_SIZE],
+        const UINT8* aad, ULONG aad_len,
+        const UINT8* ciphertext, ULONG ciphertext_len,
+        const UINT8 tag[GCM_TAG_SIZE],
+        UINT8* plaintext_out)
+    {
+        BCRYPT_ALG_HANDLE alg = nullptr;
+        BCRYPT_KEY_HANDLE hk  = nullptr;
+
+        NTSTATUS status = BCryptOpenAlgorithmProvider(
+            &alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+        if (!NT_SUCCESS(status)) return status;
+
+        status = BCryptSetProperty(
+            alg, BCRYPT_CHAINING_MODE,
+            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+            static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_GCM) + 1) * sizeof(wchar_t)),
+            0);
+        if (!NT_SUCCESS(status)) {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return status;
+        }
+
+        status = BCryptGenerateSymmetricKey(
+            alg, &hk, nullptr, 0,
+            const_cast<PUCHAR>(key), AES256_KEY_SIZE, 0);
+        if (!NT_SUCCESS(status)) {
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return status;
+        }
+
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+        BCRYPT_INIT_AUTH_MODE_INFO(info);
+        info.pbNonce       = const_cast<PUCHAR>(nonce);
+        info.cbNonce       = GCM_NONCE_SIZE;
+        info.pbAuthData    = const_cast<PUCHAR>(aad);
+        info.cbAuthData    = aad_len;
+        info.pbTag         = const_cast<PUCHAR>(tag);
+        info.cbTag         = GCM_TAG_SIZE;
+
+        ULONG bytes_done = 0;
+        status = BCryptDecrypt(
+            hk,
+            const_cast<PUCHAR>(ciphertext), ciphertext_len,
+            &info,
+            nullptr, 0,
+            plaintext_out, ciphertext_len,
+            &bytes_done, 0);
+
+        BCryptDestroyKey(hk);
         BCryptCloseAlgorithmProvider(alg, 0);
         return status;
     }

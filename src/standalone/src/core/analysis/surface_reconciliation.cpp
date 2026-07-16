@@ -15,6 +15,10 @@ constexpr std::size_t k_default_maximum_findings = 10000;
 constexpr std::uint64_t k_default_maximum_severity = 1000;
 constexpr std::size_t k_default_maximum_identifier_bytes = 512;
 constexpr std::size_t k_default_maximum_text_bytes = 4096;
+constexpr std::size_t k_maximum_auxiliary_history_entries = 100000;
+constexpr std::size_t k_maximum_auxiliary_history_values = 100000;
+constexpr std::string_view k_auxiliary_security_incomplete_detail =
+    "security regression evidence is present but detailed auxiliary history is incomplete; auxiliary marker capacity and metric accounting failed closed";
 
 struct stable_code_entry_t {
     surface_error_code_t code;
@@ -199,24 +203,25 @@ std::vector<const typename Set::value_type*> sorted_set_entries(const Set& value
     return ordered;
 }
 
-bool has_finding(
+bool has_semantic_finding(
     const surface_reconciliation_result_t& result,
-    surface_error_code_t code, std::string_view identifier) {
+    surface_finding_semantic_t semantic) noexcept {
     return std::any_of(
         result.findings.begin(), result.findings.end(),
-        [code, identifier](const auto& finding) {
-            return finding.code == code && finding.identifier == identifier;
+        [semantic](const auto& finding) noexcept {
+            return finding.semantic == semantic;
         });
 }
 
-bool mandatory_finding(const surface_finding_t& finding) noexcept {
-    return finding.code == surface_error_code_t::finding_cap_exceeded ||
-           (finding.code == surface_error_code_t::internal_error &&
-            finding.identifier == "metrics_saturated");
-}
-
 std::uint8_t retention_class(const surface_finding_t& finding) noexcept {
-    if (mandatory_finding(finding))
+    if (finding.semantic ==
+        surface_finding_semantic_t::auxiliary_security_incomplete) {
+        return 5;
+    }
+    if (finding.semantic == surface_finding_semantic_t::metrics_saturation) {
+        return 4;
+    }
+    if (finding.semantic == surface_finding_semantic_t::finding_capacity)
         return 3;
     if (finding.code == surface_error_code_t::security_regression_detected)
         return 2;
@@ -226,11 +231,11 @@ std::uint8_t retention_class(const surface_finding_t& finding) noexcept {
 bool deterministic_evidence_before(
     const surface_finding_t& left, const surface_finding_t& right) noexcept {
     return std::tie(
-               left.code, left.identifier, left.canonical_path, left.detail,
-               left.kind, left.severity) <
+               left.code, left.semantic, left.identifier, left.canonical_path,
+               left.detail, left.kind, left.severity) <
            std::tie(
-               right.code, right.identifier, right.canonical_path, right.detail,
-               right.kind, right.severity);
+               right.code, right.semantic, right.identifier,
+               right.canonical_path, right.detail, right.kind, right.severity);
 }
 
 bool stronger_retention(
@@ -285,13 +290,36 @@ std::string_view surface_reconciliation_t::entry_kind_name(
     return "unknown";
 }
 
+std::string_view surface_reconciliation_t::auxiliary_collection_name(
+    auxiliary_marker_collection_t collection) noexcept {
+    switch (collection) {
+    case auxiliary_marker_collection_t::dead_replaced_paths:
+        return "dead_replaced_paths";
+    case auxiliary_marker_collection_t::duplicate_stores:
+        return "duplicate_stores";
+    case auxiliary_marker_collection_t::stale_registrations:
+        return "stale_registrations";
+    case auxiliary_marker_collection_t::old_schema_v8_writers:
+        return "old_schema_v8_writers";
+    case auxiliary_marker_collection_t::legacy_ast_flows:
+        return "legacy_ast_flows";
+    case auxiliary_marker_collection_t::unsupported_aliases:
+        return "unsupported_aliases";
+    case auxiliary_marker_collection_t::security_regressions:
+        return "security_regressions";
+    }
+    return "auxiliary_marker_history";
+}
+
 surface_finding_t surface_reconciliation_t::make_finding(
     surface_error_code_t code, std::string_view identifier,
     std::string detail, std::string canonical_path,
-    surface_entry_kind_t kind, std::uint64_t severity) const {
+    surface_entry_kind_t kind, std::uint64_t severity,
+    surface_finding_semantic_t semantic) const {
     surface_finding_t finding;
     finding.code = code;
     finding.stable_code = stable_code_for(code);
+    finding.semantic = semantic;
     finding.identifier = bounded_evidence(identifier, limits_.maximum_identifier_bytes);
     finding.detail = bounded_evidence(detail, limits_.maximum_text_bytes);
     finding.canonical_path = bounded_evidence(
@@ -309,7 +337,7 @@ surface_reconciliation_t::surface_reconciliation_t(
         limits_.maximum_entries = k_default_maximum_entries;
         limit_contract_valid_ = false;
     }
-    if (limits_.maximum_findings < 2 ||
+    if (limits_.maximum_findings == 0 ||
         limits_.maximum_findings > k_default_maximum_findings) {
         limits_.maximum_findings = k_default_maximum_findings;
         limit_contract_valid_ = false;
@@ -475,7 +503,7 @@ void surface_reconciliation_t::record_invalid_entry(
 
 void surface_reconciliation_t::record_invalid_marker(
     std::string_view collection, std::string_view identifier,
-    std::string_view reason) {
+    std::string_view reason) noexcept {
     const bool rejected_saturated = saturating_add(
         rejected_auxiliary_markers_, 1, limits_.maximum_metric_value);
     const bool malformed_saturated = saturating_add(
@@ -483,28 +511,170 @@ void surface_reconciliation_t::record_invalid_marker(
     if (rejected_saturated || malformed_saturated) {
         metrics_saturated_.store(true, std::memory_order_release);
     }
-    auto canonical_identifier = bounded_evidence(
-        identifier, limits_.maximum_identifier_bytes);
-    if (canonical_identifier.empty())
-        canonical_identifier = "<invalid>";
-    if (first_invalid_marker_reason_.empty() ||
-        std::tie(canonical_identifier, collection, reason) <
-            std::tie(first_invalid_marker_identifier_,
-                     first_invalid_marker_collection_,
-                     first_invalid_marker_reason_)) {
-        first_invalid_marker_identifier_ = std::move(canonical_identifier);
-        first_invalid_marker_collection_ = collection;
-        first_invalid_marker_reason_ = reason;
+    try {
+        auto canonical_identifier = bounded_evidence(
+            identifier, limits_.maximum_identifier_bytes);
+        if (canonical_identifier.empty())
+            canonical_identifier = "<invalid>";
+        if (first_invalid_marker_reason_.empty() ||
+            std::tie(canonical_identifier, collection, reason) <
+                std::tie(first_invalid_marker_identifier_,
+                         first_invalid_marker_collection_,
+                         first_invalid_marker_reason_)) {
+            first_invalid_marker_identifier_ = std::move(canonical_identifier);
+            first_invalid_marker_collection_ = collection;
+            first_invalid_marker_reason_ = reason;
+        }
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
     }
 }
 
-bool surface_reconciliation_t::reserve_auxiliary_marker(
-    std::string_view collection, std::string_view identifier,
-    bool security_priority) {
-    if (auxiliary_marker_count_ < limits_.maximum_entries) {
-        ++auxiliary_marker_count_;
-        return true;
+surface_reconciliation_t::auxiliary_marker_observation_t
+surface_reconciliation_t::observe_auxiliary_marker(
+    auxiliary_marker_collection_t collection,
+    std::string_view identifier, std::string_view value) noexcept {
+    auxiliary_marker_observation_t observation;
+    if (auxiliary_history_incomplete_)
+        return observation;
+    try {
+        auto key = std::make_pair(collection, std::string(identifier));
+        const auto found = auxiliary_marker_history_.find(key);
+        if (found == auxiliary_marker_history_.end()) {
+            if (auxiliary_marker_history_.size() >=
+                    k_maximum_auxiliary_history_entries ||
+                auxiliary_history_value_count_ >=
+                    k_maximum_auxiliary_history_values) {
+                enter_auxiliary_history_incomplete();
+                return observation;
+            }
+            auxiliary_marker_history_t state;
+            state.canonical_value = std::string(value);
+            const auto value_inserted =
+                state.distinct_values.emplace(std::string(value));
+            if (!value_inserted.second) {
+                enter_auxiliary_history_incomplete();
+                return observation;
+            }
+            const auto inserted = auxiliary_marker_history_.emplace(
+                std::move(key), std::move(state));
+            if (!inserted.second) {
+                enter_auxiliary_history_incomplete();
+                return observation;
+            }
+            ++auxiliary_history_value_count_;
+            observation.state = &inserted.first->second;
+            return observation;
+        }
+        auto& state = found->second;
+        if (state.distinct_values.find(value) != state.distinct_values.end()) {
+            observation.state = &state;
+            return observation;
+        }
+        if (auxiliary_history_value_count_ >=
+            k_maximum_auxiliary_history_values) {
+            enter_auxiliary_history_incomplete();
+            return observation;
+        }
+        const auto inserted = state.distinct_values.emplace(std::string(value));
+        if (!inserted.second) {
+            enter_auxiliary_history_incomplete();
+            return observation;
+        }
+        ++auxiliary_history_value_count_;
+        observation.conflict_started = state.distinct_values.size() == 2;
+        const bool prefer_value =
+            collection == auxiliary_marker_collection_t::security_regressions
+                ? value.size() > state.canonical_value.size() ||
+                      (value.size() == state.canonical_value.size() &&
+                       value < state.canonical_value)
+                : value < state.canonical_value;
+        if (prefer_value) {
+            auto replacement = std::string(value);
+            state.canonical_value.swap(replacement);
+        }
+        observation.state = &state;
+        return observation;
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
+        return observation;
     }
+}
+
+void surface_reconciliation_t::enter_auxiliary_history_incomplete() noexcept {
+    auxiliary_history_incomplete_ = true;
+    auxiliary_cap_exceeded_ = true;
+    auxiliary_capacity_incomplete_ = true;
+    metrics_saturated_.store(true, std::memory_order_release);
+    dead_replaced_paths_.clear();
+    duplicate_stores_.clear();
+    stale_registrations_.clear();
+    old_schema_v8_writers_.clear();
+    legacy_ast_flows_.clear();
+    unsupported_aliases_.clear();
+    security_regressions_.clear();
+    auxiliary_marker_history_.clear();
+    auxiliary_marker_count_ = 0;
+    auxiliary_history_value_count_ = 0;
+}
+
+bool surface_reconciliation_t::retained_auxiliary_marker(
+    auxiliary_marker_collection_t collection,
+    const std::string& identifier) const noexcept {
+    switch (collection) {
+    case auxiliary_marker_collection_t::dead_replaced_paths:
+        return dead_replaced_paths_.find(identifier) != dead_replaced_paths_.end();
+    case auxiliary_marker_collection_t::duplicate_stores:
+        return duplicate_stores_.find(identifier) != duplicate_stores_.end();
+    case auxiliary_marker_collection_t::stale_registrations:
+        return stale_registrations_.find(identifier) != stale_registrations_.end();
+    case auxiliary_marker_collection_t::old_schema_v8_writers:
+        return old_schema_v8_writers_.find(identifier) != old_schema_v8_writers_.end();
+    case auxiliary_marker_collection_t::legacy_ast_flows:
+        return legacy_ast_flows_.find(identifier) != legacy_ast_flows_.end();
+    case auxiliary_marker_collection_t::unsupported_aliases:
+        return unsupported_aliases_.find(identifier) != unsupported_aliases_.end();
+    case auxiliary_marker_collection_t::security_regressions:
+        return security_regressions_.find(identifier) != security_regressions_.end();
+    }
+    return false;
+}
+
+std::uint64_t surface_reconciliation_t::auxiliary_capacity_rejections(
+    bool& saturated) const noexcept {
+    std::uint64_t rejected = 0;
+    saturated = false;
+    for (const auto& [key, state] : auxiliary_marker_history_) {
+        if (retained_auxiliary_marker(key.first, key.second))
+            continue;
+        const auto weight = static_cast<std::uint64_t>(
+            state.distinct_values.size());
+        if (saturating_add(rejected, weight, limits_.maximum_metric_value))
+            saturated = true;
+    }
+    return rejected;
+}
+
+std::string_view surface_reconciliation_t::auxiliary_overflow_collection()
+    const noexcept {
+    if (auxiliary_history_incomplete_)
+        return "auxiliary_marker_history";
+    std::string_view canonical;
+    for (const auto& [key, state] : auxiliary_marker_history_) {
+        static_cast<void>(state);
+        if (retained_auxiliary_marker(key.first, key.second))
+            continue;
+        const auto collection = auxiliary_collection_name(key.first);
+        if (canonical.empty() || collection < canonical)
+            canonical = collection;
+    }
+    return canonical.empty() ? "auxiliary_markers" : canonical;
+}
+
+void surface_reconciliation_t::admit_auxiliary_marker() noexcept {
+    ++auxiliary_marker_count_;
+    if (auxiliary_marker_count_ <= limits_.maximum_entries)
+        return;
 
     struct marker_rank_t final {
         std::string_view collection;
@@ -523,7 +693,7 @@ bool surface_reconciliation_t::reserve_auxiliary_marker(
     const auto consider = [&weakest, &has_weakest, &stronger](
         std::string_view candidate_collection,
         const std::string& candidate_identifier,
-        bool candidate_security) {
+        bool candidate_security) noexcept {
         const marker_rank_t candidate{
             candidate_collection, candidate_identifier, candidate_security};
         if (!has_weakest || stronger(weakest, candidate)) {
@@ -544,45 +714,52 @@ bool surface_reconciliation_t::reserve_auxiliary_marker(
     for (const auto& marker : unsupported_aliases_)
         consider("unsupported_aliases", marker.first, false);
     for (const auto& marker : security_regressions_)
-        consider("security_regressions", marker.first, true);
+        consider("security_regressions", marker, true);
 
     auxiliary_cap_exceeded_ = true;
     auxiliary_capacity_incomplete_ = true;
-    if (saturating_add(
-            rejected_auxiliary_markers_, 1,
-            limits_.maximum_metric_value)) {
-        metrics_saturated_.store(true, std::memory_order_release);
+    const auto erase_map = [&weakest](auto& markers) noexcept {
+        const auto found = std::find_if(
+            markers.begin(), markers.end(), [&weakest](const auto& marker) noexcept {
+                return std::string_view(marker.first.data(), marker.first.size()) ==
+                       weakest.identifier;
+            });
+        if (found == markers.end())
+            return false;
+        markers.erase(found);
+        return true;
+    };
+    const auto erase_set = [&weakest](auto& markers) noexcept {
+        const auto found = std::find_if(
+            markers.begin(), markers.end(), [&weakest](const auto& marker) noexcept {
+                return std::string_view(marker.data(), marker.size()) ==
+                       weakest.identifier;
+            });
+        if (found == markers.end())
+            return false;
+        markers.erase(found);
+        return true;
+    };
+    bool erased = false;
+    if (has_weakest && weakest.collection == "dead_replaced_paths")
+        erased = erase_map(dead_replaced_paths_);
+    else if (has_weakest && weakest.collection == "duplicate_stores")
+        erased = erase_map(duplicate_stores_);
+    else if (has_weakest && weakest.collection == "stale_registrations")
+        erased = erase_set(stale_registrations_);
+    else if (has_weakest && weakest.collection == "old_schema_v8_writers")
+        erased = erase_map(old_schema_v8_writers_);
+    else if (has_weakest && weakest.collection == "legacy_ast_flows")
+        erased = erase_set(legacy_ast_flows_);
+    else if (has_weakest && weakest.collection == "unsupported_aliases")
+        erased = erase_map(unsupported_aliases_);
+    else if (has_weakest && weakest.collection == "security_regressions")
+        erased = erase_set(security_regressions_);
+    if (erased) {
+        --auxiliary_marker_count_;
+        return;
     }
-    const marker_rank_t incoming{
-        collection, identifier, security_priority};
-    if (!has_weakest || !stronger(incoming, weakest)) {
-        if (first_auxiliary_overflow_collection_.empty() ||
-            collection < first_auxiliary_overflow_collection_) {
-            first_auxiliary_overflow_collection_ = collection;
-        }
-        return false;
-    }
-
-    if (first_auxiliary_overflow_collection_.empty() ||
-        weakest.collection < first_auxiliary_overflow_collection_) {
-        first_auxiliary_overflow_collection_ = weakest.collection;
-    }
-    const auto evicted_identifier = std::string(weakest.identifier);
-    if (weakest.collection == "dead_replaced_paths")
-        dead_replaced_paths_.erase(evicted_identifier);
-    else if (weakest.collection == "duplicate_stores")
-        duplicate_stores_.erase(evicted_identifier);
-    else if (weakest.collection == "stale_registrations")
-        stale_registrations_.erase(evicted_identifier);
-    else if (weakest.collection == "old_schema_v8_writers")
-        old_schema_v8_writers_.erase(evicted_identifier);
-    else if (weakest.collection == "legacy_ast_flows")
-        legacy_ast_flows_.erase(evicted_identifier);
-    else if (weakest.collection == "unsupported_aliases")
-        unsupported_aliases_.erase(evicted_identifier);
-    else
-        security_regressions_.erase(evicted_identifier);
-    return true;
+    enter_auxiliary_history_incomplete();
 }
 
 void surface_reconciliation_t::register_baseline_entry(
@@ -648,26 +825,36 @@ void surface_reconciliation_t::mark_dead_replaced_path(
             "dead_replaced_paths", identifier, "self_replacement");
         return;
     }
-    const auto found = dead_replaced_paths_.find(std::string(identifier));
-    if (found != dead_replaced_paths_.end()) {
-        if (found->second.first != replaced_by) {
-            if (!found->second.second) {
-                record_invalid_marker(
-                    "dead_replaced_paths", identifier,
-                    "conflicting_duplicate_marker");
-                found->second.second = true;
-            }
-            if (replaced_by < found->second.first)
-                found->second.first = std::string(replaced_by);
-        }
+    const auto observation = observe_auxiliary_marker(
+        auxiliary_marker_collection_t::dead_replaced_paths,
+        identifier, replaced_by);
+    if (observation.state == nullptr)
         return;
+    if (observation.conflict_started) {
+        record_invalid_marker(
+            "dead_replaced_paths", identifier,
+            "conflicting_duplicate_marker");
+        if (auxiliary_history_incomplete_)
+            return;
     }
-    if (!reserve_auxiliary_marker(
-            "dead_replaced_paths", identifier, false))
-        return;
-    dead_replaced_paths_.emplace(
-        std::string(identifier),
-        std::make_pair(std::string(replaced_by), false));
+    try {
+        auto key = std::string(identifier);
+        const auto found = dead_replaced_paths_.find(key);
+        if (found != dead_replaced_paths_.end()) {
+            found->second.first = observation.state->canonical_value;
+            found->second.second = observation.state->conflicting();
+            return;
+        }
+        const bool inserted = dead_replaced_paths_.emplace(
+            std::move(key),
+            std::make_pair(
+                observation.state->canonical_value,
+                observation.state->conflicting())).second;
+        if (inserted)
+            admit_auxiliary_marker();
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
+    }
 }
 
 void surface_reconciliation_t::mark_duplicate_store(
@@ -682,25 +869,36 @@ void surface_reconciliation_t::mark_duplicate_store(
             "duplicate_stores", identifier, "invalid_duplicate_store_marker");
         return;
     }
-    const auto found = duplicate_stores_.find(std::string(identifier));
-    if (found != duplicate_stores_.end()) {
-        if (found->second.first != other_path) {
-            if (!found->second.second) {
-                record_invalid_marker(
-                    "duplicate_stores", identifier,
-                    "conflicting_duplicate_marker");
-                found->second.second = true;
-            }
-            if (other_path < found->second.first)
-                found->second.first = std::string(other_path);
-        }
+    const auto observation = observe_auxiliary_marker(
+        auxiliary_marker_collection_t::duplicate_stores,
+        identifier, other_path);
+    if (observation.state == nullptr)
         return;
+    if (observation.conflict_started) {
+        record_invalid_marker(
+            "duplicate_stores", identifier,
+            "conflicting_duplicate_marker");
+        if (auxiliary_history_incomplete_)
+            return;
     }
-    if (!reserve_auxiliary_marker(
-            "duplicate_stores", identifier, false))
-        return;
-    duplicate_stores_.emplace(
-        std::string(identifier), std::make_pair(std::string(other_path), false));
+    try {
+        auto key = std::string(identifier);
+        const auto found = duplicate_stores_.find(key);
+        if (found != duplicate_stores_.end()) {
+            found->second.first = observation.state->canonical_value;
+            found->second.second = observation.state->conflicting();
+            return;
+        }
+        const bool inserted = duplicate_stores_.emplace(
+            std::move(key),
+            std::make_pair(
+                observation.state->canonical_value,
+                observation.state->conflicting())).second;
+        if (inserted)
+            admit_auxiliary_marker();
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
+    }
 }
 
 void surface_reconciliation_t::mark_stale_registration(
@@ -715,14 +913,22 @@ void surface_reconciliation_t::mark_stale_registration(
             "stale_registrations", identifier, "invalid_identifier");
         return;
     }
-    if (stale_registrations_.find(std::string(identifier)) !=
-        stale_registrations_.end()) {
+    const auto observation = observe_auxiliary_marker(
+        auxiliary_marker_collection_t::stale_registrations,
+        identifier, {});
+    if (observation.state == nullptr)
         return;
+    try {
+        auto key = std::string(identifier);
+        if (stale_registrations_.find(key) != stale_registrations_.end())
+            return;
+        const bool inserted =
+            stale_registrations_.emplace(std::move(key)).second;
+        if (inserted)
+            admit_auxiliary_marker();
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
     }
-    if (!reserve_auxiliary_marker(
-            "stale_registrations", identifier, false))
-        return;
-    stale_registrations_.emplace(std::string(identifier));
 }
 
 void surface_reconciliation_t::mark_old_schema_v8_writer(
@@ -737,26 +943,36 @@ void surface_reconciliation_t::mark_old_schema_v8_writer(
             "old_schema_v8_writers", identifier, "invalid_schema_marker");
         return;
     }
-    const auto found = old_schema_v8_writers_.find(std::string(identifier));
-    if (found != old_schema_v8_writers_.end()) {
-        if (found->second.first != canonical_path) {
-            if (!found->second.second) {
-                record_invalid_marker(
-                    "old_schema_v8_writers", identifier,
-                    "conflicting_duplicate_marker");
-                found->second.second = true;
-            }
-            if (canonical_path < found->second.first)
-                found->second.first = std::string(canonical_path);
-        }
+    const auto observation = observe_auxiliary_marker(
+        auxiliary_marker_collection_t::old_schema_v8_writers,
+        identifier, canonical_path);
+    if (observation.state == nullptr)
         return;
+    if (observation.conflict_started) {
+        record_invalid_marker(
+            "old_schema_v8_writers", identifier,
+            "conflicting_duplicate_marker");
+        if (auxiliary_history_incomplete_)
+            return;
     }
-    if (!reserve_auxiliary_marker(
-            "old_schema_v8_writers", identifier, false))
-        return;
-    old_schema_v8_writers_.emplace(
-        std::string(identifier),
-        std::make_pair(std::string(canonical_path), false));
+    try {
+        auto key = std::string(identifier);
+        const auto found = old_schema_v8_writers_.find(key);
+        if (found != old_schema_v8_writers_.end()) {
+            found->second.first = observation.state->canonical_value;
+            found->second.second = observation.state->conflicting();
+            return;
+        }
+        const bool inserted = old_schema_v8_writers_.emplace(
+            std::move(key),
+            std::make_pair(
+                observation.state->canonical_value,
+                observation.state->conflicting())).second;
+        if (inserted)
+            admit_auxiliary_marker();
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
+    }
 }
 
 void surface_reconciliation_t::mark_legacy_invalid_ast_flow(
@@ -770,12 +986,22 @@ void surface_reconciliation_t::mark_legacy_invalid_ast_flow(
         record_invalid_marker("legacy_ast_flows", identifier, "invalid_identifier");
         return;
     }
-    if (legacy_ast_flows_.find(std::string(identifier)) != legacy_ast_flows_.end())
+    const auto observation = observe_auxiliary_marker(
+        auxiliary_marker_collection_t::legacy_ast_flows,
+        identifier, {});
+    if (observation.state == nullptr)
         return;
-    if (!reserve_auxiliary_marker(
-            "legacy_ast_flows", identifier, false))
-        return;
-    legacy_ast_flows_.emplace(std::string(identifier));
+    try {
+        auto key = std::string(identifier);
+        if (legacy_ast_flows_.find(key) != legacy_ast_flows_.end())
+            return;
+        const bool inserted =
+            legacy_ast_flows_.emplace(std::move(key)).second;
+        if (inserted)
+            admit_auxiliary_marker();
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
+    }
 }
 
 void surface_reconciliation_t::mark_unsupported_alias(
@@ -795,26 +1021,36 @@ void surface_reconciliation_t::mark_unsupported_alias(
             "unsupported_aliases", alias, "self_replacement");
         return;
     }
-    const auto found = unsupported_aliases_.find(std::string(alias));
-    if (found != unsupported_aliases_.end()) {
-        if (found->second.first != canonical_name) {
-            if (!found->second.second) {
-                record_invalid_marker(
-                    "unsupported_aliases", alias,
-                    "conflicting_duplicate_marker");
-                found->second.second = true;
-            }
-            if (canonical_name < found->second.first)
-                found->second.first = std::string(canonical_name);
-        }
+    const auto observation = observe_auxiliary_marker(
+        auxiliary_marker_collection_t::unsupported_aliases,
+        alias, canonical_name);
+    if (observation.state == nullptr)
         return;
+    if (observation.conflict_started) {
+        record_invalid_marker(
+            "unsupported_aliases", alias,
+            "conflicting_duplicate_marker");
+        if (auxiliary_history_incomplete_)
+            return;
     }
-    if (!reserve_auxiliary_marker(
-            "unsupported_aliases", alias, false))
-        return;
-    unsupported_aliases_.emplace(
-        std::string(alias),
-        std::make_pair(std::string(canonical_name), false));
+    try {
+        auto key = std::string(alias);
+        const auto found = unsupported_aliases_.find(key);
+        if (found != unsupported_aliases_.end()) {
+            found->second.first = observation.state->canonical_value;
+            found->second.second = observation.state->conflicting();
+            return;
+        }
+        const bool inserted = unsupported_aliases_.emplace(
+            std::move(key),
+            std::make_pair(
+                observation.state->canonical_value,
+                observation.state->conflicting())).second;
+        if (inserted)
+            admit_auxiliary_marker();
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
+    }
 }
 
 void surface_reconciliation_t::mark_security_regression(
@@ -829,29 +1065,30 @@ void surface_reconciliation_t::mark_security_regression(
             "security_regressions", identifier, "invalid_security_marker");
         return;
     }
-    const auto found = security_regressions_.find(std::string(identifier));
-    if (found != security_regressions_.end()) {
-        if (found->second.first != detail) {
-            if (!found->second.second) {
-                record_invalid_marker(
-                    "security_regressions", identifier,
-                    "conflicting_duplicate_marker");
-                found->second.second = true;
-            }
-            const bool stronger_detail =
-                detail.size() > found->second.first.size() ||
-                (detail.size() == found->second.first.size() &&
-                 detail < found->second.first);
-            if (stronger_detail)
-                found->second.first = std::string(detail);
-        }
+    security_marker_observed_ = true;
+    const auto observation = observe_auxiliary_marker(
+        auxiliary_marker_collection_t::security_regressions,
+        identifier, detail);
+    if (observation.state == nullptr)
         return;
+    if (observation.conflict_started) {
+        record_invalid_marker(
+            "security_regressions", identifier,
+            "conflicting_duplicate_marker");
+        if (auxiliary_history_incomplete_)
+            return;
     }
-    if (!reserve_auxiliary_marker(
-            "security_regressions", identifier, true))
-        return;
-    security_regressions_.emplace(
-        std::string(identifier), std::make_pair(std::string(detail), false));
+    try {
+        auto key = std::string(identifier);
+        if (security_regressions_.find(key) != security_regressions_.end())
+            return;
+        const bool inserted =
+            security_regressions_.emplace(std::move(key)).second;
+        if (inserted)
+            admit_auxiliary_marker();
+    } catch (...) {
+        enter_auxiliary_history_incomplete();
+    }
 }
 
 void surface_reconciliation_t::append_finding(
@@ -867,6 +1104,7 @@ void surface_reconciliation_t::append_finding(
             result.findings.begin(), result.findings.end(),
             [&finding](const auto& candidate) {
                 return candidate.code == finding.code &&
+                       candidate.semantic == finding.semantic &&
                        candidate.identifier == finding.identifier;
             });
         if (existing != result.findings.end()) {
@@ -935,7 +1173,7 @@ void surface_reconciliation_t::append_input_contract_findings(
                 ", malformed=", std::to_string(malformed_entries_)}),
             "", surface_entry_kind_t::source_file, 950));
     }
-    if (malformed_markers_ != 0) {
+    if (!auxiliary_history_incomplete_ && malformed_markers_ != 0) {
         append_finding(result, make_finding(
             surface_error_code_t::invalid_surface_marker,
             first_invalid_marker_identifier_,
@@ -949,25 +1187,30 @@ void surface_reconciliation_t::append_input_contract_findings(
     if (auxiliary_cap_exceeded_) {
         append_finding(result, make_finding(
             surface_error_code_t::auxiliary_marker_cap_exceeded,
-            first_auxiliary_overflow_collection_,
+            auxiliary_overflow_collection(),
             bounded_concat(limits_.maximum_text_bytes, {
-                "shared auxiliary marker capacity exceeded; attempted=",
+                auxiliary_history_incomplete_
+                    ? "auxiliary marker history capacity exceeded; detailed marker state is unavailable; attempted="
+                    : "shared auxiliary marker capacity exceeded; attempted=",
                 std::to_string(attempted_auxiliary_markers_), ", rejected=",
-                std::to_string(rejected_auxiliary_markers_)}),
+                std::to_string(result.rejected_auxiliary_markers)}),
             "", surface_entry_kind_t::contract_registration, 900));
     }
 }
 
 void surface_reconciliation_t::append_metrics_saturation_finding(
     surface_reconciliation_result_t& result) const {
-    if (has_finding(result, surface_error_code_t::internal_error, "metrics_saturated"))
+    if (has_semantic_finding(
+            result, surface_finding_semantic_t::metrics_saturation)) {
         return;
+    }
     append_finding(result, make_finding(
         surface_error_code_t::internal_error, "metrics_saturated",
         bounded_concat(limits_.maximum_text_bytes, {
             "one or more reconciliation metrics reached the configured ceiling of ",
             std::to_string(limits_.maximum_metric_value)}),
-        "", surface_entry_kind_t::contract_registration, 1000));
+        "", surface_entry_kind_t::contract_registration, 1000,
+        surface_finding_semantic_t::metrics_saturation));
 }
 
 void surface_reconciliation_t::finalize_finding_cap(
@@ -979,8 +1222,7 @@ void surface_reconciliation_t::finalize_finding_cap(
         auto found = std::find_if(
             result.findings.begin(), result.findings.end(),
             [&marker](const auto& finding) {
-                return finding.code == marker.code &&
-                       finding.identifier == marker.identifier;
+                return finding.semantic == marker.semantic;
             });
         if (found != result.findings.end())
             return;
@@ -999,20 +1241,23 @@ void surface_reconciliation_t::finalize_finding_cap(
             [](const auto& left, const auto& right) {
                 return stronger_retention(right, left);
             });
-        if (replace == result.findings.end() || mandatory_finding(*replace))
-            return;
+        const bool replace_existing =
+            replace != result.findings.end() &&
+            stronger_retention(marker, *replace);
         if (saturating_add(
                 result.findings_discarded, 1,
                 limits_.maximum_metric_value)) {
             result.metrics_saturated = true;
             metrics_saturated_.store(true, std::memory_order_release);
         }
-        *replace = std::move(marker);
+        if (replace_existing)
+            *replace = std::move(marker);
     };
 
     install(make_finding(
         surface_error_code_t::finding_cap_exceeded, "surface_findings", "",
-        "", surface_entry_kind_t::contract_registration, 1000));
+        "", surface_entry_kind_t::contract_registration, 1000,
+        surface_finding_semantic_t::finding_capacity));
     if (result.metrics_saturated ||
         metrics_saturated_.load(std::memory_order_acquire)) {
         result.metrics_saturated = true;
@@ -1021,11 +1266,13 @@ void surface_reconciliation_t::finalize_finding_cap(
             bounded_concat(limits_.maximum_text_bytes, {
                 "one or more reconciliation metrics reached the configured ceiling of ",
                 std::to_string(limits_.maximum_metric_value)}),
-            "", surface_entry_kind_t::contract_registration, 1000));
+            "", surface_entry_kind_t::contract_registration, 1000,
+            surface_finding_semantic_t::metrics_saturation));
     }
     auto cap_marker = std::find_if(
         result.findings.begin(), result.findings.end(), [](const auto& finding) {
-            return finding.code == surface_error_code_t::finding_cap_exceeded;
+            return finding.semantic ==
+                   surface_finding_semantic_t::finding_capacity;
         });
     if (cap_marker == result.findings.end())
         return;
@@ -1152,19 +1399,34 @@ surface_reconciliation_t::validate_marker_targets(
         if (!marker.second.second)
             ++proof_collection_counts[marker.first];
     }
+    std::unordered_set<std::string> conflicting_proofs;
+    conflicting_proofs.reserve(
+        proof_collection_counts.size() + dead_replaced_paths_.size() +
+        unsupported_aliases_.size() + old_schema_v8_writers_.size());
+    for (const auto& marker : dead_replaced_paths_) {
+        if (marker.second.second)
+            conflicting_proofs.insert(marker.first);
+    }
+    for (const auto& marker : unsupported_aliases_) {
+        if (marker.second.second)
+            conflicting_proofs.insert(marker.first);
+    }
+    for (const auto& marker : old_schema_v8_writers_) {
+        if (marker.second.second)
+            conflicting_proofs.insert(marker.first);
+    }
     std::vector<std::string> conflicting_proof_identifiers;
     conflicting_proof_identifiers.reserve(proof_collection_counts.size());
     for (const auto& [identifier, count] : proof_collection_counts) {
-        if (count > 1)
+        if (count > 1) {
             conflicting_proof_identifiers.push_back(identifier);
+            conflicting_proofs.insert(identifier);
+        }
     }
     std::sort(
         conflicting_proof_identifiers.begin(),
         conflicting_proof_identifiers.end());
-    std::unordered_set<std::string> conflicting_proofs;
-    conflicting_proofs.reserve(conflicting_proof_identifiers.size());
     for (const auto& identifier : conflicting_proof_identifiers) {
-        conflicting_proofs.insert(identifier);
         const auto marker_count = static_cast<std::uint64_t>(
             proof_collection_counts.at(identifier));
         reject(
@@ -1844,13 +2106,28 @@ void surface_reconciliation_t::check_security_regressions(
                 entry->security_note}),
             entry->canonical_path, surface_entry_kind_t::security_guard, 900));
     }
-    for (const auto* marker : sorted_map_entries(security_regressions_)) {
+    if (auxiliary_history_incomplete_ && security_marker_observed_) {
         append_finding(result, make_finding(
             surface_error_code_t::security_regression_detected,
-            marker->first,
-            bounded_concat(limits_.maximum_text_bytes, {
-                "security regression: ", marker->second.first}),
-            "", surface_entry_kind_t::security_guard, 900));
+            "auxiliary_security_evidence",
+            std::string(k_auxiliary_security_incomplete_detail),
+            "", surface_entry_kind_t::security_guard, 1000,
+            surface_finding_semantic_t::auxiliary_security_incomplete));
+    } else {
+        for (const auto& [key, state] : auxiliary_marker_history_) {
+            if (key.first !=
+                    auxiliary_marker_collection_t::security_regressions ||
+                (!state.conflicting() &&
+                 !retained_auxiliary_marker(key.first, key.second))) {
+                continue;
+            }
+            append_finding(result, make_finding(
+                surface_error_code_t::security_regression_detected,
+                key.second,
+                bounded_concat(limits_.maximum_text_bytes, {
+                    "security regression: ", state.canonical_value}),
+                "", surface_entry_kind_t::security_guard, 900));
+        }
     }
     const auto baseline = sorted_entries(baseline_);
     std::unordered_map<std::string, std::pair<std::size_t, std::size_t>>
@@ -1932,6 +2209,22 @@ surface_reconciliation_result_t surface_reconciliation_t::reconcile() const {
     result.rejected_auxiliary_markers = rejected_auxiliary_markers_;
     result.malformed_entries = malformed_entries_;
     result.malformed_markers = malformed_markers_;
+    if (auxiliary_history_incomplete_) {
+        result.rejected_auxiliary_markers = limits_.maximum_metric_value;
+        result.malformed_markers = 0;
+        result.metrics_saturated = true;
+        metrics_saturated_.store(true, std::memory_order_release);
+    } else {
+        bool capacity_saturated = false;
+        const auto capacity_rejections =
+            auxiliary_capacity_rejections(capacity_saturated);
+        if (saturating_add(
+                result.rejected_auxiliary_markers, capacity_rejections,
+                limits_.maximum_metric_value) || capacity_saturated) {
+            result.metrics_saturated = true;
+            metrics_saturated_.store(true, std::memory_order_release);
+        }
+    }
     result.limits_invalid = !limit_contract_valid_;
     result.baseline_cap_exceeded = baseline_cap_exceeded_;
     result.actual_cap_exceeded = actual_cap_exceeded_;
@@ -1960,6 +2253,25 @@ surface_reconciliation_result_t surface_reconciliation_t::reconcile() const {
     check_unsupported_aliases(result, marker_target_proof);
     check_security_regressions(result);
     check_unexplained_removals(result);
+
+    if (result.auxiliary_cap_exceeded) {
+        const auto capacity_finding = std::find_if(
+            result.findings.begin(), result.findings.end(),
+            [](const auto& finding) {
+                return finding.code ==
+                       surface_error_code_t::auxiliary_marker_cap_exceeded;
+            });
+        if (capacity_finding != result.findings.end()) {
+            capacity_finding->detail = bounded_concat(
+                limits_.maximum_text_bytes, {
+                    auxiliary_history_incomplete_
+                        ? "auxiliary marker history capacity exceeded; detailed marker state is unavailable; attempted="
+                        : "shared auxiliary marker capacity exceeded; attempted=",
+                    std::to_string(result.attempted_auxiliary_markers),
+                    ", rejected=",
+                    std::to_string(result.rejected_auxiliary_markers)});
+        }
+    }
 
     if (saturating_atomic_add(
             reconciliations_, 1, limits_.maximum_metric_value)) {
@@ -2002,11 +2314,12 @@ surface_reconciliation_result_t surface_reconciliation_t::reconcile() const {
     std::sort(result.findings.begin(), result.findings.end(), [](const auto& left,
                                                                  const auto& right) {
         return std::tie(
-                   left.code, left.identifier, left.canonical_path, left.detail,
-                   left.kind, left.severity) <
+                   left.code, left.semantic, left.identifier,
+                   left.canonical_path, left.detail, left.kind, left.severity) <
                std::tie(
-                   right.code, right.identifier, right.canonical_path, right.detail,
-                   right.kind, right.severity);
+                   right.code, right.semantic, right.identifier,
+                   right.canonical_path, right.detail, right.kind,
+                   right.severity);
     });
     return result;
 }

@@ -247,6 +247,18 @@ public:
         const document_local_cursor_t& cursor,
         workbench_shell_workspace_context_t& output);
 
+    workbench_error_t publish_selection(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        const selection_context_t& selection,
+        const document_local_cursor_t& cursor,
+        navigation_origin_t origin,
+        workbench_shell_workspace_context_t& output);
+
+    workbench_error_t navigate_history(
+        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+        bool forward,
+        workbench_shell_workspace_context_t& output);
+
     workbench_error_t dispatch_host_command(
         const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
         document_host::document_host_dispatch_t dispatch,

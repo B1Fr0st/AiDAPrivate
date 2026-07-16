@@ -1,7 +1,6 @@
 #include "hex_view.hpp"
 
 #include "../analysis/workspace/overlay_journal.hpp"
-#include "../../helpers/globals.h"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/hex_preview_adapter.hpp"
 #else
@@ -9,6 +8,7 @@
 #include "standalone_driver.hpp"
 #endif
 #include "../ui/components.hpp"
+#include "../ui/application_view_registry.hpp"
 #include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
 
@@ -1160,7 +1160,8 @@ void render(float, float, float width, float height,
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
                             aida::preview::hex::opened_disassembly(offset);
 #else
-                            globals::ui::active_center_view = center_view_t::disassembly;
+                            aida::ui::application_views::open_or_focus(
+                                aida::ui::stable_view_id_t("document.disassembly"));
 #endif
                         }
                     }

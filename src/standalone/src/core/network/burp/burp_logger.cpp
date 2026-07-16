@@ -54,6 +54,9 @@ struct ring_t
     size_t                                       count = 0;
     size_t                                       cap = 100000;
     std::atomic<uint64_t>                        next_id{1};
+    std::atomic<uint64_t>                        generation{1};
+    std::atomic<uint64_t>                        recorded_rows{0};
+    std::atomic<uint64_t>                        query_count{0};
     std::atomic<bool>                            initialized{false};
     aida::events::subscription_handle_t          sub;
 };
@@ -263,6 +266,7 @@ void shutdown()
     r.rows.clear();
     r.count = 0;
     r.write_idx = 0;
+    r.generation.fetch_add(1, std::memory_order_release);
     diag::log_tagged_fmt("logger", "shutdown done cleared=%zu", n);
 }
 
@@ -284,18 +288,23 @@ uint64_t record(source_t src, const exchange_observed_t& ex)
     row.source          = src;
     row.exchange_id     = ex.id;
     uint64_t id = row.id;
-    diag::log_tagged_fmt("logger", "record id=%llu method=%s host=%s status=%d latency_ms=%llu src=%s",
-        static_cast<unsigned long long>(id), row.method.c_str(), row.host.c_str(),
-        row.status, static_cast<unsigned long long>(row.latency_ms), source_label(src));
+    const uint64_t recorded = r.recorded_rows.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (recorded == 1 || (recorded & 0x3ffULL) == 0ULL)
+        diag::log_tagged_fmt("logger", "record_summary recorded=%llu latest_id=%llu method=%s host=%s status=%d latency_ms=%llu src=%s",
+            static_cast<unsigned long long>(recorded), static_cast<unsigned long long>(id),
+            row.method.c_str(), row.host.c_str(), row.status,
+            static_cast<unsigned long long>(row.latency_ms), source_label(src));
     std::lock_guard<std::mutex> lk(r.mtx);
     push_locked(r, std::move(row));
+    r.generation.fetch_add(1, std::memory_order_release);
     return id;
 }
 
 std::vector<log_row_t> query(const log_filter_t& f, size_t limit)
 {
-    diag::log_tagged_fmt("logger", "query entry limit=%zu method=%s status_min=%d status_max=%d",
-        limit, f.method.c_str(), f.status_min, f.status_max);
+    const auto started = std::chrono::steady_clock::now();
+    auto& r = ring();
+    const uint64_t query_number = r.query_count.fetch_add(1, std::memory_order_relaxed) + 1;
     std::vector<log_row_t> all = snapshot_chronological();
     std::vector<log_row_t> out;
     out.reserve(all.size());
@@ -306,7 +315,13 @@ std::vector<log_row_t> query(const log_filter_t& f, size_t limit)
             if (limit > 0 && out.size() >= limit) break;
         }
     }
-    diag::log_tagged_fmt("logger", "query result total=%zu matching=%zu", all.size(), out.size());
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    if (query_number == 1 || (query_number % 100ULL) == 0ULL || elapsed_us >= 2000)
+        diag::log_tagged_fmt("logger", "query_summary queries=%llu limit=%zu method=%s status_min=%d status_max=%d total=%zu matching=%zu object_bytes=%zu elapsed_us=%lld",
+            static_cast<unsigned long long>(query_number), limit, f.method.c_str(), f.status_min,
+            f.status_max, all.size(), out.size(), out.size() * sizeof(log_row_t),
+            static_cast<long long>(elapsed_us));
     return out;
 }
 
@@ -370,6 +385,7 @@ bool import_rows(const std::vector<log_row_t>& rows, bool replace_existing)
     }
     if (max_id >= r.next_id.load())
         r.next_id.store(max_id + 1);
+    r.generation.fetch_add(1, std::memory_order_release);
     return true;
 }
 
@@ -378,8 +394,12 @@ size_t total_rows()
     auto& r = ring();
     std::lock_guard<std::mutex> lk(r.mtx);
     size_t n = r.count;
-    diag::log_tagged_fmt("logger", "total_rows result=%zu", n);
     return n;
+}
+
+uint64_t generation()
+{
+    return ring().generation.load(std::memory_order_acquire);
 }
 
 void clear()
@@ -391,6 +411,7 @@ void clear()
     r.rows.clear();
     r.count = 0;
     r.write_idx = 0;
+    r.generation.fetch_add(1, std::memory_order_release);
     diag::log_tagged_fmt("logger", "clear done cleared=%zu", n);
 }
 
@@ -538,6 +559,7 @@ void set_capacity(size_t rows)
     r.rows = std::move(chronological);
     r.count = r.rows.size();
     r.write_idx = r.count % r.cap;
+    r.generation.fetch_add(1, std::memory_order_release);
     diag::log_tagged_fmt("logger", "set_capacity done old=%zu new=%zu current_count=%zu", old_cap, rows, r.count);
 }
 
@@ -546,7 +568,6 @@ size_t capacity()
     auto& r = ring();
     std::lock_guard<std::mutex> lk(r.mtx);
     size_t cap = r.cap;
-    diag::log_tagged_fmt("logger", "capacity result=%zu", cap);
     return cap;
 }
 

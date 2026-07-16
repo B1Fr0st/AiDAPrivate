@@ -457,6 +457,7 @@ namespace detail {
 
     inline void check_function_window_timeouts()
     {
+        std::lock_guard<std::mutex> wlk(g_function_window_mtx());
         auto& wins = g_function_windows();
         uint64_t now = GetTickCount64();
         for (int i = 0; i < 4; ++i)
@@ -516,6 +517,8 @@ namespace detail {
                 }
             }
 
+            DWORD stale_tid = wins[i].thread_id;
+
             wins[i].active = false;
             wins[i].base_addr = 0;
             wins[i].size = 0;
@@ -523,6 +526,15 @@ namespace detail {
             wins[i].decrypt_tsc = 0;
             wins[i].thread_id = 0;
             wins[i].start_tick = 0;
+
+            diag::log_tagged_critical_fmt("code_encrypt",
+                "stale_window_reencrypted slot=%d base=0x%llX size=%u elapsed=%llums tid=%u",
+                i, (unsigned long long)func_base, func_size,
+                (unsigned long long)elapsed, stale_tid);
+            webhook::write_log_critical_fmt("code_encrypt",
+                "stale_window_reencrypted slot=%d base=0x%llX size=%u elapsed=%llums tid=%u",
+                i, (unsigned long long)func_base, func_size,
+                (unsigned long long)elapsed, stale_tid);
         }
     }
 
@@ -956,6 +968,8 @@ inline void encrypt_region(uint64_t base, uint32_t size, const char* section_nam
 inline void rotate_keys()
 {
     std::lock_guard<std::mutex> lk(detail::page_mtx());
+
+    detail::check_function_window_timeouts();
 
     uint8_t new_ikm[32];
     BCryptGenRandom(nullptr, new_ikm, 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);

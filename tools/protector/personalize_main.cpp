@@ -10,10 +10,53 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
+
+static int b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
+    out.clear();
+    if (in.empty()) return false;
+    std::string s;
+    s.reserve(in.size());
+    for (char c : in) {
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+        s.push_back(c);
+    }
+    if (s.size() % 4 != 0) {
+        size_t pad = 4 - (s.size() % 4);
+        for (size_t i = 0; i < pad; ++i) s.push_back('=');
+    }
+    if (s.size() % 4 != 0) return false;
+    out.reserve((s.size() / 4) * 3);
+    for (size_t i = 0; i < s.size(); i += 4) {
+        int v0 = b64_val(s[i]);
+        int v1 = b64_val(s[i + 1]);
+        if (v0 < 0 || v1 < 0) return false;
+        out.push_back(static_cast<uint8_t>((v0 << 2) | (v1 >> 4)));
+        if (s[i + 2] == '=') break;
+        int v2 = b64_val(s[i + 2]);
+        if (v2 < 0) return false;
+        out.push_back(static_cast<uint8_t>(((v1 & 0x0F) << 4) | (v2 >> 2)));
+        if (s[i + 3] == '=') break;
+        int v3 = b64_val(s[i + 3]);
+        if (v3 < 0) return false;
+        out.push_back(static_cast<uint8_t>(((v2 & 0x03) << 6) | v3));
+    }
+    return true;
+}
 
 static constexpr uint8_t kXorMask[8] = {
     0xA5, 0x5A, 0x3C, 0xC3, 0x96, 0x69, 0x4B, 0xB4
@@ -129,7 +172,22 @@ int main(int argc, char** argv) {
         personalize_config_t cfg = parse_personalize_args(argc, argv);
 
         uint8_t master_key[32];
-        reconstruct_master_key(master_key);
+        const char* envKey = std::getenv("AIDA_MASTER_KEY_B64");
+        if (envKey && envKey[0] != '\0') {
+            std::string keyB64(envKey);
+            std::vector<uint8_t> decoded;
+            if (!base64_decode(keyB64, decoded) || decoded.size() != 32) {
+                std::fprintf(stderr, "[!] AIDA_MASTER_KEY_B64 is set but decodes to %zu bytes (expected 32)\n",
+                    decoded.size());
+                return 1;
+            }
+            std::memcpy(master_key, decoded.data(), 32);
+            SecureZeroMemory(decoded.data(), decoded.size());
+            std::fprintf(stdout, "[personalize] master key loaded from AIDA_MASTER_KEY_B64 env\n");
+        } else {
+            reconstruct_master_key(master_key);
+            std::fprintf(stdout, "[personalize] master key loaded from hardcoded reconstruction\n");
+        }
 
         protector::personalize::personalize_progress_t progress;
         if (cfg.verbose) {

@@ -8,7 +8,6 @@
 
 #include <array>
 #include <atomic>
-#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -195,6 +194,27 @@ inline int hex_value(unsigned char value) noexcept
     return -1;
 }
 
+inline bool ascii_alpha(unsigned char value) noexcept
+{
+    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+}
+
+inline bool ascii_digit(unsigned char value) noexcept
+{
+    return value >= '0' && value <= '9';
+}
+
+inline bool ascii_alnum(unsigned char value) noexcept
+{
+    return ascii_alpha(value) || ascii_digit(value);
+}
+
+inline char ascii_lower(unsigned char value) noexcept
+{
+    return value >= 'A' && value <= 'Z'
+        ? static_cast<char>(value + ('a' - 'A')) : static_cast<char>(value);
+}
+
 inline bool parse_ipv4(const std::string& input, std::array<std::uint8_t, 4>& bytes) noexcept
 {
     std::size_t cursor = 0;
@@ -315,7 +335,7 @@ inline std::string canonical_ipv6(const std::array<std::uint16_t, 8>& words)
 
 inline bool canonicalize_dns_host(std::string input, std::string& output)
 {
-    if (!input.empty() && input.back() == '.') input.pop_back();
+    if (!input.empty() && input.back() == '.') return false;
     if (input.empty() || input.size() > 253) return false;
     output.clear();
     output.reserve(input.size());
@@ -328,8 +348,8 @@ inline bool canonicalize_dns_host(std::string input, std::string& output)
         if (!output.empty()) output.push_back('.');
         for (std::size_t i = cursor; i < stop; ++i) {
             const unsigned char ch = static_cast<unsigned char>(input[i]);
-            if (!(std::isalnum(ch) || ch == '-')) return false;
-            output.push_back(static_cast<char>(std::tolower(ch)));
+            if (!(ascii_alnum(ch) || ch == '-')) return false;
+            output.push_back(ascii_lower(ch));
         }
         if (end == std::string::npos) break;
         cursor = end + 1;
@@ -352,7 +372,7 @@ inline bool parse_port(const std::string& input, std::uint16_t& output) noexcept
 
 inline bool unreserved(unsigned char ch) noexcept
 {
-    return std::isalnum(ch) || ch == '-' || ch == '.' || ch == '_' || ch == '~';
+    return ascii_alnum(ch) || ch == '-' || ch == '.' || ch == '_' || ch == '~';
 }
 
 inline bool normalize_component(const std::string& input, std::string& output)
@@ -370,7 +390,7 @@ inline bool normalize_component(const std::string& input, std::string& output)
             const int lo = hex_value(static_cast<unsigned char>(input[i + 2]));
             if (hi < 0 || lo < 0) return false;
             const unsigned char value = static_cast<unsigned char>((hi << 4) | lo);
-            if (value == 0 || value < 0x20 || value == 0x7F || value == '\\') return false;
+            if (value == 0 || value < 0x20 || value >= 0x7F || value == '\\') return false;
             decoded.push_back(static_cast<char>(value));
             if (unreserved(value)) {
                 output.push_back(static_cast<char>(value));
@@ -381,7 +401,7 @@ inline bool normalize_component(const std::string& input, std::string& output)
             }
             i += 2;
         } else {
-            if (ch == 0 || ch < 0x20 || ch == 0x7F || ch == '\\') return false;
+            if (ch == 0 || ch < 0x20 || ch >= 0x7F || ch == '\\') return false;
             decoded.push_back(static_cast<char>(ch));
             output.push_back(static_cast<char>(ch));
         }
@@ -434,7 +454,7 @@ inline canonical_external_url_t canonicalize_url_impl(const std::string& input)
         return result;
     }
     for (unsigned char ch : input) {
-        if (ch == 0 || ch <= 0x20 || ch == 0x7F || ch == '\\') {
+        if (ch == 0 || ch <= 0x20 || ch >= 0x7F || ch == '\\') {
             result.reason = "url_forbidden_character";
             return result;
         }
@@ -446,7 +466,18 @@ inline canonical_external_url_t canonicalize_url_impl(const std::string& input)
         return result;
     }
     std::string scheme = input.substr(0, scheme_end);
-    for (char& ch : scheme) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (scheme.empty() || !ascii_alpha(static_cast<unsigned char>(scheme.front()))) {
+        result.reason = "url_scheme_invalid";
+        return result;
+    }
+    for (char& ch : scheme) {
+        const unsigned char value = static_cast<unsigned char>(ch);
+        if (!(ascii_alnum(value) || value == '+' || value == '-' || value == '.')) {
+            result.reason = "url_scheme_invalid";
+            return result;
+        }
+        ch = ascii_lower(value);
+    }
     if (scheme != "http" && scheme != "https") {
         result.reason = "url_scheme_not_allowed";
         return result;

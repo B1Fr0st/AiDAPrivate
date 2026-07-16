@@ -4,7 +4,7 @@
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/motion.hpp"
 #include "../ui/clock.hpp"
@@ -787,7 +787,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 			if (clicked) st.selected_row = i;
 			if (dbl) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(n.address, context);
 			}
 
@@ -985,7 +985,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (hovered) st.hovered_row = i;
 			if (clicked) st.selected_row = i;
 			if (dbl) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(n.address, context);
 			}
 

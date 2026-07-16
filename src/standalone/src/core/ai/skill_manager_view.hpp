@@ -671,7 +671,6 @@ namespace skill_manager {
 			ImGui::InvisibleButton("##tab_btn", ImVec2(btn_w, btn_h));
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked();
-			ImGui::PopID();
 
 			ImU32 text_col = (st.active_tab == tabs[i]) ? th.text_primary : th.text_secondary;
 			if (hov) text_col = th.text_primary;
@@ -828,6 +827,9 @@ namespace skill_manager {
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool right   = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+			bool keyboard_context = sel && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+				(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+				 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
 			ImGui::PopID();
 
 			float hov_v = ra->hover.tick(hov, dt, aida::motion::spring::playful);
@@ -852,9 +854,12 @@ namespace skill_manager {
 			if (clicked && !on_toggle) {
 				st.selected_skill_name = m.name;
 			}
-			if (right) ImGui::OpenPopup("##sm_row_ctx");
+			if (right || keyboard_context) ImGui::OpenPopup("##sm_row_ctx");
 
 			if (ImGui::BeginPopup("##sm_row_ctx")) {
+				if (ImGui::MenuItem("Copy Skill Name")) ImGui::SetClipboardText(m.name.c_str());
+				if (ImGui::MenuItem("Copy Skill Path")) ImGui::SetClipboardText(m.file_path.c_str());
+				ImGui::Separator();
 				if (ImGui::MenuItem("Open file")) open_path_in_shell(m.file_path, true);
 				if (ImGui::MenuItem("Reload")) ::aida::skills::reindex();
 				if (ImGui::MenuItem(en ? "Disable" : "Enable")) {
@@ -873,9 +878,16 @@ namespace skill_manager {
 								toast_notification::toast_type_t::error, 5.0f);
 						}
 					}
+				} else {
+					ImGui::BeginDisabled();
+					ImGui::MenuItem("Delete");
+					ImGui::EndDisabled();
+					if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+						ImGui::SetTooltip("Built-in and local skills are source-managed; only installed remote skills can be uninstalled here");
 				}
 				ImGui::EndPopup();
 			}
+			ImGui::PopID();
 
 			ImGui::SetCursorScreenPos(ImVec2(sp.x, sp.y + row_h + row_gap));
 		}
@@ -1049,19 +1061,23 @@ namespace skill_manager {
 			ImVec2(cs.x + 12.f, cy), th.text_dim, fp.c_str());
 
 		ImGui::SetCursorScreenPos(ImVec2(cs.x + 12.f, cy + 22.f));
+		const float action_content_w = (std::max)(120.f, w - 24.f);
+		const bool stack_skill_actions = action_content_w < 240.f;
+		const float skill_action_w = stack_skill_actions
+			? (std::min)(120.f, action_content_w)
+			: (std::min)(96.f, (action_content_w - 12.f) / 3.f);
 		if (aida::ui::button("Reveal",
 				aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::sm,
-				ImVec2(96.f, 24.f))) {
+				ImVec2(skill_action_w, 24.f))) {
 			open_path_in_shell(meta->file_path, true);
 		}
-		const bool stack_skill_actions = w < 320.f;
 		if (!stack_skill_actions)
 			ImGui::SameLine(0.f, 6.f);
 		if (aida::ui::button("Open file",
 				aida::ui::button_kind_t::ghost,
 				aida::ui::size_t_::sm,
-				ImVec2(96.f, 24.f))) {
+				ImVec2(skill_action_w, 24.f))) {
 			open_path_in_shell(meta->file_path, false);
 		}
 		if (!stack_skill_actions)
@@ -1070,11 +1086,11 @@ namespace skill_manager {
 		if (aida::ui::button(en ? "Disable" : "Enable",
 				en ? aida::ui::button_kind_t::ghost : aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::sm,
-				ImVec2(96.f, 24.f))) {
+				ImVec2(skill_action_w, 24.f))) {
 			::aida::skills::set_enabled(meta->name, !en);
 		}
 
-		float chip_y = cy + 60.f;
+		float chip_y = cy + (stack_skill_actions ? 116.f : 60.f);
 		dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			ImVec2(cs.x + 12.f, chip_y), th.text_secondary, "Agent slugs:");
 		chip_y += 22.f;

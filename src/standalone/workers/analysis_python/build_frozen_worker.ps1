@@ -415,13 +415,26 @@ if ($buildReceipt.schema -ne 'aida.analysis-python.prebuilt-build-receipt' -or [
     throw 'analysis Python build receipt is invalid'
 }
 $protectorReceipt = Read-LockedJson -Path $protectorReceiptPath -Label 'analysis Python protector receipt'
-Assert-ExactProperties -Value $protectorReceipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'post_process', 'production_flags', 'profile', 'schema', 'schema_version', 'status', 'tool_sha256', 'verifier_sha256') -Label 'analysis Python protector receipt'
-Assert-ExactProperties -Value $protectorReceipt.post_process -Expected @('debug_paths_scrubbed', 'protection_verified', 'rich_header_scrubbed', 'symbols_scrubbed') -Label 'analysis Python protector post-process receipt'
-if ($protectorReceipt.schema -ne 'aida.protector.receipt' -or [int]$protectorReceipt.schema_version -ne 2 -or
+Assert-ExactProperties -Value $protectorReceipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'post_process', 'production_flags', 'profile', 'schema', 'schema_version', 'signer_policy_sha256', 'signing_provider_sha256', 'status', 'tool_sha256', 'verifier_sha256') -Label 'analysis Python protector receipt'
+Assert-ExactProperties -Value $protectorReceipt.post_process -Expected @('codeview_records', 'coff_symbol_count', 'coff_symbol_table_pointer', 'dans_signature_count', 'debug_directory_complete', 'debug_directory_entries', 'pe_headers_complete', 'protection_checks_passed', 'protection_checks_total', 'rich_signature_count', 'unscrubbed_debug_paths') -Label 'analysis Python protector post-process receipt'
+if ($protectorReceipt.schema -ne 'aida.protector.receipt' -or [int]$protectorReceipt.schema_version -ne 4 -or
     $protectorReceipt.status -ne 'passed' -or $protectorReceipt.profile -ne 'production' -or
     $protectorReceipt.artifact_relative_path -ne $worker.prebuilt_artifact.package_relative_path -or
-    -not [bool]$protectorReceipt.post_process.protection_verified -or -not [bool]$protectorReceipt.post_process.symbols_scrubbed -or
-    -not [bool]$protectorReceipt.post_process.debug_paths_scrubbed -or -not [bool]$protectorReceipt.post_process.rich_header_scrubbed -or
+    [Int64]$protectorReceipt.post_process.protection_checks_total -le 0 -or
+    [Int64]$protectorReceipt.post_process.protection_checks_passed -ne [Int64]$protectorReceipt.post_process.protection_checks_total -or
+    [Int64]$protectorReceipt.post_process.coff_symbol_table_pointer -ne 0 -or
+    [Int64]$protectorReceipt.post_process.coff_symbol_count -ne 0 -or
+    [Int64]$protectorReceipt.post_process.debug_directory_entries -lt 0 -or
+    [Int64]$protectorReceipt.post_process.debug_directory_entries -gt 4096 -or
+    [Int64]$protectorReceipt.post_process.codeview_records -lt 0 -or
+    [Int64]$protectorReceipt.post_process.codeview_records -gt [Int64]$protectorReceipt.post_process.debug_directory_entries -or
+    [Int64]$protectorReceipt.post_process.unscrubbed_debug_paths -ne 0 -or
+    [Int64]$protectorReceipt.post_process.rich_signature_count -ne 0 -or
+    [Int64]$protectorReceipt.post_process.dans_signature_count -ne 0 -or
+    -not [bool]$protectorReceipt.post_process.pe_headers_complete -or
+    -not [bool]$protectorReceipt.post_process.debug_directory_complete -or
+    [string]$protectorReceipt.signer_policy_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    [string]$protectorReceipt.signing_provider_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
     -not (Test-HexDigestEqual ([string]$protectorReceipt.artifact_sha256) $workerIdentity.Sha256) -or
     [Int64]$protectorReceipt.artifact_size_bytes -ne $workerIdentity.SizeBytes -or
     -not (Test-HexDigestEqual ([string]$protectorReceipt.tool_sha256) ([string]$worker.prebuilt_artifact.expected_protector_tool_sha256)) -or
@@ -434,10 +447,14 @@ if (($actualFlags -join "`n") -cne ($expectedFlags -join "`n")) {
     throw 'analysis Python protector receipt flags do not match the authority lock'
 }
 $signatureReceipt = Read-LockedJson -Path $signatureReceiptPath -Label 'analysis Python signature receipt'
-Assert-ExactProperties -Value $signatureReceipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'chain_status', 'schema', 'schema_version', 'signer_thumbprint_sha256', 'status', 'timestamp_status', 'verification_mode', 'verifier_sha256') -Label 'analysis Python signature receipt'
-if ($signatureReceipt.schema -ne 'aida.signature.receipt' -or [int]$signatureReceipt.schema_version -ne 2 -or
+Assert-ExactProperties -Value $signatureReceipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'chain_status', 'schema', 'schema_version', 'signer_policy_sha256', 'signer_thumbprint_sha256', 'signing_provider_sha256', 'status', 'timestamp_filetime', 'timestamp_status', 'timestamp_validation', 'verification_mode', 'verifier_sha256') -Label 'analysis Python signature receipt'
+if ($signatureReceipt.schema -ne 'aida.signature.receipt' -or [int]$signatureReceipt.schema_version -ne 4 -or
     $signatureReceipt.status -ne 'verified' -or $signatureReceipt.verification_mode -ne 'wintrust_offline' -or
     $signatureReceipt.chain_status -ne 'trusted' -or $signatureReceipt.timestamp_status -ne 'trusted' -or
+    $signatureReceipt.timestamp_validation -ne 'wintrust_provider_counter_signer' -or
+    [Int64]$signatureReceipt.timestamp_filetime -le 0 -or
+    -not (Test-HexDigestEqual ([string]$signatureReceipt.signer_policy_sha256) ([string]$protectorReceipt.signer_policy_sha256)) -or
+    -not (Test-HexDigestEqual ([string]$signatureReceipt.signing_provider_sha256) ([string]$protectorReceipt.signing_provider_sha256)) -or
     $signatureReceipt.artifact_relative_path -ne $worker.prebuilt_artifact.package_relative_path -or
     -not (Test-HexDigestEqual ([string]$signatureReceipt.artifact_sha256) $workerIdentity.Sha256) -or
     [Int64]$signatureReceipt.artifact_size_bytes -ne $workerIdentity.SizeBytes -or

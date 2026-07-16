@@ -5,8 +5,64 @@
 #include <string_view>
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 
 namespace code_editor_widget {
+
+enum class document_action_t : std::uint8_t {
+    select_word = 0,
+    select_line,
+    copy_line,
+    copy_path,
+    duplicate_line,
+    delete_line,
+    move_line_up,
+    move_line_down,
+    toggle_line_comment,
+    trim_trailing_whitespace
+};
+
+struct document_capabilities_t {
+    bool text_editing = false;
+    bool save = false;
+    bool syntax_highlighting = false;
+    bool line_comment = false;
+    bool find = false;
+    bool replace = false;
+    bool goto_line = false;
+    bool ai_diff_review = false;
+    bool semantic_navigation = false;
+    bool semantic_rename = false;
+    bool diagnostics = false;
+    bool formatting = false;
+    bool language_server = false;
+    bool build = false;
+    bool run = false;
+    bool source_debugging = false;
+};
+
+struct document_state_t {
+    std::string filename;
+    std::string filepath;
+    std::string language;
+    std::size_t content_bytes = 0;
+    std::size_t line_count = 0;
+    int caret_line = 0;
+    int caret_column = 0;
+    bool active = false;
+    bool dirty = false;
+    bool focused = false;
+    bool large_file_mode = false;
+    bool has_selection = false;
+    document_capabilities_t capabilities;
+};
+
+struct document_pane_render_context_t {
+    float alpha = 1.f;
+    float accent_r = 0.f;
+    float accent_g = 0.f;
+    float accent_b = 0.f;
+};
 
 
 struct selection_t {
@@ -113,19 +169,41 @@ void init();
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b);
 
+void render_document_pane(const document_pane_render_context_t& context = {});
+
+document_state_t document_state();
+
+document_capabilities_t document_capabilities();
+
+bool request_document_action(document_action_t action);
+
 
 void on_text_changed();
 
 
 void get_caret(int& line, int& col);
 
+void set_caret(int line, int col);
+
 
 void trigger_undo();
 void trigger_redo();
+void trigger_cut();
+void trigger_copy();
+void trigger_paste();
+void trigger_delete();
+void trigger_select_all();
 void open_find();
 void open_replace();
+void open_goto_line();
+
+bool can_undo();
+bool can_redo();
+bool can_paste();
+bool has_selection();
 
 std::string last_error();
+std::uint64_t document_content_fingerprint();
 
 
 bool begin_agent_edit(std::string_view origin);
@@ -147,6 +225,7 @@ bool reject_hunk(int index);
 void accept_all();
 
 void reject_all();
+bool commit_resolved_diff();
 
 void cancel_agent_edit();
 

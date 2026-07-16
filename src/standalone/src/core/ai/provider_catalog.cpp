@@ -10,16 +10,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -33,8 +33,13 @@ namespace {
 
 	std::mutex s_mtx;
 	std::string s_last_error;
-	std::atomic<bool> s_init_started{false};
-	std::atomic<bool> s_refresh_inflight{false};
+	std::atomic<int> s_init_state{0};
+	std::atomic<bool> s_init_cancelled{false};
+	std::atomic<std::uint64_t> s_init_generation{0};
+	std::atomic<std::uint64_t> s_init_task_id{0};
+	std::atomic<std::uint64_t> s_init_retry_after_ms{0};
+	constexpr std::uint64_t kInitializationDeadlineMs = 20000;
+	constexpr std::uint64_t kInitializationRetryDelayMs = 30000;
 
 	struct catalog_snapshot_t
 	{
@@ -258,6 +263,12 @@ namespace {
 			return false;
 		}
 		parse_models_dev_json(parsed, providers, models);
+		if (providers.empty() || models.empty()) {
+			providers.clear();
+			models.clear();
+			error = "models.dev returned an empty provider or model catalog";
+			return false;
+		}
 		return true;
 	}
 
@@ -335,7 +346,10 @@ namespace {
 
 }
 
-bool fetch_and_cache(int timeout_ms)
+namespace {
+
+bool fetch_and_cache_impl(int timeout_ms,
+	const aida::auth::http::cancel_cb_t& cancelled)
 {
 	const int timeout_secs = (timeout_ms / 1000) > 0 ? (timeout_ms / 1000) : 14;
 
@@ -344,7 +358,7 @@ bool fetch_and_cache(int timeout_ms)
 	headers.emplace_back("Accept", "application/json");
 
 	aida::auth::http::response_t res = aida::auth::http::get(
-		std::string("https://models.dev/api.json"), headers, timeout_secs);
+		std::string("https://models.dev/api.json"), headers, timeout_secs, cancelled);
 
 	if (!res.ok && res.status == 0) {
 		std::ostringstream oss;
@@ -383,7 +397,8 @@ bool fetch_and_cache(int timeout_ms)
 	return true;
 }
 
-bool load_cached_or_fetch(int max_age_seconds)
+bool load_cached_or_fetch_impl(int max_age_seconds,
+	const aida::auth::http::cancel_cb_t& cancelled)
 {
 	const auto path = cache_path();
 	std::error_code ec;
@@ -401,54 +416,180 @@ bool load_cached_or_fetch(int max_age_seconds)
 		}
 	}
 
-	return fetch_and_cache();
+	return fetch_and_cache_impl(10000, cancelled);
 }
 
-void initialize_async(int max_age_seconds)
-{
-	bool expected = false;
-	if (!s_init_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-		return;
+}
 
+bool fetch_and_cache(int timeout_ms)
+{
+	return fetch_and_cache_impl(timeout_ms, {});
+}
+
+bool load_cached_or_fetch(int max_age_seconds)
+{
+	return load_cached_or_fetch_impl(max_age_seconds, {});
+}
+
+model_list_validation_t validate_provider_model_list_response(
+	const std::string& provider_id, const std::string& body)
+{
+	model_list_validation_t result;
+	if (body.empty()) {
+		result.error = "Provider returned an empty response";
+		return result;
+	}
+	try {
+		const auto json = nlohmann::json::parse(body);
+		if (!json.is_object()) {
+			result.error = "Provider response root is not an object";
+			return result;
+		}
+		if (json.contains("error") && !json["error"].is_null()) {
+			result.error = "Provider returned an error payload";
+			return result;
+		}
+		const char* collection = provider_id == "google" ? "models" : "data";
+		const char* identifier = provider_id == "google" ? "name" : "id";
+		if (!json.contains(collection) || !json[collection].is_array()) {
+			result.error = std::string("Provider response is missing the ")
+				+ collection + " array";
+			return result;
+		}
+		const auto& models = json[collection];
+		if (models.empty()) {
+			result.error = "Provider returned no models";
+			return result;
+		}
+		for (const auto& model : models) {
+			if (!model.is_object() || !model.contains(identifier)
+				|| !model[identifier].is_string()
+				|| model[identifier].get_ref<const std::string&>().empty()) {
+				result.model_count = 0;
+				result.error = "Provider returned a malformed model entry";
+				return result;
+			}
+			if (result.model_count == (std::numeric_limits<int>::max)()) {
+				result.model_count = 0;
+				result.error = "Provider model count exceeds the supported limit";
+				return result;
+			}
+			++result.model_count;
+		}
+		result.valid = true;
+		return result;
+	} catch (...) {
+		result.error = "Provider response JSON is malformed";
+	}
+	return result;
+}
+
+bool initialize_async(int max_age_seconds)
+{
+	const std::uint64_t now = aida::infra::executor::now_ms();
+	int state = s_init_state.load(std::memory_order_acquire);
+	if (state == 3 || state == 1 || state == 2) return true;
+	if (now < s_init_retry_after_ms.load(std::memory_order_acquire)) return false;
+	while (!s_init_state.compare_exchange_weak(state, 1,
+		std::memory_order_acq_rel, std::memory_order_acquire)) {
+		if (state == 3 || state == 1 || state == 2) return true;
+		if (aida::infra::executor::now_ms()
+			< s_init_retry_after_ms.load(std::memory_order_acquire)) return false;
+	}
+	const std::uint64_t generation = s_init_generation.fetch_add(1,
+		std::memory_order_acq_rel) + 1;
+	s_init_cancelled.store(false, std::memory_order_release);
+	const std::uint64_t deadline = now > (std::numeric_limits<std::uint64_t>::max)()
+		- kInitializationDeadlineMs
+		? (std::numeric_limits<std::uint64_t>::max)() : now + kInitializationDeadlineMs;
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "ai_provider_catalog";
 	sub.label = "provider_catalog.initialize";
 	sub.thread_class = "bounded_task";
 	sub.domain = aida::infra::executor::domain_t::external_tool;
 	sub.priority = 3;
-	sub.body = [max_age_seconds]() {
-		const auto path = cache_path();
-		std::error_code ec;
-		bool cache_fresh = false;
-		if (std::filesystem::exists(path, ec)) {
-			const int64_t age = cache_age_seconds();
-			if (age >= 0 && age <= max_age_seconds)
-				cache_fresh = true;
-			std::string body;
-			std::vector<provider_info_t> providers;
-			std::vector<model_info_t> models;
-			std::string parse_error;
-			if (read_cache_file(body) && parse_catalog_body(body, providers, models, parse_error))
-				publish_snapshot(std::move(providers), std::move(models));
-			else if (!parse_error.empty())
-				set_error(parse_error);
-		}
-
-		auto snapshot = current_snapshot();
-		if (snapshot && snapshot->loaded && cache_fresh)
-			return;
-
-		bool refresh_expected = false;
-		if (!s_refresh_inflight.compare_exchange_strong(refresh_expected, true, std::memory_order_acq_rel))
-			return;
-
-		(void)fetch_and_cache();
-		s_refresh_inflight.store(false, std::memory_order_release);
+	sub.deadline_ms = deadline;
+	sub.generation = generation;
+	sub.ui_access_policy = "none";
+	sub.failure_policy = "publish_typed_failure";
+	sub.shutdown_policy = "cancel_pending";
+	sub.cancel_hook = [generation]() noexcept {
+		if (s_init_generation.load(std::memory_order_acquire) != generation) return;
+		s_init_cancelled.store(true, std::memory_order_release);
+		s_init_state.store(5, std::memory_order_release);
+		s_init_task_id.store(0, std::memory_order_release);
+		s_init_retry_after_ms.store(aida::infra::executor::now_ms()
+			+ kInitializationRetryDelayMs, std::memory_order_release);
 	};
-	bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
-	if (!posted) {
-		s_init_started.store(false, std::memory_order_release);
-		set_error("failed to schedule models catalog initialization");
+	sub.body = [max_age_seconds, generation, deadline]() noexcept {
+		if (s_init_generation.load(std::memory_order_acquire) != generation
+			|| s_init_cancelled.load(std::memory_order_acquire)) return;
+		s_init_state.store(2, std::memory_order_release);
+		bool success = false;
+		try {
+			success = load_cached_or_fetch_impl(max_age_seconds,
+				[generation, deadline]() noexcept {
+					return s_init_generation.load(std::memory_order_acquire) != generation
+						|| s_init_cancelled.load(std::memory_order_acquire)
+						|| aida::infra::executor::now_ms() >= deadline;
+				});
+		} catch (...) {
+			try { set_error("models catalog initialization exception"); } catch (...) {}
+		}
+		if (s_init_generation.load(std::memory_order_acquire) != generation) return;
+		s_init_task_id.store(0, std::memory_order_release);
+		const std::uint64_t completed = aida::infra::executor::now_ms();
+		if (s_init_cancelled.load(std::memory_order_acquire)) {
+			s_init_state.store(5, std::memory_order_release);
+			s_init_retry_after_ms.store(completed + kInitializationRetryDelayMs,
+				std::memory_order_release);
+			return;
+		}
+		if (!success || completed >= deadline) {
+			if (success && completed >= deadline)
+				try { set_error("models catalog initialization deadline exceeded"); } catch (...) {}
+			s_init_state.store(4, std::memory_order_release);
+			s_init_retry_after_ms.store(completed + kInitializationRetryDelayMs,
+				std::memory_order_release);
+			return;
+		}
+		s_init_state.store(3, std::memory_order_release);
+		s_init_retry_after_ms.store(0, std::memory_order_release);
+	};
+	aida::infra::executor::submit_result_t posted;
+	try { posted = aida::infra::executor::submit(std::move(sub)); } catch (...) {
+		s_init_state.store(6, std::memory_order_release);
+		s_init_retry_after_ms.store(now + kInitializationRetryDelayMs,
+			std::memory_order_release);
+		set_error("models catalog initialization submission exception");
+		return false;
+	}
+	if (!posted.submitted) {
+		s_init_state.store(6, std::memory_order_release);
+		s_init_retry_after_ms.store(now + kInitializationRetryDelayMs,
+			std::memory_order_release);
+		set_error(posted.reject_reason.empty()
+			? "failed to schedule models catalog initialization"
+			: "models catalog initialization rejected: " + posted.reject_reason);
+		return false;
+	}
+	s_init_task_id.store(posted.task_id, std::memory_order_release);
+	const int published_state = s_init_state.load(std::memory_order_acquire);
+	if (published_state != 1 && published_state != 2)
+		s_init_task_id.store(0, std::memory_order_release);
+	return true;
+}
+
+void cancel_initialize() noexcept
+{
+	s_init_cancelled.store(true, std::memory_order_release);
+	s_init_generation.fetch_add(1, std::memory_order_acq_rel);
+	s_init_state.store(5, std::memory_order_release);
+	s_init_retry_after_ms.store(aida::infra::executor::now_ms()
+		+ kInitializationRetryDelayMs, std::memory_order_release);
+	const std::uint64_t task_id = s_init_task_id.exchange(0, std::memory_order_acq_rel);
+	if (task_id != 0) {
+		try { aida::infra::executor::cancel(task_id); } catch (...) {}
 	}
 }
 

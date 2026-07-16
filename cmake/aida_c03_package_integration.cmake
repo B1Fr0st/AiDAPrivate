@@ -19,7 +19,9 @@ set(AIDA_C03_NATIVE_WORKER_PACKAGE_OUTPUTS
     "deps/AiDA_NativeDecompilerWorker.exe"
     "deps/AiDA_NativeDecompilerWorker.manifest.bin"
     "deps/AiDA_NativeDecompilerWorker.manifest.sha256"
-    "deps/evidence/native.acl.json")
+    "deps/evidence/native.acl.json"
+    "deps/evidence/native.protector.json"
+    "deps/evidence/native.signature.json")
 set(AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET "aida_c03_b16_managed_worker_package_manifest")
 set(AIDA_C03_MANAGED_WORKER_PACKAGE_OUTPUTS
     "deps/AiDA_ManagedDecompilerWorker.exe"
@@ -34,7 +36,9 @@ set(AIDA_C03_MANAGED_WORKER_PACKAGE_OUTPUTS
     "deps/AiDA_ManagedRuntime.manifest.sha256"
     "deps/AiDA_ManagedDecompilerWorker.manifest.bin"
     "deps/AiDA_ManagedDecompilerWorker.manifest.sha256"
-    "deps/evidence/managed.acl.json")
+    "deps/evidence/managed.acl.json"
+    "deps/evidence/managed.protector.json"
+    "deps/evidence/managed.signature.json")
 set(AIDA_C03_ANALYSIS_PYTHON_WORKER_SOURCE_TARGET "aida_c03_b24_analysis_python_worker_source_contract")
 set(AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_TARGET "aida_c03_b24_analysis_python_worker_package_manifest")
 set(AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_OUTPUTS
@@ -64,6 +68,42 @@ set(AIDA_C03_CUSTOMER_SIDECAR_ENVIRONMENT
     "AIDA_CAMOUFOX_MCP_EXECUTABLE=verified-frozen-sidecar"
     "AIDA_CAMOUFOX_PYTHON=unset-unless-verified-sidecar-runtime")
 
+if(NOT AIDA_C03_SIGNING_AUTHORITY_AVAILABLE AND
+   NOT TARGET aida_c03_signing_authority_blocker)
+    add_custom_target(aida_c03_signing_authority_blocker
+        COMMAND "${CMAKE_COMMAND}"
+            "-DAIDA_C03_DISTRIBUTION_BLOCKER=${AIDA_C03_SIGNING_AUTHORITY_BLOCKER}"
+            -P "${AIDA_C03_DISTRIBUTION_BLOCKER_SCRIPT}"
+        DEPENDS "${AIDA_C03_DISTRIBUTION_BLOCKER_SCRIPT}"
+        VERBATIM)
+    set_target_properties(aida_c03_signing_authority_blocker PROPERTIES
+        FOLDER "Packaging/C03"
+        AIDA_C03_PACKAGE_ROLE "external-signing-authority-blocker"
+        AIDA_C03_EXTERNAL_PREREQUISITE "TRUE")
+endif()
+
+function(_aida_c03_package_signing_step output_commands output_dependencies artifact)
+    if(AIDA_C03_SIGNING_AUTHORITY_AVAILABLE)
+        set(${output_commands}
+            COMMAND "$<TARGET_FILE:aida_c03_package_verifier>" run-signing-provider
+                --artifact "${artifact}"
+                --signer-policy "${AIDA_C03_SIGNER_POLICY_FILE}"
+                --expected-signer-policy-sha256 "${AIDA_C03_SIGNER_POLICY_SHA256}"
+                --signing-provider "${AIDA_C03_SIGNING_PROVIDER}"
+                --expected-signing-provider-sha256 "${AIDA_C03_SIGNING_PROVIDER_SHA256}"
+                --deadline-ms 900000
+            PARENT_SCOPE)
+        set(${output_dependencies}
+            aida_c03_package_verifier
+            "${AIDA_C03_SIGNING_PROVIDER}"
+            "${AIDA_C03_SIGNER_POLICY_FILE}"
+            PARENT_SCOPE)
+    else()
+        set(${output_commands} PARENT_SCOPE)
+        set(${output_dependencies} aida_c03_signing_authority_blocker PARENT_SCOPE)
+    endif()
+endfunction()
+
 function(_aida_c03_package_require_target target descriptor)
     if(NOT target OR NOT TARGET "${target}")
         message(FATAL_ERROR "AiDA C03 ${descriptor} target is missing: ${target}")
@@ -76,23 +116,24 @@ function(_aida_c03_package_require_dependency_targets descriptor)
     endforeach()
 endfunction()
 
-function(_aida_c03_package_require_python)
-    if(NOT Python3_EXECUTABLE OR NOT EXISTS "${Python3_EXECUTABLE}" OR IS_DIRECTORY "${Python3_EXECUTABLE}")
-        message(FATAL_ERROR "AiDA C03 worker manifest materialization requires the configured local Python3 interpreter")
+function(_aida_c03_package_require_python output_variable)
+    if(NOT ARGC EQUAL 1 OR NOT AIDA_C03_VALIDATED_PYTHON_EXECUTABLE OR
+       NOT EXISTS "${AIDA_C03_VALIDATED_PYTHON_EXECUTABLE}" OR
+       IS_DIRECTORY "${AIDA_C03_VALIDATED_PYTHON_EXECUTABLE}" OR
+       IS_SYMLINK "${AIDA_C03_VALIDATED_PYTHON_EXECUTABLE}")
+        message(FATAL_ERROR "AiDA C03 worker manifest materialization requires the canonical validated local Python interpreter")
     endif()
+    set(${output_variable} "${AIDA_C03_VALIDATED_PYTHON_EXECUTABLE}" PARENT_SCOPE)
 endfunction()
 
 function(_aida_c03_package_find_powershell output_variable)
-    if(AIDA_POWERSHELL_EXECUTABLE AND EXISTS "${AIDA_POWERSHELL_EXECUTABLE}" AND
-       NOT IS_DIRECTORY "${AIDA_POWERSHELL_EXECUTABLE}")
-        set(${output_variable} "${AIDA_POWERSHELL_EXECUTABLE}" PARENT_SCOPE)
-        return()
+    if(NOT ARGC EQUAL 1 OR NOT AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE OR
+       NOT EXISTS "${AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE}" OR
+       IS_DIRECTORY "${AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE}" OR
+       IS_SYMLINK "${AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE}")
+        message(FATAL_ERROR "AiDA C03 package materialization requires the canonical validated system PowerShell executable")
     endif()
-    find_program(_aida_c03_powershell NAMES powershell.exe pwsh.exe powershell pwsh)
-    if(NOT _aida_c03_powershell)
-        message(FATAL_ERROR "AiDA C03 package materialization requires a local PowerShell executable")
-    endif()
-    set(${output_variable} "${_aida_c03_powershell}" PARENT_SCOPE)
+    set(${output_variable} "${AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE}" PARENT_SCOPE)
 endfunction()
 
 function(_aida_c03_package_require_filename path expected descriptor)
@@ -157,9 +198,9 @@ function(aida_c03_register_ghidra_spec_package)
         list(APPEND _aida_c03_seen_names "${_aida_c03_spec_name}")
         list(APPEND _aida_c03_input_arguments --input "${_aida_c03_spec_file}")
     endforeach()
-    _aida_c03_package_require_python()
+    _aida_c03_package_require_python(_aida_c03_python)
     add_custom_target(${AIDA_C03_GHIDRA_SPEC_PACKAGE_TARGET}
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_GHIDRA_SPEC_MATERIALIZER}"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_GHIDRA_SPEC_MATERIALIZER}"
             --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --contract "${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC}"
@@ -167,7 +208,7 @@ function(aida_c03_register_ghidra_spec_package)
             --approved-generator-root "$<TARGET_FILE_DIR:${_aida_c03_GENERATOR_TARGET}>"
             --generator "$<TARGET_FILE:${_aida_c03_GENERATOR_TARGET}>"
             ${_aida_c03_input_arguments}
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_GHIDRA_SPEC_MATERIALIZER}"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_GHIDRA_SPEC_MATERIALIZER}"
             --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --contract "${AIDA_C03_GHIDRA_SPEC_SOURCE_SPEC}"
@@ -217,19 +258,46 @@ function(aida_c03_register_native_worker_package)
     if(_aida_c03_APPLICATION_TARGET STREQUAL _aida_c03_WORKER_TARGET)
         message(FATAL_ERROR "AiDA C03 native worker must remain a distinct disk-backed sidecar")
     endif()
-    _aida_c03_package_require_python()
+    _aida_c03_package_require_python(_aida_c03_python)
     _aida_c03_package_find_powershell(_aida_c03_powershell)
+    set(_aida_c03_native_worker_artifact
+        "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe")
+    _aida_c03_package_signing_step(
+        _aida_c03_native_signing_commands
+        _aida_c03_native_signing_dependencies
+        "${_aida_c03_native_worker_artifact}")
     add_custom_target(${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET}
         COMMAND "${CMAKE_COMMAND}" -E make_directory
             "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps"
+            "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/evidence"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "$<TARGET_FILE:${_aida_c03_WORKER_TARGET}>"
             "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe"
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER}"
+        COMMAND "$<TARGET_FILE:AiDAProtector>"
+            --input "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe"
+            --output "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe"
+            --all --tamper-level 2 --jit --verbose
+        COMMAND "$<TARGET_FILE:AiDAProtectorVerify>" --profile strict-no-imports
+            "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe"
+        ${_aida_c03_native_signing_commands}
+        COMMAND "$<TARGET_FILE:aida_c03_package_verifier>" emit-receipts
+            --artifact "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe"
+            --artifact-relative "deps/AiDA_NativeDecompilerWorker.exe"
+            --protector-tool "$<TARGET_FILE:AiDAProtector>"
+            --protector-verifier "$<TARGET_FILE:AiDAProtectorVerify>"
+            --protector-profile "strict-no-imports"
+            --protector-receipt "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/evidence/native.protector.json"
+            --signature-receipt "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/evidence/native.signature.json"
+            --signer-policy "${AIDA_C03_SIGNER_POLICY_FILE}"
+            --expected-signer-policy-sha256 "${AIDA_C03_SIGNER_POLICY_SHA256}"
+            --signing-provider "${AIDA_C03_SIGNING_PROVIDER}"
+            --expected-signing-provider-sha256 "${AIDA_C03_SIGNING_PROVIDER_SHA256}"
+            --deadline-ms 900000
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER}"
             --contract "${AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --worker "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe"
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER}"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_NATIVE_WORKER_MANIFEST_MATERIALIZER}"
             --contract "${AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --worker "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_NativeDecompilerWorker.exe"
@@ -255,13 +323,14 @@ function(aida_c03_register_native_worker_package)
             "${AIDA_C03_NATIVE_WORKER_MANIFEST_CONTRACT}"
             "${AIDA_C03_NATIVE_WORKER_MANIFEST_SCHEMA}"
             "${AIDA_C03_WORKER_RUNTIME_ACL_MATERIALIZER}"
+            ${_aida_c03_native_signing_dependencies}
         VERBATIM)
     set_target_properties(${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET} PROPERTIES
         FOLDER "Packaging/C03"
         AIDA_C03_PACKAGE_ROLE "native-decompiler-worker-manifest-v2"
         AIDA_C03_PACKAGE_OUTPUTS "${AIDA_C03_NATIVE_WORKER_PACKAGE_OUTPUTS}"
         AIDA_C03_GHIDRA_SPEC_AUTHORITY "deps/AiDA_GhidraSpecs.manifest.json;deps/AiDA_GhidraSpecs.manifest.sha256;exact-51-file-mirrors"
-        AIDA_C03_FINAL_BYTE_ORDERING "verified-ghidra-specs;worker-target;finalizers;copy;manifest;verify;appcontainer-acl;acl-receipt;verify-acl")
+        AIDA_C03_FINAL_BYTE_ORDERING "verified-ghidra-specs;worker-target;finalizers;copy;protect;direct-protector-verify;offline-wintrust-receipts;manifest;verify;appcontainer-acl;acl-receipt;verify-acl")
     add_dependencies("${_aida_c03_APPLICATION_TARGET}" ${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET})
     set_property(TARGET "${_aida_c03_APPLICATION_TARGET}" PROPERTY
         AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET "${AIDA_C03_NATIVE_WORKER_PACKAGE_TARGET}")
@@ -283,7 +352,7 @@ function(aida_c03_register_managed_worker_package)
     _aida_c03_package_require_filename("${_aida_c03_WORKER_EXECUTABLE}" "AiDA_ManagedDecompilerWorker.exe" "managed worker")
     _aida_c03_package_require_filename("${_aida_c03_PROVIDER_BINARY}" "ICSharpCode.Decompiler.dll" "managed provider")
     _aida_c03_package_require_distinct_paths("${_aida_c03_WORKER_EXECUTABLE}" "${_aida_c03_PROVIDER_BINARY}" "managed worker/provider")
-    _aida_c03_package_require_python()
+    _aida_c03_package_require_python(_aida_c03_python)
     _aida_c03_package_find_powershell(_aida_c03_powershell)
     set(_aida_c03_expected_runtime_names
         "AiDA_ManagedDecompilerWorker.dll"
@@ -338,9 +407,16 @@ function(aida_c03_register_managed_worker_package)
         "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/ThirdPartyNotices.txt"
         "${AIDA_C03_MANAGED_RUNTIME_SOURCE_ROOT}/host/fxr/${AIDA_C03_MANAGED_RUNTIME_VERSION}/hostfxr.dll"
         ${_aida_c03_framework_runtime_files})
+    set(_aida_c03_managed_worker_artifact
+        "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe")
+    _aida_c03_package_signing_step(
+        _aida_c03_managed_signing_commands
+        _aida_c03_managed_signing_dependencies
+        "${_aida_c03_managed_worker_artifact}")
     add_custom_target(${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET}
         COMMAND "${CMAKE_COMMAND}" -E make_directory
             "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps"
+            "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/evidence"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${_aida_c03_WORKER_EXECUTABLE}"
             "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe"
@@ -348,23 +424,43 @@ function(aida_c03_register_managed_worker_package)
             "${_aida_c03_PROVIDER_BINARY}"
             "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/ICSharpCode.Decompiler.dll"
         ${_aida_c03_runtime_commands}
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
+        COMMAND "$<TARGET_FILE:AiDAProtector>"
+            --input "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe"
+            --output "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe"
+            --all --tamper-level 2 --jit --verbose
+        COMMAND "$<TARGET_FILE:AiDAProtectorVerify>" --profile strict-no-imports
+            "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe"
+        ${_aida_c03_managed_signing_commands}
+        COMMAND "$<TARGET_FILE:aida_c03_package_verifier>" emit-receipts
+            --artifact "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe"
+            --artifact-relative "deps/AiDA_ManagedDecompilerWorker.exe"
+            --protector-tool "$<TARGET_FILE:AiDAProtector>"
+            --protector-verifier "$<TARGET_FILE:AiDAProtectorVerify>"
+            --protector-profile "strict-no-imports"
+            --protector-receipt "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/evidence/managed.protector.json"
+            --signature-receipt "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/evidence/managed.signature.json"
+            --signer-policy "${AIDA_C03_SIGNER_POLICY_FILE}"
+            --expected-signer-policy-sha256 "${AIDA_C03_SIGNER_POLICY_SHA256}"
+            --signing-provider "${AIDA_C03_SIGNING_PROVIDER}"
+            --expected-signing-provider-sha256 "${AIDA_C03_SIGNING_PROVIDER_SHA256}"
+            --deadline-ms 900000
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
             --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --contract "${AIDA_C03_MANAGED_RUNTIME_SOURCE_SPEC}"
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
             --repository-root "${AIDA_C03_DEPENDENCY_ROOT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --contract "${AIDA_C03_MANAGED_RUNTIME_SOURCE_SPEC}"
             --verify-only
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER}"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER}"
             --contract "${AIDA_C03_MANAGED_WORKER_MANIFEST_CONTRACT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --worker "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe"
             --provider "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/ICSharpCode.Decompiler.dll"
             --runtime-manifest "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedRuntime.manifest.json"
             --runtime-manifest-digest "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedRuntime.manifest.sha256"
-        COMMAND "${Python3_EXECUTABLE}" "${AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER}"
+        COMMAND "${_aida_c03_python}" "${AIDA_C03_MANAGED_WORKER_MANIFEST_MATERIALIZER}"
             --contract "${AIDA_C03_MANAGED_WORKER_MANIFEST_CONTRACT}"
             --package-root "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>"
             --worker "$<TARGET_FILE_DIR:${_aida_c03_APPLICATION_TARGET}>/deps/AiDA_ManagedDecompilerWorker.exe"
@@ -398,6 +494,7 @@ function(aida_c03_register_managed_worker_package)
             "${AIDA_C03_MANAGED_RUNTIME_MATERIALIZER}"
             "${AIDA_C03_WORKER_RUNTIME_ACL_MATERIALIZER}"
             ${_aida_c03_managed_runtime_sources}
+            ${_aida_c03_managed_signing_dependencies}
         VERBATIM)
     set(_aida_c03_outputs ${AIDA_C03_MANAGED_WORKER_PACKAGE_OUTPUTS} ${_aida_c03_runtime_outputs})
     set_target_properties(${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET} PROPERTIES
@@ -407,7 +504,7 @@ function(aida_c03_register_managed_worker_package)
         AIDA_C03_OFFLINE_RESTORE "locked-mode;local-source-only;no-machine-install"
         AIDA_C03_APP_LOCAL_RUNTIME "Microsoft.NETCore.App-${AIDA_C03_MANAGED_RUNTIME_VERSION};${AIDA_C03_MANAGED_RUNTIME_TFM};win-x64;exact-193-file-inventory"
         AIDA_C03_CUSTOMER_SDK_SHIPMENT "forbidden"
-        AIDA_C03_FINAL_BYTE_ORDERING "offline-build;finalizers;copy-application;materialize-app-local-runtime;verify-runtime;manifest-v3;verify;appcontainer-acl;acl-receipt;verify-acl")
+        AIDA_C03_FINAL_BYTE_ORDERING "offline-build;finalizers;copy-application;protect;direct-protector-verify;offline-wintrust-receipts;materialize-app-local-runtime;verify-runtime;manifest-v3;verify;appcontainer-acl;acl-receipt;verify-acl")
     add_dependencies("${_aida_c03_APPLICATION_TARGET}" ${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET})
     set_property(TARGET "${_aida_c03_APPLICATION_TARGET}" PROPERTY
         AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET "${AIDA_C03_MANAGED_WORKER_PACKAGE_TARGET}")
@@ -636,25 +733,64 @@ function(aida_c03_register_auxiliary_notice_package)
 endfunction()
 
 function(aida_c03_register_distribution_manifest)
-    cmake_parse_arguments(PARSE_ARGV 0 _aida_c03 "REQUIRE_ANALYSIS_PYTHON" "TARGET;APPLICATION_TARGET;APPLICATION_ROOT;SOURCE_ROOT;DEVELOPER_ROOT;CUSTOMER_STAGE_ANCHOR;PACKAGE_ROOT;SPEC;OUTPUT_MANIFEST;OUTPUT_DIGEST;POWERSHELL_EXECUTABLE" "DEPENDS")
+    cmake_parse_arguments(PARSE_ARGV 0 _aida_c03 "REQUIRE_ANALYSIS_PYTHON" "TARGET;APPLICATION_TARGET;REPOSITORY_ROOT;BINARY_ROOT;APPLICATION_ROOT;SOURCE_ROOT;DEVELOPER_ROOT;CUSTOMER_STAGE_ANCHOR;EVIDENCE_ROOT;STAGE_OWNER_ROOT;PACKAGE_ROOT;SPEC;OUTPUT_MANIFEST;OUTPUT_DIGEST;POWERSHELL_EXECUTABLE;PACKAGE_VERIFIER_TARGET" "DEPENDS")
     if(_aida_c03_UNPARSED_ARGUMENTS OR _aida_c03_KEYWORDS_MISSING_VALUES OR
        NOT _aida_c03_TARGET OR NOT _aida_c03_APPLICATION_TARGET OR
+       NOT _aida_c03_REPOSITORY_ROOT OR NOT _aida_c03_BINARY_ROOT OR
        NOT _aida_c03_APPLICATION_ROOT OR NOT _aida_c03_SOURCE_ROOT OR
        NOT _aida_c03_DEVELOPER_ROOT OR NOT _aida_c03_CUSTOMER_STAGE_ANCHOR OR
+       NOT _aida_c03_EVIDENCE_ROOT OR NOT _aida_c03_STAGE_OWNER_ROOT OR
        NOT _aida_c03_PACKAGE_ROOT OR NOT _aida_c03_SPEC OR
        NOT _aida_c03_OUTPUT_MANIFEST OR NOT _aida_c03_OUTPUT_DIGEST OR NOT _aida_c03_DEPENDS OR
-       NOT _aida_c03_POWERSHELL_EXECUTABLE OR
+       NOT _aida_c03_POWERSHELL_EXECUTABLE OR NOT _aida_c03_PACKAGE_VERIFIER_TARGET OR
        TARGET "${_aida_c03_TARGET}")
         message(FATAL_ERROR "AiDA C03 distribution manifest arguments are incomplete, malformed, or duplicated")
     endif()
     if(NOT _aida_c03_REQUIRE_ANALYSIS_PYTHON)
         message(FATAL_ERROR "AiDA C03 distribution requires the complete three-worker inventory")
     endif()
-    _aida_c03_package_require_target("${_aida_c03_APPLICATION_TARGET}" "distribution application")
-    _aida_c03_package_require_dependency_targets("distribution manifest" ${_aida_c03_DEPENDS})
-    if(NOT EXISTS "${_aida_c03_SPEC}" OR IS_DIRECTORY "${_aida_c03_SPEC}")
-        message(FATAL_ERROR "AiDA C03 distribution specification is missing: ${_aida_c03_SPEC}")
+    if(NOT COMMAND aida_c03_validate_canonical_regular_file OR
+       NOT COMMAND aida_c03_validate_canonical_directory OR
+       NOT COMMAND aida_c03_validate_no_reparse_chain OR
+       NOT COMMAND aida_c03_require_detached_roots OR
+       NOT COMMAND _aida_c03_validate_raw_windows_path_shape OR
+       NOT AIDA_C03_PATH_IDENTITY_POLICY)
+        message(FATAL_ERROR "AiDA C03 distribution requires the canonical path-identity policy")
     endif()
+    _aida_c03_package_require_target("${_aida_c03_APPLICATION_TARGET}" "distribution application")
+    _aida_c03_package_require_target("${_aida_c03_PACKAGE_VERIFIER_TARGET}" "production distribution verifier")
+    _aida_c03_package_require_dependency_targets("distribution manifest" ${_aida_c03_DEPENDS})
+    if(NOT "${_aida_c03_POWERSHELL_EXECUTABLE}" STREQUAL
+       "${AIDA_C03_VALIDATED_POWERSHELL_EXECUTABLE}")
+        message(FATAL_ERROR "AiDA C03 distribution requires the exact validated system PowerShell executable")
+    endif()
+    aida_c03_validate_canonical_regular_file(
+        _aida_c03_distribution_powershell
+        _aida_c03_distribution_powershell_sha256
+        "${_aida_c03_POWERSHELL_EXECUTABLE}"
+        "distribution system PowerShell")
+    set(_aida_c03_distribution_authority_files
+        "${_aida_c03_SPEC}"
+        "${AIDA_C03_DISTRIBUTION_MANIFEST_MATERIALIZER}"
+        "${AIDA_C03_DISTRIBUTION_MANIFEST_SCHEMA}"
+        "${AIDA_C03_WORKER_MANIFEST_LOCK}")
+    foreach(_aida_c03_authority_file IN LISTS _aida_c03_distribution_authority_files)
+        aida_c03_validate_canonical_regular_file(
+            _aida_c03_validated_authority_file
+            _aida_c03_validated_authority_sha256
+            "${_aida_c03_authority_file}"
+            "distribution source authority")
+        aida_c03_validate_no_reparse_chain(
+            "${_aida_c03_distribution_powershell}"
+            "${AIDA_C03_PATH_IDENTITY_POLICY}"
+            "${_aida_c03_validated_authority_file}"
+            "distribution source authority")
+    endforeach()
+    aida_c03_validate_no_reparse_chain(
+        "${_aida_c03_distribution_powershell}"
+        "${AIDA_C03_PATH_IDENTITY_POLICY}"
+        "${_aida_c03_distribution_powershell}"
+        "distribution system PowerShell")
     file(READ "${_aida_c03_SPEC}" _aida_c03_spec_json LIMIT 16777216)
     string(JSON _aida_c03_spec_type ERROR_VARIABLE _aida_c03_spec_error TYPE "${_aida_c03_spec_json}")
     string(JSON _aida_c03_spec_schema ERROR_VARIABLE _aida_c03_spec_schema_error GET "${_aida_c03_spec_json}" schema)
@@ -675,45 +811,48 @@ function(aida_c03_register_distribution_manifest)
        NOT _aida_c03_PACKAGE_ROOT STREQUAL _aida_c03_expected_package_root)
         message(FATAL_ERROR "AiDA C03 distribution must stage from the exact application target into the exact detached customer root")
     endif()
+    aida_c03_require_detached_roots(
+        "${_aida_c03_REPOSITORY_ROOT}"
+        "${_aida_c03_BINARY_ROOT}"
+        "${_aida_c03_BINARY_ROOT}"
+        "${_aida_c03_APPLICATION_ROOT}"
+        "${_aida_c03_DEVELOPER_ROOT}"
+        "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+        "${_aida_c03_EVIDENCE_ROOT}"
+        "${_aida_c03_STAGE_OWNER_ROOT}")
     foreach(_aida_c03_literal_root IN ITEMS
             "${_aida_c03_APPLICATION_ROOT}"
             "${_aida_c03_DEVELOPER_ROOT}"
-            "${_aida_c03_CUSTOMER_STAGE_ANCHOR}")
-        string(FIND "${_aida_c03_literal_root}" "$<" _aida_c03_literal_generator_expression)
-        if(NOT _aida_c03_literal_generator_expression EQUAL -1 OR
-           NOT IS_ABSOLUTE "${_aida_c03_literal_root}" OR
-           NOT IS_DIRECTORY "${_aida_c03_literal_root}" OR
-           IS_SYMLINK "${_aida_c03_literal_root}")
-            message(FATAL_ERROR "AiDA C03 application, developer, and customer roots must be existing literal absolute non-reparse directories")
-        endif()
+            "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+            "${_aida_c03_EVIDENCE_ROOT}"
+            "${_aida_c03_STAGE_OWNER_ROOT}")
+        aida_c03_validate_no_reparse_chain(
+            "${_aida_c03_distribution_powershell}"
+            "${AIDA_C03_PATH_IDENTITY_POLICY}"
+            "${_aida_c03_literal_root}"
+            "distribution detached root")
     endforeach()
-    foreach(_aida_c03_pair IN ITEMS
-            "${_aida_c03_APPLICATION_ROOT}|${_aida_c03_DEVELOPER_ROOT}"
-            "${_aida_c03_APPLICATION_ROOT}|${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
-            "${_aida_c03_DEVELOPER_ROOT}|${_aida_c03_CUSTOMER_STAGE_ANCHOR}")
-        string(REPLACE "|" ";" _aida_c03_pair_fields "${_aida_c03_pair}")
-        list(GET _aida_c03_pair_fields 0 _aida_c03_left)
-        list(GET _aida_c03_pair_fields 1 _aida_c03_right)
-        cmake_path(IS_PREFIX _aida_c03_left "${_aida_c03_right}" NORMALIZE _aida_c03_left_contains_right)
-        cmake_path(IS_PREFIX _aida_c03_right "${_aida_c03_left}" NORMALIZE _aida_c03_right_contains_left)
-        if(_aida_c03_left_contains_right OR _aida_c03_right_contains_left)
-            message(FATAL_ERROR "AiDA C03 application, developer, and customer roots must not equal, contain, or descend from one another")
-        endif()
-    endforeach()
-    if(NOT EXISTS "${_aida_c03_POWERSHELL_EXECUTABLE}" OR
-       IS_DIRECTORY "${_aida_c03_POWERSHELL_EXECUTABLE}" OR
-       IS_SYMLINK "${_aida_c03_POWERSHELL_EXECUTABLE}")
-        message(FATAL_ERROR "AiDA C03 distribution requires the validated system PowerShell executable")
-    endif()
     foreach(_aida_c03_output IN ITEMS "${_aida_c03_OUTPUT_MANIFEST}" "${_aida_c03_OUTPUT_DIGEST}")
-        string(FIND "${_aida_c03_output}" "$<" _aida_c03_output_generator_expression)
-        if(NOT _aida_c03_output_generator_expression EQUAL -1 OR
-           NOT IS_ABSOLUTE "${_aida_c03_output}")
-            message(FATAL_ERROR "AiDA C03 distribution manifest and digest outputs must be literal absolute paths")
-        endif()
+        _aida_c03_validate_raw_windows_path_shape(
+            "${_aida_c03_output}" "distribution detached evidence output")
+        get_filename_component(_aida_c03_output_parent "${_aida_c03_output}" DIRECTORY)
+        aida_c03_validate_canonical_directory(
+            _aida_c03_output_parent
+            "${_aida_c03_output_parent}"
+            "distribution detached evidence root")
+        aida_c03_validate_no_reparse_chain(
+            "${_aida_c03_distribution_powershell}"
+            "${AIDA_C03_PATH_IDENTITY_POLICY}"
+            "${_aida_c03_output_parent}"
+            "distribution detached evidence root")
     endforeach()
     foreach(_aida_c03_detached IN ITEMS "${_aida_c03_OUTPUT_MANIFEST}" "${_aida_c03_OUTPUT_DIGEST}")
         get_filename_component(_aida_c03_detached_absolute "${_aida_c03_detached}" ABSOLUTE)
+        cmake_path(IS_PREFIX _aida_c03_EVIDENCE_ROOT "${_aida_c03_detached_absolute}"
+            NORMALIZE _aida_c03_detached_inside_evidence)
+        if(NOT _aida_c03_detached_inside_evidence)
+            message(FATAL_ERROR "AiDA C03 distribution evidence must remain inside its detached evidence root")
+        endif()
         foreach(_aida_c03_root IN ITEMS
                 "${_aida_c03_APPLICATION_ROOT}"
                 "${_aida_c03_DEVELOPER_ROOT}"
@@ -725,11 +864,19 @@ function(aida_c03_register_distribution_manifest)
             endif()
         endforeach()
     endforeach()
-    if(NOT AIDA_C03_ANALYSIS_PYTHON_WORKER_AVAILABLE OR
+    if(NOT AIDA_C03_SIGNING_AUTHORITY_AVAILABLE OR
+       NOT AIDA_C03_ANALYSIS_PYTHON_WORKER_AVAILABLE OR
        NOT TARGET "${AIDA_C03_ANALYSIS_PYTHON_WORKER_PACKAGE_TARGET}")
+        if(NOT AIDA_C03_SIGNING_AUTHORITY_AVAILABLE)
+            set(_aida_c03_distribution_blocker
+                "${AIDA_C03_SIGNING_AUTHORITY_BLOCKER}")
+        else()
+            set(_aida_c03_distribution_blocker
+                "${AIDA_C03_ANALYSIS_PYTHON_WORKER_ARTIFACT_BLOCKER}")
+        endif()
         add_custom_target("${_aida_c03_TARGET}"
             COMMAND "${CMAKE_COMMAND}"
-                "-DAIDA_C03_DISTRIBUTION_BLOCKER=${AIDA_C03_ANALYSIS_PYTHON_WORKER_ARTIFACT_BLOCKER}"
+                "-DAIDA_C03_DISTRIBUTION_BLOCKER=${_aida_c03_distribution_blocker}"
                 -P "${AIDA_C03_DISTRIBUTION_BLOCKER_SCRIPT}"
             DEPENDS
                 ${_aida_c03_DEPENDS}
@@ -740,13 +887,15 @@ function(aida_c03_register_distribution_manifest)
             FOLDER "Packaging/C03"
             AIDA_C03_PACKAGE_ROLE "mandatory-three-worker-distribution-blocked"
             AIDA_C03_DISTRIBUTION_AVAILABLE "FALSE"
-            AIDA_C03_DISTRIBUTION_BLOCKER "${AIDA_C03_ANALYSIS_PYTHON_WORKER_ARTIFACT_BLOCKER}"
+            AIDA_C03_DISTRIBUTION_BLOCKER "${_aida_c03_distribution_blocker}"
             AIDA_C03_WORKER_CARDINALITY "3"
             AIDA_C03_EXPLICIT_INVOCATION_REQUIRED "TRUE")
         set(AIDA_C03_DISTRIBUTION_MANIFEST_TARGET "${_aida_c03_TARGET}" PARENT_SCOPE)
         set(AIDA_C03_DISTRIBUTION_MANIFEST_OUTPUT "${_aida_c03_OUTPUT_MANIFEST}" PARENT_SCOPE)
         set(AIDA_C03_DISTRIBUTION_MANIFEST_DIGEST_OUTPUT "${_aida_c03_OUTPUT_DIGEST}" PARENT_SCOPE)
-        message(STATUS "AiDA C03 explicit distribution target is fail-closed: ${AIDA_C03_ANALYSIS_PYTHON_WORKER_ARTIFACT_BLOCKER}")
+        set(AIDA_C03_DISTRIBUTION_GENERATION_POINTER_OUTPUT
+            "${_aida_c03_OUTPUT_MANIFEST}.generation-pointer.json" PARENT_SCOPE)
+        message(STATUS "AiDA C03 explicit distribution target is fail-closed: ${_aida_c03_distribution_blocker}")
         return()
     endif()
     foreach(_aida_c03_required_target IN ITEMS
@@ -764,23 +913,43 @@ function(aida_c03_register_distribution_manifest)
             "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
             "${_aida_c03_manifest_directory}"
             "${_aida_c03_digest_directory}"
-        COMMAND "${_aida_c03_POWERSHELL_EXECUTABLE}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+        COMMAND "${_aida_c03_distribution_powershell}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
             -File "${AIDA_C03_DISTRIBUTION_MANIFEST_MATERIALIZER}"
             -PackageRoot "${_aida_c03_PACKAGE_ROOT}"
             -SourceRoot "${_aida_c03_SOURCE_ROOT}"
+            -ApplicationStageAnchor "${_aida_c03_APPLICATION_ROOT}"
             -CustomerStageAnchor "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+            -EvidenceRoot "${_aida_c03_EVIDENCE_ROOT}"
+            -StageOwnerRoot "${_aida_c03_STAGE_OWNER_ROOT}"
             -StageCustomerPackage
             -Spec "${_aida_c03_SPEC}"
             -AuthorityLock "${AIDA_C03_WORKER_MANIFEST_LOCK}"
             -OutputManifest "${_aida_c03_OUTPUT_MANIFEST}"
             -OutputDigest "${_aida_c03_OUTPUT_DIGEST}"
             -Force
+        COMMAND "$<TARGET_FILE:${_aida_c03_PACKAGE_VERIFIER_TARGET}>" verify-package
+            --generation-pointer "${_aida_c03_OUTPUT_MANIFEST}.generation-pointer.json"
+            --customer-stage-anchor "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+            --evidence-root "${_aida_c03_EVIDENCE_ROOT}"
+            --stage-owner-root "${_aida_c03_STAGE_OWNER_ROOT}"
+            --authority-lock "${AIDA_C03_WORKER_MANIFEST_LOCK}"
+            --protector-tool "$<TARGET_FILE:AiDAProtector>"
+            --protector-verifier "$<TARGET_FILE:AiDAProtectorVerify>"
+            --signature-verifier "$<TARGET_FILE:${_aida_c03_PACKAGE_VERIFIER_TARGET}>"
+            --signer-policy "${AIDA_C03_SIGNER_POLICY_FILE}"
+            --expected-signer-policy-sha256 "${AIDA_C03_SIGNER_POLICY_SHA256}"
+            --signing-provider "${AIDA_C03_SIGNING_PROVIDER}"
+            --expected-signing-provider-sha256 "${AIDA_C03_SIGNING_PROVIDER_SHA256}"
+            --deadline-ms 900000
         DEPENDS
             ${_aida_c03_DEPENDS}
             "${_aida_c03_SPEC}"
             "${AIDA_C03_DISTRIBUTION_MANIFEST_MATERIALIZER}"
             "${AIDA_C03_DISTRIBUTION_MANIFEST_SCHEMA}"
             "${AIDA_C03_WORKER_MANIFEST_LOCK}"
+            "${_aida_c03_PACKAGE_VERIFIER_TARGET}"
+            "${AIDA_C03_SIGNER_POLICY_FILE}"
+            "${AIDA_C03_SIGNING_PROVIDER}"
         VERBATIM)
     set_target_properties("${_aida_c03_TARGET}" PROPERTIES
         FOLDER "Packaging/C03"
@@ -790,8 +959,12 @@ function(aida_c03_register_distribution_manifest)
         AIDA_C03_APPLICATION_ROOT "${_aida_c03_APPLICATION_ROOT}"
         AIDA_C03_DEVELOPER_ROOT "${_aida_c03_DEVELOPER_ROOT}"
         AIDA_C03_CUSTOMER_STAGE_ANCHOR "${_aida_c03_CUSTOMER_STAGE_ANCHOR}"
+        AIDA_C03_DISTRIBUTION_EVIDENCE_ROOT "${_aida_c03_EVIDENCE_ROOT}"
+        AIDA_C03_STAGE_OWNER_ROOT "${_aida_c03_STAGE_OWNER_ROOT}"
+        AIDA_C03_PACKAGE_VERIFIER_TARGET "${_aida_c03_PACKAGE_VERIFIER_TARGET}"
         AIDA_C03_SANITIZED_CUSTOMER_STAGE "TRUE"
-        AIDA_C03_PACKAGE_OUTPUTS "${_aida_c03_OUTPUT_MANIFEST};${_aida_c03_OUTPUT_DIGEST}"
+        AIDA_C03_PACKAGE_OUTPUTS "${_aida_c03_OUTPUT_MANIFEST}.generation-pointer.json"
+        AIDA_C03_GENERATION_POINTER_OUTPUT "${_aida_c03_OUTPUT_MANIFEST}.generation-pointer.json"
         AIDA_C03_WORKER_CARDINALITY "3"
         AIDA_C03_DISTRIBUTION_AVAILABLE "TRUE"
         AIDA_C03_EXPLICIT_INVOCATION_REQUIRED "TRUE"
@@ -802,4 +975,6 @@ function(aida_c03_register_distribution_manifest)
     set(AIDA_C03_DISTRIBUTION_MANIFEST_TARGET "${_aida_c03_TARGET}" PARENT_SCOPE)
     set(AIDA_C03_DISTRIBUTION_MANIFEST_OUTPUT "${_aida_c03_OUTPUT_MANIFEST}" PARENT_SCOPE)
     set(AIDA_C03_DISTRIBUTION_MANIFEST_DIGEST_OUTPUT "${_aida_c03_OUTPUT_DIGEST}" PARENT_SCOPE)
+    set(AIDA_C03_DISTRIBUTION_GENERATION_POINTER_OUTPUT
+        "${_aida_c03_OUTPUT_MANIFEST}.generation-pointer.json" PARENT_SCOPE)
 endfunction()

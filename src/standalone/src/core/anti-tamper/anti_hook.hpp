@@ -1053,6 +1053,81 @@ namespace veh_chain {
         return true;
     }
 
+    inline uint32_t remove_foreign_handlers()
+    {
+        if (!baseline_set().load())
+            return 0;
+
+        uint64_t head_addr = list_head_addr().load();
+        if (head_addr == 0)
+        {
+            head_addr = locate_veh_list_head();
+            if (head_addr == 0) return 0;
+            list_head_addr().store(head_addr);
+        }
+
+        auto* head = reinterpret_cast<_VECTORED_HANDLER_LIST*>(head_addr);
+        if (!pointer_readable(head, sizeof(_VECTORED_HANDLER_LIST)))
+            return 0;
+
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll) return 0;
+        using RtlRemoveVEH_t = PVOID(NTAPI*)(PVOID);
+        auto pRtlRemove = reinterpret_cast<RtlRemoveVEH_t>(
+            GetProcAddress(ntdll, "RtlRemoveVectoredExceptionHandler"));
+        if (!pRtlRemove) return 0;
+
+        const auto& base = baseline_handlers();
+        uint32_t removed = 0;
+
+        __try
+        {
+            LIST_ENTRY* cursor = head->ListHead.Flink;
+            uint32_t guard = 0;
+            while (cursor != &head->ListHead && guard < 256)
+            {
+                if (!pointer_readable(cursor, sizeof(LIST_ENTRY)))
+                    break;
+                auto* entry = CONTAINING_RECORD(cursor, _VECTORED_HANDLER_ENTRY, Entry);
+                if (!pointer_readable(entry, sizeof(_VECTORED_HANDLER_ENTRY)))
+                    break;
+
+                uint64_t handler_va = reinterpret_cast<uint64_t>(entry->VectoredHandler);
+                LIST_ENTRY* next = cursor->Flink;
+
+                bool is_foreign = true;
+                for (uint64_t b : base)
+                {
+                    if (b == handler_va) { is_foreign = false; break; }
+                }
+
+                if (is_foreign)
+                {
+                    PVOID result = pRtlRemove(reinterpret_cast<PVOID>(entry));
+                    if (result)
+                    {
+                        ++removed;
+                        char dbg[256];
+                        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+                            "veh_foreign_handler_removed handler_va=0x%llX entry=0x%llX",
+                            static_cast<unsigned long long>(handler_va),
+                            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(entry)));
+                        webhook::write_log_critical("veh_chain", dbg);
+                    }
+                }
+
+                if (!next) break;
+                cursor = next;
+                ++guard;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return removed;
+        }
+        return removed;
+    }
+
     inline bool verify_chain()
     {
         if (!baseline_set().load())
@@ -1063,9 +1138,32 @@ namespace veh_chain {
         uint32_t count = 0;
         if (!walk_chain(hs, count)) return false;
 
+        const auto& base = baseline_handlers();
+
+        bool foreign_detected = false;
+        for (uint64_t h : hs)
+        {
+            bool found = false;
+            for (uint64_t b : base)
+            {
+                if (b == h) { found = true; break; }
+            }
+            if (!found)
+            {
+                foreign_detected = true;
+                break;
+            }
+        }
+
+        if (foreign_detected)
+        {
+            webhook::write_log_critical("veh_chain", "foreign_handler_detected");
+            remove_foreign_handlers();
+            return false;
+        }
+
         if (count != baseline_count().load()) return false;
 
-        const auto& base = baseline_handlers();
         if (hs.size() != base.size()) return false;
         for (size_t i = 0; i < hs.size(); ++i)
         {

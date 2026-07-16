@@ -28,6 +28,8 @@ enum check_class_t : uint32_t
     CHECK_PAGE_PROTECT   = 3
 };
 
+inline uint8_t g_wbaes_table_hash[32] = {};
+
 namespace token_chain {
 
 #pragma region RDTSC_ENTANGLE

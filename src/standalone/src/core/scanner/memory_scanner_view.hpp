@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+#include "memory_interaction_context.hpp"
 
 namespace memory_scanner_view {
 
@@ -69,7 +72,6 @@ struct ui_state_t {
 	float  refresh_timer = 0.f;
 	float  refresh_interval = 0.5f;
 
-	std::unordered_set<uint64_t> prev_result_addresses;
 	std::vector<float>           row_flash;
 	bool                         user_scrolled_up = false;
 	float                        autoscroll_pill_alpha = 0.f;
@@ -81,17 +83,30 @@ struct ui_state_t {
 
 	region_cache_t region_cache;
 	uint64_t       last_region_refresh_gen = static_cast<uint64_t>(-1);
+	std::vector<region_cache_entry_t> render_region_snapshot;
+	uint64_t       render_region_generation = static_cast<uint64_t>(-1);
 
 	desc_edit_state_t desc_edit;
 
 	float       result_pane_ratio = 0.6f;
 	bool        splitter_dragging = false;
 	float       splitter_press_anim = 0.f;
+	bool        result_pane_focused = false;
+	bool        address_pane_focused = false;
+	std::uint64_t last_flash_revision = static_cast<std::uint64_t>(-1);
+	float       flash_revision_age = 0.f;
+	std::size_t last_result_count = 0;
+	memory_interaction::context_t result_context;
+	memory_interaction::context_t address_context;
 };
 
 inline ui_state_t g_ui;
 
 void render(float pos_x, float pos_y, float width, float height,
 			float alpha, float accent_r, float accent_g, float accent_b);
+void render_results(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_address_list(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
 
 }

@@ -16,12 +16,14 @@
 #include "event_bus.hpp"
 #include "mcp_client.hpp"
 #include "session_store.hpp"
+#include "settings_overlay.hpp"
 #include "skills.hpp"
 #include "standalone_chat.hpp"
 #include "standalone_settings.hpp"
 
-#include "../helpers/globals.h"
 #include "../helpers/diag_log.hpp"
+#include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
 
 
 extern mcp_client::manager_t s_mcp_client_mgr;
@@ -396,21 +398,23 @@ namespace commands {
 		}
 
 
-		bool resolver_view_switch(center_view_t target,
+		bool resolver_view_switch(const char* target,
 		                          const std::vector<std::string>& args,
 		                          std::string& out_text)
 		{
 			(void)args;
-			globals::ui::active_center_view = target;
-			out_text = "[view] switched";
-			return true;
+			const auto result = aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t(target));
+			out_text = result.ok() ? "[view] switched" :
+				"[view] unavailable: " + result.detail;
+			return result.ok();
 		}
 
 
 		bool resolver_open_settings(const std::vector<std::string>& args, std::string& out_text)
 		{
 			(void)args;
-			g_settings_open = true;
+			aida::settings_overlay::open();
 			out_text = "[settings] opened";
 			return true;
 		}
@@ -419,21 +423,21 @@ namespace commands {
 		bool resolver_toggle_left(const std::vector<std::string>& args, std::string& out_text)
 		{
 			(void)args;
-			globals::ui::panel_left_visible = !globals::ui::panel_left_visible;
-			g_sa_settings.workspace.left_visible = globals::ui::panel_left_visible;
-			g_sa_settings.save();
-			out_text = "[panel] left toggled";
-			return true;
+			const aida::ui::stable_view_id_t id("view.project_explorer");
+			const auto result = aida::ui::application_views::is_open(id)
+				? aida::ui::application_views::close(id)
+				: aida::ui::application_views::open_or_focus(id);
+			out_text = result.ok() ? "[view] project explorer toggled" : "[view] project explorer unavailable: " + result.detail;
+			return result.ok();
 		}
 
 
 		bool resolver_toggle_right(const std::vector<std::string>& args, std::string& out_text)
 		{
 			(void)args;
-			globals::ui::panel_right_visible = !globals::ui::panel_right_visible;
-			g_sa_settings.workspace.right_visible = globals::ui::panel_right_visible;
-			g_sa_settings.save();
-			out_text = "[panel] right toggled";
+			aida::settings_overlay::toggle();
+			out_text = aida::settings_overlay::is_open()
+				? "[settings] opened" : "[settings] closed";
 			return true;
 		}
 
@@ -441,11 +445,12 @@ namespace commands {
 		bool resolver_toggle_bottom(const std::vector<std::string>& args, std::string& out_text)
 		{
 			(void)args;
-			globals::ui::panel_bottom_visible = !globals::ui::panel_bottom_visible;
-			g_sa_settings.workspace.bottom_visible = globals::ui::panel_bottom_visible;
-			g_sa_settings.save();
-			out_text = "[panel] bottom toggled";
-			return true;
+			const aida::ui::stable_view_id_t id("view.output");
+			const auto result = aida::ui::application_views::is_open(id)
+				? aida::ui::application_views::close(id)
+				: aida::ui::application_views::open_or_focus(id);
+			out_text = result.ok() ? "[view] output toggled" : "[view] output unavailable: " + result.detail;
+			return result.ok();
 		}
 
 
@@ -519,39 +524,39 @@ namespace commands {
 				dst.push_back(std::move(c));
 			}
 
-			struct view_entry_t { const char* name; const char* desc; center_view_t target; };
+			struct view_entry_t { const char* name; const char* desc; const char* target; };
 			static const view_entry_t view_entries[] = {
-				{ "view:editor",            "switch to code editor",         center_view_t::code_editor      },
-				{ "view:disassembly",       "switch to disassembly view",    center_view_t::disassembly      },
-				{ "view:hex",               "switch to hex view",            center_view_t::hex_view         },
-				{ "view:network",           "switch to network monitor",     center_view_t::network_view     },
-				{ "view:scanner",           "switch to scanner hub",         center_view_t::scan_hub         },
-				{ "view:analysis",          "switch to analysis hub",        center_view_t::analysis_hub     },
-				{ "view:debugger",          "switch to debugger",            center_view_t::debugger_view    },
-				{ "view:decompiler",        "switch to pseudocode",          center_view_t::pseudocode       },
-				{ "view:struct",            "switch to struct recon",        center_view_t::struct_recon     },
-				{ "view:crypto",            "switch to crypto scanner",      center_view_t::crypto_scanner   },
-				{ "view:aob",               "switch to aob generator",       center_view_t::aob_generator    },
-				{ "view:fuzzer",            "switch to fuzzer",              center_view_t::fuzzer_view      },
-				{ "view:xrefs",             "switch to xref browser",        center_view_t::xref_browser     },
-				{ "view:snapshot",          "switch to snapshot diff",       center_view_t::snapshot_diff    },
-				{ "view:pointer",           "switch to pointer scanner",     center_view_t::pointer_scanner  },
-				{ "view:decrypt-oracle",    "switch to decrypt oracle",      center_view_t::decrypt_oracle   },
-				{ "view:integrity",         "switch to integrity hunter",    center_view_t::integrity_hunter },
-				{ "view:symbolic",          "switch to symbolic engine",     center_view_t::symbolic_view    },
-				{ "view:taint",             "switch to taint view",          center_view_t::taint_view       },
-				{ "view:deobfuscation",     "switch to deobfuscation",       center_view_t::deobfuscation_view },
-				{ "view:stealth",           "switch to stealth view",        center_view_t::stealth_view     },
-				{ "view:types",             "switch to types hub",           center_view_t::types_hub        },
-				{ "view:binary-map",        "switch to binary map",          center_view_t::binary_map       },
-				{ "view:memory-scanner",    "switch to memory scanner",      center_view_t::memory_scanner   },
+				{ "view:editor",            "switch to code editor",         "document.code" },
+				{ "view:disassembly",       "switch to disassembly view",    "document.disassembly" },
+				{ "view:hex",               "switch to hex view",            "document.hex" },
+				{ "view:network",           "switch to network monitor",     "view.network.connections" },
+				{ "view:scanner",           "switch to scanner hub",         "view.memory.value_scan" },
+				{ "view:analysis",          "switch to analysis hub",        "view.analysis.symbolic" },
+				{ "view:debugger",          "switch to debugger",            "view.debug.cpu" },
+				{ "view:decompiler",        "switch to pseudocode",          "document.pseudocode" },
+				{ "view:struct",            "switch to struct recon",        "view.types.struct_recon" },
+				{ "view:crypto",            "switch to crypto scanner",      "view.memory.crypto" },
+				{ "view:aob",               "switch to aob generator",       "view.memory.aob" },
+				{ "view:fuzzer",            "switch to fuzzer",              "view.analysis.fuzzer" },
+				{ "view:xrefs",             "switch to cross references",     "view.analysis.references" },
+				{ "view:snapshot",          "switch to snapshot diff",       "view.memory.snapshots" },
+				{ "view:pointer",           "switch to pointer scanner",     "view.memory.pointers" },
+				{ "view:decrypt-oracle",    "switch to decrypt oracle",      "view.memory.decrypt" },
+				{ "view:integrity",         "switch to integrity hunter",    "view.memory.integrity" },
+				{ "view:symbolic",          "switch to symbolic engine",     "view.analysis.symbolic" },
+				{ "view:taint",             "switch to taint view",          "view.analysis.taint" },
+				{ "view:deobfuscation",     "switch to deobfuscation",       "view.analysis.deobfuscation" },
+				{ "view:stealth",           "switch to stealth view",        "view.analysis.protection" },
+				{ "view:types",             "switch to types hub",           "view.types.structures" },
+				{ "view:binary-map",        "switch to binary map",          "view.analysis.binary_map" },
+				{ "view:memory-scanner",    "switch to memory scanner",      "view.memory.value_scan" },
 			};
 			for (const auto& v : view_entries) {
 				command_t c;
 				c.name        = v.name;
 				c.description = v.desc;
 				c.source      = command_source_t::builtin;
-				center_view_t target = v.target;
+				const char* target = v.target;
 				c.resolver = [target](const std::vector<std::string>& args, std::string& out) -> bool {
 					return resolver_view_switch(target, args, out);
 				};
@@ -798,6 +803,29 @@ namespace commands {
 		}
 
 
+		void append_application_actions(std::vector<command_t>& result)
+		{
+			const auto actions = aida::ui::application_ui::list_actions(
+				aida::ui::action_surface_t::command_palette);
+			result.reserve(result.size() + actions.size());
+			for (const auto& action : actions) {
+				if (!action.visible)
+					continue;
+				command_t command;
+				command.name = std::string("action:") + action.id;
+				command.display_name = action.label;
+				command.description = action.description;
+				command.category = action.category;
+				command.shortcut = action.shortcut;
+				command.application_action_id = action.id;
+				command.disabled_reason = action.disabled_reason;
+				command.source = command_source_t::builtin;
+				command.enabled = action.enabled;
+				result.push_back(std::move(command));
+			}
+		}
+
+
 	}
 
 
@@ -892,8 +920,13 @@ namespace commands {
 
 	std::vector<command_t> list()
 	{
-		std::lock_guard<std::mutex> lk(registry_mutex());
-		return commands_vector();
+		std::vector<command_t> result;
+		{
+			std::lock_guard<std::mutex> lk(registry_mutex());
+			result = commands_vector();
+		}
+		append_application_actions(result);
+		return result;
 	}
 
 
@@ -913,8 +946,13 @@ namespace commands {
 
 	std::vector<command_t> fuzzy_search(const std::string& query, int limit)
 	{
-		std::lock_guard<std::mutex> lk(registry_mutex());
-		const auto& v = commands_vector();
+		std::vector<command_t> available;
+		{
+			std::lock_guard<std::mutex> lk(registry_mutex());
+			available = commands_vector();
+		}
+		append_application_actions(available);
+		const auto& v = available;
 		const std::string q = to_lower_ascii(trim_copy(query));
 
 		std::vector<command_t> result;
@@ -931,13 +969,20 @@ namespace commands {
 		std::vector<std::pair<int, const command_t*>> scored;
 		scored.reserve(v.size());
 		for (const auto& c : v) {
-			const std::string name_lower = to_lower_ascii(c.name);
+			const std::string name_lower = to_lower_ascii(
+				c.display_name.empty() ? c.name : c.display_name);
 			const std::string desc_lower = to_lower_ascii(c.description);
+			const std::string category_lower = to_lower_ascii(c.category);
+			const std::string shortcut_lower = to_lower_ascii(c.shortcut);
 			int score = fuzzy_score(q, name_lower);
 			if (score < 0) {
 				const int desc_score = fuzzy_score(q, desc_lower);
-				if (desc_score < 0) continue;
-				score = desc_score - 200;
+				const int category_score = fuzzy_score(q, category_lower);
+				const int shortcut_score = fuzzy_score(q, shortcut_lower);
+				if (desc_score < 0 && category_score < 0 && shortcut_score < 0)
+					continue;
+				score = (std::max)(desc_score - 200,
+					(std::max)(category_score - 120, shortcut_score - 80));
 			}
 			scored.emplace_back(score, &c);
 		}

@@ -7,9 +7,25 @@ param(
     [string]$OutputManifest,
     [string]$OutputDigest,
     [string]$SourceRoot,
+    [string]$ApplicationStageAnchor,
     [string]$CustomerStageAnchor,
+    [string]$EvidenceRoot,
+    [string]$StageOwnerRoot,
     [switch]$StageCustomerPackage,
     [string]$PolicyFixtureReport,
+    [switch]$StagePolicyFixture,
+    [int]$FixtureMaximumFiles,
+    [int]$FixtureMaximumDirectories,
+    [int]$FixtureMaximumEntries,
+    [int]$FixtureMaximumDepth,
+    [int]$FixtureMaximumRelativePathBytes,
+    [Int64]$FixtureMaximumInventoryPathBytes,
+    [Int64]$FixtureMaximumEntryBytes,
+    [Int64]$FixtureMaximumAggregateBytes,
+    [ValidateSet('none', 'prepared', 'package-ready', 'evidence-ready', 'before-commit', 'after-commit')]
+    [string]$FixturePublicationFailure = 'none',
+    [ValidateSet('none', 'prepared', 'package-ready', 'evidence-ready', 'before-commit', 'after-commit')]
+    [string]$FixturePublicationTermination = 'none',
     [switch]$Force
 )
 
@@ -41,9 +57,24 @@ $script:MaximumPackageDirectories = 65536
 $script:MaximumPackageEntries = 300000
 $script:MaximumPackageDepth = 64
 $script:MaximumRelativePathBytes = 32768
+$script:MaximumInventoryPathBytes = [Int64]268435456
 $script:MaximumEntryBytes = [Int64]8589934592
 $script:MaximumAggregateBytes = [Int64]17179869184
 $script:MaximumStreamsPerEntry = 16
+$script:ImmutableGeneration = $null
+$script:SignerPolicyReceiptSha256 = $null
+$script:SigningProviderReceiptSha256 = $null
+
+function Invoke-PublicationCheckpoint {
+    param([string]$Name)
+    if ($FixturePublicationFailure -ceq $Name) {
+        Throw-PackagePolicy -Code 'FIXTURE_PUBLICATION_FAILURE' -Path $Name
+    }
+    if ($FixturePublicationTermination -ceq $Name) {
+        Stop-Process -Id $PID -Force
+        [Environment]::FailFast('AIDA_C03_PUBLICATION_TERMINATION_' + $Name)
+    }
+}
 
 if (-not ('AidaC03PackageNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -75,6 +106,13 @@ public static class AidaC03PackageNative
         public uint FileIndexLow;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILE_ATTRIBUTE_TAG_INFO
+    {
+        public uint FileAttributes;
+        public uint ReparseTag;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr FindFirstStreamW(string path, int level, out WIN32_FIND_STREAM_DATA data, uint flags);
 
@@ -95,6 +133,13 @@ public static class AidaC03PackageNative
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandleEx(IntPtr handle, int informationClass, out FILE_ATTRIBUTE_TAG_INFO information, uint size);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetFinalPathNameByHandleW(IntPtr handle, System.Text.StringBuilder path, uint size, uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr handle);
 }
 '@
@@ -105,10 +150,117 @@ function Throw-PackagePolicy {
     throw ('AIDA_C03_PACKAGE_POLICY_' + $Code + '|' + $Path)
 }
 
+function ConvertTo-CanonicalNativePath {
+    param([string]$Path, [string]$Label)
+    if ([string]::IsNullOrEmpty($Path) -or $Path.Length -gt 32767 -or
+        $Path -cnotmatch '^[A-Z]:/' -or
+        $Path.Contains('\') -or $Path.Contains('//') -or
+        ($Path.Length -gt 3 -and $Path.EndsWith('/', [StringComparison]::Ordinal))) {
+        Throw-PackagePolicy -Code 'RAW_ABSOLUTE_PATH' -Path $Label
+    }
+    foreach ($character in $Path.ToCharArray()) {
+        if ([int]$character -lt 0x20 -or [int]$character -gt 0x7e) {
+            Throw-PackagePolicy -Code 'RAW_ABSOLUTE_PATH' -Path $Label
+        }
+    }
+    $segments = @($Path.Substring(3).Split('/'))
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.' -or $segment -eq '..' -or
+            $segment.EndsWith('.', [StringComparison]::Ordinal) -or
+            $segment.EndsWith(' ', [StringComparison]::Ordinal) -or
+            $segment.IndexOf(':', [StringComparison]::Ordinal) -ge 0) {
+            Throw-PackagePolicy -Code 'RAW_ABSOLUTE_PATH' -Path $Label
+        }
+    }
+    $native = $Path.Replace('/', '\')
+    $full = [IO.Path]::GetFullPath($native).Replace('\', '/')
+    if (-not [string]::Equals($full, $Path, [StringComparison]::Ordinal)) {
+        Throw-PackagePolicy -Code 'RAW_ABSOLUTE_PATH' -Path $Label
+    }
+    return $native
+}
+
+function Get-ExactExistingPath {
+    param([string]$Path, [string]$Label, [ValidateSet('Any', 'File', 'Directory')][string]$Kind = 'Any')
+    $native = ConvertTo-CanonicalNativePath -Path $Path -Label $Label
+    $segments = @($Path.Substring(3).Split('/'))
+    $current = $Path.Substring(0, 3)
+    $finalAttributes = 0
+    for ($index = -1; $index -lt $segments.Count; ++$index) {
+        if ($index -ge 0) {
+            if (-not $current.EndsWith('/', [StringComparison]::Ordinal)) { $current += '/' }
+            $current += $segments[$index]
+        }
+        $currentNative = $current.Replace('/', '\')
+        $handle = [AidaC03PackageNative]::CreateFileW(
+            $currentNative, 0, 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+        if ($handle -eq [IntPtr](-1)) {
+            Throw-PackagePolicy -Code 'CANONICAL_PATH_OPEN' -Path $Label
+        }
+        try {
+            $tag = New-Object AidaC03PackageNative+FILE_ATTRIBUTE_TAG_INFO
+            if (-not [AidaC03PackageNative]::GetFileInformationByHandleEx(
+                    $handle, 9, [ref]$tag,
+                    [Runtime.InteropServices.Marshal]::SizeOf([type]'AidaC03PackageNative+FILE_ATTRIBUTE_TAG_INFO'))) {
+                Throw-PackagePolicy -Code 'CANONICAL_PATH_TAG' -Path $Label
+            }
+            if (($tag.FileAttributes -band 0x400) -ne 0 -or $tag.ReparseTag -ne 0) {
+                Throw-PackagePolicy -Code 'REPARSE_POINT' -Path $Label
+            }
+            $buffer = New-Object Text.StringBuilder 32768
+            $length = [AidaC03PackageNative]::GetFinalPathNameByHandleW($handle, $buffer, 32768, 0)
+            if ($length -eq 0 -or $length -ge 32768) {
+                Throw-PackagePolicy -Code 'CANONICAL_PATH_FINAL' -Path $Label
+            }
+            $final = $buffer.ToString()
+            if ($final.StartsWith('\\?\UNC\', [StringComparison]::Ordinal)) {
+                Throw-PackagePolicy -Code 'CANONICAL_PATH_VOLUME' -Path $Label
+            }
+            if ($final.StartsWith('\\?\', [StringComparison]::Ordinal)) { $final = $final.Substring(4) }
+            $final = $final.Replace('\', '/')
+            if ($index -lt 0 -and -not $final.EndsWith('/', [StringComparison]::Ordinal)) { $final += '/' }
+            if (-not [string]::Equals($final, $current, [StringComparison]::Ordinal)) {
+                Throw-PackagePolicy -Code 'CANONICAL_PATH_CASE' -Path $Label
+            }
+            $finalAttributes = $tag.FileAttributes
+        } finally {
+            [AidaC03PackageNative]::CloseHandle($handle) | Out-Null
+        }
+    }
+    if (($Kind -eq 'File' -and ($finalAttributes -band 0x10) -ne 0) -or
+        ($Kind -eq 'Directory' -and ($finalAttributes -band 0x10) -eq 0)) {
+        Throw-PackagePolicy -Code 'CANONICAL_PATH_TYPE' -Path $Label
+    }
+    if ($Kind -eq 'File') { Assert-NoNamedStreams -Path $native | Out-Null }
+    return $native
+}
+
+function Get-ExactOutputPath {
+    param([string]$Path, [string]$Label)
+    $native = ConvertTo-CanonicalNativePath -Path $Path -Label $Label
+    $parent = [IO.Path]::GetDirectoryName($native)
+    if ([string]::IsNullOrEmpty($parent)) {
+        Throw-PackagePolicy -Code 'OUTPUT_PARENT' -Path $Label
+    }
+    $parentCanonical = $parent.Replace('\', '/')
+    Get-ExactExistingPath -Path $parentCanonical -Label ($Label + ':parent') -Kind Directory | Out-Null
+    if ([IO.File]::Exists($native)) {
+        Get-ExactExistingPath -Path $Path -Label $Label -Kind File | Out-Null
+    } elseif ([IO.Directory]::Exists($native)) {
+        Throw-PackagePolicy -Code 'CANONICAL_PATH_TYPE' -Path $Label
+    }
+    return $native
+}
+
 function Test-AsciiAlphaNumeric {
     param([char]$Character)
     return ($Character -ge 'a' -and $Character -le 'z') -or
         ($Character -ge '0' -and $Character -le '9')
+}
+
+function Get-Utf8PathByteCount {
+    param([string]$Value)
+    return [Text.UTF8Encoding]::new($false, $true).GetByteCount($Value)
 }
 
 function Test-PolicyNameMatch {
@@ -127,7 +279,7 @@ function Test-PolicyNameMatch {
 function Test-ForbiddenCustomerRelativePath {
     param([string]$RelativePath)
     if ([string]::IsNullOrWhiteSpace($RelativePath) -or
-        $RelativePath.Length -gt $script:MaximumRelativePathBytes -or
+        (Get-Utf8PathByteCount -Value $RelativePath) -gt $script:MaximumRelativePathBytes -or
         $RelativePath[0] -eq '/' -or $RelativePath[$RelativePath.Length - 1] -eq '/') {
         return $true
     }
@@ -221,8 +373,6 @@ function Assert-NoNamedStreams {
     $data = New-Object AidaC03PackageNative+WIN32_FIND_STREAM_DATA
     $handle = [AidaC03PackageNative]::FindFirstStreamW($Path, 0, [ref]$data, 0)
     if ($handle -eq [IntPtr](-1)) {
-        $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        if ($lastError -eq 38) { return 0 }
         Throw-PackagePolicy -Code 'STREAM_ENUMERATION' -Path $Path
     }
     $count = 0
@@ -271,6 +421,39 @@ function Get-DirectoryIdentity {
     }
 }
 
+function Assert-SingleLinkFile {
+    param([string]$Path, [string]$Label)
+    $handle = [AidaC03PackageNative]::CreateFileW(
+        $Path, 0x80, 1, [IntPtr]::Zero, 3, 0x00200000, [IntPtr]::Zero)
+    if ($handle -eq [IntPtr](-1)) {
+        Throw-PackagePolicy -Code 'FILE_IDENTITY' -Path $Label
+    }
+    try {
+        $information = New-Object AidaC03PackageNative+BY_HANDLE_FILE_INFORMATION
+        if (-not [AidaC03PackageNative]::GetFileInformationByHandle($handle, [ref]$information) -or
+            [UInt32]$information.NumberOfLinks -ne 1) {
+            Throw-PackagePolicy -Code 'HARDLINK_FORBIDDEN' -Path $Label
+        }
+        $buffer = New-Object Text.StringBuilder 32768
+        $length = [AidaC03PackageNative]::GetFinalPathNameByHandleW($handle, $buffer, 32768, 0)
+        if ($length -eq 0 -or $length -ge 32768) {
+            Throw-PackagePolicy -Code 'GENERATION_FINAL_PATH' -Path $Label
+        }
+        $final = $buffer.ToString()
+        if ($final.StartsWith('\\?\UNC\', [StringComparison]::Ordinal)) {
+            Throw-PackagePolicy -Code 'GENERATION_FINAL_VOLUME' -Path $Label
+        }
+        if ($final.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+            $final = $final.Substring(4)
+        }
+        if (-not [string]::Equals($final, [IO.Path]::GetFullPath($Path), [StringComparison]::Ordinal)) {
+            Throw-PackagePolicy -Code 'GENERATION_FINAL_PATH' -Path $Label
+        }
+    } finally {
+        [AidaC03PackageNative]::CloseHandle($handle) | Out-Null
+    }
+}
+
 function Get-BoundedTreeInventory {
     param([string]$Root, [switch]$AllowForbiddenPaths)
     $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
@@ -292,22 +475,46 @@ function Get-BoundedTreeInventory {
     $foldedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $directories = 1
     $entries = 0
+    [Int64]$pathBytes = 0
     [Int64]$bytes = 0
     while ($pending.Count -ne 0) {
         $current = $pending.Dequeue()
+        $discovered = [Collections.Generic.List[object]]::new()
         foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries([string]$current.path)) {
             ++$entries
             if ($entries -gt $script:MaximumPackageEntries) {
-                Throw-PackagePolicy -Code 'RESOURCE_ENTRY_LIMIT' -Path $entryPath
+                Throw-PackagePolicy -Code 'RESOURCE_ENTRY_LIMIT' -Path $normalizedRoot
             }
-            $item = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                Throw-PackagePolicy -Code 'REPARSE_POINT' -Path $entryPath
+            $entryFull = [IO.Path]::GetFullPath($entryPath)
+            if (-not $entryFull.StartsWith($normalizedRoot + [IO.Path]::DirectorySeparatorChar,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                Throw-PackagePolicy -Code 'PATH_ESCAPE' -Path $normalizedRoot
             }
-            $relative = $item.FullName.Substring($normalizedRoot.Length + 1).Replace('\', '/')
-            if ([Text.Encoding]::UTF8.GetByteCount($relative) -gt $script:MaximumRelativePathBytes) {
+            $relative = $entryFull.Substring($normalizedRoot.Length + 1).Replace('\', '/')
+            $relativeBytes = Get-Utf8PathByteCount -Value $relative
+            if ($relativeBytes -gt $script:MaximumRelativePathBytes) {
                 Throw-PackagePolicy -Code 'RESOURCE_PATH_LIMIT' -Path $relative
             }
+            $entryMemoryBytes = $relativeBytes + (Get-Utf8PathByteCount -Value $entryFull)
+            if ($entryMemoryBytes -gt $script:MaximumInventoryPathBytes - $pathBytes) {
+                Throw-PackagePolicy -Code 'RESOURCE_PATH_BUFFER_LIMIT' -Path $normalizedRoot
+            }
+            $pathBytes += $entryMemoryBytes
+            $discovered.Add([pscustomobject]@{
+                full_name = $entryFull
+                relative_path = $relative
+            })
+        }
+        foreach ($discoveredEntry in @($discovered | Sort-Object -Property relative_path -CaseSensitive)) {
+            $item = Get-Item -LiteralPath $discoveredEntry.full_name -Force -ErrorAction Stop
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Throw-PackagePolicy -Code 'REPARSE_POINT' -Path $discoveredEntry.full_name
+            }
+            if (-not [string]::Equals($item.FullName, $discoveredEntry.full_name,
+                    [StringComparison]::Ordinal)) {
+                Throw-PackagePolicy -Code 'CANONICAL_PATH_CASE' -Path $discoveredEntry.relative_path
+            }
+            $relative = [string]$discoveredEntry.relative_path
             if (-not $AllowForbiddenPaths -and
                 (Test-ForbiddenCustomerRelativePath -RelativePath $relative)) {
                 Throw-PackagePolicy -Code 'PATH_POLICY' -Path $relative
@@ -335,6 +542,7 @@ function Get-BoundedTreeInventory {
             if ($files.Count -ge $script:MaximumPackageFiles) {
                 Throw-PackagePolicy -Code 'RESOURCE_FILE_LIMIT' -Path $relative
             }
+            Assert-SingleLinkFile -Path $item.FullName -Label $relative
             $size = [Int64]$item.Length
             if ($size -lt 0 -or $size -gt $script:MaximumEntryBytes) {
                 Throw-PackagePolicy -Code 'RESOURCE_FILE_BYTES_LIMIT' -Path $relative
@@ -357,6 +565,7 @@ function Get-BoundedTreeInventory {
         directory_count = $directories
         entry_count = $entries
         total_size_bytes = $bytes
+        inventory_path_bytes = $pathBytes
         stream_inventory_count = $streamInventories
     }
 }
@@ -370,11 +579,466 @@ function Test-ContainedPath {
             [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Remove-OwnedGenerationDirectory {
+    param(
+        [string]$Path,
+        [string]$Anchor,
+        [string]$ExpectedIdentity,
+        [string]$AllowedPrefix
+    )
+    $pathFull = [IO.Path]::GetFullPath($Path).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $anchorFull = [IO.Path]::GetFullPath($Anchor).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if (-not [IO.Directory]::Exists($pathFull) -or
+        -not (Test-ContainedPath -Candidate $pathFull -Root $anchorFull) -or
+        -not [string]::Equals((Split-Path -Parent $pathFull), $anchorFull, [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([IO.Path]::GetFileName($pathFull)).StartsWith($AllowedPrefix, [StringComparison]::Ordinal) -or
+        (Get-DirectoryIdentity -Path $pathFull) -cne $ExpectedIdentity) {
+        Throw-PackagePolicy -Code 'OWNED_GENERATION_IDENTITY' -Path $pathFull
+    }
+    Get-BoundedTreeInventory -Root $pathFull -AllowForbiddenPaths | Out-Null
+    if ((Get-DirectoryIdentity -Path $pathFull) -cne $ExpectedIdentity) {
+        Throw-PackagePolicy -Code 'OWNED_GENERATION_CHANGED' -Path $pathFull
+    }
+    [IO.Directory]::Delete($pathFull, $true)
+}
+
+function Test-GenerationReclaimable {
+    param(
+        [string]$PackagePath,
+        [string]$EvidencePath,
+        [string]$ManifestName,
+        [string]$DigestName
+    )
+    foreach ($probe in @(
+        [pscustomobject]@{ path = $PackagePath; flags = 0x02200000 },
+        [pscustomobject]@{ path = (Join-Path $EvidencePath $ManifestName); flags = 0x00200000 },
+        [pscustomobject]@{ path = (Join-Path $EvidencePath $DigestName); flags = 0x00200000 })) {
+        $handle = [AidaC03PackageNative]::CreateFileW(
+            [string]$probe.path, 0x80, 0, [IntPtr]::Zero, 3, [UInt32]$probe.flags,
+            [IntPtr]::Zero)
+        if ($handle -eq [IntPtr](-1)) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if ($errorCode -eq 32 -or $errorCode -eq 33) {
+                return $false
+            }
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_RECLAIM' -Path ([string]$probe.path)
+        }
+        [AidaC03PackageNative]::CloseHandle($handle) | Out-Null
+    }
+    return $true
+}
+
+function Write-PublicationJournal {
+    param([string]$Path, [object]$Value)
+    $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
+        (($Value | ConvertTo-Json -Compress) + "`n"))
+    Write-AtomicBytes -Path $Path -Bytes $bytes -Replace
+    $identity = Get-LockedIdentity -Path $Path -Label 'publication journal' `
+        -MaximumBytes 65536 -Transient -CaptureBytes
+    if ($identity.size_bytes -ne $bytes.Length -or
+        [Convert]::ToBase64String([byte[]]$identity.bytes) -cne
+            [Convert]::ToBase64String($bytes)) {
+        Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_JOURNAL' -Path $Path
+    }
+}
+
+function Remove-JournalOwnedDirectory {
+    param(
+        [string]$Path,
+        [string]$Anchor,
+        [string]$ExpectedIdentity,
+        [string]$AllowedPrefix
+    )
+    if ([IO.Directory]::Exists($Path)) {
+        Remove-OwnedGenerationDirectory -Path $Path -Anchor $Anchor `
+            -ExpectedIdentity $ExpectedIdentity -AllowedPrefix $AllowedPrefix
+    } elseif ([IO.File]::Exists($Path)) {
+        Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_JOURNAL_TYPE' -Path $Path
+    }
+}
+
+function Recover-PublicationJournal {
+    param(
+        [string]$Path,
+        [string]$PackageAnchor,
+        [string]$PackageCandidateAnchor,
+        [string]$EvidenceAnchor,
+        [string]$PointerPath
+    )
+    if (-not [IO.File]::Exists($Path)) {
+        if ([IO.Directory]::Exists($Path)) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_JOURNAL_TYPE' -Path $Path
+        }
+        return
+    }
+    $journalIdentity = Get-LockedIdentity -Path $Path -Label 'publication journal' `
+        -MaximumBytes 65536 -Transient -CaptureBytes
+    $journal = [Text.UTF8Encoding]::new($false, $true).GetString(
+        [byte[]]$journalIdentity.bytes) | ConvertFrom-Json
+    Assert-ExactProperties -Value $journal -Expected @(
+        'evidence_candidate', 'evidence_identity', 'evidence_generation',
+        'generation_id', 'package_candidate', 'package_generation',
+        'package_identity', 'phase', 'pointer_path', 'schema', 'schema_version') `
+        -Label 'publication journal'
+    if ($journal.schema -cne 'aida.c03.publication-journal' -or
+        [int]$journal.schema_version -ne 1 -or
+        [string]$journal.generation_id -cnotmatch '^[0-9a-f]{32}$' -or
+        [string]$journal.phase -cnotmatch '^(prepared|package-ready|evidence-ready|before-commit|after-commit)$' -or
+        -not [string]::Equals([IO.Path]::GetFullPath([string]$journal.pointer_path),
+            [IO.Path]::GetFullPath($PointerPath), [StringComparison]::Ordinal) -or
+        [string]$journal.package_identity -cnotmatch '^[0-9]+:[0-9a-f]{16}$' -or
+        [string]$journal.evidence_identity -cnotmatch '^[0-9]+:[0-9a-f]{16}$') {
+        Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_JOURNAL' -Path $Path
+    }
+    $generationName = '.aida-c03-generation-' + [string]$journal.generation_id
+    $packageGeneration = [IO.Path]::GetFullPath([string]$journal.package_generation)
+    $evidenceGeneration = [IO.Path]::GetFullPath([string]$journal.evidence_generation)
+    $packageCandidate = [IO.Path]::GetFullPath([string]$journal.package_candidate)
+    $evidenceCandidate = [IO.Path]::GetFullPath([string]$journal.evidence_candidate)
+    if (-not [string]::Equals((Split-Path -Parent $packageGeneration), $PackageAnchor,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Split-Path -Parent $evidenceGeneration), $EvidenceAnchor,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($packageGeneration) -cne $generationName -or
+        [IO.Path]::GetFileName($evidenceGeneration) -cne $generationName -or
+        -not [string]::Equals((Split-Path -Parent $packageCandidate),
+            $PackageCandidateAnchor,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Split-Path -Parent $evidenceCandidate), $EvidenceAnchor,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not ([IO.Path]::GetFileName($packageCandidate)).StartsWith(
+            '.aida-c03-candidate-', [StringComparison]::Ordinal) -or
+        -not ([IO.Path]::GetFileName($evidenceCandidate)).StartsWith(
+            '.aida-c03-evidence-candidate-', [StringComparison]::Ordinal)) {
+        Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_JOURNAL_PATH' -Path $Path
+    }
+    $currentId = $null
+    if ([IO.File]::Exists($PointerPath)) {
+        $pointer = [IO.File]::ReadAllText(
+            $PointerPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+        if ($pointer.schema -ceq 'aida.c03.complete-generation-pointer' -and
+            [int]$pointer.schema_version -eq 1 -and
+            [string]$pointer.generation_id -cmatch '^[0-9a-f]{32}$') {
+            $currentId = [string]$pointer.generation_id
+        }
+    }
+    if ($currentId -cne [string]$journal.generation_id) {
+        Remove-JournalOwnedDirectory -Path $packageGeneration -Anchor $PackageAnchor `
+            -ExpectedIdentity ([string]$journal.package_identity) `
+            -AllowedPrefix '.aida-c03-generation-'
+        Remove-JournalOwnedDirectory -Path $evidenceGeneration -Anchor $EvidenceAnchor `
+            -ExpectedIdentity ([string]$journal.evidence_identity) `
+            -AllowedPrefix '.aida-c03-generation-'
+    }
+    Remove-JournalOwnedDirectory -Path $packageCandidate `
+        -Anchor $PackageCandidateAnchor `
+        -ExpectedIdentity ([string]$journal.package_identity) `
+        -AllowedPrefix '.aida-c03-candidate-'
+    Remove-JournalOwnedDirectory -Path $evidenceCandidate -Anchor $EvidenceAnchor `
+        -ExpectedIdentity ([string]$journal.evidence_identity) `
+        -AllowedPrefix '.aida-c03-evidence-candidate-'
+    $journalFinal = Get-LockedIdentity -Path $Path -Label 'publication journal' `
+        -MaximumBytes 65536 -Transient
+    if ([string]$journalFinal.file_identity -cne [string]$journalIdentity.file_identity -or
+        [string]$journalFinal.sha256 -cne [string]$journalIdentity.sha256) {
+        Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_JOURNAL' -Path $Path
+    }
+    [IO.File]::Delete($Path)
+}
+
+function Publish-CompleteGeneration {
+    param(
+        [object]$Stage,
+        [string]$ManifestCandidate,
+        [object]$ManifestIdentity,
+        [string]$DigestCandidate,
+        [object]$DigestIdentity,
+        [string]$ManifestDestination,
+        [string]$DigestDestination,
+        [string]$EvidenceCandidate,
+        [string]$EvidenceCandidateIdentity,
+        [string]$EvidencePublicationAnchor,
+        [string]$ExpectedManifestDigest,
+        [switch]$Replace
+    )
+    $packageAnchor = [IO.Path]::GetFullPath([string]$Stage.publication_anchor).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $evidenceAnchor = [IO.Path]::GetFullPath($EvidencePublicationAnchor).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $generationId = [Guid]::NewGuid().ToString('N')
+    $packageGeneration = Join-Path $packageAnchor ('.aida-c03-generation-' + $generationId)
+    $evidenceGeneration = Join-Path $evidenceAnchor ('.aida-c03-generation-' + $generationId)
+    $manifestGeneration = Join-Path $evidenceGeneration ([IO.Path]::GetFileName($ManifestDestination))
+    $digestGeneration = Join-Path $evidenceGeneration ([IO.Path]::GetFileName($DigestDestination))
+    $pointerPath = $ManifestDestination + '.generation-pointer.json'
+    $publicationLockPath = Join-Path $evidenceAnchor '.aida-c03-publication.lock'
+    $publicationJournalPath = Join-Path $evidenceAnchor '.aida-c03-publication-journal.json'
+    $packageCandidateAnchor = [IO.Path]::GetFullPath(
+        (Split-Path -Parent ([string]$Stage.candidate_path))).TrimEnd(
+            [IO.Path]::DirectorySeparatorChar)
+    $publicationLock = $null
+    $journal = $null
+    $packageMoved = $false
+    $evidenceMoved = $false
+    $pointerCommitted = $false
+    try {
+        if ([IO.File]::Exists($publicationLockPath)) {
+            Assert-RegularFile -Path $publicationLockPath -Label 'publication lock' | Out-Null
+            Assert-SingleLinkFile -Path $publicationLockPath -Label 'publication lock'
+        }
+        $publicationLock = [AidaC03PackageNative]::CreateFileW(
+            $publicationLockPath, [UInt32]3221225472, 0, [IntPtr]::Zero, 4,
+            [UInt32]0x00200080, [IntPtr]::Zero)
+        if ($publicationLock -eq [IntPtr](-1)) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_LOCK' -Path $publicationLockPath
+        }
+        $publicationLockIdentity = New-Object AidaC03PackageNative+BY_HANDLE_FILE_INFORMATION
+        if (-not [AidaC03PackageNative]::GetFileInformationByHandle(
+                $publicationLock, [ref]$publicationLockIdentity) -or
+            [UInt32]$publicationLockIdentity.NumberOfLinks -ne 1 -or
+            ([UInt32]$publicationLockIdentity.FileAttributes -band
+                [UInt32]([IO.FileAttributes]::ReparsePoint)) -ne 0) {
+            Throw-PackagePolicy -Code 'HARDLINK_FORBIDDEN' -Path $publicationLockPath
+        }
+        $publicationLockFinal = New-Object Text.StringBuilder 32768
+        $publicationLockFinalLength = [AidaC03PackageNative]::GetFinalPathNameByHandleW(
+            $publicationLock, $publicationLockFinal, 32768, 0)
+        if ($publicationLockFinalLength -eq 0 -or $publicationLockFinalLength -ge 32768) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_LOCK' -Path $publicationLockPath
+        }
+        $publicationLockObserved = $publicationLockFinal.ToString()
+        if ($publicationLockObserved.StartsWith('\\?\UNC\', [StringComparison]::Ordinal)) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_LOCK' -Path $publicationLockPath
+        }
+        if ($publicationLockObserved.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+            $publicationLockObserved = $publicationLockObserved.Substring(4)
+        }
+        if (-not [string]::Equals($publicationLockObserved,
+                [IO.Path]::GetFullPath($publicationLockPath), [StringComparison]::Ordinal)) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_LOCK' -Path $publicationLockPath
+        }
+        Recover-PublicationJournal -Path $publicationJournalPath `
+            -PackageAnchor $packageAnchor -PackageCandidateAnchor $packageCandidateAnchor `
+            -EvidenceAnchor $evidenceAnchor -PointerPath $pointerPath
+        $currentGenerationId = $null
+        if ([IO.File]::Exists($pointerPath)) {
+            Assert-SingleLinkFile -Path $pointerPath -Label 'complete generation pointer'
+            if (-not $Replace) {
+                Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_EXISTS' -Path $pointerPath
+            }
+            $currentPointerItem = Get-Item -LiteralPath $pointerPath -Force -ErrorAction Stop
+            if ($currentPointerItem.Length -le 0 -or $currentPointerItem.Length -gt 65536) {
+                Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_POINTER' -Path $pointerPath
+            }
+            $currentPointer = [IO.File]::ReadAllText(
+                $pointerPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+            Assert-ExactProperties -Value $currentPointer -Expected @(
+                'digest_file_identity', 'digest_path', 'generation_id',
+                'manifest_file_identity', 'manifest_path', 'manifest_sha256',
+                'package_directory_identity', 'package_root', 'schema', 'schema_version') `
+                -Label 'complete generation pointer'
+            if ($currentPointer.schema -cne 'aida.c03.complete-generation-pointer' -or
+                [int]$currentPointer.schema_version -ne 1 -or
+                [string]$currentPointer.generation_id -cnotmatch '^[0-9a-f]{32}$' -or
+                [string]$currentPointer.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_POINTER' -Path $pointerPath
+            }
+            $currentGenerationId = [string]$currentPointer.generation_id
+            $currentPackageGeneration = Join-Path $packageAnchor ('.aida-c03-generation-' + $currentGenerationId)
+            $currentEvidenceGeneration = Join-Path $evidenceAnchor ('.aida-c03-generation-' + $currentGenerationId)
+            if (-not [string]::Equals([IO.Path]::GetFullPath([string]$currentPointer.package_root),
+                    $currentPackageGeneration, [StringComparison]::Ordinal) -or
+                -not [string]::Equals((Split-Path -Parent ([IO.Path]::GetFullPath([string]$currentPointer.manifest_path))),
+                    $currentEvidenceGeneration, [StringComparison]::Ordinal) -or
+                -not [string]::Equals((Split-Path -Parent ([IO.Path]::GetFullPath([string]$currentPointer.digest_path))),
+                    $currentEvidenceGeneration, [StringComparison]::Ordinal)) {
+                Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_POINTER' -Path $pointerPath
+            }
+        } elseif ([IO.Directory]::Exists($pointerPath)) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_TYPE' -Path $pointerPath
+        }
+        $packageGenerations = [Collections.Generic.Dictionary[string, string]]::new(
+            [StringComparer]::Ordinal)
+        $evidenceGenerations = [Collections.Generic.Dictionary[string, string]]::new(
+            [StringComparer]::Ordinal)
+        foreach ($generationRoot in @(
+            [pscustomobject]@{ anchor = $packageAnchor; map = $packageGenerations },
+            [pscustomobject]@{ anchor = $evidenceAnchor; map = $evidenceGenerations })) {
+            foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries([string]$generationRoot.anchor)) {
+                $name = [IO.Path]::GetFileName($entryPath)
+                if (-not $name.StartsWith('.aida-c03-generation-', [StringComparison]::Ordinal)) {
+                    continue
+                }
+                $item = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
+                $id = $name.Substring('.aida-c03-generation-'.Length)
+                if (-not $item.PSIsContainer -or
+                    ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                    $id -cnotmatch '^[0-9a-f]{32}$' -or
+                    $generationRoot.map.ContainsKey($id)) {
+                    Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_INVENTORY' -Path $entryPath
+                }
+                if ($generationRoot.map.Count -ge 64) {
+                    Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_LIMIT' -Path $entryPath
+                }
+                $generationRoot.map.Add($id, $item.FullName)
+            }
+        }
+        if ($packageGenerations.Count -ne $evidenceGenerations.Count) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_INCOMPLETE' -Path $generationId
+        }
+        $retainedGenerations = if ($null -eq $currentGenerationId) { 0 } else { 1 }
+        foreach ($id in @($packageGenerations.Keys)) {
+            if (-not $evidenceGenerations.ContainsKey($id)) {
+                Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_INCOMPLETE' -Path $id
+            }
+            if ($id -cne $currentGenerationId) {
+                $stalePackage = $packageGenerations[$id]
+                $staleEvidence = $evidenceGenerations[$id]
+                if (-not (Test-GenerationReclaimable -PackagePath $stalePackage `
+                        -EvidencePath $staleEvidence `
+                        -ManifestName ([IO.Path]::GetFileName($ManifestDestination)) `
+                        -DigestName ([IO.Path]::GetFileName($DigestDestination)))) {
+                    ++$retainedGenerations
+                    continue
+                }
+                Remove-OwnedGenerationDirectory -Path $stalePackage -Anchor $packageAnchor `
+                    -ExpectedIdentity (Get-DirectoryIdentity -Path $stalePackage) `
+                    -AllowedPrefix '.aida-c03-generation-'
+                Remove-OwnedGenerationDirectory -Path $staleEvidence -Anchor $evidenceAnchor `
+                    -ExpectedIdentity (Get-DirectoryIdentity -Path $staleEvidence) `
+                    -AllowedPrefix '.aida-c03-generation-'
+            }
+        }
+        if ($retainedGenerations -gt 8) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_LIMIT' -Path $generationId
+        }
+        if ($null -ne $currentGenerationId -and
+            (-not $packageGenerations.ContainsKey($currentGenerationId) -or
+             -not $evidenceGenerations.ContainsKey($currentGenerationId))) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_POINTER' -Path $pointerPath
+        }
+        if ([IO.Directory]::Exists($packageGeneration) -or [IO.File]::Exists($packageGeneration) -or
+            [IO.Directory]::Exists($evidenceGeneration) -or [IO.File]::Exists($evidenceGeneration)) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_EXISTS' -Path $generationId
+        }
+        $journal = [ordered]@{
+            schema = 'aida.c03.publication-journal'
+            schema_version = 1
+            generation_id = $generationId
+            phase = 'prepared'
+            pointer_path = $pointerPath
+            package_candidate = [string]$Stage.candidate_path
+            package_identity = [string]$Stage.candidate_identity
+            package_generation = $packageGeneration
+            evidence_candidate = $EvidenceCandidate
+            evidence_identity = $EvidenceCandidateIdentity
+            evidence_generation = $evidenceGeneration
+        }
+        Write-PublicationJournal -Path $publicationJournalPath -Value $journal
+        Invoke-PublicationCheckpoint -Name 'prepared'
+        [IO.Directory]::Move([string]$Stage.candidate_path, $packageGeneration)
+        $packageMoved = $true
+        Set-ImmutableGenerationExpectedPathPrefix -OldRoot ([string]$Stage.candidate_path) -NewRoot $packageGeneration
+        $publishedPackage = Get-BoundedTreeInventory -Root $packageGeneration
+        if ($publishedPackage.file_count -ne [int]$Stage.inventory.file_count -or
+            $publishedPackage.directory_count -ne [int]$Stage.inventory.directory_count -or
+            $publishedPackage.entry_count -ne [int]$Stage.inventory.entry_count -or
+            [Int64]$publishedPackage.total_size_bytes -ne [Int64]$Stage.inventory.total_size_bytes -or
+            [Int64]$publishedPackage.inventory_path_bytes -ne [Int64]$Stage.inventory.inventory_path_bytes -or
+            $publishedPackage.stream_inventory_count -ne [int]$Stage.inventory.stream_inventory_count -or
+            (Get-DirectoryIdentity -Path $packageGeneration) -cne [string]$Stage.candidate_identity) {
+            Throw-PackagePolicy -Code 'STAGE_EXACT_INVENTORY' -Path $packageGeneration
+        }
+        $journal.phase = 'package-ready'
+        Write-PublicationJournal -Path $publicationJournalPath -Value $journal
+        Invoke-PublicationCheckpoint -Name 'package-ready'
+        [IO.Directory]::Move($EvidenceCandidate, $evidenceGeneration)
+        $evidenceMoved = $true
+        Set-ImmutableGenerationExpectedPathPrefix -OldRoot $EvidenceCandidate -NewRoot $evidenceGeneration
+        if (-not [IO.File]::Exists($manifestGeneration) -or
+            -not [IO.File]::Exists($digestGeneration) -or
+            (Get-DirectoryIdentity -Path $evidenceGeneration) -cne $EvidenceCandidateIdentity) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_CHANGED' -Path $evidenceGeneration
+        }
+        $publishedManifest = Get-LockedIdentity -Path $manifestGeneration -Label 'published distribution manifest' -MaximumBytes 16777216
+        $publishedDigestIdentity = Get-LockedIdentity -Path $digestGeneration -Label 'published distribution digest' -MaximumBytes 256
+        $publishedDigest = Get-LockedBytes -Path $digestGeneration -Label 'published distribution digest bytes' -MaximumBytes 256
+        $publishedDigestText = [Text.Encoding]::ASCII.GetString($publishedDigest.bytes)
+        if ([string]$publishedManifest.file_identity -cne [string]$ManifestIdentity.file_identity -or
+            [string]$publishedManifest.sha256 -cne $ExpectedManifestDigest -or
+            [string]$publishedDigestIdentity.file_identity -cne [string]$DigestIdentity.file_identity -or
+            $publishedDigestText -cne ($ExpectedManifestDigest + "`n")) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_CHANGED' -Path $evidenceGeneration
+        }
+        Assert-ImmutableGeneration
+        $journal.phase = 'evidence-ready'
+        Write-PublicationJournal -Path $publicationJournalPath -Value $journal
+        Invoke-PublicationCheckpoint -Name 'evidence-ready'
+        $pointer = [ordered]@{
+            schema = 'aida.c03.complete-generation-pointer'
+            schema_version = 1
+            generation_id = $generationId
+            package_root = $packageGeneration
+            package_directory_identity = [string]$Stage.candidate_identity
+            manifest_path = $manifestGeneration
+            manifest_sha256 = $ExpectedManifestDigest
+            manifest_file_identity = [string]$ManifestIdentity.file_identity
+            digest_path = $digestGeneration
+            digest_file_identity = [string]$DigestIdentity.file_identity
+        }
+        $pointerBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
+            (($pointer | ConvertTo-Json -Compress) + "`n"))
+        $journal.phase = 'before-commit'
+        Write-PublicationJournal -Path $publicationJournalPath -Value $journal
+        Invoke-PublicationCheckpoint -Name 'before-commit'
+        Write-AtomicBytes -Path $pointerPath -Bytes $pointerBytes -Replace:$Replace
+        $pointerCommitted = $true
+        $pointerIdentity = Get-LockedIdentity -Path $pointerPath -Label 'complete generation pointer' -MaximumBytes 65536
+        if ($pointerIdentity.size_bytes -ne $pointerBytes.Length) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_CHANGED' -Path $pointerPath
+        }
+        $journal.phase = 'after-commit'
+        Write-PublicationJournal -Path $publicationJournalPath -Value $journal
+        Invoke-PublicationCheckpoint -Name 'after-commit'
+        [IO.File]::Delete($publicationJournalPath)
+        return [pscustomobject]@{
+            inventory = $publishedPackage
+            generation_id = $generationId
+            package_root = $packageGeneration
+            manifest_path = $manifestGeneration
+            digest_path = $digestGeneration
+            pointer_path = $pointerPath
+        }
+    } catch {
+        if (-not $pointerCommitted) {
+            if ($evidenceMoved -and [IO.Directory]::Exists($evidenceGeneration) -and
+                -not [IO.Directory]::Exists($EvidenceCandidate)) {
+                [IO.Directory]::Move($evidenceGeneration, $EvidenceCandidate)
+                Set-ImmutableGenerationExpectedPathPrefix -OldRoot $evidenceGeneration -NewRoot $EvidenceCandidate
+                $evidenceMoved = $false
+            }
+            if ($packageMoved -and [IO.Directory]::Exists($packageGeneration) -and
+                -not [IO.Directory]::Exists([string]$Stage.candidate_path)) {
+                [IO.Directory]::Move($packageGeneration, [string]$Stage.candidate_path)
+                Set-ImmutableGenerationExpectedPathPrefix -OldRoot $packageGeneration -NewRoot ([string]$Stage.candidate_path)
+                $packageMoved = $false
+            }
+            if ([IO.File]::Exists($publicationJournalPath)) {
+                [IO.File]::Delete($publicationJournalPath)
+            }
+        }
+        throw
+    } finally {
+        if ($null -ne $publicationLock -and $publicationLock -ne [IntPtr](-1)) {
+            [AidaC03PackageNative]::CloseHandle($publicationLock) | Out-Null
+        }
+    }
+}
+
 function Stage-SanitizedCustomerPackage {
     param(
         [string]$Source,
         [string]$Destination,
-        [string]$Anchor,
+        [string]$CandidateAnchor,
+        [string]$PublicationAnchor,
         [string]$SpecificationPath
     )
     $sourceFull = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
@@ -383,30 +1047,30 @@ function Stage-SanitizedCustomerPackage {
         ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         Throw-PackagePolicy -Code 'STAGE_SOURCE' -Path $sourceFull
     }
-    [IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($Anchor)) | Out-Null
-    $anchorFull = (Resolve-Path -LiteralPath $Anchor -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
-    $anchorItem = Get-Item -LiteralPath $anchorFull -Force
-    if (-not $anchorItem.PSIsContainer -or
-        ($anchorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        Throw-PackagePolicy -Code 'STAGE_ANCHOR' -Path $anchorFull
+    [IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($CandidateAnchor)) | Out-Null
+    [IO.Directory]::CreateDirectory([IO.Path]::GetFullPath($PublicationAnchor)) | Out-Null
+    $candidateAnchorFull = (Resolve-Path -LiteralPath $CandidateAnchor -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $publicationAnchorFull = (Resolve-Path -LiteralPath $PublicationAnchor -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
+    foreach ($anchorFull in @($candidateAnchorFull, $publicationAnchorFull)) {
+        $anchorItem = Get-Item -LiteralPath $anchorFull -Force
+        if (-not $anchorItem.PSIsContainer -or
+            ($anchorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Throw-PackagePolicy -Code 'STAGE_ANCHOR' -Path $anchorFull
+        }
+        Assert-NoNamedStreams -Path $anchorFull | Out-Null
     }
-    Assert-NoNamedStreams -Path $anchorFull | Out-Null
     $destinationFull = [IO.Path]::GetFullPath($Destination).TrimEnd([IO.Path]::DirectorySeparatorChar)
-    if ([string]::Equals($destinationFull, $anchorFull, [StringComparison]::OrdinalIgnoreCase) -or
-        -not (Test-ContainedPath -Candidate $destinationFull -Root $anchorFull) -or
-        (Test-ContainedPath -Candidate $sourceFull -Root $anchorFull) -or
-        (Test-ContainedPath -Candidate $anchorFull -Root $sourceFull) -or
+    if ([string]::Equals($destinationFull, $publicationAnchorFull, [StringComparison]::OrdinalIgnoreCase) -or
+        [string]::Equals($candidateAnchorFull, $publicationAnchorFull, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-ContainedPath -Candidate $destinationFull -Root $publicationAnchorFull) -or
+        (Test-ContainedPath -Candidate $sourceFull -Root $candidateAnchorFull) -or
+        (Test-ContainedPath -Candidate $candidateAnchorFull -Root $sourceFull) -or
+        (Test-ContainedPath -Candidate $sourceFull -Root $publicationAnchorFull) -or
+        (Test-ContainedPath -Candidate $publicationAnchorFull -Root $sourceFull) -or
         (Test-ContainedPath -Candidate $sourceFull -Root $destinationFull) -or
         (Test-ContainedPath -Candidate $destinationFull -Root $sourceFull)) {
         Throw-PackagePolicy -Code 'STAGE_CONTAINMENT' -Path $destinationFull
     }
-    if ([IO.Directory]::Exists($destinationFull)) {
-        Get-BoundedTreeInventory -Root $destinationFull -AllowForbiddenPaths | Out-Null
-        [IO.Directory]::Delete($destinationFull, $true)
-    } elseif ([IO.File]::Exists($destinationFull)) {
-        Throw-PackagePolicy -Code 'STAGE_DESTINATION_TYPE' -Path $destinationFull
-    }
-    [IO.Directory]::CreateDirectory($destinationFull) | Out-Null
     $specification = (Read-StrictJson -Path $SpecificationPath -Label 'distribution manifest spec').value
     $paths = [Collections.Generic.List[string]]::new()
     $exactPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -484,6 +1148,7 @@ function Stage-SanitizedCustomerPackage {
         Throw-PackagePolicy -Code 'RESOURCE_FILE_LIMIT' -Path $destinationFull
     }
     $orderedPaths = @($paths | Sort-Object -CaseSensitive)
+    $copyPlan = [Collections.Generic.List[object]]::new()
     [Int64]$copiedBytes = 0
     foreach ($relativePath in $orderedPaths) {
         $sourcePath = Resolve-SafeRelativePath -Root $sourceFull -RelativePath $relativePath `
@@ -492,36 +1157,153 @@ function Stage-SanitizedCustomerPackage {
         if ($sourceIdentity.size_bytes -gt $script:MaximumAggregateBytes - $copiedBytes) {
             Throw-PackagePolicy -Code 'RESOURCE_TOTAL_BYTES_LIMIT' -Path $relativePath
         }
-        $destinationPath = [IO.Path]::GetFullPath((Join-Path $destinationFull ($relativePath -replace '/', '\')))
-        $destinationDirectory = Split-Path -Parent $destinationPath
-        [IO.Directory]::CreateDirectory($destinationDirectory) | Out-Null
-        [IO.File]::Copy($sourcePath, $destinationPath, $false)
-        $destinationIdentity = Get-LockedIdentity -Path $destinationPath -Label 'customer stage destination'
-        if ([Int64]$destinationIdentity.size_bytes -ne [Int64]$sourceIdentity.size_bytes -or
-            [string]$destinationIdentity.sha256 -cne [string]$sourceIdentity.sha256) {
-            Throw-PackagePolicy -Code 'STAGE_COPY_IDENTITY' -Path $relativePath
+        $copyPlan.Add([pscustomobject]@{
+            relative_path = $relativePath
+            source_path = $sourcePath
+            size_bytes = [Int64]$sourceIdentity.size_bytes
+            sha256 = [string]$sourceIdentity.sha256
+        })
+        $copiedBytes += [Int64]$sourceIdentity.size_bytes
+    }
+    if ([IO.Directory]::Exists($destinationFull)) {
+        Get-BoundedTreeInventory -Root $destinationFull -AllowForbiddenPaths | Out-Null
+    } elseif ([IO.File]::Exists($destinationFull)) {
+        Throw-PackagePolicy -Code 'STAGE_DESTINATION_TYPE' -Path $destinationFull
+    }
+    $candidateFull = Join-Path $candidateAnchorFull ('.aida-c03-candidate-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($candidateFull) | Out-Null
+    $candidateDirectoryIdentity = Get-DirectoryIdentity -Path $candidateFull
+    $retainCandidate = $false
+    try {
+        foreach ($copyEntry in $copyPlan) {
+            $relativePath = [string]$copyEntry.relative_path
+            $candidatePath = [IO.Path]::GetFullPath((Join-Path $candidateFull ($relativePath -replace '/', '\')))
+            $candidateDirectory = Split-Path -Parent $candidatePath
+            [IO.Directory]::CreateDirectory($candidateDirectory) | Out-Null
+            [IO.File]::Copy([string]$copyEntry.source_path, $candidatePath, $false)
+            $candidateFileIdentity = Get-LockedIdentity -Path $candidatePath -Label 'customer stage candidate' -AllowRename
+            if ([Int64]$candidateFileIdentity.size_bytes -ne [Int64]$copyEntry.size_bytes -or
+                [string]$candidateFileIdentity.sha256 -cne [string]$copyEntry.sha256) {
+                Throw-PackagePolicy -Code 'STAGE_COPY_IDENTITY' -Path $relativePath
+            }
         }
-        $copiedBytes += [Int64]$destinationIdentity.size_bytes
+        $candidateInventory = Get-BoundedTreeInventory -Root $candidateFull
+        if ($candidateInventory.file_count -ne $orderedPaths.Count -or
+            [Int64]$candidateInventory.total_size_bytes -ne $copiedBytes) {
+            Throw-PackagePolicy -Code 'STAGE_EXACT_INVENTORY' -Path $candidateFull
+        }
+        Assert-ImmutableGeneration
+        $retainCandidate = $true
+        return [pscustomobject]@{
+            candidate_path = $candidateFull
+            candidate_identity = $candidateDirectoryIdentity
+            destination_path = $destinationFull
+            publication_anchor = $publicationAnchorFull
+            inventory = $candidateInventory
+        }
+    } finally {
+        if (-not $retainCandidate -and [IO.Directory]::Exists($candidateFull)) {
+            Remove-OwnedGenerationDirectory -Path $candidateFull -Anchor $candidateAnchorFull -ExpectedIdentity $candidateDirectoryIdentity -AllowedPrefix '.aida-c03-candidate-'
+        }
     }
-    $staged = Get-BoundedTreeInventory -Root $destinationFull
-    if ($staged.file_count -ne $orderedPaths.Count -or
-        [Int64]$staged.total_size_bytes -ne $copiedBytes) {
-        Throw-PackagePolicy -Code 'STAGE_EXACT_INVENTORY' -Path $destinationFull
+}
+
+function Start-ImmutableGeneration {
+    if ($null -ne $script:ImmutableGeneration) {
+        Throw-PackagePolicy -Code 'GENERATION_STATE' -Path 'already-active'
     }
-    return $staged
+    $script:ImmutableGeneration = [Collections.Generic.Dictionary[string, object]]::new(
+        [StringComparer]::Ordinal)
+}
+
+function Stop-ImmutableGeneration {
+    if ($null -eq $script:ImmutableGeneration) { return }
+    foreach ($entry in $script:ImmutableGeneration.Values) {
+        if ($null -ne $entry.stream) {
+            $entry.stream.Dispose()
+        }
+    }
+    $script:ImmutableGeneration = $null
+}
+
+function Test-IdentityEqual {
+    param([object]$Left, [object]$Right)
+    return [UInt32]$Left.VolumeSerialNumber -eq [UInt32]$Right.VolumeSerialNumber -and
+        [UInt32]$Left.FileIndexHigh -eq [UInt32]$Right.FileIndexHigh -and
+        [UInt32]$Left.FileIndexLow -eq [UInt32]$Right.FileIndexLow -and
+        [UInt32]$Left.FileSizeHigh -eq [UInt32]$Right.FileSizeHigh -and
+        [UInt32]$Left.FileSizeLow -eq [UInt32]$Right.FileSizeLow -and
+        [UInt32]$Left.NumberOfLinks -eq 1 -and
+        [UInt32]$Right.NumberOfLinks -eq 1 -and
+        [Int32]$Left.LastWriteTime.dwHighDateTime -eq [Int32]$Right.LastWriteTime.dwHighDateTime -and
+        [Int32]$Left.LastWriteTime.dwLowDateTime -eq [Int32]$Right.LastWriteTime.dwLowDateTime
+}
+
+function Get-FileIdentityKey {
+    param([object]$Identity)
+    return ([string][UInt32]$Identity.VolumeSerialNumber + ':' +
+        ([UInt64][UInt32]$Identity.FileIndexHigh).ToString('x8') +
+        ([UInt64][UInt32]$Identity.FileIndexLow).ToString('x8'))
+}
+
+function Get-LockedFinalPath {
+    param([object]$Entry)
+    $buffer = New-Object Text.StringBuilder 32768
+    $length = [AidaC03PackageNative]::GetFinalPathNameByHandleW(
+        $Entry.stream.SafeFileHandle.DangerousGetHandle(), $buffer, 32768, 0)
+    if ($length -eq 0 -or $length -ge 32768) {
+        Throw-PackagePolicy -Code 'GENERATION_FINAL_PATH' -Path ([string]$Entry.path)
+    }
+    $final = $buffer.ToString()
+    if ($final.StartsWith('\\?\UNC\', [StringComparison]::Ordinal)) {
+        Throw-PackagePolicy -Code 'GENERATION_FINAL_VOLUME' -Path ([string]$Entry.path)
+    }
+    if ($final.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+        $final = $final.Substring(4)
+    }
+    return $final
 }
 
 function Get-LockedIdentity {
     param(
         [string]$Path,
         [string]$Label,
-        [Int64]$MaximumBytes = 8589934592
+        [Int64]$MaximumBytes = 8589934592,
+        [switch]$AllowRename,
+        [switch]$Transient,
+        [switch]$CaptureBytes
     )
-    Assert-RegularFile -Path $Path -Label $Label | Out-Null
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not $Transient -and $null -ne $script:ImmutableGeneration -and
+        $script:ImmutableGeneration.ContainsKey($fullPath)) {
+        $existing = $script:ImmutableGeneration[$fullPath]
+        if ([Int64]$existing.size_bytes -gt $MaximumBytes) {
+            throw "$Label size violates policy"
+        }
+        return [pscustomobject]@{
+            size_bytes = [Int64]$existing.size_bytes
+            sha256 = [string]$existing.sha256
+            file_identity = [string]$existing.file_identity
+            bytes = $existing.bytes
+        }
+    }
+    Assert-RegularFile -Path $fullPath -Label $Label | Out-Null
+    $share = [IO.FileShare]::Read
+    if ($AllowRename) {
+        $share = $share -bor [IO.FileShare]::Delete
+    }
+    $stream = [IO.File]::Open($fullPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
     try {
         if ($stream.Length -le 0 -or $stream.Length -gt $MaximumBytes) {
             throw "$Label size violates policy"
+        }
+        $identityBefore = New-Object AidaC03PackageNative+BY_HANDLE_FILE_INFORMATION
+        if (-not [AidaC03PackageNative]::GetFileInformationByHandle(
+                $stream.SafeFileHandle.DangerousGetHandle(), [ref]$identityBefore)) {
+            Throw-PackagePolicy -Code 'GENERATION_IDENTITY' -Path $fullPath
+        }
+        if ([UInt32]$identityBefore.NumberOfLinks -ne 1) {
+            Throw-PackagePolicy -Code 'HARDLINK_FORBIDDEN' -Path $fullPath
         }
         $sha = [Security.Cryptography.SHA256]::Create()
         try {
@@ -529,12 +1311,150 @@ function Get-LockedIdentity {
         } finally {
             $sha.Dispose()
         }
-        return [pscustomobject]@{
+        $capturedBytes = $null
+        if ($CaptureBytes) {
+            if ($stream.Length -gt [int]::MaxValue) {
+                Throw-PackagePolicy -Code 'RESOURCE_FILE_BYTES_LIMIT' -Path $fullPath
+            }
+            $capturedBytes = [byte[]]::new([int]$stream.Length)
+            $stream.Position = 0
+            $capturedOffset = 0
+            while ($capturedOffset -lt $capturedBytes.Length) {
+                $captured = $stream.Read(
+                    $capturedBytes, $capturedOffset,
+                    $capturedBytes.Length - $capturedOffset)
+                if ($captured -le 0) {
+                    Throw-PackagePolicy -Code 'GENERATION_CHANGED' -Path $fullPath
+                }
+                $capturedOffset += $captured
+            }
+        }
+        $identityAfter = New-Object AidaC03PackageNative+BY_HANDLE_FILE_INFORMATION
+        if (-not [AidaC03PackageNative]::GetFileInformationByHandle(
+                $stream.SafeFileHandle.DangerousGetHandle(), [ref]$identityAfter) -or
+            -not (Test-IdentityEqual -Left $identityBefore -Right $identityAfter)) {
+            Throw-PackagePolicy -Code 'GENERATION_CHANGED' -Path $fullPath
+        }
+        $capturedPath = Get-LockedFinalPath -Entry ([pscustomobject]@{ stream = $stream; path = $fullPath })
+        if (-not [string]::Equals($capturedPath, $fullPath, [StringComparison]::Ordinal)) {
+            Throw-PackagePolicy -Code 'GENERATION_FINAL_PATH' -Path $fullPath
+        }
+        $result = [pscustomobject]@{
             size_bytes = [Int64]$stream.Length
             sha256 = ([BitConverter]::ToString($digest) -replace '-', '').ToLowerInvariant()
+            file_identity = Get-FileIdentityKey -Identity $identityAfter
+            bytes = $capturedBytes
         }
+        if (-not $Transient -and $null -ne $script:ImmutableGeneration) {
+            $script:ImmutableGeneration.Add($fullPath, [pscustomobject]@{
+                path = $fullPath
+                stream = $stream
+                identity = $identityAfter
+                size_bytes = [Int64]$result.size_bytes
+                sha256 = [string]$result.sha256
+                file_identity = [string]$result.file_identity
+                bytes = $capturedBytes
+                allow_rename = [bool]$AllowRename
+                expected_final_path = $fullPath
+            })
+            $stream = $null
+        }
+        return $result
     } finally {
-        $stream.Dispose()
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Get-LockedBytes {
+    param(
+        [string]$Path,
+        [string]$Label,
+        [Int64]$MaximumBytes
+    )
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $identity = Get-LockedIdentity -Path $fullPath -Label $Label -MaximumBytes $MaximumBytes
+    if ($null -eq $script:ImmutableGeneration -or
+        -not $script:ImmutableGeneration.ContainsKey($fullPath)) {
+        Throw-PackagePolicy -Code 'GENERATION_STATE' -Path $fullPath
+    }
+    $entry = $script:ImmutableGeneration[$fullPath]
+    if ($null -eq $entry.bytes) {
+        if ([Int64]$entry.size_bytes -gt [Int64][int]::MaxValue) {
+            Throw-PackagePolicy -Code 'RESOURCE_FILE_BYTES_LIMIT' -Path $fullPath
+        }
+        $bytes = New-Object byte[] ([int]$entry.size_bytes)
+        $entry.stream.Position = 0
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $received = $entry.stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($received -le 0) {
+                Throw-PackagePolicy -Code 'GENERATION_CHANGED' -Path $fullPath
+            }
+            $offset += $received
+        }
+        $entry.bytes = $bytes
+    }
+    return [pscustomobject]@{
+        identity = $identity
+        bytes = [byte[]]$entry.bytes
+    }
+}
+
+function Assert-ImmutableGeneration {
+    if ($null -eq $script:ImmutableGeneration) {
+        Throw-PackagePolicy -Code 'GENERATION_STATE' -Path 'not-active'
+    }
+    foreach ($entry in $script:ImmutableGeneration.Values) {
+        $current = New-Object AidaC03PackageNative+BY_HANDLE_FILE_INFORMATION
+        if (-not [AidaC03PackageNative]::GetFileInformationByHandle(
+                $entry.stream.SafeFileHandle.DangerousGetHandle(), [ref]$current) -or
+            -not (Test-IdentityEqual -Left $entry.identity -Right $current)) {
+            Throw-PackagePolicy -Code 'GENERATION_CHANGED' -Path ([string]$entry.path)
+        }
+        if (-not [bool]$entry.allow_rename) {
+            Get-ExactExistingPath -Path ([string]$entry.path).Replace('\', '/') -Label 'immutable generation member' -Kind File | Out-Null
+        }
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $entry.stream.Position = 0
+            $digest = ([BitConverter]::ToString($sha.ComputeHash($entry.stream)) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $sha.Dispose()
+        }
+        if ($digest -cne [string]$entry.sha256) {
+            Throw-PackagePolicy -Code 'GENERATION_CHANGED' -Path ([string]$entry.path)
+        }
+        $streamPath = if ([bool]$entry.allow_rename) {
+            Get-LockedFinalPath -Entry $entry
+        } else {
+            [string]$entry.path
+        }
+        if (-not [string]::Equals($streamPath, [string]$entry.expected_final_path,
+                [StringComparison]::Ordinal)) {
+            Throw-PackagePolicy -Code 'GENERATION_FINAL_PATH' -Path ([string]$entry.path)
+        }
+        Assert-NoNamedStreams -Path $streamPath | Out-Null
+    }
+}
+
+function Set-ImmutableGenerationExpectedPathPrefix {
+    param([string]$OldRoot, [string]$NewRoot)
+    $oldFull = [IO.Path]::GetFullPath($OldRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $newFull = [IO.Path]::GetFullPath($NewRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    foreach ($entry in $script:ImmutableGeneration.Values) {
+        $entryPath = [string]$entry.expected_final_path
+        if ([string]::Equals($entryPath, $oldFull, [StringComparison]::Ordinal) -or
+            $entryPath.StartsWith($oldFull + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::Ordinal)) {
+            $relative = $entryPath.Substring($oldFull.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
+            $entry.expected_final_path = if ([string]::IsNullOrEmpty($relative)) {
+                $newFull
+            } else {
+                Join-Path $newFull $relative
+            }
+        }
     }
 }
 
@@ -543,18 +1463,9 @@ function Read-StrictJson {
         [string]$Path,
         [string]$Label
     )
-    $identity = Get-LockedIdentity -Path $Path -Label $Label -MaximumBytes 16777216
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    try {
-        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true), $true, 65536, $true)
-        try {
-            $text = $reader.ReadToEnd()
-        } finally {
-            $reader.Dispose()
-        }
-    } finally {
-        $stream.Dispose()
-    }
+    $locked = Get-LockedBytes -Path $Path -Label $Label -MaximumBytes 16777216
+    $identity = $locked.identity
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($locked.bytes)
     if ($text -match 'https?://|ftp://|git://|ssh://|file://|"(?:\$ref|\$id|url|uri)"\s*:') {
         throw "$Label contains a remote reference"
     }
@@ -592,6 +1503,8 @@ function Resolve-SafeRelativePath {
         }
         $cursor = Split-Path -Parent $cursor
     }
+    $canonicalInput = $path.Replace('\', '/')
+    Get-ExactExistingPath -Path $canonicalInput -Label $Label -Kind Any | Out-Null
     return $path
 }
 
@@ -602,7 +1515,6 @@ function Write-AtomicBytes {
         [switch]$Replace
     )
     $parent = Split-Path -Parent $Path
-    New-Item -ItemType Directory -Path $parent -Force | Out-Null
     $parentItem = Get-Item -LiteralPath $parent -Force
     if (-not $parentItem.PSIsContainer -or ($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw 'manifest output directory must be a regular non-reparse directory'
@@ -666,11 +1578,12 @@ function Assert-DigestBinding {
         [string]$Label
     )
     $manifestIdentity = Get-LockedIdentity -Path $ManifestPath -Label "$Label manifest" -MaximumBytes 16777216
-    $digestIdentity = Get-LockedIdentity -Path $DigestPath -Label "$Label digest" -MaximumBytes 256
+    $digestLocked = Get-LockedBytes -Path $DigestPath -Label "$Label digest" -MaximumBytes 256
+    $digestIdentity = $digestLocked.identity
     if ($digestIdentity.size_bytes -ne 65) {
         throw "$Label digest has an invalid size"
     }
-    $digestText = [IO.File]::ReadAllText($DigestPath, [Text.Encoding]::ASCII)
+    $digestText = [Text.Encoding]::ASCII.GetString($digestLocked.bytes)
     if ($digestText -cnotmatch '^[0-9a-f]{64}\n$' -or $digestText.Substring(0, 64) -cne $manifestIdentity.sha256) {
         throw "$Label manifest digest binding is invalid"
     }
@@ -692,7 +1605,7 @@ function Add-PackageArtifact {
         [object]$ExpectedIdentity = $null
     )
     if ($Id -cnotmatch '^[A-Za-z0-9_.-]{1,256}$' -or $Owner -cnotmatch '^[A-Za-z0-9_.-]{1,256}$' -or
-        $Kind -notin @('application', 'application_runtime', 'worker_executable', 'worker_runtime', 'worker_manifest', 'resource_manifest', 'manifest_digest', 'acl_receipt', 'build_receipt', 'protector_receipt', 'signature_receipt', 'browser', 'reverse_mcp', 'license', 'notice', 'dependency', 'resource') -or
+        $Kind -notin @('application', 'application_runtime', 'worker_executable', 'worker_runtime', 'worker_manifest', 'resource_manifest', 'manifest_digest', 'acl_receipt', 'build_receipt', 'protector_receipt', 'signature_receipt', 'browser', 'reverse_mcp', 'license', 'notice', 'dependency', 'resource', 'build_evidence') -or
         $Ids.ContainsKey($Id) -or $Paths.ContainsKey($RelativePath)) {
         throw 'distribution artifact id, owner, kind, or path is invalid or duplicated'
     }
@@ -742,24 +1655,47 @@ function Assert-ProtectorReceipt {
     }
     $path = Resolve-SafeRelativePath -Root $Root -RelativePath ([string]$ReceiptArtifact.relative_path) -Label 'protector receipt'
     $receipt = (Read-StrictJson -Path $path -Label 'protector receipt').value
-    Assert-ExactProperties -Value $receipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'post_process', 'production_flags', 'profile', 'schema', 'schema_version', 'status', 'tool_sha256', 'verifier_sha256') -Label 'protector receipt'
-    Assert-ExactProperties -Value $receipt.post_process -Expected @('debug_paths_scrubbed', 'protection_verified', 'rich_header_scrubbed', 'symbols_scrubbed') -Label 'protector post-process receipt'
+    Assert-ExactProperties -Value $receipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'post_process', 'production_flags', 'profile', 'schema', 'schema_version', 'signer_policy_sha256', 'signing_provider_sha256', 'status', 'tool_sha256', 'verifier_sha256') -Label 'protector receipt'
+    Assert-ExactProperties -Value $receipt.post_process -Expected @('codeview_records', 'coff_symbol_count', 'coff_symbol_table_pointer', 'dans_signature_count', 'debug_directory_complete', 'debug_directory_entries', 'pe_headers_complete', 'protection_checks_passed', 'protection_checks_total', 'rich_signature_count', 'unscrubbed_debug_paths') -Label 'protector post-process receipt'
     $expectedFlags = @('/Qspectre', '/sdl', '/guard:cf', '/guard:ehcont', '/guard:xfg') | Sort-Object -CaseSensitive
     $actualFlags = @($receipt.production_flags | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
-    if ($receipt.schema -ne 'aida.protector.receipt' -or [int]$receipt.schema_version -ne 2 -or
-        $receipt.status -ne 'passed' -or $receipt.profile -ne 'production' -or
+    $expectedProfile = if ([string]$ExecutableArtifact.relative_path -ceq 'AiDAStandalone.exe') {
+        'standalone-no-imports'
+    } else {
+        'strict-no-imports'
+    }
+    if ($receipt.schema -ne 'aida.protector.receipt' -or [int]$receipt.schema_version -ne 4 -or
+        $receipt.status -ne 'passed' -or $receipt.profile -cne $expectedProfile -or
         $receipt.artifact_relative_path -cne [string]$ExecutableArtifact.relative_path -or
         $receipt.artifact_sha256 -cne [string]$ExecutableArtifact.sha256 -or
         [Int64]$receipt.artifact_size_bytes -ne [Int64]$ExecutableArtifact.size_bytes -or
         [string]$receipt.tool_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
         [string]$receipt.verifier_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        -not [bool]$receipt.post_process.protection_verified -or
-        -not [bool]$receipt.post_process.symbols_scrubbed -or
-        -not [bool]$receipt.post_process.debug_paths_scrubbed -or
-        -not [bool]$receipt.post_process.rich_header_scrubbed -or
+        [string]$receipt.signer_policy_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$receipt.signing_provider_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [Int64]$receipt.post_process.protection_checks_total -le 0 -or
+        [Int64]$receipt.post_process.protection_checks_passed -ne [Int64]$receipt.post_process.protection_checks_total -or
+        [Int64]$receipt.post_process.coff_symbol_table_pointer -ne 0 -or
+        [Int64]$receipt.post_process.coff_symbol_count -ne 0 -or
+        [Int64]$receipt.post_process.debug_directory_entries -lt 0 -or
+        [Int64]$receipt.post_process.debug_directory_entries -gt 4096 -or
+        [Int64]$receipt.post_process.codeview_records -lt 0 -or
+        [Int64]$receipt.post_process.codeview_records -gt [Int64]$receipt.post_process.debug_directory_entries -or
+        [Int64]$receipt.post_process.unscrubbed_debug_paths -ne 0 -or
+        [Int64]$receipt.post_process.rich_signature_count -ne 0 -or
+        [Int64]$receipt.post_process.dans_signature_count -ne 0 -or
+        -not [bool]$receipt.post_process.pe_headers_complete -or
+        -not [bool]$receipt.post_process.debug_directory_complete -or
         $actualFlags.Count -ne $expectedFlags.Count -or
         ($actualFlags -join "`n") -cne ($expectedFlags -join "`n")) {
         throw 'protector receipt is invalid or does not bind the protected artifact'
+    }
+    if ($null -eq $script:SignerPolicyReceiptSha256) {
+        $script:SignerPolicyReceiptSha256 = [string]$receipt.signer_policy_sha256
+        $script:SigningProviderReceiptSha256 = [string]$receipt.signing_provider_sha256
+    } elseif ([string]$receipt.signer_policy_sha256 -cne $script:SignerPolicyReceiptSha256 -or
+        [string]$receipt.signing_provider_sha256 -cne $script:SigningProviderReceiptSha256) {
+        throw 'protector receipts do not share one signing authority generation'
     }
 }
 
@@ -770,26 +1706,90 @@ function Assert-SignatureReceipt {
     }
     $path = Resolve-SafeRelativePath -Root $Root -RelativePath ([string]$ReceiptArtifact.relative_path) -Label 'signature receipt'
     $receipt = (Read-StrictJson -Path $path -Label 'signature receipt').value
-    Assert-ExactProperties -Value $receipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'chain_status', 'schema', 'schema_version', 'signer_thumbprint_sha256', 'status', 'timestamp_status', 'verification_mode', 'verifier_sha256') -Label 'signature receipt'
-    if ($receipt.schema -ne 'aida.signature.receipt' -or [int]$receipt.schema_version -ne 2 -or
+    Assert-ExactProperties -Value $receipt -Expected @('artifact_relative_path', 'artifact_sha256', 'artifact_size_bytes', 'chain_status', 'schema', 'schema_version', 'signer_policy_sha256', 'signer_thumbprint_sha256', 'signing_provider_sha256', 'status', 'timestamp_filetime', 'timestamp_status', 'timestamp_validation', 'verification_mode', 'verifier_sha256') -Label 'signature receipt'
+    if ($receipt.schema -ne 'aida.signature.receipt' -or [int]$receipt.schema_version -ne 4 -or
         $receipt.status -ne 'verified' -or $receipt.verification_mode -ne 'wintrust_offline' -or
         $receipt.chain_status -ne 'trusted' -or $receipt.timestamp_status -ne 'trusted' -or
+        $receipt.timestamp_validation -ne 'wintrust_provider_counter_signer' -or
+        [Int64]$receipt.timestamp_filetime -le 0 -or
         $receipt.artifact_relative_path -cne [string]$ExecutableArtifact.relative_path -or
         $receipt.artifact_sha256 -cne [string]$ExecutableArtifact.sha256 -or
         [Int64]$receipt.artifact_size_bytes -ne [Int64]$ExecutableArtifact.size_bytes -or
         [string]$receipt.signer_thumbprint_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
-        [string]$receipt.verifier_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        [string]$receipt.verifier_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$receipt.signer_policy_sha256 -cne $script:SignerPolicyReceiptSha256 -or
+        [string]$receipt.signing_provider_sha256 -cne $script:SigningProviderReceiptSha256) {
         throw 'signature receipt is invalid or does not bind the signed artifact'
     }
 }
 
+$productionStage = $null
+$productionCandidateAnchor = $null
+$evidenceCandidatePath = $null
+$evidenceCandidateIdentity = $null
+$evidencePublicationAnchor = $null
+$evidenceRootPath = $null
+$stageOwnerPath = $null
+$generationPointerPath = $null
+if (($FixturePublicationFailure -cne 'none' -or $FixturePublicationTermination -cne 'none') -and
+    (-not $PolicyFixtureReport -or -not $StagePolicyFixture)) {
+    Throw-PackagePolicy -Code 'FIXTURE_PUBLICATION_ARGUMENT' -Path (
+        $FixturePublicationFailure + ':' + $FixturePublicationTermination)
+}
+if ($FixturePublicationFailure -cne 'none' -and
+    $FixturePublicationTermination -cne 'none') {
+    Throw-PackagePolicy -Code 'FIXTURE_PUBLICATION_ARGUMENT' -Path 'multiple'
+}
+Start-ImmutableGeneration
+try {
 if ($PolicyFixtureReport) {
-    if ($StageCustomerPackage -or $Spec -or $AuthorityLock -or $OutputManifest -or
-        $OutputDigest -or $SourceRoot -or $CustomerStageAnchor) {
+    if ($AuthorityLock -or $OutputManifest -or $OutputDigest -or $EvidenceRoot -or $StageOwnerRoot -or
+        ($StageCustomerPackage -and -not $StagePolicyFixture) -or
+        ($StagePolicyFixture -and -not $StageCustomerPackage) -or
+        ($StagePolicyFixture -and (-not $Spec -or -not $SourceRoot -or -not $ApplicationStageAnchor -or -not $CustomerStageAnchor)) -or
+        (-not $StagePolicyFixture -and ($Spec -or $SourceRoot -or $ApplicationStageAnchor -or $CustomerStageAnchor))) {
         Throw-PackagePolicy -Code 'FIXTURE_ARGUMENTS' -Path $PackageRoot
     }
-    $fixtureRoot = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
-    $fixtureReportPath = [IO.Path]::GetFullPath($PolicyFixtureReport)
+    $fixtureLimits = @(
+        [pscustomobject]@{ name = 'files'; value = $FixtureMaximumFiles; maximum = $script:MaximumPackageFiles }
+        [pscustomobject]@{ name = 'directories'; value = $FixtureMaximumDirectories; maximum = $script:MaximumPackageDirectories }
+        [pscustomobject]@{ name = 'entries'; value = $FixtureMaximumEntries; maximum = $script:MaximumPackageEntries }
+        [pscustomobject]@{ name = 'depth'; value = $FixtureMaximumDepth; maximum = $script:MaximumPackageDepth }
+        [pscustomobject]@{ name = 'relative_path_bytes'; value = $FixtureMaximumRelativePathBytes; maximum = $script:MaximumRelativePathBytes }
+        [pscustomobject]@{ name = 'inventory_path_bytes'; value = $FixtureMaximumInventoryPathBytes; maximum = $script:MaximumInventoryPathBytes }
+        [pscustomobject]@{ name = 'entry_bytes'; value = $FixtureMaximumEntryBytes; maximum = $script:MaximumEntryBytes }
+        [pscustomobject]@{ name = 'aggregate_bytes'; value = $FixtureMaximumAggregateBytes; maximum = $script:MaximumAggregateBytes }
+    )
+    foreach ($limit in $fixtureLimits) {
+        if ([Int64]$limit.value -lt 0 -or [Int64]$limit.value -gt [Int64]$limit.maximum) {
+            Throw-PackagePolicy -Code 'FIXTURE_RESOURCE_LIMIT' -Path ([string]$limit.name)
+        }
+    }
+    if ($FixtureMaximumFiles -gt 0) { $script:MaximumPackageFiles = $FixtureMaximumFiles }
+    if ($FixtureMaximumDirectories -gt 0) { $script:MaximumPackageDirectories = $FixtureMaximumDirectories }
+    if ($FixtureMaximumEntries -gt 0) { $script:MaximumPackageEntries = $FixtureMaximumEntries }
+    if ($FixtureMaximumDepth -gt 0) { $script:MaximumPackageDepth = $FixtureMaximumDepth }
+    if ($FixtureMaximumRelativePathBytes -gt 0) { $script:MaximumRelativePathBytes = $FixtureMaximumRelativePathBytes }
+    if ($FixtureMaximumInventoryPathBytes -gt 0) { $script:MaximumInventoryPathBytes = $FixtureMaximumInventoryPathBytes }
+    if ($FixtureMaximumEntryBytes -gt 0) { $script:MaximumEntryBytes = $FixtureMaximumEntryBytes }
+    if ($FixtureMaximumAggregateBytes -gt 0) { $script:MaximumAggregateBytes = $FixtureMaximumAggregateBytes }
+    if ($StagePolicyFixture) {
+        $sourceFixture = Get-ExactExistingPath -Path $SourceRoot -Label 'fixture source root' -Kind Directory
+        $candidateAnchorFixture = Get-ExactExistingPath -Path $ApplicationStageAnchor -Label 'fixture application anchor' -Kind Directory
+        $anchorFixture = Get-ExactExistingPath -Path $CustomerStageAnchor -Label 'fixture customer anchor' -Kind Directory
+        $specFixture = Get-ExactExistingPath -Path $Spec -Label 'fixture stage specification' -Kind File
+        $productionCandidateAnchor = $candidateAnchorFixture
+        $productionStage = Stage-SanitizedCustomerPackage -Source $sourceFixture `
+            -Destination ((ConvertTo-CanonicalNativePath -Path $PackageRoot -Label 'fixture package root')) `
+            -CandidateAnchor $candidateAnchorFixture -PublicationAnchor $anchorFixture `
+            -SpecificationPath $specFixture
+    }
+    $fixtureRoot = if ($null -ne $productionStage) {
+        Get-ExactExistingPath -Path ([string]$productionStage.candidate_path) -Label 'fixture package candidate' -Kind Directory
+    } else {
+        Get-ExactExistingPath -Path $PackageRoot -Label 'fixture package root' -Kind Directory
+    }
+    $fixtureReportPath = Get-ExactOutputPath -Path $PolicyFixtureReport -Label 'fixture report'
     if (Test-ContainedPath -Candidate $fixtureReportPath -Root $fixtureRoot) {
         Throw-PackagePolicy -Code 'FIXTURE_REPORT_CONTAINMENT' -Path $fixtureReportPath
     }
@@ -800,12 +1800,46 @@ if ($PolicyFixtureReport) {
         directory_count = $fixtureInventory.directory_count
         entry_count = $fixtureInventory.entry_count
         total_size_bytes = $fixtureInventory.total_size_bytes
+        inventory_path_bytes = $fixtureInventory.inventory_path_bytes
         stream_inventory_count = $fixtureInventory.stream_inventory_count
-        package_root = $fixtureRoot
+        package_root = if ($null -ne $productionStage) { [string]$productionStage.destination_path } else { $fixtureRoot }
     }
     $fixtureBytes = [Text.UTF8Encoding]::new($false, $true).GetBytes(
         (($fixtureResult | ConvertTo-Json -Compress) + "`n"))
-    Write-AtomicBytes -Path $fixtureReportPath -Bytes $fixtureBytes -Replace:$Force
+    if ($null -ne $productionStage) {
+        $fixtureDigestPath = $fixtureReportPath + '.sha256'
+        $fixtureSha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $fixtureDigest = ([BitConverter]::ToString($fixtureSha.ComputeHash($fixtureBytes)) -replace '-', '').ToLowerInvariant()
+        } finally {
+            $fixtureSha.Dispose()
+        }
+        $evidencePublicationAnchor = Split-Path -Parent $fixtureReportPath
+        $evidenceCandidatePath = Join-Path $evidencePublicationAnchor ('.aida-c03-evidence-candidate-' + [Guid]::NewGuid().ToString('N'))
+        [IO.Directory]::CreateDirectory($evidenceCandidatePath) | Out-Null
+        $evidenceCandidateIdentity = Get-DirectoryIdentity -Path $evidenceCandidatePath
+        $fixtureManifestCandidate = Join-Path $evidenceCandidatePath ([IO.Path]::GetFileName($fixtureReportPath))
+        $fixtureDigestCandidate = Join-Path $evidenceCandidatePath ([IO.Path]::GetFileName($fixtureDigestPath))
+        Write-AtomicBytes -Path $fixtureManifestCandidate -Bytes $fixtureBytes
+        Write-AtomicBytes -Path $fixtureDigestCandidate -Bytes ([Text.Encoding]::ASCII.GetBytes($fixtureDigest + "`n"))
+        $fixtureManifestIdentity = Get-LockedIdentity -Path $fixtureManifestCandidate -Label 'fixture generation manifest' -AllowRename
+        $fixtureDigestIdentity = Get-LockedIdentity -Path $fixtureDigestCandidate -Label 'fixture generation digest' -AllowRename
+        $fixturePublication = Publish-CompleteGeneration -Stage $productionStage `
+            -ManifestCandidate $fixtureManifestCandidate -ManifestIdentity $fixtureManifestIdentity `
+            -DigestCandidate $fixtureDigestCandidate -DigestIdentity $fixtureDigestIdentity `
+            -ManifestDestination $fixtureReportPath -DigestDestination $fixtureDigestPath `
+            -EvidenceCandidate $evidenceCandidatePath -EvidenceCandidateIdentity $evidenceCandidateIdentity `
+            -EvidencePublicationAnchor $evidencePublicationAnchor -ExpectedManifestDigest $fixtureDigest `
+            -Replace:$Force
+        if (-not [IO.Directory]::Exists([string]$fixturePublication.package_root) -or
+            -not [IO.File]::Exists([string]$fixturePublication.pointer_path)) {
+            Throw-PackagePolicy -Code 'EVIDENCE_GENERATION_CHANGED' -Path $fixtureReportPath
+        }
+        $productionStage = $null
+        $evidenceCandidatePath = $null
+    } else {
+        Write-AtomicBytes -Path $fixtureReportPath -Bytes $fixtureBytes -Replace:$Force
+    }
     $fixtureResult | ConvertTo-Json -Compress
     return
 }
@@ -813,34 +1847,84 @@ if ($PolicyFixtureReport) {
 if (-not $Spec -or -not $AuthorityLock -or -not $OutputManifest -or -not $OutputDigest) {
     Throw-PackagePolicy -Code 'PRODUCTION_ARGUMENTS' -Path $PackageRoot
 }
+$specPath = Get-ExactExistingPath -Path $Spec -Label 'distribution specification' -Kind File
+$authorityPath = Get-ExactExistingPath -Path $AuthorityLock -Label 'source authority lock' -Kind File
+$manifestOutputPath = Get-ExactOutputPath -Path $OutputManifest -Label 'distribution manifest output'
+$digestOutputPath = Get-ExactOutputPath -Path $OutputDigest -Label 'distribution digest output'
 if ($StageCustomerPackage) {
-    if (-not $SourceRoot -or -not $CustomerStageAnchor) {
+    if (-not $SourceRoot -or -not $ApplicationStageAnchor -or -not $CustomerStageAnchor -or
+        -not $EvidenceRoot -or -not $StageOwnerRoot) {
         Throw-PackagePolicy -Code 'STAGE_ARGUMENTS' -Path $PackageRoot
     }
-    Stage-SanitizedCustomerPackage -Source $SourceRoot -Destination $PackageRoot `
-        -Anchor $CustomerStageAnchor -SpecificationPath $Spec | Out-Null
-} elseif ($SourceRoot -or $CustomerStageAnchor) {
+    $stageSource = Get-ExactExistingPath -Path $SourceRoot -Label 'customer stage source' -Kind Directory
+    $productionCandidateAnchor = Get-ExactExistingPath -Path $ApplicationStageAnchor -Label 'application stage anchor' -Kind Directory
+    $stageAnchor = Get-ExactExistingPath -Path $CustomerStageAnchor -Label 'customer stage anchor' -Kind Directory
+    $evidenceRootPath = Get-ExactExistingPath -Path $EvidenceRoot -Label 'distribution evidence root' -Kind Directory
+    $stageOwnerPath = Get-ExactExistingPath -Path $StageOwnerRoot -Label 'stage owner root' -Kind Directory
+    foreach ($ownedRoot in @($productionCandidateAnchor, $stageAnchor, $evidenceRootPath)) {
+        if ([string]::Equals($ownedRoot, $stageOwnerPath, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-ContainedPath -Candidate $ownedRoot -Root $stageOwnerPath)) {
+            Throw-PackagePolicy -Code 'STAGE_OWNERSHIP' -Path $ownedRoot
+        }
+    }
+    foreach ($rootPair in @(
+        [pscustomobject]@{ left = $productionCandidateAnchor; right = $stageAnchor },
+        [pscustomobject]@{ left = $productionCandidateAnchor; right = $evidenceRootPath },
+        [pscustomobject]@{ left = $stageAnchor; right = $evidenceRootPath })) {
+        if ((Test-ContainedPath -Candidate ([string]$rootPair.left) -Root ([string]$rootPair.right)) -or
+            (Test-ContainedPath -Candidate ([string]$rootPair.right) -Root ([string]$rootPair.left))) {
+            Throw-PackagePolicy -Code 'STAGE_ROOT_OVERLAP' -Path ([string]$rootPair.left)
+        }
+    }
+    if ((Test-ContainedPath -Candidate $stageSource -Root $stageOwnerPath) -or
+        (Test-ContainedPath -Candidate $stageOwnerPath -Root $stageSource)) {
+        Throw-PackagePolicy -Code 'STAGE_SOURCE_OVERLAP' -Path $stageSource
+    }
+    $stageDestination = ConvertTo-CanonicalNativePath -Path $PackageRoot -Label 'customer package root'
+    $productionStage = Stage-SanitizedCustomerPackage -Source $stageSource -Destination $stageDestination `
+        -CandidateAnchor $productionCandidateAnchor -PublicationAnchor $stageAnchor `
+        -SpecificationPath $specPath
+} elseif ($SourceRoot -or $ApplicationStageAnchor -or $CustomerStageAnchor -or $EvidenceRoot -or $StageOwnerRoot) {
     Throw-PackagePolicy -Code 'STAGE_ARGUMENTS' -Path $PackageRoot
 }
 
-$root = (Resolve-Path -LiteralPath $PackageRoot -ErrorAction Stop).Path.TrimEnd([IO.Path]::DirectorySeparatorChar)
+$root = if ($null -ne $productionStage) {
+    Get-ExactExistingPath -Path ([string]$productionStage.candidate_path) -Label 'customer package candidate' -Kind Directory
+} else {
+    Get-ExactExistingPath -Path $PackageRoot -Label 'customer package root' -Kind Directory
+}
 $rootItem = Get-Item -LiteralPath $root -Force
 if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
     throw 'package root must be a regular non-reparse directory'
 }
 $packageInventory = Get-BoundedTreeInventory -Root $root
-$manifestPath = [IO.Path]::GetFullPath($OutputManifest)
-$digestPath = [IO.Path]::GetFullPath($OutputDigest)
+$manifestPath = $manifestOutputPath
+$digestPath = $digestOutputPath
+if ($null -ne $productionStage) {
+    $evidencePublicationAnchor = Split-Path -Parent $manifestOutputPath
+    if (-not [string]::Equals($evidencePublicationAnchor, (Split-Path -Parent $digestOutputPath), [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-ContainedPath -Candidate $evidencePublicationAnchor -Root $evidenceRootPath) -or
+        -not (Test-ContainedPath -Candidate $evidenceRootPath -Root $stageOwnerPath) -or
+        (Test-ContainedPath -Candidate $evidenceRootPath -Root $root) -or
+        (Test-ContainedPath -Candidate $root -Root $evidenceRootPath)) {
+        Throw-PackagePolicy -Code 'EVIDENCE_CONTAINMENT' -Path $evidencePublicationAnchor
+    }
+    $evidenceCandidatePath = Join-Path $evidencePublicationAnchor ('.aida-c03-evidence-candidate-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($evidenceCandidatePath) | Out-Null
+    $evidenceCandidateIdentity = Get-DirectoryIdentity -Path $evidenceCandidatePath
+    $manifestPath = Join-Path $evidenceCandidatePath ([IO.Path]::GetFileName($manifestOutputPath))
+    $digestPath = Join-Path $evidenceCandidatePath ([IO.Path]::GetFileName($digestOutputPath))
+}
 if ([string]::Equals($manifestPath, $digestPath, [StringComparison]::OrdinalIgnoreCase) -or
     $manifestPath.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
     $digestPath.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'detached distribution manifest and digest must be distinct and outside the package inventory root'
 }
-$authorityDocument = Read-StrictJson -Path ((Resolve-Path -LiteralPath $AuthorityLock -ErrorAction Stop).Path) -Label 'source authority lock'
+$authorityDocument = Read-StrictJson -Path $authorityPath -Label 'source authority lock'
 if ($authorityDocument.value.schema -ne 'aida.c03.worker-manifest-lock' -or [int]$authorityDocument.value.schema_version -ne 2 -or -not [bool]$authorityDocument.value.no_network_fetch) {
     throw 'source authority lock is malformed or downgraded'
 }
-$specDocument = Read-StrictJson -Path ((Resolve-Path -LiteralPath $Spec -ErrorAction Stop).Path) -Label 'distribution manifest spec'
+$specDocument = Read-StrictJson -Path $specPath -Label 'distribution manifest spec'
 $specification = $specDocument.value
 Assert-ExactProperties -Value $specification -Expected @('artifacts', 'customer_sidecars', 'dependencies', 'distribution', 'generator', 'inventory_sources', 'schema', 'schema_version', 'workers') -Label 'distribution manifest spec'
 if ($specification.schema -ne 'aida.c03.distribution-manifest-spec' -or [int]$specification.schema_version -ne 2) {
@@ -1207,7 +2291,8 @@ foreach ($worker in @($specification.workers)) {
     $acl = (Read-StrictJson -Path $aclPath -Label 'worker ACL receipt').value
     Assert-ExactProperties -Value $acl -Expected @('access', 'app_container_profile', 'app_container_sid', 'path_count', 'policy', 'protected_parent_required', 'schema', 'schema_version', 'verified', 'worker_manifest_sha256') -Label 'worker ACL receipt'
     $workerDigestPath = Resolve-SafeRelativePath -Root $root -RelativePath ([string]$manifestDigestArtifact.relative_path) -Label 'worker manifest digest'
-    $workerDigest = [IO.File]::ReadAllText($workerDigestPath, [Text.Encoding]::ASCII)
+    $workerDigest = [Text.Encoding]::ASCII.GetString(
+        (Get-LockedBytes -Path $workerDigestPath -Label 'worker manifest digest' -MaximumBytes 256).bytes)
     if ($workerDigest -cnotmatch '^[0-9a-f]{64}\n$' -or
         $acl.schema -ne 'aida.c03.worker-runtime-acl-receipt' -or [int]$acl.schema_version -ne 1 -or
         $acl.policy -ne $expectedWorker[3] -or -not [bool]$acl.protected_parent_required -or -not [bool]$acl.verified -or
@@ -1348,9 +2433,38 @@ try {
 }
 Write-AtomicBytes -Path $manifestPath -Bytes $jsonBytes -Replace:$Force
 Write-AtomicBytes -Path $digestPath -Bytes ([Text.Encoding]::ASCII.GetBytes($manifestDigest + "`n")) -Replace:$Force
-$manifestIdentity = Get-LockedIdentity -Path $manifestPath -Label 'detached distribution manifest' -MaximumBytes 16777216
-if ($manifestIdentity.sha256 -ne $manifestDigest -or (Get-Content -LiteralPath $digestPath -Raw -Encoding ASCII) -cne ($manifestDigest + "`n")) {
+$manifestIdentity = Get-LockedIdentity -Path $manifestPath -Label 'detached distribution manifest' -MaximumBytes 16777216 -AllowRename:($null -ne $productionStage)
+$digestIdentity = Get-LockedIdentity -Path $digestPath -Label 'detached distribution digest' -MaximumBytes 256 -AllowRename:($null -ne $productionStage)
+$digestBytes = Get-LockedBytes -Path $digestPath -Label 'detached distribution digest bytes' -MaximumBytes 256
+if ($manifestIdentity.sha256 -ne $manifestDigest -or
+    [Text.Encoding]::ASCII.GetString($digestBytes.bytes) -cne ($manifestDigest + "`n")) {
     throw 'detached distribution manifest verification failed after publication'
+}
+if ($null -ne $productionStage) {
+    $confirmedCandidate = Get-BoundedTreeInventory -Root $root
+    if ($confirmedCandidate.file_count -ne $packageInventory.file_count -or
+        $confirmedCandidate.directory_count -ne $packageInventory.directory_count -or
+        $confirmedCandidate.entry_count -ne $packageInventory.entry_count -or
+        [Int64]$confirmedCandidate.total_size_bytes -ne [Int64]$packageInventory.total_size_bytes -or
+        [Int64]$confirmedCandidate.inventory_path_bytes -ne [Int64]$packageInventory.inventory_path_bytes -or
+        $confirmedCandidate.stream_inventory_count -ne $packageInventory.stream_inventory_count) {
+        Throw-PackagePolicy -Code 'GENERATION_CHANGED' -Path $root
+    }
+    Assert-ImmutableGeneration
+    $publication = Publish-CompleteGeneration -Stage $productionStage `
+        -ManifestCandidate $manifestPath -ManifestIdentity $manifestIdentity `
+        -DigestCandidate $digestPath -DigestIdentity $digestIdentity `
+        -ManifestDestination $manifestOutputPath -DigestDestination $digestOutputPath `
+        -EvidenceCandidate $evidenceCandidatePath -EvidenceCandidateIdentity $evidenceCandidateIdentity `
+        -EvidencePublicationAnchor $evidencePublicationAnchor -ExpectedManifestDigest $manifestDigest `
+        -Replace:$Force
+    $packageInventory = $publication.inventory
+    $root = [string]$publication.package_root
+    $manifestPath = [string]$publication.manifest_path
+    $digestPath = [string]$publication.digest_path
+    $generationPointerPath = [string]$publication.pointer_path
+    $productionStage = $null
+    $evidenceCandidatePath = $null
 }
 [pscustomobject]@{
     artifact_count = $materializedArtifacts.Count
@@ -1361,6 +2475,23 @@ if ($manifestIdentity.sha256 -ne $manifestDigest -or (Get-Content -LiteralPath $
     manifest = $manifestPath
     manifest_sha256 = $manifestDigest
     package_root = $root
+    generation_pointer = $generationPointerPath
     source_authority_sha256 = $authorityDocument.identity.sha256
     verified = $true
 } | ConvertTo-Json -Compress
+} finally {
+    try {
+        if ($null -ne $productionStage -and
+            [IO.Directory]::Exists([string]$productionStage.candidate_path)) {
+            Remove-OwnedGenerationDirectory -Path ([string]$productionStage.candidate_path) `
+                -Anchor $productionCandidateAnchor -ExpectedIdentity ([string]$productionStage.candidate_identity) `
+                -AllowedPrefix '.aida-c03-candidate-'
+        }
+        if ($null -ne $evidenceCandidatePath -and [IO.Directory]::Exists($evidenceCandidatePath)) {
+            Remove-OwnedGenerationDirectory -Path $evidenceCandidatePath -Anchor $evidencePublicationAnchor `
+                -ExpectedIdentity $evidenceCandidateIdentity -AllowedPrefix '.aida-c03-evidence-candidate-'
+        }
+    } finally {
+        Stop-ImmutableGeneration
+    }
+}

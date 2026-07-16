@@ -64,6 +64,7 @@ void                shutdown();
 uint64_t            record(source_t src, const exchange_observed_t& ex);
 std::vector<log_row_t>   query(const log_filter_t& f, size_t limit);
 size_t              total_rows();
+uint64_t            generation();
 void                clear();
 bool                export_csv(const std::string& path, const log_filter_t& f);
 nlohmann::json      row_to_json(const log_row_t& row);

@@ -27,7 +27,7 @@ namespace detail {
     }
 
 
-    static constexpr uint32_t cff_max_states = 64;
+    static constexpr uint32_t cff_max_states = 256;
 
 
     struct cff_ctx_t

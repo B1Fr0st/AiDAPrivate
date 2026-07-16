@@ -7,7 +7,7 @@
 #include "../../helpers/diag_log.hpp"
 #include "../../helpers/win32_dialog.hpp"
 #endif
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #include "../../helpers/helpers.h"
 #include "binary_map.hpp"
 #include "../editor/hex_view.hpp"
@@ -814,7 +814,7 @@ namespace binary_map_view {
 			}
 			const auto context = disasm_view::capture_workspace(state.workspace.lock());
 			if (!context) return;
-			globals::ui::active_center_view = center_view_t::disassembly;
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(va, context);
 			diag::log_tagged_fmt("binary_map",
 				"jump_to_disasm va=0x%llX",
@@ -866,7 +866,7 @@ namespace binary_map_view {
 				}
 			}
 			if (ok) {
-				globals::ui::active_center_view = center_view_t::hex_view;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 				diag::log_tagged_fmt("binary_map",
 					"jump_to_hex va=0x%llX size=%zu path=%s",
 					static_cast<unsigned long long>(va), size,

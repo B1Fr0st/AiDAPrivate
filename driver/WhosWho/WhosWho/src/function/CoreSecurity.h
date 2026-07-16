@@ -1135,12 +1135,12 @@ namespace secure_comm {
         RtlCopyMemory(aad + 28, &v2.version,      4);
         RtlCopyMemory(aad + 32, &counter,         8);
 
-        if (!kernel_crypto::sw_aes256_gcm_decrypt(
+        if (!NT_SUCCESS(kernel_crypto::bcrypt_aes256_gcm_decrypt(
                 g_aes_key, nonce,
                 aad, sizeof(aad),
                 ciphertext, v2.payload_size,
                 v2.gcm_tag,
-                static_cast<UINT8*>(output_buffer))) {
+                static_cast<UINT8*>(output_buffer)))) {
             RtlSecureZeroMemory(output_buffer, v2.payload_size);
             RtlSecureZeroMemory(nonce, sizeof(nonce));
             RtlSecureZeroMemory(aad,   sizeof(aad));
@@ -1207,12 +1207,17 @@ namespace secure_comm {
 
         UINT8* ciphertext = static_cast<UINT8*>(output_buffer) + SECURE_WIRE_PREFIX;
 
-        kernel_crypto::sw_aes256_gcm_encrypt(
+        NTSTATUS enc_st = kernel_crypto::bcrypt_aes256_gcm_encrypt(
             g_aes_key, nonce,
             aad, sizeof(aad),
             static_cast<const UINT8*>(plaintext_buffer), static_cast<ULONG>(plaintext_size),
             ciphertext,
             v2.gcm_tag);
+        if (!NT_SUCCESS(enc_st)) {
+            RtlSecureZeroMemory(nonce, sizeof(nonce));
+            RtlSecureZeroMemory(aad,   sizeof(aad));
+            return FALSE;
+        }
 
         compute_secure_hmac(&v2, counter, ciphertext, plaintext_size, v2.payload_hmac);
 
@@ -1291,5 +1296,131 @@ namespace handshake_auth {
         RtlSecureZeroMemory(const_cast<UINT8*>(static_cast<const volatile UINT8*>(g_session_hmac_key)), 32);
         RtlSecureZeroMemory(const_cast<UINT8*>(static_cast<const volatile UINT8*>(g_expected_hmac)), 32);
         KeMemoryBarrier();
+    }
+}
+
+namespace client_challenge {
+    constexpr UINT32 CHALLENGE_SIZE = 16;
+    constexpr UINT32 RESPONSE_SIZE = 32;
+    constexpr UINT32 CHALLENGE_MAGIC = 0x4343484Cu;
+    constexpr UINT32 OP_ISSUE = 0;
+    constexpr UINT32 OP_VERIFY = 1;
+    constexpr UINT64 CHALLENGE_EXPIRY_TSC = 30000000000ULL;
+
+    alignas(16) inline UINT8 g_challenge[CHALLENGE_SIZE] = {};
+    inline volatile LONG g_challenge_issued = 0;
+    inline volatile LONG g_challenge_verified = 0;
+    inline volatile LONG g_challenge_lock = 0;
+    inline volatile LONG64 g_challenge_issue_tsc = 0;
+
+    __forceinline void acquire_lock() {
+        while (_InterlockedCompareExchange(&g_challenge_lock, 1, 0) != 0) {
+            YieldProcessor();
+        }
+        KeMemoryBarrier();
+    }
+
+    __forceinline void release_lock() {
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_challenge_lock, 0);
+    }
+
+    __forceinline void generate_random_bytes(UINT8* buf, SIZE_T len) {
+        UINT64 tsc = __rdtsc();
+        UINT64 counter = tsc;
+        for (SIZE_T i = 0; i < len; i += 8) {
+            counter ^= __rdtsc();
+            counter *= 0x2545F4914F6CDD1Dull;
+            counter ^= counter >> 32;
+            UINT64 chunk = counter ^ (tsc + i * 0x9E3779B97F4A7C15ull);
+            SIZE_T copy_len = (len - i < 8) ? (len - i) : 8;
+            RtlCopyMemory(buf + i, &chunk, copy_len);
+        }
+    }
+
+    __forceinline BOOLEAN issue_challenge(UINT8 out_challenge[CHALLENGE_SIZE]) {
+        acquire_lock();
+
+        UINT8 challenge[CHALLENGE_SIZE];
+        generate_random_bytes(challenge, CHALLENGE_SIZE);
+
+        UINT64 tsc = __rdtsc();
+        for (UINT32 i = 0; i < CHALLENGE_SIZE; ++i) {
+            challenge[i] ^= static_cast<UINT8>((tsc >> ((i % 8) * 8)) & 0xFF);
+        }
+
+        RtlCopyMemory(g_challenge, challenge, CHALLENGE_SIZE);
+        RtlCopyMemory(out_challenge, challenge, CHALLENGE_SIZE);
+
+        _InterlockedExchange(&g_challenge_verified, 0);
+        _InterlockedExchange64(&g_challenge_issue_tsc, static_cast<LONG64>(tsc));
+        KeMemoryBarrier();
+        _InterlockedExchange(&g_challenge_issued, 1);
+
+        RtlSecureZeroMemory(challenge, sizeof(challenge));
+        release_lock();
+        return TRUE;
+    }
+
+    __forceinline BOOLEAN verify_response(const UINT8 response[RESPONSE_SIZE]) {
+        if (_InterlockedCompareExchange(&g_challenge_issued, 0, 0) == 0) {
+            return FALSE;
+        }
+
+        UINT64 issue_tsc = static_cast<UINT64>(
+            _InterlockedCompareExchange64(&g_challenge_issue_tsc, 0, 0));
+        UINT64 now_tsc = __rdtsc();
+        if ((now_tsc - issue_tsc) > CHALLENGE_EXPIRY_TSC) {
+            acquire_lock();
+            _InterlockedExchange(&g_challenge_issued, 0);
+            RtlSecureZeroMemory(g_challenge, CHALLENGE_SIZE);
+            release_lock();
+            return FALSE;
+        }
+
+        acquire_lock();
+
+        if (_InterlockedCompareExchange(&g_challenge_issued, 0, 0) == 0) {
+            release_lock();
+            return FALSE;
+        }
+
+        UINT8 computed[RESPONSE_SIZE];
+        kernel_crypto::sw_hmac_sha256(
+            secure_comm::g_hmac_key, kernel_crypto::SHA256_DIGEST_SIZE,
+            g_challenge, CHALLENGE_SIZE,
+            computed);
+
+        volatile UINT8 diff = 0;
+        for (UINT32 i = 0; i < RESPONSE_SIZE; ++i) {
+            diff |= computed[i] ^ response[i];
+        }
+
+        BOOLEAN ok = (diff == 0) ? TRUE : FALSE;
+
+        if (ok) {
+            _InterlockedExchange(&g_challenge_verified, 1);
+        }
+
+        RtlSecureZeroMemory(g_challenge, CHALLENGE_SIZE);
+        RtlSecureZeroMemory(computed, sizeof(computed));
+        _InterlockedExchange(&g_challenge_issued, 0);
+        _InterlockedExchange64(&g_challenge_issue_tsc, 0);
+
+        release_lock();
+        return ok;
+    }
+
+    __forceinline BOOLEAN is_verified() {
+        return _InterlockedCompareExchange(&g_challenge_verified, 0, 0) != 0;
+    }
+
+    __forceinline void reset() {
+        acquire_lock();
+        RtlSecureZeroMemory(g_challenge, CHALLENGE_SIZE);
+        _InterlockedExchange(&g_challenge_issued, 0);
+        _InterlockedExchange(&g_challenge_verified, 0);
+        _InterlockedExchange64(&g_challenge_issue_tsc, 0);
+        release_lock();
     }
 }

@@ -1,10 +1,7 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 #include "auth_claude_code.hpp"
-#include "auth_store.hpp"
-#include "auth_browser_launch.hpp"
-
-#include <ctime>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -33,116 +30,100 @@ namespace {
 		preview_error() = std::move(value);
 	}
 
+	bool claim_preview_terminal(claude_code_login_state_t& state, std::uint8_t phase) noexcept
+	{
+		std::uint8_t expected = 0;
+		return state.terminal_phase.compare_exchange_strong(expected, phase,
+			std::memory_order_acq_rel, std::memory_order_acquire);
+	}
+
 }
 
-bool start_login(claude_code_login_state_t& state, std::uint64_t absolute_deadline_ms)
+bool start_login(claude_code_login_state_t& state, std::uint64_t)
 {
-	if (state.cancelled.load(std::memory_order_acquire)) {
-		set_preview_error("login cancelled before start");
-		return false;
-	}
-	if (absolute_deadline_ms != 0 && aida::infra::executor::now_ms() >= absolute_deadline_ms) {
-		set_preview_error("login startup timed out");
-		return false;
-	}
+	state.done.store(false, std::memory_order_release);
+	state.terminal_phase.store(0, std::memory_order_release);
+	const bool cancelled = state.cancelled.load(std::memory_order_acquire);
+	const char* error = cancelled
+		? "preview_auth_cancelled" : "preview_auth_unavailable";
 	{
 		std::lock_guard<std::mutex> lock(state.mutex);
-		state.verifier = "aida-studio-claude-verifier";
-		state.challenge = "aida-studio-claude-challenge";
-		state.state = "aida-studio-claude-state";
-		state.port = 54821;
-		state.started_unix = static_cast<std::int64_t>(std::time(nullptr));
-		state.auth_url = std::string(CLAUDE_CODE_AUTHORIZE_URL)
-			+ "?client_id=" + CLAUDE_CODE_CLIENT_ID
-			+ "&redirect_uri=http%3A%2F%2Flocalhost%3A54821%2Fcallback"
-			+ "&code_challenge=" + state.challenge + "&state=" + state.state;
-		state.received_code = "aida-studio-claude-code";
-		state.received_state = state.state;
-		state.error.clear();
-		state.listener_handle = std::shared_ptr<void>(&state, [](void*) {});
+		if (!claim_preview_terminal(state, cancelled ? 3 : 2)) return false;
+		state.verifier.clear();
+		state.challenge.clear();
+		state.state.clear();
+		state.auth_url.clear();
+		state.port = 0;
+		state.received_code.clear();
+		state.received_state.clear();
+		state.error = error;
+		state.listener_handle.reset();
+		state.started_unix = 0;
+		state.done.store(true, std::memory_order_release);
 	}
-	state.done.store(true, std::memory_order_release);
-	set_preview_error({});
-	return true;
+	set_preview_error(error);
+	return false;
 }
 
 bool poll_login(claude_code_login_state_t& state)
 {
-	if (state.cancelled.load(std::memory_order_acquire)) {
-		set_preview_error("login cancelled");
-		return false;
-	}
-	const claude_code_login_snapshot_t current = snapshot(state);
-	if (!current.done || current.received_code.empty()
-		|| current.received_state != current.state) {
-		set_preview_error("waiting for browser callback");
-		return false;
-	}
-	auth_info_t info;
-	info.kind = auth_kind_t::oauth;
-	info.access = "aida-studio-anthropic-access";
-	info.refresh = "aida-studio-anthropic-refresh";
-	info.account_id = "studio-anthropic";
-	info.email = "reverse.engineer@preview.aida";
-	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
-	info.metadata["preview_receipt"] = "oauth:anthropic:accepted";
-	if (!store::set("anthropic", info)) {
-		set_preview_error(store::last_error());
-		return false;
-	}
+	const bool cancelled = state.cancelled.load(std::memory_order_acquire);
+	const char* error = cancelled
+		? "preview_auth_cancelled" : "preview_auth_unavailable";
 	{
 		std::lock_guard<std::mutex> lock(state.mutex);
+		if (!claim_preview_terminal(state, cancelled ? 3 : 2)) return false;
 		state.listener_handle.reset();
-		state.error.clear();
+		state.error = error;
+		state.done.store(true, std::memory_order_release);
 	}
-	set_preview_error({});
+	set_preview_error(error);
+	return false;
+}
+
+bool request_cancel(claude_code_login_state_t& state) noexcept
+{
+	std::uint8_t phase = state.terminal_phase.load(std::memory_order_acquire);
+	while (phase == 0 || phase == 4 || phase == 5) {
+		if (state.terminal_phase.compare_exchange_weak(phase, 3,
+			std::memory_order_acq_rel, std::memory_order_acquire)) break;
+	}
+	if (phase != 0 && phase != 4 && phase != 5) return false;
+	state.cancelled.store(true, std::memory_order_release);
+	state.done.store(true, std::memory_order_release);
+	try {
+		std::lock_guard<std::mutex> lock(state.mutex);
+		state.listener_handle.reset();
+		state.error = "preview_auth_cancelled";
+	} catch (...) {
+	}
+	try { set_preview_error("preview_auth_cancelled"); } catch (...) {}
 	return true;
 }
 
 bool cancel_login(claude_code_login_state_t& state)
 {
-	state.cancelled.store(true, std::memory_order_release);
-	state.done.store(true, std::memory_order_release);
-	std::lock_guard<std::mutex> lock(state.mutex);
-	state.listener_handle.reset();
-	return true;
+	return request_cancel(state);
 }
 
-bool refresh_token()
+bool refresh_token(const http::cancel_cb_t&, int)
 {
-	auth_info_t info;
-	if (!store::get("anthropic", info) || info.kind != auth_kind_t::oauth) {
-		set_preview_error("no anthropic oauth credentials");
-		return false;
-	}
-	info.access = "aida-studio-anthropic-access-refreshed";
-	info.expires_unix = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
-	info.metadata["preview_receipt"] = "oauth:anthropic:refreshed";
-	const bool result = store::set("anthropic", info);
-	set_preview_error(result ? std::string{} : store::last_error());
-	return result;
+	set_preview_error("preview_auth_unavailable");
+	return false;
 }
 
-bool revoke_tokens(const std::string& access_token,
-	const std::string& refresh_token_value,
+bool revoke_tokens(const std::string&,
+	const std::string&,
 	const std::string&)
 {
-	if (access_token.empty() && refresh_token_value.empty()) {
-		set_preview_error("revoke_tokens: no tokens provided");
-		return false;
-	}
-	set_preview_error({});
-	return true;
+	set_preview_error("preview_auth_unavailable");
+	return false;
 }
 
 bool revoke_token()
 {
-	auth_info_t info;
-	if (!store::get("anthropic", info) || info.kind != auth_kind_t::oauth) {
-		set_preview_error("no anthropic oauth credentials");
-		return false;
-	}
-	return revoke_tokens(info.access, info.refresh, info.custom_client_id);
+	set_preview_error("preview_auth_unavailable");
+	return false;
 }
 
 claude_code_login_snapshot_t snapshot(const claude_code_login_state_t& state)
@@ -156,6 +137,7 @@ claude_code_login_snapshot_t snapshot(const claude_code_login_state_t& state)
 	value.port = state.port;
 	value.done = state.done.load(std::memory_order_acquire);
 	value.cancelled = state.cancelled.load(std::memory_order_acquire);
+	value.terminal_phase = state.terminal_phase.load(std::memory_order_acquire);
 	value.received_code = state.received_code;
 	value.received_state = state.received_state;
 	value.error = state.error;
@@ -197,7 +179,7 @@ std::string last_error()
 #include <openssl/evp.h>
 
 #include <algorithm>
-#include <cctype>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -244,7 +226,10 @@ namespace claude_code {
 			std::vector<SOCKET> sockets;
 			std::atomic<SOCKET> active_client{ INVALID_SOCKET };
 			std::atomic<bool> worker_done{ true };
+			std::atomic<bool> worker_started{ false };
 			std::atomic<bool> stop{ false };
+			std::atomic<bool> cancellation_dispatched{ false };
+			std::atomic<std::uint64_t> task_id{ 0 };
 		};
 
 		void close_active_client(const std::shared_ptr<listener_t>& ctx, SOCKET client) noexcept
@@ -267,6 +252,142 @@ namespace claude_code {
 			}
 			for (const SOCKET value : sockets)
 				if (value != INVALID_SOCKET) closesocket(value);
+		}
+
+		void close_listener_resources(const std::shared_ptr<listener_t>& ctx) noexcept
+		{
+			if (!ctx) return;
+			ctx->stop.store(true, std::memory_order_release);
+			close_listener_sockets(ctx);
+			const SOCKET client = ctx->active_client.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+			if (client != INVALID_SOCKET) closesocket(client);
+		}
+
+		void dispatch_listener_cancel(const std::shared_ptr<listener_t>& ctx) noexcept
+		{
+			if (!ctx) return;
+			bool expected = false;
+			if (!ctx->cancellation_dispatched.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel, std::memory_order_acquire)) return;
+			close_listener_resources(ctx);
+			const std::uint64_t task_id = ctx->task_id.load(std::memory_order_acquire);
+			if (task_id != 0) {
+				try { aida::infra::executor::cancel(task_id); } catch (...) {}
+			}
+		}
+
+		bool claim_login_publication(claude_code_login_state_t& state,
+			std::uint8_t expected_phase, std::uint8_t published_phase) noexcept
+		{
+			return state.terminal_phase.compare_exchange_strong(expected_phase, published_phase,
+				std::memory_order_acq_rel, std::memory_order_acquire);
+		}
+
+		bool publish_login_terminal_state(claude_code_login_state_t& state,
+			const char* failure, std::uint8_t phase, std::uint8_t expected_phase = 0) noexcept
+		{
+			bool claimed = false;
+			try {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				claimed = claim_login_publication(state, expected_phase, phase);
+				if (!claimed) return false;
+				try { state.error = failure ? failure : "login failed"; } catch (...) {}
+				state.done.store(true, std::memory_order_release);
+			} catch (...) {
+				if (claimed) state.done.store(true, std::memory_order_release);
+			}
+			if (claimed) {
+				try { set_last_error(failure ? failure : "login failed"); } catch (...) {}
+			}
+			return claimed;
+		}
+
+		bool publish_login_terminal_failure(claude_code_login_state_t& state,
+			const char* failure, std::uint8_t phase = 2) noexcept
+		{
+			static_cast<void>(publish_login_terminal_state(state, failure, phase));
+			return false;
+		}
+
+		bool publish_login_callback(claude_code_login_state_t& state,
+			const std::string& code, const std::string& callback_state) noexcept
+		{
+			bool claimed = false;
+			try {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				claimed = claim_login_publication(state, 0, 5);
+				if (!claimed) return false;
+				state.received_code = code;
+				state.received_state = callback_state;
+				state.error.clear();
+				state.done.store(true, std::memory_order_release);
+			} catch (...) {
+				if (claimed) {
+					try {
+						std::lock_guard<std::mutex> lock(state.mutex);
+						try { state.error = "callback publication failed"; } catch (...) {}
+						state.done.store(true, std::memory_order_release);
+						std::uint8_t expected = 5;
+						state.terminal_phase.compare_exchange_strong(expected, 2,
+							std::memory_order_acq_rel, std::memory_order_acquire);
+					} catch (...) {
+						state.done.store(true, std::memory_order_release);
+						std::uint8_t expected = 5;
+						state.terminal_phase.compare_exchange_strong(expected, 2,
+							std::memory_order_acq_rel, std::memory_order_acquire);
+					}
+				}
+				try { set_last_error("callback publication failed"); } catch (...) {}
+				return false;
+			}
+			return true;
+		}
+
+		bool claim_login_exchange(claude_code_login_state_t& state) noexcept
+		{
+			try {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				return claim_login_publication(state, 5, 4);
+			} catch (...) {
+				return false;
+			}
+		}
+
+		bool finish_login_exchange(claude_code_login_state_t& state, bool success,
+			const char* failure) noexcept
+		{
+			if (success && state.terminal_phase.load(std::memory_order_acquire) != 1)
+				return false;
+			try {
+				std::lock_guard<std::mutex> lock(state.mutex);
+				const std::uint8_t phase = state.terminal_phase.load(std::memory_order_acquire);
+				if (success) {
+					if (phase != 1) return false;
+				} else {
+					if (phase != 4) return false;
+					std::uint8_t expected = 4;
+					if (!state.terminal_phase.compare_exchange_strong(expected, 2,
+						std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+				}
+				try {
+					if (success) state.error.clear();
+					else state.error = failure && *failure ? failure : "token exchange failed";
+				} catch (...) {
+				}
+				state.done.store(true, std::memory_order_release);
+			} catch (...) {
+				if (!success) {
+					std::uint8_t expected = 4;
+					state.terminal_phase.compare_exchange_strong(expected, 2,
+						std::memory_order_acq_rel, std::memory_order_acquire);
+				}
+				state.done.store(true, std::memory_order_release);
+				try { set_last_error("token exchange publication failed"); } catch (...) {}
+				return false;
+			}
+			try { set_last_error(success ? std::string{}
+				: std::string(failure && *failure ? failure : "token exchange failed")); } catch (...) {}
+			return success;
 		}
 
 		const char kVerifierCharset[] =
@@ -443,7 +564,7 @@ namespace claude_code {
 			std::vector<std::string> scopes;
 			std::string token;
 			for (char ch : scope_string) {
-				if (std::isspace(static_cast<unsigned char>(ch))) {
+				if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\f' || ch == '\v') {
 					if (!token.empty()) {
 						scopes.push_back(token);
 						token.clear();
@@ -596,14 +717,6 @@ namespace claude_code {
 			return metadata;
 		}
 
-		bool is_callback_target(const std::string& target)
-		{
-			const size_t query_pos = target.find('?');
-			const std::string path = query_pos == std::string::npos
-				? target : target.substr(0, query_pos);
-			return path == "/callback" || path == "/auth/callback";
-		}
-
 		std::string success_html()
 		{
 			return std::string(
@@ -648,9 +761,10 @@ namespace claude_code {
 		void send_response(SOCKET client, int status, const std::string& body)
 		{
 			std::string status_text;
-			switch (status) {
+				switch (status) {
 				case 200: status_text = "OK"; break;
 				case 400: status_text = "Bad Request"; break;
+				case 405: status_text = "Method Not Allowed"; break;
 				case 404: status_text = "Not Found"; break;
 				default: status_text = "OK"; break;
 			}
@@ -664,40 +778,104 @@ namespace claude_code {
 			::send(client, resp.data(), static_cast<int>(resp.size()), 0);
 		}
 
-		std::map<std::string, std::string> parse_query(const std::string& query)
+		bool decode_query_component(const std::string& input, std::string& output)
 		{
-			std::map<std::string, std::string> out;
-			size_t pos = 0;
-			while (pos < query.size()) {
-				size_t amp = query.find('&', pos);
-				if (amp == std::string::npos)
-					amp = query.size();
-				const std::string pair = query.substr(pos, amp - pos);
-				const size_t eq = pair.find('=');
-				std::string key = (eq == std::string::npos) ? pair : pair.substr(0, eq);
-				std::string val = (eq == std::string::npos) ? std::string{} : pair.substr(eq + 1);
-				std::string decoded;
-				decoded.reserve(val.size());
-				for (size_t i = 0; i < val.size(); ++i) {
-					if (val[i] == '+') {
-						decoded.push_back(' ');
-					} else if (val[i] == '%' && i + 2 < val.size()) {
-						const int hi = hex_digit(val[i + 1]);
-						const int lo = hex_digit(val[i + 2]);
-						if (hi >= 0 && lo >= 0) {
-							decoded.push_back(static_cast<char>((hi << 4) | lo));
-							i += 2;
-						} else {
-							decoded.push_back(val[i]);
-						}
-					} else {
-						decoded.push_back(val[i]);
-					}
+			output.clear();
+			output.reserve(input.size());
+			for (std::size_t i = 0; i < input.size(); ++i) {
+				unsigned char value = static_cast<unsigned char>(input[i]);
+				if (value == '+') {
+					value = ' ';
+				} else if (value == '%') {
+					if (i + 2 >= input.size()) return false;
+					const int hi = hex_digit(input[i + 1]);
+					const int lo = hex_digit(input[i + 2]);
+					if (hi < 0 || lo < 0) return false;
+					value = static_cast<unsigned char>((hi << 4) | lo);
+					i += 2;
 				}
-				out[key] = decoded;
-				pos = amp + 1;
+				if (value < 0x20 || value >= 0x7F) return false;
+				output.push_back(static_cast<char>(value));
 			}
-			return out;
+			return true;
+		}
+
+		struct callback_query_t {
+			bool valid = false;
+			std::map<std::string, std::string> params;
+		};
+
+		callback_query_t parse_query(const std::string& query)
+		{
+			callback_query_t result;
+			if (query.empty()) {
+				result.valid = true;
+				return result;
+			}
+			std::size_t pos = 0;
+			while (pos < query.size()) {
+				if (result.params.size() >= 64) return result;
+				std::size_t amp = query.find('&', pos);
+				if (amp == std::string::npos) amp = query.size();
+				if (amp == pos) return result;
+				const std::string pair = query.substr(pos, amp - pos);
+				const std::size_t eq = pair.find('=');
+				const std::string encoded_key = eq == std::string::npos
+					? pair : pair.substr(0, eq);
+				const std::string encoded_value = eq == std::string::npos
+					? std::string{} : pair.substr(eq + 1);
+				std::string key;
+				std::string value;
+				if (!decode_query_component(encoded_key, key) || key.empty()
+					|| !decode_query_component(encoded_value, value)) return result;
+				if (!result.params.emplace(std::move(key), std::move(value)).second)
+					return result;
+				if (amp == query.size()) break;
+				pos = amp + 1;
+				if (pos == query.size()) return result;
+			}
+			result.valid = true;
+			return result;
+		}
+
+		struct callback_request_t {
+			int status = 400;
+			std::string query;
+		};
+
+		callback_request_t parse_callback_request(const std::string& raw)
+		{
+			callback_request_t result;
+			const std::size_t line_end = raw.find("\r\n");
+			if (line_end == std::string::npos || line_end > 8192) return result;
+			const std::string line = raw.substr(0, line_end);
+			const std::size_t first_space = line.find(' ');
+			const std::size_t second_space = first_space == std::string::npos
+				? std::string::npos : line.find(' ', first_space + 1);
+			if (first_space == std::string::npos || second_space == std::string::npos
+				|| line.find(' ', second_space + 1) != std::string::npos) return result;
+			if (line.substr(0, first_space) != "GET") {
+				result.status = 405;
+				return result;
+			}
+			const std::string target = line.substr(first_space + 1,
+				second_space - first_space - 1);
+			const std::string version = line.substr(second_space + 1);
+			if (version != "HTTP/1.1" && version != "HTTP/1.0") return result;
+			if (target.empty() || target.front() != '/' || target.find('#') != std::string::npos)
+				return result;
+			for (const unsigned char value : target) {
+				if (value <= 0x20 || value >= 0x7F || value == '\\') return result;
+			}
+			const std::size_t query = target.find('?');
+			const std::string path = query == std::string::npos ? target : target.substr(0, query);
+			if (path != "/callback" && path != "/auth/callback") {
+				result.status = 404;
+				return result;
+			}
+			result.status = 200;
+			if (query != std::string::npos) result.query = target.substr(query + 1);
+			return result;
 		}
 
 		void listener_thread(claude_code_login_state_t* state, std::shared_ptr<listener_t> ctx)
@@ -759,55 +937,51 @@ namespace claude_code {
 						break;
 				}
 
-				const size_t first_space = raw.find(' ');
-				const size_t second_space = (first_space == std::string::npos)
-					? std::string::npos
-					: raw.find(' ', first_space + 1);
-				if (first_space == std::string::npos || second_space == std::string::npos) {
-					send_response(client, 400, failure_html("malformed request"));
+				const callback_request_t request = parse_callback_request(raw);
+				if (request.status != 200) {
+					const char* detail = request.status == 405 ? "method not allowed"
+						: request.status == 404 ? "not found" : "malformed request";
+					send_response(client, request.status, failure_html(detail));
 					close_active_client(ctx, client);
 					continue;
 				}
 
-				const std::string target = raw.substr(first_space + 1, second_space - first_space - 1);
-
-				if (!is_callback_target(target)) {
-					send_response(client, 404, failure_html("not found"));
+				const callback_query_t query = parse_query(request.query);
+				if (!query.valid) {
+					send_response(client, 400, failure_html("malformed query"));
 					close_active_client(ctx, client);
 					continue;
 				}
-
-				const size_t qpos = target.find('?');
-				const std::string query_str = (qpos == std::string::npos)
-					? std::string{} : target.substr(qpos + 1);
-				const auto params = parse_query(query_str);
+				const auto& params = query.params;
 
 				const auto err_it = params.find("error");
 				if (err_it != params.end()) {
 					std::string detail = err_it->second;
 					const auto desc_it = params.find("error_description");
-					if (desc_it != params.end())
-						detail += ": " + desc_it->second;
-					{
-						std::lock_guard<std::mutex> lock(state->mutex);
-						state->error = detail;
+					if (desc_it != params.end() && !desc_it->second.empty())
+						detail = detail.empty() ? desc_it->second : detail + ": " + desc_it->second;
+					if (detail.empty()) detail = "authorization failed";
+					if (!publish_login_terminal_state(*state, detail.c_str(), 2)) {
+						send_response(client, 400, failure_html("login no longer active"));
+						close_active_client(ctx, client);
+						return;
 					}
 					send_response(client, 200, failure_html(detail));
 					close_active_client(ctx, client);
-					state->done.store(true);
 					return;
 				}
 
 				const auto code_it = params.find("code");
 				const auto state_it = params.find("state");
-				if (code_it == params.end() || state_it == params.end()) {
-					{
-						std::lock_guard<std::mutex> lock(state->mutex);
-						state->error = "missing code or state";
+				if (code_it == params.end() || state_it == params.end()
+					|| code_it->second.empty() || state_it->second.empty()) {
+					if (!publish_login_terminal_state(*state, "missing code or state", 2)) {
+						send_response(client, 400, failure_html("login no longer active"));
+						close_active_client(ctx, client);
+						return;
 					}
 					send_response(client, 400, failure_html("missing code or state"));
 					close_active_client(ctx, client);
-					state->done.store(true);
 					return;
 				}
 
@@ -817,24 +991,23 @@ namespace claude_code {
 					expected_state = state->state;
 				}
 				if (state_it->second != expected_state) {
-					{
-						std::lock_guard<std::mutex> lock(state->mutex);
-						state->error = "state mismatch (csrf)";
+					if (!publish_login_terminal_state(*state, "state mismatch (csrf)", 2)) {
+						send_response(client, 400, failure_html("login no longer active"));
+						close_active_client(ctx, client);
+						return;
 					}
 					send_response(client, 400, failure_html("state mismatch"));
 					close_active_client(ctx, client);
-					state->done.store(true);
 					return;
 				}
 
-				{
-					std::lock_guard<std::mutex> lock(state->mutex);
-					state->received_code = code_it->second;
-					state->received_state = state_it->second;
+				if (!publish_login_callback(*state, code_it->second, state_it->second)) {
+					send_response(client, 400, failure_html("login no longer active"));
+					close_active_client(ctx, client);
+					return;
 				}
 				send_response(client, 200, success_html());
 				close_active_client(ctx, client);
-				state->done.store(true);
 				return;
 			}
 		}
@@ -849,10 +1022,7 @@ namespace claude_code {
 				ctx = std::static_pointer_cast<listener_t>(state.listener_handle);
 				state.listener_handle.reset();
 			}
-			ctx->stop.store(true, std::memory_order_release);
-			close_listener_sockets(ctx);
-			const SOCKET client = ctx->active_client.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
-			if (client != INVALID_SOCKET) closesocket(client);
+			dispatch_listener_cancel(ctx);
 			if (!ctx->worker_done.load(std::memory_order_acquire))
 				anti_tamper::webhook::write_log("auth.claude_code",
 					"[aida.auth.claude_code] listener task retained until socket-close cancellation completes");
@@ -1003,13 +1173,22 @@ namespace claude_code {
 				sub.domain = aida::infra::executor::domain_t::security_liveness;
 				sub.priority = 1;
 				sub.shutdown_policy = "cancel_pending";
-				sub.cancel_hook = [ctx]() noexcept {
-					ctx->stop.store(true, std::memory_order_release);
-					close_listener_sockets(ctx);
-					const SOCKET client = ctx->active_client.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
-					if (client != INVALID_SOCKET) closesocket(client);
+				const std::weak_ptr<claude_code_login_state_t> state_weak = state_owner;
+				sub.cancel_hook = [ctx, state_weak]() noexcept {
+					ctx->cancellation_dispatched.store(true, std::memory_order_release);
+					close_listener_resources(ctx);
+					if (const auto owner = state_weak.lock()) {
+						try {
+							std::lock_guard<std::mutex> lock(owner->mutex);
+							if (owner->listener_handle.get() == ctx.get()) owner->listener_handle.reset();
+						} catch (...) {
+						}
+					}
+					if (!ctx->worker_started.load(std::memory_order_acquire))
+						ctx->worker_done.store(true, std::memory_order_release);
 				};
 				sub.body = [state_owner, ctx]() noexcept {
+					ctx->worker_started.store(true, std::memory_order_release);
 					struct terminal_t {
 						std::shared_ptr<listener_t> value;
 						~terminal_t() noexcept { value->worker_done.store(true, std::memory_order_release); }
@@ -1027,19 +1206,13 @@ namespace claude_code {
 						&& !ctx->stop.load(std::memory_order_acquire))
 						failure = "listener exited before callback";
 					if (failure && !state_owner->cancelled.load(std::memory_order_acquire)
-						&& !ctx->stop.load(std::memory_order_acquire)) {
+						&& !ctx->stop.load(std::memory_order_acquire)
+						&& publish_login_terminal_state(*state_owner, failure, 2)) {
 						ctx->stop.store(true, std::memory_order_release);
 						close_listener_sockets(ctx);
 						const SOCKET client = ctx->active_client.exchange(INVALID_SOCKET,
 							std::memory_order_acq_rel);
 						if (client != INVALID_SOCKET) closesocket(client);
-						try {
-							std::lock_guard<std::mutex> lock(state_owner->mutex);
-							state_owner->error = failure;
-						} catch (...) {
-						}
-						state_owner->done.store(true, std::memory_order_release);
-						try { set_last_error(failure); } catch (...) {}
 					}
 				};
 				submitted = aida::infra::executor::submit(std::move(sub));
@@ -1055,6 +1228,12 @@ namespace claude_code {
 				try { set_last_error("listener submission rejected"); } catch (...) {}
 				return false;
 			}
+			ctx->task_id.store(submitted.task_id, std::memory_order_release);
+			if (ctx->cancellation_dispatched.load(std::memory_order_acquire)) {
+				try { aida::infra::executor::cancel(submitted.task_id); } catch (...) {}
+				try { set_last_error("listener cancelled before ownership publication"); } catch (...) {}
+				return false;
+			}
 			try {
 				std::lock_guard<std::mutex> lock(state.mutex);
 				state.listener_handle = ctx;
@@ -1063,12 +1242,20 @@ namespace claude_code {
 				try { set_last_error("listener ownership publication failed"); } catch (...) {}
 				return false;
 			}
+			if (ctx->cancellation_dispatched.load(std::memory_order_acquire)) {
+				stop_listener(state);
+				try { set_last_error("listener cancelled during ownership publication"); } catch (...) {}
+				return false;
+			}
 			if (state.cancelled.load(std::memory_order_acquire))
 				stop_listener(state);
 			return true;
 		}
 
-		bool token_post(const nlohmann::json& body, nlohmann::json& json_out, std::string& err_out)
+		bool token_post(const nlohmann::json& body, nlohmann::json& json_out,
+			std::string& err_out,
+			const aida::auth::http::cancel_cb_t& cancelled = {},
+			int timeout_sec = 15)
 		{
 			const aida::auth::http::header_list_t headers = {
 				{ "User-Agent", "AiDA/1.0" },
@@ -1077,8 +1264,12 @@ namespace claude_code {
 			const std::string body_str = body.dump();
 			const aida::auth::http::response_t res = aida::auth::http::request(
 				"POST", CLAUDE_CODE_TOKEN_URL, headers, body_str,
-				"application/json", 15);
-			if (!res.ok) {
+				"application/json", timeout_sec, cancelled);
+			if (res.cancelled || (cancelled && cancelled())) {
+				err_out = "anthropic token request cancelled";
+				return false;
+			}
+			if (!res.ok || !res.complete || res.truncated) {
 				err_out = "anthropic token endpoint unreachable: " + res.error;
 				return false;
 			}
@@ -1100,7 +1291,10 @@ namespace claude_code {
 			return true;
 		}
 
-		bool profile_get(const std::string& access_token, nlohmann::json& json_out, std::string& err_out)
+		bool profile_get(const std::string& access_token, nlohmann::json& json_out,
+			std::string& err_out,
+			const aida::auth::http::cancel_cb_t& cancelled = {},
+			int timeout_sec = 10)
 		{
 			const aida::auth::http::header_list_t headers = {
 				{ "User-Agent", "AiDA/1.0" },
@@ -1110,8 +1304,12 @@ namespace claude_code {
 			};
 			const aida::auth::http::response_t res = aida::auth::http::request(
 				"GET", std::string(CLAUDE_CODE_BASE_API_URL) + CLAUDE_CODE_PROFILE_PATH,
-				headers, std::string(), std::string(), 10);
-			if (!res.ok) {
+				headers, std::string(), std::string(), timeout_sec, cancelled);
+			if (res.cancelled || (cancelled && cancelled())) {
+				err_out = "anthropic profile request cancelled";
+				return false;
+			}
+			if (!res.ok || !res.complete || res.truncated) {
 				err_out = "anthropic profile endpoint unreachable: " + res.error;
 				return false;
 			}
@@ -1141,7 +1339,7 @@ namespace claude_code {
 			anti_tamper::webhook::write_log("auth.claude_code", line.c_str());
 		}
 
-		bool exchange_code(claude_code_login_state_t& state)
+		bool exchange_code(claude_code_login_state_t& state, std::string& failure)
 		{
 			const claude_code_login_snapshot_t current = snapshot(state);
 			const std::string client_id = load_custom_client_id();
@@ -1158,10 +1356,11 @@ namespace claude_code {
 
 			nlohmann::json resp;
 			std::string err;
-			if (!token_post(body, resp, err)) {
-				set_last_error(err);
-				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = err;
+			const aida::auth::http::cancel_cb_t cancelled = [&state]() noexcept {
+				return state.cancelled.load(std::memory_order_acquire);
+			};
+			if (!token_post(body, resp, err, cancelled)) {
+				failure = err.empty() ? "token exchange failed" : std::move(err);
 				return false;
 			}
 
@@ -1174,15 +1373,13 @@ namespace claude_code {
 			read_token_account(resp, account_id, email, organization_id);
 
 			if (access.empty() || refresh.empty()) {
-				set_last_error("token response missing access/refresh");
-				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = "token response missing access/refresh";
+				failure = "token response missing access/refresh";
 				return false;
 			}
 
 			nlohmann::json profile = nlohmann::json::object();
 			std::string profile_err;
-			if (profile_get(access, profile, profile_err))
+			if (profile_get(access, profile, profile_err, cancelled))
 				read_profile_account(profile, account_id, email, organization_id);
 			else
 				log_nonfatal_profile_error(profile_err);
@@ -1210,13 +1407,19 @@ namespace claude_code {
 				info.custom_scopes = prev.custom_scopes;
 			}
 
-			if (!store::set("anthropic", info)) {
-				set_last_error("store::set anthropic failed: " + store::last_error());
-				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = "store::set anthropic failed";
+			if (!store::set_if("anthropic", info, [&state]() noexcept {
+				std::uint8_t expected = 4;
+				return state.terminal_phase.compare_exchange_strong(expected, 1,
+					std::memory_order_acq_rel, std::memory_order_acquire);
+			})) {
+				const std::string store_failure = store::last_error();
+				std::uint8_t expected = 1;
+				state.terminal_phase.compare_exchange_strong(expected, 4,
+					std::memory_order_acq_rel, std::memory_order_acquire);
+				failure = store_failure.empty() ? "store::set_if anthropic failed"
+					: "store::set_if anthropic failed: " + store_failure;
 				return false;
 			}
-			set_last_error({});
 			return true;
 		}
 
@@ -1224,25 +1427,22 @@ namespace claude_code {
 
 	bool start_login(claude_code_login_state_t& state, std::uint64_t absolute_deadline_ms)
 	{
-		state.done.store(false);
+		state.terminal_phase.store(0, std::memory_order_release);
+		state.done.store(false, std::memory_order_release);
 		if (state.cancelled.load(std::memory_order_acquire)) {
-			set_last_error("login cancelled before start");
-			return false;
+			return publish_login_terminal_failure(state, "login cancelled before start", 3);
 		}
 		const std::string verifier = generate_verifier();
 		if (verifier.empty()) {
-			set_last_error("verifier generation failed");
-			return false;
+			return publish_login_terminal_failure(state, "verifier generation failed");
 		}
 		const std::string challenge = sha256_base64url(verifier);
 		if (challenge.empty()) {
-			set_last_error("challenge sha256 failed");
-			return false;
+			return publish_login_terminal_failure(state, "challenge sha256 failed");
 		}
 		const std::string state_token = generate_state_token();
 		if (state_token.empty()) {
-			set_last_error("state token generation failed");
-			return false;
+			return publish_login_terminal_failure(state, "state token generation failed");
 		}
 		{
 			std::lock_guard<std::mutex> lock(state.mutex);
@@ -1256,12 +1456,14 @@ namespace claude_code {
 			state.state = state_token;
 			state.auth_url.clear();
 		}
-		if (!start_listener_locked(state))
-			return false;
+		if (!start_listener_locked(state)) {
+			const std::string failure = last_error();
+			return publish_login_terminal_failure(state,
+				failure.empty() ? "listener start failed" : failure.c_str());
+		}
 		if (state.cancelled.load(std::memory_order_acquire)) {
 			stop_listener(state);
-			set_last_error("login cancelled during start");
-			return false;
+			return publish_login_terminal_failure(state, "login cancelled during start", 3);
 		}
 
 		const std::string client_id = load_custom_client_id();
@@ -1276,13 +1478,15 @@ namespace claude_code {
 		}
 		if (state.cancelled.load(std::memory_order_acquire)) {
 			stop_listener(state);
-			set_last_error("login cancelled before browser navigation");
-			return false;
+			return publish_login_terminal_failure(state,
+				"login cancelled before browser navigation", 3);
 		}
 
-		if (!aida::auth::open_url_external_until(auth_url, absolute_deadline_ms))
-			anti_tamper::webhook::write_log("auth.claude_code",
-				"[aida.auth.claude_code] open browser failed; user must open auth_url manually");
+		if (!aida::auth::open_url_external_until(auth_url, absolute_deadline_ms)) {
+			stop_listener(state);
+			return publish_login_terminal_failure(state,
+				"Camoufox authorization navigation failed");
+		}
 
 		set_last_error({});
 		return true;
@@ -1300,11 +1504,7 @@ namespace claude_code {
 		if (current.started_unix != 0
 			&& now - current.started_unix > OAUTH_TIMEOUT_SECONDS
 			&& !state.done.load()) {
-			{
-				std::lock_guard<std::mutex> lock(state.mutex);
-				state.error = "login timed out";
-			}
-			set_last_error("login timed out");
+			publish_login_terminal_failure(state, "login timed out");
 			stop_listener(state);
 			return false;
 		}
@@ -1327,18 +1527,62 @@ namespace claude_code {
 			set_last_error("callback completed without code");
 			return false;
 		}
-		return exchange_code(state);
+		if (!claim_login_exchange(state)) return false;
+		std::string failure;
+		bool exchanged = false;
+		const char* exception_failure = nullptr;
+		try {
+			exchanged = exchange_code(state, failure);
+		} catch (...) {
+			exception_failure = "token exchange exception";
+		}
+		return finish_login_exchange(state, exchanged,
+			failure.empty() ? exception_failure : failure.c_str());
+	}
+
+	bool request_cancel(claude_code_login_state_t& state) noexcept
+	{
+		std::uint8_t phase = state.terminal_phase.load(std::memory_order_acquire);
+		bool claimed = false;
+		while (phase == 0 || phase == 4 || phase == 5) {
+			if (state.terminal_phase.compare_exchange_weak(phase, 3,
+				std::memory_order_acq_rel, std::memory_order_acquire)) {
+				claimed = true;
+				break;
+			}
+		}
+		if (!claimed) return false;
+		state.cancelled.store(true, std::memory_order_release);
+		state.done.store(true, std::memory_order_release);
+		try {
+			std::lock_guard<std::mutex> lock(state.mutex);
+			try { state.error = "login cancelled"; } catch (...) {}
+		} catch (...) {
+		}
+		try { set_last_error("login cancelled"); } catch (...) {}
+		return true;
 	}
 
 	bool cancel_login(claude_code_login_state_t& state)
 	{
-		state.cancelled.store(true);
+		const bool claimed = request_cancel(state);
 		stop_listener(state);
-		return true;
+		return claimed;
 	}
 
-	bool refresh_token()
+	bool refresh_token(const http::cancel_cb_t& cancelled, int timeout_sec)
 	{
+		if (timeout_sec <= 0 || (cancelled && cancelled())) {
+			set_last_error("refresh cancelled or timed out");
+			return false;
+		}
+		const auto deadline = std::chrono::steady_clock::now()
+			+ std::chrono::seconds(timeout_sec);
+		const auto remaining_seconds = [&]() -> int {
+			const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+				deadline - std::chrono::steady_clock::now()).count();
+			return remaining <= 0 ? 0 : static_cast<int>((remaining + 999) / 1000);
+		};
 		auth_info_t info;
 		if (!store::get("anthropic", info) || info.kind != auth_kind_t::oauth) {
 			set_last_error("no anthropic oauth credentials");
@@ -1363,7 +1607,7 @@ namespace claude_code {
 
 		nlohmann::json resp;
 		std::string err;
-		if (!token_post(body, resp, err)) {
+		if (!token_post(body, resp, err, cancelled, remaining_seconds())) {
 			set_last_error(err);
 			return false;
 		}
@@ -1386,7 +1630,8 @@ namespace claude_code {
 
 		nlohmann::json profile = nlohmann::json::object();
 		std::string profile_err;
-		if (profile_get(access, profile, profile_err))
+		if (remaining_seconds() > 0 &&
+			profile_get(access, profile, profile_err, cancelled, remaining_seconds()))
 			read_profile_account(profile, account_id, email, organization_id);
 		else
 			log_nonfatal_profile_error(profile_err);
@@ -1401,6 +1646,10 @@ namespace claude_code {
 		info.email = email;
 		info.metadata = build_oauth_metadata(resp, profile, scopes, organization_id);
 
+		if (remaining_seconds() <= 0 || (cancelled && cancelled())) {
+			set_last_error("refresh cancelled or timed out");
+			return false;
+		}
 		if (!store::set("anthropic", info)) {
 			set_last_error("store::set anthropic failed: " + store::last_error());
 			return false;
@@ -1520,6 +1769,7 @@ namespace claude_code {
 		value.port = state.port;
 		value.done = state.done.load(std::memory_order_acquire);
 		value.cancelled = state.cancelled.load(std::memory_order_acquire);
+		value.terminal_phase = state.terminal_phase.load(std::memory_order_acquire);
 		value.received_code = state.received_code;
 		value.received_state = state.received_state;
 		value.error = state.error;

@@ -197,6 +197,89 @@ function(aida_c03_require_json_array_exact json expected_variable descriptor)
     endforeach()
 endfunction()
 
+set(AIDA_C03_SIGNER_POLICY_FILE "" CACHE FILEPATH "AiDA C03 authorized signer policy")
+set(AIDA_C03_SIGNING_PROVIDER "" CACHE FILEPATH "AiDA C03 external signing provider")
+set(AIDA_C03_SIGNING_PROVIDER_SHA256 "" CACHE STRING "AiDA C03 external signing provider SHA-256")
+set(AIDA_C03_SIGNING_AUTHORITY_AVAILABLE FALSE)
+set(AIDA_C03_SIGNING_AUTHORITY_BLOCKER
+    "AIDA_C03_EXTERNAL_SIGNING_AUTHORITY_REQUIRED: provide an absolute regular non-reparse signer-policy file, external signing provider, and its exact SHA-256")
+
+function(aida_c03_configure_signing_authority)
+    if(NOT AIDA_C03_SIGNER_POLICY_FILE OR NOT AIDA_C03_SIGNING_PROVIDER OR
+       NOT AIDA_C03_SIGNING_PROVIDER_SHA256)
+        set(AIDA_C03_SIGNING_AUTHORITY_AVAILABLE FALSE PARENT_SCOPE)
+        return()
+    endif()
+    foreach(_aida_c03_signing_path IN ITEMS
+            "${AIDA_C03_SIGNER_POLICY_FILE}" "${AIDA_C03_SIGNING_PROVIDER}")
+        if(NOT IS_ABSOLUTE "${_aida_c03_signing_path}" OR
+           NOT EXISTS "${_aida_c03_signing_path}" OR
+           IS_DIRECTORY "${_aida_c03_signing_path}" OR
+           IS_SYMLINK "${_aida_c03_signing_path}")
+            message(FATAL_ERROR "AiDA C03 signing authority path is not an absolute regular non-reparse file")
+        endif()
+    endforeach()
+    aida_c03_require_sha256_value(
+        "${AIDA_C03_SIGNING_PROVIDER_SHA256}" "external signing provider")
+    file(SHA256 "${AIDA_C03_SIGNING_PROVIDER}" _aida_c03_signing_provider_actual)
+    string(TOLOWER "${_aida_c03_signing_provider_actual}" _aida_c03_signing_provider_actual)
+    if(NOT _aida_c03_signing_provider_actual STREQUAL AIDA_C03_SIGNING_PROVIDER_SHA256)
+        message(FATAL_ERROR "AiDA C03 external signing provider hash mismatch")
+    endif()
+    file(READ "${AIDA_C03_SIGNER_POLICY_FILE}" _aida_c03_signer_policy LIMIT 1048576)
+    string(JSON _aida_c03_signer_policy_type ERROR_VARIABLE _aida_c03_signer_policy_error
+        TYPE "${_aida_c03_signer_policy}")
+    string(JSON _aida_c03_signer_policy_length ERROR_VARIABLE _aida_c03_signer_policy_length_error
+        LENGTH "${_aida_c03_signer_policy}")
+    string(JSON _aida_c03_signer_policy_schema ERROR_VARIABLE _aida_c03_signer_policy_schema_error
+        GET "${_aida_c03_signer_policy}" schema)
+    string(JSON _aida_c03_signer_policy_version ERROR_VARIABLE _aida_c03_signer_policy_version_error
+        GET "${_aida_c03_signer_policy}" schema_version)
+    string(JSON _aida_c03_signer_policy_timestamp ERROR_VARIABLE _aida_c03_signer_policy_timestamp_error
+        GET "${_aida_c03_signer_policy}" require_trusted_timestamp)
+    string(JSON _aida_c03_signer_policy_provider ERROR_VARIABLE _aida_c03_signer_policy_provider_error
+        GET "${_aida_c03_signer_policy}" signing_provider_sha256)
+    string(JSON _aida_c03_signer_count ERROR_VARIABLE _aida_c03_signer_count_error
+        LENGTH "${_aida_c03_signer_policy}" authorized_signer_thumbprints_sha256)
+    if(NOT _aida_c03_signer_policy_error STREQUAL "NOTFOUND" OR
+       NOT _aida_c03_signer_policy_length_error STREQUAL "NOTFOUND" OR
+       NOT _aida_c03_signer_policy_schema_error STREQUAL "NOTFOUND" OR
+       NOT _aida_c03_signer_policy_version_error STREQUAL "NOTFOUND" OR
+       NOT _aida_c03_signer_policy_timestamp_error STREQUAL "NOTFOUND" OR
+       NOT _aida_c03_signer_policy_provider_error STREQUAL "NOTFOUND" OR
+       NOT _aida_c03_signer_count_error STREQUAL "NOTFOUND" OR
+       NOT _aida_c03_signer_policy_type STREQUAL "OBJECT" OR
+       NOT _aida_c03_signer_policy_length EQUAL 5 OR
+       NOT _aida_c03_signer_policy_schema STREQUAL "aida.c03.authorized-signer-policy" OR
+       NOT _aida_c03_signer_policy_version EQUAL 1 OR
+       NOT _aida_c03_signer_policy_timestamp OR
+       NOT _aida_c03_signer_policy_provider STREQUAL AIDA_C03_SIGNING_PROVIDER_SHA256 OR
+       _aida_c03_signer_count LESS 1 OR _aida_c03_signer_count GREATER 16)
+        message(FATAL_ERROR "AiDA C03 authorized signer policy is invalid")
+    endif()
+    set(_aida_c03_signers)
+    math(EXPR _aida_c03_signer_last "${_aida_c03_signer_count} - 1")
+    foreach(_aida_c03_signer_index RANGE 0 ${_aida_c03_signer_last})
+        string(JSON _aida_c03_signer GET "${_aida_c03_signer_policy}"
+            authorized_signer_thumbprints_sha256 ${_aida_c03_signer_index})
+        aida_c03_require_sha256_value("${_aida_c03_signer}" "authorized signer")
+        if(_aida_c03_signer IN_LIST _aida_c03_signers)
+            message(FATAL_ERROR "AiDA C03 authorized signer policy contains a duplicate identity")
+        endif()
+        list(APPEND _aida_c03_signers "${_aida_c03_signer}")
+    endforeach()
+    list(SORT _aida_c03_signers)
+    file(SHA256 "${AIDA_C03_SIGNER_POLICY_FILE}" _aida_c03_signer_policy_sha256)
+    string(TOLOWER "${_aida_c03_signer_policy_sha256}" _aida_c03_signer_policy_sha256)
+    set(AIDA_C03_AUTHORIZED_SIGNER_THUMBPRINTS_SHA256
+        "${_aida_c03_signers}" PARENT_SCOPE)
+    set(AIDA_C03_SIGNER_POLICY_SHA256
+        "${_aida_c03_signer_policy_sha256}" PARENT_SCOPE)
+    set(AIDA_C03_SIGNING_AUTHORITY_AVAILABLE TRUE PARENT_SCOPE)
+endfunction()
+
+aida_c03_configure_signing_authority()
+
 function(aida_c03_require_locked_source_tree)
     set(_aida_c03_inputs
         "src/standalone/workers/native_decompiler/fake_native_decompiler_worker.cpp|15972|4323a48219411fb872594dc96e6b884039c8e8cf20c2954424a765818d6c2dc4"
@@ -750,13 +833,25 @@ function(aida_c03_reject_forbidden_target_links)
                 string(TOLOWER "${_aida_c03_link}" _aida_c03_normalized_link)
                 foreach(_aida_c03_forbidden IN LISTS AIDA_C03_PRODUCTION_LINK_DENY_TOKENS)
                     if(_aida_c03_normalized_link MATCHES "(^|[^a-z0-9])${_aida_c03_forbidden}([^a-z0-9]|$)")
-                        message(FATAL_ERROR "AiDA C03 target links a forbidden dependency: ${_aida_c03_target} -> ${_aida_c03_link}")
+                        set(_aida_c03_edge
+                            "${_aida_c03_target}|${_aida_c03_property}|${_aida_c03_link}")
+                        if(NOT _aida_c03_edge STREQUAL
+                           "AiDAStandalone|LINK_LIBRARIES|unicorn")
+                            message(FATAL_ERROR "AiDA C03 target links a forbidden dependency: ${_aida_c03_target} -> ${_aida_c03_link}")
+                        endif()
                     endif()
                 endforeach()
                 if(TARGET "${_aida_c03_link}")
                     list(APPEND _aida_c03_queue "${_aida_c03_link}")
                 else()
-                    string(REGEX MATCHALL "[A-Za-z0-9_.:+-]+" _aida_c03_link_tokens "${_aida_c03_link}")
+                    string(REGEX MATCHALL
+                        "[A-Za-z0-9_.+-]+(::[A-Za-z0-9_.+-]+)+"
+                        _aida_c03_namespaced_link_tokens "${_aida_c03_link}")
+                    string(REGEX MATCHALL "[A-Za-z0-9_.+-]+"
+                        _aida_c03_plain_link_tokens "${_aida_c03_link}")
+                    set(_aida_c03_link_tokens
+                        ${_aida_c03_namespaced_link_tokens}
+                        ${_aida_c03_plain_link_tokens})
                     foreach(_aida_c03_link_token IN LISTS _aida_c03_link_tokens)
                         if(TARGET "${_aida_c03_link_token}")
                             list(APPEND _aida_c03_queue "${_aida_c03_link_token}")
@@ -766,6 +861,196 @@ function(aida_c03_reject_forbidden_target_links)
             endforeach()
         endforeach()
     endwhile()
+endfunction()
+
+function(_aida_c03_link_evidence_quote output value)
+    string(REPLACE "\\" "\\\\" _aida_c03_value "${value}")
+    string(REPLACE "\"" "\\\"" _aida_c03_value "${_aida_c03_value}")
+    string(REPLACE "\r" "\\r" _aida_c03_value "${_aida_c03_value}")
+    string(REPLACE "\n" "\\n" _aida_c03_value "${_aida_c03_value}")
+    set(${output} "\"${_aida_c03_value}\"" PARENT_SCOPE)
+endfunction()
+
+function(aida_c03_emit_production_link_graph_evidence output_path integration_host)
+    cmake_parse_arguments(_aida_c03 "" "" "MANIFEST_ROOTS;DIRECT_ROOTS;OTHER_ROOTS" ${ARGN})
+    if(_aida_c03_UNPARSED_ARGUMENTS OR _aida_c03_KEYWORDS_MISSING_VALUES)
+        message(FATAL_ERROR "AiDA C03 production link evidence root groups are malformed")
+    endif()
+    list(LENGTH _aida_c03_MANIFEST_ROOTS _aida_c03_manifest_root_count)
+    list(LENGTH _aida_c03_DIRECT_ROOTS _aida_c03_direct_root_count)
+    if(NOT _aida_c03_manifest_root_count EQUAL 57 OR
+       NOT _aida_c03_direct_root_count EQUAL 15)
+        message(FATAL_ERROR "AiDA C03 production link evidence requires exactly 57 manifest and 15 direct roots")
+    endif()
+    set(_aida_c03_strict_roots
+        ${_aida_c03_MANIFEST_ROOTS}
+        ${_aida_c03_DIRECT_ROOTS}
+        ${_aida_c03_OTHER_ROOTS})
+    if(NOT IS_ABSOLUTE "${output_path}" OR
+       NOT integration_host STREQUAL "AiDAStandalone" OR
+       NOT TARGET "${integration_host}" OR
+       NOT _aida_c03_strict_roots OR
+       NOT "AiDAStandalone" IN_LIST _aida_c03_strict_roots OR
+       NOT "aida_c03_safe_headless_runtime" IN_LIST _aida_c03_strict_roots OR
+       NOT "aida_c03_auth_preview_implementation" IN_LIST _aida_c03_strict_roots OR
+       NOT "aida_c03_b14_native_decompiler_worker" IN_LIST _aida_c03_strict_roots OR
+       NOT "aida_c03_package_verifier" IN_LIST _aida_c03_strict_roots)
+        message(FATAL_ERROR "AiDA C03 production link evidence arguments are invalid")
+    endif()
+    aida_c03_reject_forbidden_target_links(${_aida_c03_strict_roots})
+    list(REMOVE_DUPLICATES _aida_c03_strict_roots)
+    list(SORT _aida_c03_strict_roots)
+    list(LENGTH _aida_c03_strict_roots _aida_c03_strict_root_count)
+    math(EXPR _aida_c03_minimum_root_count
+        "${_aida_c03_manifest_root_count} + ${_aida_c03_direct_root_count} + 6")
+    if(_aida_c03_strict_root_count LESS _aida_c03_minimum_root_count)
+        message(FATAL_ERROR "AiDA C03 production link evidence root closure lost a required target")
+    endif()
+    set(_aida_c03_queue ${_aida_c03_strict_roots})
+    set(_aida_c03_visited)
+    set(_aida_c03_edges)
+    while(_aida_c03_queue)
+        list(POP_FRONT _aida_c03_queue _aida_c03_target)
+        if(NOT TARGET "${_aida_c03_target}")
+            message(FATAL_ERROR "AiDA C03 production link evidence target is absent: ${_aida_c03_target}")
+        endif()
+        get_target_property(_aida_c03_aliased_target "${_aida_c03_target}" ALIASED_TARGET)
+        if(_aida_c03_aliased_target)
+            set(_aida_c03_target "${_aida_c03_aliased_target}")
+        endif()
+        if(_aida_c03_target IN_LIST _aida_c03_visited)
+            continue()
+        endif()
+        list(APPEND _aida_c03_visited "${_aida_c03_target}")
+        foreach(_aida_c03_property IN ITEMS
+                LINK_LIBRARIES LINK_INTERFACE_LIBRARIES INTERFACE_LINK_LIBRARIES
+                INTERFACE_LINK_LIBRARIES_DIRECT
+                IMPORTED_LINK_INTERFACE_LIBRARIES
+                IMPORTED_LINK_INTERFACE_LIBRARIES_DEBUG
+                IMPORTED_LINK_INTERFACE_LIBRARIES_RELEASE
+                IMPORTED_LINK_INTERFACE_LIBRARIES_RELWITHDEBINFO
+                IMPORTED_LINK_INTERFACE_LIBRARIES_MINSIZEREL
+                IMPORTED_LINK_DEPENDENT_LIBRARIES
+                IMPORTED_LINK_DEPENDENT_LIBRARIES_DEBUG
+                IMPORTED_LINK_DEPENDENT_LIBRARIES_RELEASE
+                IMPORTED_LINK_DEPENDENT_LIBRARIES_RELWITHDEBINFO
+                IMPORTED_LINK_DEPENDENT_LIBRARIES_MINSIZEREL)
+            get_target_property(_aida_c03_links "${_aida_c03_target}" "${_aida_c03_property}")
+            if(NOT _aida_c03_links OR _aida_c03_links MATCHES "-NOTFOUND$")
+                continue()
+            endif()
+            foreach(_aida_c03_link IN LISTS _aida_c03_links)
+                list(APPEND _aida_c03_edges
+                    "${_aida_c03_target}|${_aida_c03_property}|${_aida_c03_link}")
+                if(TARGET "${_aida_c03_link}")
+                    list(APPEND _aida_c03_queue "${_aida_c03_link}")
+                else()
+                    string(REGEX MATCHALL
+                        "[A-Za-z0-9_.+-]+(::[A-Za-z0-9_.+-]+)+"
+                        _aida_c03_namespaced_tokens "${_aida_c03_link}")
+                    string(REGEX MATCHALL "[A-Za-z0-9_.+-]+"
+                        _aida_c03_plain_tokens "${_aida_c03_link}")
+                    set(_aida_c03_tokens
+                        ${_aida_c03_namespaced_tokens}
+                        ${_aida_c03_plain_tokens})
+                    foreach(_aida_c03_token IN LISTS _aida_c03_tokens)
+                        if(TARGET "${_aida_c03_token}")
+                            list(APPEND _aida_c03_queue "${_aida_c03_token}")
+                        endif()
+                    endforeach()
+                endif()
+            endforeach()
+        endforeach()
+    endwhile()
+    list(REMOVE_DUPLICATES _aida_c03_visited)
+    list(REMOVE_DUPLICATES _aida_c03_edges)
+    list(SORT _aida_c03_visited)
+    list(SORT _aida_c03_edges)
+    set(_aida_c03_host_edges)
+    foreach(_aida_c03_property IN ITEMS
+            LINK_LIBRARIES LINK_INTERFACE_LIBRARIES INTERFACE_LINK_LIBRARIES
+            INTERFACE_LINK_LIBRARIES_DIRECT
+            IMPORTED_LINK_INTERFACE_LIBRARIES
+            IMPORTED_LINK_INTERFACE_LIBRARIES_DEBUG
+            IMPORTED_LINK_INTERFACE_LIBRARIES_RELEASE
+            IMPORTED_LINK_INTERFACE_LIBRARIES_RELWITHDEBINFO
+            IMPORTED_LINK_INTERFACE_LIBRARIES_MINSIZEREL
+            IMPORTED_LINK_DEPENDENT_LIBRARIES
+            IMPORTED_LINK_DEPENDENT_LIBRARIES_DEBUG
+            IMPORTED_LINK_DEPENDENT_LIBRARIES_RELEASE
+            IMPORTED_LINK_DEPENDENT_LIBRARIES_RELWITHDEBINFO
+            IMPORTED_LINK_DEPENDENT_LIBRARIES_MINSIZEREL)
+        get_target_property(_aida_c03_host_links "${integration_host}" "${_aida_c03_property}")
+        if(NOT _aida_c03_host_links OR _aida_c03_host_links MATCHES "-NOTFOUND$")
+            continue()
+        endif()
+        foreach(_aida_c03_host_link IN LISTS _aida_c03_host_links)
+            list(APPEND _aida_c03_host_edges
+                "${integration_host}|${_aida_c03_property}|${_aida_c03_host_link}")
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES _aida_c03_host_edges)
+    list(SORT _aida_c03_host_edges)
+    set(_aida_c03_host_exemptions
+        "AiDAStandalone|LINK_LIBRARIES|unicorn")
+    foreach(_aida_c03_host_exemption IN LISTS _aida_c03_host_exemptions)
+        if(NOT _aida_c03_host_exemption IN_LIST _aida_c03_host_edges)
+            message(FATAL_ERROR
+                "AiDA C03 expected pre-existing host link exemption is absent: ${_aida_c03_host_exemption}")
+        endif()
+    endforeach()
+    foreach(_aida_c03_host_edge IN LISTS _aida_c03_host_edges)
+        string(TOLOWER "${_aida_c03_host_edge}" _aida_c03_normalized_host_edge)
+        foreach(_aida_c03_forbidden IN LISTS AIDA_C03_PRODUCTION_LINK_DENY_TOKENS)
+            if(_aida_c03_normalized_host_edge MATCHES
+               "(^|[^a-z0-9])${_aida_c03_forbidden}([^a-z0-9]|$)" AND
+               NOT _aida_c03_host_edge IN_LIST _aida_c03_host_exemptions)
+                message(FATAL_ERROR
+                    "AiDA C03 integration host has an unapproved forbidden dependency edge: ${_aida_c03_host_edge}")
+            endif()
+        endforeach()
+    endforeach()
+    set(_aida_c03_root_json)
+    foreach(_aida_c03_item IN LISTS _aida_c03_strict_roots)
+        _aida_c03_link_evidence_quote(_aida_c03_quoted "${_aida_c03_item}")
+        list(APPEND _aida_c03_root_json "${_aida_c03_quoted}")
+    endforeach()
+    set(_aida_c03_target_json)
+    foreach(_aida_c03_item IN LISTS _aida_c03_visited)
+        _aida_c03_link_evidence_quote(_aida_c03_quoted "${_aida_c03_item}")
+        list(APPEND _aida_c03_target_json "${_aida_c03_quoted}")
+    endforeach()
+    set(_aida_c03_edge_json)
+    foreach(_aida_c03_item IN LISTS _aida_c03_edges)
+        _aida_c03_link_evidence_quote(_aida_c03_quoted "${_aida_c03_item}")
+        list(APPEND _aida_c03_edge_json "${_aida_c03_quoted}")
+    endforeach()
+    set(_aida_c03_host_edge_json)
+    foreach(_aida_c03_item IN LISTS _aida_c03_host_edges)
+        _aida_c03_link_evidence_quote(_aida_c03_quoted "${_aida_c03_item}")
+        list(APPEND _aida_c03_host_edge_json "${_aida_c03_quoted}")
+    endforeach()
+    set(_aida_c03_host_exemption_json)
+    foreach(_aida_c03_item IN LISTS _aida_c03_host_exemptions)
+        _aida_c03_link_evidence_quote(_aida_c03_quoted "${_aida_c03_item}")
+        list(APPEND _aida_c03_host_exemption_json "${_aida_c03_quoted}")
+    endforeach()
+    string(JOIN "," _aida_c03_root_json ${_aida_c03_root_json})
+    string(JOIN "," _aida_c03_target_json ${_aida_c03_target_json})
+    string(JOIN "," _aida_c03_edge_json ${_aida_c03_edge_json})
+    string(JOIN "," _aida_c03_host_edge_json ${_aida_c03_host_edge_json})
+    string(JOIN "," _aida_c03_host_exemption_json ${_aida_c03_host_exemption_json})
+    string(JOIN "\",\"" _aida_c03_denylist ${AIDA_C03_PRODUCTION_LINK_DENY_TOKENS})
+    _aida_c03_link_evidence_quote(_aida_c03_integration_host_json "${integration_host}")
+    get_filename_component(_aida_c03_output_parent "${output_path}" DIRECTORY)
+    file(MAKE_DIRECTORY "${_aida_c03_output_parent}")
+    file(WRITE "${output_path}"
+        "{\"schema\":\"aida.c03.production-link-graph.v3\",\"schema_version\":3,\"configuration\":\"${CMAKE_BUILD_TYPE}\",\"denylist\":[\"${_aida_c03_denylist}\"],\"manifest_root_count\":${_aida_c03_manifest_root_count},\"direct_root_count\":${_aida_c03_direct_root_count},\"strict_root_count\":${_aida_c03_strict_root_count},\"strict_roots\":[${_aida_c03_root_json}],\"strict_targets\":[${_aida_c03_target_json}],\"strict_edges\":[${_aida_c03_edge_json}],\"integration_host\":${_aida_c03_integration_host_json},\"host_direct_edges\":[${_aida_c03_host_edge_json}],\"host_preexisting_exemptions\":[${_aida_c03_host_exemption_json}]}\n")
+    file(SHA256 "${output_path}" _aida_c03_evidence_sha256)
+    string(TOLOWER "${_aida_c03_evidence_sha256}" _aida_c03_evidence_sha256)
+    set(AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE "${output_path}" PARENT_SCOPE)
+    set(AIDA_C03_PRODUCTION_LINK_GRAPH_EVIDENCE_SHA256
+        "${_aida_c03_evidence_sha256}" PARENT_SCOPE)
 endfunction()
 
 set(AIDA_C03_CUSTOMER_NOTICE_SOURCE_PATHS

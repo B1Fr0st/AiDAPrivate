@@ -57,6 +57,7 @@ struct view_state_t
 };
 
 static view_state_t g_view_state;
+static uint64_t g_pending_remove_slot = 0;
 
 static aida::burp::comparer::diff_mode_t mode_from_index(int idx)
 {
@@ -187,6 +188,75 @@ static void render_pane(const char* id, const std::vector<uint8_t>& data,
         if (std::fabs(ImGui::GetScrollY() - syn) > 0.5f) {
             ImGui::SetScrollY(syn);
         }
+    }
+
+    const uint64_t slot_id = is_a ? g_view_state.selected_a : g_view_state.selected_b;
+    const bool keyboard_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+    if ((ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) || keyboard_context)
+        ImGui::OpenPopupEx(ImHashStr(is_a ? "aida.network.comparer.a.context" : "aida.network.comparer.b.context"));
+    if (ImGui::BeginPopupEx(ImHashStr(is_a ? "aida.network.comparer.a.context" : "aida.network.comparer.b.context"),
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        aida::burp::comparer::slot_t current;
+        if (slot_id == 0 || !aida::burp::comparer::get_slot(slot_id, current)) {
+            ImGui::BeginDisabled();
+            ImGui::MenuItem("Comparer slot is stale");
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("The slot was removed or replaced; select a current slot");
+        } else {
+            if (ImGui::MenuItem("Copy Slot")) {
+                const std::string text = current.data.empty() ? std::string() :
+                    std::string(reinterpret_cast<const char*>(current.data.data()), current.data.size());
+                ImGui::SetClipboardText(text.c_str());
+            }
+            if (ImGui::MenuItem("Use as A")) {
+                g_view_state.selected_a = current.id;
+                g_view_state.cached_valid = false;
+            }
+            if (ImGui::MenuItem("Use as B")) {
+                g_view_state.selected_b = current.id;
+                g_view_state.cached_valid = false;
+            }
+            if (ImGui::MenuItem("Swap A and B")) {
+                std::swap(g_view_state.selected_a, g_view_state.selected_b);
+                g_view_state.cached_valid = false;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Remove Slot Permanently...")) {
+                g_pending_remove_slot = current.id;
+                ImGui::OpenPopupEx(ImHashStr("aida.network.comparer.remove.confirm"));
+            }
+        }
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopupEx(ImHashStr("aida.network.comparer.remove.confirm"), ImGuiWindowFlags_AlwaysAutoResize)) {
+        aida::burp::comparer::slot_t current;
+        if (g_pending_remove_slot == 0 || !aida::burp::comparer::get_slot(g_pending_remove_slot, current)) {
+            ImGui::TextUnformatted("The comparer slot is no longer available.");
+            if (ImGui::Button("Close")) {
+                g_pending_remove_slot = 0;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            ImGui::TextWrapped("Remove '%s' and its %zu bytes from the comparer? This cannot be undone.",
+                current.label.c_str(), current.data.size());
+            if (ImGui::Button("Remove")) {
+                aida::burp::comparer::remove_slot(current.id);
+                if (g_view_state.selected_a == current.id) g_view_state.selected_a = 0;
+                if (g_view_state.selected_b == current.id) g_view_state.selected_b = 0;
+                g_view_state.cached_valid = false;
+                g_pending_remove_slot = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                g_pending_remove_slot = 0;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
     }
     ImGui::EndChild();
 }

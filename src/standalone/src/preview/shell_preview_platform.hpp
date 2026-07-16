@@ -24,6 +24,7 @@ inline constexpr BOOL FALSE = 0;
 inline constexpr DWORD ERROR_SUCCESS = 0;
 inline constexpr std::size_t MAX_PATH = 260;
 inline constexpr std::size_t _TRUNCATE = static_cast<std::size_t>(-1);
+inline constexpr std::uint16_t IMAGE_FILE_MACHINE_AMD64 = 0x8664;
 
 inline DWORD& preview_last_error_storage()
 {
@@ -142,11 +143,23 @@ namespace analysis_session
 namespace aida::preview::platform
 {
 	using save_dialog_observer_t = void (*)(const char*);
+	using open_dialog_observer_t = void (*)(const char*);
 	inline save_dialog_observer_t save_dialog_observer = nullptr;
+	inline open_dialog_observer_t open_dialog_observer = nullptr;
 }
 
 namespace win32_dialog
 {
+	inline bool show_open_file_dialog(HWND, const char* title, const char*, char* output_path,
+		std::size_t capacity, const char*)
+	{
+		if (output_path && capacity > 0)
+			output_path[0] = '\0';
+		if (aida::preview::platform::open_dialog_observer)
+			aida::preview::platform::open_dialog_observer(title ? title : "Open");
+		return false;
+	}
+
 	inline bool show_save_file_dialog(HWND, const char* title, const char*,
 		const char* default_extension, char* output_path,
 		std::size_t capacity, const char* context)
@@ -193,6 +206,7 @@ namespace workspace_search
 		bool case_sensitive = false;
 		bool whole_word = false;
 		bool use_regex = false;
+		std::mutex results_mtx;
 		std::vector<match_result_t> results = {
 			{ "C:/Preview/ReverseEngineering/src/unpacker.cpp", "unpacker.cpp", 184, 8, 22, "if (!VirtualProtect(region, size, PAGE_EXECUTE_READWRITE, &old_protect))" },
 			{ "C:/Preview/ReverseEngineering/src/anti_debug.cpp", "anti_debug.cpp", 71, 14, 28, "resolve_api(\"VirtualProtect\");" },

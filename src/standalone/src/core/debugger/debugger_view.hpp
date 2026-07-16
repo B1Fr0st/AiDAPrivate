@@ -3,8 +3,27 @@
 #include <cstdint>
 #include <string>
 #include "transition.hpp"
+#include "debugger_interaction_context.hpp"
 
 namespace debugger_view {
+
+enum class execution_command_t : std::uint8_t {
+	launch,
+	run_continue,
+	pause,
+	step_over,
+	step_into,
+	step_out,
+	stop,
+	restart,
+	detach,
+	toggle_breakpoint_at_instruction_pointer
+};
+
+struct execution_capability_t {
+	bool enabled = false;
+	const char* disabled_reason = nullptr;
+};
 
 enum class sub_tab_t : int {
 	cpu = 0,
@@ -108,12 +127,14 @@ struct ui_state_t {
 	char     add_bookmark_buf[24] = {};
 	char     add_bookmark_label_buf[64] = {};
 	char     trace_filter_buf[96] = {};
+	bool     trace_freeze_display = false;
 
 	list_panel_state_t cpu_panel;
 	float    cpu_scroll_y = 0.f;
 	int      cpu_edit_reg_idx = -1;
 	char     cpu_edit_value_buf[24] = {};
 	bool     cpu_edit_popup_open = false;
+	debugger_interaction::context_t cpu_edit_context;
 
 	uint64_t cpu_prev_reg_values[32] = {};
 	float    cpu_reg_flash[32] = {};
@@ -123,15 +144,6 @@ struct ui_state_t {
 	int      cpu_stack_selected = -1;
 	int      cpu_disasm_selected = -1;
 	uint64_t cpu_disasm_anchor_rip = 0;
-	int      cpu_context_reg_idx = -1;
-	bool     cpu_context_open = false;
-	int      cpu_stack_context_idx = -1;
-	bool     cpu_stack_context_open = false;
-	int      cpu_disasm_context_idx = -1;
-	bool     cpu_disasm_context_open = false;
-	uint64_t cpu_disasm_context_target = 0;
-	uint64_t cpu_disasm_context_addr = 0;
-
 	int      bp_edit_idx = -1;
 	char     bp_edit_condition_buf[160] = {};
 	char     bp_edit_log_buf[160] = {};
@@ -143,14 +155,21 @@ struct ui_state_t {
 	std::string handle_close_type;
 	std::string handle_close_name;
 	bool     handle_close_popup_open = false;
+	debugger_interaction::context_t handle_close_context;
 
 	int      thread_kill_idx = -1;
 	uint32_t thread_kill_tid = 0;
 	bool     thread_kill_popup_open = false;
+	debugger_interaction::context_t thread_kill_context;
 
 	uint64_t cfg_last_built_addr = 0;
 
 	bool     seh_break_request_active = false;
+	bool     patch_stage_open = false;
+	std::uint64_t patch_stage_address = 0;
+	std::uint64_t patch_stage_extent = 0;
+	char     patch_stage_bytes_buf[12288] = {};
+	char     patch_stage_description_buf[256] = {};
 };
 
 inline ui_state_t g_ui;
@@ -160,5 +179,44 @@ int visible_sub_tab_count();
 
 void render(float pos_x, float pos_y, float width, float height,
 			float alpha, float accent_r, float accent_g, float accent_b);
+
+void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b,
+	bool show_execution_controls = false, bool show_status = false);
+void render_execution_controls(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+execution_capability_t execution_capability(execution_command_t command);
+bool execute_command(execution_command_t command, std::string* error = nullptr);
+bool stage_patch_review(std::uint64_t address, std::uint64_t extent,
+	const std::string& description, std::string* error = nullptr);
+
+void render_cpu_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_breakpoints_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_memory_map_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_call_stack_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_threads_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_watches_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_handles_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_trace_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_strings_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_bookmarks_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_modules_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_patches_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_seh_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_cfg_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
 
 }

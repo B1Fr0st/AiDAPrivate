@@ -4,8 +4,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -13,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -264,6 +267,12 @@ struct preview_job_t {
     bool cancel_hook_invoked = false;
 };
 
+struct preview_work_item_t {
+    std::uint64_t id = 0;
+    executor_domain_t domain = executor_domain_t::general;
+    task_descriptor_t descriptor;
+};
+
 inline std::atomic<std::uint64_t> g_next_job_id{0};
 inline std::atomic<std::uint64_t> g_total_submitted{0};
 inline std::atomic<std::uint64_t> g_total_rejected{0};
@@ -272,8 +281,22 @@ inline std::atomic<std::uint64_t> g_total_failed{0};
 inline std::atomic<std::uint64_t> g_total_timed_out{0};
 inline std::atomic<bool> g_stop_accepting{false};
 inline std::atomic<bool> g_shutdown_requested{false};
-inline std::mutex g_jobs_mutex;
-inline std::map<std::uint64_t, preview_job_t> g_jobs;
+inline std::atomic<bool> g_shutdown_completed{false};
+inline std::atomic<bool> g_shutdown_in_progress{false};
+inline std::mutex& g_jobs_mutex = *new std::mutex;
+inline std::condition_variable& g_jobs_cv = *new std::condition_variable;
+inline std::map<std::uint64_t, preview_job_t>& g_jobs =
+    *new std::map<std::uint64_t, preview_job_t>;
+inline std::mutex& g_workers_mutex = *new std::mutex;
+inline std::condition_variable& g_workers_cv = *new std::condition_variable;
+inline std::condition_variable& g_workers_stopped_cv = *new std::condition_variable;
+inline std::deque<preview_work_item_t>& g_work_queue = *new std::deque<preview_work_item_t>;
+inline std::vector<std::thread>& g_workers = *new std::vector<std::thread>;
+inline bool g_workers_started = false;
+inline bool g_workers_stop = false;
+inline std::size_t g_live_workers = 0;
+inline thread_local bool g_preview_worker_thread = false;
+inline constexpr std::size_t kPreviewWorkerCount = 4;
 
 inline const char* domain_name(executor_domain_t domain) {
     switch (domain) {
@@ -317,7 +340,8 @@ inline int general_pool_size() { return 1; }
 inline int service_pool_size() { return 1; }
 
 inline pool_t& domain_pool(executor_domain_t domain) {
-    static std::array<pool_t, executor_domain_count> pools{{
+    static std::array<pool_t, executor_domain_count>& pools =
+        *new std::array<pool_t, executor_domain_count>{{
         {"runtime.general", "taskflow_runtime", "runtime.general", pool_family_t::general, 1},
         {"runtime.service", "taskflow_runtime", "runtime.service", pool_family_t::service, 1},
         {"runtime.critical", "taskflow_runtime", "runtime.critical", pool_family_t::critical, 1},
@@ -332,15 +356,26 @@ inline pool_t& domain_pool(executor_domain_t domain) {
     return pools[index < pools.size() ? index : 0];
 }
 
+inline void ensure_preview_workers();
+
 inline void initialize() {
-    g_stop_accepting.store(false);
-    g_shutdown_requested.store(false);
+    if (g_shutdown_requested.load(std::memory_order_acquire)
+        || g_shutdown_completed.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard<std::mutex> lock(g_workers_mutex);
+        if (g_workers_started && g_workers_stop) return;
+        if (g_shutdown_requested.load(std::memory_order_acquire)
+            || g_shutdown_completed.load(std::memory_order_acquire)) return;
+    }
+    g_stop_accepting.store(false, std::memory_order_release);
+    g_shutdown_requested.store(false, std::memory_order_release);
     for (std::size_t index = 0; index < executor_domain_count; ++index) {
         auto& pool = domain_pool(static_cast<executor_domain_t>(index));
         pool.alive.store(true);
         pool.shutting_down.store(false);
         pool.stop_accepting.store(false);
     }
+    ensure_preview_workers();
 }
 
 inline bool preview_terminal_state(job_state_t state) {
@@ -365,6 +400,134 @@ inline void preview_invoke_cancel_hook(std::function<void()>& hook) noexcept {
     try {
         hook();
     } catch (...) {
+    }
+}
+
+inline void preview_execute_job(preview_work_item_t item) noexcept {
+    auto& pool = domain_pool(item.domain);
+    pool.pending_tasks.fetch_sub(1);
+    pool.started_tasks.fetch_add(1);
+    pool.active_tasks.fetch_add(1);
+    std::shared_ptr<cancellation_token_t> cancellation;
+    {
+        std::lock_guard<std::mutex> lock(g_jobs_mutex);
+        const auto found = g_jobs.find(item.id);
+        if (found == g_jobs.end()) {
+            pool.active_tasks.fetch_sub(1);
+            pool.finished_tasks.fetch_add(1);
+            return;
+        }
+        found->second.snapshot.state = job_state_t::running;
+        found->second.snapshot.started_ms = preview_now_ms();
+        found->second.snapshot.started_ns = preview_now_ns();
+        cancellation = found->second.cancellation;
+    }
+
+    job_state_t final_state = job_state_t::completed;
+    std::string exception_text;
+    try {
+        if (item.descriptor.deadline_ms != 0 && preview_now_ms() >= item.descriptor.deadline_ms) {
+            std::lock_guard<std::mutex> lock(g_jobs_mutex);
+            const auto found = g_jobs.find(item.id);
+            if (found != g_jobs.end()) {
+                found->second.timed_out_requested = true;
+                found->second.cancellation->requested.store(true, std::memory_order_release);
+            }
+        }
+        if (item.descriptor.cancellable_body) {
+            item.descriptor.cancellable_body(*cancellation);
+        } else if (!cancellation->requested.load(std::memory_order_acquire)) {
+            item.descriptor.body();
+        }
+    } catch (const std::exception& exception) {
+        final_state = job_state_t::failed;
+        exception_text = exception.what();
+    } catch (...) {
+        final_state = job_state_t::failed;
+        exception_text = "preview_task_exception";
+    }
+
+    std::function<void()> timeout_hook;
+    {
+        std::lock_guard<std::mutex> lock(g_jobs_mutex);
+        const auto found = g_jobs.find(item.id);
+        if (found != g_jobs.end()) {
+            if (final_state != job_state_t::failed) {
+                if (found->second.timed_out_requested
+                    || (item.descriptor.deadline_ms != 0
+                        && preview_now_ms() >= item.descriptor.deadline_ms)) {
+                    final_state = job_state_t::timed_out;
+                    found->second.timed_out_requested = true;
+                    found->second.cancellation->requested.store(true, std::memory_order_release);
+                    if (!found->second.cancel_hook_invoked && found->second.cancel_hook) {
+                        found->second.cancel_hook_invoked = true;
+                        timeout_hook = std::move(found->second.cancel_hook);
+                    }
+                } else if (found->second.cancellation->requested.load(std::memory_order_acquire)) {
+                    final_state = job_state_t::cancelled;
+                }
+            }
+            found->second.snapshot.state = final_state;
+            found->second.snapshot.finished_ms = preview_now_ms();
+            found->second.snapshot.exception_text = std::move(exception_text);
+            found->second.snapshot.cancellation_requested =
+                found->second.cancellation->requested.load(std::memory_order_acquire);
+        }
+    }
+    preview_invoke_cancel_hook(timeout_hook);
+    g_jobs_cv.notify_all();
+    pool.active_tasks.fetch_sub(1);
+    pool.finished_tasks.fetch_add(1);
+    if (final_state == job_state_t::cancelled) {
+        pool.cancelled_tasks.fetch_add(1);
+        g_total_cancelled.fetch_add(1);
+    } else if (final_state == job_state_t::failed) {
+        pool.failed_tasks.fetch_add(1);
+        g_total_failed.fetch_add(1);
+    } else if (final_state == job_state_t::timed_out) {
+        pool.timed_out_tasks.fetch_add(1);
+        g_total_timed_out.fetch_add(1);
+    }
+}
+
+inline void preview_worker_loop() noexcept {
+    g_preview_worker_thread = true;
+    for (;;) {
+        preview_work_item_t item;
+        {
+            std::unique_lock<std::mutex> lock(g_workers_mutex);
+            g_workers_cv.wait(lock, []() { return g_workers_stop || !g_work_queue.empty(); });
+            if (g_workers_stop && g_work_queue.empty()) break;
+            item = std::move(g_work_queue.front());
+            g_work_queue.pop_front();
+        }
+        preview_execute_job(std::move(item));
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_workers_mutex);
+        if (g_live_workers != 0) --g_live_workers;
+    }
+    g_preview_worker_thread = false;
+    g_workers_stopped_cv.notify_all();
+}
+
+inline void ensure_preview_workers() {
+    std::lock_guard<std::mutex> lock(g_workers_mutex);
+    if (g_workers_started || g_shutdown_requested.load(std::memory_order_acquire)) return;
+    g_workers_stop = false;
+    g_workers_started = true;
+    g_live_workers = 0;
+    try {
+        for (std::size_t index = 0; index < kPreviewWorkerCount; ++index) {
+            g_workers.emplace_back([]() { preview_worker_loop(); });
+            ++g_live_workers;
+        }
+    } catch (...) {
+        g_workers_stop = true;
+        g_stop_accepting.store(true, std::memory_order_release);
+        g_shutdown_requested.store(true, std::memory_order_release);
+        g_workers_cv.notify_all();
+        throw;
     }
 }
 
@@ -411,83 +574,45 @@ inline submit_result_t preview_submit(task_descriptor_t&& descriptor, bool graph
     job.snapshot.node_count = node_count;
     job.cancellation = std::make_shared<cancellation_token_t>();
     job.cancel_hook = std::move(descriptor.cancel_hook);
-    {
-        std::lock_guard<std::mutex> lock(g_jobs_mutex);
-        preview_prune_jobs_locked();
-        auto inserted = g_jobs.emplace(id, std::move(job));
-        inserted.first->second.snapshot.state = job_state_t::running;
-        inserted.first->second.snapshot.started_ms = preview_now_ms();
-        inserted.first->second.snapshot.started_ns = preview_now_ns();
-    }
-
-    pool.posted_tasks.fetch_add(1);
-    pool.started_tasks.fetch_add(1);
-    pool.active_tasks.fetch_add(1);
-    g_total_submitted.fetch_add(1);
-    job_state_t final_state = job_state_t::completed;
-    std::string exception_text;
-    std::shared_ptr<cancellation_token_t> cancellation;
-    {
-        std::lock_guard<std::mutex> lock(g_jobs_mutex);
-        cancellation = g_jobs.at(id).cancellation;
-    }
     try {
-        if (descriptor.deadline_ms != 0 && preview_now_ms() >= descriptor.deadline_ms) {
-            std::lock_guard<std::mutex> lock(g_jobs_mutex);
-            auto& stored = g_jobs.at(id);
-            stored.timed_out_requested = true;
-            stored.cancellation->requested.store(true);
+        ensure_preview_workers();
+        {
+            std::lock_guard<std::mutex> jobs_lock(g_jobs_mutex);
+            preview_prune_jobs_locked();
+            g_jobs.emplace(id, std::move(job));
         }
-        if (descriptor.cancellable_body)
-            descriptor.cancellable_body(*cancellation);
-        else if (!cancellation->requested.load())
-            descriptor.body();
-    } catch (const std::exception& exception) {
-        final_state = job_state_t::failed;
-        exception_text = exception.what();
-    } catch (...) {
-        final_state = job_state_t::failed;
-        exception_text = "Unknown preview task failure";
-    }
-
-    std::function<void()> timeout_hook;
-    {
-        std::lock_guard<std::mutex> lock(g_jobs_mutex);
-        auto found = g_jobs.find(id);
-        if (found != g_jobs.end()) {
-            if (final_state != job_state_t::failed) {
-                if (found->second.timed_out_requested ||
-                    (descriptor.deadline_ms != 0 && preview_now_ms() >= descriptor.deadline_ms)) {
-                    final_state = job_state_t::timed_out;
-                    found->second.timed_out_requested = true;
-                    found->second.cancellation->requested.store(true);
-                    if (!found->second.cancel_hook_invoked && found->second.cancel_hook) {
-                        found->second.cancel_hook_invoked = true;
-                        timeout_hook = found->second.cancel_hook;
-                    }
-                } else if (found->second.cancellation->requested.load()) {
-                    final_state = job_state_t::cancelled;
+        bool shutdown_rejected = false;
+        {
+            std::lock_guard<std::mutex> workers_lock(g_workers_mutex);
+            if (g_workers_stop || g_shutdown_requested.load(std::memory_order_acquire)) {
+                shutdown_rejected = true;
+            } else {
+                pool.pending_tasks.fetch_add(1, std::memory_order_acq_rel);
+                try {
+                    g_work_queue.push_back(preview_work_item_t{id, descriptor.domain, std::move(descriptor)});
+                } catch (...) {
+                    pool.pending_tasks.fetch_sub(1, std::memory_order_acq_rel);
+                    throw;
                 }
             }
-            found->second.snapshot.state = final_state;
-            found->second.snapshot.finished_ms = preview_now_ms();
-            found->second.snapshot.exception_text = std::move(exception_text);
-            found->second.snapshot.cancellation_requested = found->second.cancellation->requested.load();
         }
+        if (shutdown_rejected) {
+            std::lock_guard<std::mutex> jobs_lock(g_jobs_mutex);
+            g_jobs.erase(id);
+            pool.rejected_tasks.fetch_add(1);
+            g_total_rejected.fetch_add(1);
+            return {false, {}, "preview_runtime_shutdown"};
+        }
+    } catch (...) {
+        std::lock_guard<std::mutex> jobs_lock(g_jobs_mutex);
+        g_jobs.erase(id);
+        pool.rejected_tasks.fetch_add(1);
+        g_total_rejected.fetch_add(1);
+        return {false, {}, "preview_runtime_allocation_failed"};
     }
-    preview_invoke_cancel_hook(timeout_hook);
-    pool.active_tasks.fetch_sub(1);
-    pool.finished_tasks.fetch_add(1);
-    if (final_state == job_state_t::cancelled) {
-        pool.cancelled_tasks.fetch_add(1);
-        g_total_cancelled.fetch_add(1);
-    } else if (final_state == job_state_t::failed) {
-        pool.failed_tasks.fetch_add(1);
-        g_total_failed.fetch_add(1);
-    } else if (final_state == job_state_t::timed_out) {
-        pool.timed_out_tasks.fetch_add(1);
-        g_total_timed_out.fetch_add(1);
-    }
+    pool.posted_tasks.fetch_add(1);
+    g_total_submitted.fetch_add(1);
+    g_workers_cv.notify_one();
     return {true, {id}, {}};
 }
 
@@ -613,8 +738,8 @@ inline bool cancel(job_handle_t handle) {
         found->second.cancellation->requested.store(true);
         found->second.snapshot.cancellation_requested = true;
         if (!found->second.cancel_hook_invoked) {
-            cancel_hook = found->second.cancel_hook;
             found->second.cancel_hook_invoked = true;
+            cancel_hook = std::move(found->second.cancel_hook);
         }
     }
     preview_invoke_cancel_hook(cancel_hook);
@@ -629,12 +754,21 @@ inline bool cooperative_cancel_requested(job_handle_t handle) {
     return found != g_jobs.end() && found->second.cancellation->requested.load();
 }
 
-inline wait_result_t wait_for(job_handle_t handle, std::uint32_t) {
+inline wait_result_t wait_for(job_handle_t handle, std::uint32_t timeout_ms) {
     if (!handle.valid())
         return {true, false, false, false, false};
-    std::lock_guard<std::mutex> lock(g_jobs_mutex);
-    const auto found = g_jobs.find(handle.id);
+    std::unique_lock<std::mutex> lock(g_jobs_mutex);
+    auto found = g_jobs.find(handle.id);
     if (found == g_jobs.end()) return {true, false, false, false, false};
+    if (!preview_terminal_state(found->second.snapshot.state)) {
+        const bool terminal = g_jobs_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&]() {
+            const auto current = g_jobs.find(handle.id);
+            return current == g_jobs.end() || preview_terminal_state(current->second.snapshot.state);
+        });
+        if (!terminal) return {false, true, false, false, false};
+        found = g_jobs.find(handle.id);
+        if (found == g_jobs.end()) return {true, false, false, false, false};
+    }
     const auto state = found->second.snapshot.state;
     return {
         state == job_state_t::completed,
@@ -651,7 +785,6 @@ inline wait_result_t wait_for(std::uint64_t job_id, std::uint32_t timeout_ms) {
 
 inline void check_deadlines() {
     const auto current = preview_now_ms();
-    std::vector<std::function<void()>> cancel_hooks;
     {
         std::lock_guard<std::mutex> lock(g_jobs_mutex);
         for (auto& entry : g_jobs) {
@@ -662,14 +795,24 @@ inline void check_deadlines() {
             job.timed_out_requested = true;
             job.cancellation->requested.store(true);
             job.snapshot.cancellation_requested = true;
-            if (!job.cancel_hook_invoked && job.cancel_hook) {
-                job.cancel_hook_invoked = true;
-                cancel_hooks.push_back(job.cancel_hook);
-            }
         }
     }
-    for (auto& hook : cancel_hooks)
-        preview_invoke_cancel_hook(hook);
+    for (;;) {
+        std::function<void()> cancel_hook;
+        {
+            std::lock_guard<std::mutex> lock(g_jobs_mutex);
+            for (auto& entry : g_jobs) {
+                auto& job = entry.second;
+                if (!job.timed_out_requested || job.cancel_hook_invoked || !job.cancel_hook)
+                    continue;
+                job.cancel_hook_invoked = true;
+                cancel_hook = std::move(job.cancel_hook);
+                break;
+            }
+        }
+        if (!cancel_hook) break;
+        preview_invoke_cancel_hook(cancel_hook);
+    }
 }
 
 inline stats_t stats_for(pool_t& pool, int pool_size, const char*) {
@@ -775,15 +918,75 @@ inline std::string snapshot_json_string() {
         ",\"total_active\":" + std::to_string(snapshot.total_active) + "}";
 }
 
-inline void shutdown(std::uint32_t = 15000) {
-    g_stop_accepting.store(true);
-    g_shutdown_requested.store(true);
+inline bool shutdown(std::uint32_t timeout_ms = 15000) {
+    if (g_shutdown_completed.load(std::memory_order_acquire)) return true;
+    bool expected_progress = false;
+    if (!g_shutdown_in_progress.compare_exchange_strong(expected_progress, true,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    struct shutdown_progress_guard_t {
+        ~shutdown_progress_guard_t() noexcept {
+            g_shutdown_in_progress.store(false, std::memory_order_release);
+        }
+    } progress_guard;
+    g_stop_accepting.store(true, std::memory_order_release);
+    g_shutdown_requested.store(true, std::memory_order_release);
     for (std::size_t index = 0; index < executor_domain_count; ++index) {
         auto& pool = domain_pool(static_cast<executor_domain_t>(index));
-        pool.stop_accepting.store(true);
-        pool.shutting_down.store(true);
-        pool.alive.store(false);
+        pool.stop_accepting.store(true, std::memory_order_release);
+        pool.shutting_down.store(true, std::memory_order_release);
     }
+
+    {
+        std::lock_guard<std::mutex> lock(g_jobs_mutex);
+        for (auto& entry : g_jobs) {
+            auto& job = entry.second;
+            if (preview_terminal_state(job.snapshot.state)) continue;
+            job.cancellation->requested.store(true, std::memory_order_release);
+            job.snapshot.cancellation_requested = true;
+        }
+    }
+    for (;;) {
+        std::function<void()> cancel_hook;
+        {
+            std::lock_guard<std::mutex> lock(g_jobs_mutex);
+            for (auto& entry : g_jobs) {
+                auto& job = entry.second;
+                if (!job.cancellation->requested.load(std::memory_order_acquire)
+                    || job.cancel_hook_invoked || !job.cancel_hook) continue;
+                job.cancel_hook_invoked = true;
+                cancel_hook = std::move(job.cancel_hook);
+                break;
+            }
+        }
+        if (!cancel_hook) break;
+        preview_invoke_cancel_hook(cancel_hook);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_workers_mutex);
+        g_workers_stop = true;
+    }
+    g_workers_cv.notify_all();
+    if (g_preview_worker_thread) return false;
+
+    std::vector<std::thread> joined_workers;
+    {
+        std::unique_lock<std::mutex> lock(g_workers_mutex);
+        const bool stopped = g_workers_stopped_cv.wait_for(lock,
+            std::chrono::milliseconds(timeout_ms), []() { return g_live_workers == 0; });
+        if (!stopped) return false;
+        joined_workers.swap(g_workers);
+        g_workers_started = false;
+    }
+    for (auto& worker : joined_workers) {
+        if (worker.joinable()) worker.join();
+    }
+    for (std::size_t index = 0; index < executor_domain_count; ++index) {
+        auto& pool = domain_pool(static_cast<executor_domain_t>(index));
+        pool.alive.store(false, std::memory_order_release);
+    }
+    g_shutdown_completed.store(true, std::memory_order_release);
+    return true;
 }
 
 }

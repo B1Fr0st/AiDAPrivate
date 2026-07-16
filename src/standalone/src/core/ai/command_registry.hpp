@@ -22,13 +22,19 @@ namespace commands {
 	struct command_t
 	{
 		std::string                                                                            name;
+		std::string                                                                            display_name;
 		std::string                                                                            description;
+		std::string                                                                            category;
+		std::string                                                                            shortcut;
+		std::string                                                                            application_action_id;
+		std::string                                                                            disabled_reason;
 		command_source_t                                                                       source = command_source_t::builtin;
 		std::string                                                                            template_text;
 		std::vector<std::string>                                                               placeholder_hints;
 		std::optional<std::string>                                                             agent_override;
 		std::optional<std::string>                                                             model_override;
 		bool                                                                                   subtask = false;
+		bool                                                                                   enabled = true;
 		std::string                                                                            source_path;
 		std::function<bool(const std::vector<std::string>& args, std::string& out_text)>       resolver;
 	};

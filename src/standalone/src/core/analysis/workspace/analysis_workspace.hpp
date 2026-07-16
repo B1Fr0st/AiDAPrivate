@@ -136,8 +136,6 @@ private:
 
 struct workspace_view_state_t {
     std::optional<address_t> selection;
-    std::vector<address_t> navigation_back;
-    std::vector<address_t> navigation_forward;
     std::vector<address_t> bookmarks;
     std::uint64_t revision = 0;
 };

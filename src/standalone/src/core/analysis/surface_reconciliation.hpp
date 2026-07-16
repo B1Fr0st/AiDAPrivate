@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -49,6 +51,13 @@ enum class surface_entry_kind_t : std::uint8_t {
     test_harness = 9
 };
 
+enum class surface_finding_semantic_t : std::uint8_t {
+    ordinary = 0,
+    finding_capacity = 1,
+    metrics_saturation = 2,
+    auxiliary_security_incomplete = 3
+};
+
 struct surface_entry_t final {
     std::string identifier;
     std::string canonical_path;
@@ -63,6 +72,7 @@ struct surface_entry_t final {
 struct surface_finding_t final {
     surface_error_code_t code = surface_error_code_t::none;
     std::string_view stable_code;
+    surface_finding_semantic_t semantic = surface_finding_semantic_t::ordinary;
     std::string identifier;
     std::string detail;
     std::string canonical_path;
@@ -138,10 +148,55 @@ public:
 private:
     struct marker_target_proof_t;
 
+    enum class auxiliary_marker_collection_t : std::uint8_t {
+        dead_replaced_paths = 0,
+        duplicate_stores = 1,
+        stale_registrations = 2,
+        old_schema_v8_writers = 3,
+        legacy_ast_flows = 4,
+        unsupported_aliases = 5,
+        security_regressions = 6
+    };
+
+    struct auxiliary_value_less_t final {
+        using is_transparent = void;
+
+        bool operator()(const std::string& left,
+                        const std::string& right) const noexcept {
+            return left < right;
+        }
+
+        bool operator()(const std::string& left,
+                        std::string_view right) const noexcept {
+            return std::string_view(left.data(), left.size()) < right;
+        }
+
+        bool operator()(std::string_view left,
+                        const std::string& right) const noexcept {
+            return left < std::string_view(right.data(), right.size());
+        }
+    };
+
+    struct auxiliary_marker_history_t final {
+        std::string canonical_value;
+        std::set<std::string, auxiliary_value_less_t> distinct_values;
+
+        bool conflicting() const noexcept {
+            return distinct_values.size() > 1;
+        }
+    };
+
+    struct auxiliary_marker_observation_t final {
+        const auxiliary_marker_history_t* state = nullptr;
+        bool conflict_started = false;
+    };
+
     surface_finding_t make_finding(
         surface_error_code_t code, std::string_view identifier,
         std::string detail, std::string canonical_path,
-        surface_entry_kind_t kind, std::uint64_t severity) const;
+        surface_entry_kind_t kind, std::uint64_t severity,
+        surface_finding_semantic_t semantic =
+            surface_finding_semantic_t::ordinary) const;
 
     bool valid_identifier(std::string_view value) const noexcept;
     bool valid_path(std::string_view value) const noexcept;
@@ -150,9 +205,19 @@ private:
     void record_invalid_entry(bool baseline, const surface_entry_t& entry,
         std::string_view reason);
     void record_invalid_marker(std::string_view collection,
-        std::string_view identifier, std::string_view reason);
-    bool reserve_auxiliary_marker(std::string_view collection,
-        std::string_view identifier, bool security_priority);
+        std::string_view identifier, std::string_view reason) noexcept;
+    auxiliary_marker_observation_t observe_auxiliary_marker(
+        auxiliary_marker_collection_t collection,
+        std::string_view identifier, std::string_view value) noexcept;
+    void enter_auxiliary_history_incomplete() noexcept;
+    void admit_auxiliary_marker() noexcept;
+    bool retained_auxiliary_marker(
+        auxiliary_marker_collection_t collection,
+        const std::string& identifier) const noexcept;
+    std::uint64_t auxiliary_capacity_rejections(bool& saturated) const noexcept;
+    std::string_view auxiliary_overflow_collection() const noexcept;
+    static std::string_view auxiliary_collection_name(
+        auxiliary_marker_collection_t collection) noexcept;
     void append_finding(surface_reconciliation_result_t& result,
         surface_finding_t finding) const;
     void append_input_contract_findings(surface_reconciliation_result_t& result) const;
@@ -189,7 +254,10 @@ private:
     std::unordered_map<std::string, std::pair<std::string, bool>> old_schema_v8_writers_;
     std::unordered_set<std::string> legacy_ast_flows_;
     std::unordered_map<std::string, std::pair<std::string, bool>> unsupported_aliases_;
-    std::unordered_map<std::string, std::pair<std::string, bool>> security_regressions_;
+    std::unordered_set<std::string> security_regressions_;
+    std::map<
+        std::pair<auxiliary_marker_collection_t, std::string>,
+        auxiliary_marker_history_t> auxiliary_marker_history_;
 
     std::uint64_t attempted_baseline_entries_ = 0;
     std::uint64_t attempted_actual_entries_ = 0;
@@ -200,17 +268,19 @@ private:
     std::uint64_t malformed_entries_ = 0;
     std::uint64_t malformed_markers_ = 0;
     std::size_t auxiliary_marker_count_ = 0;
+    std::size_t auxiliary_history_value_count_ = 0;
     bool baseline_cap_exceeded_ = false;
     bool actual_cap_exceeded_ = false;
     bool auxiliary_cap_exceeded_ = false;
     bool auxiliary_capacity_incomplete_ = false;
+    bool auxiliary_history_incomplete_ = false;
+    bool security_marker_observed_ = false;
     std::string first_invalid_entry_identifier_;
     std::string_view first_invalid_entry_reason_;
     bool first_invalid_entry_is_baseline_ = true;
     std::string first_invalid_marker_identifier_;
     std::string_view first_invalid_marker_collection_;
     std::string_view first_invalid_marker_reason_;
-    std::string_view first_auxiliary_overflow_collection_;
 
     mutable std::atomic_uint64_t reconciliations_{0};
     mutable std::atomic_uint64_t total_findings_{0};

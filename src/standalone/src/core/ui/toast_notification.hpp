@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cmath>
+#include <array>
 
 namespace toast_notification
 {
@@ -281,7 +282,8 @@ namespace toast_notification
 
     inline void render()
     {
-        std::vector<std::function<void()>> deferred_callbacks;
+        std::array<std::function<void()>, MAX_VISIBLE * 2> deferred_callbacks;
+        std::size_t deferred_callback_count = 0;
 
         {
         std::lock_guard<std::mutex> lk(detail::s_mtx);
@@ -314,10 +316,9 @@ namespace toast_notification
         const bool mouse_released = ImGui::IsMouseReleased(0);
 
         std::size_t visible_index = 0;
-        std::vector<float> stack_target_y;
-        std::vector<float> stack_height;
-        stack_target_y.reserve(detail::s_toasts.size());
-        stack_height.reserve(detail::s_toasts.size());
+        std::array<float, MAX_VISIBLE * 2> stack_target_y{};
+        std::array<float, MAX_VISIBLE * 2> stack_height{};
+        std::size_t stack_count = 0;
 
         auto compute_action_btn_w = [&](const toast_t& t) -> float {
             if (!t.has_action) return 0.0f;
@@ -326,10 +327,11 @@ namespace toast_notification
         };
 
         for (auto it = detail::s_toasts.rbegin(); it != detail::s_toasts.rend(); ++it) {
+            if (stack_count >= stack_target_y.size()) break;
             auto& t = *it;
             if (t.dismissing && t.fade_out <= 0.001f) {
-                stack_target_y.push_back(0.0f);
-                stack_height.push_back(0.0f);
+                stack_target_y[stack_count] = 0.0f;
+                stack_height[stack_count++] = 0.0f;
                 continue;
             }
 
@@ -338,32 +340,27 @@ namespace toast_notification
             if (content_w < 80.0f) content_w = 80.0f;
 
             float h = detail::compute_toast_height(t, font_msg, font_size_msg, content_w);
-            stack_height.push_back(h);
+            stack_height[stack_count] = h;
 
             if (visible_index >= MAX_VISIBLE) {
-                stack_target_y.push_back(display.y);
+                stack_target_y[stack_count++] = display.y;
                 continue;
             }
 
             float ty = display.y - BOTTOM_MARGIN - h;
             for (std::size_t p = 0; p < visible_index; ++p) {
                 const std::size_t stack_offset = p + 2;
-                if (stack_offset > stack_height.size()) break;
-                const std::size_t idx_above = stack_height.size() - stack_offset;
+                if (stack_offset > stack_count + 1) break;
+                const std::size_t idx_above = stack_count + 1 - stack_offset;
                 ty -= stack_height[idx_above] + GAP;
             }
-            stack_target_y.push_back(ty);
+            stack_target_y[stack_count++] = ty;
             ++visible_index;
         }
 
-        std::vector<std::size_t> render_order;
-        render_order.reserve(detail::s_toasts.size());
-        for (std::size_t i = 0; i < detail::s_toasts.size(); ++i)
-            render_order.push_back(i);
-
-        for (std::size_t order_i = 0; order_i < render_order.size(); ++order_i) {
-            std::size_t i = render_order[order_i];
+        for (std::size_t i = 0; i < detail::s_toasts.size(); ++i) {
             auto& t = detail::s_toasts[i];
+            const bool reduced_motion = aida::ui::reduced_motion_enabled();
 
             std::size_t reverse_i = detail::s_toasts.size() - 1 - i;
             float target_y = stack_target_y[reverse_i];
@@ -376,7 +373,7 @@ namespace toast_notification
             float resting_x = display.x - SIDE_MARGIN - TOAST_WIDTH;
 
             if (!t.initialized_position) {
-                t.current_x = display.x + 12.0f;
+                t.current_x = reduced_motion ? resting_x : display.x + 12.0f;
                 t.current_y = target_y;
                 t.target_x = resting_x;
                 t.target_y = target_y;
@@ -388,7 +385,9 @@ namespace toast_notification
             t.target_y = target_y;
 
             if (!t.dismissing && !t.swipe_dismissing) {
-                if (t.intro_progress < 1.0f) {
+                if (reduced_motion) {
+                    t.intro_progress = 1.0f;
+                } else if (t.intro_progress < 1.0f) {
                     t.intro_progress += dt / SLIDE_DURATION;
                     if (t.intro_progress > 1.0f) t.intro_progress = 1.0f;
                 }
@@ -402,9 +401,9 @@ namespace toast_notification
                               mouse.y >= toast_tl_pre.y && mouse.y <= toast_br_pre.y;
 
             float hover_target = is_hovered ? 1.0f : 0.0f;
-            t.hover_amount = aida::motion::spring_step(t.hover_amount, hover_target,
-                                                        t.hover_velocity,
-                                                        aida::motion::spring::balanced, dt);
+            t.hover_amount = reduced_motion ? hover_target :
+                aida::motion::spring_step(t.hover_amount, hover_target,
+                    t.hover_velocity, aida::motion::spring::balanced, dt);
             if (t.hover_amount < 0.0f) t.hover_amount = 0.0f;
             if (t.hover_amount > 1.0f) t.hover_amount = 1.0f;
 
@@ -478,19 +477,20 @@ namespace toast_notification
                 }
             }
             else if (t.dismissing) {
-                t.fade_out -= dt / FADE_OUT_TAIL;
+                t.fade_out = reduced_motion ? 0.0f : t.fade_out - dt / FADE_OUT_TAIL;
                 if (t.fade_out < 0.0f) t.fade_out = 0.0f;
             }
 
             if (!t.swipe_dismissing) {
-                t.current_x = aida::motion::spring_step(t.current_x, t.target_x,
-                                                         t.velocity_x,
-                                                         aida::motion::spring::playful, dt);
+                t.current_x = reduced_motion ? t.target_x :
+                    aida::motion::spring_step(t.current_x, t.target_x,
+                        t.velocity_x, aida::motion::spring::playful, dt);
             } else {
                 t.current_x = t.target_x + t.swipe_offset;
             }
-            t.current_y = aida::motion::critically_damped_step(t.current_y, t.target_y,
-                                                                t.velocity_y, 0.090f, dt);
+            t.current_y = reduced_motion ? t.target_y :
+                aida::motion::critically_damped_step(t.current_y, t.target_y,
+                    t.velocity_y, 0.090f, dt);
 
             float live_x = t.current_x + (t.swipe_dismissing ? 0.0f : t.swipe_offset);
             ImVec2 tl(live_x, t.current_y);
@@ -634,7 +634,8 @@ namespace toast_notification
 
         for (auto& t : detail::s_toasts) {
             if (t.action_clicked_this_frame && t.action.on_click) {
-                deferred_callbacks.push_back(std::move(t.action.on_click));
+                if (deferred_callback_count < deferred_callbacks.size())
+                    deferred_callbacks[deferred_callback_count++] = std::move(t.action.on_click);
                 t.action.on_click = nullptr;
                 t.action_clicked_this_frame = false;
                 t.dismissing = true;
@@ -652,8 +653,7 @@ namespace toast_notification
             detail::s_toasts.end());
         }
 
-        for (auto& cb : deferred_callbacks) {
-            if (cb) cb();
-        }
+        for (std::size_t i = 0; i < deferred_callback_count; ++i)
+            if (deferred_callbacks[i]) deferred_callbacks[i]();
     }
 }

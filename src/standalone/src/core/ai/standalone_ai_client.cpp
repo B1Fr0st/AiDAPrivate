@@ -22,7 +22,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <ctime>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <cstdio>
@@ -30,16 +37,230 @@
 #include <thread>
 #include <chrono>
 #include <utility>
+#include <vector>
 
 using json = nlohmann::json;
 
 extern mcp_client::manager_t s_mcp_client_mgr;
 
+struct standalone_ai_client_t::runtime_operation_t
+{
+    enum class terminal_t : uint8_t
+    {
+        running,
+        completed,
+        cancelled,
+        timed_out
+    };
+
+    uint64_t generation = 0;
+    std::chrono::steady_clock::time_point deadline;
+    std::atomic<terminal_t> terminal{terminal_t::running};
+    mutable std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+
+    bool request_cancel() noexcept
+    {
+        terminal_t expected = terminal_t::running;
+        const bool changed = terminal.compare_exchange_strong(
+            expected, terminal_t::cancelled,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        if (changed)
+            wait_cv.notify_all();
+        return changed;
+    }
+
+    bool request_timeout() noexcept
+    {
+        terminal_t expected = terminal_t::running;
+        const bool changed = terminal.compare_exchange_strong(
+            expected, terminal_t::timed_out,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        if (changed)
+            wait_cv.notify_all();
+        return changed;
+    }
+
+    bool stop_requested() noexcept
+    {
+        terminal_t state = terminal.load(std::memory_order_acquire);
+        if (state != terminal_t::running)
+            return true;
+        if (std::chrono::steady_clock::now() < deadline)
+            return false;
+        terminal_t expected = terminal_t::running;
+        if (terminal.compare_exchange_strong(
+                expected, terminal_t::timed_out,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            wait_cv.notify_all();
+        }
+        return true;
+    }
+
+    bool claim_completed() noexcept
+    {
+        terminal_t expected = terminal_t::running;
+        const bool changed = terminal.compare_exchange_strong(
+            expected, terminal_t::completed,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        if (changed)
+            wait_cv.notify_all();
+        return changed;
+    }
+
+    terminal_t state() const noexcept
+    {
+        return terminal.load(std::memory_order_acquire);
+    }
+
+    int remaining_seconds() noexcept
+    {
+        if (stop_requested())
+            return 0;
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+        return static_cast<int>((std::max<int64_t>)(1, (millis + 999) / 1000));
+    }
+
+    bool wait_for_stop(std::chrono::milliseconds delay) noexcept
+    {
+        if (stop_requested())
+            return true;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        const auto bounded = (std::min)(delay, remaining);
+        std::unique_lock<std::mutex> lock(wait_mutex);
+        wait_cv.wait_for(lock, bounded, [this]() noexcept {
+            return terminal.load(std::memory_order_acquire) != terminal_t::running;
+        });
+        return stop_requested();
+    }
+};
+
+struct standalone_ai_client_t::runtime_control_t
+{
+    static constexpr size_t max_active_operations = 8;
+
+    std::mutex mutex;
+    std::condition_variable quiescent_cv;
+    std::map<uint64_t, std::shared_ptr<runtime_operation_t>> active;
+    uint64_t next_generation = 1;
+    bool generation_exhausted = false;
+    bool shutdown = false;
+
+    std::shared_ptr<runtime_operation_t> acquire(
+        std::chrono::steady_clock::time_point deadline,
+        std::string& error) noexcept
+    {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (shutdown) {
+                error = "Error: AI client is shutting down.";
+                return nullptr;
+            }
+            if (generation_exhausted) {
+                error = "Error: AI request generation space exhausted.";
+                return nullptr;
+            }
+            if (active.size() >= max_active_operations) {
+                error = "Error: Too many concurrent AI requests.";
+                return nullptr;
+            }
+
+            const uint64_t generation = next_generation;
+            if (next_generation == (std::numeric_limits<uint64_t>::max)())
+                generation_exhausted = true;
+            else
+                ++next_generation;
+
+            auto operation = std::make_shared<runtime_operation_t>();
+            operation->generation = generation;
+            operation->deadline = deadline;
+            active.emplace(generation, operation);
+            return operation;
+        } catch (...) {
+            error = "Error: Unable to allocate AI request state.";
+            return nullptr;
+        }
+    }
+
+    void release(uint64_t generation) noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        active.erase(generation);
+        if (active.empty())
+            quiescent_cv.notify_all();
+    }
+
+    void cancel_active() noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto& entry : active)
+            entry.second->request_cancel();
+    }
+
+    void shutdown_and_wait(std::chrono::milliseconds timeout) noexcept
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        shutdown = true;
+        for (const auto& entry : active)
+            entry.second->request_cancel();
+        quiescent_cv.wait_for(lock, timeout, [this]() noexcept {
+            return active.empty();
+        });
+    }
+
+    bool busy() const noexcept
+    {
+        auto& self = const_cast<runtime_control_t&>(*this);
+        std::lock_guard<std::mutex> lock(self.mutex);
+        return !self.active.empty();
+    }
+};
+
+struct standalone_ai_client_t::async_state_t
+{
+    struct pending_result_t
+    {
+        ai_callback_t callback;
+        std::string text;
+    };
+
+    struct pending_chunk_t
+    {
+        ai_stream_chunk_t callback;
+        std::string text;
+    };
+
+    std::mutex mutex;
+    std::deque<pending_result_t> results;
+    std::deque<pending_chunk_t> chunks;
+    std::atomic<bool> accepting{true};
+};
+
+struct standalone_ai_client_t::usage_record_t
+{
+    std::string model;
+    int64_t input_tokens = 0;
+    int64_t output_tokens = 0;
+    int64_t cache_read = 0;
+    int64_t cache_write = 0;
+    int64_t thinking_tokens = 0;
+};
+
 namespace {
 
 constexpr int64_t k_oauth_refresh_safety_margin_sec = 30;
-
-std::string s_last_error;
+#if defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
+constexpr int k_ai_chat_stream_timeout_sec = 5;
+constexpr int k_ai_chat_post_timeout_sec = 2;
+constexpr int k_ai_retry_base_delay_ms = 20;
+#else
+constexpr int k_ai_chat_stream_timeout_sec = 300;
+constexpr int k_ai_chat_post_timeout_sec = 60;
+constexpr int k_ai_retry_base_delay_ms = 2000;
+#endif
+constexpr const char* k_ai_user_agent = "AiDAStandalone/1.0";
 
 nlohmann::json compact_tool_parameters()
 {
@@ -58,8 +279,16 @@ const char* oauth_store_key_for_profile_kind(const std::string& kind)
     return "";
 }
 
-bool refresh_oauth_if_needed(const std::string& store_key)
+bool refresh_oauth_if_needed(
+    const std::string& store_key,
+    const aida::auth::http::cancel_cb_t& cancelled,
+    int timeout_sec,
+    std::string& error)
 {
+    if ((cancelled && cancelled()) || timeout_sec <= 0) {
+        error = "Operation cancelled or timed out before OAuth refresh.";
+        return false;
+    }
     if (store_key.empty())
         return true;
 
@@ -83,26 +312,35 @@ bool refresh_oauth_if_needed(const std::string& store_key)
 
     bool ok = false;
     if (store_key == "anthropic") {
-        ok = aida::auth::claude_code::refresh_token();
+        ok = aida::auth::claude_code::refresh_token(cancelled, timeout_sec);
         if (!ok)
-            s_last_error = std::string("Anthropic OAuth refresh failed: ") + aida::auth::claude_code::last_error();
+            error = std::string("Anthropic OAuth refresh failed: ") + aida::auth::claude_code::last_error();
     } else if (store_key == "openai") {
-        ok = aida::auth::codex::refresh_token();
+        ok = aida::auth::codex::refresh_token(cancelled, timeout_sec);
         if (!ok)
-            s_last_error = std::string("Codex OAuth refresh failed: ") + aida::auth::codex::last_error();
+            error = std::string("Codex OAuth refresh failed: ") + aida::auth::codex::last_error();
     } else if (store_key == "github-copilot") {
-        ok = aida::auth::copilot::refresh_token();
+        ok = aida::auth::copilot::refresh_token(cancelled, timeout_sec);
         if (!ok)
-            s_last_error = std::string("Copilot token refresh failed: ") + aida::auth::copilot::last_error();
+            error = std::string("Copilot token refresh failed: ") + aida::auth::copilot::last_error();
     } else {
         return true;
+    }
+    if (ok && cancelled && cancelled()) {
+        error = "Operation cancelled during OAuth refresh.";
+        return false;
     }
     return ok;
 }
 
-bool refresh_active_provider_oauth(const std::string& profile_kind)
+bool refresh_active_provider_oauth(
+    const std::string& profile_kind,
+    const aida::auth::http::cancel_cb_t& cancelled,
+    int timeout_sec,
+    std::string& error)
 {
-    return refresh_oauth_if_needed(oauth_store_key_for_profile_kind(profile_kind));
+    return refresh_oauth_if_needed(
+        oauth_store_key_for_profile_kind(profile_kind), cancelled, timeout_sec, error);
 }
 
 aida::provider::transforms::request_context_t build_request_context(const nlohmann::json* request_body)
@@ -135,39 +373,147 @@ void apply_oauth_headers(std::map<std::string, std::string>& headers,
         headers[k] = v;
 }
 
+class ai_operation_lease_t
+{
+public:
+    ai_operation_lease_t(
+        std::shared_ptr<standalone_ai_client_t::runtime_control_t> control,
+        std::shared_ptr<standalone_ai_client_t::runtime_operation_t> operation) noexcept
+        : _control(std::move(control)), _operation(std::move(operation))
+    {
+    }
+
+    ~ai_operation_lease_t()
+    {
+        if (_operation) {
+            _operation->request_cancel();
+            if (_control)
+                _control->release(_operation->generation);
+        }
+    }
+
+    ai_operation_lease_t(const ai_operation_lease_t&) = delete;
+    ai_operation_lease_t& operator=(const ai_operation_lease_t&) = delete;
+
+    const std::shared_ptr<standalone_ai_client_t::runtime_operation_t>& operation() const noexcept
+    {
+        return _operation;
+    }
+
+private:
+    std::shared_ptr<standalone_ai_client_t::runtime_control_t> _control;
+    std::shared_ptr<standalone_ai_client_t::runtime_operation_t> _operation;
+};
+
+std::string operation_stop_error(
+    const std::shared_ptr<standalone_ai_client_t::runtime_operation_t>& operation)
+{
+    if (!operation)
+        return "Error: AI request state unavailable.";
+    operation->stop_requested();
+    switch (operation->state()) {
+    case standalone_ai_client_t::runtime_operation_t::terminal_t::cancelled:
+        return "Error: Operation cancelled.";
+    case standalone_ai_client_t::runtime_operation_t::terminal_t::timed_out:
+        return "Error: Operation timed out.";
+    default:
+        return {};
+    }
+}
+
+aida::auth::http::cancel_cb_t operation_cancel_callback(
+    const std::shared_ptr<standalone_ai_client_t::runtime_operation_t>& operation)
+{
+    return [operation]() noexcept {
+        return !operation || operation->stop_requested();
+    };
+}
+
+bool has_non_whitespace(const std::string& value)
+{
+    return std::any_of(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c) == 0;
+    });
+}
+
+bool is_error_result(const std::string& value)
+{
+    return value.rfind("Error:", 0) == 0;
+}
+
+void commit_usage(const standalone_ai_client_t::usage_record_t& usage)
+{
+    cost_tracking::accumulate(
+        usage.model,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read,
+        usage.cache_write,
+        usage.thinking_tokens);
+}
+
 }
 
 
 standalone_ai_client_t::standalone_ai_client_t(const settings_sa_t& settings)
-    : _settings(settings)
+    : _settings_source(&settings),
+      _control(std::make_shared<runtime_control_t>()),
+      _async(std::make_shared<async_state_t>())
 {
 }
 
-standalone_ai_client_t::~standalone_ai_client_t()
+standalone_ai_client_t::~standalone_ai_client_t() noexcept
 {
-    cancel();
-    std::lock_guard<std::mutex> lk(_worker_mtx);
-    while (!_task_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (_async)
+        _async->accepting.store(false, std::memory_order_release);
+    if (_control)
+        _control->shutdown_and_wait(std::chrono::seconds(5));
 }
 
+standalone_ai_client_t::cancellation_handle_t::cancellation_handle_t(
+    std::weak_ptr<runtime_control_t> control) noexcept
+    : _control(std::move(control))
+{
+}
+
+void standalone_ai_client_t::cancellation_handle_t::cancel() const noexcept
+{
+    if (auto control = _control.lock())
+        control->cancel_active();
+}
+
+bool standalone_ai_client_t::cancellation_handle_t::valid() const noexcept
+{
+    return !_control.expired();
+}
 
 bool standalone_ai_client_t::is_available() const
 {
-    const auto model = _settings.get_active_model();
+    if (!_settings_source)
+        return false;
+    try {
+        return is_available(_settings_source->ai_runtime_snapshot());
+    } catch (...) {
+        return false;
+    }
+}
+
+bool standalone_ai_client_t::is_available(const settings_sa_t& settings)
+{
+    const auto model = settings.get_active_model();
     if (model.empty())
         return false;
 
-    const auto kind = _settings.get_active_profile_kind();
+    const auto kind = settings.get_active_profile_kind();
     if (kind == "local" || kind == "ollama" || kind == "lmstudio" || kind == "litellm")
-        return !_settings.resolve_active_base_url().empty();
+        return !settings.resolve_active_base_url().empty();
 
     // For providers that require an API key, check resolve_active_api_key first.
     if (kind == "gemini" || kind == "google" || kind == "anthropic" || kind == "openrouter"
         || kind == "deepseek" || kind == "mistral" || kind == "xai" || kind == "fireworks"
         || kind == "sambanova" || kind == "moonshot" || kind == "minimax" || kind == "qwen_code"
         || kind == "baseten" || kind == "zai") {
-        if (!_settings.resolve_active_api_key().empty())
+        if (!settings.resolve_active_api_key().empty())
             return true;
     }
 
@@ -187,7 +533,7 @@ bool standalone_ai_client_t::is_available() const
     }
 
     // Also check the auth store using the raw selected_provider_id (e.g. "google" from catalog).
-    const std::string raw_pid = _settings.selected_provider_id();
+    const std::string raw_pid = settings.selected_provider_id();
     if (!raw_pid.empty() && raw_pid != store_key) {
         aida::auth::auth_info_t info;
         if (aida::auth::store::get(raw_pid, info)) {
@@ -201,18 +547,20 @@ bool standalone_ai_client_t::is_available() const
     }
 
     // Fallback: if there's a base URL configured, allow it (for custom/unknown providers).
-    return !_settings.resolve_active_base_url().empty();
+    return !settings.resolve_active_base_url().empty();
 }
 
 
-std::string standalone_ai_client_t::resolve_api_key_logged(const char* context) const
+std::string standalone_ai_client_t::resolve_api_key_logged(
+    const settings_sa_t& settings,
+    const char* context)
 {
     bool from_store = false;
-    std::string key = _settings.resolve_active_api_key(from_store);
+    std::string key = settings.resolve_active_api_key(from_store);
     diag::log_tagged_fmt("ai",
         "resolve_api_key context=%.40s provider=%.40s source=%s present=%d",
         context ? context : "",
-        _settings.selected_provider_id().c_str(),
+        settings.selected_provider_id().c_str(),
         from_store ? "auth-store" : "profile",
         key.empty() ? 0 : 1);
     return key;
@@ -225,20 +573,31 @@ void standalone_ai_client_t::chat_async(
     ai_callback_t on_complete,
     ai_stream_chunk_t on_chunk)
 {
-    if (!is_available()) {
+    settings_sa_t settings;
+    try {
+        settings = _settings_source->ai_runtime_snapshot();
+    } catch (...) {
+        if (on_complete)
+            on_complete("Error: Unable to snapshot AI settings.");
+        return;
+    }
+
+    if (!is_available(settings)) {
         if (on_complete)
             on_complete("Error: AI client not configured. Set your API key in Settings.");
         return;
     }
 
 
+#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
     if (!standalone_license::is_valid()) {
         if (on_complete)
             on_complete("Error: Service unavailable. Please restart the application.");
         return;
     }
+#endif
 
-
+#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_ai_chat_async);
@@ -250,16 +609,20 @@ void standalone_ai_client_t::chat_async(
             return;
         }
     }
-
-    std::lock_guard<std::mutex> lk(_worker_mtx);
-    while (!_task_done.load(std::memory_order_acquire))
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-
-    _cancelled = false;
-    _task_done = false;
+#endif
 
     auto prompt = build_chat_prompt(user_message, history);
-
+    std::string acquire_error;
+    auto operation = _control->acquire(
+        std::chrono::steady_clock::now() + std::chrono::seconds(k_ai_chat_stream_timeout_sec),
+        acquire_error);
+    if (!operation) {
+        if (on_complete)
+            on_complete(acquire_error);
+        return;
+    }
+    auto lease = std::make_shared<ai_operation_lease_t>(_control, operation);
+    const auto async = _async;
 
     aida::infra::executor::submission_t sub;
     sub.owner_subsystem = "ai_client";
@@ -267,35 +630,51 @@ void standalone_ai_client_t::chat_async(
     sub.thread_class = "bounded_task";
     sub.domain = aida::infra::executor::domain_t::external_tool;
     sub.priority = 3;
-    sub.body = [this, prompt, on_complete, on_chunk]() {
+    sub.body = [lease, operation, settings = std::move(settings), prompt, on_complete, on_chunk, async]() mutable {
         std::string result;
+        usage_record_t usage;
         try {
-
-
             ai_stream_chunk_t threadsafe_chunk = nullptr;
             if (on_chunk) {
-                threadsafe_chunk = [this, on_chunk](const std::string& chunk) {
-                    std::lock_guard<std::mutex> ck(_chunk_mtx);
-                    _chunks.push_back({on_chunk, chunk});
+                threadsafe_chunk = [operation, async, on_chunk](const std::string& chunk) {
+                    if (!async->accepting.load(std::memory_order_acquire) || operation->stop_requested())
+                        return;
+                    std::lock_guard<std::mutex> lock(async->mutex);
+                    if (async->accepting.load(std::memory_order_acquire) && !operation->stop_requested())
+                        async->chunks.push_back({on_chunk, chunk});
                 };
             }
 
-            result = do_generate(prompt, _settings.temperature, threadsafe_chunk, nullptr);
+            result = do_generate(
+                operation, settings, prompt, settings.temperature,
+                threadsafe_chunk, nullptr, usage);
         } catch (const std::exception& e) {
             result = std::string("Error: ") + e.what();
         } catch (...) {
             result = "Error: Unknown exception in AI worker thread.";
         }
 
-        _task_done = true;
-
-        std::lock_guard<std::mutex> rl(_result_mtx);
-        _results.push_back({on_complete, std::move(result)});
+        const bool completed = operation->claim_completed();
+        if (completed && !is_error_result(result))
+            commit_usage(usage);
+        if (!completed) {
+            const auto terminal_error = operation_stop_error(operation);
+            result = terminal_error.empty() ? "Error: AI request did not complete." : terminal_error;
+        }
+        if (async->accepting.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(async->mutex);
+            if (async->accepting.load(std::memory_order_acquire))
+                async->results.push_back({on_complete, std::move(result)});
+        }
     };
+    std::lock_guard<std::mutex> submit_lock(_async_submit_mutex);
     if (!aida::infra::executor::submit(std::move(sub)).submitted) {
-        _task_done = true;
-        std::lock_guard<std::mutex> rl(_result_mtx);
-        _results.push_back({on_complete, "Error: Service unavailable. Please restart the application."});
+        operation->claim_completed();
+        if (async->accepting.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(async->mutex);
+            if (async->accepting.load(std::memory_order_acquire))
+                async->results.push_back({on_complete, "Error: Service unavailable. Please restart the application."});
+        }
     }
 }
 
@@ -306,17 +685,26 @@ std::string standalone_ai_client_t::chat_blocking(
     ai_stream_chunk_t on_chunk,
     ai_stop_predicate_t stop_check)
 {
-    if (!is_available())
+    settings_sa_t settings;
+    try {
+        settings = _settings_source->ai_runtime_snapshot();
+    } catch (...) {
+        return "Error: Unable to snapshot AI settings.";
+    }
+
+    if (!is_available(settings))
         return "Error: AI client not configured.";
 
 
+#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
     if (standalone_license::inline_proof_check_b() == 0) {
 
         std::this_thread::sleep_for(std::chrono::milliseconds(800 + (GetTickCount64() % 400)));
         return "Error: Internal model routing failure. Please retry.";
     }
+#endif
 
-
+#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
     {
         uint64_t gt = standalone_license::inline_gate_check(
             standalone_license::gate_ai_stream_cb);
@@ -326,9 +714,34 @@ std::string standalone_ai_client_t::chat_blocking(
                 standalone_license::str_model_routing);
         }
     }
+#endif
 
-    auto prompt = build_chat_prompt(user_message, history);
-    return do_generate(prompt, _settings.temperature, on_chunk, stop_check);
+    std::string acquire_error;
+    auto operation = _control->acquire(
+        std::chrono::steady_clock::now() + std::chrono::seconds(k_ai_chat_stream_timeout_sec),
+        acquire_error);
+    if (!operation)
+        return acquire_error;
+    ai_operation_lease_t lease(_control, operation);
+
+    usage_record_t usage;
+    std::string result;
+    try {
+        result = do_generate(
+            operation, settings, build_chat_prompt(user_message, history),
+            settings.temperature, on_chunk, stop_check, usage);
+    } catch (const std::exception& e) {
+        result = std::string("Error: ") + e.what();
+    } catch (...) {
+        result = "Error: Unknown exception in AI request.";
+    }
+    if (!operation->claim_completed()) {
+        const auto terminal_error = operation_stop_error(operation);
+        return terminal_error.empty() ? "Error: AI request did not complete." : terminal_error;
+    }
+    if (!is_error_result(result))
+        commit_usage(usage);
+    return result;
 }
 
 
@@ -336,41 +749,59 @@ bool standalone_ai_client_t::poll()
 {
     bool dispatched = false;
 
-
+    std::deque<async_state_t::pending_chunk_t> chunks;
+    std::deque<async_state_t::pending_result_t> results;
     {
-        std::lock_guard<std::mutex> ck(_chunk_mtx);
-        for (auto& [cb, text] : _chunks) {
-            if (cb) cb(text);
-            dispatched = true;
-        }
-        _chunks.clear();
+        std::lock_guard<std::mutex> lock(_async->mutex);
+        chunks.swap(_async->chunks);
+        results.swap(_async->results);
     }
 
-
-    {
-        std::lock_guard<std::mutex> rl(_result_mtx);
-        for (auto& [cb, text] : _results) {
-            if (cb) cb(text);
-            dispatched = true;
+    for (auto& pending : chunks) {
+        if (!pending.callback)
+            continue;
+        try {
+            pending.callback(pending.text);
+        } catch (...) {
+            diag::log_tagged("ai", "stream callback failed");
         }
-        _results.clear();
+        dispatched = true;
+    }
+
+    for (auto& pending : results) {
+        if (!pending.callback)
+            continue;
+        try {
+            pending.callback(pending.text);
+        } catch (...) {
+            diag::log_tagged("ai", "completion callback failed");
+        }
+        dispatched = true;
     }
 
     return dispatched;
 }
 
 
-void standalone_ai_client_t::cancel()
+void standalone_ai_client_t::cancel() noexcept
 {
-    _cancelled = true;
+    if (_control)
+        _control->cancel_active();
+}
+
+standalone_ai_client_t::cancellation_handle_t
+standalone_ai_client_t::cancellation_handle() const noexcept
+{
+    return cancellation_handle_t(_control);
+}
+
+bool standalone_ai_client_t::is_busy() const noexcept
+{
+    return _control && _control->busy();
 }
 
 
 namespace {
-
-constexpr int k_ai_chat_stream_timeout_sec = 300;
-constexpr int k_ai_chat_post_timeout_sec = 60;
-constexpr const char* k_ai_user_agent = "AiDAStandalone/1.0";
 
 std::string join_host_path(const std::string& host, const std::string& path)
 {
@@ -422,31 +853,39 @@ std::string sanitize_transport_error(const std::string& provider,
 
 
 std::string standalone_ai_client_t::do_generate(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const std::string& prompt,
     double temperature,
     ai_stream_chunk_t on_chunk,
-    ai_stop_predicate_t stop_check)
+    ai_stop_predicate_t stop_check,
+    usage_record_t& usage)
 {
-
+    if (const auto error = operation_stop_error(operation); !error.empty())
+        return error;
+#if !defined(AIDA_C03_STANDALONE_AI_CANCEL_FIXTURE)
     if (!standalone_license::inline_proof_check_c()) {
         return "Error: API endpoint unreachable. Check your network connection.";
     }
+#endif
 
-    const auto provider = _settings.get_active_profile_kind();
+    const auto provider = settings.get_active_profile_kind();
     diag::log_tagged_fmt("chat",
         "do_generate_dispatch provider=%.40s",
         provider.c_str());
     if (provider == "gemini" || provider == "google" || provider == "vertex")
-        return generate_gemini(prompt, temperature, on_chunk, stop_check);
-    if (provider == "anthropic")   return generate_anthropic(prompt, temperature, on_chunk, stop_check);
-    if (provider == "openrouter")  return generate_openrouter(prompt, temperature, on_chunk, stop_check);
+        return generate_gemini(operation, settings, prompt, temperature, on_chunk, stop_check, usage);
+    if (provider == "anthropic")
+        return generate_anthropic(operation, settings, prompt, temperature, on_chunk, stop_check, usage);
+    if (provider == "openrouter")
+        return generate_openrouter(operation, settings, prompt, temperature, on_chunk, stop_check, usage);
 
-
-    return generate_openai(prompt, temperature, on_chunk, stop_check);
+    return generate_openai(operation, settings, prompt, temperature, on_chunk, stop_check, usage);
 }
 
 
 std::string standalone_ai_client_t::simple_post(
+    const std::shared_ptr<runtime_operation_t>& operation,
     const std::string& host,
     const std::string& path,
     const std::map<std::string, std::string>& headers,
@@ -454,24 +893,49 @@ std::string standalone_ai_client_t::simple_post(
     std::function<std::string(const json&)> response_parser)
 {
     constexpr int MAX_RETRIES = 3;
-    constexpr int BASE_DELAY_MS = 2000;
 
     const std::string url = join_host_path(host, path);
     auto hdrs = headers_map_to_list(headers, true);
+    const auto cancel_cb = operation_cancel_callback(operation);
+    const auto request_deadline = (std::min)(
+        operation->deadline,
+        std::chrono::steady_clock::now() + std::chrono::seconds(k_ai_chat_post_timeout_sec));
 
     for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
-        if (_cancelled) return "Error: Operation cancelled.";
+        if (const auto error = operation_stop_error(operation); !error.empty())
+            return error;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            request_deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            operation->request_timeout();
+            return "Error: Operation timed out.";
+        }
+        const int timeout_sec = static_cast<int>((std::max<int64_t>)(
+            1, (remaining.count() + 999) / 1000));
 
         aida::auth::http::response_t res = aida::auth::http::post(
             url, hdrs, body, std::string("application/json"),
-            k_ai_chat_post_timeout_sec);
+            timeout_sec, cancel_cb);
 
-        if (_cancelled) return "Error: Operation cancelled.";
+        if (const auto error = operation_stop_error(operation); !error.empty())
+            return error;
+        if (res.cancelled) {
+            operation->request_cancel();
+            return "Error: Operation cancelled.";
+        }
 
         if (!res.ok && res.status == 0) {
             if (attempt < MAX_RETRIES) {
-                int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), 30000);
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                int delay = (std::min)(k_ai_retry_base_delay_ms * (1 << attempt), 30000);
+                const auto retry_remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    request_deadline - std::chrono::steady_clock::now());
+                if (retry_remaining.count() <= 0) {
+                    operation->request_timeout();
+                    return "Error: Operation timed out.";
+                }
+                if (operation->wait_for_stop((std::min)(
+                        std::chrono::milliseconds(delay), retry_remaining)))
+                    return operation_stop_error(operation);
                 continue;
             }
             return std::string("Error: ")
@@ -479,14 +943,29 @@ std::string standalone_ai_client_t::simple_post(
         }
 
         if ((res.status == 429 || res.status == 503) && attempt < MAX_RETRIES) {
-            int delay = (std::min)(BASE_DELAY_MS * (1 << attempt), 30000);
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            int delay = (std::min)(k_ai_retry_base_delay_ms * (1 << attempt), 30000);
+            const auto retry_remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                request_deadline - std::chrono::steady_clock::now());
+            if (retry_remaining.count() <= 0) {
+                operation->request_timeout();
+                return "Error: Operation timed out.";
+            }
+            if (operation->wait_for_stop((std::min)(
+                    std::chrono::milliseconds(delay), retry_remaining)))
+                return operation_stop_error(operation);
             continue;
         }
 
         if (res.status < 200 || res.status >= 300)
             return "Error: API returned status " + std::to_string(res.status) +
                    ": " + res.body.substr(0, 600);
+
+        if (!res.ok || !res.complete || res.truncated) {
+            const std::string detail = res.error.empty()
+                ? "response body was incomplete"
+                : res.error;
+            return "Error: API response incomplete: " + detail;
+        }
 
         auto j = json::parse(res.body, nullptr, false);
         if (j.is_discarded())
@@ -499,6 +978,7 @@ std::string standalone_ai_client_t::simple_post(
 
 
 std::string standalone_ai_client_t::streaming_post(
+    const std::shared_ptr<runtime_operation_t>& operation,
     const std::string& host,
     const std::string& path,
     const std::map<std::string, std::string>& headers,
@@ -512,50 +992,78 @@ std::string standalone_ai_client_t::streaming_post(
 
     std::string accumulated;
     std::string sse_buffer;
+    bool callback_failed = false;
+    bool caller_stopped = false;
+    const auto cancel_cb = operation_cancel_callback(operation);
+
+    const int transport_timeout_sec = operation->remaining_seconds();
+    if (transport_timeout_sec <= 0)
+        return operation_stop_error(operation);
 
     auto chunk_cb = [&](const char* data, size_t len) -> bool {
-        if (_cancelled) return false;
+        if (operation->stop_requested())
+            return false;
 
-        sse_buffer.append(data, len);
+        try {
+            sse_buffer.append(data, len);
 
-        size_t pos = 0;
-        while (pos < sse_buffer.size()) {
-            auto nl = sse_buffer.find('\n', pos);
-            if (nl == std::string::npos) break;
+            size_t pos = 0;
+            while (pos < sse_buffer.size()) {
+                auto nl = sse_buffer.find('\n', pos);
+                if (nl == std::string::npos)
+                    break;
 
-            std::string line = sse_buffer.substr(pos, nl - pos);
-            pos = nl + 1;
+                std::string line = sse_buffer.substr(pos, nl - pos);
+                pos = nl + 1;
 
-            if (!line.empty() && line.back() == '\r')
-                line.pop_back();
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
 
-            if (line == "data: [DONE]" || line == "data:[DONE]")
-                continue;
+                if (line == "data: [DONE]" || line == "data:[DONE]")
+                    continue;
 
-            if (line.size() >= 5 && line.substr(0, 5) == "data:") {
-                std::string payload = (line.size() > 6 && line[5] == ' ')
-                    ? line.substr(6) : line.substr(5);
-                if (payload.empty()) continue;
+                if (line.size() >= 5 && line.substr(0, 5) == "data:") {
+                    std::string payload = (line.size() > 6 && line[5] == ' ')
+                        ? line.substr(6) : line.substr(5);
+                    if (payload.empty())
+                        continue;
 
-                std::string chunk_text = chunk_parser(payload);
-                if (!chunk_text.empty()) {
-                    accumulated += chunk_text;
-                    if (on_chunk) on_chunk(chunk_text);
-                    if (stop_check && stop_check(accumulated))
-                        return false;
+                    std::string chunk_text = chunk_parser(payload);
+                    if (!chunk_text.empty()) {
+                        accumulated += chunk_text;
+                        if (on_chunk)
+                            on_chunk(chunk_text);
+                        if (stop_check && stop_check(accumulated)) {
+                            caller_stopped = true;
+                            operation->request_cancel();
+                            return false;
+                        }
+                    }
                 }
             }
+            sse_buffer.erase(0, pos);
+            return true;
+        } catch (...) {
+            callback_failed = true;
+            operation->request_cancel();
+            return false;
         }
-        sse_buffer.erase(0, pos);
-        return true;
     };
 
     aida::auth::http::stream_result_t res = aida::auth::http::stream(
         "POST", url, hdrs, body, std::string("application/json"),
-        k_ai_chat_stream_timeout_sec, chunk_cb);
+        transport_timeout_sec, chunk_cb, cancel_cb);
 
-    if (_cancelled) return "Error: Operation cancelled.";
-    if (res.cancelled) return accumulated;
+    if (callback_failed)
+        return "Error: AI stream callback failed.";
+    if (caller_stopped)
+        return "Error: Operation cancelled by caller.";
+    if (const auto error = operation_stop_error(operation); !error.empty())
+        return error;
+    if (res.cancelled) {
+        operation->request_cancel();
+        return "Error: Operation cancelled.";
+    }
 
     if (!res.ok && res.status == 0) {
         return std::string("Error: ")
@@ -581,17 +1089,30 @@ std::string standalone_ai_client_t::streaming_post(
              + (err_detail.empty() ? "" : ": " + err_detail);
     }
 
+    if (!res.ok || !res.complete || res.truncated) {
+        const std::string detail = res.error.empty()
+            ? "stream ended before a complete response"
+            : res.error;
+        return "Error: API stream incomplete: " + detail;
+    }
+    if (has_non_whitespace(sse_buffer))
+        return "Error: API stream ended with an incomplete SSE frame.";
+
     return accumulated;
 }
 
 
 std::string standalone_ai_client_t::generate_gemini(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const std::string& prompt, double temperature,
-    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
+    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check,
+    usage_record_t& usage)
 {
-    std::string base_url = _settings.resolve_active_base_url();
-    std::string model = clean_model_name(_settings.get_active_model());
-    std::string api_key = resolve_api_key_logged("gemini");
+    std::string base_url = settings.resolve_active_base_url();
+    std::string model = clean_model_name(settings.get_active_model());
+    std::string api_key = resolve_api_key_logged(settings, "gemini");
+    usage.model = model;
 
 
     bool is_thinking_model = (model.find("2.5") != std::string::npos ||
@@ -610,9 +1131,9 @@ std::string standalone_ai_client_t::generate_gemini(
     };
 
 
-    if (is_thinking_model && _settings.enable_reasoning) {
+    if (is_thinking_model && settings.enable_reasoning) {
         body["generationConfig"]["thinkingConfig"] = {
-            {"thinkingBudget", (std::max)(_settings.reasoning_budget, 1024)}
+            {"thinkingBudget", (std::max)(settings.reasoning_budget, 1024)}
         };
     }
 
@@ -621,7 +1142,7 @@ std::string standalone_ai_client_t::generate_gemini(
         int64_t in_tokens = 0, out_tokens = 0;
 
         std::string path = "/v1beta/models/" + model + ":streamGenerateContent?alt=sse&key=" + api_key;
-        auto result = streaming_post(base_url, path, {}, body.dump(),
+        auto result = streaming_post(operation, base_url, path, {}, body.dump(),
             [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
@@ -652,29 +1173,35 @@ std::string standalone_ai_client_t::generate_gemini(
             }, on_chunk, stop_check);
 
 
-        cost_tracking::session_input_tokens += in_tokens;
-        cost_tracking::session_output_tokens += out_tokens;
-        cost_tracking::session_request_count++;
-        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-            model, in_tokens, out_tokens, 0, 0);
+        usage.input_tokens = in_tokens;
+        usage.output_tokens = out_tokens;
 
         return result;
     }
 
     std::string path = "/v1beta/models/" + model + ":generateContent?key=" + api_key;
-    return simple_post(base_url, path, {}, body.dump(),
-        [](const json& j) -> std::string {
+    return simple_post(operation, base_url, path, {}, body.dump(),
+        [&usage](const json& j) -> std::string {
+            if (j.contains("usageMetadata") && j["usageMetadata"].is_object()) {
+                const auto& metrics = j["usageMetadata"];
+                usage.input_tokens = metrics.value("promptTokenCount", int64_t{0});
+                usage.output_tokens = metrics.value("candidatesTokenCount", int64_t{0});
+            }
             return j["candidates"][0]["content"]["parts"][0]["text"].get<std::string>();
         });
 }
 
 
 std::string standalone_ai_client_t::generate_openai(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const std::string& prompt, double temperature,
-    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
+    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check,
+    usage_record_t& usage)
 {
-    std::string base_url = _settings.resolve_active_base_url();
-    std::string model = _settings.get_active_model();
+    std::string base_url = settings.resolve_active_base_url();
+    std::string model = settings.get_active_model();
+    usage.model = model;
 
 
     bool is_o_series = (model.find("o1") != std::string::npos ||
@@ -693,26 +1220,31 @@ std::string standalone_ai_client_t::generate_openai(
     if (is_o_series) {
 
         body["max_completion_tokens"] = 16384;
-        if (_settings.enable_reasoning && !_settings.reasoning_effort.empty()) {
-            body["reasoning_effort"] = _settings.reasoning_effort;
+        if (settings.enable_reasoning && !settings.reasoning_effort.empty()) {
+            body["reasoning_effort"] = settings.reasoning_effort;
         }
     } else {
         body["temperature"] = temperature;
         body["max_tokens"] = 16384;
     }
 
-    const std::string oai_kind = _settings.get_active_profile_kind();
+    const std::string oai_kind = settings.get_active_profile_kind();
     const std::string oai_store_key = oauth_store_key_for_profile_kind(oai_kind);
-    if (!refresh_oauth_if_needed(oai_store_key)) {
-        return std::string("Error: ") + s_last_error;
+    std::string oauth_error;
+    if (!refresh_oauth_if_needed(
+            oai_store_key, operation_cancel_callback(operation),
+            operation->remaining_seconds(), oauth_error)) {
+        if (const auto error = operation_stop_error(operation); !error.empty())
+            return error;
+        return std::string("Error: ") + oauth_error;
     }
 
     const bool oai_is_copilot = (oai_store_key == "github-copilot");
     std::string oai_path = "/v1/chat/completions";
 
-    std::map<std::string, std::string> headers = _settings.get_active_headers();
+    std::map<std::string, std::string> headers = settings.get_active_headers();
     {
-        const std::string resolved_key = resolve_api_key_logged("openai");
+        const std::string resolved_key = resolve_api_key_logged(settings, "openai");
         if (!resolved_key.empty())
             headers["Authorization"] = "Bearer " + resolved_key;
     }
@@ -721,7 +1253,7 @@ std::string standalone_ai_client_t::generate_openai(
     if (!oai_store_key.empty()) {
         std::string provider_id;
         if (oai_is_copilot)
-            provider_id = _settings.selected_provider_id();
+            provider_id = settings.selected_provider_id();
         else if (oai_kind == "openai_codex")
             provider_id = "openai-codex";
         else
@@ -754,7 +1286,7 @@ std::string standalone_ai_client_t::generate_openai(
         std::string thinking_text;
         int64_t in_tokens = 0, out_tokens = 0, cache_read = 0, cache_write = 0;
 
-        auto result = streaming_post(base_url, oai_path, headers, body.dump(),
+        auto result = streaming_post(operation, base_url, oai_path, headers, body.dump(),
             [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
@@ -768,6 +1300,8 @@ std::string standalone_ai_client_t::generate_openai(
                         if (u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object()) {
                             cache_read = u["prompt_tokens_details"].value("cached_tokens", (int64_t)0);
                         }
+                        if (u.contains("completion_tokens_details") && u["completion_tokens_details"].is_object())
+                            usage.thinking_tokens = u["completion_tokens_details"].value("reasoning_tokens", int64_t{0});
                     }
 
                     auto& choices = j["choices"];
@@ -790,26 +1324,35 @@ std::string standalone_ai_client_t::generate_openai(
             }, on_chunk, stop_check);
 
 
-        cost_tracking::session_input_tokens += in_tokens;
-        cost_tracking::session_output_tokens += out_tokens;
-        cost_tracking::session_cache_read += cache_read;
-        cost_tracking::session_request_count++;
-        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-            model, in_tokens, out_tokens, cache_read, 0);
+        usage.input_tokens = in_tokens;
+        usage.output_tokens = out_tokens;
+        usage.cache_read = cache_read;
 
         return result;
     }
 
-    return simple_post(base_url, oai_path, headers, body.dump(),
-        [](const json& j) -> std::string {
+    return simple_post(operation, base_url, oai_path, headers, body.dump(),
+        [&usage](const json& j) -> std::string {
+            if (j.contains("usage") && j["usage"].is_object()) {
+                const auto& metrics = j["usage"];
+                usage.input_tokens = metrics.value("prompt_tokens", int64_t{0});
+                usage.output_tokens = metrics.value("completion_tokens", int64_t{0});
+                if (metrics.contains("prompt_tokens_details") && metrics["prompt_tokens_details"].is_object())
+                    usage.cache_read = metrics["prompt_tokens_details"].value("cached_tokens", int64_t{0});
+                if (metrics.contains("completion_tokens_details") && metrics["completion_tokens_details"].is_object())
+                    usage.thinking_tokens = metrics["completion_tokens_details"].value("reasoning_tokens", int64_t{0});
+            }
             return j["choices"][0]["message"]["content"].get<std::string>();
         });
 }
 
 
 std::string standalone_ai_client_t::generate_anthropic(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const std::string& prompt, double temperature,
-    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
+    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check,
+    usage_record_t& usage)
 {
 
     {
@@ -822,8 +1365,8 @@ std::string standalone_ai_client_t::generate_anthropic(
         }
     }
 
-    std::string base_url = _settings.resolve_active_base_url();
-    std::string model = _settings.get_active_model();
+    std::string base_url = settings.resolve_active_base_url();
+    std::string model = settings.get_active_model();
 
     std::string clean_model = model;
     for (const char* suffix : {" (Max Effort)", " (High Effort)", " (Medium Effort)",
@@ -831,13 +1374,14 @@ std::string standalone_ai_client_t::generate_anthropic(
         auto pos = clean_model.find(suffix);
         if (pos != std::string::npos) { clean_model.erase(pos); break; }
     }
+    usage.model = clean_model;
 
 
     json system_block = {
         {"type", "text"},
         {"text", "You are AiDA, an advanced reverse engineering assistant. Be precise and technical."}
     };
-    if (_settings.prompt_caching) {
+    if (settings.prompt_caching) {
         system_block["cache_control"] = {{"type", "ephemeral"}};
     }
 
@@ -852,10 +1396,10 @@ std::string standalone_ai_client_t::generate_anthropic(
     };
 
 
-    if (_settings.enable_reasoning) {
+    if (settings.enable_reasoning) {
         json thinking_cfg = {
             {"type", "enabled"},
-            {"budget_tokens", (std::max)(_settings.reasoning_budget, 1024)}
+            {"budget_tokens", (std::max)(settings.reasoning_budget, 1024)}
         };
         body["thinking"] = thinking_cfg;
 
@@ -863,12 +1407,17 @@ std::string standalone_ai_client_t::generate_anthropic(
         body["temperature"] = temperature;
     }
 
-    if (!refresh_active_provider_oauth("anthropic")) {
-        return std::string("Error: ") + s_last_error;
+    std::string oauth_error;
+    if (!refresh_active_provider_oauth(
+            "anthropic", operation_cancel_callback(operation),
+            operation->remaining_seconds(), oauth_error)) {
+        if (const auto error = operation_stop_error(operation); !error.empty())
+            return error;
+        return std::string("Error: ") + oauth_error;
     }
 
-    std::map<std::string, std::string> headers = _settings.get_active_headers();
-    const std::string anthropic_api_key = resolve_api_key_logged("anthropic");
+    std::map<std::string, std::string> headers = settings.get_active_headers();
+    const std::string anthropic_api_key = resolve_api_key_logged(settings, "anthropic");
     if (!anthropic_api_key.empty())
         headers["x-api-key"] = anthropic_api_key;
     headers["anthropic-version"] = "2023-06-01";
@@ -884,7 +1433,7 @@ std::string standalone_ai_client_t::generate_anthropic(
         std::string thinking_text;
         int64_t in_tokens = 0, out_tokens = 0, cache_read = 0, cache_write = 0;
 
-        auto result = streaming_post(base_url, "/v1/messages", headers, body.dump(),
+        auto result = streaming_post(operation, base_url, "/v1/messages", headers, body.dump(),
             [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
                 if (j.is_discarded()) return "";
@@ -920,19 +1469,16 @@ std::string standalone_ai_client_t::generate_anthropic(
             }, on_chunk, stop_check);
 
 
-        cost_tracking::session_input_tokens += in_tokens;
-        cost_tracking::session_output_tokens += out_tokens;
-        cost_tracking::session_cache_read += cache_read;
-        cost_tracking::session_cache_write += cache_write;
-        cost_tracking::session_request_count++;
-        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-            clean_model, in_tokens, out_tokens, cache_read, cache_write);
+        usage.input_tokens = in_tokens;
+        usage.output_tokens = out_tokens;
+        usage.cache_read = cache_read;
+        usage.cache_write = cache_write;
 
         return result;
     }
 
 
-    return simple_post(base_url, "/v1/messages", headers, body.dump(),
+    return simple_post(operation, base_url, "/v1/messages", headers, body.dump(),
         [&](const json& j) -> std::string {
             std::string text;
             std::string thinking;
@@ -947,18 +1493,11 @@ std::string standalone_ai_client_t::generate_anthropic(
 
 
             if (j.contains("usage") && j["usage"].is_object()) {
-                auto& usage = j["usage"];
-                int64_t in_t = usage.value("input_tokens", (int64_t)0);
-                int64_t out_t = usage.value("output_tokens", (int64_t)0);
-                int64_t cr = usage.value("cache_read_input_tokens", (int64_t)0);
-                int64_t cw = usage.value("cache_creation_input_tokens", (int64_t)0);
-                cost_tracking::session_input_tokens += in_t;
-                cost_tracking::session_output_tokens += out_t;
-                cost_tracking::session_cache_read += cr;
-                cost_tracking::session_cache_write += cw;
-                cost_tracking::session_request_count++;
-                cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-                    clean_model, in_t, out_t, cr, cw);
+                const auto& metrics = j["usage"];
+                usage.input_tokens = metrics.value("input_tokens", int64_t{0});
+                usage.output_tokens = metrics.value("output_tokens", int64_t{0});
+                usage.cache_read = metrics.value("cache_read_input_tokens", int64_t{0});
+                usage.cache_write = metrics.value("cache_creation_input_tokens", int64_t{0});
             }
 
 
@@ -970,11 +1509,15 @@ std::string standalone_ai_client_t::generate_anthropic(
 
 
 std::string standalone_ai_client_t::generate_openrouter(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const std::string& prompt, double temperature,
-    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check)
+    ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check,
+    usage_record_t& usage)
 {
-    std::string model = _settings.get_active_model();
-    std::string base_url = _settings.resolve_active_base_url();
+    std::string model = settings.get_active_model();
+    std::string base_url = settings.resolve_active_base_url();
+    usage.model = model;
 
     json body = {
         {"model", model},
@@ -985,8 +1528,8 @@ std::string standalone_ai_client_t::generate_openrouter(
         {"stream", on_chunk != nullptr}
     };
 
-    std::map<std::string, std::string> headers = _settings.get_active_headers();
-    headers["Authorization"] = "Bearer " + resolve_api_key_logged("openrouter");
+    std::map<std::string, std::string> headers = settings.get_active_headers();
+    headers["Authorization"] = "Bearer " + resolve_api_key_logged(settings, "openrouter");
     headers["X-Title"] = "AiDA Standalone";
     headers["Content-Type"] = "application/json";
 
@@ -995,7 +1538,7 @@ std::string standalone_ai_client_t::generate_openrouter(
 
         int64_t in_tokens = 0, out_tokens = 0;
 
-        auto result = streaming_post(base_url, "/api/v1/chat/completions",
+        auto result = streaming_post(operation, base_url, "/api/v1/chat/completions",
             headers, body.dump(),
             [&](const std::string& sse_data) -> std::string {
                 auto j = json::parse(sse_data, nullptr, false);
@@ -1035,18 +1578,20 @@ std::string standalone_ai_client_t::generate_openrouter(
             }, on_chunk, stop_check);
 
 
-        cost_tracking::session_input_tokens += in_tokens;
-        cost_tracking::session_output_tokens += out_tokens;
-        cost_tracking::session_request_count++;
-        cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-            model, in_tokens, out_tokens, 0, 0);
+        usage.input_tokens = in_tokens;
+        usage.output_tokens = out_tokens;
 
         return result;
     }
 
-    return simple_post(base_url, "/api/v1/chat/completions",
+    return simple_post(operation, base_url, "/api/v1/chat/completions",
         headers, body.dump(),
-        [](const json& j) -> std::string {
+        [&usage](const json& j) -> std::string {
+            if (j.contains("usage") && j["usage"].is_object()) {
+                const auto& metrics = j["usage"];
+                usage.input_tokens = metrics.value("prompt_tokens", int64_t{0});
+                usage.output_tokens = metrics.value("completion_tokens", int64_t{0});
+            }
 
             auto& msg = j["choices"][0]["message"];
             std::string text = msg.value("content", "");
@@ -1525,6 +2070,14 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
     ai_stream_chunk_t on_chunk)
 {
     ai_generation_result_t result;
+    settings_sa_t settings;
+    try {
+        settings = _settings_source->ai_runtime_snapshot();
+    } catch (...) {
+        result.is_error = true;
+        result.text = "Error: Unable to snapshot AI settings.";
+        return result;
+    }
 
     {
         const uint64_t gt = standalone_license::inline_gate_check(
@@ -1542,41 +2095,74 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools(
         }
     }
 
-    const auto provider = _settings.get_active_profile_kind();
-    const auto raw_provider = _settings.selected_provider_id();
+    std::string acquire_error;
+    auto operation = _control->acquire(
+        std::chrono::steady_clock::now() + std::chrono::seconds(k_ai_chat_stream_timeout_sec),
+        acquire_error);
+    if (!operation) {
+        result.is_error = true;
+        result.text = acquire_error;
+        return result;
+    }
+    ai_operation_lease_t lease(_control, operation);
+    usage_record_t usage;
+
+    const auto provider = settings.get_active_profile_kind();
+    const auto raw_provider = settings.selected_provider_id();
     diag::log_tagged_fmt("chat",
         "generate_with_tools_enter provider=%.40s raw=%.40s tools=%zu msgs=%zu",
         provider.c_str(), raw_provider.c_str(),
         tools.size(), messages.is_array() ? messages.size() : 0);
 
 
-    if (provider == "anthropic") {
-        diag::log_tagged_fmt("chat", "generate_with_tools_path=anthropic");
-        return generate_with_tools_anthropic(messages, system_prompt, tools, on_chunk);
+    try {
+        if (provider == "anthropic") {
+            diag::log_tagged_fmt("chat", "generate_with_tools_path=anthropic");
+            result = generate_with_tools_anthropic(
+                operation, settings, messages, system_prompt, tools, on_chunk, usage);
+        } else if (provider == "gemini" || provider == "google" || provider == "vertex") {
+            diag::log_tagged_fmt("chat", "generate_with_tools_path=gemini");
+            result = generate_with_tools_gemini(
+                operation, settings, messages, system_prompt, tools, on_chunk, usage);
+        } else if (provider == "openai_native" || provider == "openai_codex") {
+            diag::log_tagged_fmt("chat", "generate_with_tools_path=openai_native");
+            result = generate_with_tools_openai(
+                operation, settings, messages, system_prompt, tools, on_chunk, usage);
+        } else {
+            diag::log_tagged_fmt("chat", "generate_with_tools_path=generic_openai provider=%.40s",
+                provider.c_str());
+            result = generate_with_tools_generic_openai(
+                operation, settings, messages, system_prompt, tools, on_chunk, usage);
+        }
+    } catch (const std::exception& e) {
+        result.is_error = true;
+        result.text = std::string("Error: ") + e.what();
+    } catch (...) {
+        result.is_error = true;
+        result.text = "Error: Unknown exception in AI tool request.";
     }
 
-    if (provider == "gemini" || provider == "google" || provider == "vertex") {
-        diag::log_tagged_fmt("chat", "generate_with_tools_path=gemini");
-        return generate_with_tools_gemini(messages, system_prompt, tools, on_chunk);
+    if (!operation->claim_completed()) {
+        result.is_error = true;
+        const auto terminal_error = operation_stop_error(operation);
+        result.text = terminal_error.empty() ? "Error: AI request did not complete." : terminal_error;
+        result.tool_calls.clear();
+        return result;
     }
-
-    if (provider == "openai_native" || provider == "openai_codex") {
-        diag::log_tagged_fmt("chat", "generate_with_tools_path=openai_native");
-        return generate_with_tools_openai(messages, system_prompt, tools, on_chunk);
-    }
-
-
-    diag::log_tagged_fmt("chat", "generate_with_tools_path=generic_openai provider=%.40s",
-        provider.c_str());
-    return generate_with_tools_generic_openai(messages, system_prompt, tools, on_chunk);
+    if (!result.is_error)
+        commit_usage(usage);
+    return result;
 }
 
 
 ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const nlohmann::json& messages,
     const std::string& system_prompt,
     const std::vector<mcp_standalone::tool_def_t>& tools,
-    ai_stream_chunk_t on_chunk)
+    ai_stream_chunk_t on_chunk,
+    usage_record_t& usage)
 {
     using json = nlohmann::json;
     ai_generation_result_t result;
@@ -1598,8 +2184,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
         }
     }
 
-    std::string base_url = _settings.resolve_active_base_url();
-    std::string model    = _settings.get_active_model();
+    std::string base_url = settings.resolve_active_base_url();
+    std::string model    = settings.get_active_model();
     diag::log_tagged_fmt("chat",
         "anthropic_enter base=%.80s model=%.80s tools=%zu",
         base_url.c_str(), model.c_str(), tools.size());
@@ -1611,13 +2197,14 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
         auto pos = clean_model.find(suffix);
         if (pos != std::string::npos) { clean_model.erase(pos); break; }
     }
+    usage.model = clean_model;
 
 
     json system_block = {
         {"type", "text"},
         {"text", system_prompt}
     };
-    if (_settings.prompt_caching)
+    if (settings.prompt_caching)
         system_block["cache_control"] = {{"type", "ephemeral"}};
 
 
@@ -1634,24 +2221,28 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
         body["tools"] = build_anthropic_tools(tools);
 
 
-    if (_settings.enable_reasoning) {
+    if (settings.enable_reasoning) {
         body["thinking"] = {
             {"type", "enabled"},
-            {"budget_tokens", (std::max)(_settings.reasoning_budget, 1024)}
+            {"budget_tokens", (std::max)(settings.reasoning_budget, 1024)}
         };
     } else if (clean_model.find("thought") == std::string::npos) {
         body["temperature"] = 0.0;
     }
 
 
-    if (!refresh_active_provider_oauth("anthropic")) {
+    std::string oauth_error;
+    if (!refresh_active_provider_oauth(
+            "anthropic", operation_cancel_callback(operation),
+            operation->remaining_seconds(), oauth_error)) {
         result.is_error = true;
-        result.text = std::string("Error: ") + s_last_error;
+        const auto stop_error = operation_stop_error(operation);
+        result.text = stop_error.empty() ? std::string("Error: ") + oauth_error : stop_error;
         return result;
     }
 
-    std::map<std::string, std::string> headers = _settings.get_active_headers();
-    const std::string anthropic_api_key = resolve_api_key_logged("anthropic_tools");
+    std::map<std::string, std::string> headers = settings.get_active_headers();
+    const std::string anthropic_api_key = resolve_api_key_logged(settings, "anthropic_tools");
     if (!anthropic_api_key.empty())
         headers["x-api-key"] = anthropic_api_key;
     headers["anthropic-version"]  = "2023-06-01";
@@ -1677,11 +2268,15 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
     std::map<int, block_state_t> blocks;
 
     std::string sse_buffer;
+    bool callback_failed = false;
     const std::string request_body = body.dump();
+    const auto cancel_cb = operation_cancel_callback(operation);
 
     auto chunk_cb = [&](const char* data, size_t len) -> bool {
-        if (_cancelled) return false;
-        sse_buffer.append(data, len);
+        if (operation->stop_requested())
+            return false;
+        try {
+            sse_buffer.append(data, len);
 
         size_t pos = 0;
         while (pos < sse_buffer.size()) {
@@ -1780,20 +2375,42 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
                     result.output_tokens = j["usage"].value("output_tokens", (int64_t)0);
             }
         }
-        sse_buffer.erase(0, pos);
-        return true;
+            sse_buffer.erase(0, pos);
+            return true;
+        } catch (...) {
+            callback_failed = true;
+            operation->request_cancel();
+            return false;
+        }
     };
 
+    const int anthropic_timeout_sec = operation->remaining_seconds();
+    if (anthropic_timeout_sec <= 0) {
+        result.is_error = true;
+        result.text = operation_stop_error(operation);
+        return result;
+    }
     aida::auth::http::stream_result_t res = aida::auth::http::stream(
         "POST", url, hdrs_list, request_body, std::string("application/json"),
-        k_ai_chat_stream_timeout_sec, chunk_cb);
+        anthropic_timeout_sec, chunk_cb, cancel_cb);
 
-    if (_cancelled) {
+    if (callback_failed) {
         result.is_error = true;
-        result.text = "Error: Operation cancelled.";
+        result.text = "Error: Anthropic stream callback failed.";
+        result.tool_calls.clear();
+        return result;
+    }
+    if (const auto stop_error = operation_stop_error(operation); !stop_error.empty()) {
+        result.is_error = true;
+        result.text = stop_error;
+        result.tool_calls.clear();
         return result;
     }
     if (res.cancelled) {
+        operation->request_cancel();
+        result.is_error = true;
+        result.text = "Error: Operation cancelled.";
+        result.tool_calls.clear();
         return result;
     }
     if (!res.ok && res.status == 0) {
@@ -1819,31 +2436,39 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_anthropic(
         return result;
     }
 
+    if (!res.ok || !res.complete || res.truncated || has_non_whitespace(sse_buffer)) {
+        result.is_error = true;
+        result.text = has_non_whitespace(sse_buffer)
+            ? "Error: Anthropic stream ended with an incomplete SSE frame."
+            : "Error: Anthropic stream response was incomplete.";
+        result.tool_calls.clear();
+        return result;
+    }
 
-    cost_tracking::session_input_tokens  += result.input_tokens;
-    cost_tracking::session_output_tokens += result.output_tokens;
-    cost_tracking::session_cache_read    += result.cache_read;
-    cost_tracking::session_cache_write   += result.cache_write;
-    cost_tracking::session_request_count++;
-    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-        clean_model, result.input_tokens, result.output_tokens,
-        result.cache_read, result.cache_write);
+    usage.input_tokens = result.input_tokens;
+    usage.output_tokens = result.output_tokens;
+    usage.cache_read = result.cache_read;
+    usage.cache_write = result.cache_write;
 
     return result;
 }
 
 
 ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const nlohmann::json& messages,
     const std::string& system_prompt,
     const std::vector<mcp_standalone::tool_def_t>& tools,
-    ai_stream_chunk_t on_chunk)
+    ai_stream_chunk_t on_chunk,
+    usage_record_t& usage)
 {
     using json = nlohmann::json;
     ai_generation_result_t result;
 
-    std::string base_url = _settings.resolve_active_base_url();
-    std::string model    = clean_model_name(_settings.get_active_model());
+    std::string base_url = settings.resolve_active_base_url();
+    std::string model    = clean_model_name(settings.get_active_model());
+    usage.model = model;
 
     json oai_messages = convert_messages_for_openai(messages, system_prompt);
     json oai_tools    = build_openai_tools(tools);
@@ -1867,8 +2492,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
     if (is_o_series) {
         body.erase("stream");
         body.erase("stream_options");
-        if (_settings.enable_reasoning) {
-            std::string effort = _settings.reasoning_effort;
+        if (settings.enable_reasoning) {
+            std::string effort = settings.reasoning_effort;
             if (effort.empty() || effort == "xhigh") effort = "high";
             if (effort == "minimal") effort = "low";
             body["reasoning"] = {{"effort", effort}};
@@ -1877,17 +2502,21 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
         body["temperature"] = 0.0;
     }
 
-    const std::string oai_kind = _settings.get_active_profile_kind();
+    const std::string oai_kind = settings.get_active_profile_kind();
     const std::string oai_store_key = oauth_store_key_for_profile_kind(oai_kind);
-    if (!refresh_oauth_if_needed(oai_store_key)) {
+    std::string oauth_error;
+    if (!refresh_oauth_if_needed(
+            oai_store_key, operation_cancel_callback(operation),
+            operation->remaining_seconds(), oauth_error)) {
         result.is_error = true;
-        result.text = std::string("Error: ") + s_last_error;
+        const auto stop_error = operation_stop_error(operation);
+        result.text = stop_error.empty() ? std::string("Error: ") + oauth_error : stop_error;
         return result;
     }
 
-    std::map<std::string, std::string> openai_headers = _settings.get_active_headers();
+    std::map<std::string, std::string> openai_headers = settings.get_active_headers();
     openai_headers["Content-Type"] = "application/json";
-    openai_headers["Authorization"] = "Bearer " + resolve_api_key_logged("openai_tools");
+    openai_headers["Authorization"] = "Bearer " + resolve_api_key_logged(settings, "openai_tools");
 
     if (!oai_store_key.empty()) {
         const std::string provider_id = (oai_kind == "openai_codex") ? std::string("openai-codex") : std::string("openai");
@@ -1909,13 +2538,17 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
     std::map<int, oai_tc_state_t> tc_map;
 
     std::string sse_buffer;
+    bool callback_failed = false;
     bool is_streaming = body.contains("stream") && body["stream"].get<bool>();
     const std::string openai_body = body.dump();
+    const auto cancel_cb = operation_cancel_callback(operation);
 
     if (is_streaming) {
         auto chunk_cb = [&](const char* data, size_t len) -> bool {
-            if (_cancelled) return false;
-            sse_buffer.append(data, len);
+            if (operation->stop_requested())
+                return false;
+            try {
+                sse_buffer.append(data, len);
 
             size_t pos = 0;
             while (pos < sse_buffer.size()) {
@@ -1997,17 +2630,45 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
                 if (choice.contains("finish_reason") && choice["finish_reason"].is_string())
                     result.stop_reason = choice["finish_reason"].get<std::string>();
             }
-            sse_buffer.erase(0, pos);
-            return true;
+                sse_buffer.erase(0, pos);
+                return true;
+            } catch (...) {
+                callback_failed = true;
+                operation->request_cancel();
+                return false;
+            }
         };
 
+        const int openai_timeout_sec = operation->remaining_seconds();
+        if (openai_timeout_sec <= 0) {
+            result.is_error = true;
+            result.text = operation_stop_error(operation);
+            return result;
+        }
         aida::auth::http::stream_result_t res = aida::auth::http::stream(
             "POST", openai_url, openai_hdr_list, openai_body,
             std::string("application/json"),
-            k_ai_chat_stream_timeout_sec, chunk_cb);
+            openai_timeout_sec, chunk_cb, cancel_cb);
 
-        if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
-        if (res.cancelled) return result;
+        if (callback_failed) {
+            result.is_error = true;
+            result.text = "Error: OpenAI stream callback failed.";
+            result.tool_calls.clear();
+            return result;
+        }
+        if (const auto stop_error = operation_stop_error(operation); !stop_error.empty()) {
+            result.is_error = true;
+            result.text = stop_error;
+            result.tool_calls.clear();
+            return result;
+        }
+        if (res.cancelled) {
+            operation->request_cancel();
+            result.is_error = true;
+            result.text = "Error: Operation cancelled.";
+            result.tool_calls.clear();
+            return result;
+        }
         if (!res.ok && res.status == 0) {
             result.is_error = true;
             result.text = std::string("Error: ")
@@ -2031,12 +2692,39 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
                         + (err_body.empty() ? std::string() : (": " + err_body));
             return result;
         }
+        if (!res.ok || !res.complete || res.truncated || has_non_whitespace(sse_buffer)) {
+            result.is_error = true;
+            result.text = has_non_whitespace(sse_buffer)
+                ? "Error: OpenAI stream ended with an incomplete SSE frame."
+                : "Error: OpenAI stream response was incomplete.";
+            result.tool_calls.clear();
+            return result;
+        }
     } else {
 
+        const int openai_timeout_sec = (std::min)(
+            k_ai_chat_post_timeout_sec, operation->remaining_seconds());
+        if (openai_timeout_sec <= 0) {
+            result.is_error = true;
+            result.text = operation_stop_error(operation);
+            return result;
+        }
         aida::auth::http::response_t res = aida::auth::http::post(
             openai_url, openai_hdr_list, openai_body,
-            std::string("application/json"), k_ai_chat_post_timeout_sec);
-        if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
+            std::string("application/json"),
+            openai_timeout_sec,
+            cancel_cb);
+        if (const auto stop_error = operation_stop_error(operation); !stop_error.empty()) {
+            result.is_error = true;
+            result.text = stop_error;
+            return result;
+        }
+        if (res.cancelled) {
+            operation->request_cancel();
+            result.is_error = true;
+            result.text = "Error: Operation cancelled.";
+            return result;
+        }
         if (!res.ok && res.status == 0) {
             result.is_error = true;
             result.text = std::string("Error: ")
@@ -2046,6 +2734,11 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
         if (res.status < 200 || res.status >= 300) {
             result.is_error = true;
             result.text = "Error: API returned status " + std::to_string(res.status) + ": " + res.body.substr(0, 800);
+            return result;
+        }
+        if (!res.ok || !res.complete || res.truncated) {
+            result.is_error = true;
+            result.text = "Error: OpenAI response was incomplete.";
             return result;
         }
 
@@ -2093,30 +2786,30 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_openai(
     }
 
 
-    cost_tracking::session_input_tokens  += result.input_tokens;
-    cost_tracking::session_output_tokens += result.output_tokens;
-    cost_tracking::session_cache_read    += result.cache_read;
-    cost_tracking::session_request_count++;
-    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-        model, result.input_tokens, result.output_tokens,
-        result.cache_read, 0);
+    usage.input_tokens = result.input_tokens;
+    usage.output_tokens = result.output_tokens;
+    usage.cache_read = result.cache_read;
 
     return result;
 }
 
 
 ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const nlohmann::json& messages,
     const std::string& system_prompt,
     const std::vector<mcp_standalone::tool_def_t>& tools,
-    ai_stream_chunk_t on_chunk)
+    ai_stream_chunk_t on_chunk,
+    usage_record_t& usage)
 {
     using json = nlohmann::json;
     ai_generation_result_t result;
 
-    std::string base_url = _settings.resolve_active_base_url();
-    std::string model    = clean_model_name(_settings.get_active_model());
-    std::string api_key  = resolve_api_key_logged("gemini_tools");
+    std::string base_url = settings.resolve_active_base_url();
+    std::string model    = clean_model_name(settings.get_active_model());
+    std::string api_key  = resolve_api_key_logged(settings, "gemini_tools");
+    usage.model = model;
 
 
     json contents  = convert_messages_for_gemini(messages);
@@ -2153,13 +2846,13 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
                               model.find("3-pro") != std::string::npos ||
                               model.find("3-flash") != std::string::npos);
 
-    if (is_thinking_model && _settings.enable_reasoning) {
+    if (is_thinking_model && settings.enable_reasoning) {
         gen_config["thinkingConfig"] = {
-            {"thinkingBudget", (std::max)(_settings.reasoning_budget, 1024)}
+            {"thinkingBudget", (std::max)(settings.reasoning_budget, 1024)}
         };
     }
 
-    if (!is_thinking_model || !_settings.enable_reasoning) {
+    if (!is_thinking_model || !settings.enable_reasoning) {
         gen_config["temperature"] = 0.0;
     }
 
@@ -2169,12 +2862,13 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     const std::string gemini_path = "/v1beta/models/" + model + ":streamGenerateContent?alt=sse&key=" + api_key;
     const std::string gemini_url = join_host_path(base_url, gemini_path);
 
-    std::map<std::string, std::string> gemini_headers = _settings.get_active_headers();
+    std::map<std::string, std::string> gemini_headers = settings.get_active_headers();
     gemini_headers["Content-Type"] = "application/json";
     auto gemini_hdr_list = headers_map_to_list(gemini_headers, true);
 
     std::string sse_buffer;
     std::string raw_response;
+    bool callback_failed = false;
     const std::string gemini_body = body.dump();
 
     diag::log_tagged_fmt("chat",
@@ -2185,11 +2879,17 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
     output_log::push(bottom_tab_t::output, "[ai] Gemini POST model=" + model
         + " tools=" + std::to_string(gem_tools.empty() ? 0 : gem_tools[0].value("functionDeclarations", json::array()).size())
         + " body=" + std::to_string(gemini_body.size()) + "B");
+    const auto cancel_cb = operation_cancel_callback(operation);
 
     auto chunk_cb = [&](const char* data, size_t len) -> bool {
-        if (_cancelled) return false;
-        sse_buffer.append(data, len);
-        raw_response.append(data, len);
+        if (operation->stop_requested())
+            return false;
+        try {
+            sse_buffer.append(data, len);
+            if (raw_response.size() < 65536) {
+                const size_t available = 65536 - raw_response.size();
+                raw_response.append(data, (std::min)(len, available));
+            }
 
         size_t pos = 0;
         while (pos < sse_buffer.size()) {
@@ -2256,22 +2956,50 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
                 }
             }
         }
-        sse_buffer.erase(0, pos);
-        return true;
+            sse_buffer.erase(0, pos);
+            return true;
+        } catch (...) {
+            callback_failed = true;
+            operation->request_cancel();
+            return false;
+        }
     };
 
+    const int gemini_timeout_sec = operation->remaining_seconds();
+    if (gemini_timeout_sec <= 0) {
+        result.is_error = true;
+        result.text = operation_stop_error(operation);
+        return result;
+    }
     aida::auth::http::stream_result_t res = aida::auth::http::stream(
         "POST", gemini_url, gemini_hdr_list, gemini_body,
         std::string("application/json"),
-        k_ai_chat_stream_timeout_sec, chunk_cb);
+        gemini_timeout_sec, chunk_cb, cancel_cb);
 
     diag::log_tagged_fmt("chat",
         "gemini_response status=%d ok=%d cancelled=%d err_len=%zu raw_len=%zu",
         res.status, res.ok ? 1 : 0, res.cancelled ? 1 : 0,
         res.error.size(), raw_response.size());
 
-    if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
-    if (res.cancelled) return result;
+    if (callback_failed) {
+        result.is_error = true;
+        result.text = "Error: Gemini stream callback failed.";
+        result.tool_calls.clear();
+        return result;
+    }
+    if (const auto stop_error = operation_stop_error(operation); !stop_error.empty()) {
+        result.is_error = true;
+        result.text = stop_error;
+        result.tool_calls.clear();
+        return result;
+    }
+    if (res.cancelled) {
+        operation->request_cancel();
+        result.is_error = true;
+        result.text = "Error: Operation cancelled.";
+        result.tool_calls.clear();
+        return result;
+    }
 
     if (!res.ok && res.status == 0) {
         result.is_error = true;
@@ -2310,32 +3038,40 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_gemini(
         return result;
     }
 
+    if (!res.ok || !res.complete || res.truncated || has_non_whitespace(sse_buffer)) {
+        result.is_error = true;
+        result.text = has_non_whitespace(sse_buffer)
+            ? "Error: Gemini stream ended with an incomplete SSE frame."
+            : "Error: Gemini stream response was incomplete.";
+        result.tool_calls.clear();
+        return result;
+    }
 
-    cost_tracking::session_input_tokens  += result.input_tokens;
-    cost_tracking::session_output_tokens += result.output_tokens;
-    cost_tracking::session_cache_read    += result.cache_read;
-    cost_tracking::session_request_count++;
-    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-        model, result.input_tokens, result.output_tokens,
-        result.cache_read, 0);
+    usage.input_tokens = result.input_tokens;
+    usage.output_tokens = result.output_tokens;
+    usage.cache_read = result.cache_read;
 
     return result;
 }
 
 
 ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_openai(
+    const std::shared_ptr<runtime_operation_t>& operation,
+    const settings_sa_t& settings,
     const nlohmann::json& messages,
     const std::string& system_prompt,
     const std::vector<mcp_standalone::tool_def_t>& tools,
-    ai_stream_chunk_t on_chunk)
+    ai_stream_chunk_t on_chunk,
+    usage_record_t& usage)
 {
     using json = nlohmann::json;
     ai_generation_result_t result;
 
-    std::string base_url = _settings.resolve_active_base_url();
-    std::string model    = clean_model_name(_settings.get_active_model());
-    std::string api_key  = resolve_api_key_logged("generic_openai");
-    std::string provider = _settings.get_active_profile_kind();
+    std::string base_url = settings.resolve_active_base_url();
+    std::string model    = clean_model_name(settings.get_active_model());
+    std::string api_key  = resolve_api_key_logged(settings, "generic_openai");
+    std::string provider = settings.get_active_profile_kind();
+    usage.model = model;
 
     json oai_messages = convert_messages_for_openai(messages, system_prompt);
     json oai_tools    = build_openai_tools(tools);
@@ -2357,8 +3093,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
         generic_is_copilot && aida::provider::transforms::copilot_uses_responses_api(model);
 
     if (copilot_reasoning_model) {
-        if (_settings.enable_reasoning && !_settings.reasoning_effort.empty()) {
-            std::string effort = _settings.reasoning_effort;
+        if (settings.enable_reasoning && !settings.reasoning_effort.empty()) {
+            std::string effort = settings.reasoning_effort;
             if (effort == "xhigh") effort = "high";
             if (effort == "minimal") effort = "low";
             body["reasoning_effort"] = effort;
@@ -2386,13 +3122,17 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
 
 
     const std::string generic_store_key = oauth_store_key_for_profile_kind(provider);
-    if (!refresh_oauth_if_needed(generic_store_key)) {
+    std::string oauth_error;
+    if (!refresh_oauth_if_needed(
+            generic_store_key, operation_cancel_callback(operation),
+            operation->remaining_seconds(), oauth_error)) {
         result.is_error = true;
-        result.text = std::string("Error: ") + s_last_error;
+        const auto stop_error = operation_stop_error(operation);
+        result.text = stop_error.empty() ? std::string("Error: ") + oauth_error : stop_error;
         return result;
     }
 
-    std::map<std::string, std::string> generic_headers = _settings.get_active_headers();
+    std::map<std::string, std::string> generic_headers = settings.get_active_headers();
     generic_headers["Content-Type"] = "application/json";
     if (provider == "openrouter") {
         generic_headers["Authorization"] = "Bearer " + api_key;
@@ -2407,7 +3147,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
         // matching generate_openai's Copilot handling.
         std::string oauth_provider_id;
         if (generic_is_copilot)
-            oauth_provider_id = _settings.selected_provider_id();
+            oauth_provider_id = settings.selected_provider_id();
         else if (provider == "openai_codex")
             oauth_provider_id = "openai-codex";
         else if (!generic_store_key.empty())
@@ -2433,8 +3173,17 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
                     diag::log_tagged_fmt("ai",
                         "generic_openai_empty_oauth_token store_key=%.40s provider=%.40s, forcing refresh",
                         generic_store_key.c_str(), oauth_provider_id.c_str());
-                    refresh_oauth_if_needed(generic_store_key);
-                    // Re-apply OAuth headers after refresh.
+                    std::string retry_error;
+                    if (!refresh_oauth_if_needed(
+                            generic_store_key, operation_cancel_callback(operation),
+                            operation->remaining_seconds(), retry_error)) {
+                        result.is_error = true;
+                        const auto stop_error = operation_stop_error(operation);
+                        result.text = stop_error.empty()
+                            ? std::string("Error: ") + retry_error
+                            : stop_error;
+                        return result;
+                    }
                     apply_oauth_headers(generic_headers, oauth_provider_id, generic_store_key, model,
                                         build_request_context(&body));
                     if (generic_headers.count("authorization") > 0)
@@ -2467,7 +3216,7 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
 
     if (generic_store_key == "github-copilot") {
         aida::auth::auth_info_t copilot_info;
-        const std::string endpoint_provider = _settings.selected_provider_id();
+        const std::string endpoint_provider = settings.selected_provider_id();
         const bool have_info = aida::auth::store::get(generic_store_key, copilot_info);
         const bool uses_responses = aida::provider::transforms::copilot_uses_responses_api(model);
         std::string resolved = aida::provider::transforms::resolve_endpoint(endpoint_provider, model, copilot_info);
@@ -2509,10 +3258,14 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
 
     auto generic_hdr_list = headers_map_to_list(generic_headers, true);
     const std::string generic_body = body.dump();
+    bool callback_failed = false;
+    const auto cancel_cb = operation_cancel_callback(operation);
 
     auto chunk_cb = [&](const char* data, size_t len) -> bool {
-        if (_cancelled) return false;
-        sse_buffer.append(data, len);
+        if (operation->stop_requested())
+            return false;
+        try {
+            sse_buffer.append(data, len);
 
         size_t pos = 0;
         while (pos < sse_buffer.size()) {
@@ -2602,25 +3355,60 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
             if (choice.contains("finish_reason") && choice["finish_reason"].is_string())
                 result.stop_reason = choice["finish_reason"].get<std::string>();
         }
-        sse_buffer.erase(0, pos);
-        return true;
+            sse_buffer.erase(0, pos);
+            return true;
+        } catch (...) {
+            callback_failed = true;
+            operation->request_cancel();
+            return false;
+        }
     };
 
+    const int generic_timeout_sec = operation->remaining_seconds();
+    if (generic_timeout_sec <= 0) {
+        result.is_error = true;
+        result.text = operation_stop_error(operation);
+        return result;
+    }
     aida::auth::http::stream_result_t res = aida::auth::http::stream(
         "POST", generic_url, generic_hdr_list, generic_body,
         std::string("application/json"),
-        k_ai_chat_stream_timeout_sec, chunk_cb);
+        generic_timeout_sec, chunk_cb, cancel_cb);
 
-    if (_cancelled) { result.is_error = true; result.text = "Error: Operation cancelled."; return result; }
+    if (callback_failed) {
+        result.is_error = true;
+        result.text = "Error: Provider stream callback failed.";
+        result.tool_calls.clear();
+        return result;
+    }
+    if (result.is_error)
+        return result;
+    if (const auto stop_error = operation_stop_error(operation); !stop_error.empty()) {
+        result.is_error = true;
+        result.text = stop_error;
+        result.tool_calls.clear();
+        return result;
+    }
     if (res.cancelled) {
-        if (!result.is_error)
-            return result;
+        operation->request_cancel();
+        result.is_error = true;
+        result.text = "Error: Operation cancelled.";
+        result.tool_calls.clear();
         return result;
     }
     if (!res.ok && res.status == 0) {
         result.is_error = true;
         result.text = std::string("Error: ")
             + sanitize_transport_error(provider, base_url, res.error);
+        return result;
+    }
+
+    if (!res.ok || !res.complete || res.truncated || has_non_whitespace(sse_buffer)) {
+        result.is_error = true;
+        result.text = has_non_whitespace(sse_buffer)
+            ? "Error: Provider stream ended with an incomplete SSE frame."
+            : "Error: Provider stream response was incomplete.";
+        result.tool_calls.clear();
         return result;
     }
     if (res.status < 200 || res.status >= 300) {
@@ -2652,11 +3440,8 @@ ai_generation_result_t standalone_ai_client_t::generate_with_tools_generic_opena
     }
 
 
-    cost_tracking::session_input_tokens  += result.input_tokens;
-    cost_tracking::session_output_tokens += result.output_tokens;
-    cost_tracking::session_request_count++;
-    cost_tracking::session_cost_usd += cost_tracking::estimate_cost(
-        model, result.input_tokens, result.output_tokens, 0, 0);
+    usage.input_tokens = result.input_tokens;
+    usage.output_tokens = result.output_tokens;
 
     return result;
 }

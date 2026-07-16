@@ -3,6 +3,7 @@
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
 #include "shell_preview_platform.hpp"
+#include "../core/disasm/zydis_disasm.hpp"
 #include "ui_task_executor.hpp"
 #include "../core/debugger/debugger_engine.hpp"
 #include "../core/runtime/standalone_driver.hpp"
@@ -39,36 +40,6 @@ using UINT = unsigned int;
 inline HANDLE OpenProcess(DWORD, BOOL, DWORD pid) { return reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(pid)); }
 inline BOOL TerminateProcess(HANDLE process, UINT);
 inline BOOL CloseHandle(HANDLE);
-
-struct mem_op_snapshot_t {
-	std::uint16_t base_reg = 0;
-	std::uint16_t index_reg = 0;
-	std::uint8_t scale = 0;
-	std::int64_t disp = 0;
-	std::uint16_t size = 0;
-	std::uint8_t segment = 0;
-	bool has_disp = false;
-};
-
-struct AsmInstr {
-	std::uint64_t addr = 0;
-	std::uint8_t raw[16] = {};
-	int len = 1;
-	char mnem[32] = {};
-	char ops[128] = {};
-	bool is_branch = false;
-	bool is_call = false;
-	bool is_ret = false;
-	bool is_nop = false;
-	bool is_priv = false;
-	std::uint64_t branch_target = 0;
-	std::int64_t imm_signed = 0;
-	std::uint64_t imm_unsigned = 0;
-	bool has_imm = false;
-	std::uint8_t imm_op_index = 0xFF;
-	bool has_mem_op = false;
-	mem_op_snapshot_t mem_op{};
-};
 
 namespace aida::preview::debugger {
 
@@ -130,9 +101,9 @@ inline void initialize_fixture() {
 		{8132, 6420, 8, 2, 0x00007FFDA111C4E0}
 	};
 	state.breakpoints = {
-		{0x00007FF7A4C16A32, debugger_engine::bp_type_t::software, debugger_engine::bp_state_t::enabled, -1, 1, "license_gate", "rax == 1", "authorization branch", 4, 0x75, false, false, true},
-		{0x00007FF7A4C1B420, debugger_engine::bp_type_t::hardware_execute, debugger_engine::bp_state_t::enabled, 0, 1, "decrypt_stage", "", "", 1, 0, false, false, false},
-		{0x00007FF7A4C208F0, debugger_engine::bp_type_t::hardware_write, debugger_engine::bp_state_t::disabled, 1, 8, "iat_write", "", "", 0, 0, false, false, false}
+		{0x00007FF7A4C16A32, debugger_engine::bp_type_t::software, debugger_engine::bp_state_t::enabled, -1, 1, "license_gate", "rax == 1", "authorization branch", 4, 0x75, false, false, true, "", 0, 0, false, true, ""},
+		{0x00007FF7A4C1B420, debugger_engine::bp_type_t::hardware_execute, debugger_engine::bp_state_t::enabled, 0, 1, "decrypt_stage", "", "", 1, 0, false, false, false, "", 0, 0, false, true, ""},
+		{0x00007FF7A4C208F0, debugger_engine::bp_type_t::hardware_write, debugger_engine::bp_state_t::disabled, 1, 8, "iat_write", "", "", 0, 0, false, false, false, "", 0, 0, false, true, ""}
 	};
 	state.call_stack = {
 		{0x00007FF7A4C16A32, 0x00007FF7A4C16B14, 0x00007FF7A4C00000, 0x001A0000, "sample.exe", "C:/Samples/sample.exe", "validate_license", 0x16A32, 0x00007FF7A4C169D0, 0x62, "pdb", "resolved"},
@@ -148,10 +119,10 @@ inline void initialize_fixture() {
 		{0x0000007C52C00000, 0x100000, PAGE_READWRITE, MEM_COMMIT, MEM_PRIVATE, "", "Thread stack"}
 	};
 	state.watches = {
-		{"rip", "00007FF7A4C16A32", "uint64_t", "", true},
-		{"poi(rsp)", "00007FF7A4C16B14", "pointer", "", true},
-		{"[rbx+18]", "000001F61A4E90F0", "pointer", "", true},
-		{"module_base+0x208F0", "00007FF7A4C208F0", "address", "", true}
+		{"rip", "00007FF7A4C16A32", "uint64_t", "", true, "rip", "", 0, 0, false, true},
+		{"poi(rsp)", "00007FF7A4C16B14", "pointer", "", true, "poi(rsp)", "", 0, 0, false, true},
+		{"[rbx+18]", "000001F61A4E90F0", "pointer", "", true, "[rbx+18]", "", 0, 0, false, true},
+		{"module_base+0x208F0", "00007FF7A4C208F0", "address", "", true, "module_base+0x208F0", "", 0, 0, false, true}
 	};
 	for (int i = 0; i < 18; ++i) {
 		debugger_engine::trace_record_t row;
@@ -189,53 +160,6 @@ inline void record_save_dialog(const char* title) {
 	return true;
 }();
 
-}
-
-inline AsmInstr zydis_decode_one(const std::uint8_t* code, int avail, std::uint64_t va, bool = true) {
-	AsmInstr out;
-	out.addr = va;
-	if (!code || avail <= 0) {
-		std::snprintf(out.mnem, sizeof(out.mnem), "db");
-		std::snprintf(out.ops, sizeof(out.ops), "??");
-		return out;
-	}
-	out.raw[0] = code[0];
-	if (code[0] == 0xC3) {
-		std::snprintf(out.mnem, sizeof(out.mnem), "ret");
-		out.is_ret = true;
-	} else if (code[0] == 0xCC) {
-		std::snprintf(out.mnem, sizeof(out.mnem), "int3");
-	} else if (code[0] == 0xE8 && avail >= 5) {
-		out.len = 5;
-		out.is_call = true;
-		out.branch_target = va + 5 + 0x142;
-		std::snprintf(out.mnem, sizeof(out.mnem), "call");
-		std::snprintf(out.ops, sizeof(out.ops), "0x%llX", static_cast<unsigned long long>(out.branch_target));
-	} else if (code[0] == 0x74 || code[0] == 0x75) {
-		out.len = 2;
-		out.is_branch = true;
-		const std::int64_t displacement = static_cast<std::int8_t>(avail > 1 ? code[1] : 0);
-		const std::uint64_t branch_base = va + 2;
-		out.branch_target = displacement < 0
-			? branch_base - static_cast<std::uint64_t>(-displacement)
-			: branch_base + static_cast<std::uint64_t>(displacement);
-		std::snprintf(out.mnem, sizeof(out.mnem), code[0] == 0x74 ? "je" : "jne");
-		std::snprintf(out.ops, sizeof(out.ops), "0x%llX", static_cast<unsigned long long>(out.branch_target));
-	} else if (code[0] == 0x48 && avail >= 3 && code[1] == 0x85) {
-		out.len = 3;
-		std::snprintf(out.mnem, sizeof(out.mnem), "test");
-		std::snprintf(out.ops, sizeof(out.ops), "rdx, rdx");
-	} else if (code[0] == 0x48 && avail >= 4 && code[1] == 0x83) {
-		out.len = 4;
-		std::snprintf(out.mnem, sizeof(out.mnem), code[2] == 0xEC ? "sub" : "add");
-		std::snprintf(out.ops, sizeof(out.ops), "rsp, 30h");
-	} else {
-		std::snprintf(out.mnem, sizeof(out.mnem), "mov");
-		std::snprintf(out.ops, sizeof(out.ops), "rax, qword ptr [rbx+18h]");
-	}
-	for (int i = 1; i < out.len && i < avail && i < 16; ++i)
-		out.raw[i] = code[i];
-	return out;
 }
 
 namespace run_target {
@@ -298,6 +222,7 @@ inline bool pause_target() { g_state.status.store(dbg_status_t::paused); aida::p
 inline bool step_into() { g_state.cached_regs.rip += 3; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_into", std::to_string(g_state.cached_regs.rip)); return true; }
 inline bool step_over() { g_state.cached_regs.rip += 5; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_over", std::to_string(g_state.cached_regs.rip)); return true; }
 inline bool step_out() { g_state.cached_regs.rip = 0x00007FF7A4C1B5A8; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); aida::preview::debugger::record("step_out", std::to_string(g_state.cached_regs.rip)); return true; }
+inline bool run_to_address(std::uint64_t address, bool, std::uint32_t) { if (address == 0) { preview_last_error() = "run_to_address: invalid address"; return false; } g_state.cached_regs.rip = address; g_state.registers = g_state.cached_regs; g_state.status.store(dbg_status_t::paused); preview_last_error().clear(); aida::preview::debugger::record("run_to_address", std::to_string(address)); return true; }
 inline register_set_t get_registers() { aida::preview::debugger::initialize_fixture(); return g_state.registers; }
 inline register_set_t cached_registers() { aida::preview::debugger::initialize_fixture(); return g_state.cached_regs; }
 inline std::vector<cached_thread_t> cached_thread_list() { aida::preview::debugger::initialize_fixture(); return g_state.cached_threads; }
@@ -315,7 +240,7 @@ inline bool set_register(const std::string& name, std::uint64_t value) {
 	aida::preview::debugger::record("set_register", name + "=" + std::to_string(value));
 	return true;
 }
-inline int add_breakpoint(std::uint64_t address, bp_type_t type, const std::string& name, const std::string& condition, int size) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.push_back({address, type, bp_state_t::enabled, -1, size, name, condition, "", 0, 0, false, false, false}); aida::preview::debugger::record("add_breakpoint", std::to_string(address)); return static_cast<int>(g_state.breakpoints.size() - 1); }
+inline int add_breakpoint(std::uint64_t address, bp_type_t type, const std::string& name, const std::string& condition, int size) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.push_back({address, type, bp_state_t::enabled, -1, size, name, condition, "", 0, 0, false, false, false, "", 0, 0, false, true, ""}); aida::preview::debugger::record("add_breakpoint", std::to_string(address)); return static_cast<int>(g_state.breakpoints.size() - 1); }
 inline bool remove_breakpoint(int index) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; g_state.breakpoints.erase(g_state.breakpoints.begin() + index); aida::preview::debugger::record("remove_breakpoint", std::to_string(index)); return true; }
 inline bool toggle_breakpoint(int index) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; auto& state = g_state.breakpoints[static_cast<std::size_t>(index)].state; state = state == bp_state_t::disabled ? bp_state_t::enabled : bp_state_t::disabled; aida::preview::debugger::record("toggle_breakpoint", std::to_string(index)); return true; }
 inline void clear_all_breakpoints() { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.clear(); aida::preview::debugger::record("clear_breakpoints"); }
@@ -324,7 +249,7 @@ inline bool set_breakpoint_log(int index, const std::string& text, bool auto_con
 inline std::vector<breakpoint_t> snapshot_breakpoints() { std::lock_guard<std::mutex> lock(g_state.bp_mutex); return g_state.breakpoints; }
 inline std::vector<stack_frame_t> get_call_stack() { aida::preview::debugger::initialize_fixture(); return g_state.call_stack; }
 inline std::vector<memory_region_t> get_memory_map() { aida::preview::debugger::initialize_fixture(); return g_state.memory_map; }
-inline int add_watch(const std::string& expression) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); g_state.watches.push_back({expression, "00007FF7A4C16A32", "uint64_t", "", true}); aida::preview::debugger::record("add_watch", expression); return static_cast<int>(g_state.watches.size() - 1); }
+inline int add_watch(const std::string& expression) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); g_state.watches.push_back({expression, "00007FF7A4C16A32", "uint64_t", "", true, expression, "", 0, 0, false, true}); aida::preview::debugger::record("add_watch", expression); return static_cast<int>(g_state.watches.size() - 1); }
 inline bool remove_watch(int index) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); if (index < 0 || index >= static_cast<int>(g_state.watches.size())) return false; g_state.watches.erase(g_state.watches.begin() + index); return true; }
 inline void refresh_watches() { aida::preview::debugger::record("refresh_watches"); }
 inline bool start_trace(int) { g_state.tracing.store(true); aida::preview::debugger::record("trace", "recording"); return true; }

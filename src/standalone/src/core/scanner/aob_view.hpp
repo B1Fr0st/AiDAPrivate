@@ -20,7 +20,7 @@
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
 #endif
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -866,14 +866,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (ctx_saved_idx >= 0 && static_cast<std::size_t>(ctx_saved_idx) < saved_copy.size()) {
 			auto& csig = saved_copy[static_cast<std::size_t>(ctx_saved_idx)];
 			if (ImGui::MenuItem("Open in Disassembly")) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(csig.address, context);
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob saved ctx open_disasm");
 			}
 			if (ImGui::MenuItem("Open in Hex")) {
 				detail::open_saved_in_hex(context, csig.address);
-				globals::ui::active_center_view = center_view_t::hex_view;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob saved ctx open_hex");
 			}

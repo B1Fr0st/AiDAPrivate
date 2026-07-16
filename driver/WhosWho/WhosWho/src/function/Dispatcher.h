@@ -163,6 +163,8 @@ namespace ioctl_codes {
     __forceinline ULONG HRES() { return make(79); }
     __forceinline ULONG WMRK() { return make(80); }
     __forceinline ULONG CEDH() { return make(81); }
+    __forceinline ULONG WBAES() { return make(82); }
+    __forceinline ULONG CCHL()  { return make(83); }
 }
 
 namespace phase3_msg {
@@ -353,12 +355,12 @@ namespace dispatcher {
         out.encoded = (code & 0x0000FFFFu) >> 2;
         if (out.base_previous != 0 && out.encoded >= out.base_previous) {
             ULONG prev_candidate = out.encoded - out.base_previous;
-            if (prev_candidate <= 80u)
+            if (prev_candidate <= 83u)
                 out.offset_via_previous = prev_candidate;
         }
         if (out.encoded >= out.base) {
             ULONG candidate = out.encoded - out.base;
-            if (candidate <= 80u) {
+            if (candidate <= 83u) {
                 out.offset = candidate;
                 out.valid = TRUE;
             }
@@ -794,6 +796,7 @@ namespace dispatcher {
             reinterpret_cast<volatile LONG64*>(&sentinel_bridge::g_bridge.protected_pid), 0);
         secure_comm::reset();
         handshake_auth::reset();
+        client_challenge::reset();
 
         if (cleanup_client && prev_client) {
             UINT32 prev_pid = static_cast<UINT32>(reinterpret_cast<ULONG_PTR>(prev_client));
@@ -1615,6 +1618,7 @@ namespace dispatcher {
         if (code != ioctl_codes::HB() &&
             code != ioctl_codes::SRVT() && code != ioctl_codes::SRV2() &&
             code != ioctl_codes::HSHK() && code != ioctl_codes::HRES() &&
+            code != ioctl_codes::CCHL() &&
             _InterlockedCompareExchange(&handshake_auth::g_handshake_verified, 0, 0) == 0) {
             _InterlockedIncrement(&handshake_auth::g_ioctl_hmac_fail_count);
             WW_LOG("HANDSHAKE_GATE_REJECT code=0x%08lx handshake_verified=0 fail_count=%ld pid=%llu",
@@ -3759,6 +3763,141 @@ namespace dispatcher {
                 status = STATUS_SUCCESS;
                 bytes = sizeof(watermark_verify_request_k);
             } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::WBAES()) {
+            struct wbaes_challenge_k {
+                UINT8 challenge_plaintext[16];
+                UINT8 expected_ciphertext[16];
+                UINT8 build_id[16];
+                UINT8 fallback_mode;
+                UINT8 fallback_token[64];
+                UINT8 reserved[15];
+            };
+            static_assert(sizeof(wbaes_challenge_k) == 128, "wbaes_challenge_k must be 128 bytes");
+
+            static UINT8 g_wbaes_key[16] = {};
+            static volatile LONG g_wbaes_key_initialized = 0;
+
+            if (input_size >= sizeof(wbaes_challenge_k) && output_size >= sizeof(wbaes_challenge_k)) {
+                auto* req = reinterpret_cast<wbaes_challenge_k*>(buffer);
+                BOOLEAN proceed = TRUE;
+
+                if (req->fallback_mode == 1) {
+                    BOOLEAN token_zero = TRUE;
+                    for (ULONG i = 0; i < 64; ++i) {
+                        if (req->fallback_token[i] != 0) { token_zero = FALSE; break; }
+                    }
+                    if (token_zero) {
+                        WW_LOG("WBAES: fallback_token rejected (all zeros)");
+                        proceed = FALSE;
+                    }
+                }
+
+                if (!proceed) {
+                    status = STATUS_ACCESS_DENIED;
+                } else {
+                    if (_InterlockedCompareExchange(&g_wbaes_key_initialized, 0, 0) == 0) {
+                        UINT32 dk = dynamic_key::get();
+                        UINT8 seed_bytes[4];
+                        seed_bytes[0] = static_cast<UINT8>(dk & 0xFF);
+                        seed_bytes[1] = static_cast<UINT8>((dk >> 8) & 0xFF);
+                        seed_bytes[2] = static_cast<UINT8>((dk >> 16) & 0xFF);
+                        seed_bytes[3] = static_cast<UINT8>((dk >> 24) & 0xFF);
+                        kernel_crypto::sw_hkdf_sha256(nullptr, 0, seed_bytes, 4,
+                            reinterpret_cast<const UINT8*>("WBAES_VER_KEY"), 12,
+                            g_wbaes_key, 16);
+                        _InterlockedExchange(&g_wbaes_key_initialized, 1);
+                    }
+
+                    BCRYPT_ALG_HANDLE wbaes_alg = nullptr;
+                    BCRYPT_KEY_HANDLE wbaes_hk = nullptr;
+                    NTSTATUS wbaes_bst = BCryptOpenAlgorithmProvider(&wbaes_alg, BCRYPT_AES_ALGORITHM, nullptr, 0);
+                    if (NT_SUCCESS(wbaes_bst)) {
+                        wbaes_bst = BCryptSetProperty(wbaes_alg, BCRYPT_CHAINING_MODE,
+                            reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_ECB)),
+                            static_cast<ULONG>((wcslen(BCRYPT_CHAIN_MODE_ECB) + 1) * sizeof(wchar_t)), 0);
+                    }
+                    if (NT_SUCCESS(wbaes_bst)) {
+                        wbaes_bst = BCryptGenerateSymmetricKey(wbaes_alg, &wbaes_hk, nullptr, 0,
+                            g_wbaes_key, 16, 0);
+                    }
+                    UINT8 computed_ct[16] = {};
+                    if (NT_SUCCESS(wbaes_bst)) {
+                        ULONG wbaes_done = 0;
+                        wbaes_bst = BCryptEncrypt(wbaes_hk,
+                            const_cast<PUCHAR>(req->challenge_plaintext), 16,
+                            nullptr, nullptr, 0,
+                            computed_ct, 16, &wbaes_done, 0);
+                    }
+                    if (wbaes_hk) BCryptDestroyKey(wbaes_hk);
+                    if (wbaes_alg) BCryptCloseAlgorithmProvider(wbaes_alg, 0);
+
+                    if (!NT_SUCCESS(wbaes_bst)) {
+                        WW_LOG("WBAES: bcrypt encrypt failed status=0x%08lx", wbaes_bst);
+                        status = STATUS_UNSUCCESSFUL;
+                    } else {
+                        volatile UINT8 wbaes_diff = 0;
+                        for (ULONG i = 0; i < 16; ++i)
+                            wbaes_diff |= computed_ct[i] ^ req->expected_ciphertext[i];
+                        if (wbaes_diff != 0) {
+                            WW_LOG("WBAES: challenge mismatch, triggering targeting latch");
+                            targeting_latch::latch_targeting(
+                                0xAE10u,
+                                static_cast<UINT64>(reinterpret_cast<ULONG_PTR>(caller_validation::g_registered_client_pid)),
+                                0, 0, 0);
+                            status = STATUS_ACCESS_DENIED;
+                        } else {
+                            WW_LOG("WBAES: challenge verified successfully");
+                            status = STATUS_SUCCESS;
+                        }
+                        RtlSecureZeroMemory(computed_ct, sizeof(computed_ct));
+                    }
+                }
+                bytes = sizeof(wbaes_challenge_k);
+            } else { status = STATUS_INFO_LENGTH_MISMATCH; }
+        }
+        else if (code == ioctl_codes::CCHL()) {
+            struct client_challenge_k {
+                UINT32 magic;
+                UINT32 session_key;
+                UINT32 operation;
+                UINT32 result;
+                UINT8  challenge[16];
+                UINT8  response[32];
+            };
+            static_assert(sizeof(client_challenge_k) == 64, "client_challenge_k must be 64 bytes");
+
+            if (input_size >= sizeof(client_challenge_k) && output_size >= sizeof(client_challenge_k)) {
+                auto* req = reinterpret_cast<client_challenge_k*>(buffer);
+
+                if (req->operation == 0) {
+                    if (client_challenge::issue_challenge(req->challenge)) {
+                        req->result = 1;
+                        status = STATUS_SUCCESS;
+                    } else {
+                        req->result = 0;
+                        status = STATUS_UNSUCCESSFUL;
+                    }
+                } else if (req->operation == 1) {
+                    if (client_challenge::verify_response(req->response)) {
+                        req->result = 1;
+                        status = STATUS_SUCCESS;
+                        WW_LOG("CCHL: client challenge-response verified pid=%llu",
+                            handle_to_u64(PsGetCurrentProcessId()));
+                    } else {
+                        req->result = 0;
+                        status = STATUS_ACCESS_DENIED;
+                        WW_LOG("CCHL: client challenge-response FAILED pid=%llu",
+                            handle_to_u64(PsGetCurrentProcessId()));
+                    }
+                } else {
+                    req->result = 0;
+                    status = STATUS_INVALID_PARAMETER;
+                }
+                bytes = sizeof(client_challenge_k);
+            } else {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
         }
         else {
 

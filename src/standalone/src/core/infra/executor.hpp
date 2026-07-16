@@ -572,12 +572,10 @@ inline void check_deadlines() {
     }
 }
 
-inline void shutdown() {
-    bool expected = false;
-    if (!g_shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-        return;
+inline bool shutdown() {
+    const bool first_request = !g_shutdown_requested.exchange(true, std::memory_order_acq_rel);
     auto snap = active_snapshot();
-    diag::log_tagged_fmt("executor",
+    if (first_request) diag::log_tagged_fmt("executor",
         "EXECUTOR-SNAPSHOT phase=pre_shutdown total_active=%u work_queue_active=%u service_queue_active=%u critical_queue_active=%u work_queue_pending=%llu service_queue_pending=%llu critical_queue_pending=%llu oldest_active_ms=%llu total_submits=%llu total_rejected=%llu total_ui_wait_rejected=%llu total_cancels=%llu total_timeouts=%llu labels_under_pressure=%.800s tid=%lu",
         static_cast<unsigned>(snap.total_active),
         static_cast<unsigned>(snap.work_queue_active),
@@ -594,13 +592,15 @@ inline void shutdown() {
         static_cast<unsigned long long>(total_timeouts.load(std::memory_order_acquire)),
         snap.labels_under_pressure.c_str(),
         static_cast<unsigned long>(GetCurrentThreadId()));
-    aida::diagnostics::breadcrumb_options_t opts;
-    opts.category = aida::diagnostics::breadcrumb_category_t::startup_shutdown;
-    opts.label = "executor_shutdown";
-    opts.reason = "EXECUTOR-SNAPSHOT";
-    opts.owner_subsystem = "executor";
-    opts.status_code = 5;
-    aida::diagnostics::emit(std::move(opts));
+    if (first_request) {
+        aida::diagnostics::breadcrumb_options_t opts;
+        opts.category = aida::diagnostics::breadcrumb_category_t::startup_shutdown;
+        opts.label = "executor_shutdown";
+        opts.reason = "EXECUTOR-SNAPSHOT";
+        opts.owner_subsystem = "executor";
+        opts.status_code = 5;
+        aida::diagnostics::emit(std::move(opts));
+    }
     auto runtime_snap = aida::infra::taskflow_runtime::active_snapshot(128);
     for (const auto& job : runtime_snap.active_jobs) {
         diag::log_tagged_fmt("executor",
@@ -613,10 +613,12 @@ inline void shutdown() {
             static_cast<unsigned long long>(job.deadline_ms),
             static_cast<unsigned long long>(job.active_ms));
     }
-    aida::infra::taskflow_runtime::shutdown();
+    const bool complete = aida::infra::taskflow_runtime::shutdown();
     diag::log_tagged_fmt("executor",
-        "EXECUTOR-SHUTDOWN-COMPLETE tid=%lu",
+        complete ? "EXECUTOR-SHUTDOWN-COMPLETE tid=%lu"
+            : "EXECUTOR-SHUTDOWN-DEFERRED tid=%lu",
         static_cast<unsigned long>(GetCurrentThreadId()));
+    return complete;
 }
 
 inline void json_append_escaped(std::string& out, const std::string& s) {
@@ -716,7 +718,7 @@ inline std::string snapshot_json_string() {
 }
 
 struct shutdown_guard_t {
-    ~shutdown_guard_t() { shutdown(); }
+    ~shutdown_guard_t() noexcept { try { static_cast<void>(shutdown()); } catch (...) {} }
 };
 
 inline shutdown_guard_t g_shutdown_guard;

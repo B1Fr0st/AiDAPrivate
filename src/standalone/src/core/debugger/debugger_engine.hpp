@@ -45,6 +45,12 @@ struct breakpoint_t {
 	bool        is_internal = false;
 	bool        auto_continue = false;
 	bool        byte_written = false;
+	std::string definition_module;
+	uint64_t    definition_module_offset = 0;
+	uint32_t    definition_module_size = 0;
+	bool        persistent_definition = false;
+	bool        definition_resolved = true;
+	std::string definition_status;
 };
 
 struct internal_bp_t {
@@ -113,6 +119,12 @@ struct watch_entry_t {
 	std::string type;
 	std::string error;
 	bool        valid = false;
+	std::string persistent_expression;
+	std::string definition_module;
+	uint64_t    definition_module_offset = 0;
+	uint32_t    definition_module_size = 0;
+	bool        persistent_definition = false;
+	bool        definition_resolved = true;
 };
 
 
@@ -175,6 +187,7 @@ struct state_t {
 	std::mutex                 bp_mutex;
 	std::vector<breakpoint_t>  breakpoints;
 	std::vector<internal_bp_t> internal_breakpoints;
+	std::atomic<uint64_t>      breakpoints_generation{1};
 	int                        next_bp_id = 1;
 
 
@@ -184,6 +197,7 @@ struct state_t {
 
 	std::mutex                 stack_mutex;
 	std::vector<stack_frame_t> call_stack;
+	std::atomic<uint64_t>      call_stack_generation{1};
 
 
 	std::mutex                       memmap_mutex;
@@ -192,11 +206,14 @@ struct state_t {
 
 	std::mutex                 watch_mutex;
 	std::vector<watch_entry_t> watches;
+	std::atomic<uint64_t>      watches_generation{1};
 
 
 	std::mutex                     trace_mutex;
 	std::vector<trace_record_t>    trace_log;
 	std::atomic<bool>              tracing{false};
+	std::atomic<uint64_t>          trace_generation{1};
+	std::atomic<uint64_t>          trace_dropped{0};
 	int                            trace_max_depth = 50000;
 
 
@@ -208,10 +225,12 @@ struct state_t {
 
 	std::mutex                   handle_mutex;
 	std::vector<handle_info_t>   handles;
+	std::atomic<uint64_t>        handles_generation{1};
 
 
 	std::mutex                   strings_mutex;
 	std::vector<string_ref_t>    strings;
+	std::atomic<uint64_t>        strings_generation{1};
 	std::atomic<bool>            strings_scanning{false};
 	std::atomic<bool>            strings_cancel{false};
 	std::atomic<uint64_t>        strings_pages_scanned{0};
@@ -230,6 +249,7 @@ struct state_t {
 	std::mutex                       cache_mtx;
 	register_set_t                   cached_regs{};
 	std::vector<cached_thread_t>     cached_threads;
+	std::atomic<uint64_t>            cached_threads_generation{1};
 	std::vector<uint8_t>             cached_stack;
 	uint64_t                         cached_stack_addr = 0;
 	std::vector<uint8_t>             cached_dump;

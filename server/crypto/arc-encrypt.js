@@ -58,7 +58,7 @@ function encryptArc(plaintext, sessionToken, hwid, issuedAt) {
     const key = deriveKeySeed(sessionToken, hwid, issuedAt);
     const iv = crypto.randomBytes(12);
 
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const cipher = crypto.createCipheriv('aes-128-gcm', key.subarray(0, 16), iv);
     const encrypted = Buffer.concat([
         cipher.update(plaintext),
         cipher.final(),
@@ -74,7 +74,7 @@ function encryptArcFull(plaintext, licenseRow, sessionRow) {
     const key = deriveKeySeedFull(licenseRow, sessionRow);
     const iv = crypto.randomBytes(12);
 
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const cipher = crypto.createCipheriv('aes-128-gcm', key.subarray(0, 16), iv);
     const encrypted = Buffer.concat([
         cipher.update(plaintext),
         cipher.final(),
@@ -143,7 +143,7 @@ function encryptPage(plaintext, pageIndex, sessionToken, hwid, issuedAt, proofTo
     const key = derivePageKey(keySeed, pageIndex, sessionToken, hwid, issuedAt, proofToken, chainTag);
     const iv = crypto.randomBytes(12);
 
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const cipher = crypto.createCipheriv('aes-128-gcm', key.subarray(0, 16), iv);
     const encrypted = Buffer.concat([
         cipher.update(plaintext),
         cipher.final(),
@@ -162,7 +162,7 @@ function encryptPageFull(plaintext, pageIndex, licenseRow, sessionRow, proofToke
     const key = derivePageKeyFull(keySeed, pageIndex, sessionRow, licenseRow, proofToken, chainTag);
     const iv = crypto.randomBytes(12);
 
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const cipher = crypto.createCipheriv('aes-128-gcm', key.subarray(0, 16), iv);
     const encrypted = Buffer.concat([
         cipher.update(plaintext),
         cipher.final(),

@@ -5,18 +5,19 @@
 #include "../../src/core/analysis/build_worker_packaging_integration.hpp"
 
 #include <Windows.h>
-#include <wincrypt.h>
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -25,7 +26,10 @@
 #include <utility>
 #include <vector>
 
-#pragma comment(lib, "crypt32.lib")
+#ifndef AIDA_C03_PACKAGE_FIXTURE_ADAPTERS
+#error AIDA_C03_PACKAGE_FIXTURE_ADAPTERS is required
+#endif
+
 
 namespace aida::analysis::c03_test {
 namespace {
@@ -155,72 +159,9 @@ std::string canonical_inventory_hash(const json& entries) {
     return digest.sha256;
 }
 
-std::filesystem::path signed_system_binary() {
-    std::array<wchar_t, 32768> windows{};
-    const UINT length = GetWindowsDirectoryW(windows.data(), static_cast<UINT>(windows.size()));
-    require(length != 0 && length < static_cast<UINT>(windows.size()),
-            "Windows directory is unavailable");
-    const auto path = std::filesystem::path(windows.data()) / "System32" / "where.exe";
-    require(std::filesystem::is_regular_file(path), "signed system fixture is unavailable");
-    return path;
-}
-
-std::string signer_sha256(const std::filesystem::path& path) {
-    HCERTSTORE store = nullptr;
-    HCRYPTMSG message = nullptr;
-    DWORD encoding = 0;
-    DWORD content_type = 0;
-    DWORD format_type = 0;
-    require(CryptQueryObject(CERT_QUERY_OBJECT_FILE, path.c_str(),
-                             CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
-                             CERT_QUERY_FORMAT_FLAG_BINARY, 0, &encoding, &content_type,
-                             &format_type, &store, &message, nullptr) != FALSE,
-            "signed system fixture has no embedded signer");
-    struct closer_t final {
-        HCERTSTORE store;
-        HCRYPTMSG message;
-        ~closer_t() {
-            if (message)
-                CryptMsgClose(message);
-            if (store)
-                CertCloseStore(store, 0);
-        }
-    } closer{store, message};
-    DWORD signer_size = 0;
-    require(CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signer_size) != FALSE &&
-                signer_size >= static_cast<DWORD>(sizeof(CMSG_SIGNER_INFO)),
-            "signed system fixture signer metadata is unavailable");
-    std::vector<std::uint8_t> buffer(signer_size);
-    require(CryptMsgGetParam(message, CMSG_SIGNER_INFO_PARAM, 0, buffer.data(),
-                             &signer_size) != FALSE,
-            "signed system fixture signer metadata is unreadable");
-    const auto* signer = reinterpret_cast<const CMSG_SIGNER_INFO*>(buffer.data());
-    CERT_INFO certificate_info{};
-    certificate_info.Issuer = signer->Issuer;
-    certificate_info.SerialNumber = signer->SerialNumber;
-    PCCERT_CONTEXT certificate = CertFindCertificateInStore(
-        store, encoding, 0, CERT_FIND_SUBJECT_CERT, &certificate_info, nullptr);
-    require(certificate != nullptr, "signed system fixture certificate is unavailable");
-    struct certificate_closer_t final {
-        PCCERT_CONTEXT value;
-        ~certificate_closer_t() {
-            if (value)
-                CertFreeCertificateContext(value);
-        }
-    } certificate_closer{certificate};
-    std::array<std::uint8_t, 32> digest{};
-    DWORD digest_size = static_cast<DWORD>(digest.size());
-    require(CertGetCertificateContextProperty(certificate, CERT_SHA256_HASH_PROP_ID,
-                                               digest.data(), &digest_size) != FALSE &&
-                digest_size == static_cast<DWORD>(digest.size()),
-            "signed system fixture certificate digest is unavailable");
-    constexpr char digits[] = "0123456789abcdef";
-    std::string result(digest.size() * 2, '0');
-    for (std::size_t index = 0; index < digest.size(); ++index) {
-        result[index * 2] = digits[digest[index] >> 4U];
-        result[index * 2 + 1] = digits[digest[index] & 0x0fU];
-    }
-    return result;
+void write_fixture_executable(const std::filesystem::path& path,
+                              std::string_view identity) {
+    write_text(path, "MZ-AIDA-C03-PURE-CONTRACT-" + std::string(identity) + "\n");
 }
 
 std::vector<std::uint8_t> native_manifest(std::string_view path,
@@ -348,8 +289,7 @@ private:
     std::string create_managed_runtime() {
         const auto managed_executable = package_ / "deps/AiDA_ManagedDecompilerWorker.exe";
         std::filesystem::create_directories(managed_executable.parent_path());
-        std::filesystem::copy_file(signed_system_binary(), managed_executable,
-                                   std::filesystem::copy_options::overwrite_existing);
+        write_fixture_executable(managed_executable, "managed-worker");
         const std::array<std::pair<std::string_view, std::string_view>, 6> application_files{{
             {"assembly", "deps/AiDA_ManagedDecompilerWorker.dll"},
             {"deps", "deps/AiDA_ManagedDecompilerWorker.deps.json"},
@@ -532,11 +472,9 @@ private:
                        std::string_view acl_path, std::string_view protector_path,
                        std::string_view signature_path, std::uint8_t provider,
                        std::string_view managed_runtime_manifest_hash = {}) {
-        const auto source = signed_system_binary();
         const auto executable = package_ / std::filesystem::u8path(std::string(executable_path));
         std::filesystem::create_directories(executable.parent_path());
-        std::filesystem::copy_file(source, executable,
-                                   std::filesystem::copy_options::overwrite_existing);
+        write_fixture_executable(executable, executable_path);
         const auto executable_hash = file_hash(executable);
         const auto manifest = provider == 0 ? python_manifest(executable_hash) :
                                              native_manifest(executable_path, executable_hash, provider,
@@ -550,25 +488,38 @@ private:
             (provider == 2 ? "managed" : "analysis_python"), manifest_path,
             provider == 1 ? 105 : (provider == 2 ? 207 : 1));
         const json protector{
-            {"schema", "aida.protector.receipt"}, {"schema_version", 2},
+            {"schema", "aida.protector.receipt"}, {"schema_version", 4},
             {"status", "passed"}, {"artifact_relative_path", std::string(executable_path)},
             {"artifact_sha256", executable_hash}, {"artifact_size_bytes", file_size(executable)},
             {"tool_sha256", std::string(64, '1')},
-            {"verifier_sha256", std::string(64, '2')}, {"profile", "production"},
-            {"post_process", {{"protection_verified", true}, {"symbols_scrubbed", true},
-                              {"debug_paths_scrubbed", true}, {"rich_header_scrubbed", true}}},
+            {"verifier_sha256", std::string(64, '2')},
+            {"signer_policy_sha256", std::string(64, '5')},
+            {"signing_provider_sha256", std::string(64, '6')},
+            {"profile", "strict-no-imports"},
+            {"post_process", {{"protection_checks_total", 1},
+                              {"protection_checks_passed", 1},
+                              {"coff_symbol_table_pointer", 0}, {"coff_symbol_count", 0},
+                              {"debug_directory_entries", 0}, {"codeview_records", 0},
+                              {"unscrubbed_debug_paths", 0}, {"rich_signature_count", 0},
+                              {"dans_signature_count", 0}, {"pe_headers_complete", true},
+                              {"debug_directory_complete", true}}},
             {"production_flags", {"/Qspectre", "/sdl", "/guard:cf", "/guard:ehcont", "/guard:xfg"}}
         };
         write_text(package_ / std::filesystem::u8path(std::string(protector_path)),
                    protector.dump() + "\n");
         const json signature{
-            {"schema", "aida.signature.receipt"}, {"schema_version", 2},
+            {"schema", "aida.signature.receipt"}, {"schema_version", 4},
             {"status", "verified"}, {"artifact_relative_path", std::string(executable_path)},
             {"artifact_sha256", executable_hash}, {"artifact_size_bytes", file_size(executable)},
             {"verification_mode", "wintrust_offline"},
-            {"signer_thumbprint_sha256", signer_sha256(executable)},
-            {"verifier_sha256", std::string(64, '3')}, {"chain_status", "trusted"},
-            {"timestamp_status", "trusted"}
+            {"signer_thumbprint_sha256", std::string(64, '4')},
+            {"verifier_sha256", std::string(64, '3')},
+            {"signer_policy_sha256", std::string(64, '5')},
+            {"signing_provider_sha256", std::string(64, '6')},
+            {"chain_status", "trusted"},
+            {"timestamp_status", "trusted"},
+            {"timestamp_validation", "wintrust_provider_counter_signer"},
+            {"timestamp_filetime", 133000000000000000ULL}
         };
         write_text(package_ / std::filesystem::u8path(std::string(signature_path)),
                    signature.dump() + "\n");
@@ -595,42 +546,87 @@ private:
                       "deps/evidence/analysis-python/AiDA_AnalysisPythonWorker.protector_receipt.json",
                        "deps/evidence/analysis-python/AiDA_AnalysisPythonWorker.signature_receipt.json", 0);
         const auto standalone = package_ / "AiDAStandalone.exe";
-        std::filesystem::copy_file(signed_system_binary(), standalone,
-                                   std::filesystem::copy_options::overwrite_existing);
+        write_fixture_executable(standalone, "standalone");
         const auto standalone_hash = file_hash(standalone);
         const json standalone_protector{
-            {"schema", "aida.protector.receipt"}, {"schema_version", 2},
+            {"schema", "aida.protector.receipt"}, {"schema_version", 4},
             {"status", "passed"}, {"artifact_relative_path", "AiDAStandalone.exe"},
             {"artifact_sha256", standalone_hash},
             {"artifact_size_bytes", file_size(standalone)},
             {"tool_sha256", std::string(64, '1')},
-            {"verifier_sha256", std::string(64, '2')}, {"profile", "production"},
-            {"post_process", {{"protection_verified", true}, {"symbols_scrubbed", true},
-                              {"debug_paths_scrubbed", true}, {"rich_header_scrubbed", true}}},
+            {"verifier_sha256", std::string(64, '2')},
+            {"signer_policy_sha256", std::string(64, '5')},
+            {"signing_provider_sha256", std::string(64, '6')},
+            {"profile", "standalone-no-imports"},
+            {"post_process", {{"protection_checks_total", 1},
+                              {"protection_checks_passed", 1},
+                              {"coff_symbol_table_pointer", 0}, {"coff_symbol_count", 0},
+                              {"debug_directory_entries", 0}, {"codeview_records", 0},
+                              {"unscrubbed_debug_paths", 0}, {"rich_signature_count", 0},
+                              {"dans_signature_count", 0}, {"pe_headers_complete", true},
+                              {"debug_directory_complete", true}}},
             {"production_flags", {"/Qspectre", "/sdl", "/guard:cf", "/guard:ehcont", "/guard:xfg"}}
         };
         write_text(package_ / "deps/evidence/standalone.protector.json",
                    standalone_protector.dump() + "\n");
         const json standalone_signature{
-            {"schema", "aida.signature.receipt"}, {"schema_version", 2},
+            {"schema", "aida.signature.receipt"}, {"schema_version", 4},
             {"status", "verified"}, {"artifact_relative_path", "AiDAStandalone.exe"},
             {"artifact_sha256", standalone_hash},
             {"artifact_size_bytes", file_size(standalone)},
             {"verification_mode", "wintrust_offline"},
-            {"signer_thumbprint_sha256", signer_sha256(standalone)},
-            {"verifier_sha256", std::string(64, '3')}, {"chain_status", "trusted"},
-            {"timestamp_status", "trusted"}
+            {"signer_thumbprint_sha256", std::string(64, '4')},
+            {"verifier_sha256", std::string(64, '3')},
+            {"signer_policy_sha256", std::string(64, '5')},
+            {"signing_provider_sha256", std::string(64, '6')},
+            {"chain_status", "trusted"},
+            {"timestamp_status", "trusted"},
+            {"timestamp_validation", "wintrust_provider_counter_signer"},
+            {"timestamp_filetime", 133000000000000000ULL}
         };
         write_text(package_ / "deps/evidence/standalone.signature.json",
                    standalone_signature.dump() + "\n");
+        std::vector<std::string> production_roots{
+            "AiDAStandalone", "aida_c03_safe_headless_runtime",
+            "aida_c03_auth_preview_implementation",
+            "aida_c03_safe_headless_manifest_suite",
+            "aida_c03_b14_native_decompiler_worker", "aida_c03_package_verifier"};
+        for (std::size_t index = 0; index < 57; ++index)
+            production_roots.emplace_back("fixture_manifest_root_" + std::to_string(index));
+        for (std::size_t index = 0; index < 15; ++index)
+            production_roots.emplace_back("fixture_direct_root_" + std::to_string(index));
+        std::sort(production_roots.begin(), production_roots.end());
+        auto production_targets = production_roots;
+        production_targets.emplace_back("libdecomp_aida");
+        std::sort(production_targets.begin(), production_targets.end());
+        const json production_link_graph{
+            {"schema", "aida.c03.production-link-graph.v3"}, {"schema_version", 3},
+            {"configuration", "fixture"},
+            {"denylist", {"lief", "lmdb", "unicorn", "remill"}},
+            {"manifest_root_count", 57}, {"direct_root_count", 15},
+            {"strict_root_count", production_roots.size()},
+            {"strict_roots", production_roots},
+            {"strict_targets", production_targets},
+            {"strict_edges", {
+                "aida_c03_b14_native_decompiler_worker|LINK_LIBRARIES|libdecomp_aida",
+                "aida_c03_package_verifier|LINK_LIBRARIES|bcrypt"}},
+            {"integration_host", "AiDAStandalone"},
+            {"host_direct_edges", {
+                "AiDAStandalone|LINK_LIBRARIES|Zydis",
+                "AiDAStandalone|LINK_LIBRARIES|unicorn"}},
+            {"host_preexisting_exemptions", {
+                "AiDAStandalone|LINK_LIBRARIES|unicorn"}}
+        };
+        write_text(package_ / "deps/evidence/production-link-graph.json",
+                   production_link_graph.dump() + "\n");
         std::filesystem::create_directories(package_ / "deps/camoufox-135.0.1-beta.24-win.x86_64");
         std::filesystem::create_directories(package_ / "deps/AiDA_CamoufoxReverseMcp");
-        std::filesystem::copy_file(signed_system_binary(),
+        write_fixture_executable(
             package_ / "deps/camoufox-135.0.1-beta.24-win.x86_64/camoufox.exe",
-            std::filesystem::copy_options::overwrite_existing);
-        std::filesystem::copy_file(signed_system_binary(),
+            "camoufox");
+        write_fixture_executable(
             package_ / "deps/AiDA_CamoufoxReverseMcp/AiDA_CamoufoxReverseMcp.exe",
-            std::filesystem::copy_options::overwrite_existing);
+            "reverse-mcp");
         write_text(package_ / "notices/THIRD_PARTY_NOTICES.md", "AiDA C03 fixture notices\n");
         for (std::size_t index = 1; index < 502; ++index)
             write_text(package_ / "deps/camoufox-135.0.1-beta.24-win.x86_64" /
@@ -728,6 +724,9 @@ private:
         manifest_["artifacts"].push_back(artifact(
             "standalone-signature", "signature_receipt",
             "deps/evidence/standalone.signature.json", "standalone"));
+        manifest_["artifacts"].push_back(artifact(
+            "production-link-graph", "build_evidence",
+            "deps/evidence/production-link-graph.json", "standalone"));
         manifest_["artifacts"].push_back(artifact(
             "managed-runtime-manifest", "resource_manifest",
             "deps/AiDA_ManagedRuntime.manifest.json", "managed_cli_decompiler"));
@@ -883,11 +882,278 @@ package_verification_request_t request_for(const fixture_t& fixture,
     request.expected_protector_tool_sha256 = std::string(64, '1');
     request.expected_protector_verifier_sha256 = std::string(64, '2');
     request.expected_signature_verifier_sha256 = std::string(64, '3');
+    request.expected_signer_policy_sha256 = std::string(64, '5');
+    request.expected_signing_provider_sha256 = std::string(64, '6');
+    request.authorized_signer_thumbprints_sha256 = {std::string(64, '4')};
+    request.deadline = std::chrono::minutes(5);
+    request.cancellation_requested = [] { return false; };
+    request.protector_verifier = [](const std::filesystem::path&, std::string_view profile) {
+        return profile == "strict-no-imports" || profile == "standalone-no-imports";
+    };
+    request.signature_verifier = [](const std::filesystem::path&)
+        -> std::optional<package_signature_identity_t> {
+        return package_signature_identity_t{
+            std::string(64, '4'), true, 133000000000000000ULL};
+    };
     return request;
 }
 
+void verify_utf8_path_policy_table() {
+    const auto table_path = locate_repository_root() /
+        "packaging/c03_distribution_fixture/path_byte_policy.json";
+    std::ifstream stream(table_path, std::ios::binary);
+    require(static_cast<bool>(stream), "UTF-8 path policy table is unavailable");
+    const json table = json::parse(stream, nullptr, true, true);
+    require(table.is_object() && table.size() == 4 &&
+                table.at("schema") == "aida.c03.utf8-path-byte-policy.v1" &&
+                table.at("maximum_relative_path_bytes") == k_default_relative_path_limit &&
+                table.at("maximum_inventory_path_bytes") ==
+                    k_default_inventory_path_bytes_limit &&
+                table.at("cases").is_array() && table.at("cases").size() == 12,
+            "UTF-8 path policy table contract is invalid");
+    for (const auto& item : table.at("cases")) {
+        require(item.is_object() && item.size() == 3,
+                "UTF-8 path policy case shape is invalid");
+        const auto text = item.at("text").get<std::string>();
+        const auto expected_bytes = item.at("utf8_bytes").get<std::size_t>();
+        const auto expected_allowed = item.at("customer_path_allowed").get<bool>();
+        require(text.size() == expected_bytes,
+                "UTF-8 path policy byte width differs from the canonical table");
+        require(customer_package_relative_path_allowed(text) == expected_allowed,
+                "C++ customer path policy differs from the canonical UTF-8 table");
+    }
+}
+
+std::pair<std::size_t, std::size_t> exact_fixture_path_budgets(
+    const std::filesystem::path& root) {
+    std::size_t maximum_relative = 0;
+    std::size_t inventory = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        const auto relative = entry.path().lexically_relative(root).generic_u8string();
+        const auto absolute = entry.path().generic_u8string();
+        maximum_relative = (std::max)(maximum_relative, relative.size());
+        inventory += relative.size() + absolute.size();
+    }
+    require(maximum_relative > 1 && inventory > 1 &&
+                maximum_relative < k_default_relative_path_limit &&
+                inventory < k_default_inventory_path_bytes_limit,
+            "fixture UTF-8 path budgets are outside testable boundaries");
+    return {maximum_relative, inventory};
+}
+
+void verify_utf8_path_budget_boundaries(
+    fixture_t& fixture, build_worker_packaging_integration_t& integration,
+    const std::string& manifest_hash) {
+    const auto budgets = exact_fixture_path_budgets(fixture.package());
+    const auto reject = [&](package_verification_request_t request,
+                            build_worker_error_code_t code,
+                            std::string_view message) {
+        const auto result = integration.verify_distribution_package(request);
+        require(!result && result.error().code == code, message);
+    };
+    auto relative_minus = request_for(fixture, manifest_hash);
+    relative_minus.maximum_relative_path_bytes = budgets.first - 1;
+    reject(std::move(relative_minus), build_worker_error_code_t::resource_path_limit,
+           "relative UTF-8 N-1 boundary was accepted");
+    auto relative_exact = request_for(fixture, manifest_hash);
+    relative_exact.maximum_relative_path_bytes = budgets.first;
+    require(integration.verify_distribution_package(relative_exact).has_value(),
+            "relative UTF-8 N boundary was rejected");
+    auto relative_plus = request_for(fixture, manifest_hash);
+    relative_plus.maximum_relative_path_bytes = budgets.first + 1;
+    require(integration.verify_distribution_package(relative_plus).has_value(),
+            "relative UTF-8 N+1 boundary was rejected");
+
+    auto inventory_minus = request_for(fixture, manifest_hash);
+    inventory_minus.maximum_inventory_path_bytes = budgets.second - 1;
+    reject(std::move(inventory_minus), build_worker_error_code_t::resource_path_limit,
+           "aggregate UTF-8 N-1 boundary was accepted");
+    auto inventory_exact = request_for(fixture, manifest_hash);
+    inventory_exact.maximum_inventory_path_bytes = budgets.second;
+    require(integration.verify_distribution_package(inventory_exact).has_value(),
+            "aggregate UTF-8 N boundary was rejected");
+    auto inventory_plus = request_for(fixture, manifest_hash);
+    inventory_plus.maximum_inventory_path_bytes = budgets.second + 1;
+    require(integration.verify_distribution_package(inventory_plus).has_value(),
+            "aggregate UTF-8 N+1 boundary was rejected");
+}
+
+void verify_actual_path_stream_and_resource_policy(
+    fixture_t& fixture, build_worker_packaging_integration_t& integration,
+    const std::string& manifest_hash) {
+    auto reject = [&](package_verification_request_t request,
+                      build_worker_error_code_t expected, const char* message) {
+        const auto result = integration.verify_distribution_package(request);
+        require(!result && result.error().code == expected, message);
+    };
+    auto case_alias = request_for(fixture, manifest_hash);
+    auto case_native = case_alias.package_root.native();
+    require(case_native.size() >= 3 && case_native[1] == L':',
+            "fixture package root is not a drive path");
+    case_native[0] = static_cast<wchar_t>(case_native[0] >= L'A' && case_native[0] <= L'Z'
+        ? case_native[0] + (L'a' - L'A') : case_native[0]);
+    case_alias.package_root = std::filesystem::path(case_native);
+    reject(std::move(case_alias), build_worker_error_code_t::unsafe_path,
+           "case-aliased package root was accepted");
+    auto separator_alias = request_for(fixture, manifest_hash);
+    auto separator_native = separator_alias.package_root.native();
+    std::replace(separator_native.begin(), separator_native.end(), L'\\', L'/');
+    separator_alias.package_root = std::filesystem::path(separator_native);
+    reject(std::move(separator_alias), build_worker_error_code_t::unsafe_path,
+           "alternate-separator package root was accepted");
+    auto dot_alias = request_for(fixture, manifest_hash);
+    dot_alias.package_root /= ".";
+    reject(std::move(dot_alias), build_worker_error_code_t::unsafe_path,
+           "dot-aliased package root was accepted");
+    auto manifest_alias = request_for(fixture, manifest_hash);
+    auto manifest_native = manifest_alias.manifest_path.native();
+    manifest_native[0] = static_cast<wchar_t>(manifest_native[0] >= L'A' && manifest_native[0] <= L'Z'
+        ? manifest_native[0] + (L'a' - L'A') : manifest_native[0]);
+    manifest_alias.manifest_path = std::filesystem::path(manifest_native);
+    reject(std::move(manifest_alias), build_worker_error_code_t::unsafe_path,
+           "case-aliased detached manifest was accepted");
+
+    const auto standalone = fixture.package() / "AiDAStandalone.exe";
+    const auto stream_path = standalone.native() + L":aida-policy";
+    HANDLE stream = CreateFileW(stream_path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    require(stream != INVALID_HANDLE_VALUE, "cannot create actual named-stream fixture");
+    constexpr std::array<std::uint8_t, 4> stream_bytes{1, 2, 3, 4};
+    DWORD written = 0;
+    const BOOL stream_written = WriteFile(stream, stream_bytes.data(),
+        static_cast<DWORD>(stream_bytes.size()), &written, nullptr);
+    CloseHandle(stream);
+    require(stream_written != FALSE && written == stream_bytes.size(),
+            "cannot write actual named-stream fixture");
+    reject(request_for(fixture, manifest_hash),
+           build_worker_error_code_t::named_stream_forbidden,
+           "named-stream package artifact was accepted");
+    require(DeleteFileW(stream_path.c_str()) != FALSE,
+            "cannot remove actual named-stream fixture");
+
+    auto file_limit = request_for(fixture, manifest_hash);
+    file_limit.maximum_file_count = 1;
+    reject(std::move(file_limit), build_worker_error_code_t::resource_file_limit,
+           "package file-count resource limit was not enforced");
+    auto directory_limit = request_for(fixture, manifest_hash);
+    directory_limit.maximum_directory_count = 1;
+    reject(std::move(directory_limit), build_worker_error_code_t::resource_directory_limit,
+           "package directory-count resource limit was not enforced");
+    auto entry_limit = request_for(fixture, manifest_hash);
+    entry_limit.maximum_total_entry_count = 1;
+    reject(std::move(entry_limit), build_worker_error_code_t::resource_entry_limit,
+           "package entry-count resource limit was not enforced");
+    auto depth_limit = request_for(fixture, manifest_hash);
+    depth_limit.maximum_depth = 1;
+    reject(std::move(depth_limit), build_worker_error_code_t::resource_depth_limit,
+           "package depth resource limit was not enforced");
+    auto path_limit = request_for(fixture, manifest_hash);
+    path_limit.maximum_relative_path_bytes = 1;
+    reject(std::move(path_limit), build_worker_error_code_t::resource_path_limit,
+           "package relative-path resource limit was not enforced");
+    auto inventory_path_limit = request_for(fixture, manifest_hash);
+    inventory_path_limit.maximum_inventory_path_bytes = 1;
+    reject(std::move(inventory_path_limit), build_worker_error_code_t::resource_path_limit,
+           "package inventory path-buffer resource limit was not enforced");
+    auto file_bytes_limit = request_for(fixture, manifest_hash);
+    file_bytes_limit.maximum_artifact_bytes = 1;
+    reject(std::move(file_bytes_limit), build_worker_error_code_t::resource_file_bytes_limit,
+           "package file-byte resource limit was not enforced");
+    auto total_bytes_limit = request_for(fixture, manifest_hash);
+    total_bytes_limit.maximum_total_artifact_bytes = 1;
+    reject(std::move(total_bytes_limit), build_worker_error_code_t::resource_total_bytes_limit,
+           "package aggregate-byte resource limit was not enforced");
+
+    for (const auto& relative : std::array<std::filesystem::path, 2>{
+             std::filesystem::u8path("payload-\xce\x94.bin"),
+             std::filesystem::path("payload.cpp.backup")}) {
+        const auto absolute = fixture.package() / relative;
+        write_text(absolute, "forbidden\n");
+        reject(request_for(fixture, manifest_hash),
+               build_worker_error_code_t::package_policy_violation,
+               "actual ambiguous or deceptive package path was accepted");
+        std::filesystem::remove(absolute);
+    }
+    const auto directory_alias = fixture.package() / "SDK";
+    write_text(directory_alias / "runtime.dll", "forbidden\n");
+    reject(request_for(fixture, manifest_hash),
+           build_worker_error_code_t::package_policy_violation,
+           "actual forbidden directory alias was accepted");
+    std::filesystem::remove_all(directory_alias);
+
+    const auto link_target = fixture.package() / "link-target";
+    const auto link_path = fixture.package() / "link-entry";
+    std::filesystem::create_directory(link_target);
+    const DWORD link_flags = SYMBOLIC_LINK_FLAG_DIRECTORY | 0x2U;
+    require(CreateSymbolicLinkW(link_path.c_str(), link_target.c_str(), link_flags) != FALSE,
+            "cannot create actual symbolic-link fixture");
+    reject(request_for(fixture, manifest_hash), build_worker_error_code_t::reparse_point,
+           "symbolic-link package transition was accepted");
+    std::filesystem::remove(link_path);
+    std::filesystem::remove(link_target);
+
+    const auto hardlink_path = fixture.package() / "hardlink-alias.bin";
+    require(CreateHardLinkW(hardlink_path.c_str(), standalone.c_str(), nullptr) != FALSE,
+            "cannot create actual hardlink fixture");
+    reject(request_for(fixture, manifest_hash),
+           build_worker_error_code_t::hardlink_forbidden,
+           "hardlink package alias was accepted");
+    std::filesystem::remove(hardlink_path);
+
+    const auto repeat_first = integration.verify_distribution_package(
+        request_for(fixture, manifest_hash));
+    const auto repeat_second = integration.verify_distribution_package(
+        request_for(fixture, manifest_hash));
+    require(repeat_first && repeat_second &&
+                repeat_first.value().manifest_sha256 == repeat_second.value().manifest_sha256 &&
+                repeat_first.value().artifacts_verified == repeat_second.value().artifacts_verified &&
+                repeat_first.value().artifact_bytes_verified == repeat_second.value().artifact_bytes_verified &&
+                repeat_first.value().directories_verified == repeat_second.value().directories_verified &&
+                repeat_first.value().entries_verified == repeat_second.value().entries_verified,
+            "repeated production verifier results are not deterministic");
+}
+
+void verify_cancellation_deadline_policy(
+    fixture_t& fixture, build_worker_packaging_integration_t& integration,
+    const std::string& manifest_hash) {
+    auto cancelled = request_for(fixture, manifest_hash);
+    std::size_t cancellation_polls = 0;
+    cancelled.cancellation_requested = [&] {
+        ++cancellation_polls;
+        return true;
+    };
+    const auto cancelled_result = integration.verify_distribution_package(cancelled);
+    require(!cancelled_result &&
+                cancelled_result.error().code == build_worker_error_code_t::cancelled &&
+                cancellation_polls == 1,
+            "package verification cancellation was not prompt and deterministic");
+
+    auto deadline = request_for(fixture, manifest_hash);
+    deadline.deadline = std::chrono::milliseconds(1);
+    const auto wait_until = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(3);
+    bool delayed = false;
+    deadline.cancellation_requested = [&] {
+        if (!delayed) {
+            delayed = true;
+            while (std::chrono::steady_clock::now() < wait_until) {
+            }
+        }
+        return false;
+    };
+    const auto deadline_result = integration.verify_distribution_package(deadline);
+    require(!deadline_result &&
+                deadline_result.error().code == build_worker_error_code_t::deadline_exceeded,
+            "package verification deadline was not source enforced");
+
+    const auto recovered = integration.verify_distribution_package(
+        request_for(fixture, manifest_hash));
+    require(recovered.has_value(),
+            "cancelled verification retained handles or poisoned later fairness");
+}
+
 void verify_allowed_customer_path_neighbors(fixture_t& fixture,
-                                            build_worker_packaging_integration_t& integration) {
+                                             build_worker_packaging_integration_t& integration) {
     constexpr std::string_view allowed_paths[]{
         "resources/runtime-policy.json",
         "resources/runtime-policy.sha256",
@@ -914,6 +1180,61 @@ void verify_allowed_customer_path_neighbors(fixture_t& fixture,
     for (const auto path : allowed_paths)
         std::filesystem::remove(fixture.package() / std::filesystem::u8path(path));
     fixture.publish_manifest(fixture.manifest());
+}
+
+void verify_immutable_generation_mutation_policy(
+    fixture_t& fixture, build_worker_packaging_integration_t& integration,
+    const std::string& manifest_hash) {
+    const auto mutation_path = fixture.package() /
+        "deps/camoufox-135.0.1-beta.24-win.x86_64/fixture-500.bin";
+    const auto exercise = [&](package_verification_checkpoint_t checkpoint) {
+        HANDLE file = CreateFileW(mutation_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(file != INVALID_HANDLE_VALUE,
+                "immutable-generation mapped mutation file is unavailable");
+        HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+        CloseHandle(file);
+        require(mapping != nullptr,
+                "immutable-generation writable mapping is unavailable");
+        void* view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0);
+        if (view == nullptr) {
+            CloseHandle(mapping);
+            require(false, "immutable-generation writable view is unavailable");
+        }
+        struct mapping_scope_t final {
+            HANDLE mapping;
+            void* view;
+            ~mapping_scope_t() {
+                if (view)
+                    UnmapViewOfFile(view);
+                if (mapping)
+                    CloseHandle(mapping);
+            }
+        };
+        [[maybe_unused]] const mapping_scope_t mapping_scope{mapping, view};
+        auto* first = static_cast<std::uint8_t*>(view);
+        const auto original = *first;
+        bool mutated = false;
+        auto request = request_for(fixture, manifest_hash);
+        request.verification_checkpoint = [&](package_verification_checkpoint_t observed) {
+            if (observed != checkpoint || mutated)
+                return;
+            *first ^= 0x5aU;
+            require(FlushViewOfFile(view, 1) != FALSE,
+                    "immutable-generation mapped mutation did not flush");
+            mutated = true;
+        };
+        const auto rejected = integration.verify_distribution_package(request);
+        *first = original;
+        require(FlushViewOfFile(view, 1) != FALSE,
+                "immutable-generation mapped fixture restoration did not flush");
+        require(mutated, "immutable-generation mutation checkpoint was not reached");
+        require(!rejected && rejected.error().code == build_worker_error_code_t::file_changed,
+                "same-size mapped mutation escaped immutable-generation verification");
+    };
+    exercise(package_verification_checkpoint_t::immutable_generation_captured);
+    exercise(package_verification_checkpoint_t::immutable_generation_precommit);
 }
 
 void verify_forbidden_customer_path_policy(fixture_t& fixture,
@@ -985,10 +1306,12 @@ void verify_deny_link_policy() {
     const auto accepted = integration.check_deny_links(clean);
     require(accepted && accepted.value().inspected == 6,
             "clean direct/interface/transitive link graph was rejected");
-    for (const auto& request : std::array<deny_link_check_request_t, 3>{
+    for (const auto& request : std::array<deny_link_check_request_t, 5>{
+             deny_link_check_request_t{"evidence-only", {"lief"}, {}, {}},
              deny_link_check_request_t{"direct", {"lmdb"}, {}, {}},
              deny_link_check_request_t{"interface", {}, {"unicorn::unicorn"}, {}},
-             deny_link_check_request_t{"transitive", {}, {}, {"Remill-library"}}}) {
+             deny_link_check_request_t{"transitive", {}, {}, {"Remill-library"}},
+             deny_link_check_request_t{"suffix", {}, {}, {"unicorn_static"}}}) {
         const auto rejected = integration.check_deny_links(request);
         require(!rejected && rejected.error().code ==
                     build_worker_error_code_t::forbidden_link_detected,
@@ -998,14 +1321,46 @@ void verify_deny_link_policy() {
             "deny-link success counter is not success-only");
 }
 
-void verify_real_distribution() {
+void verify_build_bound_link_graph_mutations(
+    fixture_t& fixture, build_worker_packaging_integration_t& integration) {
+    const auto graph_path = fixture.package() / "deps/evidence/production-link-graph.json";
+    std::ifstream graph_stream(graph_path, std::ios::binary);
+    require(static_cast<bool>(graph_stream), "production link graph fixture is unreadable");
+    const auto original = json::parse(graph_stream);
+    const auto reject = [&](json candidate, std::string_view name) {
+        write_text(graph_path, candidate.dump() + "\n");
+        json manifest = fixture.manifest();
+        fixture.refresh_artifact(manifest, "production-link-graph");
+        const auto manifest_hash = fixture.publish_manifest(manifest, name);
+        const auto rejected = integration.verify_distribution_package(
+            request_for(fixture, manifest_hash));
+        require(!rejected && rejected.error().code ==
+                    build_worker_error_code_t::forbidden_link_detected,
+                "build-bound production link graph accepted a forbidden edge");
+        write_text(graph_path, original.dump() + "\n");
+    };
+    json strict_forbidden = original;
+    strict_forbidden["strict_edges"].insert(
+        strict_forbidden["strict_edges"].begin() + 1,
+        "aida_c03_b14_native_decompiler_worker|LINK_LIBRARIES|unicorn_static");
+    reject(std::move(strict_forbidden), "strict-link-forbidden.json");
+    json host_forbidden = original;
+    host_forbidden["host_direct_edges"].insert(
+        host_forbidden["host_direct_edges"].begin() + 1,
+        "AiDAStandalone|LINK_LIBRARIES|remill");
+    reject(std::move(host_forbidden), "host-link-forbidden.json");
+    fixture.publish_manifest(fixture.manifest());
+}
+
+void verify_distribution_contract() {
+    verify_utf8_path_policy_table();
     fixture_t fixture;
     build_worker_packaging_integration_t integration;
     const auto manifest_hash = file_hash(fixture.manifest_path());
     const auto verified = integration.verify_distribution_package(
         request_for(fixture, manifest_hash));
     require(static_cast<bool>(verified), verified ? "" : verified.error().stable_code);
-    require(verified.value().artifacts_verified == 855 &&
+    require(verified.value().artifacts_verified == 856 &&
                 verified.value().workers_verified == 3 &&
                 verified.value().dependencies_verified == 30 &&
                 verified.value().resource_manifests_verified == 2 &&
@@ -1015,13 +1370,18 @@ void verify_real_distribution() {
                 verified.value().signature_receipts_verified == 4 &&
                 verified.value().exact_package_inventory && verified.value().no_network_fetch &&
                 verified.value().disk_backed && verified.value().arc_license_gates_required &&
-                verified.value().camoufox_only,
+                verified.value().camoufox_only && verified.value().deny_link_policy,
             "verified package evidence counters or policy results are incomplete");
     require(integration.package_verifications_completed() == 1,
             "package success counter did not advance exactly once");
+    verify_build_bound_link_graph_mutations(fixture, integration);
     verify_allowed_customer_path_neighbors(fixture, integration);
     require(integration.package_verifications_completed() == 2,
             "allowed customer resource neighbors did not reach the production verifier");
+    verify_actual_path_stream_and_resource_policy(fixture, integration, manifest_hash);
+    verify_utf8_path_budget_boundaries(fixture, integration, manifest_hash);
+    verify_cancellation_deadline_policy(fixture, integration, manifest_hash);
+    verify_immutable_generation_mutation_policy(fixture, integration, manifest_hash);
 
     auto widened_budget = request_for(fixture, manifest_hash);
     widened_budget.maximum_total_artifact_bytes = k_default_package_total_limit + 1;
@@ -1151,7 +1511,7 @@ void verify_real_distribution() {
     require(static_cast<bool>(protector_stream), "protector receipt fixture is unreadable");
     const auto original_protector = json::parse(protector_stream);
     json invalid_protector = original_protector;
-    invalid_protector["post_process"]["protection_verified"] = false;
+    invalid_protector["post_process"]["protection_checks_passed"] = 0;
     write_text(protector_path, invalid_protector.dump() + "\n");
     json invalid_protector_manifest = fixture.manifest();
     fixture.refresh_artifact(invalid_protector_manifest, "native_decompiler-protector");
@@ -1169,7 +1529,7 @@ void verify_real_distribution() {
     require(static_cast<bool>(signature_stream), "signature receipt fixture is unreadable");
     const auto original_signature = json::parse(signature_stream);
     json invalid_signature = original_signature;
-    invalid_signature["signer_thumbprint_sha256"] = std::string(64, '4');
+    invalid_signature["signer_thumbprint_sha256"] = std::string(64, '7');
     write_text(signature_path, invalid_signature.dump() + "\n");
     json invalid_signature_manifest = fixture.manifest();
     fixture.refresh_artifact(invalid_signature_manifest, "native_decompiler-signature");
@@ -1178,8 +1538,97 @@ void verify_real_distribution() {
     const auto signature_rejected = integration.verify_distribution_package(
         request_for(fixture, invalid_signature_hash));
     require(!signature_rejected && signature_rejected.error().code ==
-                build_worker_error_code_t::signature_receipt_invalid,
-            "fake signer receipt was accepted");
+                build_worker_error_code_t::signature_receipt_invalid &&
+                signature_rejected.error().detail ==
+                    "unauthorized_signer_thumbprint_sha256",
+            "unauthorized signer receipt was accepted or misclassified");
+    write_text(signature_path, original_signature.dump() + "\n");
+
+    const auto canonical_signature_hash = fixture.publish_manifest(
+        fixture.manifest(), "canonical-signature-callback.json");
+    const auto reject_signature_callback = [&](package_verification_request_t request,
+                                               std::string_view detail,
+                                               std::string_view message) {
+        const auto rejected = integration.verify_distribution_package(request);
+        require(!rejected &&
+                    rejected.error().code ==
+                        build_worker_error_code_t::signature_receipt_invalid &&
+                    rejected.error().detail == detail,
+                message);
+    };
+
+    auto missing_signature_result = request_for(fixture, canonical_signature_hash);
+    missing_signature_result.signature_verifier = [](const std::filesystem::path&)
+        -> std::optional<package_signature_identity_t> { return std::nullopt; };
+    reject_signature_callback(std::move(missing_signature_result),
+                              "signature_verifier_result",
+                              "missing signer verification result was accepted or misclassified");
+
+    auto untrusted_timestamp = request_for(fixture, canonical_signature_hash);
+    untrusted_timestamp.signature_verifier = [](const std::filesystem::path&)
+        -> std::optional<package_signature_identity_t> {
+        return package_signature_identity_t{std::string(64, '4'), false, 0};
+    };
+    reject_signature_callback(std::move(untrusted_timestamp), "trusted_timestamp",
+                              "untrusted timestamp was accepted or misclassified");
+
+    auto zero_timestamp = request_for(fixture, canonical_signature_hash);
+    zero_timestamp.signature_verifier = [](const std::filesystem::path&)
+        -> std::optional<package_signature_identity_t> {
+        return package_signature_identity_t{std::string(64, '4'), true, 0};
+    };
+    reject_signature_callback(std::move(zero_timestamp), "trusted_timestamp",
+                              "zero trusted timestamp was accepted or misclassified");
+
+    auto unauthorized_actual_signer = request_for(fixture, canonical_signature_hash);
+    unauthorized_actual_signer.signature_verifier = [](const std::filesystem::path&)
+        -> std::optional<package_signature_identity_t> {
+        return package_signature_identity_t{
+            std::string(64, '7'), true, 133000000000000000ULL};
+    };
+    reject_signature_callback(std::move(unauthorized_actual_signer),
+                              "unauthorized_actual_signer_thumbprint_sha256",
+                              "unauthorized actual signer was accepted or misclassified");
+
+    auto mismatched_actual_signer = request_for(fixture, canonical_signature_hash);
+    mismatched_actual_signer.authorized_signer_thumbprints_sha256.push_back(
+        std::string(64, '7'));
+    mismatched_actual_signer.signature_verifier = [](const std::filesystem::path&)
+        -> std::optional<package_signature_identity_t> {
+        return package_signature_identity_t{
+            std::string(64, '7'), true, 133000000000000000ULL};
+    };
+    reject_signature_callback(std::move(mismatched_actual_signer),
+                              "signer_receipt_identity_mismatch",
+                              "mismatched authorized actual signer was accepted or misclassified");
+
+    json mismatched_timestamp = original_signature;
+    mismatched_timestamp["timestamp_filetime"] = 133000000000000001ULL;
+    write_text(signature_path, mismatched_timestamp.dump() + "\n");
+    json mismatched_timestamp_manifest = fixture.manifest();
+    fixture.refresh_artifact(mismatched_timestamp_manifest, "native_decompiler-signature");
+    const auto mismatched_timestamp_hash = fixture.publish_manifest(
+        mismatched_timestamp_manifest, "mismatched-signature-timestamp.json");
+    reject_signature_callback(request_for(fixture, mismatched_timestamp_hash),
+                              "signer_receipt_identity_mismatch",
+                              "mismatched signer timestamp receipt was accepted or misclassified");
+    write_text(signature_path, original_signature.dump() + "\n");
+
+    json invalid_timestamp_status = original_signature;
+    invalid_timestamp_status["timestamp_status"] = "untrusted";
+    write_text(signature_path, invalid_timestamp_status.dump() + "\n");
+    json invalid_timestamp_status_manifest = fixture.manifest();
+    fixture.refresh_artifact(invalid_timestamp_status_manifest,
+                             "native_decompiler-signature");
+    const auto invalid_timestamp_status_hash = fixture.publish_manifest(
+        invalid_timestamp_status_manifest, "invalid-signature-timestamp-status.json");
+    const auto invalid_timestamp_status_rejected =
+        integration.verify_distribution_package(
+            request_for(fixture, invalid_timestamp_status_hash));
+    require(!invalid_timestamp_status_rejected &&
+                invalid_timestamp_status_rejected.error().code ==
+                    build_worker_error_code_t::signature_receipt_invalid,
+            "untrusted receipt timestamp status was accepted or misclassified");
     write_text(signature_path, original_signature.dump() + "\n");
 
     const auto acl_path = fixture.package() / "deps/evidence/native.acl.json";
@@ -1285,7 +1734,7 @@ void verify_real_distribution() {
 
 void run_build_packaging_integration_harness() {
     verify_deny_link_policy();
-    verify_real_distribution();
+    verify_distribution_contract();
 }
 
 }
@@ -1293,7 +1742,7 @@ void run_build_packaging_integration_harness() {
 int main() {
     try {
         aida::analysis::c03_test::run_build_packaging_integration_harness();
-        std::cout << "build_packaging_integration_harness verified real package bytes\n";
+        std::cout << "build_packaging_integration_harness verified package contract fixtures\n";
         return 0;
     } catch (const std::exception& error) {
         aida::analysis::c03_test::assertion_telemetry::record_exception(error.what());

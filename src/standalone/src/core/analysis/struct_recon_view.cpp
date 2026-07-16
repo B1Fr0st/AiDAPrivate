@@ -1,4 +1,6 @@
 #include "struct_recon_view.hpp"
+#include "../disasm/disasm_view.hpp"
+#include "../workbench/workbench_shell_integration.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/struct_recon_preview_runtime.hpp"
 #include "../../preview/ui_task_executor.hpp"
@@ -23,7 +25,7 @@
 #include "ui/fonts.hpp"
 #include "ui/ui_anim.hpp"
 #include "imgui.h"
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
@@ -33,6 +35,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -61,9 +64,112 @@ struct local_state_t {
 	std::unordered_map<int, field_anim_t> field_anims;
 	aida::ui::transition_t vtable_expand;
 	bool  vtable_expanded = true;
+	int context_field = -1;
+	uint64_t context_base = 0;
+	uint64_t context_offset = 0;
+	int context_size = 0;
+	std::string context_name;
+	std::string context_struct_name;
+	std::string operation_status;
+	bool operation_error = false;
+	bool operation_pending = false;
+	uint64_t operation_generation = 0;
+	uint64_t operation_overlay_revision = 0;
 };
 
 static local_state_t s_state;
+
+static bool checked_field_address(uint64_t base, uint64_t offset, uint64_t& result)
+{
+	if (offset > (std::numeric_limits<uint64_t>::max)() - base)
+		return false;
+	result = base + offset;
+	return true;
+}
+
+static bool context_is_current(const struct_recon::reconstructed_struct_t& structure,
+	const local_state_t& state)
+{
+	if (state.context_field < 0 ||
+		state.context_field >= static_cast<int>(structure.fields.size()) ||
+		structure.base_address != state.context_base ||
+		structure.name != state.context_struct_name)
+		return false;
+	const auto& field = structure.fields[static_cast<size_t>(state.context_field)];
+	return field.offset == state.context_offset && field.size == state.context_size &&
+		field.name == state.context_name;
+}
+
+static void publish_field_selection(const struct_recon::reconstructed_struct_t& structure,
+	const struct_recon::struct_field_t& field)
+{
+	auto context = disasm_view::capture_selected_workspace();
+	if (!context.workspace)
+		return;
+	uint64_t address = 0;
+	if (checked_field_address(structure.base_address, field.offset, address) &&
+		disasm_view::typed_address(context, address)) {
+		disasm_view::select_address(address, context);
+		return;
+	}
+	aida::workbench::selection_context_t selection;
+	selection.kind = aida::workbench::selection_kind_t::entity;
+	selection.entity_key = "structure.reconstruction." + structure.name + ".field." +
+		std::to_string(field.offset);
+	aida::workbench::document_local_cursor_t cursor;
+	aida::workbench::workbench_shell_workspace_context_t workbench;
+	static_cast<void>(aida::workbench::workbench_shell_runtime_t::instance()
+		.publish_selection(context.workspace, selection, cursor,
+			aida::workbench::navigation_origin_t::inspector, workbench));
+}
+
+bool has_current_structure()
+{
+	std::lock_guard<std::mutex> lock(struct_recon::g_state.mutex);
+	return struct_recon::g_state.active && !struct_recon::g_state.current.fields.empty();
+}
+
+command_result_t copy_current_declaration()
+{
+	struct_recon::reconstructed_struct_t structure;
+	{
+		std::lock_guard<std::mutex> lock(struct_recon::g_state.mutex);
+		if (!struct_recon::g_state.active || struct_recon::g_state.current.fields.empty())
+			return {false, "Reconstruct or load a structure first"};
+		structure = struct_recon::g_state.current;
+	}
+	const std::string declaration = struct_recon::export_as_cpp(structure);
+	if (declaration.empty())
+		return {false, "The reconstruction engine produced no declaration"};
+	ImGui::SetClipboardText(declaration.c_str());
+	return {true, "Generated C++ declaration copied"};
+}
+
+command_result_t declare_and_apply_current()
+{
+	struct_recon::reconstructed_struct_t structure;
+	{
+		std::lock_guard<std::mutex> lock(struct_recon::g_state.mutex);
+		if (!struct_recon::g_state.active || struct_recon::g_state.current.fields.empty())
+			return {false, "Reconstruct or load a structure first"};
+		structure = struct_recon::g_state.current;
+	}
+	auto context = disasm_view::capture_selected_workspace();
+	if (!context.workspace)
+		return {false, "Open and analyze the static or live target that owns this structure first"};
+	if (context.workspace->closing() || context.workspace->closed())
+		return {false, "The selected analysis workspace is closing"};
+	const auto address = disasm_view::typed_address(context, structure.base_address);
+	if (!address)
+		return {false, "The reconstructed base address is outside the selected workspace mapping"};
+	const std::string declaration = struct_recon::export_as_cpp(structure);
+	if (declaration.empty() || structure.name.empty())
+		return {false, "The reconstruction has no valid generated declaration or type name"};
+	if (!disasm_view::queue_type_declaration_and_application(context, *address,
+			declaration, structure.name))
+		return {false, "The reversible overlay rejected the atomic declaration and application request"};
+	return {true, "Queued one atomic overlay transaction; views update after its revision commits"};
+}
 
 static ImU32 type_color_token(struct_recon::field_type_t tp, float alpha)
 {
@@ -375,6 +481,23 @@ void render(float pos_x, float pos_y, float width, float height,
 			name.c_str(), field_count, cpp.size());
 	}
 	ImGui::SameLine(0.f, 6.f);
+	if (aida::ui::button("Apply Type", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(92.f, 28.f))) {
+		const auto result = declare_and_apply_current();
+		st.operation_status = result.detail;
+		st.operation_error = !result.completed;
+		if (result.completed) {
+			auto workspace = disasm_view::capture_selected_workspace();
+			st.operation_pending = true;
+			st.operation_generation = workspace.workspace
+				? workspace.workspace->generation() : 0;
+			st.operation_overlay_revision = workspace.workspace
+				? workspace.workspace->overlay_revision() : 0;
+		}
+	}
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("Queue the generated declaration and base-address application as one reversible overlay transaction");
+	ImGui::SameLine(0.f, 6.f);
 	{
 		bool ai_naming = sr.ai_naming.load();
 		bool clicked = aida::ui::button(ai_naming ? "Naming" : "AI Name",
@@ -406,10 +529,18 @@ void render(float pos_x, float pos_y, float width, float height,
 				"save_disk_done name='%s' fields=%zu",
 				snap.name.c_str(), snap.fields.size());
 		};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		const auto save_submission = aida::infra::executor::submit(std::move(sub));
+		if (!save_submission.submitted) {
 			diag::log_tagged_fmt("struct_recon",
 				"save_disk_post_failed name='%s' fields=%zu",
 				snap.name.c_str(), snap.fields.size());
+			st.operation_error = true;
+			st.operation_status = save_submission.reject_reason.empty()
+				? "The structure persistence queue rejected Save."
+				: save_submission.reject_reason;
+		} else {
+			st.operation_error = false;
+			st.operation_status = "Save queued; the persisted structure remains available after restart.";
 		}
 		diag::log_tagged_fmt("struct_recon",
 			"save_clicked name='%s' fields=%zu",
@@ -434,8 +565,17 @@ void render(float pos_x, float pos_y, float width, float height,
 			diag::log_tagged_fmt("struct_recon",
 				"load_all_done count=%zu", loaded);
 		};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted)
+		const auto load_submission = aida::infra::executor::submit(std::move(sub));
+		if (!load_submission.submitted) {
 			diag::log_tagged_fmt("struct_recon", "load_all_post_failed");
+			st.operation_error = true;
+			st.operation_status = load_submission.reject_reason.empty()
+				? "The structure persistence queue rejected Load All."
+				: load_submission.reject_reason;
+		} else {
+			st.operation_error = false;
+			st.operation_status = "Load All queued; saved structures will appear when disk loading completes.";
+		}
 		diag::log_tagged_fmt("struct_recon", "load_all_clicked");
 	}
 	ImGui::SameLine(0.f, 6.f);
@@ -462,12 +602,23 @@ void render(float pos_x, float pos_y, float width, float height,
 				diag::log_tagged_fmt("struct_recon",
 					"refresh_value_history_done");
 			};
-			if (!aida::infra::executor::submit(std::move(sub)).submitted)
+			const auto refresh_submission = aida::infra::executor::submit(std::move(sub));
+			if (!refresh_submission.submitted) {
 				diag::log_tagged_fmt("struct_recon", "refresh_value_history_post_failed");
+				st.operation_error = true;
+				st.operation_status = refresh_submission.reject_reason.empty()
+					? "The value refresh queue rejected the request."
+					: refresh_submission.reject_reason;
+			} else {
+				st.operation_error = false;
+				st.operation_status = "Value refresh queued; displayed values remain the last completed snapshot.";
+			}
 			diag::log_tagged_fmt("struct_recon",
 				"refresh_clicked base=0x%llX",
 				static_cast<unsigned long long>(base));
 		} else {
+			st.operation_error = true;
+			st.operation_status = "Refresh requires an active reconstructed structure with a nonzero base address.";
 			diag::log_tagged_fmt("struct_recon",
 				"refresh_skipped active=%d base=0x%llX has_fields=%d",
 				active ? 1 : 0,
@@ -477,6 +628,30 @@ void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	cy = oy + toolbar_h + 8.f;
+	if (st.operation_pending) {
+		auto workspace = disasm_view::capture_selected_workspace();
+		const auto mutation = disasm_view::mutation_state(workspace);
+		if (!workspace.workspace ||
+			workspace.workspace->generation() != st.operation_generation) {
+			st.operation_pending = false;
+			st.operation_error = true;
+			st.operation_status = "Analysis generation changed before the structure application committed.";
+		} else if (mutation.overlay_revision > st.operation_overlay_revision) {
+			st.operation_pending = false;
+			st.operation_error = false;
+			st.operation_status = "Structure declaration and base application committed to the reversible overlay.";
+		} else if (mutation.pending == 0 && !mutation.error.empty()) {
+			st.operation_pending = false;
+			st.operation_error = true;
+			st.operation_status = mutation.error;
+		}
+	}
+	if (!st.operation_status.empty()) {
+		dl->AddText(ImVec2(ox + 12.f, cy), aida::ui::with_alpha(
+			st.operation_error ? th.error : (st.operation_pending ? th.warning : th.success), alpha),
+			st.operation_status.c_str());
+		cy += 22.f;
+	}
 
 	bool driver_loaded = driver_bridge::is_loaded();
 	bool sr_static_pe = function_index::detail::static_pe_active();
@@ -598,6 +773,7 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	const float per_item_delay = 0.008f;
 	const float total_stagger_cap = 0.240f;
+	int context_request = -1;
 	for (int i = first_vis; i < last_vis; ++i) {
 		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
 		if (ry + row_h < cy || ry > oy + height) continue;
@@ -614,7 +790,14 @@ void render(float pos_x, float pos_y, float width, float height,
 		ImVec2 rmin(ox, ry);
 		ImVec2 rmax(ox + main_w, ry + row_h);
 
-		bool hovered = ImGui::IsMouseHoveringRect(rmin, rmax);
+		ImGui::SetCursorScreenPos(rmin);
+		ImGui::PushID(i);
+		ImGui::InvisibleButton("##struct_recon_field", ImVec2(main_w, row_h));
+		const bool hovered = ImGui::IsItemHovered();
+		const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+		const bool right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+		const bool focused = ImGui::IsItemFocused();
+		ImGui::PopID();
 		bool selected = (st.selected_field == i);
 
 		ImU32 row_fill;
@@ -653,7 +836,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		fa.last_value = cur_val;
 		fa.has_last = true;
 
-		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+		if (clicked) {
 			diag::log_tagged_fmt("struct_recon",
 				"field_row_click idx=%d offset=0x%llX type=%s name='%s' size=%d",
 				i,
@@ -662,7 +845,17 @@ void render(float pos_x, float pos_y, float width, float height,
 				field.name.c_str(),
 				field.size);
 			st.selected_field = i;
+			publish_field_selection(current_copy, field);
 		}
+		if (right_clicked) {
+			st.selected_field = i;
+			context_request = i;
+			publish_field_selection(current_copy, field);
+		}
+		const ImGuiIO& field_io = ImGui::GetIO();
+		if (selected && focused && (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+			(field_io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false))))
+			context_request = i;
 
 		float rx = cx;
 		ImFont* code_font = aida::ui::fonts::code();
@@ -748,8 +941,137 @@ void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(th.text_dim, alpha * entrance), buf);
 		}
 	}
+	if (context_request < 0 && st.selected_field >= 0 &&
+		ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+		const ImGuiIO& field_io = ImGui::GetIO();
+		if (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+			(field_io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))
+			context_request = st.selected_field;
+	}
+	if (context_request >= 0 &&
+		context_request < static_cast<int>(current_copy.fields.size())) {
+		const auto& field = current_copy.fields[static_cast<size_t>(context_request)];
+		st.context_field = context_request;
+		st.context_base = current_copy.base_address;
+		st.context_offset = field.offset;
+		st.context_size = field.size;
+		st.context_name = field.name;
+		st.context_struct_name = current_copy.name;
+		ImGui::OpenPopup("##struct_recon_field_context");
+	}
 
 	ImGui::PopClipRect();
+
+	if (ImGui::BeginPopup("##struct_recon_field_context")) {
+		struct_recon::reconstructed_struct_t live;
+		{
+			std::lock_guard<std::mutex> lock(sr.mutex);
+			live = sr.current;
+		}
+		const bool current = context_is_current(live, st);
+		const bool valid_field = current && st.context_field >= 0 &&
+			st.context_field < static_cast<int>(live.fields.size());
+		const auto field = valid_field
+			? live.fields[static_cast<size_t>(st.context_field)]
+			: struct_recon::struct_field_t{};
+		uint64_t absolute = 0;
+		const bool address_valid = valid_field &&
+			checked_field_address(live.base_address, field.offset, absolute);
+		auto workspace = disasm_view::capture_selected_workspace();
+		const bool mapped = address_valid && workspace &&
+			disasm_view::typed_address(workspace, absolute).has_value();
+		if (!current) {
+			ImGui::TextDisabled("Selection is stale");
+			ImGui::Separator();
+		}
+		if (ImGui::MenuItem("Open field in Disassembly", "Enter", false,
+				current && mapped)) {
+			disasm_view::goto_address(absolute, workspace);
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+		}
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !mapped)
+			ImGui::SetTooltip("The field address is not mapped by the selected analysis workspace");
+		if (ImGui::BeginMenu("Access References", valid_field && !field.accesses.empty())) {
+			const size_t shown = (std::min)(field.accesses.size(), static_cast<size_t>(64));
+			for (size_t index = 0; index < shown; ++index) {
+				const auto& access = field.accesses[index];
+				char label[320]{};
+				std::snprintf(label, sizeof(label), "0x%llX  %s  %s",
+					static_cast<unsigned long long>(access.instruction_addr),
+					access.is_write ? "write" : "read", access.disasm_text.c_str());
+				if (ImGui::MenuItem(label)) {
+					disasm_view::goto_address(access.instruction_addr, workspace);
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+				}
+			}
+			if (field.accesses.size() > shown)
+				ImGui::TextDisabled("%zu more references; use the field detail evidence view",
+					field.accesses.size() - shown);
+			ImGui::EndMenu();
+		}
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+			valid_field && field.accesses.empty())
+			ImGui::SetTooltip("No monitored instruction access references were captured for this field");
+		ImGui::Separator();
+		if (ImGui::MenuItem("Copy field name", "Ctrl+C", false, valid_field))
+			ImGui::SetClipboardText(field.name.c_str());
+		if (ImGui::MenuItem("Copy field type", nullptr, false, valid_field))
+			ImGui::SetClipboardText(struct_recon::field_type_name(field.type));
+		if (ImGui::MenuItem("Copy offset", nullptr, false, valid_field)) {
+			char text[32]{};
+			std::snprintf(text, sizeof(text), "0x%llX",
+				static_cast<unsigned long long>(field.offset));
+			ImGui::SetClipboardText(text);
+		}
+		if (ImGui::MenuItem("Copy absolute address", nullptr, false, address_valid)) {
+			char text[32]{};
+			std::snprintf(text, sizeof(text), "0x%llX",
+				static_cast<unsigned long long>(absolute));
+			ImGui::SetClipboardText(text);
+		}
+		if (ImGui::MenuItem("Copy access evidence", nullptr, false,
+				valid_field && !field.accesses.empty())) {
+			std::string evidence;
+			for (const auto& access : field.accesses) {
+				char prefix[96]{};
+				std::snprintf(prefix, sizeof(prefix), "0x%llX %s ",
+					static_cast<unsigned long long>(access.instruction_addr),
+					access.is_write ? "write" : "read");
+				evidence += prefix;
+				evidence += access.disasm_text;
+				evidence.push_back('\n');
+			}
+			ImGui::SetClipboardText(evidence.c_str());
+		}
+		ImGui::Separator();
+		if (ImGui::MenuItem("Declare and Apply Structure", nullptr, false, valid_field)) {
+			const auto result = declare_and_apply_current();
+			st.operation_status = result.detail;
+			st.operation_error = !result.completed;
+			if (result.completed) {
+				auto selected_workspace = disasm_view::capture_selected_workspace();
+				st.operation_pending = true;
+				st.operation_generation = selected_workspace.workspace
+					? selected_workspace.workspace->generation() : 0;
+				st.operation_overlay_revision = selected_workspace.workspace
+					? selected_workspace.workspace->overlay_revision() : 0;
+			}
+		}
+		ImGui::MenuItem("Rename field...", nullptr, false, false);
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip("The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction");
+		ImGui::MenuItem("Set field type...", nullptr, false, false);
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip("The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction");
+		ImGui::MenuItem("Edit live value...", nullptr, false, false);
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip("The reconstruction view has no target-session-bound write and readback provider");
+		ImGui::Separator();
+		ImGui::MenuItem("Send Field Evidence to AI Chat", nullptr, false, false);
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip("No evidence-review adapter currently accepts reconstruction field snapshots");
+		ImGui::EndPopup();
+	}
 
 	if (content_h > visible_h && visible_h > 0.f) {
 		float bar_x = ox + main_w - 12.f;

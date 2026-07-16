@@ -291,6 +291,7 @@ struct pool_t {
     std::atomic<bool> alive{false};
     std::atomic<bool> shutting_down{false};
     std::atomic<bool> shutdown_called{false};
+    std::atomic<bool> shutdown_in_progress{false};
     std::atomic<bool> stop_accepting{false};
     std::atomic<std::uint32_t> active_tasks{0};
     std::atomic<std::uint64_t> pending_tasks{0};
@@ -395,10 +396,11 @@ inline std::atomic<std::uint64_t> g_total_failed{0};
 inline std::atomic<std::uint64_t> g_total_timed_out{0};
 inline std::atomic<bool> g_stop_accepting{false};
 inline std::atomic<bool> g_shutdown_requested{false};
-inline std::mutex g_jobs_mtx;
-inline std::map<std::uint64_t, std::shared_ptr<job_record_t>> g_jobs;
-inline std::mutex g_pool_registry_mtx;
-inline std::vector<pool_t*> g_registered_pools;
+inline std::mutex& g_jobs_mtx = *new std::mutex;
+inline std::map<std::uint64_t, std::shared_ptr<job_record_t>>& g_jobs =
+    *new std::map<std::uint64_t, std::shared_ptr<job_record_t>>;
+inline std::mutex& g_pool_registry_mtx = *new std::mutex;
+inline std::vector<pool_t*>& g_registered_pools = *new std::vector<pool_t*>;
 
 inline const char* safe_pool_name(const pool_t& p) {
     return p.pool_name && *p.pool_name ? p.pool_name : "<unnamed>";
@@ -499,15 +501,15 @@ inline void register_pool(pool_t& p) {
 }
 
 inline pool_t& domain_pool(executor_domain_t d) {
-    static pool_t general{"runtime.general", "taskflow_runtime", "runtime.general", pool_family_t::general, general_pool_size()};
-    static pool_t service{"runtime.service", "taskflow_runtime", "runtime.service", pool_family_t::service, service_pool_size()};
-    static pool_t critical{"runtime.critical", "taskflow_runtime", "runtime.critical", pool_family_t::critical, 24};
-    static pool_t ui_dispatch{"runtime.ui_dispatch", "taskflow_runtime", "runtime.ui_dispatch", pool_family_t::general, narrow_pool_size(4u, 8u)};
-    static pool_t external_tool{"runtime.external_tool", "taskflow_runtime", "runtime.external_tool", pool_family_t::general, narrow_pool_size(8u, 16u)};
-    static pool_t long_running{"runtime.long_running", "taskflow_runtime", "runtime.long_running", pool_family_t::service, narrow_pool_size(8u, 16u)};
-    static pool_t security_liveness{"runtime.security_liveness", "taskflow_runtime", "runtime.security_liveness", pool_family_t::critical, 8};
-    static pool_t feature_worker{"runtime.feature_worker", "taskflow_runtime", "runtime.feature_worker", pool_family_t::general, narrow_pool_size(8u, 16u)};
-    static pool_t diagnostics{"runtime.diagnostics", "taskflow_runtime", "runtime.diagnostics", pool_family_t::general, narrow_pool_size(4u, 8u)};
+    static pool_t& general = *new pool_t{"runtime.general", "taskflow_runtime", "runtime.general", pool_family_t::general, general_pool_size()};
+    static pool_t& service = *new pool_t{"runtime.service", "taskflow_runtime", "runtime.service", pool_family_t::service, service_pool_size()};
+    static pool_t& critical = *new pool_t{"runtime.critical", "taskflow_runtime", "runtime.critical", pool_family_t::critical, 24};
+    static pool_t& ui_dispatch = *new pool_t{"runtime.ui_dispatch", "taskflow_runtime", "runtime.ui_dispatch", pool_family_t::general, narrow_pool_size(4u, 8u)};
+    static pool_t& external_tool = *new pool_t{"runtime.external_tool", "taskflow_runtime", "runtime.external_tool", pool_family_t::general, narrow_pool_size(8u, 16u)};
+    static pool_t& long_running = *new pool_t{"runtime.long_running", "taskflow_runtime", "runtime.long_running", pool_family_t::service, narrow_pool_size(8u, 16u)};
+    static pool_t& security_liveness = *new pool_t{"runtime.security_liveness", "taskflow_runtime", "runtime.security_liveness", pool_family_t::critical, 8};
+    static pool_t& feature_worker = *new pool_t{"runtime.feature_worker", "taskflow_runtime", "runtime.feature_worker", pool_family_t::general, narrow_pool_size(8u, 16u)};
+    static pool_t& diagnostics = *new pool_t{"runtime.diagnostics", "taskflow_runtime", "runtime.diagnostics", pool_family_t::general, narrow_pool_size(4u, 8u)};
     switch (d) {
     case executor_domain_t::service: return service;
     case executor_domain_t::critical: return critical;
@@ -1183,6 +1185,7 @@ inline std::shared_ptr<job_record_t> make_record_from_descriptor(task_descriptor
 
 inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_t&& desc) {
     submit_result_t result;
+    register_pool(p);
     p.post_attempts.fetch_add(1u, std::memory_order_acq_rel);
     if (!desc.owner_subsystem || !*desc.owner_subsystem) {
         result.reject_reason = "missing_owner_subsystem";
@@ -1220,7 +1223,9 @@ inline submit_result_t submit_to_pool(pool_t& p, int pool_size, task_descriptor_
     bool pending_incremented = false;
     try {
         std::lock_guard<std::mutex> lk(p.mtx);
-        if (!p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire) || p.stop_accepting.load(std::memory_order_acquire) || !p.executor) {
+        if (g_stop_accepting.load(std::memory_order_acquire)
+            || !p.alive.load(std::memory_order_acquire) || p.shutting_down.load(std::memory_order_acquire)
+            || p.stop_accepting.load(std::memory_order_acquire) || !p.executor) {
             result.reject_reason = "pool_not_accepting";
         } else {
             p.pending_tasks.fetch_add(1u, std::memory_order_acq_rel);
@@ -1540,7 +1545,7 @@ inline bool cancel(job_handle_t handle) {
             signalled = record->future.cancel();
         if (!record->cancel_hook_invoked) {
             record->cancel_hook_invoked = true;
-            cancel_hook = record->cancel_hook;
+            cancel_hook = std::move(record->cancel_hook);
         }
         if (!record->cancellation_accounted) {
             record->cancellation_accounted = true;
@@ -1920,14 +1925,17 @@ inline bool all_pools_quiescent() {
     return true;
 }
 
-inline void shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms) {
-    register_pool(p);
+inline bool shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms) {
+    if (p.shutdown_called.load(std::memory_order_acquire)) return true;
     bool expected = false;
-    if (!p.shutdown_called.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-        return;
+    if (!p.shutdown_in_progress.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+    struct progress_guard_t {
+        std::atomic<bool>& value;
+        ~progress_guard_t() { value.store(false, std::memory_order_release); }
+    } progress_guard{p.shutdown_in_progress};
     p.stop_accepting.store(true, std::memory_order_release);
     p.shutting_down.store(true, std::memory_order_release);
-    p.alive.store(false, std::memory_order_release);
     tf::Executor* executor = nullptr;
     {
         std::lock_guard<std::mutex> lk(p.mtx);
@@ -1943,7 +1951,7 @@ inline void shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms)
             static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
             static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
             static_cast<unsigned long>(GetCurrentThreadId()));
-        return;
+        return false;
     }
     const ULONGLONG start = GetTickCount64();
     const bool infinite_wait = timeout_ms == INFINITE;
@@ -1966,7 +1974,7 @@ inline void shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms)
             static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
             static_cast<unsigned long>(GetCurrentThreadId()));
         log_stuck_workers_for(p, name, 0ULL, 16);
-        return;
+        return false;
     }
     std::unique_ptr<tf::Executor> owned_executor;
     {
@@ -1996,6 +2004,8 @@ inline void shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms)
             active = {};
     }
     p.worker_count.store(0, std::memory_order_release);
+    p.alive.store(false, std::memory_order_release);
+    p.shutdown_called.store(true, std::memory_order_release);
     const ULONGLONG end = GetTickCount64();
     diag::log_tagged_fmt(safe_log_tag(p),
         "taskflow_shutdown_complete pool=%s elapsed_ms=%llu active=%u pending=%llu started=%llu finished=%llu tid=%lu",
@@ -2006,6 +2016,7 @@ inline void shutdown_pool(pool_t& p, const char* name, std::uint32_t timeout_ms)
         static_cast<unsigned long long>(p.started_tasks.load(std::memory_order_acquire)),
         static_cast<unsigned long long>(p.finished_tasks.load(std::memory_order_acquire)),
         static_cast<unsigned long>(GetCurrentThreadId()));
+    return true;
 }
 
 inline runtime_snapshot_t active_snapshot(std::size_t max_jobs = 64) {
@@ -2170,48 +2181,56 @@ inline std::string snapshot_json_string() {
     return out;
 }
 
-inline void shutdown(std::uint32_t timeout_ms = 15000) {
+inline bool shutdown(std::uint32_t timeout_ms = 15000) {
     g_shutdown_requested.store(true, std::memory_order_release);
     g_stop_accepting.store(true, std::memory_order_release);
-    std::vector<job_handle_t> cancel_pending;
-    {
-        std::lock_guard<std::mutex> jobs_lk(g_jobs_mtx);
-        cancel_pending.reserve(g_jobs.size());
-        for (const auto& entry : g_jobs) {
-            const auto& record = entry.second;
-            if (!record)
-                continue;
-            std::lock_guard<std::mutex> record_lk(record->mtx);
-            if (record->active && record->shutdown_policy == "cancel_pending")
-                cancel_pending.push_back(job_handle_t{record->id});
+    bool complete = true;
+    for (;;) {
+        job_handle_t cancel_pending;
+        try {
+            std::lock_guard<std::mutex> jobs_lk(g_jobs_mtx);
+            for (const auto& entry : g_jobs) {
+                const auto& record = entry.second;
+                if (!record) continue;
+                std::lock_guard<std::mutex> record_lk(record->mtx);
+                if (record->active && record->shutdown_policy == "cancel_pending"
+                    && (!record->cancel_token
+                        || !record->cancel_token->requested.load(std::memory_order_acquire))) {
+                    cancel_pending.id = record->id;
+                    break;
+                }
+            }
+        } catch (...) {
+            complete = false;
+            break;
         }
-    }
-    for (const auto handle : cancel_pending)
-        cancel(handle);
-    std::vector<pool_t*> pools;
-    {
-        std::lock_guard<std::mutex> lk(g_pool_registry_mtx);
-        pools = g_registered_pools;
+        if (!cancel_pending.valid()) break;
+        try {
+            if (!cancel(cancel_pending)) complete = false;
+        } catch (...) {
+            complete = false;
+            break;
+        }
     }
     const std::uint64_t started = now_ms();
     const std::uint64_t deadline = timeout_ms == INFINITE
         ? (std::numeric_limits<std::uint64_t>::max)()
         : started + static_cast<std::uint64_t>(timeout_ms);
-    for (auto* p : pools) {
-        if (!p)
-            continue;
+    for (std::size_t index = 0; index < executor_domain_count; ++index) {
+        auto& pool = domain_pool(static_cast<executor_domain_t>(index));
         const std::uint64_t current = now_ms();
         const std::uint32_t remaining = timeout_ms == INFINITE
             ? INFINITE
             : current >= deadline ? 0u
             : static_cast<std::uint32_t>((std::min<std::uint64_t>)(deadline - current,
                 static_cast<std::uint64_t>((std::numeric_limits<std::uint32_t>::max)())));
-        shutdown_pool(*p, safe_pool_name(*p), remaining);
+        if (!shutdown_pool(pool, safe_pool_name(pool), remaining)) complete = false;
     }
+    return complete;
 }
 
 struct shutdown_guard_t {
-    ~shutdown_guard_t() { shutdown(); }
+    ~shutdown_guard_t() noexcept { try { static_cast<void>(shutdown()); } catch (...) {} }
 };
 
 inline shutdown_guard_t g_shutdown_guard;

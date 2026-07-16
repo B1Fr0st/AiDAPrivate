@@ -16,6 +16,9 @@
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
 #include "ui/ui_anim.hpp"
+#include "ui/toast_notification.hpp"
+#include "../disasm/disasm_view.hpp"
+#include "../workbench/workbench_shell_integration.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -80,9 +83,34 @@ struct ui_state_t {
 	bool  addr_buf_seeded = false;
 	edit_target_t edit_target = edit_target_t::none;
 	int   edit_target_field = -1;
+	bool  table_focused = false;
+	uint64_t context_refresh_seq = 0;
+	uint64_t context_base_address = 0;
+	uint32_t context_target_pid = 0;
+	uint32_t edit_target_pid = 0;
+	uint64_t edit_base_address = 0;
+	int pending_remove_field = -1;
 };
 
 inline ui_state_t g_ui;
+
+inline void publish_field_selection(const std::string& structure_name,
+	const struct_dissector::field_def_t& field) {
+	auto context = disasm_view::capture_selected_workspace();
+	if (!context.workspace)
+		return;
+	aida::workbench::selection_context_t selection;
+	selection.kind = aida::workbench::selection_kind_t::entity;
+	selection.entity_key = "structure.dissector." + structure_name + ".field." +
+		std::to_string(field.offset);
+	aida::workbench::document_local_cursor_t cursor;
+	cursor.has_position = true;
+	cursor.position = field.offset;
+	aida::workbench::workbench_shell_workspace_context_t workbench;
+	static_cast<void>(aida::workbench::workbench_shell_runtime_t::instance()
+		.publish_selection(context.workspace, selection, cursor,
+			aida::workbench::navigation_origin_t::inspector, workbench));
+}
 
 inline ImU32 type_color_token(struct_dissector::field_type_t tp, float alpha) {
 	const auto& th = aida::ui::resolved();
@@ -701,6 +729,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		bool table_hovered = ImGui::IsMouseHoveringRect(
 			ImVec2(rx, table_y), ImVec2(rx + rw, table_y + table_h));
 		if (table_hovered) {
+			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+				ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				ui.table_focused = true;
 			float wheel = ImGui::GetIO().MouseWheel;
 			if (wheel != 0.f) ui.target_scroll_y -= wheel * line_h * 3.f;
 		}
@@ -723,7 +754,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::lock_guard<std::mutex> lk(st.mtx);
 			if (struct_dissector::valid_index(active_idx, st.structs.size())) {
 				const auto& sd = st.structs[static_cast<std::size_t>(active_idx)];
-				for (std::size_t field_index = 0; field_index < sd.fields.size(); ++field_index) {
+				const std::size_t first_visible = static_cast<std::size_t>((std::max)(0,
+					static_cast<int>(ui.scroll_y / line_h)));
+				const std::size_t visible_capacity = static_cast<std::size_t>((std::max)(1,
+					static_cast<int>(table_h / line_h) + 2));
+				const std::size_t last_visible = (std::min)(sd.fields.size(),
+					first_visible + visible_capacity);
+				for (std::size_t field_index = first_visible; field_index < last_visible; ++field_index) {
 					if (!struct_dissector::index_fits_int(field_index)) break;
 					const int fi = static_cast<int>(field_index);
 					float row_y = table_y + static_cast<float>(field_index) * line_h - ui.scroll_y;
@@ -769,15 +806,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							pulse, 4.f);
 					}
 
-					if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+					const auto& f = sd.fields[field_index];
+					if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 						ui.selected_field = fi;
+						publish_field_selection(sd.name, f);
+					}
 					if (row_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 						ui.selected_field = fi;
 						ctx_open_request = true;
 						ctx_open_field = fi;
+						publish_field_selection(sd.name, f);
 					}
-
-					const auto& f = sd.fields[field_index];
 					float fx = rx + 8.f;
 					ImFont* code_font = aida::ui::fonts::code();
 					if (!code_font) code_font = ImGui::GetFont();
@@ -861,7 +900,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 								wrote_ok = struct_dissector::write_preview_value(fi, ui.edit_value_buf);
 #else
-								uint64_t write_addr = st.base_address + f.offset;
+								uint64_t write_addr = ui.edit_base_address + f.offset;
 								memory_scanner::value_type_t scanner_type = memory_scanner::value_type_t::int32_val;
 								bool hex_input = false;
 								switch (f.type) {
@@ -895,21 +934,35 @@ inline void render(float pos_x, float pos_y, float width, float height,
 								}
 								auto bytes = memory_scanner::parse_value(ui.edit_value_buf,
 									scanner_type, hex_input);
-								if (!bytes.empty()) {
-									wrote_ok = driver_bridge::write_memory(write_addr, bytes);
+								const bool target_current = driver_bridge::is_loaded() &&
+									driver_bridge::attached_pid() != 0 &&
+									driver_bridge::attached_pid() == ui.edit_target_pid &&
+									st.base_address == ui.edit_base_address;
+								if (target_current && !bytes.empty()) {
+									const bool submitted = driver_bridge::write_memory(write_addr, bytes);
+									std::vector<uint8_t> observed;
+									wrote_ok = submitted &&
+										driver_bridge::read_memory(write_addr, bytes.size(), observed) &&
+										observed == bytes;
 								}
 #endif
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 								diag::log_tagged_fmt("dissector",
-									"write_field addr=0x%llX type=%s input='%s' bytes=%zu ok=%d",
+									"write_field addr=0x%llX type=%s input='%s' bytes=%zu verified=%d",
 									static_cast<unsigned long long>(write_addr),
 									struct_dissector::field_type_name(f.type),
 									ui.edit_value_buf,
 									bytes.size(),
 									wrote_ok ? 1 : 0);
 #endif
-								if (wrote_ok)
+								if (wrote_ok) {
 									fa.write_success.trigger();
+									toast_notification::push("Field value written and verified.",
+										toast_notification::toast_type_t::success, 2.f);
+								} else {
+									toast_notification::push("Field write was rejected, stale, or failed readback verification.",
+										toast_notification::toast_type_t::error, 5.f);
+								}
 								ui.editing_field = -1;
 							}
 							if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -922,6 +975,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							if (mp.x >= fx && mp.x <= fx + col_value_w &&
 								mp.y >= row_y && mp.y <= row_y + line_h) {
 								ui.editing_field = fi;
+								ui.edit_base_address = st.base_address;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+								ui.edit_target_pid = 4242;
+#else
+								ui.edit_target_pid = driver_bridge::attached_pid();
+#endif
 								std::strncpy(ui.edit_value_buf, cv.display_text.c_str(),
 											 sizeof(ui.edit_value_buf) - 1);
 								ui.edit_value_buf[sizeof(ui.edit_value_buf) - 1] = '\0';
@@ -956,6 +1015,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		ImGui::PopClipRect();
 
+		if (!ctx_open_request && ui.table_focused && ui.selected_field >= 0 &&
+			(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+				(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+			ctx_open_request = true;
+			ctx_open_field = ui.selected_field;
+		}
+
 		if (pending_edit.target != edit_target_t::none && pending_edit.field_idx >= 0) {
 			ui.edit_target = pending_edit.target;
 			ui.edit_target_field = pending_edit.field_idx;
@@ -969,6 +1035,22 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 		if (ctx_open_request && ctx_open_field >= 0) {
 			ui.edit_target_field = ctx_open_field;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				if (struct_dissector::valid_index(active_idx, st.structs.size())) {
+					const auto& selected = st.structs[static_cast<std::size_t>(active_idx)];
+					if (struct_dissector::valid_index(ctx_open_field, selected.fields.size()))
+						publish_field_selection(selected.name,
+							selected.fields[static_cast<std::size_t>(ctx_open_field)]);
+				}
+			}
+			ui.context_refresh_seq = st.last_completed_seq.load(std::memory_order_acquire);
+			ui.context_base_address = st.base_address;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			ui.context_target_pid = 4242;
+#else
+			ui.context_target_pid = driver_bridge::attached_pid();
+#endif
 			ImGui::OpenPopup("##sd_field_ctx");
 			diag::log_tagged_fmt("dissector",
 				"field_ctx_open field_idx=%d", ctx_open_field);
@@ -1033,8 +1115,75 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ui.edit_target = edit_target_t::none;
 		}
 
+		bool open_remove_confirmation = false;
 		if (ImGui::BeginPopup("##sd_field_ctx")) {
 			int tgt_field = ui.edit_target_field;
+			struct_dissector::field_def_t field_snapshot;
+			struct_dissector::live_value_t value_snapshot;
+			bool valid_field = false;
+			{
+				std::lock_guard<std::mutex> lk(st.mtx);
+				if (struct_dissector::valid_index(active_idx, st.structs.size())) {
+					const auto& fields = st.structs[static_cast<std::size_t>(active_idx)].fields;
+					if (struct_dissector::valid_index(tgt_field, fields.size())) {
+						field_snapshot = fields[static_cast<std::size_t>(tgt_field)];
+						if (static_cast<std::size_t>(tgt_field) < st.cached_values.size())
+							value_snapshot = st.cached_values[static_cast<std::size_t>(tgt_field)];
+						valid_field = true;
+					}
+				}
+			}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const bool live_current = valid_field;
+#else
+			const bool live_current = valid_field && driver_bridge::is_loaded() &&
+				driver_bridge::attached_pid() != 0 &&
+				driver_bridge::attached_pid() == ui.context_target_pid &&
+				st.base_address == ui.context_base_address &&
+				st.last_completed_seq.load(std::memory_order_acquire) == ui.context_refresh_seq;
+#endif
+			auto unavailable = [](const char* label, const char* reason) {
+				ImGui::MenuItem(label, nullptr, false, false);
+				if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+					ImGui::SetTooltip("%s", reason);
+			};
+			ImGui::TextDisabled("%s  |  +0x%X  |  %s",
+				live_current ? "Live process" : "Structure definition",
+				field_snapshot.offset,
+				valid_field ? struct_dissector::field_type_name(field_snapshot.type) : "stale field");
+			if (!valid_field)
+				ImGui::TextDisabled("The structure changed; select the field again.");
+			ImGui::Separator();
+			if (ImGui::MenuItem("Copy field name", "Ctrl+C", false, valid_field))
+				ImGui::SetClipboardText(field_snapshot.name.c_str());
+			if (ImGui::MenuItem("Copy offset", nullptr, false, valid_field)) {
+				char text[24]{};
+				std::snprintf(text, sizeof(text), "0x%X", field_snapshot.offset);
+				ImGui::SetClipboardText(text);
+			}
+			if (ImGui::MenuItem("Copy absolute address", nullptr, false,
+					valid_field && ui.context_base_address != 0)) {
+				char text[32]{};
+				std::snprintf(text, sizeof(text), "0x%016llX",
+					static_cast<unsigned long long>(ui.context_base_address + field_snapshot.offset));
+				ImGui::SetClipboardText(text);
+			}
+			if (ImGui::MenuItem("Copy current value", nullptr, false,
+					live_current && !value_snapshot.display_text.empty()))
+				ImGui::SetClipboardText(value_snapshot.display_text.c_str());
+			ImGui::Separator();
+			if (ImGui::MenuItem("Edit live value...", nullptr, false,
+					live_current && !value_snapshot.raw_bytes.empty())) {
+				ui.editing_field = tgt_field;
+				ui.edit_target_pid = ui.context_target_pid;
+				ui.edit_base_address = ui.context_base_address;
+				std::strncpy(ui.edit_value_buf, value_snapshot.display_text.c_str(),
+					sizeof(ui.edit_value_buf) - 1);
+				ui.edit_value_buf[sizeof(ui.edit_value_buf) - 1] = '\0';
+			}
+			if (!live_current)
+				unavailable("Refresh live value", "Attach the original target and reselect the field before reading live memory.");
+			ImGui::Separator();
 			if (ImGui::MenuItem("Rename field...")) {
 				std::string seed;
 				{
@@ -1089,13 +1238,37 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 				ImGui::EndMenu();
 			}
+			unavailable("Set array count...", "The current structure backend does not expose array-count mutation.");
+			unavailable("Choose nested structure...", "Nested-structure linkage is not implemented by the current backend.");
+			unavailable("Configure bitfield...", "The current field model has no bitfield layout representation.");
+			unavailable("Set alignment...", "Alignment and packing are not represented by the current structure backend.");
 			ImGui::Separator();
-			if (ImGui::MenuItem("Remove field")) {
-				if (tgt_field >= 0) {
-					struct_dissector::remove_field(active_idx, tgt_field);
-					if (ui.selected_field == tgt_field) ui.selected_field = -1;
-					if (ui.editing_field == tgt_field) ui.editing_field = -1;
+			if (ImGui::MenuItem("Remove field...", nullptr, false, valid_field)) {
+				ui.pending_remove_field = tgt_field;
+				open_remove_confirmation = true;
+			}
+			ImGui::EndPopup();
+		}
+		if (open_remove_confirmation)
+			ImGui::OpenPopup("##sd_confirm_remove_field");
+
+		if (ImGui::BeginPopupModal("##sd_confirm_remove_field", nullptr,
+			ImGuiWindowFlags_AlwaysAutoResize)) {
+			ImGui::TextUnformatted("Remove this field from the structure definition?");
+			ImGui::TextDisabled("This backend has no field-removal undo journal.");
+			if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
+				ui.pending_remove_field = -1;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Remove", ImVec2(110.f, 0.f))) {
+				const int target = ui.pending_remove_field;
+				if (target >= 0 && struct_dissector::remove_field(active_idx, target)) {
+					if (ui.selected_field == target) ui.selected_field = -1;
+					if (ui.editing_field == target) ui.editing_field = -1;
 				}
+				ui.pending_remove_field = -1;
+				ImGui::CloseCurrentPopup();
 			}
 			ImGui::EndPopup();
 		}

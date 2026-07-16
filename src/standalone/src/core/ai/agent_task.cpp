@@ -7,11 +7,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -27,6 +27,8 @@
 #include "cost_calculator.hpp"
 #include "provider_catalog.hpp"
 #include "../infra/executor.hpp"
+#include "../ui/task_center.hpp"
+#include "../ui/application_view_registry.hpp"
 
 #include "../helpers/diag_log.hpp"
 
@@ -92,6 +94,93 @@ namespace task {
 			return latest_id;
 		}
 
+		class ai_task_completion_t
+		{
+		public:
+			void publish(standalone_ai_client_t::cancellation_handle_t handle)
+			{
+				bool cancel_now = false;
+				auto published = handle;
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					if (_done)
+						return;
+					_handle = std::move(handle);
+					cancel_now = _cancel_requested;
+				}
+				if (cancel_now)
+					published.cancel();
+			}
+
+			void finish() noexcept
+			{
+				try {
+					std::lock_guard<std::mutex> lock(_mutex);
+					_handle = {};
+					_done = true;
+					_cv.notify_all();
+				} catch (...) {
+				}
+			}
+
+			void request_cancel()
+			{
+				standalone_ai_client_t::cancellation_handle_t handle;
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					if (_done || _cancel_requested)
+						return;
+					_cancel_requested = true;
+					handle = _handle;
+				}
+				handle.cancel();
+			}
+
+			void wait(std::atomic<bool>* cancel_flag)
+			{
+				std::unique_lock<std::mutex> lock(_mutex);
+				while (!_done) {
+					if (!_cancel_requested && cancel_flag != nullptr &&
+						cancel_flag->load(std::memory_order_acquire)) {
+						_cancel_requested = true;
+						auto handle = _handle;
+						lock.unlock();
+						handle.cancel();
+						lock.lock();
+					}
+					if (_cancel_requested)
+						_cv.wait(lock, [this]() noexcept { return _done; });
+					else
+						_cv.wait_for(lock, std::chrono::milliseconds(50),
+							[this]() noexcept { return _done; });
+				}
+			}
+
+		private:
+			std::mutex _mutex;
+			std::condition_variable _cv;
+			standalone_ai_client_t::cancellation_handle_t _handle;
+			bool _cancel_requested = false;
+			bool _done = false;
+		};
+
+		class ai_task_finish_guard_t
+		{
+		public:
+			explicit ai_task_finish_guard_t(std::shared_ptr<ai_task_completion_t> completion)
+				: _completion(std::move(completion))
+			{
+			}
+
+			~ai_task_finish_guard_t()
+			{
+				_completion->finish();
+			}
+
+		private:
+			std::shared_ptr<ai_task_completion_t> _completion;
+		};
+
 	}
 
 	const std::string& last_error()
@@ -118,12 +207,11 @@ namespace task {
 
 		aida::agent::agent_info_t agent = *agent_info;
 
-		std::atomic<bool> done{false};
+		auto completion = std::make_shared<ai_task_completion_t>();
 		std::string thread_result;
 		std::string thread_error;
 		std::string sub_session_id;
 		bool         aborted = false;
-		std::atomic<standalone_ai_client_t*> active_client_ptr{nullptr};
 
 		auto is_cancelled = [cancel_flag]() -> bool {
 			return cancel_flag != nullptr &&
@@ -138,28 +226,27 @@ namespace task {
 		sub.thread_class = "bounded_task";
 		sub.domain = aida::infra::executor::domain_t::external_tool;
 		sub.priority = 3;
-		sub.body = [&, ws]() {
+		sub.cancel_hook = [completion] { completion->request_cancel(); };
+		sub.body = [&, ws, completion]() {
+			ai_task_finish_guard_t finish_guard(completion);
 			std::unique_ptr<standalone_ai_client_t> local_client;
 			try {
 				local_client = std::make_unique<standalone_ai_client_t>(g_sa_settings);
 			} catch (const std::exception& ex) {
 				thread_error = std::string("Failed to construct subagent AI client: ") + ex.what();
 				thread_result = "Error: " + thread_error;
-				done.store(true, std::memory_order_release);
 				return;
 			} catch (...) {
 				thread_error = "Failed to construct subagent AI client: unknown exception";
 				thread_result = "Error: " + thread_error;
-				done.store(true, std::memory_order_release);
 				return;
 			}
 
-			active_client_ptr.store(local_client.get(), std::memory_order_release);
+			completion->publish(local_client->cancellation_handle());
 
 			if (!local_client || !local_client->is_available()) {
 				thread_error = "subagent AI client is not available";
 				thread_result = "Error: " + thread_error;
-				done.store(true, std::memory_order_release);
 				return;
 			}
 
@@ -360,33 +447,30 @@ namespace task {
 				thread_error = "Unknown exception in subagent thread";
 				thread_result = "Error: " + thread_error;
 			}
-			active_client_ptr.store(nullptr, std::memory_order_release);
-			done.store(true, std::memory_order_release);
 		};
-		const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
+		const auto submission = aida::infra::executor::submit(std::move(sub));
+		const bool posted = submission.submitted;
+		if (posted && submission.task_id != 0) {
+			aida::ui::task_center::task_registration_t registration;
+			registration.owner = "automation.agent";
+			registration.owner_view = "view.ai.agents";
+			registration.owner_action = "agent_task.execute";
+			registration.session = parent_session_id;
+			registration.label = "Agent: " + agent.name;
+			registration.stage = "Running agent workflow";
+			registration.cancellation_is_safe = true;
+			registration.callbacks.focus = [] {
+				(void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.ai.agents"));
+			};
+			(void)aida::ui::task_center::register_executor_job(submission.task_id, std::move(registration));
+		}
 		if (!posted) {
 			thread_error = "failed to schedule subagent AI worker";
 			thread_result = "Error: " + thread_error;
-			done.store(true, std::memory_order_release);
+			completion->finish();
 		}
 
-		if (cancel_flag != nullptr) {
-			bool propagated = false;
-			while (!done.load(std::memory_order_acquire)) {
-				if (!propagated &&
-				    cancel_flag->load(std::memory_order_acquire)) {
-					standalone_ai_client_t* cli =
-						active_client_ptr.load(std::memory_order_acquire);
-					if (cli != nullptr) cli->cancel();
-					propagated = true;
-				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
-			}
-		} else {
-			while (!done.load(std::memory_order_acquire)) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
-			}
-		}
+		completion->wait(cancel_flag);
 
 		if (!parent_session_id.empty() && !sub_session_id.empty()) {
 			const std::string parent_msg_id = find_latest_assistant_message_id(parent_session_id);

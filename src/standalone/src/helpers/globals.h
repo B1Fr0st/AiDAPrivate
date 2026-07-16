@@ -93,16 +93,11 @@ enum class center_view_t : int {
 	graph_view,
 	image_view,
 	test_lab,
-	workbench
+	workbench,
+	functions_panel,
+	xref_database
 };
 
-
-enum class activity_item_t : int {
-	explorer = 0,
-	search,
-	recent,
-	COUNT
-};
 
 enum class bottom_tab_t : int {
 	output = 0,
@@ -145,6 +140,7 @@ namespace output_log {
 			case 14: return "state_guard_snapshot";
 			case 15: return "state_guard_restore";
 			case 16: return "try_clear";
+			case 17: return "try_set_auto_scroll";
 			default: return "unknown";
 		}
 	}
@@ -320,6 +316,15 @@ namespace output_log {
 		++version[idx];
 		return true;
 	}
+	inline bool try_set_auto_scroll(bottom_tab_t tab, bool enabled) {
+		int idx = tab_index(tab);
+		std::unique_lock<std::mutex> lk(mutex, std::try_to_lock);
+		if (!lk.owns_lock())
+			return false;
+		owner_scope owner(17, idx);
+		auto_scroll[idx] = enabled;
+		return true;
+	}
 }
 
 
@@ -460,8 +465,6 @@ namespace conversations {
 
 void tick_ai_chat();
 void poll_ai_chat();
-void render_settings_inline(float panel_w, float panel_h);
-extern bool g_settings_open;
 
 inline ImFont* g_code_font = nullptr;
 
@@ -532,7 +535,11 @@ namespace file_browser
 }
 
 
-namespace code_editor_widget { void on_text_changed(); }
+namespace code_editor_widget {
+	void on_text_changed();
+	void get_caret(int& line, int& col);
+	void set_caret(int line, int col);
+}
 
 namespace code_editor
 {
@@ -670,24 +677,6 @@ namespace globals
 
 		inline float test2 = 0.0f;
 
-
-		inline float panel_left_w  = 220.f;
-		inline float panel_right_w = 350.f;
-		inline float panel_bottom_h = 180.f;
-
-		inline bool  panel_left_visible   = true;
-		inline bool  panel_right_visible  = true;
-		inline bool  panel_bottom_visible = false;
-
-		inline bool  dragging_left_splitter  = false;
-		inline bool  dragging_right_splitter = false;
-		inline bool  dragging_bottom_splitter = false;
-
-		inline bottom_tab_t active_bottom_tab = bottom_tab_t::output;
-
-
-		inline activity_item_t active_activity = activity_item_t::explorer;
-		inline constexpr float activity_bar_w = 56.f;
 
 		inline center_view_t active_center_view = center_view_t::welcome;
 
@@ -894,22 +883,30 @@ namespace editor_config {
 
 
 namespace cost_tracking {
-	inline int64_t session_input_tokens   = 0;
-	inline int64_t session_output_tokens  = 0;
-	inline int64_t session_cache_read     = 0;
-	inline int64_t session_cache_write    = 0;
-	inline int64_t session_thinking_tokens = 0;
-	inline double  session_cost_usd       = 0.0;
-	inline int     session_request_count  = 0;
-	inline std::string session_provider;
+	struct usage_snapshot_t {
+		int64_t input_tokens = 0;
+		int64_t output_tokens = 0;
+		int64_t cache_read = 0;
+		int64_t cache_write = 0;
+		int64_t thinking_tokens = 0;
+		double cost_usd = 0.0;
+		int request_count = 0;
+		std::string provider;
+	};
+
+	namespace detail {
+		inline std::mutex mutex;
+		inline usage_snapshot_t value;
+	}
+
+	inline usage_snapshot_t snapshot() {
+		std::lock_guard<std::mutex> lock(detail::mutex);
+		return detail::value;
+	}
 
 	inline void reset() {
-		session_input_tokens = session_output_tokens = 0;
-		session_cache_read = session_cache_write = 0;
-		session_thinking_tokens = 0;
-		session_cost_usd = 0.0;
-		session_request_count = 0;
-		session_provider.clear();
+		std::lock_guard<std::mutex> lock(detail::mutex);
+		detail::value = {};
 	}
 
 	inline double estimate_cost(const std::string& model, int64_t in_tok, int64_t out_tok,
@@ -939,13 +936,15 @@ namespace cost_tracking {
 
 	inline void accumulate(const std::string& model, int64_t in_tok, int64_t out_tok,
 	                        int64_t cache_read = 0, int64_t cache_write = 0, int64_t thinking = 0) {
-		session_input_tokens += in_tok;
-		session_output_tokens += out_tok;
-		session_cache_read += cache_read;
-		session_cache_write += cache_write;
-		session_thinking_tokens += thinking;
-		session_cost_usd += estimate_cost(model, in_tok, out_tok, cache_read, cache_write);
-		++session_request_count;
+		std::lock_guard<std::mutex> lock(detail::mutex);
+		detail::value.input_tokens += in_tok;
+		detail::value.output_tokens += out_tok;
+		detail::value.cache_read += cache_read;
+		detail::value.cache_write += cache_write;
+		detail::value.thinking_tokens += thinking;
+		detail::value.cost_usd += estimate_cost(model, in_tok, out_tok, cache_read, cache_write);
+		++detail::value.request_count;
+		detail::value.provider = model;
 	}
 
 	inline std::string format_tokens(int64_t count) {
@@ -955,8 +954,9 @@ namespace cost_tracking {
 	}
 
 	inline std::string format_cost() {
+		const auto current = snapshot();
 		char buf[32];
-		snprintf(buf, sizeof(buf), "$%.4f", session_cost_usd);
+		snprintf(buf, sizeof(buf), "$%.4f", current.cost_usd);
 		return buf;
 	}
 }
@@ -968,11 +968,36 @@ struct OpenTab {
 	std::string buffer;
 	bool        buffer_loaded = false;
 	bool        dirty          = false;
+	std::uint64_t document_id  = 0;
+	std::uint32_t group_id     = 0;
+	bool          pinned       = false;
+	std::int64_t  disk_write_version = 0;
+	bool          external_conflict = false;
+	bool          external_overwrite_approved = false;
+	int           caret_line = 0;
+	int           caret_column = 0;
 };
 
 namespace file_tabs {
+	struct navigation_entry_t {
+		std::uint64_t document_id = 0;
+		int caret_line = 0;
+		int caret_column = 0;
+	};
+
+	struct group_navigation_t {
+		std::deque<navigation_entry_t> back;
+		std::deque<navigation_entry_t> forward;
+	};
+
 	inline std::vector<OpenTab> tabs;
 	inline int active_tab = -1;
+	inline std::uint64_t next_document_id = 1;
+	inline std::uint32_t next_group_id = 1;
+	inline std::unordered_map<std::uint32_t, std::uint64_t> active_document_by_group;
+	inline std::unordered_map<std::uint32_t, group_navigation_t> navigation_by_group;
+	inline std::uint64_t last_external_poll_ms = 0;
+	inline std::size_t external_poll_index = 0;
 	inline int  pending_close_idx = -1;
 	inline bool show_close_confirm = false;
 	inline float close_confirm_anim = 0.f;
@@ -1077,6 +1102,132 @@ namespace file_tabs {
 		return static_cast<size_t>(idx);
 	}
 
+	inline std::int64_t disk_write_version(const std::string& fpath) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		(void)fpath;
+		return 0;
+#else
+		if (fpath.empty()) return 0;
+		std::error_code ec;
+		const auto value = std::filesystem::last_write_time(fpath, ec);
+		return ec ? 0 : static_cast<std::int64_t>(value.time_since_epoch().count());
+#endif
+	}
+
+	inline void poll_external_changes() {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		const std::uint64_t now = aida::shell_platform::tick_ms();
+		if (tabs.empty() || now - last_external_poll_ms < 1000)
+			return;
+		last_external_poll_ms = now;
+		external_poll_index %= tabs.size();
+		auto& tab = tabs[external_poll_index++];
+		if (tab.filepath.empty()) return;
+		const std::int64_t observed = disk_write_version(tab.filepath);
+		if (observed == 0) return;
+		if (tab.disk_write_version == 0) {
+			tab.disk_write_version = observed;
+			return;
+		}
+		if (observed != tab.disk_write_version) {
+			tab.external_conflict = true;
+			tab.external_overwrite_approved = false;
+		}
+#endif
+	}
+
+	inline void load_tab_into_editor(int idx);
+
+	inline bool reload_external(int idx) {
+		if (!is_valid_tab_index(idx)) return false;
+		auto& tab = tabs[tab_index(idx)];
+		if (tab.dirty || tab.filepath.empty()) return false;
+		tab.buffer.clear();
+		tab.buffer_loaded = false;
+		tab.external_conflict = false;
+		tab.external_overwrite_approved = false;
+		tab.disk_write_version = disk_write_version(tab.filepath);
+		if (idx == active_tab)
+			load_tab_into_editor(idx);
+		return true;
+	}
+
+	inline bool keep_editor_version(int idx) {
+		if (!is_valid_tab_index(idx)) return false;
+		auto& tab = tabs[tab_index(idx)];
+		if (!tab.external_conflict) return false;
+		tab.disk_write_version = disk_write_version(tab.filepath);
+		tab.external_conflict = false;
+		tab.external_overwrite_approved = true;
+		return true;
+	}
+
+	inline void normalize_document_identities() {
+		std::uint64_t maximum_document_id = 0;
+		std::uint32_t maximum_group_id = 0;
+		std::vector<std::uint64_t> identities;
+		identities.reserve(tabs.size());
+		for (auto& tab : tabs) {
+			if (tab.document_id == 0 ||
+				std::find(identities.begin(), identities.end(), tab.document_id) != identities.end())
+				tab.document_id = next_document_id++;
+			identities.push_back(tab.document_id);
+			maximum_document_id = (std::max)(maximum_document_id, tab.document_id);
+			maximum_group_id = (std::max)(maximum_group_id, tab.group_id);
+			if (active_document_by_group.find(tab.group_id) == active_document_by_group.end())
+				active_document_by_group.emplace(tab.group_id, tab.document_id);
+		}
+		next_document_id = (std::max)(next_document_id, maximum_document_id + 1);
+		next_group_id = (std::max)(next_group_id, maximum_group_id + 1);
+	}
+
+	inline int find_document(std::uint64_t document_id) {
+		for (std::size_t index = 0; index < tabs.size(); ++index)
+			if (tabs[index].document_id == document_id)
+				return static_cast<int>(index);
+		return -1;
+	}
+
+	inline std::string group_instance_key(std::uint32_t group_id) {
+		return std::string("group.") + std::to_string(group_id);
+	}
+
+	inline int active_in_group(std::uint32_t group_id) {
+		normalize_document_identities();
+		const auto selected = active_document_by_group.find(group_id);
+		if (selected != active_document_by_group.end()) {
+			const int index = find_document(selected->second);
+			if (is_valid_tab_index(index) && tabs[tab_index(index)].group_id == group_id)
+				return index;
+		}
+		for (std::size_t index = 0; index < tabs.size(); ++index) {
+			if (tabs[index].group_id == group_id) {
+				active_document_by_group[group_id] = tabs[index].document_id;
+				return static_cast<int>(index);
+			}
+		}
+		return -1;
+	}
+
+	inline void record_navigation(int from_index) {
+		if (!is_valid_tab_index(from_index)) return;
+		normalize_document_identities();
+		const auto& source = tabs[tab_index(from_index)];
+		int line = 0;
+		int column = 0;
+		if (from_index == active_tab && code_editor::active)
+			code_editor_widget::get_caret(line, column);
+		auto& history = navigation_by_group[source.group_id];
+		if (!history.back.empty() && history.back.back().document_id == source.document_id &&
+			history.back.back().caret_line == line && history.back.back().caret_column == column)
+			return;
+		history.back.push_back({source.document_id, line, column});
+		constexpr std::size_t k_navigation_capacity = 128;
+		if (history.back.size() > k_navigation_capacity)
+			history.back.pop_front();
+		history.forward.clear();
+	}
+
 	inline void snapshot_active_to_tab() {
 		if (!is_valid_tab_index(active_tab)) return;
 		if (!code_editor::active) return;
@@ -1085,6 +1236,7 @@ namespace file_tabs {
 		t.buffer = code_editor::get_content();
 		t.buffer_loaded = true;
 		t.dirty = code_editor::dirty;
+		code_editor_widget::get_caret(t.caret_line, t.caret_column);
 	}
 
 	inline void load_tab_into_editor(int idx) {
@@ -1093,13 +1245,15 @@ namespace file_tabs {
 		if (t.buffer_loaded) {
 			code_editor::load(t.buffer, t.filename, t.filepath);
 			code_editor::dirty = t.dirty;
+			code_editor_widget::set_caret(t.caret_line, t.caret_column);
 			return;
 		}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		t.buffer.clear();
 		t.buffer_loaded = true;
-		t.dirty = false;
-		code_editor::load(t.buffer, t.filename, t.filepath);
+			t.dirty = false;
+			code_editor::load(t.buffer, t.filename, t.filepath);
+			code_editor_widget::set_caret(t.caret_line, t.caret_column);
 #else
 		std::error_code ec;
 		uintmax_t fsize = t.filepath.empty() ? 0 : std::filesystem::file_size(t.filepath, ec);
@@ -1157,21 +1311,77 @@ namespace file_tabs {
 #endif
 	}
 
-	inline void switch_to(int idx) {
+	inline void switch_to(int idx, bool record_history = true) {
 		if (!is_valid_tab_index(idx)) return;
+		normalize_document_identities();
 		if (idx == active_tab && code_editor::active &&
 		    code_editor::filepath == tabs[tab_index(idx)].filepath) {
 			return;
 		}
+		if (record_history)
+			record_navigation(active_tab);
 		snapshot_active_to_tab();
 		active_tab = idx;
+		active_document_by_group[tabs[tab_index(idx)].group_id] =
+			tabs[tab_index(idx)].document_id;
 		load_tab_into_editor(idx);
+	}
+
+	inline bool navigate_group_history(std::uint32_t group_id, bool forward) {
+		normalize_document_identities();
+		auto found = navigation_by_group.find(group_id);
+		if (found == navigation_by_group.end()) return false;
+		auto& source = forward ? found->second.forward : found->second.back;
+		auto& destination = forward ? found->second.back : found->second.forward;
+		while (!source.empty()) {
+			const navigation_entry_t target = source.back();
+			source.pop_back();
+			const int target_index = find_document(target.document_id);
+			if (!is_valid_tab_index(target_index) || tabs[tab_index(target_index)].group_id != group_id)
+				continue;
+			if (is_valid_tab_index(active_tab)) {
+				int line = 0;
+				int column = 0;
+				code_editor_widget::get_caret(line, column);
+				destination.push_back({tabs[tab_index(active_tab)].document_id, line, column});
+			}
+			switch_to(target_index, false);
+			code_editor_widget::set_caret(target.caret_line, target.caret_column);
+			tabs[tab_index(target_index)].caret_line = target.caret_line;
+			tabs[tab_index(target_index)].caret_column = target.caret_column;
+			return true;
+		}
+		return false;
+	}
+
+	inline std::uint32_t create_group_for_tab(int idx) {
+		if (!is_valid_tab_index(idx)) return 0;
+		normalize_document_identities();
+		const std::uint32_t group = next_group_id++;
+		tabs[tab_index(idx)].group_id = group;
+		active_document_by_group[group] = tabs[tab_index(idx)].document_id;
+		return group;
+	}
+
+	inline bool move_to_group(int idx, std::uint32_t group_id) {
+		if (!is_valid_tab_index(idx)) return false;
+		normalize_document_identities();
+		const std::uint32_t old_group = tabs[tab_index(idx)].group_id;
+		if (old_group == group_id) return true;
+		const std::uint64_t document_id = tabs[tab_index(idx)].document_id;
+		tabs[tab_index(idx)].group_id = group_id;
+		active_document_by_group[group_id] = document_id;
+		if (active_document_by_group[old_group] == document_id)
+			active_document_by_group.erase(old_group);
+		active_in_group(old_group);
+		return true;
 	}
 
 	inline bool save_tab_to_disk(int idx) {
 		if (!is_valid_tab_index(idx)) return false;
 		auto& t = tabs[tab_index(idx)];
 		if (t.filepath.empty()) return false;
+		if (t.external_conflict && !t.external_overwrite_approved) return false;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		if (idx == active_tab && code_editor::active && code_editor::filepath == t.filepath) {
 			t.buffer = code_editor::get_content();
@@ -1179,6 +1389,9 @@ namespace file_tabs {
 			code_editor::dirty = false;
 		}
 		t.dirty = false;
+		t.external_conflict = false;
+		t.external_overwrite_approved = false;
+		t.disk_write_version = disk_write_version(t.filepath);
 		return true;
 #else
 		if (!standalone_license::is_valid()) return false;
@@ -1201,6 +1414,9 @@ namespace file_tabs {
 		fwrite(t.buffer.data(), 1, t.buffer.size(), f);
 		fclose(f);
 		t.dirty = false;
+		t.external_conflict = false;
+		t.external_overwrite_approved = false;
+		t.disk_write_version = disk_write_version(t.filepath);
 		if (idx == active_tab && code_editor::active &&
 		    code_editor::filepath == t.filepath) {
 			code_editor::dirty = false;
@@ -1221,6 +1437,8 @@ namespace file_tabs {
 				return;
 			}
 		}
+		const std::uint32_t target_group = is_valid_tab_index(active_tab)
+			? tabs[tab_index(active_tab)].group_id : 0;
 		snapshot_active_to_tab();
 		OpenTab t;
 		t.filename = fname;
@@ -1235,22 +1453,56 @@ namespace file_tabs {
 			t.buffer_loaded = true;
 			t.dirty = false;
 		}
+		t.group_id = target_group;
+		t.disk_write_version = disk_write_version(fpath);
 		tabs.push_back(std::move(t));
 		active_tab = static_cast<int>(tabs.size()) - 1;
+		normalize_document_identities();
 		auto& nt = tabs[tab_index(active_tab)];
+		active_document_by_group[nt.group_id] = nt.document_id;
 		code_editor::load(nt.buffer, nt.filename, nt.filepath);
 		code_editor::dirty = nt.dirty;
 	}
 
 	inline void close_tab(int idx) {
 		if (!is_valid_tab_index(idx)) return;
+		normalize_document_identities();
+		const std::uint64_t removed_document = tabs[tab_index(idx)].document_id;
+		const std::uint32_t removed_group = tabs[tab_index(idx)].group_id;
 		bool was_active = (idx == active_tab);
 		tabs.erase(tabs.begin() + static_cast<std::vector<OpenTab>::difference_type>(idx));
-		if (active_tab >= static_cast<int>(tabs.size())) active_tab = static_cast<int>(tabs.size()) - 1;
-		else if (idx < active_tab) active_tab--;
+		for (auto& entry : navigation_by_group) {
+			auto erase_removed = [removed_document](std::deque<navigation_entry_t>& history) {
+				history.erase(std::remove_if(history.begin(), history.end(),
+					[removed_document](const navigation_entry_t& value) {
+						return value.document_id == removed_document;
+					}), history.end());
+			};
+			erase_removed(entry.second.back);
+			erase_removed(entry.second.forward);
+		}
+		if (active_document_by_group[removed_group] == removed_document)
+			active_document_by_group.erase(removed_group);
+		if (was_active) {
+			active_tab = -1;
+			for (std::size_t index = 0; index < tabs.size(); ++index) {
+				if (tabs[index].group_id == removed_group) {
+					active_tab = static_cast<int>(index);
+					break;
+				}
+			}
+			if (active_tab < 0 && !tabs.empty())
+				active_tab = (std::min)(idx, static_cast<int>(tabs.size()) - 1);
+		} else if (active_tab >= static_cast<int>(tabs.size())) {
+			active_tab = static_cast<int>(tabs.size()) - 1;
+		} else if (idx < active_tab) {
+			active_tab--;
+		}
 		if (is_valid_tab_index(active_tab)) {
 			if (was_active || code_editor::filepath != tabs[tab_index(active_tab)].filepath)
 				load_tab_into_editor(active_tab);
+			active_document_by_group[tabs[tab_index(active_tab)].group_id] =
+				tabs[tab_index(active_tab)].document_id;
 		} else {
 			code_editor::active = false;
 			code_editor::buffer.clear();

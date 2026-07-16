@@ -9,8 +9,13 @@
 #include "../infra/taskflow_runtime.hpp"
 #include "executor_status.hpp"
 #endif
+#include "../ui/task_center.hpp"
+#include "../ui/application_view_registry.hpp"
+#include "../ai/standalone_chat.hpp"
 #include "standalone_driver.hpp"
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../runtime/standalone_license.hpp"
+#endif
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
@@ -64,6 +69,7 @@
 #include "burp/collaborator_view.hpp"
 #include "burp/sequencer_view.hpp"
 #include "burp/comparer_view.hpp"
+#include "burp/comparer.hpp"
 #include "burp/jwt_lab_view.hpp"
 #include "burp/match_replace_view.hpp"
 #include "burp/session_handler_view.hpp"
@@ -134,6 +140,12 @@
 #include <utility>
 #include <vector>
 
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+namespace network_open_dialog = aida::preview::network_dialog;
+#else
+namespace network_open_dialog = win32_dialog;
+#endif
+
 namespace network_view {
 
 using json = nlohmann::json;
@@ -181,6 +193,69 @@ struct capture_table_snapshot_t {
     int selected_index = -1;
     std::vector<capture_row_snapshot_t> rows;
 };
+
+struct capture_context_t {
+    int packet_index = -1;
+    uint64_t timestamp = 0;
+};
+
+struct proxy_context_t {
+    uint64_t exchange_id = 0;
+    uint64_t timestamp = 0;
+};
+
+struct websocket_context_t {
+    uint64_t timestamp = 0;
+    uint64_t exchange_id = 0;
+    size_t payload_size = 0;
+    bool outbound = false;
+    uint8_t opcode = 0;
+};
+
+static capture_context_t s_capture_context;
+static proxy_context_t s_proxy_context;
+static websocket_context_t s_websocket_context;
+static std::atomic<std::uint64_t> s_repeater_artifact_sequence{1};
+
+static std::uint64_t artifact_hash(const std::vector<std::uint8_t>& bytes) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const std::uint8_t value : bytes) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    hash ^= static_cast<std::uint64_t>(bytes.size());
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+static artifact_identity_t exchange_artifact_identity(const mitm_proxy::http_exchange& exchange,
+                                                       artifact_kind_t kind) {
+    artifact_identity_t identity;
+    identity.kind = kind;
+    identity.source_id = exchange.id;
+    identity.timestamp = exchange.timestamp;
+    identity.target_host = exchange.target_host;
+    identity.target_port = exchange.target_port;
+    identity.use_tls = exchange.is_tls;
+    identity.parent_id = "network.exchange." + std::to_string(exchange.id);
+    const bool response = kind == artifact_kind_t::response;
+    identity.id = identity.parent_id + (response ? ".response" : ".request");
+    identity.source_view_id = "view.network.proxy";
+    identity.label = std::string(response ? "Response #" : "Request #") + std::to_string(exchange.id);
+    const auto& bytes = response ? exchange.raw_response : exchange.raw_request;
+    identity.content_size = bytes.size();
+    identity.content_hash = artifact_hash(bytes);
+    return identity;
+}
+
+static bool menu_item_disabled(const char* label, const char* reason) {
+    ImGui::BeginDisabled();
+    ImGui::MenuItem(label);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", reason);
+    return false;
+}
 
 static ImU32 status_code_color(int code) {
     const auto& t = aida::ui::resolved();
@@ -311,6 +386,44 @@ static bool post_network_task(const char* name,
         };
         auto submit_result = aida::infra::executor::submit(std::move(sub));
         bool ok = submit_result.submitted;
+        if (ok && submit_result.task_id != 0) {
+            const std::string task_label = [&task_name] {
+                std::string label;
+                label.reserve(task_name.size());
+                bool capitalize = true;
+                for (const char character : task_name) {
+                    if (character == '_' || character == '.') {
+                        label.push_back(' ');
+                        capitalize = true;
+                    } else {
+                        label.push_back(capitalize
+                            ? static_cast<char>(std::toupper(static_cast<unsigned char>(character)))
+                            : character);
+                        capitalize = false;
+                    }
+                }
+                return label.empty() ? std::string("Network task") : label;
+            }();
+            std::string owner_view = "view.network.connections";
+            if (task_name.find("capture") != std::string::npos) owner_view = "view.network.capture";
+            else if (task_name.find("repeater") != std::string::npos) owner_view = "view.network.repeater";
+            else if (task_name.find("fuzzer") != std::string::npos) owner_view = "view.network.fuzzer";
+            else if (task_name.find("offensive") != std::string::npos) owner_view = "view.network.offensive";
+            else if (task_name.find("pcap") != std::string::npos) owner_view = "view.network.pcap";
+            else if (task_name.find("har") != std::string::npos) owner_view = "view.network.proxy";
+            else if (task_name.find("script") != std::string::npos) owner_view = "view.network.scripting";
+            aida::ui::task_center::task_registration_t registration;
+            registration.owner = "network";
+            registration.owner_view = owner_view;
+            registration.owner_action = task_name;
+            registration.label = task_label;
+            registration.stage = "Queued";
+            registration.cancellation_is_safe = false;
+            registration.callbacks.focus = [owner_view] {
+                (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(owner_view));
+            };
+            (void)aida::ui::task_center::register_executor_job(submit_result.task_id, std::move(registration));
+        }
         diag::log_tagged_fmt("network", "executor_post name=%s domain=%s ok=%d reject=%s",
             name ? name : "?",
             aida::infra::executor::domain_name(domain),
@@ -2353,12 +2466,19 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, transparent);
                     ImGui::PushStyleColor(ImGuiCol_HeaderActive, transparent);
                     float row_h = ImGui::GetTextLineHeight() + ImGui::GetStyle().CellPadding.y * 2.f;
+                    bool open_context = false;
                     if (ImGui::Selectable("##row_select", selected, sel_flags, ImVec2(0.f, row_h))) {
                         pending_selection = row.packet_index;
                         cap_snapshot.selected_index = row.packet_index;
                         selected = true;
                         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
                                                aida::ui::with_alpha(th.selection, r_alpha * 0.55f));
+                    }
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                        s_capture_context.packet_index = row.packet_index;
+                        s_capture_context.timestamp = row.timestamp;
+                        pending_selection = row.packet_index;
+                        open_context = true;
                     }
                     bool hovered = ImGui::IsItemHovered();
                     ImGui::PopStyleColor(3);
@@ -2409,6 +2529,8 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                     table_text(row.summary, info_col);
 
                     ImGui::PopID();
+                    if (open_context)
+                        ImGui::OpenPopupEx(ImHashStr("aida.network.capture.context"));
                 }
             }
 
@@ -2423,6 +2545,82 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             }
 
             ImGui::EndTable();
+        }
+
+        if (cap_snapshot.selected_index >= 0 &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+             (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+            const auto selected_row = std::find_if(cap_snapshot.rows.begin(), cap_snapshot.rows.end(),
+                [&](const capture_row_snapshot_t& row) {
+                    return row.packet_index == cap_snapshot.selected_index;
+                });
+            if (selected_row != cap_snapshot.rows.end()) {
+                s_capture_context.packet_index = selected_row->packet_index;
+                s_capture_context.timestamp = selected_row->timestamp;
+                ImGui::OpenPopupEx(ImHashStr("aida.network.capture.context"));
+            }
+        }
+
+        if (ImGui::BeginPopupEx(ImHashStr("aida.network.capture.context"), ImGuiWindowFlags_AlwaysAutoResize)) {
+            packet_entry_t packet;
+            bool current = false;
+            {
+                std::lock_guard<std::mutex> lock(state.cap_mutex);
+                if (s_capture_context.packet_index >= 0 &&
+                    s_capture_context.packet_index < static_cast<int>(state.captured_packets.size())) {
+                    const auto& candidate = state.captured_packets[static_cast<size_t>(s_capture_context.packet_index)];
+                    if (candidate.timestamp == s_capture_context.timestamp) {
+                        packet = candidate;
+                        current = true;
+                    }
+                }
+            }
+            if (!current) {
+                menu_item_disabled("Captured packet is stale", "The bounded capture buffer advanced; reopen the menu on a current packet");
+            } else {
+                const std::string src = format_ip(packet.src_addr, 2) + ":" + std::to_string(packet.src_port);
+                const std::string dst = format_ip(packet.dst_addr, 2) + ":" + std::to_string(packet.dst_port);
+                if (ImGui::MenuItem("Copy Summary"))
+                    ImGui::SetClipboardText(packet.summary.c_str());
+                if (ImGui::MenuItem("Copy Source Endpoint"))
+                    ImGui::SetClipboardText(src.c_str());
+                if (ImGui::MenuItem("Copy Destination Endpoint"))
+                    ImGui::SetClipboardText(dst.c_str());
+                if (ImGui::MenuItem("Copy Payload")) {
+                    const std::string payload = payload_display_text(packet.payload, 262144);
+                    ImGui::SetClipboardText(payload.c_str());
+                }
+                ImGui::Separator();
+                artifact_identity_t packet_identity;
+                packet_identity.kind = artifact_kind_t::packet;
+                packet_identity.id = "network.packet." + std::to_string(packet.timestamp) + "." +
+                    std::to_string(s_capture_context.packet_index);
+                packet_identity.source_view_id = "view.network.capture";
+                packet_identity.source_id = static_cast<std::uint64_t>(s_capture_context.packet_index + 1);
+                packet_identity.timestamp = packet.timestamp;
+                packet_identity.content_size = packet.payload.size();
+                packet_identity.content_hash = artifact_hash(packet.payload);
+                packet_identity.label = packet.protocol_label + " packet";
+                std::string handoff_reason;
+                if (ImGui::MenuItem("Send Payload to Comparer"))
+                    (void)send_artifact_to_comparer(packet_identity, handoff_reason);
+                if (ImGui::MenuItem("Add Payload to AI Chat"))
+                    (void)add_artifact_to_chat(packet_identity, handoff_reason);
+                if (ImGui::MenuItem("Assign Payload to Agent"))
+                    (void)assign_artifact_to_agent(packet_identity, handoff_reason);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Filter by PID"))
+                    state.cap_filter_pid = packet.pid;
+                if (ImGui::MenuItem("Filter by Protocol"))
+                    state.cap_filter_protocol = packet.protocol;
+                if (ImGui::MenuItem(state.cap_auto_scroll ? "Disable Follow Tail" : "Enable Follow Tail"))
+                    state.cap_auto_scroll = !state.cap_auto_scroll;
+                ImGui::Separator();
+                menu_item_disabled("Send to Repeater", "A raw driver packet is not necessarily a complete HTTP request; use Proxy history for safe request reconstruction");
+                menu_item_disabled("Replay Packet", "Raw packet replay has no capability-backed human handler in this view");
+            }
+            ImGui::EndPopup();
         }
 
         if (pending_selection >= 0) {
@@ -3069,7 +3267,20 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImGuiTableFlags_Hideable |
         ImGuiTableFlags_SizingStretchProp;
 
-    int visible_rows = 0;
+    static std::vector<int> filtered_history_indices;
+    filtered_history_indices.clear();
+    filtered_history_indices.reserve(history.size());
+    for (int index = 0; index < static_cast<int>(history.size()); ++index) {
+        const auto& exchange = history[static_cast<size_t>(index)];
+        if (state.proxy_filter_text[0]) {
+            const std::string searchable = exchange.target_host + " " + exchange.request.method + " " + exchange.request.uri;
+            if (!filter_text_match(state.proxy_filter_text, searchable))
+                continue;
+        }
+        filtered_history_indices.push_back(index);
+    }
+
+    int visible_rows = static_cast<int>(filtered_history_indices.size());
     if (ImGui::BeginTable("##proxy_history_table", 8, table_flags, ImVec2(w - 4.f, list_h))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 54.f);
@@ -3082,13 +3293,12 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImGui::TableSetupColumn("TLS", ImGuiTableColumnFlags_WidthFixed, 48.f);
         ImGui::TableHeadersRow();
 
-        for (int i = 0; i < static_cast<int>(history.size()); i++) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(filtered_history_indices.size()), 24.f);
+        while (clipper.Step()) {
+        for (int visible_index = clipper.DisplayStart; visible_index < clipper.DisplayEnd; ++visible_index) {
+            const int i = filtered_history_indices[static_cast<size_t>(visible_index)];
             auto& ex = history[static_cast<size_t>(i)];
-
-            if (state.proxy_filter_text[0]) {
-                std::string all = ex.target_host + " " + ex.request.method + " " + ex.request.uri;
-                if (!filter_text_match(state.proxy_filter_text, all)) continue;
-            }
 
             float row_alpha = 1.f;
             float row_yoff = 0.f;
@@ -3108,6 +3318,12 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
                                   ImVec2(0.f, 22.f))) {
                 state.proxy_selected = i;
+            }
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                state.proxy_selected = i;
+                s_proxy_context.exchange_id = ex.id;
+                s_proxy_context.timestamp = ex.timestamp;
+                ImGui::OpenPopupEx(ImHashStr("aida.network.proxy.context"));
             }
             ImGui::PopID();
 
@@ -3147,9 +3363,78 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             ImGui::TableSetColumnIndex(7);
             table_text(ex.is_tls ? "TLS" : "-", ex.is_tls ? aida::ui::with_alpha(th.success, r_alpha)
                                                           : dim_col);
-            ++visible_rows;
+        }
         }
         ImGui::EndTable();
+    }
+
+    if (state.proxy_selected >= 0 && state.proxy_selected < static_cast<int>(history.size()) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+        (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+        const auto& selected = history[static_cast<size_t>(state.proxy_selected)];
+        s_proxy_context.exchange_id = selected.id;
+        s_proxy_context.timestamp = selected.timestamp;
+        ImGui::OpenPopupEx(ImHashStr("aida.network.proxy.context"));
+    }
+
+    if (ImGui::BeginPopupEx(ImHashStr("aida.network.proxy.context"), ImGuiWindowFlags_AlwaysAutoResize)) {
+        const auto found = std::find_if(history.begin(), history.end(), [](const mitm_proxy::http_exchange& exchange) {
+            return exchange.id == s_proxy_context.exchange_id && exchange.timestamp == s_proxy_context.timestamp;
+        });
+        if (found == history.end()) {
+            menu_item_disabled("Request is stale", "Proxy history changed; reopen the menu on a current request");
+        } else {
+            const auto& exchange = *found;
+            const std::string url = std::string(exchange.is_tls ? "https://" : "http://") +
+                exchange.target_host + exchange.request.uri;
+            if (ImGui::MenuItem("Copy URL"))
+                ImGui::SetClipboardText(url.c_str());
+            if (ImGui::MenuItem("Copy Request")) {
+                const std::string request = payload_display_text(exchange.raw_request);
+                ImGui::SetClipboardText(request.c_str());
+            }
+            if (ImGui::MenuItem("Copy Response", nullptr, false, !exchange.raw_response.empty())) {
+                const std::string response = payload_display_text(exchange.raw_response);
+                ImGui::SetClipboardText(response.c_str());
+            }
+            if (exchange.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("No response has been captured for this request");
+            ImGui::Separator();
+            const artifact_identity_t request_identity = exchange_artifact_identity(exchange, artifact_kind_t::request);
+            const artifact_identity_t response_identity = exchange_artifact_identity(exchange, artifact_kind_t::response);
+            std::string handoff_reason;
+            if (ImGui::MenuItem("Send to Repeater"))
+                (void)send_artifact_to_repeater(request_identity, handoff_reason);
+            if (ImGui::MenuItem("Send Request to Comparer"))
+                (void)send_artifact_to_comparer(request_identity, handoff_reason);
+            if (ImGui::MenuItem("Send Response to Comparer", nullptr, false, !exchange.raw_response.empty()))
+                (void)send_artifact_to_comparer(response_identity, handoff_reason);
+            if (exchange.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("No response has been captured for this request");
+            if (ImGui::BeginMenu("AI and Automation")) {
+                if (ImGui::MenuItem("Add Request to Chat"))
+                    (void)add_artifact_to_chat(request_identity, handoff_reason);
+                if (ImGui::MenuItem("Assign Request to Agent"))
+                    (void)assign_artifact_to_agent(request_identity, handoff_reason);
+                if (ImGui::MenuItem("Add Response to Chat", nullptr, false, !exchange.raw_response.empty()))
+                    (void)add_artifact_to_chat(response_identity, handoff_reason);
+                if (ImGui::MenuItem("Assign Response to Agent", nullptr, false, !exchange.raw_response.empty()))
+                    (void)assign_artifact_to_agent(response_identity, handoff_reason);
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Filter by Host"))
+                std::snprintf(state.proxy_filter_text, sizeof(state.proxy_filter_text), "%s", exchange.target_host.c_str());
+            if (ImGui::MenuItem("Filter by Method"))
+                std::snprintf(state.proxy_filter_text, sizeof(state.proxy_filter_text), "%s", exchange.request.method.c_str());
+            if (ImGui::MenuItem("Clear Filter", nullptr, false, state.proxy_filter_text[0] != '\0'))
+                state.proxy_filter_text[0] = '\0';
+            ImGui::Separator();
+            menu_item_disabled("Replay Request Now", "Replay is a live network mutation; review and send it from Repeater so the target, TLS mode, and bytes remain visible");
+            menu_item_disabled("Delete Request", "The proxy backend exposes bounded history clearing, not safe single-request deletion");
+        }
+        ImGui::EndPopup();
     }
 
     if (visible_rows == 0) {
@@ -3190,10 +3475,13 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 
         if (aida::ui::button("Send to Repeater", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             auto rep = std::make_shared<repeater_entry_t>();
+            rep->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
+            rep->source_artifact_id = "network.exchange." + std::to_string(ex.id) + ".request";
             rep->host = ex.target_host;
             rep->port = ex.target_port;
             rep->use_tls = ex.is_tls;
             rep->raw_request = std::string(ex.raw_request.begin(), ex.raw_request.end());
+            rep->request_hash = artifact_hash(ex.raw_request);
             diag::log_tagged_fmt("network", "proxy_send_to_repeater id=%llu host=%s:%u tls=%d size=%zu",
                 static_cast<unsigned long long>(ex.id), ex.target_host.c_str(), ex.target_port,
                 ex.is_tls ? 1 : 0, rep->raw_request.size());
@@ -3597,10 +3885,12 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
 
     if (aida::ui::button("New", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
         auto rep = std::make_shared<repeater_entry_t>();
+        rep->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
         rep->host = state.rep_host;
         rep->port = static_cast<uint16_t>(state.rep_port);
         rep->use_tls = state.rep_use_tls;
         rep->raw_request = "GET / HTTP/1.1\r\nHost: " + std::string(state.rep_host) + "\r\n\r\n";
+        rep->request_hash = artifact_hash(std::vector<std::uint8_t>(rep->raw_request.begin(), rep->raw_request.end()));
         diag::log_tagged_fmt("network", "repeater_new_entry host=%s:%d tls=%d",
             state.rep_host, state.rep_port, state.rep_use_tls ? 1 : 0);
         state.repeater_entries.push_back(std::move(rep));
@@ -3645,6 +3935,8 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         if (state.repeater_selected >= 0 && state.repeater_selected < static_cast<int>(state.repeater_entries.size())) {
             auto rep_ptr = state.repeater_entries[static_cast<size_t>(state.repeater_selected)];
             auto& rep = *rep_ptr;
+            if (rep.id == 0)
+                rep.id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
 
             const bool stack_editors = w < 760.f;
             float half_w = (w - 8.f) * 0.5f;
@@ -3679,7 +3971,56 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
             if (ImGui::InputTextMultiline("##rep_req_edit", req_buf, sizeof(req_buf),
                 ImVec2(req_w - 4.f, std::max(72.f, req_h - 78.f)))) {
                 rep.raw_request = req_buf;
+                ++rep.request_revision;
+                rep.request_hash = artifact_hash(std::vector<std::uint8_t>(rep.raw_request.begin(), rep.raw_request.end()));
                 req_buf_dirty = true;
+            }
+            const bool request_context = ImGui::IsItemClicked(ImGuiMouseButton_Right) ||
+                (ImGui::IsItemFocused() && (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false))));
+            if (request_context)
+                ImGui::OpenPopup("##repeater_request_context");
+            if (ImGui::BeginPopup("##repeater_request_context")) {
+                if (ImGui::MenuItem("Copy Request"))
+                    ImGui::SetClipboardText(req_buf);
+                if (ImGui::MenuItem("Duplicate Repeater Tab")) {
+                    auto duplicate = std::make_shared<repeater_entry_t>();
+                    duplicate->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
+                    duplicate->source_artifact_id = "network.repeater." + std::to_string(rep.id) + ".request";
+                    duplicate->host = rep.host;
+                    duplicate->port = rep.port;
+                    duplicate->use_tls = rep.use_tls;
+                    duplicate->raw_request = req_buf;
+                    duplicate->request_hash = artifact_hash(std::vector<std::uint8_t>(
+                        duplicate->raw_request.begin(), duplicate->raw_request.end()));
+                    state.repeater_entries.push_back(std::move(duplicate));
+                    state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
+                }
+                artifact_identity_t request_identity;
+                request_identity.kind = artifact_kind_t::repeater_request;
+                request_identity.id = "network.repeater." + std::to_string(rep.id) + ".request." +
+                    std::to_string(rep.request_revision);
+                request_identity.parent_id = rep.source_artifact_id;
+                request_identity.source_view_id = "view.network.repeater";
+                request_identity.source_id = rep.id;
+                request_identity.revision = rep.request_revision;
+                request_identity.content_size = rep.raw_request.size();
+                request_identity.content_hash = artifact_hash(std::vector<std::uint8_t>(
+                    rep.raw_request.begin(), rep.raw_request.end()));
+                request_identity.label = "Repeater request #" + std::to_string(rep.id);
+                request_identity.target_host = rep.host;
+                request_identity.target_port = rep.port;
+                request_identity.use_tls = rep.use_tls;
+                std::string handoff_reason;
+                if (ImGui::MenuItem("Send Request to Comparer"))
+                    (void)send_artifact_to_comparer(request_identity, handoff_reason);
+                if (ImGui::MenuItem("Add Request to AI Chat"))
+                    (void)add_artifact_to_chat(request_identity, handoff_reason);
+                if (ImGui::MenuItem("Assign Request to Agent"))
+                    (void)assign_artifact_to_agent(request_identity, handoff_reason);
+                ImGui::Separator();
+                menu_item_disabled("Send Request Now", "Sending performs live network activity; use the visible Send button after reviewing host, port, TLS mode, and request bytes");
+                ImGui::EndPopup();
             }
 
             if (!rep.in_progress.load()) {
@@ -3707,6 +4048,8 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                                 result.exchange.raw_response.end());
                             entry->status_code = result.exchange.response.status_code;
                             entry->latency_ms = result.exchange.latency_ms;
+                            entry->response_timestamp = result.exchange.timestamp;
+                            entry->response_hash = artifact_hash(result.exchange.raw_response);
                             diag::log_tagged_fmt("network", "repeater_send_ok host=%s:%u status=%d size=%zu latency_ms=%llu wall_ms=%llu",
                                 entry->host.c_str(), entry->port, entry->status_code,
                                 entry->raw_response.size(),
@@ -3729,6 +4072,9 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                         entry->in_progress.store(false);
                     }
                 }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Sends the visible request to %s:%u over %s; this creates live network activity",
+                        rep.host.c_str(), static_cast<unsigned>(rep.port), rep.use_tls ? "TLS" : "plain TCP");
             } else {
                 aida::ui::pill_kind("Sending...", aida::ui::pill_kind_t::accent,
                                      aida::ui::size_t_::sm, true);
@@ -3760,6 +4106,52 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 rep.raw_response.size() + 1,
                 ImVec2(resp_w - 4.f, std::max(72.f, resp_h - 78.f)),
                 ImGuiInputTextFlags_ReadOnly);
+            const bool response_context = ImGui::IsItemClicked(ImGuiMouseButton_Right) ||
+                (ImGui::IsItemFocused() && (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false))));
+            if (response_context)
+                ImGui::OpenPopup("##repeater_response_context");
+            if (ImGui::BeginPopup("##repeater_response_context")) {
+                artifact_identity_t response_identity;
+                response_identity.kind = artifact_kind_t::repeater_response;
+                response_identity.id = "network.repeater." + std::to_string(rep.id) + ".response." +
+                    std::to_string(rep.response_timestamp);
+                response_identity.parent_id = "network.repeater." + std::to_string(rep.id) + ".request." +
+                    std::to_string(rep.request_revision);
+                response_identity.source_view_id = "view.network.repeater";
+                response_identity.source_id = rep.id;
+                response_identity.timestamp = rep.response_timestamp;
+                response_identity.revision = rep.request_revision;
+                response_identity.content_size = rep.raw_response.size();
+                response_identity.content_hash = rep.raw_response.empty() ? 0 : artifact_hash(
+                    std::vector<std::uint8_t>(rep.raw_response.begin(), rep.raw_response.end()));
+                response_identity.label = "Repeater response #" + std::to_string(rep.id);
+                response_identity.target_host = rep.host;
+                response_identity.target_port = rep.port;
+                response_identity.use_tls = rep.use_tls;
+                std::string handoff_reason;
+                if (ImGui::MenuItem("Copy Response", nullptr, false, !rep.raw_response.empty()))
+                    ImGui::SetClipboardText(rep.raw_response.c_str());
+                if (rep.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Send the request and receive a response first");
+                if (ImGui::MenuItem("Send Response to Comparer", nullptr, false, !rep.raw_response.empty()))
+                    (void)send_artifact_to_comparer(response_identity, handoff_reason);
+                if (ImGui::MenuItem("Add Response to AI Chat", nullptr, false, !rep.raw_response.empty()))
+                    (void)add_artifact_to_chat(response_identity, handoff_reason);
+                if (ImGui::MenuItem("Assign Response to Agent", nullptr, false, !rep.raw_response.empty()))
+                    (void)assign_artifact_to_agent(response_identity, handoff_reason);
+                if (rep.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Send the request and receive a response first");
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Response Display", nullptr, false, !rep.raw_response.empty())) {
+                    rep.raw_response.clear();
+                    rep.status_code = 0;
+                    rep.latency_ms = 0;
+                    rep.response_hash = 0;
+                    rep.response_timestamp = 0;
+                }
+                ImGui::EndPopup();
+            }
 
             ImGui::EndChild();
         }
@@ -4022,10 +4414,13 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         ImGui::SameLine();
         if (aida::ui::button("Send to Repeater", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
             auto rep = std::make_shared<repeater_entry_t>();
+            rep->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
+            rep->source_artifact_id = "network.exchange." + std::to_string(sel.id) + ".request";
             rep->host = sel.target_host;
             rep->port = sel.target_port;
             rep->use_tls = sel.is_tls;
             rep->raw_request = std::string(sel.raw_request.begin(), sel.raw_request.end());
+            rep->request_hash = artifact_hash(sel.raw_request);
             diag::log_tagged_fmt("network", "intercept_send_to_repeater id=%llu host=%s:%u size=%zu",
                 static_cast<unsigned long long>(sel.id), sel.target_host.c_str(), sel.target_port,
                 rep->raw_request.size());
@@ -4117,7 +4512,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
         static const char k_exe_open_filter[] =
             "Executable (*.exe)\0*.exe\0"
             "All files (*.*)\0*.*\0\0";
-        if (win32_dialog::show_open_file_dialog(g_hwnd,
+        if (network_open_dialog::show_open_file_dialog(g_hwnd,
                 "Select Target Executable",
                 k_exe_open_filter,
                 path_buf, sizeof(path_buf),
@@ -4160,7 +4555,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
             static const char k_keylog_open_filter[] =
                 "SSL Keylog (*.log;*.keylog;*.txt)\0*.log;*.keylog;*.txt\0"
                 "All files (*.*)\0*.*\0\0";
-            if (win32_dialog::show_open_file_dialog(g_hwnd,
+            if (network_open_dialog::show_open_file_dialog(g_hwnd,
                     "Watch SSLKEYLOGFILE",
                     k_keylog_open_filter,
                     path_buf, sizeof(path_buf),
@@ -6102,7 +6497,6 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
 
     std::lock_guard<std::mutex> lock(state.ws_mutex);
     std::string filter(state.ws_filter_text);
-    int visible_idx = 0;
 
     if (state.ws_frames.empty()) {
         ImGui::EndChild();
@@ -6120,11 +6514,23 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
         return;
     }
 
-    for (size_t i = 0; i < state.ws_frames.size(); i++) {
-        const auto& fr = state.ws_frames[i];
-        if (!filter.empty() && fr.host.find(filter) == std::string::npos &&
-            fr.preview.find(filter) == std::string::npos)
+    static std::vector<size_t> filtered_frame_indices;
+    filtered_frame_indices.clear();
+    filtered_frame_indices.reserve(state.ws_frames.size());
+    for (size_t index = 0; index < state.ws_frames.size(); ++index) {
+        const auto& frame = state.ws_frames[index];
+        if (!filter.empty() && frame.host.find(filter) == std::string::npos &&
+            frame.preview.find(filter) == std::string::npos)
             continue;
+        filtered_frame_indices.push_back(index);
+    }
+
+    ImGuiListClipper frame_clipper;
+    frame_clipper.Begin(static_cast<int>(filtered_frame_indices.size()), row_h);
+    while (frame_clipper.Step()) {
+    for (int visible_idx = frame_clipper.DisplayStart; visible_idx < frame_clipper.DisplayEnd; ++visible_idx) {
+        const size_t i = filtered_frame_indices[static_cast<size_t>(visible_idx)];
+        const auto& fr = state.ws_frames[i];
 
         float ry = static_cast<float>(visible_idx) * row_h;
         float abs_ry = ImGui::GetWindowPos().y + ry - ImGui::GetScrollY();
@@ -6137,9 +6543,16 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
         }
 
         ImVec2 mouse = ImGui::GetMousePos();
-        if (mouse.x >= ImGui::GetWindowPos().x && mouse.x < ImGui::GetWindowPos().x + w &&
-            mouse.y >= abs_ry && mouse.y < abs_ry + row_h && ImGui::IsMouseClicked(0))
+        const bool hovered = mouse.x >= ImGui::GetWindowPos().x && mouse.x < ImGui::GetWindowPos().x + w &&
+            mouse.y >= abs_ry && mouse.y < abs_ry + row_h;
+        if (hovered && ImGui::IsMouseClicked(0))
             state.ws_selected = static_cast<int>(i);
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            state.ws_selected = static_cast<int>(i);
+            s_websocket_context = {fr.timestamp, fr.exchange_id, fr.payload.size(),
+                fr.is_outbound, fr.opcode};
+            ImGui::OpenPopupEx(ImHashStr("aida.network.websocket.context"));
+        }
 
         cx = 8.f;
         ImU32 dir_col = fr.is_outbound
@@ -6162,7 +6575,66 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
             fr.preview.empty() ? "(empty)" : fr.preview.c_str());
 
         ImGui::SetCursorPosY(ry + row_h);
-        visible_idx++;
+    }
+    }
+
+    if (state.ws_selected >= 0 && state.ws_selected < static_cast<int>(state.ws_frames.size()) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+        const auto& frame = state.ws_frames[static_cast<size_t>(state.ws_selected)];
+        s_websocket_context = {frame.timestamp, frame.exchange_id, frame.payload.size(),
+            frame.is_outbound, frame.opcode};
+        ImGui::OpenPopupEx(ImHashStr("aida.network.websocket.context"));
+    }
+
+    if (ImGui::BeginPopupEx(ImHashStr("aida.network.websocket.context"), ImGuiWindowFlags_AlwaysAutoResize)) {
+        const auto frame = std::find_if(state.ws_frames.begin(), state.ws_frames.end(), [](const state_t::ws_frame_entry_t& candidate) {
+            return candidate.timestamp == s_websocket_context.timestamp &&
+                candidate.exchange_id == s_websocket_context.exchange_id &&
+                candidate.payload.size() == s_websocket_context.payload_size &&
+                candidate.is_outbound == s_websocket_context.outbound &&
+                candidate.opcode == s_websocket_context.opcode;
+        });
+        if (frame == state.ws_frames.end()) {
+            menu_item_disabled("WebSocket frame is stale", "The bounded frame buffer advanced; reopen the menu on a current frame");
+        } else {
+            artifact_identity_t frame_identity;
+            frame_identity.kind = artifact_kind_t::websocket_frame;
+            frame_identity.id = "network.websocket." + std::to_string(frame->exchange_id) + "." +
+                std::to_string(frame->timestamp) + (frame->is_outbound ? ".out" : ".in");
+            frame_identity.parent_id = "network.exchange." + std::to_string(frame->exchange_id);
+            frame_identity.source_view_id = "view.network.websocket";
+            frame_identity.source_id = frame->exchange_id;
+            frame_identity.timestamp = frame->timestamp;
+            frame_identity.content_size = frame->payload.size();
+            frame_identity.content_hash = artifact_hash(frame->payload);
+            frame_identity.label = std::string(frame->is_outbound ? "Outbound" : "Inbound") + " WebSocket frame";
+            frame_identity.target_host = frame->host;
+            frame_identity.target_port = frame->port;
+            std::string handoff_reason;
+            if (ImGui::MenuItem("Copy Payload")) {
+                const std::string payload = payload_display_text(frame->payload);
+                ImGui::SetClipboardText(payload.c_str());
+            }
+            if (ImGui::MenuItem("Copy Host"))
+                ImGui::SetClipboardText(frame->host.c_str());
+            if (ImGui::MenuItem("Send Payload to Comparer"))
+                (void)send_artifact_to_comparer(frame_identity, handoff_reason);
+            if (ImGui::MenuItem("Add Frame to AI Chat"))
+                (void)add_artifact_to_chat(frame_identity, handoff_reason);
+            if (ImGui::MenuItem("Assign Frame to Agent"))
+                (void)assign_artifact_to_agent(frame_identity, handoff_reason);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Filter by Host"))
+                std::snprintf(state.ws_filter_text, sizeof(state.ws_filter_text), "%s", frame->host.c_str());
+            if (ImGui::MenuItem(state.ws_auto_scroll ? "Disable Follow Tail" : "Enable Follow Tail"))
+                state.ws_auto_scroll = !state.ws_auto_scroll;
+            ImGui::Separator();
+            menu_item_disabled("Replay Frame Now", "Frame replay is a live network mutation; review connection, direction, opcode, and payload in WebSocket Editor first");
+            menu_item_disabled("Send to WebSocket Editor", "The WebSocket Editor backend does not expose a capability-backed import operation for captured frames");
+        }
+        ImGui::EndPopup();
     }
 
     if (state.ws_auto_scroll && !state.ws_frames.empty())
@@ -6352,7 +6824,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         static const char k_lua_open_filter[] =
             "Lua Scripts (*.lua)\0*.lua\0"
             "All files (*.*)\0*.*\0\0";
-        if (!win32_dialog::show_open_file_dialog(g_hwnd,
+        if (!network_open_dialog::show_open_file_dialog(g_hwnd,
                 "Load Lua Script",
                 k_lua_open_filter,
                 path_buf, sizeof(path_buf),
@@ -7120,6 +7592,49 @@ static void render_decoder(state_t& state, float x, float y, float w, float h,
     ImGui::EndChild();
 }
 
+static void render_tab_content(sub_tab_t tab, state_t& state, float x, float y, float w, float h,
+                               float alpha, float ar, float ag, float ab) {
+    switch (tab) {
+        case sub_tab_t::connections: render_connections(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::capture: render_capture(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::intercept: render_intercept(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::proxy: render_proxy(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::dns: render_dns(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::filters: render_filters(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::bandwidth: render_bandwidth(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::repeater: render_repeater(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::keylog: render_keylog(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::pcap_export: render_pcap_export(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::fuzzer: render_fuzzer(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::offensive: render_offensive(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::websocket: render_websocket(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::scripting: render_scripting(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::decoder: render_decoder(state, x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::sitemap: aida::burp::sitemap::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::scope: aida::burp::scope::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::cookies: aida::burp::cookie_jar::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::scanner: aida::burp::scanner_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::recon: aida::burp::recon_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::intruder: aida::burp::intruder_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::collab: aida::burp::collaborator_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::sequencer: aida::burp::sequencer_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::comparer: aida::burp::comparer_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::jwt: aida::burp::jwt_lab_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::mr: aida::burp::match_replace_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::session: aida::burp::session_handler_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::api: aida::burp::api_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::ws_edit: aida::burp::ws_editor_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::h2_edit: aida::burp::h2_editor_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::logger: aida::burp::logger_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::csp: aida::burp::csp::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::upstream: aida::burp::upstream::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::browser: aida::burp::browser::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::reports: aida::burp::report_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::headless: aida::burp::headless_view::render(x, y, w, h, alpha, ar, ag, ab); break;
+        case sub_tab_t::COUNT: break;
+    }
+}
+
 static aida::ui::components::status_kind_t network_header_status(const state_t& state,
                                                                  bool has_target) {
     if (!has_target)
@@ -7444,6 +7959,212 @@ void render(float pos_x, float pos_y, float width, float height,
 
     render_network_status_bar(g_state, ImVec2(outer_pad, status_y), inner_width, has_target);
     ImGui::EndChild();
+}
+
+const char* tab_name(sub_tab_t tab) noexcept {
+    const int index = static_cast<int>(tab);
+    if (index < 0 || index >= static_cast<int>(sub_tab_t::COUNT))
+        return "Network";
+    return tab_names[index];
+}
+
+void render_pane(sub_tab_t tab, float pos_x, float pos_y, float width, float height,
+                 float alpha, float accent_r, float accent_g, float accent_b) {
+    const int index = static_cast<int>(tab);
+    if (index < 0 || index >= static_cast<int>(sub_tab_t::COUNT))
+        return;
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    g_state.last_render_tick_ms.store(aida::preview::network::monotonic_ms(), std::memory_order_release);
+#else
+    g_state.last_render_tick_ms.store(static_cast<uint64_t>(GetTickCount64()), std::memory_order_release);
+#endif
+    ImGui::PushID(index);
+    ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    const bool visible = ImGui::BeginChild("##network_independent_pane", ImVec2(width, height), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    if (visible) {
+        const ImVec2 size = ImGui::GetWindowSize();
+        const ImVec2 screen = ImGui::GetWindowPos();
+        ImGui::GetWindowDrawList()->AddRectFilled(screen,
+            ImVec2(screen.x + size.x, screen.y + size.y),
+            aida::ui::with_alpha(aida::ui::resolved().bg_base, alpha));
+        const bool has_target = analysis_session::has_active_target();
+        if (!has_target && tab_requires_target(tab)) {
+            aida::ui::no_target_overlay::render(screen, size, "No target attached",
+                "Attach or launch a target to enable this driver-backed Network pane.",
+                alpha, aida::ui::empty_state::glyph_t::network);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, aida::ui::with_alpha(aida::ui::resolved().panel_header, alpha));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, aida::ui::with_alpha(aida::ui::resolved().hover_wash, alpha));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, aida::ui::with_alpha(aida::ui::resolved().selection, alpha));
+            ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(aida::ui::resolved().border_subtle, alpha));
+            ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, IM_COL32(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrab, aida::ui::with_alpha(aida::ui::resolved().accent_dim, alpha));
+            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabHovered, aida::ui::with_alpha(aida::ui::resolved().accent_hover, alpha));
+            ImGui::PushStyleColor(ImGuiCol_ScrollbarGrabActive, aida::ui::with_alpha(aida::ui::resolved().accent_u32, alpha));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+            render_tab_content(tab, g_state, 0.f, 0.f, size.x, size.y, alpha,
+                accent_r, accent_g, accent_b);
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(8);
+        }
+    }
+    ImGui::EndChild();
+    ImGui::PopID();
+}
+
+bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& snapshot,
+                      std::string& unavailable_reason) {
+    snapshot = artifact_snapshot_t{};
+    if (!identity.valid()) {
+        unavailable_reason = "The network artifact identity is incomplete; select the item again.";
+        return false;
+    }
+    snapshot.identity = identity;
+    switch (identity.kind) {
+    case artifact_kind_t::request:
+    case artifact_kind_t::response:
+    case artifact_kind_t::exchange: {
+        const auto history = mitm_proxy::get_history();
+        const auto found = std::find_if(history.begin(), history.end(), [&](const mitm_proxy::http_exchange& exchange) {
+            return exchange.id == identity.source_id && exchange.timestamp == identity.timestamp;
+        });
+        if (found == history.end()) {
+            unavailable_reason = "The captured exchange is no longer retained; select a current history item.";
+            return false;
+        }
+        snapshot.bytes = identity.kind == artifact_kind_t::response ? found->raw_response : found->raw_request;
+        break;
+    }
+    case artifact_kind_t::packet: {
+        std::lock_guard<std::mutex> lock(g_state.cap_mutex);
+        const auto found = std::find_if(g_state.captured_packets.begin(), g_state.captured_packets.end(),
+            [&](const packet_entry_t& packet) {
+                return packet.timestamp == identity.timestamp && packet.payload.size() == identity.content_size;
+            });
+        if (found == g_state.captured_packets.end()) {
+            unavailable_reason = "The captured packet rolled out of the bounded capture history; select a current packet.";
+            return false;
+        }
+        snapshot.bytes = found->payload;
+        break;
+    }
+    case artifact_kind_t::websocket_frame: {
+        std::lock_guard<std::mutex> lock(g_state.ws_mutex);
+        const auto found = std::find_if(g_state.ws_frames.begin(), g_state.ws_frames.end(),
+            [&](const state_t::ws_frame_entry_t& frame) {
+                return frame.exchange_id == identity.source_id && frame.timestamp == identity.timestamp &&
+                    frame.payload.size() == identity.content_size;
+            });
+        if (found == g_state.ws_frames.end()) {
+            unavailable_reason = "The WebSocket frame is no longer retained; select a current frame.";
+            return false;
+        }
+        snapshot.bytes = found->payload;
+        break;
+    }
+    case artifact_kind_t::repeater_request:
+    case artifact_kind_t::repeater_response: {
+        const auto found = std::find_if(g_state.repeater_entries.begin(), g_state.repeater_entries.end(),
+            [&](const std::shared_ptr<repeater_entry_t>& entry) {
+                return entry && entry->id == identity.source_id;
+            });
+        if (found == g_state.repeater_entries.end()) {
+            unavailable_reason = "The Repeater tab was closed; reopen or select another request.";
+            return false;
+        }
+        snapshot.bytes.assign(identity.kind == artifact_kind_t::repeater_response
+            ? (*found)->raw_response.begin() : (*found)->raw_request.begin(),
+            identity.kind == artifact_kind_t::repeater_response
+            ? (*found)->raw_response.end() : (*found)->raw_request.end());
+        break;
+    }
+    }
+    if (snapshot.bytes.size() != identity.content_size || artifact_hash(snapshot.bytes) != identity.content_hash) {
+        unavailable_reason = "The network artifact changed after the action menu opened; review the current bytes and try again.";
+        snapshot = artifact_snapshot_t{};
+        return false;
+    }
+    unavailable_reason.clear();
+    return true;
+}
+
+bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string& unavailable_reason) {
+    if (identity.kind == artifact_kind_t::response || identity.kind == artifact_kind_t::repeater_response) {
+        unavailable_reason = "Responses cannot be replayed as requests; choose the corresponding request artifact.";
+        return false;
+    }
+    artifact_snapshot_t snapshot;
+    if (!resolve_artifact(identity, snapshot, unavailable_reason)) return false;
+    auto entry = std::make_shared<repeater_entry_t>();
+    entry->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
+    entry->source_artifact_id = identity.id;
+    entry->host = identity.target_host;
+    entry->port = identity.target_port == 0 ? 443 : identity.target_port;
+    entry->use_tls = identity.use_tls;
+    entry->raw_request.assign(snapshot.bytes.begin(), snapshot.bytes.end());
+    entry->request_hash = artifact_hash(snapshot.bytes);
+    g_state.repeater_entries.push_back(std::move(entry));
+    g_state.repeater_selected = static_cast<int>(g_state.repeater_entries.size()) - 1;
+    unavailable_reason.clear();
+    (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.network.repeater"));
+    return true;
+}
+
+bool send_artifact_to_comparer(const artifact_identity_t& identity, std::string& unavailable_reason) {
+    artifact_snapshot_t snapshot;
+    if (!resolve_artifact(identity, snapshot, unavailable_reason)) return false;
+    const std::uint64_t slot = aida::burp::comparer::add_slot_from_bytes(
+        identity.label.empty() ? identity.id : identity.label, snapshot.bytes, identity.id);
+    if (slot == 0) {
+        unavailable_reason = "Comparer rejected the artifact: " + aida::burp::comparer::last_error();
+        return false;
+    }
+    unavailable_reason.clear();
+    (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.network.comparer"));
+    return true;
+}
+
+static bool handoff_artifact(const artifact_identity_t& identity, bool agent,
+                             std::string& unavailable_reason) {
+    artifact_snapshot_t snapshot;
+    if (!resolve_artifact(identity, snapshot, unavailable_reason)) return false;
+    constexpr std::size_t max_handoff_bytes = 64U * 1024U;
+    const std::size_t count = (std::min)(snapshot.bytes.size(), max_handoff_bytes);
+    std::string content(reinterpret_cast<const char*>(snapshot.bytes.data()), count);
+    aida::automation_ui::evidence_envelope_t envelope;
+    envelope.id = "evidence." + identity.id + "." + std::to_string(identity.content_hash);
+    envelope.session_id = identity.session_id;
+    envelope.source_view_id = identity.source_view_id;
+    envelope.source_kind = "network";
+    envelope.entity_id = identity.id;
+    envelope.display_label = identity.label.empty() ? identity.id : identity.label;
+    envelope.return_target = identity.id;
+    envelope.excerpt = std::move(content);
+    envelope.revision = identity.revision;
+    envelope.generation = identity.timestamp;
+    envelope.snapshot_hash = identity.content_hash;
+    envelope.content_hash = identity.content_hash;
+    envelope.truncated = snapshot.bytes.size() > count;
+    const std::string evidence_id = aida::automation_ui::register_evidence(std::move(envelope));
+    if (evidence_id.empty()) {
+        unavailable_reason = "The evidence envelope was rejected because its source identity was incomplete.";
+        return false;
+    }
+    return agent
+        ? aida::automation_ui::queue_evidence_for_agent(evidence_id, unavailable_reason)
+        : aida::automation_ui::queue_evidence_for_chat(evidence_id, unavailable_reason);
+}
+
+bool add_artifact_to_chat(const artifact_identity_t& identity, std::string& unavailable_reason) {
+    return handoff_artifact(identity, false, unavailable_reason);
+}
+
+bool assign_artifact_to_agent(const artifact_identity_t& identity, std::string& unavailable_reason) {
+    return handoff_artifact(identity, true, unavailable_reason);
 }
 
 }

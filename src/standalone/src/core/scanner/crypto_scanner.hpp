@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "../infra/executor.hpp"
+#include "scanner_task_center.hpp"
 #include "comm.h"
 #include "standalone_driver.hpp"
 #include "standalone_ai_client.hpp"
@@ -687,11 +688,19 @@ inline void launch_scan_worker(const char* name, Fn fn)
 	submission.diagnostic_id = worker_name.c_str();
 	submission.failure_policy = "reject_not_started";
 	submission.body = [task]() { (*task)(); };
-	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
 		diag::log_tagged_fmt("crypto_scan", "%s worker_queue_rejected", worker_name.c_str());
 		g_state.progress.store(1.f);
 		g_state.scanning.store(false);
+		return;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.crypto", "memory.crypto_scan", "Cryptographic signature scan",
+		driver_bridge::attached_pid(), true, []() {
+			g_state.cancel.store(true, std::memory_order_release);
+			return true;
+		});
 }
 
 }

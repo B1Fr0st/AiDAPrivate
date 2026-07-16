@@ -6014,6 +6014,136 @@ workbench_error_t workbench_shell_runtime_t::navigate_entity_document(
     return {};
 }
 
+workbench_error_t workbench_shell_runtime_t::publish_selection(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    const selection_context_t& selection,
+    const document_local_cursor_t& cursor,
+    navigation_origin_t origin,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    if (!validate_selection_context(selection) ||
+        !validate_document_local_cursor(cursor))
+        return shell_error(workbench_error_code_t::invalid_navigation);
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        const auto focused_view = std::find_if(
+            output.persistence.views.begin(), output.persistence.views.end(),
+            [](const view_persistence_dto_t& view) { return view.focused; });
+        if (focused_view == output.persistence.views.end())
+            return shell_error(workbench_error_code_t::invalid_view,
+                               binding->workspace.value);
+        const auto source_document = std::find_if(
+            output.persistence.documents.begin(), output.persistence.documents.end(),
+            [&focused_view](const document_persistence_dto_t& document) {
+                return document.id == focused_view->document;
+            });
+        if (source_document == output.persistence.documents.end())
+            return shell_error(workbench_error_code_t::invalid_document,
+                               focused_view->document.value);
+        document_navigation_bridge_request_t request;
+        auto event_id = binding->next_navigation_id.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (event_id == 0)
+            event_id = binding->next_navigation_id.fetch_add(
+                1, std::memory_order_acq_rel);
+        request.id = navigation_event_id_t{event_id};
+        request.sequence = event_id;
+        request.origin = origin;
+        request.source.workspace = binding->workspace;
+        request.source.document = source_document->id;
+        request.source.view = focused_view->id;
+        request.source.selection = source_document->local_state.selection;
+        request.source.cursor = source_document->local_state.cursor;
+        request.source.synchronization_group = focused_view->synchronization_group;
+        request.source.synchronization_policy = focused_view->synchronization_policy;
+        request.target.document = source_document->identity;
+        request.target.selection = selection;
+        request.target.cursor = cursor;
+        request.request_focus = false;
+        navigation_event_t event;
+        const auto emitted = output.document_bridge->emit(request, event);
+        if (!emitted)
+            return emitted;
+        workbench_command_result_t result;
+        const auto dispatched = binding->shell->dispatch_navigation(
+            binding->workspace, output.persistence.revision, event, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current = binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
+workbench_error_t workbench_shell_runtime_t::navigate_history(
+    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
+    bool forward,
+    workbench_shell_workspace_context_t& output)
+{
+    const auto attached = attach_analysis_workspace(analysis_workspace, output);
+    if (!attached)
+        return attached;
+    std::shared_ptr<workbench_runtime_binding_t> binding;
+    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
+    if (!binding_error)
+        return binding_error;
+    std::uint64_t changed_revision = 0;
+    {
+        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
+        workbench_command_t command;
+        command.kind = forward ? workbench_command_kind_t::history_forward
+                               : workbench_command_kind_t::history_back;
+        command.workspace = binding->workspace;
+        command.expected_revision = output.persistence.revision;
+        workbench_command_result_t result;
+        const auto dispatched = binding->shell->dispatch_command(command, {}, result);
+        if (!dispatched)
+            return dispatched;
+        const auto* current = binding->shell->workspace_context(binding->workspace);
+        if (!current)
+            return shell_error(workbench_error_code_t::invalid_workspace,
+                               binding->workspace.value);
+        output = *current;
+        const auto active = std::find_if(
+            output.persistence.documents.begin(), output.persistence.documents.end(),
+            [&output](const document_persistence_dto_t& document) {
+                return document.id == output.persistence.active_document;
+            });
+        if (active != output.persistence.documents.end()) {
+            inspector::inspector_context_t context;
+            context.workspace = binding->workspace;
+            context.workspace_generation = output.persistence.revision;
+            context.document = active->identity;
+            context.selection = active->local_state.selection;
+            context.selection_generation = output.persistence.revision.value;
+            const auto inspector_error = binding->shell->integrate_inspector(
+                binding->workspace, context);
+            if (!inspector_error)
+                return inspector_error;
+        }
+        if (result.changed)
+            changed_revision = output.persistence.revision.value;
+    }
+    if (changed_revision != 0)
+        mark_runtime_dirty(binding, changed_revision);
+    return {};
+}
+
 workbench_error_t workbench_shell_runtime_t::dispatch_host_command(
     const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
     document_host::document_host_dispatch_t dispatch,

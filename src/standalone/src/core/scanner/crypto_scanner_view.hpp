@@ -28,7 +28,7 @@
 #include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #endif
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -1068,7 +1068,7 @@ inline void render(float, float, float width, float height,
 		}
 
 		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-			globals::ui::active_center_view = center_view_t::disassembly;
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(hit.address, context);
 		}
 
@@ -1155,7 +1155,7 @@ inline void render(float, float, float width, float height,
 			auto& ctx_hit = filtered[static_cast<size_t>(st.ctx_hit_idx)];
 
 			if (ImGui::MenuItem("Go to Disassembly")) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(ctx_hit.address, context);
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] crypto_scanner ctx open_disasm");
@@ -1163,7 +1163,7 @@ inline void render(float, float, float width, float height,
 
 			if (ImGui::MenuItem("Open in Hex")) {
 				detail::open_hit_in_hex(context, ctx_hit.address);
-				globals::ui::active_center_view = center_view_t::hex_view;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] crypto_scanner ctx open_hex");
 			}
@@ -1179,7 +1179,7 @@ inline void render(float, float, float width, float height,
 						std::string menu_text = ref_label;
 						if (!lbl.empty()) menu_text += " (" + lbl + ")";
 						if (ImGui::MenuItem(menu_text.c_str())) {
-							globals::ui::active_center_view = center_view_t::disassembly;
+							aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 							disasm_view::goto_address(ref_addr, context);
 							anti_tamper::webhook::write_log("scan_audit",
 								"[scan_audit] crypto_scanner ctx show_ref");

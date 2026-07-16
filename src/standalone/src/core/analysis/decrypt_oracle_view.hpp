@@ -12,7 +12,7 @@
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
 #include "imgui/imgui.h"
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -348,7 +348,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			st.selected_row = i;
 		}
 		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-			globals::ui::active_center_view = center_view_t::disassembly;
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(r.source_function, workspace_context);
 		}
 

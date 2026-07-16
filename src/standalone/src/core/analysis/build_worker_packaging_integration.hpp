@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -18,6 +20,7 @@ enum class build_worker_error_code_t : std::uint8_t {
     unsafe_path,
     path_escape,
     reparse_point,
+    hardlink_forbidden,
     duplicate_entry,
     file_missing,
     file_type_invalid,
@@ -54,6 +57,8 @@ enum class build_worker_error_code_t : std::uint8_t {
     resource_stream_limit,
     directory_cycle,
     required_external_artifact_missing,
+    cancelled,
+    deadline_exceeded,
     internal_error
 };
 
@@ -126,7 +131,7 @@ inline constexpr std::string_view k_worker_manifest_lock_schema =
     "aida.c03.worker-manifest-lock";
 inline constexpr std::uint32_t k_worker_manifest_lock_schema_version = 2;
 inline constexpr std::string_view k_forbidden_link_tokens[] = {
-    "lmdb", "unicorn", "remill"
+    "lief", "lmdb", "unicorn", "remill"
 };
 inline constexpr std::size_t k_required_worker_count = 3;
 inline constexpr std::uint64_t k_default_manifest_limit = 16ULL * 1024ULL * 1024ULL;
@@ -139,7 +144,10 @@ inline constexpr std::size_t k_default_directory_count_limit = 65536;
 inline constexpr std::size_t k_default_total_entry_count_limit = 300000;
 inline constexpr std::size_t k_default_depth_limit = 64;
 inline constexpr std::size_t k_default_relative_path_limit = 32768;
+inline constexpr std::size_t k_default_inventory_path_bytes_limit = 256ULL * 1024ULL * 1024ULL;
 inline constexpr std::size_t k_default_stream_count_limit = 16;
+
+bool customer_package_relative_path_allowed(std::string_view value) noexcept;
 
 struct deny_link_check_request_t final {
     std::string target_name;
@@ -152,6 +160,17 @@ struct deny_link_check_result_t final {
     std::size_t inspected = 0;
 };
 
+enum class package_verification_checkpoint_t : std::uint8_t {
+    immutable_generation_captured = 0,
+    immutable_generation_precommit
+};
+
+struct package_signature_identity_t final {
+    std::string signer_thumbprint_sha256;
+    bool trusted_timestamp = false;
+    std::uint64_t trusted_timestamp_filetime = 0;
+};
+
 struct package_verification_request_t final {
     std::filesystem::path package_root;
     std::filesystem::path manifest_path;
@@ -160,6 +179,9 @@ struct package_verification_request_t final {
     std::string expected_protector_tool_sha256;
     std::string expected_protector_verifier_sha256;
     std::string expected_signature_verifier_sha256;
+    std::string expected_signer_policy_sha256;
+    std::string expected_signing_provider_sha256;
+    std::vector<std::string> authorized_signer_thumbprints_sha256;
     std::uint64_t maximum_manifest_bytes = k_default_manifest_limit;
     std::uint64_t maximum_receipt_bytes = k_default_receipt_limit;
     std::uint64_t maximum_artifact_bytes = k_default_artifact_limit;
@@ -169,6 +191,13 @@ struct package_verification_request_t final {
     std::size_t maximum_total_entry_count = k_default_total_entry_count_limit;
     std::size_t maximum_depth = k_default_depth_limit;
     std::size_t maximum_relative_path_bytes = k_default_relative_path_limit;
+    std::size_t maximum_inventory_path_bytes = k_default_inventory_path_bytes_limit;
+    std::chrono::milliseconds deadline{900000};
+    std::function<bool()> cancellation_requested;
+    std::function<bool(const std::filesystem::path&, std::string_view)> protector_verifier;
+    std::function<std::optional<package_signature_identity_t>(const std::filesystem::path&)>
+        signature_verifier;
+    std::function<void(package_verification_checkpoint_t)> verification_checkpoint;
 };
 
 struct package_verification_result_t final {

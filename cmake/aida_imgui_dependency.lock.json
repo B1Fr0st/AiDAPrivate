@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "name": "dear-imgui",
+  "version": "1.92.1",
+  "versionNum": 19210,
+  "branch": "docking",
+  "tag": "v1.92.1-docking",
+  "repository": "https://github.com/ocornut/imgui.git",
+  "commit": "44aa9a4b3a6f27d09a4eb5770d095cbd376dfc4b",
+  "tree": "7b2a8d999b74caf2d517911dd2403abf35e86632",
+  "capabilities": {
+    "docking": true,
+    "dockSpace": true,
+    "dockSpaceOverViewport": true,
+    "dockBuilder": "reviewed-internal-v1",
+    "multiViewportPolicy": "disabled"
+  },
+  "files": [
+    { "path": "LICENSE.txt", "sizeBytes": 1104, "sha256": "55e058cc5899e6077a819ad1005d6d1f4528f65ae100795c9692f9fa6525a8ce" },
+    { "path": "imconfig.h", "sizeBytes": 11978, "sha256": "227a8cfdc91e0fdf1ba7b3cc466ef5a2d7eb3b89e1b86dee400cd086bdd72d3f" },
+    { "path": "imgui.h", "sizeBytes": 446228, "sha256": "809701a22a8e47b56b847124e43b5518e39e493d048fcce12288285e1f71dead" },
+    { "path": "imgui_internal.h", "sizeBytes": 323783, "sha256": "4e982357f0ab75199499c27dd2471d97217a01e14d4c6c71f4360f36b519301c" },
+    { "path": "imstb_rectpack.h", "sizeBytes": 20971, "sha256": "bb53504995e983d54b1ae06ea727f0b39647e5e205b4bf7da01343953974951c" },
+    { "path": "imstb_textedit.h", "sizeBytes": 59866, "sha256": "f6ef71b6c94225d8ec554eb63ea6ae60551377a9b9328df0bc522a215b8523ea" },
+    { "path": "imstb_truetype.h", "sizeBytes": 204588, "sha256": "37aa1d602706262bf94da2f83efaa8175ebc2202ede13da96b692fbcf8b4427b" },
+    { "path": "imgui.cpp", "sizeBytes": 1256157, "sha256": "ab58f5a545bf97ebf72807f2c7f41302ad3d2a3a2e4869ff624b92d5e473c4f7" },
+    { "path": "imgui_draw.cpp", "sizeBytes": 328481, "sha256": "9f7cfec2eaa3b9cb0e33758d59139c2213bbe2b1c5c02b7cc8f8f499afff0801" },
+    { "path": "imgui_tables.cpp", "sizeBytes": 253463, "sha256": "308cfde871b3c8aa8aaf876b6725fdeadee1b1357a0cf36af5d8b537c5c37ba4" },
+    { "path": "imgui_widgets.cpp", "sizeBytes": 544153, "sha256": "e1c1fe99fe2e4484b0034f6045c2a781462e674fe90f1828fd124d100ce3c5ac" },
+    { "path": "backends/imgui_impl_dx11.cpp", "sizeBytes": 42747, "sha256": "dbf92727371386b17a73fc5ab13487a3cc114d37a3e01e31eb2199ab31872068" },
+    { "path": "backends/imgui_impl_dx11.h", "sizeBytes": 2894, "sha256": "ae62e067d6b72470c8abd529dfb6bbc80d7aa996acfdaaa4dff00379f3d6cfb5" },
+    { "path": "backends/imgui_impl_win32.cpp", "sizeBytes": 77706, "sha256": "07f59fe79cd4b719d53b7703e44d21ce32656342a0d65362ef1c5a6f2c7b043a" },
+    { "path": "backends/imgui_impl_win32.h", "sizeBytes": 3662, "sha256": "d71cfdba658c65eadf90c47cd2b73f023674a57e4adb577636d35002fe00aa9a" },
+    { "path": "misc/freetype/imgui_freetype.cpp", "sizeBytes": 35899, "sha256": "2a4ea12afd92d17b1ccb910d37857d01107a94d8f3b0c4f56a8b9275a14021ea" },
+    { "path": "misc/freetype/imgui_freetype.h", "sizeBytes": 5674, "sha256": "c926ae84fb01d38839a7d19ed5b44e93253bf603e39f73e31a3b410a24eb3e4f" }
+  ]
+}

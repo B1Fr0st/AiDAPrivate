@@ -1,6 +1,11 @@
 
 #pragma once
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
+#else
 #include <windows.h>
+#include "../../helpers/win32_dialog.hpp"
+#endif
 #include <Zydis/Zydis.h>
 
 #include <vector>
@@ -16,7 +21,6 @@
 
 #include "../analysis/workspace/analysis_workspace.hpp"
 #include "../analysis/workspace/x86_decoder.hpp"
-#include "../../helpers/win32_dialog.hpp"
 
 
 struct mem_op_snapshot_t
@@ -262,7 +266,7 @@ inline AsmInstr zydis_decode_one(const uint8_t* code, int avail, uint64_t va, bo
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
             is_64bit ? &contexts.decoder64 : &contexts.decoder32,
             code,
-            avail,
+            static_cast<ZyanUSize>(avail),
             &instruction,
             operands)))
     {

@@ -35,6 +35,7 @@
 #include "../helpers/diag_log.hpp"
 #include "../helpers/win32_dialog.hpp"
 #include "../infra/executor.hpp"
+#include "scanner_task_center.hpp"
 #endif
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
@@ -482,12 +483,20 @@ inline void take_snapshot(const std::string& name = "")
 		g_state.progress.store(1.f);
 		g_state.capturing.store(false);
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		diag::log_tagged("snapshot_diff", "take_snapshot worker_queue_rejected");
 		g_state.last_error = "take_snapshot: worker queue rejected the task";
 		g_state.progress.store(1.f);
 		g_state.capturing.store(false);
+		return;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.snapshot_diff", "memory.capture_snapshot", "Capture memory snapshot",
+		driver_bridge::attached_pid(), true, []() {
+			g_state.cancel.store(true, std::memory_order_release);
+			return true;
+		});
 #endif
 }
 
@@ -567,12 +576,17 @@ inline void load_from_disk(const std::string& path)
 		g_state.progress.store(1.f);
 		g_state.loading.store(false);
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		diag::log_tagged("snapshot_diff", "load_from_disk worker_queue_rejected");
 		g_state.last_error = "load_from_disk: worker queue rejected the task";
 		g_state.progress.store(1.f);
 		g_state.loading.store(false);
+		return;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.snapshot_diff", "memory.load_snapshot", "Load memory snapshot",
+		driver_bridge::attached_pid());
 #endif
 }
 
@@ -777,13 +791,21 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 			g_state.compare_cursor_active = false;
 		}
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		diag::log_tagged("snapshot_diff", "compare_snapshots worker_queue_rejected");
 		g_state.last_error = "compare_snapshots: worker queue rejected the task";
 		g_state.progress.store(1.f);
 		g_state.comparing.store(false);
 		g_state.compare_cursor_active = false;
+		return;
 	}
+	scanner_task_center::register_executor_task(submitted,
+		"view.memory.snapshot_diff", "memory.compare_snapshots", "Compare memory snapshots",
+		driver_bridge::attached_pid(), true, []() {
+			g_state.cancel.store(true, std::memory_order_release);
+			return true;
+		});
 #endif
 }
 

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -70,6 +71,29 @@ std::size_t finding_count(
             return finding.code == code &&
                    (identifier.empty() || finding.identifier == identifier);
         }));
+}
+
+std::size_t semantic_finding_count(
+    const surface_reconciliation_result_t& result,
+    surface_finding_semantic_t semantic) {
+    return static_cast<std::size_t>(std::count_if(
+        result.findings.begin(), result.findings.end(),
+        [semantic](const auto& finding) {
+            return finding.semantic == semantic;
+        }));
+}
+
+const surface_finding_t& require_semantic_finding(
+    const surface_reconciliation_result_t& result,
+    surface_finding_semantic_t semantic) {
+    const auto found = std::find_if(
+        result.findings.begin(), result.findings.end(),
+        [semantic](const auto& finding) {
+            return finding.semantic == semantic;
+        });
+    require(found != result.findings.end(),
+            "required reconciliation semantic finding is absent");
+    return *found;
 }
 
 const surface_finding_t& require_finding(
@@ -137,6 +161,7 @@ bool equal_results(
         const auto& a = left.findings[index];
         const auto& b = right.findings[index];
         if (a.code != b.code || a.stable_code != b.stable_code ||
+            a.semantic != b.semantic ||
             a.identifier != b.identifier || a.detail != b.detail ||
             a.canonical_path != b.canonical_path || a.kind != b.kind ||
             a.severity != b.severity) {
@@ -195,6 +220,17 @@ void verify_stable_protocol() {
     require(surface_reconciliation_t::entry_kind_name(
                 static_cast<surface_entry_kind_t>(0xff)) == "unknown",
             "unknown surface entry kind did not fail closed");
+
+    constexpr std::array<surface_finding_semantic_t, 4> semantics = {
+        surface_finding_semantic_t::ordinary,
+        surface_finding_semantic_t::finding_capacity,
+        surface_finding_semantic_t::metrics_saturation,
+        surface_finding_semantic_t::auxiliary_security_incomplete
+    };
+    for (std::size_t index = 0; index < semantics.size(); ++index) {
+        require(static_cast<std::uint8_t>(semantics[index]) == index,
+                "surface finding semantic ordinal changed");
+    }
 }
 
 void verify_clean_boundaries_and_determinism() {
@@ -1731,40 +1767,60 @@ void verify_cross_proof_exclusion_matrix() {
     };
     for (const bool include_baseline : {false, true}) {
         for (std::size_t index = 0; index < masks.size(); ++index) {
-            surface_reconciliation_t reconciliation;
             const auto identifier =
                 "cross_proof_" + std::to_string(include_baseline ? 1 : 0) +
                 "_" + std::to_string(index);
             const auto target = identifier + "_target";
-            auto source = retired(make_entry(
-                identifier, "surface/" + identifier + ".cpp",
-                surface_entry_kind_t::alias_mapping), target);
-            if (include_baseline)
-                reconciliation.register_baseline_entry(source);
-            reconciliation.register_actual_entry(source);
-            reconciliation.register_actual_entry(make_entry(
-                target, "surface/" + target + ".cpp",
-                surface_entry_kind_t::handler_registration));
             std::uint64_t proof_count = 0;
-            if ((masks[index] & 0x1U) != 0) {
-                reconciliation.mark_dead_replaced_path(identifier, target);
-                ++proof_count;
+            for (const auto bit : {0x1U, 0x2U, 0x4U, 0x8U}) {
+                if ((masks[index] & bit) != 0)
+                    ++proof_count;
             }
-            if ((masks[index] & 0x2U) != 0) {
-                reconciliation.mark_unsupported_alias(identifier, target);
-                ++proof_count;
-            }
-            if ((masks[index] & 0x4U) != 0) {
-                reconciliation.mark_stale_registration(identifier);
-                ++proof_count;
-            }
-            if ((masks[index] & 0x8U) != 0) {
-                reconciliation.mark_old_schema_v8_writer(
-                    identifier, source.canonical_path);
-                ++proof_count;
-            }
-            const auto first = reconciliation.reconcile();
-            const auto second = reconciliation.reconcile();
+            const auto exercise = [&](bool reverse) {
+                surface_reconciliation_t reconciliation;
+                auto source = retired(make_entry(
+                    identifier, "surface/" + identifier + ".cpp",
+                    surface_entry_kind_t::alias_mapping), target);
+                if (include_baseline)
+                    reconciliation.register_baseline_entry(source);
+                reconciliation.register_actual_entry(source);
+                reconciliation.register_actual_entry(make_entry(
+                    target, "surface/" + target + ".cpp",
+                    surface_entry_kind_t::handler_registration));
+                constexpr std::array<std::uint8_t, 4> bits = {
+                    0x1U, 0x2U, 0x4U, 0x8U
+                };
+                const auto add = [&](std::uint8_t bit) {
+                    if ((masks[index] & bit) == 0)
+                        return;
+                    if (bit == 0x1U) {
+                        reconciliation.mark_dead_replaced_path(
+                            identifier, target);
+                    } else if (bit == 0x2U) {
+                        reconciliation.mark_unsupported_alias(
+                            identifier, target);
+                    } else if (bit == 0x4U) {
+                        reconciliation.mark_stale_registration(identifier);
+                    } else {
+                        reconciliation.mark_old_schema_v8_writer(
+                            identifier, source.canonical_path);
+                    }
+                };
+                if (reverse) {
+                    for (auto bit = bits.rbegin(); bit != bits.rend(); ++bit)
+                        add(*bit);
+                } else {
+                    for (const auto bit : bits)
+                        add(bit);
+                }
+                const auto first = reconciliation.reconcile();
+                const auto second = reconciliation.reconcile();
+                require(equal_results(first, second),
+                        "cross-proof repeated reconciliation is nondeterministic");
+                return first;
+            };
+            const auto first = exercise(false);
+            const auto reverse = exercise(true);
             require_marker_reason(
                 first, "inactive_entry_proofs", identifier,
                 "conflicting_proof_markers");
@@ -1775,8 +1831,8 @@ void verify_cross_proof_exclusion_matrix() {
             require_finding(
                 first, surface_error_code_t::unexplained_removal_detected,
                 identifier);
-            require(equal_results(first, second),
-                    "cross-proof exclusion is nondeterministic");
+            require(equal_results(first, reverse),
+                    "cross-proof exclusion depends on marker order");
         }
     }
     {
@@ -1986,6 +2042,52 @@ void verify_same_key_conflict_invalidation() {
                 schema_forward.malformed_markers == 1 &&
                 equal_results(schema_forward, schema_reverse),
             "same-key schema conflict was eligible or order-dependent");
+
+    const auto exercise_mixed_conflict = [](bool reverse) {
+        surface_reconciliation_t reconciliation;
+        const auto source = make_entry(
+            "same_key_mixed_conflict",
+            "surface/same_key_mixed_conflict.cpp",
+            surface_entry_kind_t::alias_mapping);
+        reconciliation.register_actual_entry(retired(
+            source, "same_key_mixed_target"));
+        reconciliation.register_actual_entry(make_entry(
+            "same_key_mixed_target", "surface/same_key_mixed_target.cpp",
+            surface_entry_kind_t::handler_registration));
+        const auto add_dead_conflict = [&] {
+            reconciliation.mark_dead_replaced_path(
+                source.identifier, "same_key_mixed_target");
+            reconciliation.mark_dead_replaced_path(
+                source.identifier, "same_key_mixed_wrong");
+        };
+        const auto add_alias = [&] {
+            reconciliation.mark_unsupported_alias(
+                source.identifier, "same_key_mixed_target");
+        };
+        if (reverse) {
+            add_alias();
+            add_dead_conflict();
+        } else {
+            add_dead_conflict();
+            add_alias();
+        }
+        return reconciliation.reconcile();
+    };
+    const auto mixed_forward = exercise_mixed_conflict(false);
+    const auto mixed_reverse = exercise_mixed_conflict(true);
+    require_marker_reason(
+        mixed_forward, "dead_replaced_paths", "same_key_mixed_conflict",
+        "conflicting_duplicate_marker");
+    require(mixed_forward.attempted_auxiliary_markers == 3 &&
+                mixed_forward.rejected_auxiliary_markers == 1 &&
+                mixed_forward.malformed_markers == 1 &&
+                mixed_forward.unexplained_removals == 1,
+            "internally conflicted proof did not invalidate sibling proof eligibility");
+    require_finding(
+        mixed_forward, surface_error_code_t::unexplained_removal_detected,
+        "same_key_mixed_conflict");
+    require(equal_results(mixed_forward, mixed_reverse),
+            "mixed internal proof conflict depends on marker order");
 
     const auto exercise_duplicate = [](bool reverse) {
         surface_reconciliation_t reconciliation;
@@ -2508,7 +2610,7 @@ void verify_limits_and_finding_cap() {
     }
     {
         surface_reconciliation_limits_t value;
-        value.maximum_findings = 1;
+        value.maximum_findings = 0;
         add(value);
         value.maximum_findings = 10001;
         add(value);
@@ -2881,15 +2983,11 @@ void verify_canonical_invalid_and_overflow_evidence() {
 }
 
 void verify_auxiliary_security_priority() {
-    constexpr std::array<std::array<std::size_t, 5>, 3> orders = {{
-        {{0, 1, 2, 3, 4}},
-        {{4, 3, 2, 1, 0}},
-        {{2, 4, 1, 3, 0}}
-    }};
     for (std::size_t capacity = 1; capacity <= 5; ++capacity) {
         surface_reconciliation_result_t canonical;
         bool have_canonical = false;
-        for (const auto& order : orders) {
+        std::array<std::size_t, 5> order = {{0, 1, 2, 3, 4}};
+        do {
             surface_reconciliation_limits_t limits;
             limits.maximum_entries = capacity;
             surface_reconciliation_t reconciliation(limits);
@@ -2956,7 +3054,7 @@ void verify_auxiliary_security_priority() {
                 require(equal_results(canonical, result),
                         "auxiliary priority retention depends on input order");
             }
-        }
+        } while (std::next_permutation(order.begin(), order.end()));
     }
 
     constexpr std::array<std::array<std::size_t, 3>, 6> proof_orders = {{
@@ -3001,6 +3099,12 @@ void verify_auxiliary_security_priority() {
         require_finding(
             result, surface_error_code_t::unexplained_removal_detected,
             "priority_proof_source");
+        require_no_finding(
+            result, surface_error_code_t::invalid_surface_marker,
+            "priority_proof_stale");
+        require_finding(
+            result, surface_error_code_t::auxiliary_marker_cap_exceeded,
+            "stale_registrations");
         if (!have_proof_overflow) {
             canonical_proof_overflow = result;
             have_proof_overflow = true;
@@ -3009,6 +3113,542 @@ void verify_auxiliary_security_priority() {
                     "overflow proof closure depends on marker order");
         }
     }
+
+    surface_reconciliation_result_t canonical_conflict_eviction;
+    bool have_conflict_eviction = false;
+    for (const bool reverse : {false, true}) {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_entries = 2;
+        surface_reconciliation_t reconciliation(limits);
+        const auto source = make_entry(
+            "evicted_conflict_source", "surface/evicted_conflict_source.cpp",
+            surface_entry_kind_t::source_file);
+        reconciliation.register_actual_entry(retired(
+            source, "evicted_conflict_target"));
+        reconciliation.register_actual_entry(make_entry(
+            "evicted_conflict_target", "surface/evicted_conflict_target.cpp",
+            surface_entry_kind_t::source_file));
+        const auto add = [&](std::string_view target) {
+            reconciliation.mark_dead_replaced_path(source.identifier, target);
+        };
+        if (reverse) {
+            add("evicted_conflict_wrong");
+            add("evicted_conflict_target");
+        } else {
+            add("evicted_conflict_target");
+            add("evicted_conflict_wrong");
+        }
+        reconciliation.mark_security_regression(
+            "evicted_conflict_security_b", "security evidence b");
+        reconciliation.mark_security_regression(
+            "evicted_conflict_security_a", "security evidence a");
+        add("evicted_conflict_target");
+        const auto result = reconciliation.reconcile();
+        require(result.attempted_auxiliary_markers == 5 &&
+                    result.rejected_auxiliary_markers == 3 &&
+                    result.malformed_markers == 1 &&
+                    result.auxiliary_cap_exceeded &&
+                    result.unexplained_removals == 1,
+                "evicted conflicting proof regained eligibility or changed accounting");
+        require_marker_reason(
+            result, "dead_replaced_paths", source.identifier,
+            "conflicting_duplicate_marker");
+        require_finding(
+            result, surface_error_code_t::auxiliary_marker_cap_exceeded,
+            "dead_replaced_paths");
+        require_finding(
+            result, surface_error_code_t::unexplained_removal_detected,
+            source.identifier);
+        require_finding(
+            result, surface_error_code_t::security_regression_detected,
+            "evicted_conflict_security_a");
+        require_finding(
+            result, surface_error_code_t::security_regression_detected,
+            "evicted_conflict_security_b");
+        if (!have_conflict_eviction) {
+            canonical_conflict_eviction = result;
+            have_conflict_eviction = true;
+        } else {
+            require(equal_results(canonical_conflict_eviction, result),
+                    "evicted conflict disposition depends on marker order");
+        }
+    }
+}
+
+void verify_permanent_auxiliary_history() {
+    enum class family_t : std::uint8_t {
+        dead = 0,
+        duplicate = 1,
+        schema = 2,
+        alias = 3,
+        security = 4
+    };
+
+    constexpr std::array<std::array<std::size_t, 9>, 8> orders = {{
+        {{0, 1, 2, 3, 4, 5, 6, 7, 8}},
+        {{8, 7, 6, 5, 4, 3, 2, 1, 0}},
+        {{1, 2, 0, 3, 4, 5, 6, 7, 8}},
+        {{6, 1, 2, 3, 4, 5, 0, 7, 8}},
+        {{1, 0, 2, 6, 3, 7, 4, 5, 8}},
+        {{8, 5, 4, 3, 2, 1, 7, 6, 0}},
+        {{0, 1, 6, 2, 3, 7, 4, 5, 8}},
+        {{6, 5, 0, 4, 1, 3, 7, 8, 2}}
+    }};
+
+    const auto exercise = [](family_t family, std::size_t capacity,
+                             const std::array<std::size_t, 9>& order,
+                             std::uint64_t metric_limit) {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_entries = capacity;
+        if (metric_limit != 0)
+            limits.maximum_metric_value = metric_limit;
+        surface_reconciliation_t reconciliation(limits);
+
+        if (family == family_t::dead) {
+            const auto source = make_entry(
+                "z_history_dead", "surface/z_history_dead.cpp",
+                surface_entry_kind_t::source_file);
+            reconciliation.register_actual_entry(retired(
+                source, "z_history_dead_target"));
+            if (capacity >= 2) {
+                reconciliation.register_actual_entry(make_entry(
+                    "z_history_dead_target",
+                    "surface/z_history_dead_target.cpp",
+                    surface_entry_kind_t::source_file));
+            }
+        } else if (family == family_t::schema) {
+            reconciliation.register_baseline_entry(make_entry(
+                "z_history_schema", "surface/z_history_schema.cpp",
+                surface_entry_kind_t::schema_writer, true, "v8"));
+            reconciliation.register_actual_entry(make_entry(
+                "z_history_schema", "surface/z_history_schema.cpp",
+                surface_entry_kind_t::schema_writer, true, "v9"));
+        } else if (family == family_t::alias) {
+            const auto source = make_entry(
+                "z_history_alias", "surface/z_history_alias.cpp",
+                surface_entry_kind_t::alias_mapping);
+            reconciliation.register_actual_entry(retired(
+                source, "z_history_alias_target"));
+            if (capacity >= 2) {
+                reconciliation.register_actual_entry(make_entry(
+                    "z_history_alias_target",
+                    "surface/z_history_alias_target.cpp",
+                    surface_entry_kind_t::handler_registration));
+            }
+        }
+
+        const auto mark_family = [&](std::uint8_t variant) {
+            switch (family) {
+            case family_t::dead:
+                reconciliation.mark_dead_replaced_path(
+                    "z_history_dead",
+                    variant == 0
+                        ? "z_history_dead_target"
+                        : variant == 1
+                              ? "z_history_dead_wrong"
+                              : "z_history_dead_third");
+                break;
+            case family_t::duplicate:
+                reconciliation.mark_duplicate_store(
+                    "z_history_duplicate",
+                    variant == 0
+                        ? "surface/z_history_duplicate_a.cpp"
+                        : variant == 1
+                              ? "surface/z_history_duplicate_b.cpp"
+                              : "surface/z_history_duplicate_c.cpp");
+                break;
+            case family_t::schema:
+                reconciliation.mark_old_schema_v8_writer(
+                    "z_history_schema",
+                    variant == 0
+                        ? "surface/z_history_schema.cpp"
+                        : variant == 1
+                              ? "surface/z_history_schema_wrong.cpp"
+                              : "surface/z_history_schema_third.cpp");
+                break;
+            case family_t::alias:
+                reconciliation.mark_unsupported_alias(
+                    "z_history_alias",
+                    variant == 0
+                        ? "z_history_alias_target"
+                        : variant == 1
+                              ? "z_history_alias_wrong"
+                              : "z_history_alias_third");
+                break;
+            case family_t::security:
+                reconciliation.mark_security_regression(
+                    "z_history_security",
+                    variant == 0
+                        ? "short security evidence"
+                        : variant == 1
+                              ? "deterministically stronger retained security evidence"
+                              : "intermediate security evidence");
+                break;
+            }
+        };
+
+        for (const auto event : order) {
+            if (event == 0 || event == 8) {
+                mark_family(0);
+            } else if (event == 6) {
+                mark_family(1);
+            } else if (event == 7) {
+                mark_family(2);
+            } else {
+                const auto suffix = std::to_string(event - 1);
+                reconciliation.mark_security_regression(
+                    "a_history_interposition_" + suffix,
+                    "security interposition evidence " + suffix);
+            }
+        }
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(equal_results(first, second),
+                "permanent auxiliary history changed across repeated reconciliation");
+        return first;
+    };
+
+    constexpr std::array<family_t, 5> families = {
+        family_t::dead, family_t::duplicate, family_t::schema,
+        family_t::alias, family_t::security
+    };
+    for (const auto family : families) {
+        for (std::size_t capacity = 1; capacity <= 5; ++capacity) {
+            surface_reconciliation_result_t canonical;
+            bool have_canonical = false;
+            for (const auto& order : orders) {
+                const auto result = exercise(family, capacity, order, 0);
+                const auto identifier =
+                    family == family_t::dead
+                        ? "z_history_dead"
+                        : family == family_t::duplicate
+                              ? "z_history_duplicate"
+                              : family == family_t::schema
+                                    ? "z_history_schema"
+                                    : family == family_t::alias
+                                          ? "z_history_alias"
+                                          : "z_history_security";
+                const auto collection =
+                    family == family_t::dead
+                        ? "dead_replaced_paths"
+                        : family == family_t::duplicate
+                              ? "duplicate_stores"
+                              : family == family_t::schema
+                                    ? "old_schema_v8_writers"
+                                    : family == family_t::alias
+                                          ? "unsupported_aliases"
+                                          : "security_regressions";
+                const auto& invalid = require_finding(
+                    result, surface_error_code_t::invalid_surface_marker,
+                    identifier);
+                require_detail(
+                    invalid,
+                    "surface marker rejected; collection=" +
+                        std::string(collection) +
+                        ", reason=conflicting_duplicate_marker, malformed=1");
+                require(result.attempted_auxiliary_markers == 9 &&
+                            result.rejected_auxiliary_markers == 9 - capacity &&
+                            result.unexplained_removals ==
+                                (family == family_t::dead ||
+                                         family == family_t::alias
+                                     ? 1U
+                                     : 0U) &&
+                            result.findings_produced ==
+                                capacity +
+                                    (family == family_t::duplicate ? 2U : 3U) &&
+                            result.findings_discarded == 0 &&
+                            result.findings.size() ==
+                                capacity +
+                                    (family == family_t::duplicate ? 2U : 3U) &&
+                            result.malformed_markers == 1 &&
+                            result.auxiliary_cap_exceeded &&
+                            !result.baseline_cap_exceeded &&
+                            !result.actual_cap_exceeded &&
+                            !result.metrics_saturated && !result.clean,
+                        "permanent auxiliary history metric contract is incorrect");
+                const auto overflow_collection =
+                    family == family_t::dead
+                        ? "dead_replaced_paths"
+                        : family == family_t::duplicate
+                              ? "duplicate_stores"
+                              : family == family_t::schema
+                                    ? "old_schema_v8_writers"
+                                    : family == family_t::alias && capacity == 5
+                                          ? "unsupported_aliases"
+                                          : "security_regressions";
+                const auto& overflow = require_finding(
+                    result,
+                    surface_error_code_t::auxiliary_marker_cap_exceeded,
+                    overflow_collection);
+                require_detail(
+                    overflow,
+                    "shared auxiliary marker capacity exceeded; attempted=9, rejected=" +
+                        std::to_string(9 - capacity));
+                require(finding_count(
+                            result,
+                            surface_error_code_t::security_regression_detected) ==
+                            capacity +
+                                (family == family_t::security
+                                     ? std::size_t{1}
+                                     : std::size_t{0}),
+                        "security interposition retention is incorrect");
+
+                if (family == family_t::dead) {
+                    require_finding(
+                        result,
+                        surface_error_code_t::unexplained_removal_detected,
+                        "z_history_dead");
+                    require_no_finding(
+                        result,
+                        surface_error_code_t::dead_replaced_path_detected,
+                        "z_history_dead");
+                } else if (family == family_t::duplicate) {
+                    require_no_finding(
+                        result,
+                        surface_error_code_t::duplicate_store_detected,
+                        "z_history_duplicate");
+                } else if (family == family_t::schema) {
+                    require_finding(
+                        result, surface_error_code_t::baseline_mismatch,
+                        "z_history_schema");
+                } else if (family == family_t::alias) {
+                    require_finding(
+                        result,
+                        surface_error_code_t::unexplained_removal_detected,
+                        "z_history_alias");
+                    require_no_finding(
+                        result,
+                        surface_error_code_t::unsupported_alias_detected,
+                        "z_history_alias");
+                } else {
+                    const auto& security = require_finding(
+                        result,
+                        surface_error_code_t::security_regression_detected,
+                        "z_history_security");
+                    require_detail(
+                        security,
+                        "security regression: deterministically stronger retained security evidence");
+                }
+                if (!have_canonical) {
+                    canonical = result;
+                    have_canonical = true;
+                } else {
+                    require(equal_results(canonical, result),
+                            "permanent auxiliary history depends on eviction order");
+                }
+            }
+        }
+    }
+
+    surface_reconciliation_result_t saturated_canonical;
+    bool have_saturated_canonical = false;
+    for (const auto& order : orders) {
+        const auto result = exercise(family_t::security, 1, order, 2);
+        require(result.attempted_auxiliary_markers == 2 &&
+                    result.rejected_auxiliary_markers == 2 &&
+                    result.malformed_markers == 1 &&
+                    result.metrics_saturated && !result.clean,
+                "permanent auxiliary history saturation contract is incorrect");
+        require_finding(
+            result, surface_error_code_t::internal_error,
+            "metrics_saturated");
+        require_finding(
+            result, surface_error_code_t::security_regression_detected,
+            "z_history_security");
+        if (!have_saturated_canonical) {
+            saturated_canonical = result;
+            have_saturated_canonical = true;
+        } else {
+            require(equal_results(saturated_canonical, result),
+                    "saturated auxiliary history depends on eviction order");
+        }
+    }
+
+    const auto exercise_history_limit = [](bool reverse,
+                                           std::size_t finding_limit) {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_entries = 100000;
+        limits.maximum_findings = finding_limit;
+        surface_reconciliation_t reconciliation(limits);
+        const auto add_security = [&] {
+            reconciliation.mark_security_regression(
+                "history_limit_security", "retained security evidence");
+        };
+        if (!reverse)
+            add_security();
+        for (std::size_t index = 0; index < 100000; ++index) {
+            const auto value = reverse
+                ? std::size_t{99999} - index
+                : index;
+            reconciliation.mark_stale_registration(
+                "history_limit_stale_" + std::to_string(value));
+        }
+        if (reverse)
+            add_security();
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(equal_results(first, second),
+                "history-limit fail-closure changed across repeated reconciliation");
+        return first;
+    };
+    const auto require_history_security = [](const auto& result) {
+        require(semantic_finding_count(
+                    result,
+                    surface_finding_semantic_t::auxiliary_security_incomplete) == 1,
+                "history fail-closure did not retain one semantic security finding");
+        const auto& finding = require_semantic_finding(
+            result,
+            surface_finding_semantic_t::auxiliary_security_incomplete);
+        require(finding.code ==
+                    surface_error_code_t::security_regression_detected &&
+                    finding.stable_code == "security_regression_detected" &&
+                    finding.identifier == "auxiliary_security_evidence" &&
+                    finding.canonical_path.empty() &&
+                    finding.kind == surface_entry_kind_t::security_guard &&
+                    finding.severity == 1000 &&
+                    result.findings.front().semantic ==
+                        surface_finding_semantic_t::auxiliary_security_incomplete,
+                "history fail-closure security classification is incorrect");
+        require_detail(
+            finding,
+            "security regression evidence is present but detailed auxiliary history is incomplete; auxiliary marker capacity and metric accounting failed closed");
+    };
+    const auto require_metric_semantic = [](const auto& result) {
+        require(semantic_finding_count(
+                    result,
+                    surface_finding_semantic_t::metrics_saturation) == 1,
+                "history fail-closure did not retain one metric finding");
+        const auto& finding = require_semantic_finding(
+            result, surface_finding_semantic_t::metrics_saturation);
+        require(finding.code == surface_error_code_t::internal_error &&
+                    finding.stable_code == "internal_error" &&
+                    finding.identifier == "metrics_saturated" &&
+                    finding.canonical_path.empty() &&
+                    finding.kind ==
+                        surface_entry_kind_t::contract_registration &&
+                    finding.severity == 1000,
+                "history fail-closure metric classification is incorrect");
+    };
+
+    const auto require_history_incomplete_metrics = [](const auto& result) {
+        require(result.attempted_auxiliary_markers == 100001 &&
+                    result.rejected_auxiliary_markers ==
+                    std::numeric_limits<std::uint64_t>::max() &&
+                    result.malformed_markers == 0 &&
+                    result.auxiliary_cap_exceeded &&
+                    result.metrics_saturated && !result.clean,
+                "bounded history-incomplete metrics are incorrect");
+        require_no_finding(
+            result, surface_error_code_t::invalid_surface_marker);
+    };
+
+    const auto history_limit_one_forward =
+        exercise_history_limit(false, 1);
+    const auto history_limit_one_reverse =
+        exercise_history_limit(true, 1);
+    require(equal_results(
+                history_limit_one_forward, history_limit_one_reverse),
+            "single-finding history fail-closure depends on input order");
+    require_history_incomplete_metrics(history_limit_one_forward);
+    require(history_limit_one_forward.finding_cap_exceeded &&
+                history_limit_one_forward.findings.size() == 1 &&
+                history_limit_one_forward.findings_produced == 5 &&
+                history_limit_one_forward.findings_discarded == 4,
+            "single-finding history fail-closure retention is incorrect");
+    require_history_security(history_limit_one_forward);
+    require(semantic_finding_count(
+                history_limit_one_forward,
+                surface_finding_semantic_t::metrics_saturation) == 0 &&
+                semantic_finding_count(
+                    history_limit_one_forward,
+                    surface_finding_semantic_t::finding_capacity) == 0,
+            "single-finding history retention kept a weaker mandatory diagnostic");
+    require_no_finding(
+        history_limit_one_forward,
+        surface_error_code_t::auxiliary_marker_cap_exceeded);
+    require_no_finding(
+        history_limit_one_forward, surface_error_code_t::internal_error,
+        "metrics_saturated");
+
+    const auto history_limit_two_forward =
+        exercise_history_limit(false, 2);
+    const auto history_limit_two_reverse =
+        exercise_history_limit(true, 2);
+    require(equal_results(
+                history_limit_two_forward, history_limit_two_reverse),
+            "two-finding history fail-closure depends on input order");
+    require_history_incomplete_metrics(history_limit_two_forward);
+    require(history_limit_two_forward.finding_cap_exceeded &&
+                history_limit_two_forward.findings.size() == 2 &&
+                history_limit_two_forward.findings_produced == 4 &&
+                history_limit_two_forward.findings_discarded == 2,
+            "two-finding history fail-closure retention is incorrect");
+    require_history_security(history_limit_two_forward);
+    require_metric_semantic(history_limit_two_forward);
+    require(history_limit_two_forward.findings[0].semantic ==
+                    surface_finding_semantic_t::auxiliary_security_incomplete &&
+                history_limit_two_forward.findings[1].semantic ==
+                    surface_finding_semantic_t::metrics_saturation,
+            "two-finding history fail-closure order is incorrect");
+    require(semantic_finding_count(
+                history_limit_two_forward,
+                surface_finding_semantic_t::finding_capacity) == 0,
+            "two-finding history retention kept the weaker cap marker");
+    require_no_finding(
+        history_limit_two_forward,
+        surface_error_code_t::auxiliary_marker_cap_exceeded);
+
+    const auto exercise_value_history_limit = [](bool reverse) {
+        surface_reconciliation_limits_t limits;
+        limits.maximum_entries = 100000;
+        limits.maximum_findings = 3;
+        surface_reconciliation_t reconciliation(limits);
+        for (std::size_t index = 0; index <= 100000; ++index) {
+            const auto value = reverse
+                ? std::size_t{100000} - index
+                : index;
+            reconciliation.mark_security_regression(
+                "value_history_security",
+                "value history security evidence " + std::to_string(value));
+        }
+        const auto first = reconciliation.reconcile();
+        const auto second = reconciliation.reconcile();
+        require(equal_results(first, second),
+                "value-history fail-closure changed across repeated reconciliation");
+        return first;
+    };
+    const auto value_history_forward = exercise_value_history_limit(false);
+    const auto value_history_reverse = exercise_value_history_limit(true);
+    require(equal_results(value_history_forward, value_history_reverse),
+            "value-history fail-closure depends on insertion order");
+    require_history_incomplete_metrics(value_history_forward);
+    require(value_history_forward.findings_produced == 3 &&
+                value_history_forward.findings_discarded == 0 &&
+                value_history_forward.findings.size() == 3 &&
+                !value_history_forward.finding_cap_exceeded,
+            "three-finding value-history retention is incorrect");
+    const auto& capacity = require_finding(
+        value_history_forward,
+        surface_error_code_t::auxiliary_marker_cap_exceeded,
+        "auxiliary_marker_history");
+    require(capacity.semantic == surface_finding_semantic_t::ordinary,
+            "history capacity evidence has the wrong semantic identity");
+    require_contains(capacity, "attempted=100001");
+    require_history_security(value_history_forward);
+    require_metric_semantic(value_history_forward);
+    require(value_history_forward.findings[0].semantic ==
+                    surface_finding_semantic_t::auxiliary_security_incomplete &&
+                value_history_forward.findings[1].semantic ==
+                    surface_finding_semantic_t::metrics_saturation &&
+                value_history_forward.findings[2].code ==
+                    surface_error_code_t::auxiliary_marker_cap_exceeded &&
+                value_history_forward.findings[2].semantic ==
+                    surface_finding_semantic_t::ordinary,
+            "three-finding history fail-closure order is incorrect");
+    require(semantic_finding_count(
+                value_history_forward,
+                surface_finding_semantic_t::finding_capacity) == 0,
+            "three-finding history retention fabricated a cap marker");
 }
 
 void verify_diagnostic_families() {
@@ -3103,6 +3743,140 @@ void require_metrics_at_most(
             "reconciliation metric exceeded its configured ceiling");
 }
 
+void verify_bounded_internal_finding_identity() {
+    constexpr std::string_view metric_identifier = "metrics_saturated";
+    constexpr std::string_view metric_detail =
+        "one or more reconciliation metrics reached the configured ceiling of 1";
+    constexpr std::array<std::string_view, 4> security_identifiers = {
+        "a", "b", "c", "d"
+    };
+
+    for (std::size_t identifier_bound = 1; identifier_bound <= 16;
+         ++identifier_bound) {
+        for (std::size_t finding_bound = 1; finding_bound <= 3;
+             ++finding_bound) {
+            const auto exercise = [identifier_bound, finding_bound,
+                                   &security_identifiers](bool reverse) {
+                surface_reconciliation_limits_t limits;
+                limits.maximum_findings = finding_bound;
+                limits.maximum_identifier_bytes = identifier_bound;
+                limits.maximum_text_bytes = identifier_bound;
+                limits.maximum_metric_value = 1;
+                surface_reconciliation_t reconciliation(limits);
+                if (reverse) {
+                    for (auto identifier = security_identifiers.rbegin();
+                         identifier != security_identifiers.rend(); ++identifier) {
+                        reconciliation.mark_security_regression(*identifier, "x");
+                    }
+                } else {
+                    for (const auto identifier : security_identifiers)
+                        reconciliation.mark_security_regression(identifier, "x");
+                }
+                const auto first = reconciliation.reconcile();
+                const auto second = reconciliation.reconcile();
+                require(equal_results(first, second),
+                        "bounded internal semantic changed across reconciliation");
+                return first;
+            };
+
+            const auto forward = exercise(false);
+            const auto reverse = exercise(true);
+            require(equal_results(forward, reverse),
+                    "bounded internal semantic depends on input order");
+            require(forward.metrics_saturated &&
+                        forward.finding_cap_exceeded &&
+                        forward.findings.size() == finding_bound &&
+                        !forward.clean,
+                    "bounded metric and finding-cap disposition is incorrect");
+            require(semantic_finding_count(
+                        forward,
+                        surface_finding_semantic_t::metrics_saturation) == 1 &&
+                        finding_count(
+                            forward, surface_error_code_t::internal_error) == 1,
+                    "bounded metric semantic was duplicated or discarded");
+            const auto& metric = require_semantic_finding(
+                forward, surface_finding_semantic_t::metrics_saturation);
+            require(metric.code == surface_error_code_t::internal_error &&
+                        metric.stable_code == "internal_error" &&
+                        metric.identifier == std::string(
+                            metric_identifier.substr(0, identifier_bound)) &&
+                        metric.detail == std::string(
+                            metric_detail.substr(0, identifier_bound)) &&
+                        metric.canonical_path.empty() &&
+                        metric.kind ==
+                            surface_entry_kind_t::contract_registration &&
+                        metric.severity == 1000,
+                    "bounded metric evidence lost semantic or display identity");
+            const auto expected_capacity_count =
+                finding_bound >= 2 ? std::size_t{1} : std::size_t{0};
+            const auto expected_security_count =
+                finding_bound == 3 ? std::size_t{1} : std::size_t{0};
+            require(semantic_finding_count(
+                        forward,
+                        surface_finding_semantic_t::finding_capacity) ==
+                        expected_capacity_count &&
+                        finding_count(
+                            forward,
+                            surface_error_code_t::finding_cap_exceeded) ==
+                        expected_capacity_count &&
+                        finding_count(
+                            forward,
+                            surface_error_code_t::security_regression_detected) ==
+                        expected_security_count &&
+                        semantic_finding_count(
+                            forward,
+                            surface_finding_semantic_t::ordinary) ==
+                        expected_security_count &&
+                        semantic_finding_count(
+                            forward,
+                            surface_finding_semantic_t::auxiliary_security_incomplete) ==
+                        0,
+                    "finding-cap retention erased or demoted metric evidence");
+            if (finding_bound == 1) {
+                require(forward.findings[0].semantic ==
+                            surface_finding_semantic_t::metrics_saturation,
+                        "single-slot bounded finding order is incorrect");
+            } else if (finding_bound == 2) {
+                require(forward.findings[0].semantic ==
+                                surface_finding_semantic_t::metrics_saturation &&
+                            forward.findings[1].semantic ==
+                                surface_finding_semantic_t::finding_capacity,
+                        "two-slot bounded finding order is incorrect");
+            } else {
+                require(forward.findings[0].code ==
+                                surface_error_code_t::security_regression_detected &&
+                            forward.findings[0].semantic ==
+                                surface_finding_semantic_t::ordinary &&
+                            forward.findings[1].semantic ==
+                                surface_finding_semantic_t::metrics_saturation &&
+                            forward.findings[2].semantic ==
+                                surface_finding_semantic_t::finding_capacity,
+                        "three-slot bounded finding order is incorrect");
+            }
+            if (expected_capacity_count != 0) {
+                const auto& capacity = require_semantic_finding(
+                    forward, surface_finding_semantic_t::finding_capacity);
+                constexpr std::string_view capacity_identifier =
+                    "surface_findings";
+                constexpr std::string_view capacity_detail =
+                    "finding capacity exceeded";
+                require(capacity.code ==
+                                surface_error_code_t::finding_cap_exceeded &&
+                            capacity.stable_code == "finding_cap_exceeded" &&
+                            capacity.identifier == std::string(
+                                capacity_identifier.substr(0, identifier_bound)) &&
+                            capacity.detail == std::string(
+                                capacity_detail.substr(0, identifier_bound)) &&
+                            capacity.canonical_path.empty() &&
+                            capacity.kind ==
+                                surface_entry_kind_t::contract_registration &&
+                            capacity.severity == 1000,
+                        "bounded capacity evidence lost semantic or display identity");
+            }
+        }
+    }
+}
+
 void verify_metric_saturation() {
     {
         surface_reconciliation_limits_t limits;
@@ -3195,7 +3969,9 @@ void run_surface_reconciliation_harness() {
     verify_marker_validation_and_capacity();
     verify_canonical_invalid_and_overflow_evidence();
     verify_auxiliary_security_priority();
+    verify_permanent_auxiliary_history();
     verify_diagnostic_families();
+    verify_bounded_internal_finding_identity();
     verify_metric_saturation();
 }
 

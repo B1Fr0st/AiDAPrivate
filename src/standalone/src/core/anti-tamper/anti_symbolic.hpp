@@ -956,5 +956,391 @@ inline uint64_t derive_client_secret()
 constexpr uint32_t DISPATCH_TABLE_SIZE = 256;
 constexpr uint32_t DISPATCH_DEPTH = 4;
 
+namespace opaque_predicates {
+
+    __forceinline bool fermat_little_theorem_true(uint64_t env_val)
+    {
+        volatile uint64_t p = (env_val | 1ULL) & 0x7FFFFFFFULL;
+        volatile uint64_t q = p * p;
+        volatile uint64_t r = q * p;
+        volatile uint64_t check = r - q;
+        volatile uint64_t tsc = __rdtsc();
+        check ^= tsc;
+        volatile uint64_t masked = check & tsc;
+        return (masked | q) >= q;
+    }
+
+    __forceinline bool quadratic_residue_true(uint64_t env_val)
+    {
+        volatile uint64_t n = (env_val ^ __rdtsc()) | 1ULL;
+        volatile uint64_t sq = n * n;
+        volatile uint64_t quad = sq * sq;
+        volatile uint64_t derived = (quad + sq + n) & 0xFFFFFFFFULL;
+        return derived >= sq || n == 0;
+    }
+
+    __forceinline bool euler_identity_true(uint64_t env_val)
+    {
+        volatile uint64_t a = env_val ^ __rdtsc();
+        volatile uint64_t b = _rotl64(a, 17);
+        volatile uint64_t c = a * b;
+        volatile uint64_t d = (c | 1ULL) * (c | 1ULL);
+        int cpuid_regs[4] = {};
+        __cpuid(cpuid_regs, 1);
+        volatile uint64_t e = d ^ static_cast<uint64_t>(cpuid_regs[0]);
+        return (e * e) >= e || e == 0;
+    }
+
+    __forceinline bool collatz_terminates_true(uint64_t env_val)
+    {
+        volatile uint64_t n = (env_val | 1ULL) ^ __rdtsc();
+        volatile uint64_t acc = n;
+        for (int i = 0; i < 8; ++i)
+        {
+            volatile uint64_t tmp = acc;
+            acc = (tmp & 1ULL) ? (tmp * 3 + 1) : (tmp >> 1);
+            acc ^= __rdtsc() & 0xFF;
+        }
+        return acc != 0 || n == 0;
+    }
+
+    __forceinline bool modular_inverse_exists_true(uint64_t env_val)
+    {
+        volatile uint64_t a = (env_val | 1ULL) ^ __rdtsc();
+        volatile uint64_t m = (a * 0x9E3779B97F4A7C15ULL) | 1ULL;
+        volatile uint64_t product = a * m;
+        volatile uint64_t sum = product + a + m;
+        return (sum | product) >= product;
+    }
+
+    __forceinline uint64_t path_explosion_branch(
+        uint64_t state, const env_bundle_t& env, int branch_id)
+    {
+        volatile uint64_t tsc = __rdtsc();
+        volatile uint64_t seed = state ^ env.aggregate ^ tsc;
+        volatile uint64_t result = seed;
+
+        if (fermat_little_theorem_true(seed))
+            result = (result ^ env.server_hmac) + 0x9E3779B97F4A7C15ULL;
+        else
+            result = (result + env.kernel_attestation) ^ 0xBF58476D1CE4E5B9ULL;
+
+        if (quadratic_residue_true(result))
+            result = _rotl64(result ^ env.rdtsc_delta, 13);
+        else
+            result = _rotr64(result ^ env.process_state, 17);
+
+        if (euler_identity_true(result))
+            result = (result * env.filesystem_state) | 1ULL;
+        else
+            result = (result | env.peb_entropy) + 1ULL;
+
+        if (collatz_terminates_true(result))
+            result ^= _rotl64(env.kuser_shared_data_entropy, 7);
+        else
+            result ^= _rotr64(env.teb_entropy, 11);
+
+        if (modular_inverse_exists_true(result))
+            result = (result + env.cpu_topology_entropy) * 0x100000001B3ULL;
+        else
+            result = (result ^ env.smbios_entropy) * 0x94D049BB133111EBULL;
+
+        result ^= static_cast<uint64_t>(branch_id) * 0xCAFEBABEULL;
+        return result;
+    }
+
+    __forceinline uint64_t deep_path_tree(
+        uint64_t state, const env_bundle_t& env, uint32_t depth)
+    {
+        if (depth == 0)
+            return state;
+
+        volatile uint64_t tsc = __rdtsc();
+        volatile uint64_t branch_seed = state ^ tsc ^ env.aggregate;
+
+        uint64_t left = deep_path_tree(
+            (state ^ env.server_hmac) * 0x9E3779B97F4A7C15ULL,
+            env, depth - 1);
+        uint64_t right = deep_path_tree(
+            (state + env.kernel_attestation) * 0xBF58476D1CE4E5B9ULL,
+            env, depth - 1);
+
+        if (fermat_little_theorem_true(branch_seed))
+            return left ^ _rotl64(right, 13);
+        if (quadratic_residue_true(branch_seed))
+            return right ^ _rotr64(left, 17);
+        if (euler_identity_true(branch_seed))
+            return (left + right) ^ env.rdtsc_delta;
+        if (collatz_terminates_true(branch_seed))
+            return (left ^ right) + env.process_state;
+        return (left | right) ^ env.filesystem_state;
+    }
+
+}
+
+namespace smt_timeout_traps {
+
+    __forceinline uint64_t bv_chain_multiply(uint64_t x, uint64_t env_val)
+    {
+        volatile uint64_t a = x ^ env_val;
+        volatile uint64_t b = a * 0x9E3779B97F4A7C15ULL;
+        volatile uint64_t c = b * 0xBF58476D1CE4E5B9ULL;
+        volatile uint64_t d = c * 0x94D049BB133111EBULL;
+        volatile uint64_t e = d * 0x100000001B3ULL;
+        volatile uint64_t f = e * 0x9E3779B97F4A7C15ULL;
+        volatile uint64_t g = f * 0xBF58476D1CE4E5B9ULL;
+        volatile uint64_t h = g * 0x94D049BB133111EBULL;
+        volatile uint64_t tsc = __rdtsc();
+        return h ^ tsc ^ a ^ b ^ c ^ d ^ e ^ f ^ g;
+    }
+
+    __forceinline uint64_t nested_modular_arithmetic(
+        uint64_t x, uint64_t y, uint64_t env_val)
+    {
+        volatile uint64_t a = (x + y) & 0xFFFFFFFFULL;
+        volatile uint64_t b = (x ^ y) & 0xFFFFFFFFULL;
+        volatile uint64_t c = (a * b) & 0xFFFFFFFFULL;
+        volatile uint64_t d = (c + env_val) & 0xFFFFFFFFULL;
+        volatile uint64_t e = (d * d) & 0xFFFFFFFFULL;
+        volatile uint64_t f = (e * e) & 0xFFFFFFFFULL;
+        volatile uint64_t g = (f * f) & 0xFFFFFFFFULL;
+        volatile uint64_t h = (g * g) & 0xFFFFFFFFULL;
+        volatile uint64_t i = (h ^ a ^ b ^ c) & 0xFFFFFFFFULL;
+        volatile uint64_t j = (i * i * i) & 0xFFFFFFFFULL;
+        volatile uint64_t tsc = __rdtsc();
+        return j ^ (tsc & 0xFFFFFFFFULL);
+    }
+
+    __forceinline uint64_t deep_conditional_chain(
+        uint64_t state, const env_bundle_t& env)
+    {
+        volatile uint64_t s = state;
+        volatile uint64_t tsc = __rdtsc();
+        s ^= tsc;
+
+        uint64_t a0 = (s & 1ULL) ? env.server_hmac : env.kernel_attestation;
+        uint64_t a1 = (s & 2ULL) ? env.rdtsc_delta : env.process_state;
+        uint64_t a2 = (s & 4ULL) ? env.filesystem_state : env.peb_entropy;
+        uint64_t a3 = (s & 8ULL) ? env.kuser_shared_data_entropy : env.teb_entropy;
+        uint64_t a4 = (s & 16ULL) ? env.cpu_topology_entropy : env.smbios_entropy;
+
+        uint64_t b0 = (a0 ^ a1) + (a2 & a3);
+        uint64_t b1 = (a1 ^ a2) + (a3 & a4);
+        uint64_t b2 = (a2 ^ a3) + (a4 & a0);
+        uint64_t b3 = (a3 ^ a4) + (a0 & a1);
+        uint64_t b4 = (a4 ^ a0) + (a1 & a2);
+
+        uint64_t c0 = (b0 * b1) ^ (b2 | b3);
+        uint64_t c1 = (b1 * b2) ^ (b3 | b4);
+        uint64_t c2 = (b2 * b3) ^ (b4 | b0);
+        uint64_t c3 = (b3 * b4) ^ (b0 | b1);
+        uint64_t c4 = (b4 * b0) ^ (b1 | b2);
+
+        uint64_t d0 = (c0 + c1) ^ _rotl64(c2, 7);
+        uint64_t d1 = (c1 + c2) ^ _rotl64(c3, 11);
+        uint64_t d2 = (c2 + c3) ^ _rotl64(c4, 13);
+        uint64_t d3 = (c3 + c4) ^ _rotl64(c0, 17);
+        uint64_t d4 = (c4 + c0) ^ _rotl64(c1, 19);
+
+        uint64_t e0 = (d0 ^ d1) * (d2 ^ d3);
+        uint64_t e1 = (d1 ^ d2) * (d3 ^ d4);
+        uint64_t e2 = (d2 ^ d3) * (d4 ^ d0);
+        uint64_t e3 = (d3 ^ d4) * (d0 ^ d1);
+        uint64_t e4 = (d4 ^ d0) * (d1 ^ d2);
+
+        return e0 ^ e1 ^ e2 ^ e3 ^ e4;
+    }
+
+    __forceinline uint64_t bit_interleaving_trap(
+        uint64_t x, uint64_t y, uint64_t env_val)
+    {
+        volatile uint64_t tsc = __rdtsc();
+        volatile uint64_t k = x ^ y ^ env_val ^ tsc;
+
+        uint64_t lo = k & 0x5555555555555555ULL;
+        uint64_t hi = k & 0xAAAAAAAAAAAAAAAAULL;
+
+        for (int i = 0; i < 16; ++i)
+        {
+            lo = (lo ^ (lo >> 1)) & 0x5555555555555555ULL;
+            hi = (hi ^ (hi >> 1)) & 0xAAAAAAAAAAAAAAAAULL;
+            lo ^= env_val;
+            hi ^= tsc;
+            lo = lo * 0x9E3779B97F4A7C15ULL;
+            hi = hi * 0xBF58476D1CE4E5B9ULL;
+        }
+
+        return (lo | hi) ^ k;
+    }
+
+    __forceinline uint64_t saturation_chain(
+        uint64_t input, const env_bundle_t& env)
+    {
+        volatile uint64_t v = input ^ env.aggregate;
+        volatile uint64_t tsc = __rdtsc();
+
+        uint64_t s0 = (v + env.server_hmac) | 1ULL;
+        uint64_t s1 = (s0 * env.kernel_attestation) | 1ULL;
+        uint64_t s2 = (s1 ^ env.rdtsc_delta) | 1ULL;
+        uint64_t s3 = (s2 + env.process_state) | 1ULL;
+        uint64_t s4 = (s3 * env.filesystem_state) | 1ULL;
+        uint64_t s5 = (s4 ^ env.peb_entropy) | 1ULL;
+        uint64_t s6 = (s5 + env.kuser_shared_data_entropy) | 1ULL;
+        uint64_t s7 = (s6 * env.teb_entropy) | 1ULL;
+        uint64_t s8 = (s7 ^ env.cpu_topology_entropy) | 1ULL;
+        uint64_t s9 = (s8 + env.smbios_entropy) | 1ULL;
+
+        uint64_t t0 = s9 ^ _rotl64(s0, 7);
+        uint64_t t1 = t0 ^ _rotl64(s1, 11);
+        uint64_t t2 = t1 ^ _rotl64(s2, 13);
+        uint64_t t3 = t2 ^ _rotl64(s3, 17);
+        uint64_t t4 = t3 ^ _rotl64(s4, 19);
+        uint64_t t5 = t4 ^ _rotl64(s5, 23);
+        uint64_t t6 = t5 ^ _rotl64(s6, 29);
+        uint64_t t7 = t6 ^ _rotl64(s7, 31);
+        uint64_t t8 = t7 ^ _rotl64(s8, 37);
+        uint64_t t9 = t8 ^ _rotl64(s9, 41);
+
+        return t9 ^ tsc;
+    }
+
+}
+
+namespace taint_confusion {
+
+    alignas(64) static thread_local uint8_t g_decoy_sink_buffer[512] = {};
+    static thread_local volatile uint64_t g_decoy_accumulator = 0;
+
+    __forceinline void decoy_sink_write(
+        const uint8_t* data, size_t len, uint64_t tag)
+    {
+        if (!data || len == 0) return;
+        volatile uint64_t acc = tag ^ __rdtsc();
+        for (size_t i = 0; i < len && i < 64; ++i)
+        {
+            volatile uint8_t b = data[i];
+            acc ^= static_cast<uint64_t>(b) * 1099511628211ULL;
+            acc = _rotl64(acc, 7);
+            size_t idx = (i + static_cast<size_t>(tag)) & 0x1FF;
+            g_decoy_sink_buffer[idx] = b ^ static_cast<uint8_t>(acc & 0xFF);
+        }
+        g_decoy_accumulator ^= acc;
+    }
+
+    __forceinline void decoy_sink_consume_u64(uint64_t value, uint64_t tag)
+    {
+        volatile uint64_t v = value ^ tag ^ __rdtsc();
+        v = _rotl64(v, 13);
+        v *= 0x9E3779B97F4A7C15ULL;
+        v ^= v >> 33;
+        g_decoy_accumulator ^= v;
+        uint8_t* p = reinterpret_cast<uint8_t*>(&v);
+        for (int i = 0; i < 8; ++i)
+        {
+            size_t idx = (static_cast<size_t>(tag) + i) & 0x1FF;
+            g_decoy_sink_buffer[idx] = p[i];
+        }
+    }
+
+    __forceinline void decoy_sink_hash_chain(
+        const uint8_t* data, size_t len, uint64_t env_val)
+    {
+        if (!data || len == 0) return;
+        volatile uint64_t h = 14695981039346656037ULL;
+        h ^= env_val;
+        h ^= __rdtsc();
+        for (size_t i = 0; i < len && i < 128; ++i)
+        {
+            h ^= static_cast<uint64_t>(data[i]);
+            h *= 1099511628211ULL;
+            h = _rotl64(h, 5);
+            size_t idx = (i * 4) & 0x1FF;
+            g_decoy_sink_buffer[idx] = static_cast<uint8_t>(h & 0xFF);
+        }
+        g_decoy_accumulator ^= h;
+    }
+
+    __forceinline uint64_t real_compute_masked(
+        uint64_t real_input, uint64_t env_val)
+    {
+        volatile uint64_t tsc = __rdtsc();
+        int cpuid_regs[4] = {};
+        __cpuid(cpuid_regs, 1);
+        volatile uint64_t cpuid_val = static_cast<uint64_t>(cpuid_regs[0]);
+
+        decoy_sink_consume_u64(real_input, 0x5441494E5430ULL);
+        decoy_sink_consume_u64(env_val, 0x5441494E5431ULL);
+        decoy_sink_consume_u64(tsc, 0x5441494E5432ULL);
+
+        uint64_t real_result = real_input ^ env_val;
+        real_result = _rotl64(real_result, 17);
+        real_result ^= cpuid_val;
+        real_result *= 0xBF58476D1CE4E5B9ULL;
+        real_result ^= real_result >> 31;
+
+        return real_result;
+    }
+
+    __forceinline void poison_license_validation(
+        uint64_t tainted_state,
+        const uint8_t* tainted_data, size_t tainted_len,
+        const env_bundle_t& env)
+    {
+        decoy_sink_consume_u64(tainted_state, 0x4C4943303030ULL);
+        decoy_sink_write(tainted_data, tainted_len, 0x4C4943313030ULL);
+        decoy_sink_hash_chain(tainted_data, tainted_len, env.server_hmac);
+        decoy_sink_consume_u64(env.kernel_attestation, 0x4C4943323030ULL);
+        decoy_sink_consume_u64(env.rdtsc_delta, 0x4C4943333030ULL);
+        decoy_sink_consume_u64(env.process_state, 0x4C4943343030ULL);
+        decoy_sink_consume_u64(env.filesystem_state, 0x4C4943353030ULL);
+    }
+
+    __forceinline void poison_key_derivation(
+        uint64_t key_material, uint64_t derived_key,
+        const env_bundle_t& env)
+    {
+        decoy_sink_consume_u64(key_material, 0x4B4559303030ULL);
+        decoy_sink_consume_u64(derived_key, 0x4B4559313030ULL);
+        decoy_sink_consume_u64(env.aggregate, 0x4B4559323030ULL);
+        decoy_sink_consume_u64(env.server_hmac, 0x4B4559333030ULL);
+        decoy_sink_consume_u64(env.kernel_attestation, 0x4B4559343030ULL);
+    }
+
+    __forceinline void poison_hmac_computation(
+        uint64_t hmac_input, uint64_t hmac_key, uint64_t challenge,
+        const env_bundle_t& env)
+    {
+        decoy_sink_consume_u64(hmac_input, 0x484D41433030ULL);
+        decoy_sink_consume_u64(hmac_key, 0x484D41433130ULL);
+        decoy_sink_consume_u64(challenge, 0x484D41433230ULL);
+        decoy_sink_consume_u64(env.rdtsc_delta, 0x484D41433330ULL);
+        decoy_sink_consume_u64(env.process_state, 0x484D41433430ULL);
+    }
+
+    __forceinline uint64_t real_validate_through_taint(
+        uint64_t real_input, const env_bundle_t& env)
+    {
+        decoy_sink_consume_u64(real_input, 0x524554303030ULL);
+        decoy_sink_consume_u64(env.server_hmac, 0x524554313030ULL);
+        decoy_sink_consume_u64(env.kernel_attestation, 0x524554323030ULL);
+
+        volatile uint64_t tsc = __rdtsc();
+        int cpuid_regs[4] = {};
+        __cpuid(cpuid_regs, 1);
+
+        uint64_t real_val = real_input ^ env.server_hmac;
+        real_val = (real_val + env.kernel_attestation) * 0x9E3779B97F4A7C15ULL;
+        real_val ^= tsc;
+        real_val ^= static_cast<uint64_t>(cpuid_regs[0]);
+        real_val ^= real_val >> 33;
+        real_val *= 0xBF58476D1CE4E5B9ULL;
+        real_val ^= real_val >> 27;
+
+        return real_val;
+    }
+
+}
+
+
 }
 }

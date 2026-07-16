@@ -46,6 +46,29 @@ namespace {
 
 state_t s_state;
 
+struct query_cache_t {
+    logger::log_filter_t filter;
+    std::size_t limit = 0;
+    std::uint64_t generation = 0;
+    double next_refresh_time = 0.0;
+    std::vector<logger::log_row_t> rows;
+    std::size_t total = 0;
+    std::size_t capacity = 0;
+};
+
+query_cache_t& query_cache() {
+    static query_cache_t value;
+    return value;
+}
+
+bool same_filter(const logger::log_filter_t& lhs, const logger::log_filter_t& rhs) {
+    return lhs.method == rhs.method && lhs.host_regex == rhs.host_regex &&
+        lhs.url_regex == rhs.url_regex && lhs.status_min == rhs.status_min &&
+        lhs.status_max == rhs.status_max && lhs.source == rhs.source &&
+        lhs.time_from_ms == rhs.time_from_ms && lhs.time_to_ms == rhs.time_to_ms &&
+        lhs.mime_type == rhs.mime_type;
+}
+
 }
 
 state_t& get_state() { return s_state; }
@@ -138,7 +161,7 @@ void render(float pos_x, float pos_y, float width, float height,
         } else {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                                "Total: %zu rows (cap %zu)",
-                               logger::total_rows(), logger::capacity());
+                               query_cache().total, query_cache().capacity);
         }
     }
 
@@ -153,7 +176,21 @@ void render(float pos_x, float pos_y, float width, float height,
     f.mime_type  = s_state.mime_buf;
     f.status_min = s_state.status_min;
     f.status_max = s_state.status_max;
-    std::vector<logger::log_row_t> rows = logger::query(f, static_cast<size_t>(s_state.row_limit));
+    auto& cache = query_cache();
+    const std::size_t limit = static_cast<std::size_t>(s_state.row_limit);
+    const std::uint64_t source_generation = logger::generation();
+    const double now = ImGui::GetTime();
+    const bool filter_changed = cache.limit != limit || !same_filter(cache.filter, f);
+    if (filter_changed || (source_generation != cache.generation && now >= cache.next_refresh_time)) {
+        cache.filter = f;
+        cache.limit = limit;
+        cache.rows = logger::query(f, limit);
+        cache.total = logger::total_rows();
+        cache.capacity = logger::capacity();
+        cache.generation = source_generation;
+        cache.next_refresh_time = now + 0.100;
+    }
+    const auto& rows = cache.rows;
 
     ImGui::SetCursorPos(ImVec2(0.f, content_y));
     ImGui::BeginChild("##bl_table", ImVec2(width, content_h), false);
@@ -177,17 +214,21 @@ void render(float pos_x, float pos_y, float width, float height,
             ImGui::TableSetupColumn("Latency", ImGuiTableColumnFlags_WidthFixed, 90.f);
             ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 90.f);
             ImGui::TableHeadersRow();
-            for (size_t i = 0; i < rows.size(); ++i) {
-                const auto& r = rows[i];
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); ImGui::Text("%llu", static_cast<unsigned long long>(r.id));
-                ImGui::TableSetColumnIndex(1); ImGui::Text("%llu", static_cast<unsigned long long>(r.ts_ms));
-                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(r.method.c_str());
-                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(r.url.c_str());
-                ImGui::TableSetColumnIndex(4); ImGui::Text("%d", r.status);
-                ImGui::TableSetColumnIndex(5); ImGui::Text("%zu", r.response_length);
-                ImGui::TableSetColumnIndex(6); ImGui::Text("%llu", static_cast<unsigned long long>(r.latency_ms));
-                ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(logger::source_label(r.source));
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(rows.size()));
+            while (clipper.Step()) {
+                for (int row_index = clipper.DisplayStart; row_index < clipper.DisplayEnd; ++row_index) {
+                    const auto& r = rows[static_cast<std::size_t>(row_index)];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); ImGui::Text("%llu", static_cast<unsigned long long>(r.id));
+                    ImGui::TableSetColumnIndex(1); ImGui::Text("%llu", static_cast<unsigned long long>(r.ts_ms));
+                    ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(r.method.c_str());
+                    ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(r.url.c_str());
+                    ImGui::TableSetColumnIndex(4); ImGui::Text("%d", r.status);
+                    ImGui::TableSetColumnIndex(5); ImGui::Text("%zu", r.response_length);
+                    ImGui::TableSetColumnIndex(6); ImGui::Text("%llu", static_cast<unsigned long long>(r.latency_ms));
+                    ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(logger::source_label(r.source));
+                }
             }
             ImGui::EndTable();
         }

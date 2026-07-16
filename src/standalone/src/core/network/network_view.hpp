@@ -122,6 +122,12 @@ struct bw_entry_t {
 
 
 struct repeater_entry_t {
+    std::uint64_t       id = 0;
+    std::string         source_artifact_id;
+    std::uint64_t       request_revision = 1;
+    std::uint64_t       request_hash = 0;
+    std::uint64_t       response_hash = 0;
+    std::uint64_t       response_timestamp = 0;
     std::string       host;
     uint16_t          port = 443;
     bool              use_tls = true;
@@ -136,6 +142,42 @@ enum class fuzzer_attack_mode_t : int {
     sniper      = 0,
     pitchfork   = 1,
     clusterbomb = 2,
+};
+
+enum class artifact_kind_t : std::uint8_t {
+    packet = 0,
+    exchange,
+    request,
+    response,
+    websocket_frame,
+    repeater_request,
+    repeater_response
+};
+
+struct artifact_identity_t {
+    std::string id;
+    std::string parent_id;
+    std::string source_view_id;
+    std::string session_id;
+    artifact_kind_t kind = artifact_kind_t::packet;
+    std::uint64_t source_id = 0;
+    std::uint64_t timestamp = 0;
+    std::uint64_t revision = 0;
+    std::uint64_t content_hash = 0;
+    std::size_t content_size = 0;
+    std::string label;
+    std::string target_host;
+    std::uint16_t target_port = 0;
+    bool use_tls = false;
+
+    bool valid() const noexcept {
+        return !id.empty() && !source_view_id.empty() && content_hash != 0;
+    }
+};
+
+struct artifact_snapshot_t {
+    artifact_identity_t identity;
+    std::vector<std::uint8_t> bytes;
 };
 
 
@@ -390,5 +432,16 @@ void shutdown();
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b);
+
+const char* tab_name(sub_tab_t tab) noexcept;
+void render_pane(sub_tab_t tab, float pos_x, float pos_y, float width, float height,
+                 float alpha, float accent_r, float accent_g, float accent_b);
+
+bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& snapshot,
+                      std::string& unavailable_reason);
+bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string& unavailable_reason);
+bool send_artifact_to_comparer(const artifact_identity_t& identity, std::string& unavailable_reason);
+bool add_artifact_to_chat(const artifact_identity_t& identity, std::string& unavailable_reason);
+bool assign_artifact_to_agent(const artifact_identity_t& identity, std::string& unavailable_reason);
 
 }

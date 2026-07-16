@@ -8,6 +8,10 @@
 
 #include "imgui/imgui.h"
 #include "pointer_scanner.hpp"
+#include "memory_interaction_context.hpp"
+#include "memory_scanner.hpp"
+#include "../debugger/debugger_view.hpp"
+#include "../ui/application_view_registry.hpp"
 #include "disasm_view.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "function_index.hpp"
@@ -20,7 +24,6 @@
 #include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #endif
-#include "../helpers/globals.h"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -229,7 +232,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 			if (addr != 0) {
 				const auto context = disasm_view::capture_selected_workspace();
 				if (hex_view::read_live_memory(context, addr, 256))
-					globals::ui::active_center_view = center_view_t::hex_view;
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 			}
 		}
 		ImGui::PopID();
@@ -291,7 +294,7 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 			if (addr != 0) {
 				const auto context = disasm_view::capture_selected_workspace();
 				if (hex_view::read_live_memory(context, addr, 256))
-					globals::ui::active_center_view = center_view_t::hex_view;
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 			}
 		}
 		ImGui::PopID();
@@ -714,6 +717,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (start_row < 0) start_row = 0;
 	const size_t start_index = static_cast<size_t>(start_row);
 	const size_t rendered_row_count = visible_rows + 2;
+	bool open_chain_context = false;
 
 	for (size_t i = start_index; i < total && i - start_index < rendered_row_count; ++i) {
 		auto& chain = st.results[i];
@@ -742,8 +746,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a * row_a));
 		}
 
-		if (hovered && ImGui::IsMouseClicked(0))
+		if (hovered && ImGui::IsMouseClicked(0)) {
 			st.selected_result = static_cast<int>(i);
+			memory_interaction::runtime_t runtime;
+			runtime.driver_loaded = driver_bridge::is_loaded();
+			runtime.live_attached = driver_bridge::attached_pid() != 0;
+			runtime.target_pid = driver_bridge::attached_pid();
+			std::uint64_t base = chain.base_offset;
+			if (chain.is_static && chain.module_index >= 0 &&
+				static_cast<std::size_t>(chain.module_index) < st.cached_modules.size())
+				base += st.cached_modules[static_cast<std::size_t>(chain.module_index)].base;
+			memory_interaction::select(memory_interaction::capture_pointer_chain(runtime,
+				base, static_cast<std::uint64_t>(chain.offsets.size()), static_cast<int>(i),
+				pointer_scanner::chain_to_string(chain)));
+		}
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			st.selected_result = static_cast<int>(i);
+			open_chain_context = true;
+		}
 
 		float rx = table_x + 16.f;
 		char buf[32];
@@ -826,6 +846,66 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::empty_state::render(ImVec2(table_x, body_y), ImVec2(table_w, body_h), cfg);
 		}
 	}
+	if (open_chain_context)
+		ImGui::OpenPopup("Pointer Chain Actions##context");
+	if (ImGui::BeginPopup("Pointer Chain Actions##context")) {
+		if (st.selected_result >= 0 &&
+			static_cast<std::size_t>(st.selected_result) < st.results.size()) {
+			auto& chain = st.results[static_cast<std::size_t>(st.selected_result)];
+			const std::string chain_text = pointer_scanner::chain_to_string(chain);
+			const std::uint64_t base = detail::resolve_step_address(chain, 0);
+			const std::uint64_t resolved = detail::resolve_step_address(chain,
+				static_cast<int>(chain.offsets.size()));
+			ImGui::TextDisabled("%s", chain.is_static ? "Static pointer chain" : "Dynamic pointer chain");
+			ImGui::Separator();
+			if (ImGui::MenuItem("Copy chain"))
+				ImGui::SetClipboardText(chain_text.c_str());
+			if (ImGui::MenuItem("Copy C++ resolver")) {
+				const std::string cpp = pointer_scanner::export_chain_cpp(chain);
+				ImGui::SetClipboardText(cpp.c_str());
+			}
+			if (ImGui::MenuItem("Copy base address", nullptr, false, base != 0)) {
+				char address[24];
+				std::snprintf(address, sizeof(address), "0x%016llX",
+					static_cast<unsigned long long>(base));
+				ImGui::SetClipboardText(address);
+			}
+			if (ImGui::MenuItem("Copy resolved address", nullptr, false, resolved != 0)) {
+				char address[24];
+				std::snprintf(address, sizeof(address), "0x%016llX",
+					static_cast<unsigned long long>(resolved));
+				ImGui::SetClipboardText(address);
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Open base in Disassembly", nullptr, false, base != 0)) {
+				disasm_view::goto_address(base, disasm_view::capture_selected_workspace());
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+			}
+			if (ImGui::MenuItem("Open resolved address in Hex", nullptr, false,
+				resolved != 0 && driver_bridge::attached_pid() != 0)) {
+				const auto workspace = disasm_view::capture_selected_workspace();
+				if (hex_view::read_live_memory(workspace, resolved, 256))
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
+			}
+			if (ImGui::MenuItem("Add resolved address to Address List", nullptr, false,
+				resolved != 0 && driver_bridge::attached_pid() != 0))
+				memory_scanner::add_address(resolved, chain_text,
+					memory_scanner::value_type_t::int64_val);
+			if (ImGui::MenuItem("Stage patch at resolved address...", nullptr, false,
+				resolved != 0 && driver_bridge::attached_pid() != 0)) {
+				std::string error;
+				if (debugger_view::stage_patch_review(resolved, 1,
+					"Staged from pointer chain", &error))
+					aida::ui::application_views::open_or_focus(
+						aida::ui::stable_view_id_t("view.debug.patches"));
+			}
+			ImGui::Separator();
+			if (ImGui::MenuItem("Validate this chain", nullptr, false,
+				driver_bridge::attached_pid() != 0))
+				chain.validated = pointer_scanner::validate_chain(chain);
+		}
+		ImGui::EndPopup();
+	}
 
 	float det_x = table_x;
 	float det_y = cfg_y + list_h;
@@ -875,7 +955,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				if (addr != 0) {
 					disasm_view::goto_address(addr,
 						disasm_view::capture_selected_workspace());
-					globals::ui::active_center_view = center_view_t::disassembly;
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				}
 			}
 		}

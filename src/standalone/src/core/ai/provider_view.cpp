@@ -23,8 +23,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <windows.h>
 #include <shlobj.h>
+#endif
 
 #include "imgui/imgui.h"
 #include <nlohmann/json.hpp>
@@ -38,6 +40,8 @@
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
 #include "../infra/executor.hpp"
+#include "../ui/task_center.hpp"
+#include "../ui/application_view_registry.hpp"
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/brand.hpp"
@@ -71,7 +75,21 @@ namespace {
 		sub.domain = domain;
 		sub.priority = 3;
 		sub.body = std::move(body);
-		return aida::infra::executor::submit(std::move(sub)).submitted;
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (submitted.submitted && submitted.task_id != 0) {
+			aida::ui::task_center::task_registration_t registration;
+			registration.owner = "automation.providers";
+			registration.owner_view = "view.ai.providers";
+			registration.owner_action = label ? label : "provider.task";
+			registration.label = label ? label : "Provider task";
+			registration.stage = "Running provider operation";
+			registration.cancellation_is_safe = false;
+			registration.callbacks.focus = [] {
+				(void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.ai.providers"));
+			};
+			(void)aida::ui::task_center::register_executor_job(submitted.task_id, std::move(registration));
+		}
+		return submitted.submitted;
 	}
 
 	struct test_result_t
@@ -727,10 +745,11 @@ namespace {
 		ImU32 base = aida::ui::brand::hash_color(p.id.c_str(), th.is_dark ? 0.55f : 0.50f);
 		ImU32 top = aida::ui::lighten(base, 30);
 		ImU32 bot = aida::ui::darken(base, 20);
-		int segs = 32;
+		constexpr int segs = 32;
+		constexpr float segment_count = static_cast<float>(segs);
 		for (int i = 0; i < segs; ++i) {
-			float a0 = (static_cast<float>(i) / segs) * 6.2831853f - 1.5707963f;
-			float a1 = (static_cast<float>(i + 1) / segs) * 6.2831853f - 1.5707963f;
+			float a0 = (static_cast<float>(i) / segment_count) * 6.2831853f - 1.5707963f;
+			float a1 = (static_cast<float>(i + 1) / segment_count) * 6.2831853f - 1.5707963f;
 			float fy = (sinf(a0) + 1.f) * 0.5f;
 			ImU32 col = aida::ui::mix(top, bot, fy);
 			ImVec2 p0(center.x + cosf(a0) * radius, center.y + sinf(a0) * radius);
@@ -843,6 +862,10 @@ namespace {
 		ImGui::InvisibleButton("##card_hit", ImVec2(card_w, card_h));
 		bool hov = ImGui::IsItemHovered();
 		bool clicked = ImGui::IsItemClicked();
+		bool right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+		bool keyboard_context = selected && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+			 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
 		ImGui::PopID();
 
 		float hov_v = ca->hover.tick(hov, dt, aida::motion::spring::playful);
@@ -889,6 +912,29 @@ namespace {
 		const auto* current_model = current_model_id.empty()
 			? nullptr
 			: aida::provider::catalog::get_model(provider.id, current_model_id);
+		auto render_context = [&] {
+			if (right || keyboard_context) ImGui::OpenPopup("##provider_context");
+			if (!ImGui::BeginPopup("##provider_context")) return;
+			if (ImGui::MenuItem("Show Provider Details")) {
+				st.selected_detail_provider_id = provider.id;
+				load_detail_buffers(provider.id);
+			}
+			if (ImGui::MenuItem("Set Current Model as Default", nullptr, false, current_model != nullptr)) {
+				g_sa_settings.set_selection(provider.id, current_model_id);
+				g_sa_settings.save();
+			}
+			if (!current_model && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+				ImGui::SetTooltip("Choose a provider model before making it the default");
+			if (ImGui::MenuItem("Test Current Model", nullptr, false, current_model != nullptr))
+				run_test_connection(provider.id, current_model_id);
+			if (!current_model && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+				ImGui::SetTooltip("Choose a provider model before testing the connection");
+			ImGui::Separator();
+			if (ImGui::MenuItem("Copy Provider ID")) ImGui::SetClipboardText(provider.id.c_str());
+			if (ImGui::MenuItem("Copy Model ID", nullptr, false, current_model != nullptr))
+				ImGui::SetClipboardText(current_model_id.c_str());
+			ImGui::EndPopup();
+		};
 
 		if (current_model) {
 			render_capability_badges(ImVec2(middle_x, card_a.y + card_h - 28.f),
@@ -987,6 +1033,7 @@ namespace {
 					load_detail_buffers(provider.id);
 				}
 			}
+			render_context();
 			ImGui::PopID();
 			if (clicked) {
 				if (selected) {
@@ -1153,6 +1200,7 @@ namespace {
 			}
 		}
 
+		render_context();
 		ImGui::PopID();
 	}
 
@@ -1435,6 +1483,7 @@ void render(float panel_w, float panel_h)
 	const float callout_h = 24.f;
 	bool show_age_callout = false;
 	int64_t cache_age = -1;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	{
 		std::error_code ec;
 		wchar_t* appdata = nullptr;
@@ -1453,6 +1502,7 @@ void render(float panel_w, float panel_h)
 			}
 		}
 	}
+#endif
 	if (cache_age > 3600)
 		show_age_callout = true;
 

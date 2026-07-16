@@ -24,6 +24,7 @@
 #include "core/ui/blur_layer.hpp"
 #include "core/ui/components.hpp"
 #include "core/ui/fonts.hpp"
+#include "core/ui/ide_shell.hpp"
 #include "standalone_chat.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
@@ -4569,7 +4570,9 @@ static void show_mcp_posture_refuse_ui_and_exit(const anti_tamper::mcp_posture::
 __declspec(noinline) static DWORD cpp_render_title(helpers* h, uint64_t frame_number, ImGuiErrorRecoveryState* imgui_state_backup)
 {
     try {
-        h->render_title();
+        aida::ui::ide_shell::render_compatibility_host([](void* context) {
+            static_cast<helpers*>(context)->render_title();
+        }, h);
     } catch (const std::exception& e) {
         ImGui::ErrorRecoveryTryToRecoverState(imgui_state_backup);
         diag::log_tagged_critical_fmt("render",
@@ -5064,8 +5067,8 @@ __declspec(noinline) static DWORD seh_render_agent_picker(uint64_t frame_number)
     __try {
         aida::agent_picker::render_if_open();
         if (aida::agent_picker::consume_manager_request()) {
-            aida::settings_overlay::open();
             aida::settings_overlay::set_active_tab(aida::settings_overlay::tab_agents);
+            aida::settings_overlay::open();
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         aida::diagnostics::crash::emit_crash_breadcrumb(GetExceptionCode(), nullptr, "seh_render_agent_picker");
@@ -7678,6 +7681,7 @@ int main(int, char**)
         io.ConfigNavCaptureKeyboard ? 1 : 0);
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    aida::ui::ide_shell::configure_io(io);
     io.ConfigNavCaptureKeyboard = false;
     startup_log_critical_fmt("imgui_config_flags_post flags=0x%08X nav_capture=%d",
         static_cast<unsigned>(io.ConfigFlags),
@@ -7743,6 +7747,7 @@ int main(int, char**)
         g_imgui_dx11_initialized ? 1 : 0,
         static_cast<unsigned long>(GetLastError()));
     crash_log_write("imgui_dx11_init_ok");
+    aida::ui::ide_shell::initialize();
     D3D11_BLEND_DESC blend_desc = {};
     blend_desc.RenderTarget[0].BlendEnable = TRUE;
     blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
@@ -8770,7 +8775,7 @@ int main(int, char**)
             globals::ui::process_attach_open ||
             globals::ui::driver_status_open ||
             globals::ui::shortcuts_dialog_open ||
-            g_settings_open ||
+            aida::settings_overlay::is_open() ||
             aida::agent_picker::is_open() ||
             source_reconstruct_view::is_open() ||
             theme_animation_pre;
@@ -8989,6 +8994,8 @@ int main(int, char**)
             globals::ui::accent = __t.accent;
         }
 
+        aida::ui::ide_shell::begin_frame();
+
         {
             if (frame_number < 5)
                 crash_log_write("render_title_entering");
@@ -9041,7 +9048,7 @@ int main(int, char**)
                 globals::ui::process_attach_open ||
                 globals::ui::driver_status_open ||
                 globals::ui::shortcuts_dialog_open ||
-                g_settings_open ||
+                aida::settings_overlay::is_open() ||
                 aida::agent_picker::is_open() ||
                 mid_frame_io.WantTextInput ||
                 mid_frame_io.WantCaptureKeyboard;
@@ -9062,6 +9069,8 @@ int main(int, char**)
                 }
             }
         }
+
+        aida::ui::ide_shell::end_frame();
 
         const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -9763,6 +9772,10 @@ int main(int, char**)
     aida_shutdown_diag::mark("shutdown_auth_http");
     aida::auth::http::cleanup();
     diag::log_tagged_critical("main", "shutdown_auth_http_done");
+    aida_shutdown_diag::mark("shutdown_ide_shell");
+    if (aida::ui_thread::require_owner("imgui", "ide_shell_shutdown", "shutdown"))
+        aida::ui::ide_shell::shutdown();
+    diag::log_tagged_critical("main", "shutdown_ide_shell_done");
     aida_shutdown_diag::mark("shutdown_executor");
     aida::infra::executor::shutdown();
     diag::log_tagged_critical("main", "shutdown_executor_done");

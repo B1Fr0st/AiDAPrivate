@@ -17,7 +17,8 @@
 #include "../session/analysis_session.hpp"
 #endif
 #include "../ui/theme.hpp"
-#include "../../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
+#include "../workbench/workbench_shell_integration.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/win32_dialog.hpp"
 #endif
@@ -60,6 +61,11 @@ enum class sub_tab_t : int {
     COUNT = 7
 };
 
+struct type_reference_t {
+    aida::analysis::address_t address;
+    std::string label;
+};
+
 struct state_t {
     std::mutex mutex;
     sub_tab_t active = sub_tab_t::structs;
@@ -77,6 +83,19 @@ struct state_t {
     sub_tab_t visible_tab = sub_tab_t::structs;
     std::string visible_filter;
     std::atomic<bool> visible_loading{false};
+    bool list_focused = false;
+    int context_row = -1;
+    sub_tab_t context_tab = sub_tab_t::structs;
+    std::uint64_t context_generation = 0;
+    std::uint64_t context_analysis_revision = 0;
+    std::string apply_status;
+    bool apply_error = false;
+    bool apply_pending = false;
+    std::uint64_t apply_generation = 0;
+    std::uint64_t apply_expected_overlay_revision = 0;
+    const struct catalog_t* reference_catalog = nullptr;
+    std::string reference_type;
+    std::shared_ptr<const std::vector<type_reference_t>> references;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     bool pdb_dialog_open = false;
     std::array<char, 260> pdb_dialog_path{};
@@ -605,6 +624,97 @@ inline std::string struct_to_ida_syntax(const pdb_parser::struct_def_t& definiti
     return output;
 }
 
+inline std::vector<type_reference_t> references_for_type(
+    const catalog_t& catalog, const std::string& type_name) {
+    std::vector<type_reference_t> references;
+    if (type_name.empty())
+        return references;
+    for (const auto& function : catalog.functions) {
+        if (function.signature.find(type_name) != std::string::npos)
+            references.push_back({function.address, function.name + "  " + function.signature});
+    }
+    for (const auto& candidate : catalog.typedefs) {
+        if (candidate.canonical_type.find(type_name) != std::string::npos)
+            references.push_back({candidate.address,
+                candidate.name + "  " + candidate.canonical_type});
+    }
+    std::sort(references.begin(), references.end(), [](const auto& left, const auto& right) {
+        if (left.address != right.address)
+            return left.address < right.address;
+        return left.label < right.label;
+    });
+    references.erase(std::unique(references.begin(), references.end(),
+        [](const auto& left, const auto& right) {
+            return left.address == right.address && left.label == right.label;
+        }), references.end());
+    return references;
+}
+
+inline void publish_type_selection(const disasm_view::workspace_context_t& context,
+                                   sub_tab_t tab, const std::string& module,
+                                   const std::string& name,
+                                   std::optional<aida::analysis::address_t> address = {}) {
+    if (!context.workspace)
+        return;
+    aida::workbench::selection_context_t selection;
+    selection.kind = aida::workbench::selection_kind_t::entity;
+    selection.entity_key = "type." + std::to_string(static_cast<int>(tab)) + "." +
+        module + "." + name;
+    if (address) {
+        selection.kind = aida::workbench::selection_kind_t::address;
+        selection.has_address = true;
+        selection.address = disasm_view::runtime_address(context, *address)
+            .value_or(address->value);
+        selection.extent = 1;
+    }
+    aida::workbench::document_local_cursor_t cursor;
+    if (address) {
+        cursor.has_position = true;
+        cursor.position = selection.address;
+    }
+    aida::workbench::workbench_shell_workspace_context_t workbench;
+    static_cast<void>(aida::workbench::workbench_shell_runtime_t::instance()
+        .publish_selection(context.workspace, selection, cursor,
+            aida::workbench::navigation_origin_t::navigator, workbench));
+    if (address)
+        disasm_view::select_address(*address, context, false);
+}
+
+inline void render_type_references(const disasm_view::workspace_context_t& context,
+                                   const std::shared_ptr<const std::vector<type_reference_t>>& reference_handle,
+                                   const std::string& type_name,
+                                   float height) {
+    static const std::vector<type_reference_t> empty_references;
+    const auto& references = reference_handle ? *reference_handle : empty_references;
+    ImGui::SeparatorText("References");
+    if (references.empty()) {
+        ImGui::TextDisabled("No indexed function signature or inferred type references this type.");
+        return;
+    }
+    ImGui::TextDisabled("%zu indexed references", references.size());
+    ImGui::BeginChild("##type_references", ImVec2(0.0f, (std::max)(72.0f, height)), true);
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>((std::min)(references.size(),
+        static_cast<std::size_t>((std::numeric_limits<int>::max)()))));
+    while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const auto& reference = references[static_cast<std::size_t>(row)];
+            if (ImGui::Selectable(reference.label.c_str(), false,
+                    ImGuiSelectableFlags_AllowDoubleClick)) {
+                publish_type_selection(context, sub_tab_t::typedefs, "reference",
+                    type_name, reference.address);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    const auto runtime = disasm_view::runtime_address(context, reference.address)
+                        .value_or(reference.address.value);
+                    disasm_view::goto_address(runtime, context);
+                    aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+                }
+            }
+        }
+    }
+    ImGui::EndChild();
+}
+
 inline void send_to_dissector(const pdb_parser::struct_def_t& definition) {
     const int index = struct_dissector::create_struct(definition.name);
     for (const auto& member : definition.members) {
@@ -633,6 +743,8 @@ inline void send_to_dissector(const pdb_parser::struct_def_t& definition) {
 }
 
 inline void render_struct_detail(const disasm_view::workspace_context_t& context,
+                                 const catalog_t& catalog,
+                                 const std::shared_ptr<state_t>& state,
                                  const struct_entry_t& entry, float height) {
     const auto& definition = entry.definition;
     ImGui::Text("%s %s", definition.is_union ? "union" : "struct", definition.name.c_str());
@@ -657,7 +769,8 @@ inline void render_struct_detail(const disasm_view::workspace_context_t& context
     if (ImGui::Button("Declare in overlay"))
         disasm_view::queue_type_declaration(context, pdb_parser::struct_to_cpp(definition));
     ImGui::Separator();
-    ImGui::BeginChild("##type_members", ImVec2(0.0f, height), false);
+    const float members_height = (std::max)(96.0f, height * 0.58f);
+    ImGui::BeginChild("##type_members", ImVec2(0.0f, members_height), false);
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>((std::min)(definition.members.size(),
         static_cast<std::size_t>((std::numeric_limits<int>::max)()))));
@@ -670,6 +783,24 @@ inline void render_struct_detail(const disasm_view::workspace_context_t& context
         }
     }
     ImGui::EndChild();
+    std::shared_ptr<const std::vector<type_reference_t>> references;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->reference_catalog == &catalog &&
+            state->reference_type == definition.name)
+            references = state->references;
+    }
+    if (!references) {
+        auto computed = std::make_shared<const std::vector<type_reference_t>>(
+            references_for_type(catalog, definition.name));
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->reference_catalog = &catalog;
+        state->reference_type = definition.name;
+        state->references = computed;
+        references = std::move(computed);
+    }
+    render_type_references(context, references, definition.name,
+        height - members_height - 48.0f);
 }
 
 inline void render_enum_detail(const enum_entry_t& entry, float height) {
@@ -705,6 +836,137 @@ inline void render_enum_detail(const enum_entry_t& entry, float height) {
     ImGui::EndChild();
 }
 
+inline bool context_key_pressed() {
+    const ImGuiIO& io = ImGui::GetIO();
+    return ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+        (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
+}
+
+inline void unavailable_context_item(const char* label, const char* reason) {
+    ImGui::MenuItem(label, nullptr, false, false);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", reason);
+}
+
+inline bool catalog_context_is_current(const disasm_view::workspace_context_t& context,
+                                       const state_t& state) {
+    return context.publication && context.workspace &&
+        !context.workspace->closing() && !context.workspace->closed() &&
+        state.context_generation == context.publication->generation &&
+        state.context_analysis_revision == context.publication->analysis_revision &&
+        state.catalog_generation == state.context_generation &&
+        state.catalog_analysis_revision == state.context_analysis_revision;
+}
+
+inline void render_catalog_context_menu(const disasm_view::workspace_context_t& context,
+                                        const std::shared_ptr<state_t>& state,
+                                        const catalog_t& catalog,
+                                        const std::vector<std::size_t>& visible) {
+    if (!ImGui::BeginPopup("##types_catalog_context"))
+        return;
+    int row = -1;
+    sub_tab_t tab = sub_tab_t::structs;
+    bool current = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        row = state->context_row;
+        tab = state->context_tab;
+        current = catalog_context_is_current(context, *state);
+    }
+    if (!current || row < 0 || static_cast<std::size_t>(row) >= visible.size()) {
+        ImGui::TextDisabled("Selection is stale");
+        ImGui::Separator();
+        unavailable_context_item("Copy name", "The analysis publication changed; select the item again.");
+        unavailable_context_item("Open", "The analysis publication changed; select the item again.");
+        ImGui::EndPopup();
+        return;
+    }
+    const std::size_t index = visible[static_cast<std::size_t>(row)];
+    if (tab == sub_tab_t::structs || tab == sub_tab_t::unions) {
+        const auto& entry = tab == sub_tab_t::structs ? catalog.structs[index] : catalog.unions[index];
+        ImGui::TextDisabled("PDB %s  |  %s", tab == sub_tab_t::structs ? "structure" : "union",
+            entry.module.c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem("Copy name", "Ctrl+C"))
+            ImGui::SetClipboardText(entry.definition.name.c_str());
+        if (ImGui::MenuItem("Copy C declaration")) {
+            const std::string text = pdb_parser::struct_to_cpp(entry.definition);
+            ImGui::SetClipboardText(text.c_str());
+        }
+        if (ImGui::MenuItem("Copy IDA-style declaration")) {
+            const std::string text = struct_to_ida_syntax(entry.definition);
+            ImGui::SetClipboardText(text.c_str());
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Open in Structure Editor")) {
+            send_to_dissector(entry.definition);
+            set_sub_tab(context, sub_tab_t::dissector);
+        }
+        if (ImGui::MenuItem("Declare in reversible overlay"))
+            disasm_view::queue_type_declaration(context, pdb_parser::struct_to_cpp(entry.definition));
+        ImGui::Separator();
+        unavailable_context_item("Rename type...", "PDB catalog definitions are immutable; declare an edited overlay type instead.");
+        unavailable_context_item("Delete type", "PDB catalog definitions cannot be deleted from the analysis workspace.");
+    } else if (tab == sub_tab_t::enums) {
+        const auto& entry = catalog.enums[index];
+        ImGui::TextDisabled("PDB enum  |  %s", entry.module.c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem("Copy name", "Ctrl+C"))
+            ImGui::SetClipboardText(entry.definition.name.c_str());
+        if (ImGui::MenuItem("Copy C declaration")) {
+            std::string declaration = "enum " + entry.definition.name + " {\n";
+            for (const auto& member : entry.definition.members) {
+                declaration += "    " + member.name + " = " + std::to_string(member.value) + ",\n";
+            }
+            declaration += "};\n";
+            ImGui::SetClipboardText(declaration.c_str());
+        }
+        unavailable_context_item("Edit enum...", "The catalog has no mutable enum backend; create an overlay declaration instead.");
+    } else if (tab == sub_tab_t::functions) {
+        const auto& entry = catalog.functions[index];
+        const auto address = disasm_view::runtime_address(context, entry.address).value_or(entry.address.value);
+        ImGui::TextDisabled("Static function  |  %s", entry.provenance.c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem("Jump to disassembly", "Enter")) {
+            disasm_view::goto_address(address, context);
+            aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+        }
+        if (ImGui::MenuItem("Open pseudocode")) {
+            pseudocode_view::request_decompile(context, address, false);
+            aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.pseudocode"));
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Copy name", "Ctrl+C"))
+            ImGui::SetClipboardText(entry.name.c_str());
+        if (ImGui::MenuItem("Copy signature", nullptr, false, !entry.signature.empty()))
+            ImGui::SetClipboardText(entry.signature.c_str());
+        if (ImGui::MenuItem("Copy address")) {
+            char text[32]{};
+            std::snprintf(text, sizeof(text), "0x%llX", static_cast<unsigned long long>(address));
+            ImGui::SetClipboardText(text);
+        }
+        unavailable_context_item("Retype function...", "Use the reversible type overlay at a concrete function address.");
+    } else {
+        const auto& entry = catalog.typedefs[index];
+        ImGui::TextDisabled("%s type evidence  |  confidence %u",
+            tab == sub_tab_t::typedefs ? "Catalog" : "Inferred",
+            static_cast<unsigned>(entry.confidence));
+        ImGui::Separator();
+        if (ImGui::MenuItem("Copy name", "Ctrl+C"))
+            ImGui::SetClipboardText(entry.name.c_str());
+        if (ImGui::MenuItem("Copy canonical type", nullptr, false,
+                !entry.explicitly_unknown && !entry.canonical_type.empty()))
+            ImGui::SetClipboardText(entry.canonical_type.c_str());
+        if (entry.address.value != 0 && ImGui::MenuItem("Jump to evidence address", "Enter")) {
+            const auto address = disasm_view::runtime_address(context, entry.address).value_or(entry.address.value);
+            disasm_view::goto_address(address, context);
+            aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+        }
+        unavailable_context_item("Promote globally", "No global type-propagation backend is exposed; apply a reversible overlay at a concrete address.");
+    }
+    ImGui::EndPopup();
+}
+
 inline void render(float, float, float width, float height,
                    float alpha, float, float, float,
                    const disasm_view::workspace_context_t& context) {
@@ -716,6 +978,22 @@ inline void render(float, float, float width, float height,
     }
     auto state = state_for(context);
     request_catalog(context, state);
+    if (state->apply_pending) {
+        const auto mutation = disasm_view::mutation_state(context);
+        if (!context.workspace || context.workspace->generation() != state->apply_generation) {
+            state->apply_pending = false;
+            state->apply_error = true;
+            state->apply_status = "The analysis generation changed before the type application committed.";
+        } else if (mutation.overlay_revision > state->apply_expected_overlay_revision) {
+            state->apply_pending = false;
+            state->apply_error = false;
+            state->apply_status = "Committed to the reversible type overlay and published to analysis views.";
+        } else if (mutation.pending == 0 && !mutation.error.empty()) {
+            state->apply_pending = false;
+            state->apply_error = true;
+            state->apply_status = mutation.error;
+        }
+    }
     std::shared_ptr<const catalog_t> catalog_handle;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -836,6 +1114,13 @@ inline void render(float, float, float width, float height,
     else if (pdb_prompt && pdb_prompt.value().loading)
         ImGui::TextWrapped("%s", pdb_prompt.value().status.c_str());
 #endif
+    if (context.publication) {
+        ImGui::TextDisabled("Static analysis workspace  |  generation %llu  |  revision %llu",
+            static_cast<unsigned long long>(context.publication->generation),
+            static_cast<unsigned long long>(context.publication->analysis_revision));
+    } else {
+        ImGui::TextDisabled("Static analysis workspace  |  catalog publication pending");
+    }
     if (active == sub_tab_t::inferred || active == sub_tab_t::dissector) {
         ImGui::Separator();
         const float content_y = ImGui::GetCursorPosY();
@@ -876,6 +1161,7 @@ inline void render(float, float, float width, float height,
     }
     static const std::vector<std::size_t> empty_visible;
     const auto& visible = visible_handle ? *visible_handle : empty_visible;
+    int context_request_row = -1;
     ImGui::BeginChild("##type_list", ImVec2(list_width, content_height), true);
     if (state->visible_loading.load(std::memory_order_acquire))
         ImGui::TextUnformatted("Filtering type catalog...");
@@ -888,9 +1174,18 @@ inline void render(float, float, float width, float height,
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                 const auto& entry = entries[visible[static_cast<std::size_t>(row)]];
                 if (ImGui::Selectable(entry.definition.name.c_str(), selected == row)) {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->selected = row;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->selected = row;
+                        state->list_focused = true;
+                    }
                     selected = row;
+                    publish_type_selection(context, active, entry.module,
+                        entry.definition.name);
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    selected = row;
+                    context_request_row = row;
                 }
             }
         }
@@ -902,9 +1197,18 @@ inline void render(float, float, float width, float height,
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                 const auto& entry = catalog.enums[visible[static_cast<std::size_t>(row)]];
                 if (ImGui::Selectable(entry.definition.name.c_str(), selected == row)) {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->selected = row;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->selected = row;
+                        state->list_focused = true;
+                    }
                     selected = row;
+                    publish_type_selection(context, active, entry.module,
+                        entry.definition.name);
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    selected = row;
+                    context_request_row = row;
                 }
             }
         }
@@ -917,15 +1221,24 @@ inline void render(float, float, float width, float height,
                 const auto& entry = catalog.functions[visible[static_cast<std::size_t>(row)]];
                 if (ImGui::Selectable(entry.name.c_str(), selected == row,
                         ImGuiSelectableFlags_AllowDoubleClick)) {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->selected = row;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->selected = row;
+                        state->list_focused = true;
+                    }
                     selected = row;
+                    publish_type_selection(context, active, "analysis",
+                        entry.name, entry.address);
                     if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                         const auto address = disasm_view::runtime_address(context, entry.address).value_or(
                             entry.address.value);
                         disasm_view::goto_address(address, context);
-                        globals::ui::active_center_view = center_view_t::disassembly;
+                        aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
                     }
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    selected = row;
+                    context_request_row = row;
                 }
             }
         }
@@ -939,22 +1252,54 @@ inline void render(float, float, float width, float height,
                 const std::string label = entry.name + "  " +
                     (entry.explicitly_unknown ? "<unknown>" : entry.canonical_type);
                 if (ImGui::Selectable(label.c_str(), selected == row)) {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->selected = row;
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->selected = row;
+                        state->list_focused = true;
+                    }
                     selected = row;
+                    publish_type_selection(context, active, "analysis",
+                        entry.name, entry.address.value != 0
+                            ? std::optional<aida::analysis::address_t>(entry.address)
+                            : std::nullopt);
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    selected = row;
+                    context_request_row = row;
                 }
             }
         }
     }
     ImGui::EndChild();
+    {
+        bool list_focused = false;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            list_focused = state->list_focused;
+        }
+        if (context_request_row < 0 && list_focused && selected >= 0 && context_key_pressed())
+            context_request_row = selected;
+        if (context_request_row >= 0) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->selected = context_request_row;
+            state->context_row = context_request_row;
+            state->context_tab = active;
+            state->context_generation = context.publication ? context.publication->generation : 0;
+            state->context_analysis_revision = context.publication ? context.publication->analysis_revision : 0;
+            state->list_focused = true;
+            selected = context_request_row;
+            ImGui::OpenPopup("##types_catalog_context");
+        }
+    }
+    render_catalog_context_menu(context, state, catalog, visible);
     ImGui::SameLine();
     ImGui::BeginChild("##type_detail", ImVec2(0.0f, content_height), true);
     if (selected >= 0 && static_cast<std::size_t>(selected) < visible.size()) {
         const std::size_t index = visible[static_cast<std::size_t>(selected)];
         if (active == sub_tab_t::structs)
-            render_struct_detail(context, catalog.structs[index], content_height - 80.0f);
+            render_struct_detail(context, catalog, state, catalog.structs[index], content_height - 80.0f);
         else if (active == sub_tab_t::unions)
-            render_struct_detail(context, catalog.unions[index], content_height - 80.0f);
+            render_struct_detail(context, catalog, state, catalog.unions[index], content_height - 80.0f);
         else if (active == sub_tab_t::enums)
             render_enum_detail(catalog.enums[index], content_height - 80.0f);
         else if (active == sub_tab_t::functions) {
@@ -979,12 +1324,12 @@ inline void render(float, float, float width, float height,
             }
             if (ImGui::Button("Jump")) {
                 disasm_view::goto_address(address, context);
-                globals::ui::active_center_view = center_view_t::disassembly;
+                aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
             }
             ImGui::SameLine();
             if (ImGui::Button("Decompile")) {
                 pseudocode_view::request_decompile(context, address, false);
-                globals::ui::active_center_view = center_view_t::pseudocode;
+                aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.pseudocode"));
             }
         } else {
             const auto& entry = catalog.typedefs[index];
@@ -1007,11 +1352,35 @@ inline void render(float, float, float width, float height,
         state->apply_type.data(), state->apply_type.size());
     ImGui::SameLine();
     if (ImGui::Button("Apply")) {
-        if (const auto address = parse_address(state->apply_address.data())) {
-            if (const auto typed = disasm_view::typed_address(context, *address))
-                disasm_view::queue_type_application(context, *typed,
-                    std::string(state->apply_type.data()));
+        state->apply_error = true;
+        const std::string canonical_type(state->apply_type.data());
+        if (!context.workspace || context.workspace->closing() || context.workspace->closed()) {
+            state->apply_status = "Workspace changed; reopen the target before applying a type.";
+        } else if (canonical_type.empty()) {
+            state->apply_status = "Enter a canonical type before applying.";
+        } else if (const auto address = parse_address(state->apply_address.data())) {
+            if (const auto typed = disasm_view::typed_address(context, *address)) {
+                if (disasm_view::queue_type_application(context, *typed, canonical_type)) {
+                    state->apply_error = false;
+                    state->apply_pending = true;
+                    state->apply_generation = context.workspace->generation();
+                    state->apply_expected_overlay_revision = context.workspace->overlay_revision();
+                    state->apply_status = "Queued; waiting for the overlay revision to commit.";
+                } else {
+                    state->apply_status = "The overlay rejected the type application; no change was claimed.";
+                }
+            } else {
+                state->apply_status = "Address is outside the current workspace mapping.";
+            }
+        } else {
+            state->apply_status = "Address is not a valid hexadecimal or decimal value.";
         }
+    }
+    if (!state->apply_status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImGui::ColorConvertU32ToFloat4(state->apply_error ? theme.error : theme.success));
+        ImGui::TextWrapped("%s", state->apply_status.c_str());
+        ImGui::PopStyleColor();
     }
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -1023,6 +1392,29 @@ inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float accent_r, float accent_g, float accent_b) {
     render(pos_x, pos_y, width, height, alpha, accent_r, accent_g, accent_b,
         disasm_view::capture_selected_workspace());
+}
+
+inline void render_subview(sub_tab_t tab, float pos_x, float pos_y,
+                           float width, float height, float alpha,
+                           float accent_r, float accent_g, float accent_b,
+                           const disasm_view::workspace_context_t& context) {
+    auto state = state_for(context);
+    if (state) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->active != tab) {
+            state->active = tab;
+            state->selected = -1;
+        }
+    }
+    default_active_tab().store(static_cast<int>(tab), std::memory_order_release);
+    render(pos_x, pos_y, width, height, alpha, accent_r, accent_g, accent_b, context);
+}
+
+inline void render_subview(sub_tab_t tab, float pos_x, float pos_y,
+                           float width, float height, float alpha,
+                           float accent_r, float accent_g, float accent_b) {
+    render_subview(tab, pos_x, pos_y, width, height, alpha,
+        accent_r, accent_g, accent_b, disasm_view::capture_selected_workspace());
 }
 
 }

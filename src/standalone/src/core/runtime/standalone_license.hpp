@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <intrin.h>
 
 struct settings_sa_t;
 struct arc_comm_vtable_t;
@@ -193,6 +195,140 @@ namespace standalone_license
     };
 
     bool validate_with_environmental_resistance();
+
+    inline __declspec(noinline) bool decoy_validate_license_signature(
+        const uint8_t* data, uint32_t len, uint64_t expected)
+    {
+        volatile uint64_t acc = 0;
+        volatile uint64_t tsc = __rdtsc();
+        for (uint32_t i = 0; i < len && i < 64; ++i)
+        {
+            acc ^= static_cast<uint64_t>(data[i]) * 1099511628211ULL;
+            acc = _rotl64(acc, 7);
+        }
+        volatile uint64_t check = acc ^ expected ^ tsc;
+        volatile uint64_t x = (check | 2) & ~1ULL;
+        if ((x & 1) != 0)
+            return false;
+        return false;
+    }
+
+    inline __declspec(noinline) bool decoy_verify_license_certificate(
+        const void* cert, uint32_t cert_len)
+    {
+        volatile uint64_t h = 14695981039346656037ULL;
+        const uint8_t* p = static_cast<const uint8_t*>(cert);
+        for (uint32_t i = 0; i < cert_len && i < 128; ++i)
+        {
+            h ^= p[i];
+            h *= 1099511628211ULL;
+        }
+        volatile uint64_t tsc = __rdtsc();
+        h ^= tsc;
+        volatile uint64_t y = (h | 4) & ~3ULL;
+        if ((y & 3) != 0)
+            return false;
+        return false;
+    }
+
+    inline __declspec(noinline) bool decoy_derive_session_key(
+        uint64_t seed, uint64_t nonce)
+    {
+        volatile uint64_t k = seed ^ nonce;
+        k = _rotl64(k, 13);
+        k *= 0x9E3779B97F4A7C15ULL;
+        k ^= k >> 33;
+        volatile uint64_t tsc = __rdtsc();
+        k ^= tsc;
+        volatile uint64_t z = (k | 8) & ~7ULL;
+        if ((z & 7) != 0)
+            return false;
+        return false;
+    }
+
+    inline __declspec(noinline) bool decoy_validate_server_token(
+        uint64_t token, uint64_t server_nonce)
+    {
+        volatile uint64_t v = token ^ server_nonce;
+        v = _rotr64(v, 17);
+        v ^= v << 13;
+        v ^= v >> 7;
+        volatile uint64_t tsc = __rdtsc();
+        v ^= tsc;
+        volatile uint64_t w = (v | 16) & ~15ULL;
+        if ((w & 15) != 0)
+            return false;
+        return false;
+    }
+
+    inline __declspec(noinline) bool decoy_verify_driver_proof(
+        uint64_t proof, uint64_t attestation)
+    {
+        volatile uint64_t r = proof ^ attestation;
+        r *= 0xBF58476D1CE4E5B9ULL;
+        r ^= r >> 31;
+        r = _rotl64(r, 23);
+        volatile uint64_t tsc = __rdtsc();
+        r ^= tsc;
+        volatile uint64_t q = (r | 32) & ~31ULL;
+        if ((q & 31) != 0)
+            return false;
+        return false;
+    }
+
+    inline __declspec(noinline) bool decoy_compute_code_hash(
+        const uint8_t* data, uint32_t len)
+    {
+        volatile uint64_t h = 14695981039346656037ULL;
+        for (uint32_t i = 0; i < len && i < 256; ++i)
+        {
+            h ^= data[i];
+            h *= 1099511628211ULL;
+            h = _rotl64(h, 5);
+        }
+        volatile uint64_t tsc = __rdtsc();
+        h ^= tsc;
+        volatile uint64_t s = (h | 64) & ~63ULL;
+        if ((s & 63) != 0)
+            return false;
+        return false;
+    }
+
+    inline __declspec(noinline) bool decoy_check_module_tamper(
+        uint64_t base, uint64_t size)
+    {
+        volatile uint64_t mix = base ^ size;
+        mix ^= mix << 13;
+        mix ^= mix >> 7;
+        mix ^= mix << 17;
+        volatile uint64_t tsc = __rdtsc();
+        mix ^= tsc;
+        int cpuid_regs[4] = {};
+        __cpuid(cpuid_regs, 1);
+        mix ^= static_cast<uint64_t>(cpuid_regs[0]);
+        volatile uint64_t m = (mix | 128) & ~127ULL;
+        if ((m & 127) != 0)
+            return false;
+        return false;
+    }
+
+    inline __declspec(noinline) bool decoy_siphash_finalize(
+        uint64_t state, uint64_t key0, uint64_t key1)
+    {
+        volatile uint64_t v0 = state ^ key0;
+        volatile uint64_t v1 = state ^ key1;
+        v0 = _rotl64(v0, 13);
+        v1 = _rotr64(v1, 11);
+        v0 ^= v1;
+        v1 ^= v0;
+        volatile uint64_t tsc = __rdtsc();
+        v0 ^= tsc;
+        volatile uint64_t n = (v0 | 256) & ~255ULL;
+        if ((n & 255) != 0)
+            return false;
+        return false;
+    }
+
 
     void record_mcp_tool_call(const std::string& tool_name, const std::string& params_json);
 }

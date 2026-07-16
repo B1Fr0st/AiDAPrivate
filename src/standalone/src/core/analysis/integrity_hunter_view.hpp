@@ -3,7 +3,7 @@
 #include "integrity_hunter.hpp"
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
 #else
@@ -340,7 +340,7 @@ inline void render(float, float, float width, float height,
 			}
 
 			if (ImGui::MenuItem("Go to Disassembly")) {
-				globals::ui::active_center_view = center_view_t::disassembly;
+				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 				disasm_view::goto_address(sel_node.reader_rip, workspace_context);
 			}
 

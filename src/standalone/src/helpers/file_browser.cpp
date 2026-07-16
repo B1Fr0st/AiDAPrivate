@@ -26,6 +26,7 @@
 #include "theme.hpp"
 #include "fonts.hpp"
 #include "ui_anim.hpp"
+#include "../core/ui/application_view_registry.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../core/infra/executor.hpp"
 #include "../core/infra/taskflow_runtime.hpp"
@@ -425,7 +426,8 @@ void complete_hex_preview_success(
             return;
         }
         hex_view::activate(context);
-        globals::ui::active_center_view = center_view_t::hex_view;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.hex"));
         record_recent_workspace(path);
         preview.error.clear();
         diag::log_tagged_fmt("file_browser", "hex_fallback_complete path=%s target=%s",
@@ -557,8 +559,8 @@ void open_path(const std::string& path)
     if (entry != entries.end() && entry->is_dir) {
         current_dir = path;
         strncpy_s(path_buf, sizeof(path_buf), current_dir.c_str(), _TRUNCATE);
-        globals::ui::active_activity = activity_item_t::explorer;
-        globals::ui::panel_left_visible = true;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.project_explorer"));
         needs_refresh = false;
         aida::preview::record(aida::preview::shell_action_t::open_folder, path);
         return;
@@ -573,7 +575,8 @@ void open_path(const std::string& path)
     });
 
     if (image_view::is_image_extension(extension)) {
-        globals::ui::active_center_view = center_view_t::image_view;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.image"));
     } else if (extension == ".cpp" || extension == ".c" || extension == ".h"
         || extension == ".hpp" || extension == ".asm" || extension == ".md"
         || extension == ".txt" || extension == ".json") {
@@ -581,12 +584,14 @@ void open_path(const std::string& path)
             ? "# Reverse Engineering Notes\n\n- Entrypoint mapped\n- Import resolver identified\n- License gate cross-references indexed\n"
             : "int analyze_target(const char* path) {\n    return path != nullptr ? 0 : -1;\n}\n";
         file_tabs::open_or_focus(path, filename, content);
-        globals::ui::active_center_view = center_view_t::code_editor;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.code"));
     } else {
         std::size_t existing_index = static_cast<std::size_t>(-1);
         if (analysis_session::find_session_by_path(path, &existing_index))
             analysis_session::switch_session(existing_index);
-        globals::ui::active_center_view = center_view_t::workbench;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.disassembly"));
     }
     record_recent_workspace(path);
     aida::preview::record(aida::preview::shell_action_t::open_file, path);
@@ -608,8 +613,8 @@ void open_path(const std::string& path)
     if (fs::is_directory(path, ec) && !ec) {
         diag::log_tagged_fmt("file_browser", "open_path directory=%s", path.c_str());
         refresh(path);
-        globals::ui::active_activity = activity_item_t::explorer;
-        globals::ui::panel_left_visible = true;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.project_explorer"));
         return;
     }
 
@@ -635,7 +640,8 @@ void open_path(const std::string& path)
 
     if (image_view::is_image_extension(ext)) {
         image_view::load_from_file(path);
-        globals::ui::active_center_view = center_view_t::image_view;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.image"));
         diag::log_tagged_fmt("file_browser", "open_path -> image_view path=%s", path.c_str());
         return;
     }
@@ -646,7 +652,8 @@ void open_path(const std::string& path)
             std::ostringstream ss;
             ss << ifs.rdbuf();
             file_tabs::open_or_focus(path, fname, ss.str());
-            globals::ui::active_center_view = center_view_t::code_editor;
+            aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("document.code"));
             diag::log_tagged_fmt("file_browser", "open_path -> code_editor path=%s", path.c_str());
             return;
         }
@@ -680,7 +687,8 @@ void open_path(const std::string& path)
     bool found = analysis_session::find_session_by_path(path, &existing_idx);
     if (found) {
         if (analysis_session::switch_session(existing_idx)) {
-            globals::ui::active_center_view = center_view_t::workbench;
+            aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("document.disassembly"));
             record_recent_workspace(path);
             diag::log_tagged_fmt("file_browser",
                 "open_path -> existing_session idx=%llu",
@@ -698,7 +706,8 @@ void open_path(const std::string& path)
 
     bool started = analysis_session::open_session(path);
     if (started) {
-        globals::ui::active_center_view = center_view_t::workbench;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.disassembly"));
         record_recent_workspace(path);
         diag::log_tagged_fmt("file_browser",
             "open_path -> new_session path=%s ext=%s", path.c_str(), ext.c_str());
@@ -1019,7 +1028,8 @@ void render_pending_confirm_modal()
             file_browser::pending_open_filename.clear();
         } else if (switch_now && already_open) {
             if (analysis_session::switch_session(existing_idx)) {
-                globals::ui::active_center_view = center_view_t::workbench;
+                aida::ui::application_views::open_or_focus(
+                    aida::ui::stable_view_id_t("document.disassembly"));
                 diag::log_tagged_fmt("file_open", "explorer_click_switch idx=%llu",
                     static_cast<unsigned long long>(existing_idx));
             }

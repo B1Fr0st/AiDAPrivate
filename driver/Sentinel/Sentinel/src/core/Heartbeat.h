@@ -232,12 +232,18 @@ namespace heartbeat {
         RtlCopyMemory(pt, &plaintext_challenge, 8);
 
         UINT8 ct[8];
-        kernel_crypto::sw_aes256_gcm_encrypt(
+        NTSTATUS enc_st = kernel_crypto::bcrypt_aes256_gcm_encrypt(
             g_challenge_aes_key, nonce,
             aad, sizeof(aad),
             pt, 8,
             ct,
             tag_out);
+        if (!NT_SUCCESS(enc_st)) {
+            RtlSecureZeroMemory(nonce, sizeof(nonce));
+            RtlSecureZeroMemory(pt,    sizeof(pt));
+            RtlSecureZeroMemory(ct,    sizeof(ct));
+            return FALSE;
+        }
 
         RtlCopyMemory(&ciphertext_out, ct, 8);
         RtlSecureZeroMemory(nonce, sizeof(nonce));
@@ -267,12 +273,13 @@ namespace heartbeat {
         RtlCopyMemory(ct, &ciphertext_in, 8);
 
         UINT8 pt[8];
-        BOOLEAN ok = kernel_crypto::sw_aes256_gcm_decrypt(
+        NTSTATUS dec_st = kernel_crypto::bcrypt_aes256_gcm_decrypt(
             g_challenge_aes_key, nonce,
             aad, sizeof(aad),
             ct, 8,
             tag_in,
             pt);
+        BOOLEAN ok = NT_SUCCESS(dec_st) ? TRUE : FALSE;
 
         if (ok) {
             RtlCopyMemory(&plaintext_out, pt, 8);

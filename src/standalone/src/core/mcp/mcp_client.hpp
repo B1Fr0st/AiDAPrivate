@@ -19,6 +19,8 @@ namespace mcp_client
 
 using json = nlohmann::json;
 
+struct oauth_request_control_t;
+
 
 enum class transport_type_t
 {
@@ -140,11 +142,17 @@ struct oauth_state_t
     int64_t deadline_unix = 0;
     std::atomic<bool> done{false};
     std::atomic<bool> cancelled{false};
-    std::string received_code;
+    std::atomic<bool> terminalizing{false};
+    std::atomic<oauth_status_t> terminal_status{oauth_status_t::authenticating};
     std::string error;
-    void* listener_handle = nullptr;
+    void* flow_binding = nullptr;
 
     oauth_state_t() = default;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    ~oauth_state_t() = default;
+#else
+    ~oauth_state_t();
+#endif
     oauth_state_t(const oauth_state_t&) = delete;
     oauth_state_t& operator=(const oauth_state_t&) = delete;
 };
@@ -197,7 +205,7 @@ public:
     bool                 is_connected()  const;
     connection_state_t   state()         const;
     const std::string&   server_name()   const;
-    const std::string&   last_error()    const;
+    std::string          last_error()    const;
     const server_config_t& config()      const;
     std::uint32_t        child_process_id() const;
 
@@ -224,7 +232,8 @@ private:
     bool ensure_access_token_fresh_locked();
     bool refresh_access_token_locked();
     void process_notification(const json& notif);
-    bool detect_oauth_metadata(const std::string& www_authenticate_hdr);
+    bool detect_oauth_metadata();
+    void scrub_sensitive_state_locked() noexcept;
 
     bool dispatch_inbound_request(const json& request, json& response_out);
     json build_roots_list_result() const;
@@ -254,10 +263,8 @@ private:
 
     oauth_status_t              _oauth_status = oauth_status_t::not_required;
     std::string                 _oauth_token_endpoint;
-    std::string                 _oauth_authorization_endpoint;
-    std::string                 _oauth_registration_endpoint;
-    std::string                 _oauth_resource_metadata_url;
-    std::string                 _oauth_realm;
+    mutable std::mutex          _oauth_request_mutex;
+    std::shared_ptr<oauth_request_control_t> _oauth_request_control;
 
 
     void*   _child_process  = nullptr;
@@ -339,6 +346,7 @@ private:
     {
         server_config_t cfg;
         client_t        client;
+        ~entry_t();
     };
 
     mutable std::mutex                          _mtx;
@@ -355,8 +363,88 @@ bool finish_auth(const std::string& server_name, const std::string& authorizatio
 bool remove_auth(const std::string& server_name);
 oauth_status_t auth_status(const std::string& server_name);
 bool cancel_auth(oauth_state_t& state);
+bool cancel_auth(const std::string& server_name);
 bool trigger_auth_flow(const std::string& server_name, auth_completion_callback_t on_complete);
 
-const std::string& last_error();
+std::string last_error();
+
+#if defined(AIDA_C03_MCP_OAUTH_FIXTURE)
+namespace c03_oauth_fixture
+{
+
+struct http_reply_t
+{
+    bool transport_ok = true;
+    int status = 200;
+    std::string body;
+    std::map<std::string, std::string> headers;
+    std::string error;
+};
+
+struct http_request_t
+{
+    bool oauth_request = false;
+    std::string method;
+    std::string url;
+    std::string body;
+    std::map<std::string, std::string> headers;
+};
+
+struct credential_t
+{
+    std::string access;
+    std::string refresh;
+    int64_t expires_unix = 0;
+    json metadata = json::object();
+    std::string client_id;
+    std::string redirect_uri;
+    std::vector<std::string> scopes;
+};
+
+struct event_t
+{
+    std::string server_name;
+    oauth_status_t status = oauth_status_t::failed;
+    std::string error;
+    std::uint64_t generation = 0;
+};
+
+enum class fault_point_t
+{
+    config_lookup,
+    http_request,
+    browser,
+    credential_store,
+    event_publish
+};
+
+void reset();
+void set_time(int64_t unix_seconds);
+void advance_time(int64_t seconds);
+bool add_server(const server_config_t& config);
+void set_browser_result(bool result);
+void fail_next(fault_point_t point);
+void queue_http_reply(http_reply_t reply);
+std::vector<http_request_t> take_http_requests();
+size_t run_ready_tasks(size_t maximum);
+size_t pending_task_count();
+size_t pending_http_reply_count();
+size_t active_flow_count();
+size_t active_trigger_count();
+size_t active_flow_secret_bytes();
+bool get_active_state_token(const std::string& server_name, std::string& state_token);
+bool deliver_callback(const std::string& server_name,
+                      const std::string& state_token,
+                      const std::string& code,
+                      const std::string& error);
+bool get_credential(const std::string& server_name, credential_t& credential);
+std::vector<event_t> take_events();
+void set_flow_generation(std::uint64_t generation);
+void set_trigger_generation(std::uint64_t generation);
+void set_auth_epoch(const std::string& server_name, std::uint64_t epoch);
+void set_config_generation(const std::string& server_name, std::uint64_t generation);
+
+}
+#endif
 
 }

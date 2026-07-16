@@ -218,6 +218,8 @@ namespace ioctl_codes {
     __forceinline DWORD HRES() { return make(79); }
     __forceinline DWORD WMRK() { return make(80); }
     __forceinline DWORD CEDH() { return make(81); }
+    __forceinline DWORD WBAES() { return make(82); }
+    __forceinline DWORD CCHL()  { return make(83); }
 
     __forceinline DWORD HWID() {
         return static_cast<DWORD>(CTL_CODE(FILE_DEVICE_UNKNOWN, 0xA1D0, METHOD_BUFFERED, FILE_READ_DATA));
@@ -320,7 +322,7 @@ namespace voyager {
             if (encoded < base)
                 return false;
             const std::uint32_t candidate = encoded - base;
-            if (candidate > 80u)
+            if (candidate > 83u)
                 return false;
             offset = candidate;
             return true;
@@ -1769,6 +1771,30 @@ namespace voyager {
         static_assert(sizeof(watermark_verify_request) == 41, "watermark_verify_request must be 41 bytes");
 
 #pragma pack(pop)
+
+        struct wbaes_challenge_t {
+            std::uint8_t challenge_plaintext[16];
+            std::uint8_t expected_ciphertext[16];
+            std::uint8_t build_id[16];
+            std::uint8_t fallback_mode;
+            std::uint8_t fallback_token[64];
+            std::uint8_t reserved[15];
+        };
+        static_assert(sizeof(wbaes_challenge_t) == 128, "wbaes_challenge_t must be 128 bytes");
+
+        constexpr std::uint32_t CLIENT_CHALLENGE_MAGIC = 0x4343484Cu;
+        constexpr std::uint32_t CLIENT_CHALLENGE_OP_ISSUE = 0;
+        constexpr std::uint32_t CLIENT_CHALLENGE_OP_VERIFY = 1;
+
+        struct client_challenge_request {
+            std::uint32_t magic;
+            std::uint32_t session_key;
+            std::uint32_t operation;
+            std::uint32_t result;
+            std::uint8_t  challenge[16];
+            std::uint8_t  response[32];
+        };
+        static_assert(sizeof(client_challenge_request) == 64, "client_challenge_request must be 64 bytes");
     }
 
     namespace detail {

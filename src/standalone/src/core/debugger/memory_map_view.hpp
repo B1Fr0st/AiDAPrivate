@@ -21,6 +21,8 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
+#include "debugger_interaction_context.hpp"
+#include "../scanner/memory_interaction_context.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/debugger_preview_runtime.hpp"
 #endif
@@ -80,13 +82,12 @@ struct ui_state_t {
 	std::atomic<bool>                          refreshing{false};
 	bool                                       scrollbar_dragging = false;
 	float                                      scrollbar_drag_offset = 0.f;
-	uint64_t                                   context_addr = 0;
-	bool                                       show_context = false;
 	bool                                       change_protect_open = false;
 	uint64_t                                   change_protect_addr = 0;
 	uint64_t                                   change_protect_size = 0;
 	int                                        change_protect_choice = 0;
 	uint32_t                                   change_protect_old = 0;
+	debugger_interaction::context_t            change_protect_context;
 	stat_counter_t                             stat_regions;
 	stat_counter_t                             stat_committed;
 	stat_counter_t                             stat_rwx;
@@ -495,6 +496,12 @@ inline void render_hero_map(ImDrawList* dl, float x, float y, float w, float h,
 			g_ui.selected = s.region_index;
 			g_ui.request_pending_scroll = true;
 			g_ui.pending_scroll_index = s.region_index;
+			memory_interaction::runtime_t runtime;
+			runtime.driver_loaded = driver_bridge::is_loaded();
+			runtime.live_attached = driver_bridge::attached_pid() != 0;
+			runtime.target_pid = driver_bridge::attached_pid();
+			memory_interaction::select(memory_interaction::capture_memory_range(runtime,
+				r.base, r.size, s.region_index, r.module_name));
 		}
 	}
 
@@ -862,12 +869,28 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			g_ui.selected = idx;
 			g_ui.selected_segment = -1;
+			debugger_interaction::select(debugger_interaction::capture(
+				debugger_interaction::kind_t::memory_region, r.base, 0, idx, 0,
+				r.size, r.module_name, r.info));
+			memory_interaction::runtime_t runtime;
+			runtime.driver_loaded = driver_bridge::is_loaded();
+			runtime.live_attached = driver_bridge::attached_pid() != 0;
+			runtime.target_pid = driver_bridge::attached_pid();
+			memory_interaction::select(memory_interaction::capture_memory_range(runtime,
+				r.base, r.size, idx, r.module_name));
 		}
 
 		if (g_ui.selected == idx && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-			g_ui.context_addr = r.base;
-			g_ui.show_context = true;
-			ImGui::OpenPopup("##memmap_ctx");
+			debugger_interaction::select(debugger_interaction::capture(
+				debugger_interaction::kind_t::memory_region, r.base, 0, idx, 0,
+				r.size, r.module_name, r.info));
+			memory_interaction::runtime_t runtime;
+			runtime.driver_loaded = driver_bridge::is_loaded();
+			runtime.live_attached = driver_bridge::attached_pid() != 0;
+			runtime.target_pid = driver_bridge::attached_pid();
+			memory_interaction::select(memory_interaction::capture_memory_range(runtime,
+				r.base, r.size, idx, r.module_name));
+			ImGui::OpenPopup("Debugger Item Actions##context");
 		}
 	}
 
@@ -879,145 +902,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			g_ui.scrollbar_dragging, g_ui.scrollbar_drag_offset);
 	}
 
-	bool open_change_protect_popup = false;
-
-	if (ImGui::BeginPopup("##memmap_ctx")) {
-		if (ImGui::MenuItem("Go to Hex View")) {
-			debugger_engine::memory_region_t r{};
-			if (find_region_by_base(g_ui.context_addr, r)) {
-				const size_t cap = static_cast<size_t>(1024ULL * 1024ULL);
-				size_t req = static_cast<size_t>(std::min<uint64_t>(r.size, static_cast<uint64_t>(cap)));
-				diag::log_tagged_fmt("memmap",
-					"memmap_go_hex base=0x%llx size=%zu",
-					static_cast<unsigned long long>(r.base), req);
-				if (req == 0) {
-					toast_notification::push("Region has zero size.", toast_notification::toast_type_t::error);
-				}
-				else {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-					aida::preview::debugger::record("memory_map_to_hex", std::to_string(r.base));
-					globals::ui::active_center_view = center_view_t::hex_view;
-#else
-					const auto context = disasm_view::capture_selected_workspace();
-					if (hex_view::read_live_memory(context, r.base, req)) {
-						globals::ui::active_center_view = center_view_t::hex_view;
-					}
-					else {
-						toast_notification::push("Failed to read region for hex view.", toast_notification::toast_type_t::error);
-					}
-#endif
-				}
-			}
-			else {
-				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
-			}
-			g_ui.show_context = false;
-		}
-		if (ImGui::MenuItem("Go to Disassembly")) {
-			debugger_engine::memory_region_t r{};
-			if (find_region_by_base(g_ui.context_addr, r)) {
-				diag::log_tagged_fmt("memmap",
-					"memmap_go_disasm base=0x%llx",
-					static_cast<unsigned long long>(r.base));
-				globals::ui::active_center_view = center_view_t::disassembly;
-				disasm_view::goto_address(r.base,
-					disasm_view::capture_selected_workspace());
-			}
-			else {
-				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
-			}
-			g_ui.show_context = false;
-		}
-		if (ImGui::MenuItem("Change Protection")) {
-			debugger_engine::memory_region_t r{};
-			if (find_region_by_base(g_ui.context_addr, r)) {
-				g_ui.change_protect_addr = r.base;
-				g_ui.change_protect_size = r.size;
-				g_ui.change_protect_choice = 0;
-				g_ui.change_protect_old = r.protect;
-				g_ui.change_protect_open = true;
-				open_change_protect_popup = true;
-			}
-			else {
-				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
-			}
-			g_ui.show_context = false;
-		}
-		if (ImGui::MenuItem("Dump Region")) {
-			debugger_engine::memory_region_t r{};
-			if (find_region_by_base(g_ui.context_addr, r)) {
-				const uint64_t max_dump = 256ULL * 1024ULL * 1024ULL;
-				if (r.size == 0) {
-					toast_notification::push("Region has zero size.", toast_notification::toast_type_t::error);
-				}
-				else if (r.size > max_dump) {
-					toast_notification::push("Region exceeds 256 MiB dump cap.", toast_notification::toast_type_t::warning);
-				}
-				else {
-					char default_name[64] = {};
-					std::snprintf(default_name, sizeof(default_name), "dump_%016llX_%llu.bin",
-						static_cast<unsigned long long>(r.base),
-						static_cast<unsigned long long>(r.size));
-
-					char path_buf[MAX_PATH] = {};
-					std::strncpy(path_buf, default_name, sizeof(path_buf) - 1);
-
-					static const char k_mem_dump_filter[] =
-						"Binary (*.bin)\0*.bin\0"
-						"All files (*.*)\0*.*\0\0";
-					if (win32_dialog::show_save_file_dialog(g_hwnd,
-							"Dump Region",
-							k_mem_dump_filter,
-							"bin",
-							path_buf, sizeof(path_buf),
-							"memory_map_view::dump_region")) {
-						diag::log_tagged_critical_fmt("memmap",
-							"memmap_dump_request base=0x%llx size=%llu path='%s'",
-							static_cast<unsigned long long>(r.base),
-							static_cast<unsigned long long>(r.size),
-							path_buf);
-						std::vector<uint8_t> buf;
-						size_t req = static_cast<size_t>(r.size);
-						if (driver_bridge::read_memory(r.base, req, buf) && !buf.empty()) {
-							std::ofstream ofs(path_buf, std::ios::binary | std::ios::trunc);
-							if (ofs.is_open()) {
-								ofs.write(reinterpret_cast<const char*>(buf.data()),
-									static_cast<std::streamsize>(buf.size()));
-								ofs.close();
-								diag::log_tagged_critical_fmt("memmap",
-									"memmap_dump_done bytes=%zu path='%s'",
-									buf.size(), path_buf);
-								char msg[MAX_PATH + 64];
-								std::snprintf(msg, sizeof(msg), "Dumped %llu bytes to %s",
-									static_cast<unsigned long long>(buf.size()), path_buf);
-								toast_notification::push(msg, toast_notification::toast_type_t::info);
-							}
-							else {
-								diag::log_tagged_fmt("memmap",
-									"memmap_dump_FAILED_open path='%s'", path_buf);
-								toast_notification::push("Failed to open dump file for writing.", toast_notification::toast_type_t::error);
-							}
-						}
-						else {
-							diag::log_tagged_fmt("memmap",
-								"memmap_dump_FAILED_read base=0x%llx",
-								static_cast<unsigned long long>(r.base));
-							toast_notification::push("Failed to read region memory.", toast_notification::toast_type_t::error);
-						}
-					}
-				}
-			}
-			else {
-				toast_notification::push("Region no longer present.", toast_notification::toast_type_t::error);
-			}
-			g_ui.show_context = false;
-		}
-		ImGui::EndPopup();
-	}
-
-	if (open_change_protect_popup)
+	if (g_ui.change_protect_open && !ImGui::IsPopupOpen("Change Protection"))
 		ImGui::OpenPopup("Change Protection");
-
 	if (ImGui::BeginPopupModal("Change Protection", &g_ui.change_protect_open, ImGuiWindowFlags_AlwaysAutoResize)) {
 		ImGui::Text("Address: %016llX", static_cast<unsigned long long>(g_ui.change_protect_addr));
 		ImGui::Text("Size:    %llu bytes", static_cast<unsigned long long>(g_ui.change_protect_size));
@@ -1041,8 +927,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (g_ui.change_protect_choice >= value_count) g_ui.change_protect_choice = value_count - 1;
 
 		ImGui::Combo("##new_protect", &g_ui.change_protect_choice, labels, value_count);
+		const auto protect_gate = debugger_interaction::evaluate(
+			debugger_interaction::capability_t::change_memory_protection,
+			g_ui.change_protect_context);
+		if (!protect_gate.enabled)
+			ImGui::TextWrapped("Unavailable: %s", protect_gate.disabled_reason);
 
 		ImGui::Separator();
+		if (!protect_gate.enabled)
+			ImGui::BeginDisabled();
 		if (ImGui::Button("Apply", ImVec2(100.f, 0.f))) {
 			uint32_t new_protect = values[g_ui.change_protect_choice];
 			uint32_t old_protect = 0;
@@ -1052,24 +945,42 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				static_cast<unsigned long long>(g_ui.change_protect_size),
 				static_cast<unsigned>(new_protect));
 			bool ok = driver_bridge::protect_memory(g_ui.change_protect_addr, g_ui.change_protect_size, new_protect, &old_protect);
+			bool readback_ok = false;
+			if (ok) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				auto regions = debugger_engine::get_memory_map();
+#else
+				auto regions = driver_bridge::enumerate_memory_regions();
+#endif
+				for (const auto& region : regions) {
+					if (region.base == g_ui.change_protect_addr) {
+						readback_ok = (region.protect & 0xFFu) == new_protect;
+						break;
+					}
+				}
+			}
 			diag::log_tagged_critical_fmt("memmap",
-				"memmap_protect_done addr=0x%llx ok=%d old=0x%X new=0x%X",
+				"memmap_protect_done addr=0x%llx ok=%d readback_ok=%d old=0x%X new=0x%X",
 				static_cast<unsigned long long>(g_ui.change_protect_addr),
 				ok ? 1 : 0,
+				readback_ok ? 1 : 0,
 				static_cast<unsigned>(old_protect),
 				static_cast<unsigned>(new_protect));
-			if (ok) {
+			if (ok && readback_ok) {
 				char msg[96];
 				std::snprintf(msg, sizeof(msg), "Protection changed 0x%X -> 0x%X", old_protect, new_protect);
 				toast_notification::push(msg, toast_notification::toast_type_t::info);
 				refresh();
 			}
 			else {
-				toast_notification::push("Failed to change protection.", toast_notification::toast_type_t::error);
+				toast_notification::push(ok ? "Protection write succeeded but readback did not match."
+					: "Failed to change protection.", toast_notification::toast_type_t::error);
 			}
 			g_ui.change_protect_open = false;
 			ImGui::CloseCurrentPopup();
 		}
+		if (!protect_gate.enabled)
+			ImGui::EndDisabled();
 		ImGui::SameLine();
 		if (ImGui::Button("Cancel", ImVec2(100.f, 0.f))) {
 			g_ui.change_protect_open = false;

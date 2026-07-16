@@ -3,6 +3,7 @@
 #include "imgui/imgui.h"
 
 #include "fonts.hpp"
+#include "application_view_registry.hpp"
 #include "theme.hpp"
 #include "ui_anim.hpp"
 
@@ -10,7 +11,6 @@
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
-#include "../../helpers/globals.h"
 
 #include <algorithm>
 #include <atomic>
@@ -279,7 +279,8 @@ inline void poll_completion()
         return;
     if (state->action == completion_action_t::switch_to_disassembly ||
         state->action == completion_action_t::switch_to_disassembly_or_hex)
-        globals::ui::active_center_view = center_view_t::disassembly;
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.disassembly"));
 }
 
 inline void render()

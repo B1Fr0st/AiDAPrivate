@@ -2,11 +2,10 @@
 
 #include "imgui/imgui.h"
 #include "theme.hpp"
-#include "clock.hpp"
-#include "fonts.hpp"
-#include "metrics.hpp"
 #include "components.hpp"
 #include "empty_state.hpp"
+#include "design_system.hpp"
+#include "application_ui_runtime.hpp"
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/workspace_preview_fixture.hpp"
@@ -43,36 +42,15 @@ namespace aida::ui::no_target_overlay {
 		return action_t::none;
 	}
 
-	inline aida::ui::empty_state::config_t make_config(const char* title_text,
-		const char* subtitle_text, aida::ui::empty_state::glyph_t glyph) {
-		aida::ui::empty_state::config_t cfg;
-		cfg.glyph = glyph;
-		cfg.title = title_text ? title_text : "";
-		cfg.body = subtitle_text ? subtitle_text : "";
-		cfg.footer = "Tip: drag any .exe/.dll/.sys into this window, then ask the AI Assistant on the right.";
-		cfg.max_width = 432.f;
-		cfg.actions.push_back({
-			"open_file",
-			"Open File...",
-			aida::ui::components::button_kind_t::primary,
-			false,
-			"Open a binary for static analysis"
-		});
-		cfg.actions.push_back({
-			"attach_process",
-			"Attach...",
-			aida::ui::components::button_kind_t::secondary,
-			false,
-			"Attach to a running process"
-		});
-		cfg.actions.push_back({
-			"run_target",
-			"Run...",
-			aida::ui::components::button_kind_t::secondary,
-			false,
-			"Launch a binary under AiDA"
-		});
-		return cfg;
+	inline const char* state_id_for_glyph(aida::ui::empty_state::glyph_t glyph) {
+		switch (glyph) {
+		case aida::ui::empty_state::glyph_t::cpu: return "no_target.analysis";
+		case aida::ui::empty_state::glyph_t::shield: return "no_target.debugger";
+		case aida::ui::empty_state::glyph_t::search: return "no_target.scanner";
+		case aida::ui::empty_state::glyph_t::network: return "no_target.network";
+		case aida::ui::empty_state::glyph_t::memory: return "no_target.memory";
+		default: return "no_target.binary";
+		}
 	}
 
 	inline action_t render_actions(ImVec2 region_pos, ImVec2 region_size,
@@ -86,10 +64,32 @@ namespace aida::ui::no_target_overlay {
 			ImVec2(region_pos.x + region_size.x, region_pos.y + region_size.y),
 			aida::ui::with_alpha(t.bg_base, alpha * 0.95f));
 
-		aida::ui::empty_state::config_t cfg = make_config(title_text, subtitle_text, glyph);
-		aida::ui::empty_state::render_result_t result =
-			aida::ui::empty_state::render_panel(region_pos, region_size, cfg, alpha);
-		return action_from_id(result.action_id);
+		const auto open_action = aida::ui::application_ui::present_action("file.open");
+		const aida::ui::design::action_t actions[] = {
+			{"open_file", "Open File...", "Open", "Open a binary for static analysis",
+				open_action.shortcut.empty() ? nullptr : open_action.shortcut.c_str(),
+				open_action.disabled_reason.empty() ? nullptr : open_action.disabled_reason.c_str(),
+				aida::ui::components::button_kind_t::primary,
+				open_action.enabled, true, open_action.visible},
+			{"attach_process", "Attach...", "Attach", "Attach to a running process", nullptr, nullptr,
+				aida::ui::components::button_kind_t::secondary, true, false, true},
+			{"run_target", "Run...", "Run", "Launch a binary under AiDA", nullptr, nullptr,
+				aida::ui::components::button_kind_t::secondary, true, false, true}
+		};
+		aida::ui::design::state_presentation_t state;
+		state.stable_id = state_id_for_glyph(glyph);
+		state.state = aida::ui::design::view_state_t::empty;
+		state.title = title_text;
+		state.message = subtitle_text;
+		state.hint = "Drag any .exe, .dll, or .sys into this window, then send evidence to the AI Assistant.";
+		state.actions = actions;
+		state.action_count = IM_ARRAYSIZE(actions);
+		ImGui::SetCursorScreenPos(region_pos);
+		ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+		const aida::ui::design::action_result_t result =
+			aida::ui::design::render_state(state, region_size);
+		ImGui::PopStyleVar();
+		return action_from_id(result.id ? result.id : "");
 	}
 
 	inline void dispatch_default_action(action_t action) {

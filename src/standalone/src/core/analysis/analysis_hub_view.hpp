@@ -203,6 +203,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::EndChild();
 }
 
+inline void render_subview(sub_tab_t tab, float pos_x, float pos_y,
+	float width, float height, float alpha,
+	float accent_r, float accent_g, float accent_b,
+	const disasm_view::workspace_context_t& context)
+{
+	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+	ImGui::BeginChild("##analysis_registered_subview", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+		ImGuiWindowFlags_NoBackground);
+	if (!context) {
+		ImVec2 wp = ImGui::GetWindowPos();
+		aida::ui::no_target_overlay::render(
+			wp, ImVec2(width, height), "No binary open",
+			"This analysis tool operates on an open binary. Open a file or attach to a process to start.",
+			alpha, aida::ui::empty_state::glyph_t::cpu);
+	} else {
+		render_active(static_cast<int>(tab), width, height, alpha,
+			accent_r, accent_g, accent_b, context);
+	}
+	ImGui::EndChild();
+}
+
+inline void render_subview(sub_tab_t tab, float pos_x, float pos_y,
+	float width, float height, float alpha,
+	float accent_r, float accent_g, float accent_b)
+{
+	render_subview(tab, pos_x, pos_y, width, height, alpha,
+		accent_r, accent_g, accent_b, disasm_view::capture_selected_workspace());
+}
+
 inline void render(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b)
 {

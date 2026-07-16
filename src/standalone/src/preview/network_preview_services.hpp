@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <string>
 
-namespace win32_dialog {
+namespace aida::preview::network_dialog {
 
 inline bool show_open_file_dialog(void*, const char* title, const char*, char* out_path,
                                   std::size_t capacity, const char*) {

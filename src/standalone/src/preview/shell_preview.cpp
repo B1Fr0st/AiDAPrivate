@@ -5,6 +5,7 @@
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
 #include "../core/ui/clock.hpp"
+#include "../core/ui/application_view_registry.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -80,11 +81,10 @@ namespace aida::preview
 		globals::ui::command_palette_open = false;
 		globals::ui::command_palette_buf[0] = '\0';
 
-		globals::ui::panel_left_visible = true;
-		globals::ui::panel_right_visible = true;
-		globals::ui::panel_bottom_visible = true;
-		globals::ui::active_activity = activity_item_t::explorer;
-		globals::ui::active_bottom_tab = bottom_tab_t::output;
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.project_explorer"));
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.output"));
 		globals::ui::active_center_view = center_view_t::welcome;
 		globals::ui::breadcrumb_segments = { "AiDA", "sample.exe", ".text", "main" };
 		globals::ui::status_file_info = "sample.exe  x64  PE32+";
@@ -231,8 +231,8 @@ namespace aida::preview
 
 	void apply_open_folder()
 	{
-		globals::ui::panel_left_visible = true;
-		globals::ui::active_activity = activity_item_t::explorer;
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.project_explorer"));
 		output_log::push(bottom_tab_t::output, "[preview] Opened ReverseEngineering fixture workspace");
 	}
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,9 +41,11 @@ namespace store {
 	bool save();
 	bool get(const std::string& provider_id, auth_info_t& out);
 	bool set(const std::string& provider_id, const auth_info_t& info);
+	bool set_if(const std::string& provider_id, const auth_info_t& info,
+		const std::function<bool()>& commit_guard);
 	bool remove(const std::string& provider_id);
-	std::vector<std::pair<std::string, auth_info_t>> all();
-	const std::string& last_error();
+	bool all(std::vector<std::pair<std::string, auth_info_t>>& out);
+	std::string last_error();
 
 }
 

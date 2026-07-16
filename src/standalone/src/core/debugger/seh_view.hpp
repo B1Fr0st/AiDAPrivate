@@ -24,7 +24,7 @@
 #endif
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
-#include "../helpers/globals.h"
+#include "../ui/application_view_registry.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
@@ -580,7 +580,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						"seh_go_handler idx=%d handler=0x%llx",
 						g_ui.selected,
 						static_cast<unsigned long long>(handler_address));
-					globals::ui::active_center_view = center_view_t::disassembly;
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 					disasm_view::goto_address(handler_address,
 						disasm_view::capture_selected_workspace());
 				}

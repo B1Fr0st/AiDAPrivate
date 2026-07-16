@@ -1,0 +1,37 @@
+#pragma once
+
+#include "context_menu_contract.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <string>
+
+namespace aida::ui::analysis_context_menu {
+
+enum class menu_kind_t : std::uint8_t {
+    instruction,
+    pseudocode,
+    graph,
+    function,
+    xref
+};
+
+struct action_slot_t {
+    capability_state_t capability = capability_state_t::available();
+    std::function<action_handler_result_t()> invoke;
+    action_check_state_t check_state = action_check_state_t::not_checkable;
+};
+
+struct context_t {
+    menu_kind_t kind = menu_kind_t::instruction;
+    std::uint64_t generation = 0;
+    std::function<std::uint64_t()> live_generation;
+    std::map<std::string, action_slot_t> actions;
+};
+
+void open(context_t context, context_menu_open_origin_t origin);
+void render();
+bool keyboard_request(context_menu_open_origin_t& origin);
+
+}

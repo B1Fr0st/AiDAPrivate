@@ -1,0 +1,14 @@
+{
+  "schema": "aida.c03.package-policy-stage-fixture.v1",
+  "artifacts": [
+    { "relative_path": "AiDAStandalone.exe" }
+  ],
+  "inventory_sources": [
+    {
+      "type": "allowlisted_files_v1",
+      "relative_paths": [
+        "resources/runtime.bin"
+      ]
+    }
+  ]
+}

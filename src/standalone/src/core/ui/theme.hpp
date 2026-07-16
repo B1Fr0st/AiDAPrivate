@@ -56,6 +56,11 @@ namespace aida::ui {
 		ImU32 error_soft;
 		ImU32 info;
 		ImU32 info_soft;
+		ImU32 live;
+		ImU32 stale;
+		ImU32 breakpoint;
+		ImU32 changed;
+		ImU32 disabled;
 
 		ImU32 syn_keyword;
 		ImU32 syn_type;
@@ -186,6 +191,11 @@ namespace aida::ui {
 			t.error_soft   = IM_COL32(105, 42, 51, 150);
 			t.info         = IM_COL32(94, 158, 235, 255);
 			t.info_soft    = IM_COL32(41, 73, 111, 150);
+			t.live         = t.success;
+			t.stale        = t.warning;
+			t.breakpoint   = t.error;
+			t.changed      = t.info;
+			t.disabled     = t.text_dim;
 
 			t.syn_keyword      = IM_COL32(198, 151, 255, 255);
 			t.syn_type         = IM_COL32(103, 205, 214, 255);
@@ -246,6 +256,11 @@ namespace aida::ui {
 			t.error_soft   = IM_COL32(196, 50, 62, 26);
 			t.info         = IM_COL32(42, 104, 216, 255);
 			t.info_soft    = IM_COL32(42, 104, 216, 26);
+			t.live         = t.success;
+			t.stale        = t.warning;
+			t.breakpoint   = t.error;
+			t.changed      = t.info;
+			t.disabled     = t.text_dim;
 
 			t.syn_keyword      = IM_COL32(124, 58, 178, 255);
 			t.syn_type         = IM_COL32(20, 122, 138, 255);
@@ -306,6 +321,11 @@ namespace aida::ui {
 			t.error_soft   = IM_COL32(0xE8, 0x6F, 0x6C, 30);
 			t.info         = IM_COL32(0x1F, 0x6F, 0xE4, 255);
 			t.info_soft    = IM_COL32(0x1F, 0x6F, 0xE4, 30);
+			t.live         = t.success;
+			t.stale        = t.warning;
+			t.breakpoint   = t.error;
+			t.changed      = t.info;
+			t.disabled     = t.text_dim;
 
 			t.syn_keyword      = IM_COL32(0xD7, 0x3A, 0x83, 255);
 			t.syn_type         = IM_COL32(0xE8, 0xC4, 0x7C, 255);
@@ -366,6 +386,11 @@ namespace aida::ui {
 			t.error_soft   = IM_COL32(0xC0, 0x39, 0x2A, 26);
 			t.info         = IM_COL32(0x1C, 0x6B, 0xBB, 255);
 			t.info_soft    = IM_COL32(0x1C, 0x6B, 0xBB, 26);
+			t.live         = t.success;
+			t.stale        = t.warning;
+			t.breakpoint   = t.error;
+			t.changed      = t.info;
+			t.disabled     = t.text_dim;
 
 			t.syn_keyword      = IM_COL32(0xD7, 0x3A, 0x83, 255);
 			t.syn_type         = IM_COL32(0x8A, 0x46, 0xCE, 255);
@@ -426,6 +451,11 @@ namespace aida::ui {
 			t.error_soft   = IM_COL32(216, 50, 75, 22);
 			t.info         = IM_COL32(42, 111, 176, 255);
 			t.info_soft    = IM_COL32(42, 111, 176, 22);
+			t.live         = t.success;
+			t.stale        = t.warning;
+			t.breakpoint   = t.error;
+			t.changed      = t.info;
+			t.disabled     = t.text_dim;
 
 			t.syn_keyword      = IM_COL32(153, 48, 176, 255);
 			t.syn_type         = IM_COL32(15, 134, 150, 255);
@@ -451,6 +481,8 @@ namespace aida::ui {
 		inline std::atomic<bool> s_swap_pending  { false };
 		inline std::atomic<uint32_t> s_theme_generation{ 1 };
 		inline float s_style_dpi_scale = 1.f;
+		inline std::atomic<bool> s_comfortable_density{ false };
+		inline std::atomic<bool> s_reduced_motion{ false };
 
 		inline ImU32 lerp_u32(ImU32 a, ImU32 b, float t) {
 			float ar = (float)((a >> IM_COL32_R_SHIFT) & 0xFF);
@@ -513,6 +545,11 @@ namespace aida::ui {
 			dst.error_soft   = lerp_u32(a.error_soft, b.error_soft, t);
 			dst.info         = lerp_u32(a.info, b.info, t);
 			dst.info_soft    = lerp_u32(a.info_soft, b.info_soft, t);
+			dst.live         = lerp_u32(a.live, b.live, t);
+			dst.stale        = lerp_u32(a.stale, b.stale, t);
+			dst.breakpoint   = lerp_u32(a.breakpoint, b.breakpoint, t);
+			dst.changed      = lerp_u32(a.changed, b.changed, t);
+			dst.disabled     = lerp_u32(a.disabled, b.disabled, t);
 			dst.syn_keyword      = lerp_u32(a.syn_keyword, b.syn_keyword, t);
 			dst.syn_type         = lerp_u32(a.syn_type, b.syn_type, t);
 			dst.syn_string       = lerp_u32(a.syn_string, b.syn_string, t);
@@ -537,6 +574,15 @@ namespace aida::ui {
 		return detail::s_style_dpi_scale;
 	}
 
+	inline void set_design_preferences(bool comfortable_density, bool reduced_motion) {
+		detail::s_comfortable_density.store(comfortable_density, std::memory_order_release);
+		detail::s_reduced_motion.store(reduced_motion, std::memory_order_release);
+	}
+
+	inline bool reduced_motion_enabled() {
+		return detail::s_reduced_motion.load(std::memory_order_acquire);
+	}
+
 	inline uint32_t theme_generation() {
 		return detail::s_theme_generation.load(std::memory_order_acquire);
 	}
@@ -544,7 +590,8 @@ namespace aida::ui {
 	inline void apply_imgui_style(const theme_t& t) {
 		ImGuiStyle& s = ImGui::GetStyle();
 		s = ImGuiStyle();
-		const float ds = detail::s_style_dpi_scale;
+		const float ds = detail::s_style_dpi_scale *
+			(detail::s_comfortable_density.load(std::memory_order_acquire) ? 1.15f : 1.f);
 
 		s.WindowPadding     = ImVec2(scale_px(12.f, ds), scale_px(12.f, ds));
 		s.FramePadding      = ImVec2(scale_px(8.f, ds), scale_px(4.f, ds));
@@ -637,6 +684,16 @@ namespace aida::ui {
 	}
 
 	inline void apply(const theme_t& t) {
+		if (detail::s_reduced_motion.load(std::memory_order_acquire)) {
+			detail::s_target = t;
+			detail::s_source = t;
+			detail::s_resolved = t;
+			detail::s_swap_anim.reset();
+			detail::s_swap_pending = false;
+			apply_imgui_style(t);
+			detail::s_theme_generation.fetch_add(1u, std::memory_order_release);
+			return;
+		}
 		detail::s_target = t;
 		detail::s_source = detail::s_resolved;
 		detail::s_swap_anim.start(aida::ui::metrics::motion::theme, aida::motion::ease::in_out_cubic);
@@ -656,6 +713,13 @@ namespace aida::ui {
 
 	inline void tick_theme_animation(float dt) {
 		if (detail::s_swap_pending.load(std::memory_order_acquire)) {
+			if (detail::s_reduced_motion.load(std::memory_order_acquire)) {
+				detail::s_resolved = detail::s_target;
+				detail::s_swap_anim.reset();
+				detail::s_swap_pending = false;
+				apply_imgui_style(detail::s_resolved);
+				return;
+			}
 			detail::s_swap_anim.tick(dt);
 			float p = detail::s_swap_anim.eased();
 			detail::interpolate(detail::s_resolved, detail::s_source, detail::s_target, p);

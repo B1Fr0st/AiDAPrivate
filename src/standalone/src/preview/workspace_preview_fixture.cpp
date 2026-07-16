@@ -744,7 +744,6 @@ workspace_preview_fixture_t make_fixture() {
         static_cast<void>(fixture.workspace->update_view_state([](auto& view) {
             view.selection = rva(0x1000);
             view.bookmarks = {rva(0x1040), rva(0x1080)};
-            view.navigation_back = {rva(0x1000)};
             view.revision = 3;
         }));
         workbench::workbench_shell_workspace_context_t workbench_context;

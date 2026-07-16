@@ -14,6 +14,7 @@
 
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
+#include "debugger_interaction_context.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "pe_parser.hpp"
 #else
@@ -483,12 +484,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		bool clicked = ui_anim::row_hover_select(dl, pos_x, ry, left_w - 12.f, row_h,
 												  idx, selected_filtered_idx, alpha, ar, ag, ab);
+		const bool hovered = ImGui::IsMouseHoveringRect(
+			ImVec2(pos_x, ry), ImVec2(pos_x + left_w - 12.f, ry + row_h), false);
 		float mod_row_alpha = ui_anim::render_row_entrance(idx, static_cast<float>(mod_first), dt, alpha);
 		(void)mod_row_alpha;
 		if (clicked) {
 			select_module_by_base(m.base, m.name);
 			selected_base = m.base;
 			load_module_details_by_base(m.base);
+			debugger_interaction::select(debugger_interaction::capture(
+				debugger_interaction::kind_t::module, m.base, 0, idx, 0,
+				static_cast<uint64_t>(m.size), m.name, m.path));
+		}
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			debugger_interaction::select(debugger_interaction::capture(
+				debugger_interaction::kind_t::module, m.base, 0, idx, 0,
+				static_cast<uint64_t>(m.size), m.name, m.path));
+			ImGui::OpenPopup("Debugger Item Actions##context");
 		}
 
 		std::string display_name = m.name;

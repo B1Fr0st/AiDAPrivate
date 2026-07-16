@@ -1,6 +1,7 @@
 #include "code_editor.hpp"
 #include "syntax_highlight.hpp"
 #include "../helpers/globals.h"
+#include "../ui/application_ui_runtime.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/editor_preview_adapter.hpp"
 #else
@@ -52,15 +53,15 @@ namespace {
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 std::string document_content() { return aida::preview::editor::content(); }
-bool save_document() { return aida::preview::editor::save_document(); }
 #else
 std::string document_content() { return code_editor::get_content(); }
-bool save_document() { return code_editor::save(); }
 #endif
 
 struct line_cache_t {
     std::vector<std::string>          lines;
     std::vector<std::vector<syntax::token_t>> tokens;
+    std::vector<std::uint64_t>        line_hashes;
+    std::size_t                       content_bytes = 0;
     bool dirty = true;
 };
 
@@ -71,6 +72,9 @@ code_editor_widget::goto_state_t s_goto;
 
 
 static constexpr int UNDO_MAX = 100;
+static constexpr std::size_t LARGE_FILE_BYTES = 1024ULL * 1024ULL;
+static constexpr std::size_t HISTORY_BUDGET_BYTES = 32ULL * 1024ULL * 1024ULL;
+static constexpr std::size_t LARGE_HISTORY_BUDGET_BYTES = 12ULL * 1024ULL * 1024ULL;
 std::vector<code_editor_widget::undo_entry_t> s_undo;
 std::vector<code_editor_widget::undo_entry_t> s_redo;
 
@@ -115,8 +119,15 @@ bool           s_ghost_requesting = false;
 
 bool s_request_undo = false;
 bool s_request_redo = false;
+bool s_request_cut = false;
+bool s_request_copy = false;
+bool s_request_paste = false;
+bool s_request_delete = false;
+bool s_request_select_all = false;
 bool s_request_find = false;
 bool s_request_replace = false;
+bool s_request_goto = false;
+std::uint32_t s_document_action_requests = 0;
 
 std::string s_last_error;
 
@@ -132,13 +143,60 @@ int    s_last_edit_line   = -1;
 int    s_last_edit_col    = -1;
 int    s_undo_kind        = 0;
 
+std::uint64_t line_hash(std::string_view text) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const char character : text) {
+        const auto value = static_cast<unsigned char>(character);
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+bool large_file_mode() {
+    return s_cache.content_bytes >= LARGE_FILE_BYTES;
+}
+
+void tokenize_line(std::size_t index) {
+    if (index >= s_cache.lines.size()) return;
+    if (s_cache.tokens.size() < s_cache.lines.size())
+        s_cache.tokens.resize(s_cache.lines.size());
+    if (s_cache.line_hashes.size() < s_cache.lines.size())
+        s_cache.line_hashes.resize(s_cache.lines.size());
+    const std::uint64_t hash = line_hash(s_cache.lines[index]);
+    if (s_cache.line_hashes[index] == hash) return;
+    syntax::tokenize(s_cache.lines[index], s_lang, s_cache.tokens[index]);
+    s_cache.line_hashes[index] = hash;
+}
+
+void tokenize_range(int first, int last) {
+    if (s_cache.lines.empty()) return;
+    first = std::max(0, first);
+    last = std::min(last, static_cast<int>(s_cache.lines.size()) - 1);
+    for (int line = first; line <= last; ++line)
+        tokenize_line(static_cast<std::size_t>(line));
+}
+
+void trim_history(std::vector<code_editor_widget::undo_entry_t>& history) {
+    const std::size_t budget = large_file_mode() ? LARGE_HISTORY_BUDGET_BYTES : HISTORY_BUDGET_BYTES;
+    const std::size_t entry_limit = large_file_mode() ? 8U : static_cast<std::size_t>(UNDO_MAX);
+    std::size_t bytes = 0;
+    for (const auto& entry : history) bytes += entry.text.size();
+    while (!history.empty() && (history.size() > entry_limit || bytes > budget)) {
+        bytes -= history.front().text.size();
+        history.erase(history.begin());
+    }
+}
+
 
 void rebuild_lines() {
     s_cache.lines.clear();
+    s_cache.content_bytes = 0;
     if (editor_document::buffer.empty()) {
         s_cache.lines.push_back("");
         s_cache.tokens.clear();
         s_cache.tokens.push_back({});
+        s_cache.line_hashes.assign(1, line_hash(""));
         s_cache.dirty = false;
         return;
     }
@@ -156,17 +214,18 @@ void rebuild_lines() {
     }
     const char* line_end = (p > line_start && *(p - 1) == '\r') ? p - 1 : p;
     s_cache.lines.emplace_back(line_start, line_end);
+    s_cache.content_bytes = static_cast<std::size_t>(p - txt);
 
-
-    s_cache.tokens.resize(s_cache.lines.size());
-    for (size_t i = 0; i < s_cache.lines.size(); i++) {
-        syntax::tokenize(s_cache.lines[i], s_lang, s_cache.tokens[i]);
-    }
+    s_cache.tokens.assign(s_cache.lines.size(), {});
+    s_cache.line_hashes.assign(s_cache.lines.size(), 0);
+    if (!large_file_mode())
+        tokenize_range(0, static_cast<int>(s_cache.lines.size()) - 1);
     s_cache.dirty = false;
 }
 
 void rebuild_buffer_from_lines() {
     std::string result;
+    result.reserve(s_cache.content_bytes + 64U);
     for (size_t i = 0; i < s_cache.lines.size(); i++) {
         if (i > 0) result += '\n';
         result += s_cache.lines[i];
@@ -177,11 +236,19 @@ void rebuild_buffer_from_lines() {
     memcpy(editor_document::buffer.data(), result.c_str(), result.size());
     editor_document::buffer[result.size()] = '\0';
     editor_document::dirty = true;
-
-
+    s_cache.content_bytes = result.size();
     s_cache.tokens.resize(s_cache.lines.size());
-    for (size_t i = 0; i < s_cache.lines.size(); i++) {
-        syntax::tokenize(s_cache.lines[i], s_lang, s_cache.tokens[i]);
+    s_cache.line_hashes.resize(s_cache.lines.size());
+    if (!large_file_mode()) {
+        tokenize_range(0, static_cast<int>(s_cache.lines.size()) - 1);
+    } else {
+        for (std::size_t i = 0; i < s_cache.lines.size(); ++i) {
+            const std::uint64_t hash = line_hash(s_cache.lines[i]);
+            if (s_cache.line_hashes[i] != hash) {
+                s_cache.tokens[i].clear();
+                s_cache.line_hashes[i] = 0;
+            }
+        }
     }
 }
 
@@ -261,7 +328,7 @@ void push_undo(int coalesce_kind = 0) {
     e.caret_line = s_sel.caret_line;
     e.caret_col  = s_sel.caret_col;
     s_undo.push_back(std::move(e));
-    if (static_cast<int>(s_undo.size()) > UNDO_MAX) s_undo.erase(s_undo.begin());
+    trim_history(s_undo);
     s_redo.clear();
     s_undo_kind      = coalesce_kind;
     s_last_edit_time = ImGui::GetTime();
@@ -304,6 +371,36 @@ void delete_selection() {
     s_sel.caret_col  = s_sel.anchor_col  = c0;
     s_sel.active = false;
     rebuild_buffer_from_lines();
+}
+
+void delete_forward() {
+    if (s_sel.has_selection()) {
+        delete_selection();
+        return;
+    }
+    if (s_sel.caret_col < line_length(s_sel.caret_line)) {
+        push_undo();
+        const int caret_line = clamp_line(s_sel.caret_line);
+        auto& line = s_cache.lines[static_cast<std::size_t>(caret_line)];
+        const int caret_col = clamp_col(caret_line, s_sel.caret_col);
+        int delete_end = caret_col + 1;
+        const int line_size = static_cast<int>(line.size());
+        while (delete_end < line_size &&
+               (static_cast<unsigned char>(line[static_cast<std::size_t>(delete_end)]) & 0xC0) == 0x80)
+            ++delete_end;
+        line.erase(static_cast<std::size_t>(caret_col),
+            static_cast<std::size_t>(delete_end - caret_col));
+        rebuild_buffer_from_lines();
+        return;
+    }
+    if (s_sel.caret_line < line_count() - 1) {
+        push_undo();
+        const auto caret = static_cast<std::size_t>(s_sel.caret_line);
+        s_cache.lines[caret] += s_cache.lines[caret + 1];
+        s_cache.lines.erase(s_cache.lines.begin() + static_cast<std::ptrdiff_t>(caret + 1));
+        s_cache.tokens.erase(s_cache.tokens.begin() + static_cast<std::ptrdiff_t>(caret + 1));
+        rebuild_buffer_from_lines();
+    }
 }
 
 void insert_text_at_caret(const std::string& text, int coalesce_kind = 0) {
@@ -429,6 +526,7 @@ void do_undo() {
     redo_e.caret_line = s_sel.caret_line;
     redo_e.caret_col  = s_sel.caret_col;
     s_redo.push_back(std::move(redo_e));
+    trim_history(s_redo);
 
 
     size_t needed = e.text.size() + 1024 * 64;
@@ -452,6 +550,7 @@ void do_redo() {
     undo_e.caret_line = s_sel.caret_line;
     undo_e.caret_col  = s_sel.caret_col;
     s_undo.push_back(std::move(undo_e));
+    trim_history(s_undo);
 
     size_t needed = e.text.size() + 1024 * 64;
     if (editor_document::buffer.size() < needed)
@@ -518,6 +617,157 @@ void word_bounds(int line, int col, int& start, int& end) {
     end   = start;
     while (start > 0 && is_word_char(ln[static_cast<std::size_t>(start - 1)])) start--;
     while (end < static_cast<int>(ln.size()) && is_word_char(ln[static_cast<std::size_t>(end)])) end++;
+}
+
+void selected_line_range(int& first, int& last) {
+    if (!s_sel.has_selection()) {
+        first = last = clamp_line(s_sel.caret_line);
+        return;
+    }
+    int c0 = 0;
+    int c1 = 0;
+    selection_ordered(first, c0, last, c1);
+    first = clamp_line(first);
+    last = clamp_line(last);
+    if (c1 == 0 && last > first) --last;
+}
+
+bool perform_document_action(code_editor_widget::document_action_t action) {
+    using action_t = code_editor_widget::document_action_t;
+    if (!editor_document::active || s_cache.lines.empty()) return false;
+    int first = 0;
+    int last = 0;
+    selected_line_range(first, last);
+    switch (action) {
+        case action_t::select_word: {
+            int start = 0;
+            int end = 0;
+            word_bounds(s_sel.caret_line, s_sel.caret_col, start, end);
+            s_sel.anchor_line = s_sel.caret_line;
+            s_sel.anchor_col = start;
+            s_sel.caret_col = end;
+            s_sel.active = end > start;
+            return true;
+        }
+        case action_t::select_line:
+            s_sel.anchor_line = first;
+            s_sel.anchor_col = 0;
+            s_sel.caret_line = last;
+            s_sel.caret_col = line_length(last);
+            s_sel.active = true;
+            return true;
+        case action_t::copy_line: {
+            std::string text;
+            for (int line = first; line <= last; ++line) {
+                if (!text.empty()) text.push_back('\n');
+                text += line_at(line);
+            }
+            clipboard_copy(text);
+            return true;
+        }
+        case action_t::copy_path:
+            if (editor_document::filepath.empty()) return false;
+            clipboard_copy(editor_document::filepath);
+            return true;
+        case action_t::duplicate_line: {
+            push_undo();
+            const auto begin = s_cache.lines.begin() + first;
+            const auto end = s_cache.lines.begin() + last + 1;
+            std::vector<std::string> duplicate(begin, end);
+            s_cache.lines.insert(s_cache.lines.begin() + last + 1, duplicate.begin(), duplicate.end());
+            const int count = last - first + 1;
+            s_cache.tokens.insert(s_cache.tokens.begin() + last + 1, static_cast<std::size_t>(count), std::vector<syntax::token_t>{});
+            s_cache.line_hashes.insert(s_cache.line_hashes.begin() + last + 1, static_cast<std::size_t>(count), std::uint64_t{0});
+            s_sel.anchor_line = s_sel.caret_line = last + count;
+            s_sel.anchor_col = s_sel.caret_col = clamp_col(s_sel.caret_line, s_sel.caret_col);
+            s_sel.active = false;
+            rebuild_buffer_from_lines();
+            return true;
+        }
+        case action_t::delete_line: {
+            push_undo();
+            if (first == 0 && last == line_count() - 1) {
+                s_cache.lines.assign(1, "");
+                s_cache.tokens.assign(1, {});
+                s_cache.line_hashes.assign(1, 0);
+            } else {
+                s_cache.lines.erase(s_cache.lines.begin() + first, s_cache.lines.begin() + last + 1);
+                s_cache.tokens.erase(s_cache.tokens.begin() + first, s_cache.tokens.begin() + last + 1);
+                s_cache.line_hashes.erase(s_cache.line_hashes.begin() + first, s_cache.line_hashes.begin() + last + 1);
+            }
+            s_sel.anchor_line = s_sel.caret_line = std::min(first, line_count() - 1);
+            s_sel.anchor_col = s_sel.caret_col = 0;
+            s_sel.active = false;
+            rebuild_buffer_from_lines();
+            return true;
+        }
+        case action_t::move_line_up:
+            if (first <= 0) return false;
+            push_undo();
+            std::rotate(s_cache.lines.begin() + first - 1, s_cache.lines.begin() + first, s_cache.lines.begin() + last + 1);
+            std::rotate(s_cache.tokens.begin() + first - 1, s_cache.tokens.begin() + first, s_cache.tokens.begin() + last + 1);
+            std::rotate(s_cache.line_hashes.begin() + first - 1, s_cache.line_hashes.begin() + first, s_cache.line_hashes.begin() + last + 1);
+            --s_sel.anchor_line;
+            --s_sel.caret_line;
+            rebuild_buffer_from_lines();
+            return true;
+        case action_t::move_line_down:
+            if (last >= line_count() - 1) return false;
+            push_undo();
+            std::rotate(s_cache.lines.begin() + first, s_cache.lines.begin() + last + 1, s_cache.lines.begin() + last + 2);
+            std::rotate(s_cache.tokens.begin() + first, s_cache.tokens.begin() + last + 1, s_cache.tokens.begin() + last + 2);
+            std::rotate(s_cache.line_hashes.begin() + first, s_cache.line_hashes.begin() + last + 1, s_cache.line_hashes.begin() + last + 2);
+            ++s_sel.anchor_line;
+            ++s_sel.caret_line;
+            rebuild_buffer_from_lines();
+            return true;
+        case action_t::toggle_line_comment: {
+            if (!s_lang_set || !s_lang.line_comment || s_lang.line_comment[0] == '\0') return false;
+            const std::string marker = s_lang.line_comment;
+            bool remove = true;
+            for (int line = first; line <= last; ++line) {
+                const auto& text = s_cache.lines[static_cast<std::size_t>(line)];
+                const std::size_t nonspace = text.find_first_not_of(" \t");
+                if (nonspace == std::string::npos || text.compare(nonspace, marker.size(), marker) != 0) {
+                    remove = false;
+                    break;
+                }
+            }
+            push_undo();
+            for (int line = first; line <= last; ++line) {
+                auto& text = s_cache.lines[static_cast<std::size_t>(line)];
+                const std::size_t nonspace = text.find_first_not_of(" \t");
+                if (nonspace == std::string::npos) continue;
+                if (remove) {
+                    text.erase(nonspace, marker.size());
+                    if (nonspace < text.size() && text[nonspace] == ' ') text.erase(nonspace, 1);
+                } else {
+                    text.insert(nonspace, marker + " ");
+                }
+            }
+            rebuild_buffer_from_lines();
+            return true;
+        }
+        case action_t::trim_trailing_whitespace: {
+            bool changed = false;
+            for (const auto& text : s_cache.lines)
+                if (!text.empty() && (text.back() == ' ' || text.back() == '\t')) {
+                    changed = true;
+                    break;
+                }
+            if (!changed) return false;
+            push_undo();
+            for (auto& text : s_cache.lines) {
+                const std::size_t end = text.find_last_not_of(" \t");
+                if (end == std::string::npos) text.clear();
+                else text.erase(end + 1);
+            }
+            s_sel.caret_col = s_sel.anchor_col = clamp_col(s_sel.caret_line, s_sel.caret_col);
+            rebuild_buffer_from_lines();
+            return true;
+        }
+    }
+    return false;
 }
 
 
@@ -1164,6 +1414,7 @@ void code_editor_widget::init() {
     s_redo.clear();
     s_scroll_y = s_scroll_x = s_target_scroll_y = 0.f;
     s_lang_set = false;
+    s_document_action_requests = 0;
     {
         std::lock_guard<std::mutex> lk(s_diff_mtx);
         s_diff = code_editor_widget::pending_diff_t{};
@@ -1190,6 +1441,7 @@ void code_editor_widget::on_text_changed() {
     s_scroll_y = s_scroll_x = s_target_scroll_y = 0.f;
     s_blink_timer = 0.f;
     s_blink_on = true;
+    s_document_action_requests = 0;
     {
         std::lock_guard<std::mutex> lk(s_diff_mtx);
         s_diff = code_editor_widget::pending_diff_t{};
@@ -1214,19 +1466,144 @@ void code_editor_widget::get_caret(int& line, int& col) {
     col  = s_sel.caret_col;
 }
 
+void code_editor_widget::set_caret(int line, int col) {
+    if (s_cache.dirty)
+        rebuild_lines();
+    const int target_line = clamp_line(line);
+    const int target_column = clamp_col(target_line, col);
+    s_sel.caret_line = s_sel.anchor_line = target_line;
+    s_sel.caret_col = s_sel.anchor_col = target_column;
+    s_sel.active = false;
+    s_blink_timer = 0.f;
+    s_blink_on = true;
+    s_target_scroll_y = static_cast<float>(target_line) *
+        (std::max)(editor_preferences::font_size * 1.55f, 1.f);
+    break_undo_coalescing();
+}
+
 void code_editor_widget::trigger_undo()   { s_request_undo = true; }
 void code_editor_widget::trigger_redo()   { s_request_redo = true; }
+void code_editor_widget::trigger_cut()    { s_request_cut = true; }
+void code_editor_widget::trigger_copy()   { s_request_copy = true; }
+void code_editor_widget::trigger_paste()  { s_request_paste = true; }
+void code_editor_widget::trigger_delete() { s_request_delete = true; }
+void code_editor_widget::trigger_select_all() { s_request_select_all = true; }
 void code_editor_widget::open_find()      { s_request_find = true; }
 void code_editor_widget::open_replace()   { s_request_replace = true; }
+void code_editor_widget::open_goto_line() { s_request_goto = true; }
+
+bool code_editor_widget::can_undo() { return !s_undo.empty(); }
+bool code_editor_widget::can_redo() { return !s_redo.empty(); }
+bool code_editor_widget::can_paste() { return !clipboard_paste().empty(); }
+bool code_editor_widget::has_selection() { return s_sel.has_selection(); }
 
 std::string code_editor_widget::last_error() {
     return s_last_error;
+}
+
+std::uint64_t code_editor_widget::document_content_fingerprint() {
+    const std::string content = document_content();
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const char character : content) {
+        hash ^= static_cast<unsigned char>(character);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= static_cast<std::uint64_t>(content.size());
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+code_editor_widget::document_capabilities_t code_editor_widget::document_capabilities() {
+    document_capabilities_t result;
+    if (!editor_document::active) return result;
+    if (s_cache.dirty) rebuild_lines();
+    const auto& language = syntax::detect_language(editor_document::filename);
+    result.text_editing = true;
+    result.save = !editor_document::filepath.empty();
+    result.syntax_highlighting = true;
+    result.line_comment = language.line_comment && language.line_comment[0] != '\0';
+    result.find = true;
+    result.replace = true;
+    result.goto_line = true;
+    result.ai_diff_review = !large_file_mode();
+    return result;
+}
+
+code_editor_widget::document_state_t code_editor_widget::document_state() {
+    if (s_cache.dirty) rebuild_lines();
+    document_state_t result;
+    result.filename = editor_document::filename;
+    result.filepath = editor_document::filepath;
+    result.active = editor_document::active;
+    result.dirty = editor_document::dirty;
+    result.focused = s_has_focus;
+    result.content_bytes = s_cache.content_bytes;
+    result.line_count = s_cache.lines.size();
+    result.caret_line = s_sel.caret_line;
+    result.caret_column = s_sel.caret_col;
+    result.large_file_mode = large_file_mode();
+    result.has_selection = s_sel.has_selection();
+    result.capabilities = document_capabilities();
+    if (result.active) {
+        const auto& language = syntax::detect_language(editor_document::filename);
+        result.language = language.name ? language.name : "Text";
+    }
+    return result;
+}
+
+bool code_editor_widget::request_document_action(document_action_t action) {
+    if (!editor_document::active) {
+        s_last_error = "Open or create a text document first";
+        return false;
+    }
+    const auto capabilities = document_capabilities();
+    if (action == document_action_t::copy_path && editor_document::filepath.empty()) {
+        s_last_error = "The active document has no file path";
+        return false;
+    }
+    if (action == document_action_t::toggle_line_comment && !capabilities.line_comment) {
+        s_last_error = "The active language has no supported line-comment syntax";
+        return false;
+    }
+    const std::uint32_t index = static_cast<std::uint32_t>(action);
+    if (index > static_cast<std::uint32_t>(document_action_t::trim_trailing_whitespace)) {
+        s_last_error = "The requested editor action is invalid";
+        return false;
+    }
+    s_last_error.clear();
+    s_document_action_requests |= 1U << index;
+    return true;
+}
+
+void code_editor_widget::render_document_pane(const document_pane_render_context_t& context) {
+    const ImVec2 origin = ImGui::GetCursorPos();
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    if (available.x <= 1.f || available.y <= 1.f) return;
+    if (!editor_document::active) {
+        const char* title = "No text document open";
+        const char* detail = "Open or create a file to begin editing.";
+        const float title_width = ImGui::CalcTextSize(title).x;
+        const float detail_width = ImGui::CalcTextSize(detail).x;
+        ImGui::SetCursorPos(ImVec2(origin.x + std::max(0.f, (available.x - title_width) * 0.5f),
+                                   origin.y + std::max(0.f, available.y * 0.5f - ImGui::GetTextLineHeight())));
+        ImGui::TextUnformatted(title);
+        ImGui::SetCursorPosX(origin.x + std::max(0.f, (available.x - detail_width) * 0.5f));
+        ImGui::TextDisabled("%s", detail);
+        ImGui::SetCursorPos(ImVec2(origin.x, origin.y + available.y));
+        return;
+    }
+    render(origin.x, origin.y, available.x, available.y,
+           context.alpha, context.accent_r, context.accent_g, context.accent_b);
 }
 
 
 bool code_editor_widget::begin_agent_edit(std::string_view origin) {
     if (!editor_document::active) {
         s_last_error = "code_editor: begin_agent_edit called with no active document";
+        return false;
+    }
+    if (!document_capabilities().ai_diff_review) {
+        s_last_error = "code_editor: AI diff review is unavailable in large-file mode";
         return false;
     }
     std::vector<std::string> base = split_to_lines(document_content());
@@ -1245,6 +1622,10 @@ bool code_editor_widget::propose_full_content(std::string_view new_content) {
         s_last_error = "code_editor: propose_full_content called with no active document";
         return false;
     }
+    if (!document_capabilities().ai_diff_review) {
+        s_last_error = "code_editor: AI diff review is unavailable in large-file mode";
+        return false;
+    }
     std::vector<std::string> old_lines = split_to_lines(document_content());
     std::vector<std::string> new_lines = split_to_lines(new_content);
     std::string origin;
@@ -1260,6 +1641,10 @@ bool code_editor_widget::propose_replace_range(int start_line, int end_line,
                                                std::string_view replacement) {
     if (!editor_document::active) {
         s_last_error = "code_editor: propose_replace_range called with no active document";
+        return false;
+    }
+    if (!document_capabilities().ai_diff_review) {
+        s_last_error = "code_editor: AI diff review is unavailable in large-file mode";
         return false;
     }
 
@@ -1336,6 +1721,14 @@ void code_editor_widget::reject_all() {
         h.state = code_editor_widget::diff_hunk_state_t::rejected;
 }
 
+bool code_editor_widget::commit_resolved_diff() {
+    std::lock_guard<std::mutex> lk(s_diff_mtx);
+    if (!s_diff.active || !s_diff.fully_resolved())
+        return false;
+    finalize_diff_if_resolved_locked();
+    return !s_diff.active;
+}
+
 void code_editor_widget::cancel_agent_edit() {
     std::lock_guard<std::mutex> lk(s_diff_mtx);
     s_diff = code_editor_widget::pending_diff_t{};
@@ -1377,12 +1770,56 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     if (s_request_redo)   { do_redo();   s_request_redo = false; }
     if (s_request_find)   { s_find.visible = true; s_find.replace_mode = false; s_request_find = false; s_focus_find_input = true; }
     if (s_request_replace){ s_find.visible = true; s_find.replace_mode = true;  s_request_replace = false; s_focus_find_input = true; }
+    if (s_request_goto)   { s_goto.visible = true; s_goto.line_buf[0] = '\0'; s_request_goto = false; }
 
     if (!s_lang_set && !editor_document::filename.empty()) {
         s_lang = syntax::detect_language(editor_document::filename);
         s_lang_set = true;
     }
 
+    if (s_cache.dirty)
+        rebuild_lines();
+
+    if (s_document_action_requests != 0) {
+        const std::uint32_t requests = s_document_action_requests;
+        s_document_action_requests = 0;
+        for (std::uint32_t index = 0; index <= static_cast<std::uint32_t>(code_editor_widget::document_action_t::trim_trailing_whitespace); ++index)
+            if ((requests & (1U << index)) != 0)
+                perform_document_action(static_cast<code_editor_widget::document_action_t>(index));
+    }
+
+    if (s_request_copy) {
+        const std::string selected = get_selected_text();
+        if (!selected.empty())
+            clipboard_copy(selected);
+        s_request_copy = false;
+    }
+    if (s_request_cut) {
+        const std::string selected = get_selected_text();
+        if (!selected.empty()) {
+            clipboard_copy(selected);
+            delete_selection();
+        }
+        s_request_cut = false;
+    }
+    if (s_request_paste) {
+        const std::string pasted = clipboard_paste();
+        if (!pasted.empty())
+            insert_text_at_caret(pasted);
+        s_request_paste = false;
+    }
+    if (s_request_delete) {
+        delete_forward();
+        s_request_delete = false;
+    }
+    if (s_request_select_all) {
+        s_sel.anchor_line = 0;
+        s_sel.anchor_col = 0;
+        s_sel.caret_line = line_count() - 1;
+        s_sel.caret_col = line_length(s_sel.caret_line);
+        s_sel.active = true;
+        s_request_select_all = false;
+    }
     if (s_cache.dirty)
         rebuild_lines();
 
@@ -1418,7 +1855,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     const float goto_bar_h = s_goto.visible ? 36.f : 0.f;
     const float breadcrumb_h = 28.f;
-    const float minimap_w = (editor_preferences::minimap && width > 360.f) ? 64.f : 0.f;
+    const float minimap_w = (editor_preferences::minimap && width > 360.f && !large_file_mode()) ? 64.f : 0.f;
     const float overlay_h = goto_bar_h + breadcrumb_h;
     const float editor_y0 = pos_y + overlay_h;
     const float editor_h  = height - overlay_h;
@@ -1963,7 +2400,8 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         || globals::ui::driver_status_open
         || globals::ui::shortcuts_dialog_open
         || globals::ui::mcp_servers_dialog_open
-        || globals::ui::command_palette_open;
+        || globals::ui::command_palette_open
+        || ImGui::IsPopupOpen("##aida_editor_context");
     if (input_blocked) hovered = false;
 
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -1976,6 +2414,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         if (ImGui::GetActiveID() == id)
             ImGui::ClearActiveID();
     }
+    aida::ui::application_ui::set_editor_focus(s_has_focus, s_find_has_focus);
 
     if (s_has_focus && s_focus_anim.is_finished() && s_focus_anim.progress < 1.f)
         s_focus_anim.start(0.10f, aida::motion::ease::out_quint);
@@ -2002,6 +2441,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
     int first_row = std::max(0, static_cast<int>(s_scroll_y / line_h) - 1);
     int last_row  = std::min(n_lines - 1, static_cast<int>((s_scroll_y + editor_h) / line_h) + 1);
+    tokenize_range(first_row - 8, last_row + 8);
 
     dl->PushClipRect(ImVec2(ox, oy), ImVec2(ox + code_w, oy + editor_h), true);
 
@@ -2448,7 +2888,33 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
             s_mouse_selecting = false;
+
+        const bool pointer_context = in_text && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+        const bool keyboard_context = s_has_focus &&
+            (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+             (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+        if (pointer_context) {
+            if (!s_sel.has_selection()) {
+                int line = 0;
+                int column = 0;
+                screen_to_linecol(mp.x, mp.y, ox, oy, gutter_w, line_h, char_w, line, column);
+                s_sel.anchor_line = s_sel.caret_line = line;
+                s_sel.anchor_col = s_sel.caret_col = column;
+                s_sel.active = false;
+            }
+            s_has_focus = true;
+            aida::ui::application_ui::set_editor_focus(true, false);
+            aida::ui::application_ui::open_editor_context_menu(
+                aida::ui::context_menu_open_origin_t::pointer);
+        } else if (keyboard_context) {
+            aida::ui::application_ui::open_editor_context_menu(
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+                    ? aida::ui::context_menu_open_origin_t::menu_key
+                    : aida::ui::context_menu_open_origin_t::shift_f10);
+        }
     }
+
+    aida::ui::application_ui::render_editor_context_menu();
 
 
     if (s_has_focus && !input_blocked && !s_find_has_focus) {
@@ -2463,62 +2929,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
         ImGui::SetKeyOwner(ImGuiKey_Escape, id);
 
 
-        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
-
-            s_sel.anchor_line = 0; s_sel.anchor_col = 0;
-            s_sel.caret_line = line_count() - 1;
-            s_sel.caret_col  = line_length(s_sel.caret_line);
-            s_sel.active = true;
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-            std::string txt = get_selected_text();
-            if (!txt.empty()) clipboard_copy(txt);
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
-            std::string txt = get_selected_text();
-            if (!txt.empty()) { clipboard_copy(txt); delete_selection(); }
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
-            std::string txt = clipboard_paste();
-            if (!txt.empty()) insert_text_at_caret(txt);
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z, true)) {
-            do_undo();
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y, true)) {
-            do_redo();
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
-            s_find.visible = true;
-            s_find.replace_mode = false;
-            s_focus_find_input = true;
-
-            if (s_sel.has_selection()) {
-                std::string sel = get_selected_text();
-                if (sel.find('\n') == std::string::npos)
-                    strncpy_s(s_find.find_buf, sel.c_str(), _TRUNCATE);
-            }
-            find_all_matches();
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_H, false)) {
-            s_find.visible = true;
-            s_find.replace_mode = true;
-            s_focus_find_input = true;
-            if (s_sel.has_selection()) {
-                std::string sel = get_selected_text();
-                if (sel.find('\n') == std::string::npos)
-                    strncpy_s(s_find.find_buf, sel.c_str(), _TRUNCATE);
-            }
-            find_all_matches();
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_G, false)) {
-            s_goto.visible = !s_goto.visible;
-            s_goto.line_buf[0] = '\0';
-        }
-        else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-            save_document();
-        }
-
+        aida::ui::application_ui::process_editor_shortcuts();
 
         auto move_caret = [&](int new_line, int new_col) {
             if (shift) s_sel.active = true;
@@ -2577,13 +2988,13 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
             }
             move_caret(nl, nc);
         }
-        else if (!(autocomplete::popup_visible && !autocomplete::matches.empty()) &&
+        else if (!io.KeyAlt && !(autocomplete::popup_visible && !autocomplete::matches.empty()) &&
                  ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) {
             int nl = std::max(0, s_sel.caret_line - 1);
             int nc = clamp_col(nl, s_sel.caret_col);
             move_caret(nl, nc);
         }
-        else if (!(autocomplete::popup_visible && !autocomplete::matches.empty()) &&
+        else if (!io.KeyAlt && !(autocomplete::popup_visible && !autocomplete::matches.empty()) &&
                  ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) {
             int nl = std::min(line_count() - 1, s_sel.caret_line + 1);
             int nc = clamp_col(nl, s_sel.caret_col);
@@ -2726,30 +3137,6 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
                 rebuild_buffer_from_lines();
             }
             ensure_caret_visible(editor_h, line_h);
-        }
-        else if (!ctrl && ImGui::IsKeyPressed(ImGuiKey_Delete, true)) {
-            if (s_sel.has_selection()) {
-                delete_selection();
-            } else if (s_sel.caret_col < line_length(s_sel.caret_line)) {
-                push_undo();
-                const int caret_line = clamp_line(s_sel.caret_line);
-                auto& ln = s_cache.lines[static_cast<std::size_t>(caret_line)];
-                const int caret_col = clamp_col(caret_line, s_sel.caret_col);
-                int del_end = caret_col + 1;
-                int line_size = static_cast<int>(ln.size());
-                while (del_end < line_size &&
-                       (static_cast<unsigned char>(ln[static_cast<std::size_t>(del_end)]) & 0xC0) == 0x80)
-                    del_end++;
-                ln.erase(static_cast<std::size_t>(caret_col), static_cast<std::size_t>(del_end - caret_col));
-                rebuild_buffer_from_lines();
-            } else if (s_sel.caret_line < line_count() - 1) {
-                push_undo();
-                const std::size_t caret_idx = static_cast<std::size_t>(s_sel.caret_line);
-                s_cache.lines[caret_idx] += s_cache.lines[caret_idx + 1];
-                s_cache.lines.erase(s_cache.lines.begin() + static_cast<std::ptrdiff_t>(caret_idx + 1));
-                s_cache.tokens.erase(s_cache.tokens.begin() + static_cast<std::ptrdiff_t>(caret_idx + 1));
-                rebuild_buffer_from_lines();
-            }
         }
         else if (!ctrl && shift && !ghost_consumed_tab &&
                  !(autocomplete::popup_visible && !autocomplete::matches.empty()) &&

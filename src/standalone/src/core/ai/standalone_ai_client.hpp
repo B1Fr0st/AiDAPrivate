@@ -54,16 +54,31 @@ struct ai_generation_result_t
 class standalone_ai_client_t
 {
 public:
-    explicit standalone_ai_client_t(const settings_sa_t& settings);
-    ~standalone_ai_client_t();
+    struct runtime_control_t;
+    struct runtime_operation_t;
+    struct async_state_t;
+    struct usage_record_t;
 
+    class cancellation_handle_t
+    {
+    public:
+        cancellation_handle_t() = default;
+        void cancel() const noexcept;
+        bool valid() const noexcept;
+
+    private:
+        friend class standalone_ai_client_t;
+        explicit cancellation_handle_t(std::weak_ptr<runtime_control_t> control) noexcept;
+        std::weak_ptr<runtime_control_t> _control;
+    };
+
+    explicit standalone_ai_client_t(const settings_sa_t& settings);
+    ~standalone_ai_client_t() noexcept;
 
     standalone_ai_client_t(const standalone_ai_client_t&) = delete;
     standalone_ai_client_t& operator=(const standalone_ai_client_t&) = delete;
 
-
     bool is_available() const;
-
 
     void chat_async(
         const std::string& user_message,
@@ -71,13 +86,11 @@ public:
         ai_callback_t on_complete,
         ai_stream_chunk_t on_chunk = nullptr);
 
-
     std::string chat_blocking(
         const std::string& user_message,
         const std::vector<std::pair<std::string, std::string>>& history,
         ai_stream_chunk_t on_chunk = nullptr,
         ai_stop_predicate_t stop_check = nullptr);
-
 
     ai_generation_result_t generate_with_tools(
         const nlohmann::json& messages,
@@ -85,123 +98,67 @@ public:
         const std::vector<mcp_standalone::tool_def_t>& tools,
         ai_stream_chunk_t on_chunk = nullptr);
 
-
     static nlohmann::json build_anthropic_tools(
         const std::vector<mcp_standalone::tool_def_t>& tools);
-
     static nlohmann::json build_openai_tools(
         const std::vector<mcp_standalone::tool_def_t>& tools);
-
     static nlohmann::json build_gemini_tools(
         const std::vector<mcp_standalone::tool_def_t>& tools);
-
     static nlohmann::json build_full_tools(
         const std::vector<mcp_standalone::tool_def_t>& tools);
-
-
     static nlohmann::json make_tool_result_block(
         const std::string& tool_use_id,
         const std::string& content,
         bool is_error = false);
-
     static nlohmann::json make_openai_tool_result(
         const std::string& tool_call_id,
         const std::string& content);
-
     static nlohmann::json make_gemini_tool_result(
         const std::string& function_name,
         const nlohmann::json& result_data);
-
-
     static nlohmann::json convert_messages_for_openai(
         const nlohmann::json& anthropic_messages,
         const std::string& system_prompt);
-
     static nlohmann::json convert_messages_for_gemini(
         const nlohmann::json& anthropic_messages);
-
     static nlohmann::json merge_consecutive_roles(
         const nlohmann::json& messages);
-
     static std::string clean_model_name(const std::string& model);
 
-
     bool poll();
-
-
-    void cancel();
-
-
-    bool is_busy() const { return !_task_done.load(); }
+    void cancel() noexcept;
+    cancellation_handle_t cancellation_handle() const noexcept;
+    bool is_busy() const noexcept;
 
 private:
-    const settings_sa_t& _settings;
+    const settings_sa_t* _settings_source = nullptr;
+    std::shared_ptr<runtime_control_t> _control;
+    std::shared_ptr<async_state_t> _async;
+    mutable std::mutex _async_submit_mutex;
 
-    std::mutex             _worker_mtx;
-    std::atomic<bool>      _task_done{true};
-    std::atomic<bool>      _cancelled{false};
-
-
-    struct pending_result_t { ai_callback_t cb; std::string text; };
-    std::mutex                     _result_mtx;
-    std::deque<pending_result_t>   _results;
-
-
-    std::mutex                                 _chunk_mtx;
-    std::deque<std::pair<ai_stream_chunk_t, std::string>> _chunks;
-
-    std::string do_generate(
+    static bool is_available(const settings_sa_t& settings);
+    static std::string resolve_api_key_logged(
+        const settings_sa_t& settings,
+        const char* context);
+    static std::string do_generate(
+        const std::shared_ptr<runtime_operation_t>& operation,
+        const settings_sa_t& settings,
         const std::string& prompt,
         double temperature,
         ai_stream_chunk_t on_chunk,
-        ai_stop_predicate_t stop_check);
-
-    std::string resolve_api_key_logged(const char* context) const;
-
-
-    std::string generate_gemini(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
-    std::string generate_openai(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
-    std::string generate_anthropic(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
-    std::string generate_openrouter(const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
-
-
-    ai_generation_result_t generate_with_tools_anthropic(
-        const nlohmann::json& messages, const std::string& system_prompt,
-        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
-
-    ai_generation_result_t generate_with_tools_openai(
-        const nlohmann::json& messages, const std::string& system_prompt,
-        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
-
-    ai_generation_result_t generate_with_tools_gemini(
-        const nlohmann::json& messages, const std::string& system_prompt,
-        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
-
-    ai_generation_result_t generate_with_tools_generic_openai(
-        const nlohmann::json& messages, const std::string& system_prompt,
-        const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk);
-
-
-    std::string streaming_post(
-        const std::string& host,
-        const std::string& path,
-        const std::map<std::string, std::string>& headers,
-        const std::string& body,
-        std::function<std::string(const std::string& sse_data)> chunk_parser,
-        ai_stream_chunk_t on_chunk,
-        ai_stop_predicate_t stop_check);
-
-
-    std::string simple_post(
-        const std::string& host,
-        const std::string& path,
-        const std::map<std::string, std::string>& headers,
-        const std::string& body,
-        std::function<std::string(const nlohmann::json&)> response_parser);
-
-    static std::string build_chat_prompt(
-        const std::string& user_message,
-        const std::vector<std::pair<std::string, std::string>>& history);
+        ai_stop_predicate_t stop_check,
+        usage_record_t& usage);
+    static std::string generate_gemini(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check, usage_record_t& usage);
+    static std::string generate_openai(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check, usage_record_t& usage);
+    static std::string generate_anthropic(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check, usage_record_t& usage);
+    static std::string generate_openrouter(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const std::string& prompt, double temperature, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check, usage_record_t& usage);
+    static ai_generation_result_t generate_with_tools_anthropic(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const nlohmann::json& messages, const std::string& system_prompt, const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk, usage_record_t& usage);
+    static ai_generation_result_t generate_with_tools_openai(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const nlohmann::json& messages, const std::string& system_prompt, const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk, usage_record_t& usage);
+    static ai_generation_result_t generate_with_tools_gemini(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const nlohmann::json& messages, const std::string& system_prompt, const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk, usage_record_t& usage);
+    static ai_generation_result_t generate_with_tools_generic_openai(const std::shared_ptr<runtime_operation_t>& operation, const settings_sa_t& settings, const nlohmann::json& messages, const std::string& system_prompt, const std::vector<mcp_standalone::tool_def_t>& tools, ai_stream_chunk_t on_chunk, usage_record_t& usage);
+    static std::string streaming_post(const std::shared_ptr<runtime_operation_t>& operation, const std::string& host, const std::string& path, const std::map<std::string, std::string>& headers, const std::string& body, std::function<std::string(const std::string& sse_data)> chunk_parser, ai_stream_chunk_t on_chunk, ai_stop_predicate_t stop_check);
+    static std::string simple_post(const std::shared_ptr<runtime_operation_t>& operation, const std::string& host, const std::string& path, const std::map<std::string, std::string>& headers, const std::string& body, std::function<std::string(const nlohmann::json&)> response_parser);
+    static std::string build_chat_prompt(const std::string& user_message, const std::vector<std::pair<std::string, std::string>>& history);
 };
 
 

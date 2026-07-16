@@ -485,7 +485,10 @@ namespace agent_manager {
 			ImGui::InvisibleButton("##row", ImVec2(row_w, row_h));
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked();
-			ImGui::PopID();
+			bool right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+			bool keyboard_context = selected_now && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+				(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+				 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
 
 			float hov_v = ra->hover.tick(hov, dt, aida::motion::spring::playful);
 			float lift = hov_v * 2.f;
@@ -538,6 +541,35 @@ namespace agent_manager {
 				st.selected_name = a.name;
 				detail::load_buffers_for_selected_locked();
 			}
+			if (right || keyboard_context)
+				ImGui::OpenPopup("##agent_row_context");
+			if (ImGui::BeginPopup("##agent_row_context")) {
+				if (ImGui::MenuItem("Set as Active Agent", nullptr,
+						aida::agent::active_agent_name() == a.name))
+					aida::agent::set_active_agent(a.name);
+				if (ImGui::MenuItem("Copy Agent Name"))
+					ImGui::SetClipboardText(a.name.c_str());
+				if (ImGui::MenuItem("Copy Description", nullptr, false, !a.description.empty()))
+					ImGui::SetClipboardText(a.description.c_str());
+				ImGui::Separator();
+				if (ImGui::MenuItem("Duplicate as Custom")) {
+					aida::agent::agent_info_t copy = a;
+					copy.name += "-custom";
+					copy.native = false;
+					if (aida::agent::register_custom(copy)) {
+						aida::agent::save_custom_to_disk();
+						st.selected_name = copy.name;
+						detail::load_buffers_for_selected_locked();
+					}
+				}
+				ImGui::BeginDisabled();
+				ImGui::MenuItem("Delete...");
+				ImGui::EndDisabled();
+				if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+					ImGui::SetTooltip("Select the custom agent and use its visible destructive action after reviewing the target; native agents cannot be deleted");
+				ImGui::EndPopup();
+			}
+			ImGui::PopID();
 
 			ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y + row_h));
 		}

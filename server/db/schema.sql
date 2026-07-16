@@ -460,6 +460,9 @@ CREATE TABLE IF NOT EXISTS telemetry_kill_directives (
 
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS auth_hmac_key BYTEA;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS anomaly_score INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS wbaes_table_hash VARCHAR(64);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS fallback_mode INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS fallback_count INTEGER NOT NULL DEFAULT 0;
 
 ALTER TABLE licenses ADD COLUMN IF NOT EXISTS honeypot_strike_count INTEGER NOT NULL DEFAULT 0;
 
@@ -611,6 +614,7 @@ ALTER TABLE builds ADD COLUMN IF NOT EXISTS created_at           BIGINT NOT NULL
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS last_session_at     BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS retired_at           BIGINT;
 ALTER TABLE builds ADD COLUMN IF NOT EXISTS expected_watermark   TEXT    NOT NULL DEFAULT '';
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS expected_wbaes_table_hash VARCHAR(64) NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_builds_retired ON builds (retired) WHERE retired = false;
 CREATE INDEX IF NOT EXISTS idx_builds_last_session ON builds (last_session_at);

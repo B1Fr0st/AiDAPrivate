@@ -106,6 +106,7 @@ const bootstrapRoutes = require('./routes/bootstrap');
 const customerDownloadRoutes = require('./routes/customer_download');
 const buildRoutes = require('./routes/build');
 const honeypotRoutes = require('./routes/honeypot');
+const mcpTelemetryRoutes = require('./routes/mcp_telemetry');
 const tlsExporter = require('./crypto/tls_exporter');
 const killSwitch = require('./middleware/kill_switch');
 
@@ -323,6 +324,7 @@ app.use('/api/download', downloadRoutes);
 app.use('/api/arc', downloadRoutes);
 app.use('/api/arc/function', functionsRoutes);
 app.use('/api/honeypot', honeypotRoutes);
+app.use('/api/mcp-telemetry', killSwitch.middleware, mcpTelemetryRoutes.router);
 
 
 app.get('/health', (_req, res) => {

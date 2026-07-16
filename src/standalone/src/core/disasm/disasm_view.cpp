@@ -2,7 +2,6 @@
 
 #include "comment_dialog.hpp"
 #include "file_metadata_banner.hpp"
-#include "nav_history.hpp"
 #include "pseudocode_view.hpp"
 #include "rename_dialog.hpp"
 #include "rename_store.hpp"
@@ -16,12 +15,15 @@
 #include "../analysis/workspace/overlay_journal.hpp"
 #include "../analysis/workspace/workspace_registry.hpp"
 #include "../analysis/workspace/x86_decoder.hpp"
+#include "../workbench/workbench_shell_integration.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/taskflow_runtime.hpp"
 #include "../scanner/aob_generator.hpp"
 #include "../scanner/scan_hub_view.hpp"
 #endif
 #include "../ui/components.hpp"
+#include "../ui/analysis_context_menu.hpp"
+#include "../ui/application_view_registry.hpp"
 #include "../ui/metrics.hpp"
 #include "../ui/theme.hpp"
 #include "../../helpers/globals.h"
@@ -50,13 +52,12 @@ namespace disasm_view {
 
 struct workspace_model_t {
     explicit workspace_model_t(const aida::analysis::binary_id_t& id)
-        : comments(id), renames(id), automatic_comments(id), navigation(id),
+        : comments(id), renames(id), automatic_comments(id),
           view(std::make_shared<state_t>()) {}
 
     comment_store::workspace_store_t comments;
     rename_store::workspace_store_t renames;
     auto_comment_store::workspace_store_t automatic_comments;
-    nav_history::workspace_history_t navigation;
     std::shared_ptr<state_t> view;
     std::mutex mutation_mutex;
     std::mutex initialization_mutex;
@@ -416,21 +417,29 @@ void apply_committed_operation(const workspace_context_t& context,
     }
 }
 
-bool queue_overlay_operation(const workspace_context_t& context,
-                             overlay_operation_t operation) {
+bool queue_overlay_transaction(const workspace_context_t& context,
+                               std::vector<overlay_operation_t> operations) {
     if (!context || context.workspace->closing() || context.workspace->closed() ||
-        !context.workspace->overlay())
+        !context.workspace->overlay() || operations.empty())
         return false;
+    const auto expected_generation = context.workspace->generation();
+    const auto expected_analysis_revision = context.workspace->analysis_revision();
+    const auto expected_overlay_revision = context.workspace->overlay_revision();
     context.view->pending_mutations.fetch_add(1, std::memory_order_acq_rel);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    const auto preview_kind = operation.kind;
-    const auto preview_address = operation.address.value;
+    const auto preview_kind = operations.front().kind;
+    const auto preview_address = operations.front().address.value;
 #endif
-    auto mutation_body = [context, operation = std::move(operation)](
+    auto mutation_body = [context, operations = std::move(operations),
+                          expected_generation, expected_analysis_revision,
+                          expected_overlay_revision](
         bool cancelled) mutable {
         std::string error;
         if (cancelled) {
             error = "Mutation cancelled before execution.";
+        } else if (context.workspace->generation() != expected_generation ||
+                   context.workspace->analysis_revision() != expected_analysis_revision) {
+            error = "The analysis publication changed before the mutation ran; select the item and retry.";
         } else {
             std::lock_guard<std::mutex> mutation_lock(context.model->mutation_mutex);
             auto overlay = context.workspace->overlay();
@@ -438,13 +447,15 @@ bool queue_overlay_operation(const workspace_context_t& context,
                 error = "Workspace overlay is unavailable.";
             } else {
                 overlay_transaction_request_t request;
-                request.expected_revision = context.workspace->overlay_revision();
-                request.operations.push_back(operation);
+                request.expected_revision = expected_overlay_revision;
+                request.operations = operations;
                 auto result = overlay->transact(request, context.workspace->cancellation_token());
-                if (result)
-                    apply_committed_operation(context, operation);
-                else
+                if (result) {
+                    for (const auto& operation : operations)
+                        apply_committed_operation(context, operation);
+                } else {
                     error = result.error().stable_code() + ": " + result.error().message;
+                }
             }
         }
         {
@@ -491,6 +502,13 @@ bool queue_overlay_operation(const workspace_context_t& context,
     }
     return true;
 #endif
+}
+
+bool queue_overlay_operation(const workspace_context_t& context,
+                             overlay_operation_t operation) {
+    std::vector<overlay_operation_t> operations;
+    operations.push_back(std::move(operation));
+    return queue_overlay_transaction(context, std::move(operations));
 }
 
 std::string address_label(const workspace_context_t& context,
@@ -992,29 +1010,135 @@ bool queue_type_declaration(const workspace_context_t& context,
     return queue_overlay_operation(context, std::move(operation));
 }
 
+bool queue_type_declaration_and_application(
+    const workspace_context_t& context,
+    const aida::analysis::address_t& address,
+    std::string declaration,
+    std::string canonical_type) {
+    if (declaration.empty() || canonical_type.empty())
+        return false;
+    aida::analysis::overlay_operation_t declaration_operation;
+    declaration_operation.kind = aida::analysis::overlay_operation_kind_t::type_declaration;
+    declaration_operation.address.space = aida::analysis::address_space_id_t::relative_virtual;
+    declaration_operation.address.value = 0;
+    declaration_operation.address.architecture = context.workspace
+        ? context.workspace->identity().architecture()
+        : address.architecture;
+    declaration_operation.address.mode = context.image
+        ? context.image->architecture_mode() : address.mode;
+    declaration_operation.text = std::move(declaration);
+    aida::analysis::overlay_operation_t application_operation;
+    application_operation.kind = aida::analysis::overlay_operation_kind_t::type_application;
+    application_operation.address = address;
+    application_operation.type = std::move(canonical_type);
+    std::vector<aida::analysis::overlay_operation_t> operations;
+    operations.reserve(2);
+    operations.push_back(std::move(declaration_operation));
+    operations.push_back(std::move(application_operation));
+    return queue_overlay_transaction(context, std::move(operations));
+}
+
+mutation_state_t mutation_state(const workspace_context_t& context) {
+    mutation_state_t result;
+    if (!context.workspace || !context.view)
+        return result;
+    result.pending = context.view->pending_mutations.load(std::memory_order_acquire);
+    result.overlay_revision = context.workspace->overlay_revision();
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    result.error = context.view->mutation_error;
+    return result;
+}
+
+namespace {
+
+bool publish_workbench_selection(const workspace_context_t& context,
+                                 const aida::analysis::address_t& destination,
+                                 bool record_history) {
+    const auto runtime = runtime_address(context, destination).value_or(destination.value);
+    aida::workbench::selection_context_t selection;
+    selection.kind = aida::workbench::selection_kind_t::address;
+    selection.has_address = true;
+    selection.address = runtime;
+    selection.extent = 1;
+    selection.entity_key = "analysis.address." + std::to_string(destination.value);
+    aida::workbench::document_local_cursor_t cursor;
+    cursor.has_position = true;
+    cursor.position = runtime;
+    aida::workbench::workbench_shell_workspace_context_t workbench;
+    if (record_history) {
+        return aida::workbench::workbench_shell_runtime_t::instance()
+            .publish_selection(context.workspace, selection, cursor,
+                aida::workbench::navigation_origin_t::user, workbench).ok();
+    }
+    return true;
+}
+
+void synchronize_workspace_selection(const workspace_context_t& context,
+                                     const aida::analysis::address_t& destination,
+                                     bool reveal) {
+    if (!context.workspace || !context.view)
+        return;
+    const auto updated = context.workspace->update_view_state(
+        [&](aida::analysis::workspace_view_state_t& state) {
+            state.selection = destination;
+        });
+    if (!updated)
+        return;
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    context.view->selection = destination;
+    context.view->scroll_to_selection = reveal;
+}
+
+std::optional<aida::analysis::address_t> history_selection(
+    const workspace_context_t& context,
+    const aida::workbench::workbench_shell_workspace_context_t& workbench) {
+    const auto active = std::find_if(
+        workbench.persistence.documents.begin(), workbench.persistence.documents.end(),
+        [&workbench](const aida::workbench::document_persistence_dto_t& document) {
+            return document.id == workbench.persistence.active_document;
+        });
+    if (active == workbench.persistence.documents.end() ||
+        !active->local_state.selection.has_address)
+        return {};
+    return typed_address(context, active->local_state.selection.address);
+}
+
+}
+
+void select_address(const aida::analysis::address_t& destination,
+                    const workspace_context_t& context,
+                    bool record_history) {
+    if (!context.workspace || !context.view || !context.model)
+        return;
+    const auto current = context.workspace->view_state().selection;
+    if (current && *current == destination) {
+        synchronize_workspace_selection(context, destination, false);
+        return;
+    }
+    if (record_history && !publish_workbench_selection(context, destination, true))
+        return;
+    synchronize_workspace_selection(context, destination, false);
+}
+
+void select_address(std::uint64_t value, const workspace_context_t& context,
+                    bool record_history) {
+    const auto destination = typed_address(context, value);
+    if (destination)
+        select_address(*destination, context, record_history);
+}
+
 void goto_address(const aida::analysis::address_t& destination,
                   const workspace_context_t& context) {
     if (!context.workspace || !context.view || !context.model)
         return;
-    const auto previous = context.workspace->view_state().selection;
-    auto updated = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
-        if (state.selection && *state.selection != destination) {
-            state.navigation_back.push_back(*state.selection);
-            if (state.navigation_back.size() > 4096)
-                state.navigation_back.erase(state.navigation_back.begin(),
-                    state.navigation_back.begin() +
-                    static_cast<std::ptrdiff_t>(state.navigation_back.size() - 4096));
-        }
-        state.selection = destination;
-        state.navigation_forward.clear();
-    });
-    if (!updated)
+    const auto current = context.workspace->view_state().selection;
+    if (current && *current == destination) {
+        synchronize_workspace_selection(context, destination, true);
         return;
-    if (previous)
-        context.model->navigation.push(*previous);
-    std::lock_guard<std::mutex> lock(context.view->mutex);
-    context.view->selection = destination;
-    context.view->scroll_to_selection = true;
+    }
+    if (!publish_workbench_selection(context, destination, true))
+        return;
+    synchronize_workspace_selection(context, destination, true);
 }
 
 void goto_address(std::uint64_t value, const workspace_context_t& context) {
@@ -1027,41 +1151,25 @@ void goto_address(std::uint64_t value, const workspace_context_t& context) {
 void navigate_back(const workspace_context_t& context) {
     if (!context.workspace)
         return;
-    std::optional<aida::analysis::address_t> destination;
-    auto updated = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
-        if (state.navigation_back.empty())
-            return;
-        destination = state.navigation_back.back();
-        state.navigation_back.pop_back();
-        if (state.selection)
-            state.navigation_forward.push_back(*state.selection);
-        state.selection = destination;
-    });
-    if (updated && destination) {
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        context.view->selection = destination;
-        context.view->scroll_to_selection = true;
-    }
+    aida::workbench::workbench_shell_workspace_context_t workbench;
+    const auto result = aida::workbench::workbench_shell_runtime_t::instance()
+        .navigate_history(context.workspace, false, workbench);
+    if (!result)
+        return;
+    if (const auto destination = history_selection(context, workbench))
+        synchronize_workspace_selection(context, *destination, true);
 }
 
 void navigate_forward(const workspace_context_t& context) {
     if (!context.workspace)
         return;
-    std::optional<aida::analysis::address_t> destination;
-    auto updated = context.workspace->update_view_state([&](aida::analysis::workspace_view_state_t& state) {
-        if (state.navigation_forward.empty())
-            return;
-        destination = state.navigation_forward.back();
-        state.navigation_forward.pop_back();
-        if (state.selection)
-            state.navigation_back.push_back(*state.selection);
-        state.selection = destination;
-    });
-    if (updated && destination) {
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        context.view->selection = destination;
-        context.view->scroll_to_selection = true;
-    }
+    aida::workbench::workbench_shell_workspace_context_t workbench;
+    const auto result = aida::workbench::workbench_shell_runtime_t::instance()
+        .navigate_history(context.workspace, true, workbench);
+    if (!result)
+        return;
+    if (const auto destination = history_selection(context, workbench))
+        synchronize_workspace_selection(context, *destination, true);
 }
 
 void open_xrefs(std::uint64_t value, const workspace_context_t& context) {
@@ -1180,6 +1288,189 @@ std::uint64_t enclosing_function_start(std::uint64_t value,
         address->value >= found->end.value)
         return 0;
     return runtime_address(context, found->start).value_or(found->start.value);
+}
+
+namespace {
+
+std::uint64_t context_generation(const workspace_context_t& context) {
+    if (!context.workspace)
+        return 0;
+    const auto generation = context.workspace->generation();
+    const auto revision = context.workspace->analysis_revision();
+    return generation ^ (revision + 0x9E3779B97F4A7C15ull +
+        (generation << 6u) + (generation >> 2u));
+}
+
+void open_instruction_menu(const workspace_context_t& context,
+                           const aida::analysis::instruction_record_t& instruction,
+                           const std::optional<formatted_instruction_t>& formatted,
+                           aida::ui::context_menu_open_origin_t origin) {
+    using namespace aida::ui::analysis_context_menu;
+    using aida::ui::action_check_state_t;
+    using aida::ui::action_handler_result_t;
+    using aida::ui::capability_state_t;
+    context_t menu;
+    menu.kind = menu_kind_t::instruction;
+    menu.generation = context_generation(context);
+    menu.live_generation = [context]() { return context_generation(context); };
+    const auto runtime = runtime_address(context, instruction.address).value_or(
+        instruction.address.value);
+    addr_format_t format;
+    bool show_bytes;
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        format = context.view->addr_format;
+        show_bytes = context.view->show_bytes;
+    }
+    const auto address = address_label(context, instruction.address, format);
+    const auto text = formatted ? formatted->text : std::string();
+    const auto bytes = formatted ? formatted->bytes : std::string();
+    const auto name = resolve_name(context, instruction.address);
+    auto copy = [&menu](const char* id, std::string value, const char* reason) {
+        action_slot_t slot;
+        if (value.empty())
+            slot.capability = capability_state_t::unavailable(reason);
+        slot.invoke = [value = std::move(value)]() {
+            ImGui::SetClipboardText(value.c_str());
+            return action_handler_result_t::completed();
+        };
+        menu.actions.emplace(id, std::move(slot));
+    };
+    copy("analysis.copy.line", address + "  " + text, "The instruction is not formatted");
+    copy("analysis.copy.text", text, "The instruction is not formatted");
+    copy("analysis.copy.instruction", text, "The instruction is not formatted");
+    copy("analysis.copy.address", address, "The address is unavailable");
+    copy("analysis.copy.bytes", bytes, "The instruction bytes are not formatted");
+    copy("analysis.copy.name", name, "The selected address has no symbol name");
+    menu.actions["analysis.navigate.back"].invoke = [context]() {
+        navigate_back(context);
+        return action_handler_result_t::completed();
+    };
+    menu.actions["analysis.navigate.forward"].invoke = [context]() {
+        navigate_forward(context);
+        return action_handler_result_t::completed();
+    };
+    menu.actions["analysis.navigate.disassembly"].invoke = [context, runtime]() {
+        goto_address(runtime, context);
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.disassembly"));
+        return action_handler_result_t::completed();
+    };
+    menu.actions["analysis.navigate.xrefs"].invoke = [context, runtime]() {
+        open_xrefs(runtime, context);
+        return action_handler_result_t::completed();
+    };
+    if (instruction.target_fact_count != 0 &&
+        instruction.target_fact_begin < context.publication->snapshot->target_facts.size()) {
+        const auto target = context.publication->snapshot->target_facts[instruction.target_fact_begin];
+        if (target.direct) {
+            menu.actions["analysis.navigate.follow"].invoke = [context, target]() {
+                goto_address(runtime_address(context, target.target).value_or(target.target.value), context);
+                return action_handler_result_t::completed();
+            };
+        }
+    }
+    menu.actions["analysis.modify.rename"].invoke = [context, value = instruction.address]() {
+        rename_dialog::open(context, value);
+        return action_handler_result_t::completed();
+    };
+    menu.actions["analysis.modify.comment"].invoke = [context, value = instruction.address]() {
+        comment_dialog::open(context, value);
+        return action_handler_result_t::completed();
+    };
+    bool bookmarked;
+    {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        bookmarked = std::any_of(context.view->bookmarks.begin(), context.view->bookmarks.end(),
+            [&](const bookmark_t& item) { return item.addr == instruction.address.value; });
+    }
+    if (bookmarked) {
+        menu.actions["analysis.modify.remove_bookmark"].invoke = [context, value = instruction.address]() {
+            return queue_bookmark(context, value, {})
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed("The bookmark update was rejected");
+        };
+    } else {
+        menu.actions["analysis.modify.bookmark"].invoke =
+            [context, value = instruction.address, label = name.empty() ? address : name]() {
+                return queue_bookmark(context, value, label)
+                    ? action_handler_result_t::completed()
+                    : action_handler_result_t::failed("The bookmark update was rejected");
+            };
+    }
+    menu.actions["analysis.navigate.graph"].invoke = [context, runtime]() {
+        goto_address(runtime, context);
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("document.graph"));
+        return action_handler_result_t::completed();
+    };
+    const auto function = enclosing_function_start(runtime, context);
+    if (function != 0) {
+        auto decompile = [context, function]() {
+            pseudocode_view::request_decompile(context, function, false);
+            aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("document.pseudocode"));
+            return action_handler_result_t::completed();
+        };
+        menu.actions["analysis.navigate.pseudocode"].invoke = decompile;
+        menu.actions["analysis.function.decompile"].invoke = std::move(decompile);
+    }
+    menu.actions["analysis.function.source"].invoke = [context, runtime]() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        aida::preview::disasm::record("reconstruct_source", runtime);
+#else
+        source_reconstruct_view::open(context);
+#endif
+        return action_handler_result_t::completed();
+    };
+    menu.actions["analysis.function.aob"].invoke = [context, runtime]() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        aida::preview::disasm::record("generate_aob_signature", runtime, "16:auto_wildcard");
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.memory.aob"));
+#else
+        const auto generator = aob_generator::state_for(context);
+        int count = 16;
+        bool wildcard = true;
+        if (generator) {
+            std::lock_guard<std::mutex> lock(generator->mutex);
+            std::snprintf(generator->address_input, sizeof(generator->address_input), "%llX",
+                static_cast<unsigned long long>(runtime));
+            count = generator->instruction_count;
+            wildcard = generator->auto_wildcard;
+        }
+        aob_generator::generate_from_address(context, runtime, count, wildcard);
+        scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
+        aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.memory.aob"));
+#endif
+        return action_handler_result_t::completed();
+    };
+    auto display = [&menu, context, format](const char* id, addr_format_t target) {
+        action_slot_t slot;
+        slot.check_state = format == target ? action_check_state_t::checked : action_check_state_t::unchecked;
+        slot.invoke = [context, target]() {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->addr_format = target;
+            return action_handler_result_t::completed();
+        };
+        menu.actions.emplace(id, std::move(slot));
+    };
+    display("analysis.view.va", addr_format_t::va);
+    display("analysis.view.rva", addr_format_t::rva);
+    display("analysis.view.file_offset", addr_format_t::file_offset);
+    menu.actions["analysis.view.bytes"] = {capability_state_t::available(), [context]() {
+        std::lock_guard<std::mutex> lock(context.view->mutex);
+        context.view->show_bytes = !context.view->show_bytes;
+        return action_handler_result_t::completed();
+    }, show_bytes ? action_check_state_t::checked : action_check_state_t::unchecked};
+    menu.actions["analysis.view.full_line"] = {capability_state_t::available(), []() {
+        editor_config::disasm_full_line_select = !editor_config::disasm_full_line_select;
+        return action_handler_result_t::completed();
+    }, editor_config::disasm_full_line_select ? action_check_state_t::checked : action_check_state_t::unchecked};
+    open(std::move(menu), origin);
+}
+
 }
 
 void render(float, float, float width, float height,
@@ -1561,122 +1852,26 @@ void render(float, float, float width, float height,
                     generated_comment.empty() ? user_comment : user_comment + "; " + generated_comment;
                 ImGui::TextDisabled("; %s", combined.c_str());
             }
-            if (ImGui::BeginPopupContextItem("##instruction_actions")) {
-                const std::string combined_line = address + "  " +
-                    (formatted_ready ? formatted.text : std::string());
-                if (ImGui::MenuItem("Copy", "Ctrl+C"))
-                    ImGui::SetClipboardText(combined_line.c_str());
-                if (ImGui::MenuItem("Copy Line Text"))
-                    ImGui::SetClipboardText(formatted_ready ? formatted.text.c_str() : "");
-                if (ImGui::MenuItem("Copy Address"))
-                    ImGui::SetClipboardText(address.c_str());
-                if (formatted_ready && ImGui::MenuItem("Copy Bytes"))
-                    ImGui::SetClipboardText(formatted.bytes.c_str());
-                if (formatted_ready && ImGui::MenuItem("Copy Instruction"))
-                    ImGui::SetClipboardText(formatted.text.c_str());
-                ImGui::Separator();
-                if (ImGui::MenuItem("Dump full listing to aida_disasm_dump.txt", "Ctrl+Shift+D",
-                        false, !context.view->export_pending.load(std::memory_order_acquire)))
-                    request_listing_export(context);
-                ImGui::Separator();
-                bool has_bookmark = false;
-                {
-                    std::lock_guard<std::mutex> lock(context.view->mutex);
-                    has_bookmark = std::any_of(context.view->bookmarks.begin(),
-                        context.view->bookmarks.end(), [&](const bookmark_t& bookmark) {
-                            return bookmark.addr == instruction.address.value;
-                        });
-                }
-                if (ImGui::MenuItem("Rename"))
-                    rename_dialog::open(context, instruction.address);
-                if (ImGui::MenuItem("Edit comment"))
-                    comment_dialog::open(context, instruction.address);
-                if (has_bookmark) {
-                    if (ImGui::MenuItem("Remove Bookmark"))
-                        queue_bookmark(context, instruction.address, {});
-                } else if (ImGui::MenuItem("Add Bookmark")) {
-                    queue_bookmark(context, instruction.address, name.empty() ? address : name);
-                }
-                if (ImGui::MenuItem("Cross references"))
-                    open_xrefs(runtime_address(context, instruction.address).value_or(
-                        instruction.address.value), context);
-                if (instruction.target_fact_count != 0) {
-                    const auto target_index = instruction.target_fact_begin;
-                    if (target_index < context.publication->snapshot->target_facts.size()) {
-                        const auto& target = context.publication->snapshot->target_facts[target_index];
-                        if (target.direct && ImGui::MenuItem("Follow Target"))
-                            goto_address(runtime_address(context, target.target).value_or(
-                                target.target.value), context);
-                    }
-                }
-                ImGui::Separator();
-                if (ImGui::MenuItem("VA Format", nullptr,
-                        address_format == static_cast<int>(addr_format_t::va))) {
-                    std::lock_guard<std::mutex> lock(context.view->mutex);
-                    context.view->addr_format = addr_format_t::va;
-                }
-                if (ImGui::MenuItem("RVA Format", nullptr,
-                        address_format == static_cast<int>(addr_format_t::rva))) {
-                    std::lock_guard<std::mutex> lock(context.view->mutex);
-                    context.view->addr_format = addr_format_t::rva;
-                }
-                if (ImGui::MenuItem("Show Bytes", nullptr, show_bytes)) {
-                    std::lock_guard<std::mutex> lock(context.view->mutex);
-                    context.view->show_bytes = !context.view->show_bytes;
-                }
-                if (ImGui::MenuItem("Full-Line Selection", nullptr,
-                        editor_config::disasm_full_line_select))
-                    editor_config::disasm_full_line_select =
-                        !editor_config::disasm_full_line_select;
-                ImGui::Separator();
-                if (ImGui::MenuItem("Decompile Function")) {
-                    const auto function = enclosing_function_start(
-                        runtime_address(context, instruction.address).value_or(
-                            instruction.address.value), context);
-                    if (function != 0)
-                        pseudocode_view::request_decompile(context, function, false);
-                }
-                if (ImGui::MenuItem("Reconstruct Source")) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-                    aida::preview::disasm::record("reconstruct_source",
-                        runtime_address(context, instruction.address).value_or(
-                            instruction.address.value));
-#else
-                    source_reconstruct_view::open(context);
-#endif
-                }
-                if (ImGui::MenuItem("Generate AOB Signature")) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-                    const auto instruction_address = runtime_address(context,
-                        instruction.address).value_or(instruction.address.value);
-                    aida::preview::disasm::record("generate_aob_signature",
-                        instruction_address, "16:auto_wildcard");
-                    globals::ui::active_center_view = center_view_t::scan_hub;
-#else
-                    const auto generator = aob_generator::state_for(context);
-                    const auto instruction_address = runtime_address(context,
-                        instruction.address).value_or(instruction.address.value);
-                    int instruction_count = 16;
-                    bool auto_wildcard = true;
-                    if (generator) {
-                        std::lock_guard<std::mutex> lock(generator->mutex);
-                        std::snprintf(generator->address_input,
-                            sizeof(generator->address_input), "%llX",
-                            static_cast<unsigned long long>(instruction_address));
-                        instruction_count = generator->instruction_count;
-                        auto_wildcard = generator->auto_wildcard;
-                    }
-                    aob_generator::generate_from_address(context, instruction_address,
-                        instruction_count, auto_wildcard);
-                    scan_hub_view::set_sub_tab(scan_hub_view::sub_tab_t::aob);
-                    globals::ui::active_center_view = center_view_t::scan_hub;
-#endif
-                }
-                ImGui::EndPopup();
+            const bool typed_pointer_request = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            if (typed_pointer_request) {
+                open_instruction_menu(context, instruction,
+                    formatted_ready ? std::optional<formatted_instruction_t>(formatted) : std::nullopt,
+                    aida::ui::context_menu_open_origin_t::pointer);
             }
             ImGui::PopID();
         }
     }
+    aida::ui::context_menu_open_origin_t analysis_menu_origin{};
+    if (selection && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        aida::ui::analysis_context_menu::keyboard_request(analysis_menu_origin)) {
+        const auto found = std::lower_bound(instructions.begin(), instructions.end(), *selection,
+            [](const aida::analysis::instruction_record_t& instruction,
+               const aida::analysis::address_t& address) { return instruction.address < address; });
+        if (found != instructions.end() && found->address == *selection)
+            open_instruction_menu(context, *found, formatted_instruction(context, found->id),
+                analysis_menu_origin);
+    }
+    aida::ui::analysis_context_menu::render();
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
         const auto& io = ImGui::GetIO();
         if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))
@@ -1702,7 +1897,8 @@ void render(float, float, float width, float height,
             const auto function = enclosing_function_start(selected_runtime, context);
             if (function != 0) {
                 pseudocode_view::request_decompile(context, function, false);
-                globals::ui::active_center_view = center_view_t::pseudocode;
+                aida::ui::application_views::open_or_focus(
+                    aida::ui::stable_view_id_t("document.pseudocode"));
             }
         }
         if (selection && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {

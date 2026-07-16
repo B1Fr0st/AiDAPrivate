@@ -100,6 +100,18 @@ inline void render_active(int idx, float cw, float ch, float fa, float ar, float
 	}
 }
 
+inline void render_subview(sub_tab_t tab, float pos_x, float pos_y,
+	float width, float height, float alpha,
+	float accent_r, float accent_g, float accent_b) {
+	ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
+	ImGui::BeginChild("##scan_registered_subview", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+		ImGuiWindowFlags_NoBackground);
+	render_active(static_cast<int>(tab), width, height, alpha,
+		accent_r, accent_g, accent_b);
+	ImGui::EndChild();
+}
+
 inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b)
 {

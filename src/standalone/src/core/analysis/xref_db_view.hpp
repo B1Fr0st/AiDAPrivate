@@ -3,7 +3,8 @@
 #include "../disasm/disasm_view.hpp"
 #include "../infra/taskflow_runtime.hpp"
 #include "../ui/theme.hpp"
-#include "../../helpers/globals.h"
+#include "../ui/analysis_context_menu.hpp"
+#include "../ui/application_view_registry.hpp"
 #include "imgui/imgui.h"
 
 #include <algorithm>
@@ -51,6 +52,7 @@ struct state_t {
     std::atomic<std::uint64_t> serial{1};
     std::shared_ptr<aida::analysis::cancellation_source_t> cancellation;
     std::string error;
+    std::uint64_t selected_runtime = 0;
 };
 
 inline std::mutex& registry_mutex() {
@@ -267,9 +269,9 @@ inline void render(float, float, float width, float height,
     const bool enter = ImGui::InputTextWithHint("##xref_address", "Address",
         address_input.data(), address_input.size(), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
-    ImGui::RadioButton("XRefs To", &query_to, true);
-    ImGui::SameLine();
-    ImGui::RadioButton("XRefs From", &query_to, false);
+	if (ImGui::RadioButton("XRefs To", query_to)) query_to = true;
+	ImGui::SameLine();
+	if (ImGui::RadioButton("XRefs From", !query_to)) query_to = false;
     ImGui::SameLine();
     const bool index_requested = enter || ImGui::Button("Index");
     ImGui::SameLine();
@@ -319,14 +321,72 @@ inline void render(float, float, float width, float height,
     while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             const auto& result = visible[static_cast<std::size_t>(row)];
-            if (ImGui::Selectable(result.label.c_str(), false,
-                    ImGuiSelectableFlags_AllowDoubleClick) &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                disasm_view::goto_address(result.runtime, context);
-                globals::ui::active_center_view = center_view_t::disassembly;
+            bool selected = false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                selected = state->selected_runtime == result.runtime;
+            }
+            if (ImGui::Selectable(result.label.c_str(), selected,
+                    ImGuiSelectableFlags_AllowDoubleClick)) {
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->selected_runtime = result.runtime;
+                }
+                disasm_view::select_address(result.runtime, context);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    disasm_view::goto_address(result.runtime, context);
+                    aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+                }
+            }
+            aida::ui::context_menu_open_origin_t origin{};
+            const bool pointer = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            const bool keyboard = selected &&
+                aida::ui::analysis_context_menu::keyboard_request(origin);
+			if (pointer || keyboard) {
+				using namespace aida::ui::analysis_context_menu;
+				using aida::ui::action_handler_result_t;
+                context_t menu;
+                menu.kind = menu_kind_t::xref;
+                const auto generation = context.workspace->generation();
+                const auto revision = context.workspace->analysis_revision();
+                menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
+                    (generation << 6u) + (generation >> 2u));
+                menu.live_generation = [workspace = context.workspace]() {
+                    const auto current = workspace->generation();
+                    const auto current_revision = workspace->analysis_revision();
+                    return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
+                        (current << 6u) + (current >> 2u));
+                };
+                menu.actions["analysis.navigate.disassembly"].invoke = [context, runtime = result.runtime]() {
+                    disasm_view::goto_address(runtime, context);
+                    aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+                    return action_handler_result_t::completed();
+                };
+                menu.actions["analysis.navigate.xrefs"].invoke = [context, runtime = result.runtime]() {
+                    disasm_view::open_xrefs(runtime, context);
+                    return action_handler_result_t::completed();
+                };
+                menu.actions["analysis.copy.line"].invoke = [value = result.label]() {
+                    ImGui::SetClipboardText(value.c_str());
+                    return action_handler_result_t::completed();
+                };
+                menu.actions["analysis.copy.name"].invoke = [value = result.name]() {
+                    ImGui::SetClipboardText(value.c_str());
+                    return action_handler_result_t::completed();
+                };
+                char address[32]{};
+                std::snprintf(address, sizeof(address), "%016llX",
+                    static_cast<unsigned long long>(result.runtime));
+                menu.actions["analysis.copy.address"].invoke = [value = std::string(address)]() {
+                    ImGui::SetClipboardText(value.c_str());
+                    return action_handler_result_t::completed();
+                };
+                open(std::move(menu), pointer
+                    ? aida::ui::context_menu_open_origin_t::pointer : origin);
             }
         }
     }
+    aida::ui::analysis_context_menu::render();
     ImGui::EndChild();
     ImGui::PopStyleColor();
     ImGui::EndChild();

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdlib>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -191,8 +192,12 @@ inline void parse_ansi_sgr(TerminalSession& s, const std::string& params)
 
 inline void ensure_line(TerminalSession& s, int row)
 {
-    while (static_cast<int>(s.lines.size()) <= row)
-        s.lines.push_back(std::vector<Cell>(s.cols));
+    if (row < 0)
+        return;
+    const size_t row_index = static_cast<size_t>(row);
+    const size_t column_count = static_cast<size_t>(std::max(0, s.cols));
+    while (s.lines.size() <= row_index)
+        s.lines.push_back(std::vector<Cell>(column_count));
 }
 
 inline void push_char(TerminalSession& s, char ch)
@@ -211,9 +216,9 @@ inline void push_char(TerminalSession& s, char ch)
         int next = (s.cursor_col + 8) & ~7;
         while (s.cursor_col < next && s.cursor_col < s.cols) {
             ensure_line(s, s.cursor_row);
-            auto& row = s.lines[s.cursor_row];
+            auto& row = s.lines[static_cast<size_t>(s.cursor_row)];
             if (s.cursor_col < static_cast<int>(row.size())) {
-                row[s.cursor_col] = Cell{' ', s.cur_fg, s.cur_bg, s.cur_bold};
+                row[static_cast<size_t>(s.cursor_col)] = Cell{' ', s.cur_fg, s.cur_bg, s.cur_bold};
             }
             s.cursor_col++;
         }
@@ -229,10 +234,10 @@ inline void push_char(TerminalSession& s, char ch)
     }
 
     ensure_line(s, s.cursor_row);
-    auto& row = s.lines[s.cursor_row];
+    auto& row = s.lines[static_cast<size_t>(s.cursor_row)];
     if (s.cursor_col >= static_cast<int>(row.size()))
-        row.resize(s.cursor_col + 1);
-    row[s.cursor_col] = Cell{ch, s.cur_fg, s.cur_bg, s.cur_bold};
+        row.resize(static_cast<size_t>(s.cursor_col) + 1U);
+    row[static_cast<size_t>(s.cursor_col)] = Cell{ch, s.cur_fg, s.cur_bg, s.cur_bold};
     s.cursor_col++;
     if (s.cursor_col >= s.cols) {
         s.cursor_col = 0;
@@ -308,14 +313,14 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
                 } else if (ch == 'K') {
 
                     ensure_line(s, s.cursor_row);
-                    auto& row = s.lines[s.cursor_row];
+                    auto& row = s.lines[static_cast<size_t>(s.cursor_row)];
                     int mode = csi_params.empty() ? 0 : atoi(csi_params.c_str());
                     if (mode == 0) {
                         for (int j = s.cursor_col; j < static_cast<int>(row.size()); ++j)
-                            row[j] = Cell{};
+                            row[static_cast<size_t>(j)] = Cell{};
                     } else if (mode == 1) {
                         for (int j = 0; j <= s.cursor_col && j < static_cast<int>(row.size()); ++j)
-                            row[j] = Cell{};
+                            row[static_cast<size_t>(j)] = Cell{};
                     } else if (mode == 2) {
                         for (auto& cell : row) cell = Cell{};
                     }
@@ -679,6 +684,7 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 {
     const auto& th = aida::ui::resolved();
     ImU32 surface_bg = (bg_color != 0) ? bg_color : th.bg_elevated;
+    const ImU32 terminal_accent = accent_color != 0 ? accent_color : th.accent_u32;
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, surface_bg);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 6.f));
@@ -797,7 +803,7 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 
         for (int vi = 0; vi < vis_rows && (start_line + vi) < render_total_lines; ++vi) {
             int line_idx = start_line + vi;
-            const auto& row = s.lines[line_idx];
+            const auto& row = s.lines[static_cast<size_t>(line_idx)];
 
             float row_alpha = 1.f;
             float row_y_off = 0.f;
@@ -815,11 +821,13 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
                 }
             }
 
-            const float y = origin.y + vi * line_height + row_y_off;
+            const float y = origin.y + static_cast<float>(vi) * line_height + row_y_off;
 
-            for (int ci = 0; ci < static_cast<int>(row.size()) && ci < s.cols; ++ci) {
+            const size_t rendered_columns = std::min(row.size(),
+                static_cast<size_t>(std::max(0, s.cols)));
+            for (size_t ci = 0; ci < rendered_columns; ++ci) {
                 const auto& cell = row[ci];
-                const float x = origin.x + ci * char_width;
+                const float x = origin.x + static_cast<float>(ci) * char_width;
 
 
                 if ((cell.bg & IM_COL32_A_MASK) != 0) {
@@ -837,15 +845,15 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 
 
         if (s.alive.load(std::memory_order_acquire) && s.cursor_row >= start_line && s.cursor_row < start_line + vis_rows) {
-            const float cx = origin.x + s.cursor_col * char_width;
-            const float cy = origin.y + (s.cursor_row - start_line) * line_height;
+            const float cx = origin.x + static_cast<float>(s.cursor_col) * char_width;
+            const float cy = origin.y + static_cast<float>(s.cursor_row - start_line) * line_height;
             float blink_alpha = 0.85f;
             if (window_focused) {
                 blink_alpha = aida::ui::clock::pulse(2.0f, 0.30f, 1.0f);
             } else {
                 blink_alpha = 0.30f;
             }
-            ImU32 cursor_col = aida::ui::with_alpha(th.accent_u32, blink_alpha);
+            ImU32 cursor_col = aida::ui::with_alpha(terminal_accent, blink_alpha);
             dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + char_width, cy + line_height), cursor_col);
             if (window_focused) {
                 ImU32 glow = aida::ui::with_alpha(th.accent_glow, blink_alpha * 0.7f);
@@ -859,7 +867,7 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 
     float bell_v = s.bell_flash.tick(aida::ui::clock::dt(), 3.3f);
     if (bell_v > 0.001f) {
-        ImU32 bell_col = aida::ui::with_alpha(th.accent_u32, bell_v);
+        ImU32 bell_col = aida::ui::with_alpha(terminal_accent, bell_v);
         dl->AddRect(ImVec2(win_pos.x + 1.f, win_pos.y + 1.f),
                     ImVec2(win_pos.x + win_size.x - 1.f, win_pos.y + win_size.y - 1.f),
                     bell_col, 0.f, 0, 2.f);
@@ -895,9 +903,10 @@ struct TerminalManager
     {
         if (idx < 0 || idx >= static_cast<int>(sessions.size()))
             return;
-        destroy_session(*sessions[idx]);
-        delete sessions[idx];
-        sessions.erase(sessions.begin() + idx);
+        const size_t session_index = static_cast<size_t>(idx);
+        destroy_session(*sessions[session_index]);
+        delete sessions[session_index];
+        sessions.erase(sessions.begin() + static_cast<std::ptrdiff_t>(session_index));
         if (active_tab >= static_cast<int>(sessions.size()))
             active_tab = static_cast<int>(sessions.size()) - 1;
     }
@@ -913,7 +922,7 @@ struct TerminalManager
     }
 
     bool has_active() const { return active_tab >= 0 && active_tab < static_cast<int>(sessions.size()); }
-    TerminalSession* current() { return has_active() ? sessions[active_tab] : nullptr; }
+    TerminalSession* current() { return has_active() ? sessions[static_cast<size_t>(active_tab)] : nullptr; }
 };
 
 }

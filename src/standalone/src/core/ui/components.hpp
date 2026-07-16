@@ -1180,7 +1180,8 @@ namespace aida::ui::components {
 	}
 
 	inline bool search_field(const char* id, char* buffer, size_t buffer_size,
-		const char* hint = "Search", float width = 0.f, bool* cleared = nullptr) {
+		const char* hint = "Search", float width = 0.f, bool* cleared = nullptr,
+		bool* focused = nullptr) {
 		if (!buffer || buffer_size == 0) return false;
 		const auto& t = aida::ui::resolved();
 		float w = width > 0.f ? width : ImGui::GetContentRegionAvail().x;
@@ -1202,6 +1203,7 @@ namespace aida::ui::components {
 		ImGui::SetNextItemWidth(w);
 		bool changed = ImGui::InputTextWithHint("##input", hint ? hint : "", buffer, buffer_size);
 		bool active = ImGui::IsItemActive();
+		if (focused) *focused = active;
 		ImGui::PopStyleVar(3);
 		ImGui::PopStyleColor(4);
 		ImDrawList* dl = ImGui::GetWindowDrawList();

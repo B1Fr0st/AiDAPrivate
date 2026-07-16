@@ -38,13 +38,27 @@ public static class AidaC03PathIdentityNative
 '@
 }
 
-if ($Path -notcmatch '^[A-Z]:/' -or $Path.Contains('\') -or $Path.Contains('//') -or
+if ([string]::IsNullOrEmpty($Path) -or $Path.Length -lt 3 -or $Path.Length -gt 32767 -or
+    $Path -cnotmatch '^[A-Z]:/' -or $Path.Contains('\') -or $Path.Contains('//') -or
     $Path.EndsWith('/', [StringComparison]::Ordinal) -or
     $Path -cmatch '(^|/)\.?\.(/|$)') {
     throw 'AIDA_C03_PATH_IDENTITY_RAW'
 }
 
 $segments = @($Path.Substring(3).Split('/'))
+foreach ($character in $Path.ToCharArray()) {
+    if ([int]$character -lt 0x20 -or [int]$character -gt 0x7e) {
+        throw 'AIDA_C03_PATH_IDENTITY_RAW'
+    }
+}
+foreach ($segment in $segments) {
+    if ([string]::IsNullOrEmpty($segment) -or
+        $segment.EndsWith('.', [StringComparison]::Ordinal) -or
+        $segment.EndsWith(' ', [StringComparison]::Ordinal) -or
+        $segment.IndexOf(':', [StringComparison]::Ordinal) -ge 0) {
+        throw 'AIDA_C03_PATH_IDENTITY_RAW'
+    }
+}
 $current = $Path.Substring(0, 3)
 $final = $null
 for ($index = -1; $index -lt $segments.Count; ++$index) {
