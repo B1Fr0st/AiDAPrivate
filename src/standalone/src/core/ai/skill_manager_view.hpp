@@ -500,6 +500,7 @@ namespace skill_manager {
 				st.active_tab = tabs[i];
 				st.selected_skill_name.clear();
 			}
+			ImGui::PopID();
 		}
 	}
 
@@ -640,8 +641,6 @@ namespace skill_manager {
 				ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
 				ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
 			const bool keyboard_context = menu_key_context || shift_f10_context;
-			ImGui::PopID();
-
 			float hov_v = ra->hover.tick(hov, dt, aida::motion::spring::playful);
 			float lift = hov_v * 2.f;
 

@@ -59,7 +59,8 @@ std::string identity_key(workspace_preset_t preset, std::string_view user_name)
     if (!user_name.empty()) {
         key.push_back(':');
         constexpr char digits[] = "0123456789abcdef";
-        for (const unsigned char byte : user_name) {
+        for (const char character : user_name) {
+            const auto byte = static_cast<unsigned char>(character);
             key.push_back(digits[byte >> 4U]);
             key.push_back(digits[byte & 0x0FU]);
         }
@@ -346,7 +347,6 @@ struct preview_state_t {
     std::uint64_t user_generation = 0;
     workspace_preset_t active = workspace_preset_t::analysis;
     workspace_preset_t pending = workspace_preset_t::analysis;
-    std::string active_user;
     bool locked = false;
     bool rebuild = false;
     std::uint8_t select_defaults_after_realize_frames = 0;
@@ -394,6 +394,7 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
         return;
 #if defined(IMGUI_HAS_DOCK)
     if (!current.root_prepared || current.rebuild) {
+        current.active = current.pending;
         application_views::synchronize_workspace_visibility(current.pending);
         if (!current.rebuild && !current.layouts[preset_index(current.pending)].empty()) {
             const std::string& saved = current.layouts[preset_index(current.pending)];
@@ -403,7 +404,6 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
             open_builtin_default_documents(current.pending);
             build_preview_recipe(current, root_dockspace_id, position, size);
         }
-        current.active = current.pending;
         current.rebuild = false;
         current.root_prepared = true;
         ImGui::GetIO().WantSaveIniSettings = true;
@@ -835,7 +835,7 @@ workspace_request_result_t open_missing_views() noexcept
 
 void shutdown() noexcept
 {
-    preview_state() = {};
+    preview_state() = preview_state_t{};
 }
 
 }

@@ -164,6 +164,15 @@ inline std::string format_for_tab(const aob_generator::signature_t& sig, format_
 	}
 }
 
+inline bool signature_bytes_equal(const std::vector<aob_generator::aob_byte_t>& lhs,
+	const std::vector<aob_generator::aob_byte_t>& rhs)
+{
+	return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+		[](const auto& left, const auto& right) {
+			return left.value == right.value && left.wildcard == right.wildcard;
+		});
+}
+
 inline const char* tab_name(format_tab_t f) {
 	switch (f) {
 	case format_tab_t::standard:     return "Standard";
@@ -1466,7 +1475,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				std::lock_guard<std::mutex> lock(generator_state->mutex);
 				const bool current = std::any_of(generator_state->saved_signatures.begin(),
 					generator_state->saved_signatures.end(), [&](const auto& item) {
-						return item.address == signature.address && item.name == signature.name && item.bytes == signature.bytes;
+						return item.address == signature.address && item.name == signature.name &&
+							detail::signature_bytes_equal(item.bytes, signature.bytes);
 					});
 				return current ? aida::ui::capability_state_t::available()
 					: aida::ui::capability_state_t::unavailable("The selected signature changed or was removed.");

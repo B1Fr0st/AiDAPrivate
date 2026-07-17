@@ -14,6 +14,8 @@
 #include <initializer_list>
 #include <limits>
 #include <optional>
+#include <iterator>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -252,6 +254,7 @@ std::shared_ptr<memory_provider_t> memory_provider_t::create(
     identity.normalized_source = std::move(normalized_source);
     identity.size = storage->size();
     identity.content_sha256 = content_hash;
+    identity.immutable_snapshot = true;
     return std::shared_ptr<memory_provider_t>(new memory_provider_t(
         std::move(storage), std::move(identity)));
 }
@@ -414,6 +417,201 @@ overlay_journal_t::~overlay_journal_t() {
     request_cancel();
 }
 
+namespace {
+
+template <typename Range>
+std::string preview_overlay_hex(const Range& values) {
+    static constexpr char alphabet[] = "0123456789abcdef";
+    std::string result;
+    result.resize(values.size() * 2U);
+    std::size_t index = 0;
+    for (const auto value : values) {
+        const auto byte = static_cast<std::uint8_t>(value);
+        result[index++] = alphabet[byte >> 4U];
+        result[index++] = alphabet[byte & 0x0fU];
+    }
+    return result;
+}
+
+std::string preview_overlay_address_key(const address_t& address) {
+    return std::to_string(static_cast<unsigned>(address.space)) + ":" +
+        std::to_string(address.value) + ":" +
+        std::to_string(static_cast<unsigned>(address.architecture)) + ":" +
+        std::to_string(static_cast<unsigned>(address.mode));
+}
+
+std::string preview_overlay_entity_key(const overlay_operation_t& operation) {
+    if (operation.target_discriminator ==
+            overlay_target_discriminator_v9_t::managed_entity &&
+        operation.managed_locator) {
+        std::string domain;
+        switch (operation.kind) {
+        case overlay_operation_kind_t::comment:
+        case overlay_operation_kind_t::comment_update:
+            domain = "comment";
+            break;
+        case overlay_operation_kind_t::name:
+            domain = "name";
+            break;
+        case overlay_operation_kind_t::type_application:
+        case overlay_operation_kind_t::type_update:
+            domain = "type_application";
+            break;
+        default:
+            domain = "invalid";
+            break;
+        }
+        const auto& locator = *operation.managed_locator;
+        const std::string qualifier =
+            operation.kind == overlay_operation_kind_t::type_application ||
+                    operation.kind == overlay_operation_kind_t::type_update
+                ? (operation.variable.empty() ? operation.name
+                                              : operation.variable)
+                : std::string{};
+        return "managed:" + domain + ":" +
+            preview_overlay_hex(locator.workspace_id) + ":" +
+            preview_overlay_hex(locator.provider_hash) + ":" +
+            std::to_string(locator.provider_size) + ":" +
+            preview_overlay_hex(locator.artifact_hash) + ":" +
+            preview_overlay_hex(locator.entity_hash) + ":" +
+            preview_overlay_hex(locator.serialized_entity) + ":" + qualifier;
+    }
+    std::string prefix;
+    switch (operation.kind) {
+    case overlay_operation_kind_t::comment:
+    case overlay_operation_kind_t::comment_update:
+        prefix = "comment";
+        break;
+    case overlay_operation_kind_t::name: prefix = "name"; break;
+    case overlay_operation_kind_t::bookmark: prefix = "bookmark"; break;
+    case overlay_operation_kind_t::type_declaration:
+        return "type_declaration:" + operation.name;
+    case overlay_operation_kind_t::enum_definition:
+        return "enum_definition:" + operation.name;
+    case overlay_operation_kind_t::define_function: prefix = "define_function"; break;
+    case overlay_operation_kind_t::define_code: prefix = "define_code"; break;
+    case overlay_operation_kind_t::define_data: prefix = "define_data"; break;
+    case overlay_operation_kind_t::undefine: prefix = "undefine"; break;
+    case overlay_operation_kind_t::stack_variable:
+    case overlay_operation_kind_t::delete_stack_variable:
+        return "stack_variable:" + preview_overlay_address_key(operation.address) +
+            ":" + std::to_string(operation.stack_offset) + ":" + operation.name;
+    case overlay_operation_kind_t::type_application:
+    case overlay_operation_kind_t::type_update:
+        return "type_application:" + preview_overlay_address_key(operation.address) +
+            ":" + operation.variable + ":" + operation.name;
+    case overlay_operation_kind_t::byte_patch:
+    case overlay_operation_kind_t::assembly_patch:
+    case overlay_operation_kind_t::integer_patch:
+        prefix = "patch";
+        break;
+    case overlay_operation_kind_t::reanalysis:
+        prefix = "reanalysis";
+        break;
+    }
+    return prefix + ":" + preview_overlay_address_key(operation.address);
+}
+
+bool preview_overlay_removes_value(const overlay_operation_t& operation) {
+    if (operation.remove)
+        return true;
+    if (operation.kind == overlay_operation_kind_t::comment ||
+        operation.kind == overlay_operation_kind_t::comment_update)
+        return operation.text.empty();
+    if (operation.kind == overlay_operation_kind_t::name ||
+        operation.kind == overlay_operation_kind_t::bookmark)
+        return operation.name.empty();
+    return false;
+}
+
+overlay_operation_t preview_materialized_operation(overlay_operation_t operation) {
+    if (operation.kind == overlay_operation_kind_t::comment_update)
+        operation.kind = overlay_operation_kind_t::comment;
+    else if (operation.kind == overlay_operation_kind_t::delete_stack_variable)
+        operation.kind = overlay_operation_kind_t::stack_variable;
+    else if (operation.kind == overlay_operation_kind_t::type_update)
+        operation.kind = overlay_operation_kind_t::type_application;
+    operation.remove = false;
+    return operation;
+}
+
+workspace_result_t<std::shared_ptr<const workspace_overlay_presentation_t>>
+preview_overlay_presentation(
+    const std::unordered_map<std::string, overlay_operation_t>& items,
+    std::uint64_t revision) {
+    try {
+        auto presentation = std::make_shared<workspace_overlay_presentation_t>();
+        presentation->overlay_revision = revision;
+        presentation->comments.reserve(items.size());
+        presentation->renames.reserve(items.size());
+        presentation->bookmarks.reserve(items.size());
+        presentation->workspace_bookmarks.reserve(items.size());
+        for (const auto& item : items) {
+            const auto& operation = item.second;
+            if (operation.target_discriminator !=
+                overlay_target_discriminator_v9_t::native_address)
+                continue;
+            if (operation.kind == overlay_operation_kind_t::comment) {
+                presentation->comments.push_back(
+                    {operation.address, operation.text});
+            } else if (operation.kind == overlay_operation_kind_t::name) {
+                presentation->renames.push_back(
+                    {operation.address, operation.name});
+            } else if (operation.kind == overlay_operation_kind_t::bookmark) {
+                presentation->bookmarks.push_back(
+                    {operation.address, operation.name});
+                presentation->workspace_bookmarks.push_back(operation.address);
+            }
+        }
+        const auto address_less = [](const auto& left, const auto& right) {
+            return left.address < right.address;
+        };
+        std::sort(presentation->comments.begin(), presentation->comments.end(),
+                  address_less);
+        std::sort(presentation->renames.begin(), presentation->renames.end(),
+                  address_less);
+        std::sort(presentation->bookmarks.begin(), presentation->bookmarks.end(),
+                  address_less);
+        std::sort(presentation->workspace_bookmarks.begin(),
+                  presentation->workspace_bookmarks.end());
+        return workspace_result_t<
+            std::shared_ptr<const workspace_overlay_presentation_t>>::success(
+                std::static_pointer_cast<const workspace_overlay_presentation_t>(
+                    std::move(presentation)));
+    } catch (...) {
+        return workspace_result_t<
+            std::shared_ptr<const workspace_overlay_presentation_t>>::failure(
+                make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                     "preview overlay presentation allocation failed",
+                                     "preview_overlay"));
+    }
+}
+
+void preview_restore_overlay_item(
+    std::unordered_map<std::string, overlay_operation_t>& items,
+    const std::string& key,
+    const std::optional<overlay_operation_t>& value) {
+    if (value)
+        items.insert_or_assign(key, *value);
+    else
+        items.erase(key);
+}
+
+bool preview_overlay_target_equal(
+    const overlay_target_identity_v9_t& left,
+    const overlay_target_identity_v9_t& right) noexcept {
+    return left.image_hash == right.image_hash &&
+        left.provenance_hash == right.provenance_hash &&
+        left.image_base == right.image_base &&
+        left.image_size == right.image_size &&
+        left.generation == right.generation && left.kind == right.kind &&
+        left.architecture == right.architecture &&
+        left.address_width == right.address_width &&
+        left.reserved == right.reserved;
+}
+
+}
+
 workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
     const overlay_transaction_request_t& request,
     const cancellation_token_t& cancel) {
@@ -423,7 +621,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             make_workspace_error(workspace_error_code_t::workspace_closing,
                                  "preview overlay workspace is unavailable",
                                  "preview_overlay"));
-    if (cancel.stop_requested())
+    if (cancel.stop_requested() || cancellation_.token().stop_requested())
         return workspace_result_t<overlay_transaction_result_t>::failure(
             make_workspace_error(workspace_error_code_t::cancelled,
                                  "preview overlay transaction was cancelled",
@@ -435,42 +633,154 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                                  "preview overlay transaction is invalid",
                                  "preview_overlay"));
     std::unique_lock publication_lock(publication_mutex_);
-    std::unique_lock state_lock(state_mutex_);
-    if (request.expected_revision && *request.expected_revision != revision_)
+    overlay_transaction_result_t result;
+    result.dry_run = request.dry_run;
+    std::shared_ptr<std::unordered_map<std::string, overlay_operation_t>> next_items;
+    std::shared_ptr<std::vector<preview_history_transaction_t>> next_history;
+    std::uint64_t local_revision = 0;
+    std::uint64_t local_cursor = 0;
+    std::uint64_t local_next_transaction = 0;
+    std::uint64_t local_epoch = 0;
+    std::uint64_t next_epoch = 0;
+    overlay_target_identity_v9_t local_target;
+    try {
+        std::shared_lock state_lock(state_mutex_);
+        local_revision = revision_;
+        local_cursor = history_cursor_;
+        local_next_transaction = next_transaction_id_;
+        local_epoch = history_epoch_;
+        next_epoch = local_epoch;
+        local_target = fixed_target_;
+        if (request.expected_revision && *request.expected_revision != local_revision)
+            return workspace_result_t<overlay_transaction_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::revision_conflict,
+                                     "preview overlay revision changed",
+                                     "preview_overlay"));
+        if (local_revision == (std::numeric_limits<std::uint64_t>::max)() ||
+            local_next_transaction == (std::numeric_limits<std::uint64_t>::max)())
+            return workspace_result_t<overlay_transaction_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                                     "preview overlay revision or transaction identifier is exhausted",
+                                     "preview_overlay"));
+        next_items = std::make_shared<
+            std::unordered_map<std::string, overlay_operation_t>>(items_);
+        next_history = std::make_shared<
+            std::vector<preview_history_transaction_t>>(preview_history_);
+        const auto retained_end = std::remove_if(next_history->begin(),
+            next_history->end(), [local_cursor](const auto& transaction) {
+                return transaction.transaction_id > local_cursor;
+            });
+        if (retained_end != next_history->end()) {
+            if (next_epoch == (std::numeric_limits<std::uint64_t>::max)())
+                return workspace_result_t<overlay_transaction_result_t>::failure(
+                    make_workspace_error(workspace_error_code_t::range_overflow,
+                                         "preview overlay history epoch is exhausted",
+                                         "preview_overlay"));
+            next_history->erase(retained_end, next_history->end());
+            ++next_epoch;
+        }
+        preview_history_transaction_t transaction;
+        transaction.transaction_id = local_next_transaction;
+        transaction.operations.reserve(request.operations.size());
+        std::vector<std::string> keys;
+        keys.reserve(request.operations.size());
+        result.operations.reserve(request.operations.size());
+        for (std::size_t index = 0; index < request.operations.size(); ++index) {
+            const auto& operation = request.operations[index];
+            const auto key = preview_overlay_entity_key(operation);
+            if (std::find(keys.begin(), keys.end(), key) != keys.end())
+                return workspace_result_t<overlay_transaction_result_t>::failure(
+                    make_workspace_error(workspace_error_code_t::revision_conflict,
+                                         "preview overlay transaction contains duplicate entity operations",
+                                         "preview_overlay"));
+            keys.push_back(key);
+            const bool remove = preview_overlay_removes_value(operation);
+            result.operations.push_back({index, key, remove});
+            preview_history_operation_t historical;
+            historical.index = index;
+            historical.entity_key = key;
+            const auto before = items_.find(key);
+            if (before != items_.end())
+                historical.before = before->second;
+            if (!remove)
+                historical.after = preview_materialized_operation(operation);
+            preview_restore_overlay_item(*next_items, key, historical.after);
+            transaction.operations.push_back(std::move(historical));
+        }
+        if (!request.dry_run)
+            next_history->push_back(std::move(transaction));
+    } catch (...) {
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "preview overlay publication state allocation failed",
+                                 "preview_overlay"));
+    }
+
+    result.revision = local_revision;
+    if (request.dry_run)
+        return workspace_result_t<overlay_transaction_result_t>::success(
+            std::move(result));
+    const auto publication = workspace->analysis_publication();
+    if (!publication || !publication->provider ||
+        publication->generation != local_target.generation ||
+        publication->overlay_revision != local_revision)
         return workspace_result_t<overlay_transaction_result_t>::failure(
             make_workspace_error(workspace_error_code_t::revision_conflict,
-                                 "preview overlay revision changed",
+                                 "preview workspace and overlay journal publications differ",
                                  "preview_overlay"));
-    overlay_transaction_result_t result;
-    result.transaction_id = history_cursor_ + 1;
-    result.revision = request.dry_run ? revision_ : revision_ + 1;
-    result.dry_run = request.dry_run;
-    result.committed = !request.dry_run;
-    for (std::size_t index = 0; index < request.operations.size(); ++index) {
-        const auto& operation = request.operations[index];
-        const auto key = std::to_string(static_cast<unsigned>(operation.kind)) +
-            ":" + std::to_string(operation.address.value) + ":" +
-            operation.name + ":" + operation.variable;
-        result.operations.push_back({index, key, operation.remove});
-        if (request.dry_run)
-            continue;
-        if (operation.remove)
-            items_.erase(key);
-        else
-            items_[key] = operation;
-    }
-    if (!request.dry_run) {
-        const auto expected = revision_;
-        state_lock.unlock();
-        auto advanced = workspace->advance_overlay_revision(expected);
-        state_lock.lock();
-        if (!advanced)
-            return workspace_result_t<overlay_transaction_result_t>::failure(
-                advanced.error());
-        revision_ = advanced.value();
-        history_cursor_ = result.transaction_id;
-        result.revision = revision_;
-    }
+    if (publication->generation == (std::numeric_limits<std::uint64_t>::max)())
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::range_overflow,
+                                 "preview workspace generation is exhausted",
+                                 "preview_overlay"));
+    const std::uint64_t target_generation = publication->generation + 1;
+    const std::uint64_t target_revision = local_revision + 1;
+    auto presentation = preview_overlay_presentation(*next_items, target_revision);
+    if (!presentation)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            presentation.error());
+    if (cancel.stop_requested() || cancellation_.token().stop_requested())
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::cancelled,
+                                 "preview overlay transaction was cancelled",
+                                 "preview_overlay"));
+    auto published = workspace->publish_preview_overlay_generation(
+        publication->generation, publication->analysis_revision,
+        publication->overlay_revision, target_generation, target_revision,
+        presentation.take_value(),
+        [this, next_items, next_history, local_revision, local_cursor,
+         local_next_transaction, local_epoch, next_epoch, local_target,
+         target_generation, target_revision, cancel]() -> workspace_result_t<void> {
+            if (cancel.stop_requested() || cancellation_.token().stop_requested())
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::cancelled,
+                                         "preview overlay transaction was cancelled",
+                                         "preview_overlay"));
+            std::unique_lock state_lock(state_mutex_);
+            if (revision_ != local_revision || history_cursor_ != local_cursor ||
+                next_transaction_id_ != local_next_transaction ||
+                history_epoch_ != local_epoch ||
+                !preview_overlay_target_equal(fixed_target_, local_target))
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::revision_conflict,
+                                         "preview overlay changed before atomic publication",
+                                         "preview_overlay"));
+            items_.swap(*next_items);
+            preview_history_.swap(*next_history);
+            revision_ = target_revision;
+            history_cursor_ = local_next_transaction;
+            next_transaction_id_ = local_next_transaction + 1;
+            history_epoch_ = next_epoch;
+            fixed_target_.generation = target_generation;
+            publication_epoch_.fetch_add(1, std::memory_order_release);
+            return workspace_result_t<void>::success();
+        });
+    if (!published)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            published.error());
+    result.transaction_id = local_next_transaction;
+    result.revision = target_revision;
+    result.committed = true;
     return workspace_result_t<overlay_transaction_result_t>::success(
         std::move(result));
 }
@@ -489,6 +799,177 @@ overlay_snapshot_t overlay_journal_t::snapshot() const {
             return left.first < right.first;
         });
     return result;
+}
+
+overlay_history_snapshot_t overlay_journal_t::history_snapshot() const noexcept {
+    overlay_history_snapshot_t result;
+    std::shared_lock lock(state_mutex_);
+    result.revision = revision_;
+    result.history_cursor = history_cursor_;
+    result.next_transaction_id = next_transaction_id_;
+    result.history_epoch = history_epoch_;
+    return result;
+}
+
+workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_action(
+    bool redo_action, std::optional<std::uint64_t> expected_revision,
+    const cancellation_token_t& cancel) {
+    auto workspace = workspace_.lock();
+    if (!workspace || workspace->closing())
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                                 "preview overlay workspace is unavailable",
+                                 "preview_overlay_history"));
+    if (cancel.stop_requested() || cancellation_.token().stop_requested())
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::cancelled,
+                                 "preview overlay history action was cancelled",
+                                 "preview_overlay_history"));
+    std::unique_lock publication_lock(publication_mutex_);
+    std::shared_ptr<std::unordered_map<std::string, overlay_operation_t>> next_items;
+    std::uint64_t local_revision = 0;
+    std::uint64_t local_cursor = 0;
+    std::uint64_t local_next_transaction = 0;
+    std::uint64_t local_epoch = 0;
+    std::uint64_t next_cursor = 0;
+    std::uint64_t selected_transaction = 0;
+    overlay_target_identity_v9_t local_target;
+    overlay_transaction_result_t result;
+    try {
+        std::shared_lock state_lock(state_mutex_);
+        local_revision = revision_;
+        local_cursor = history_cursor_;
+        local_next_transaction = next_transaction_id_;
+        local_epoch = history_epoch_;
+        local_target = fixed_target_;
+        if (expected_revision && *expected_revision != local_revision)
+            return workspace_result_t<overlay_transaction_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::revision_conflict,
+                                     "preview overlay history revision changed",
+                                     "preview_overlay_history"));
+        if (local_revision == (std::numeric_limits<std::uint64_t>::max)())
+            return workspace_result_t<overlay_transaction_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::range_overflow,
+                                     "preview overlay revision is exhausted",
+                                     "preview_overlay_history"));
+        auto selected = preview_history_.end();
+        if (redo_action) {
+            selected = std::find_if(preview_history_.begin(), preview_history_.end(),
+                [local_cursor](const auto& transaction) {
+                    return transaction.transaction_id > local_cursor;
+                });
+        } else {
+            selected = std::find_if(preview_history_.begin(), preview_history_.end(),
+                [local_cursor](const auto& transaction) {
+                    return transaction.transaction_id == local_cursor;
+                });
+        }
+        if (selected == preview_history_.end())
+            return workspace_result_t<overlay_transaction_result_t>::failure(
+                make_workspace_error(workspace_error_code_t::target_not_found,
+                    redo_action ? "no preview overlay transaction is available to redo"
+                                : "no preview overlay transaction is available to undo",
+                    "preview_overlay_history"));
+        selected_transaction = selected->transaction_id;
+        next_items = std::make_shared<
+            std::unordered_map<std::string, overlay_operation_t>>(items_);
+        if (redo_action) {
+            for (const auto& operation : selected->operations) {
+                preview_restore_overlay_item(*next_items, operation.entity_key,
+                                             operation.after);
+                result.operations.push_back({operation.index, operation.entity_key,
+                                             !operation.after.has_value()});
+            }
+            next_cursor = selected_transaction;
+        } else {
+            for (auto operation = selected->operations.rbegin();
+                 operation != selected->operations.rend(); ++operation) {
+                preview_restore_overlay_item(*next_items, operation->entity_key,
+                                             operation->before);
+                result.operations.push_back({operation->index, operation->entity_key,
+                                             !operation->before.has_value()});
+            }
+            if (selected != preview_history_.begin())
+                next_cursor = std::prev(selected)->transaction_id;
+        }
+    } catch (...) {
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                                 "preview overlay history allocation failed",
+                                 "preview_overlay_history"));
+    }
+    const auto publication = workspace->analysis_publication();
+    if (!publication || !publication->provider ||
+        publication->generation != local_target.generation ||
+        publication->overlay_revision != local_revision)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::revision_conflict,
+                                 "preview workspace and overlay history publications differ",
+                                 "preview_overlay_history"));
+    if (publication->generation == (std::numeric_limits<std::uint64_t>::max)())
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::range_overflow,
+                                 "preview workspace generation is exhausted",
+                                 "preview_overlay_history"));
+    const std::uint64_t target_generation = publication->generation + 1;
+    const std::uint64_t target_revision = local_revision + 1;
+    auto presentation = preview_overlay_presentation(*next_items, target_revision);
+    if (!presentation)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            presentation.error());
+    if (cancel.stop_requested() || cancellation_.token().stop_requested())
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            make_workspace_error(workspace_error_code_t::cancelled,
+                                 "preview overlay history action was cancelled",
+                                 "preview_overlay_history"));
+    auto published = workspace->publish_preview_overlay_generation(
+        publication->generation, publication->analysis_revision,
+        publication->overlay_revision, target_generation, target_revision,
+        presentation.take_value(),
+        [this, next_items, local_revision, local_cursor,
+         local_next_transaction, local_epoch, local_target, next_cursor,
+         target_generation, target_revision, cancel]() -> workspace_result_t<void> {
+            if (cancel.stop_requested() || cancellation_.token().stop_requested())
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::cancelled,
+                                         "preview overlay history action was cancelled",
+                                         "preview_overlay_history"));
+            std::unique_lock state_lock(state_mutex_);
+            if (revision_ != local_revision || history_cursor_ != local_cursor ||
+                next_transaction_id_ != local_next_transaction ||
+                history_epoch_ != local_epoch ||
+                !preview_overlay_target_equal(fixed_target_, local_target))
+                return workspace_result_t<void>::failure(
+                    make_workspace_error(workspace_error_code_t::revision_conflict,
+                                         "preview overlay history changed before atomic publication",
+                                         "preview_overlay_history"));
+            items_.swap(*next_items);
+            revision_ = target_revision;
+            history_cursor_ = next_cursor;
+            fixed_target_.generation = target_generation;
+            publication_epoch_.fetch_add(1, std::memory_order_release);
+            return workspace_result_t<void>::success();
+        });
+    if (!published)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            published.error());
+    result.transaction_id = selected_transaction;
+    result.revision = target_revision;
+    result.committed = true;
+    return workspace_result_t<overlay_transaction_result_t>::success(
+        std::move(result));
+}
+
+workspace_result_t<overlay_transaction_result_t> overlay_journal_t::undo(
+    std::optional<std::uint64_t> expected_revision,
+    const cancellation_token_t& cancel) {
+    return history_action(false, expected_revision, cancel);
+}
+
+workspace_result_t<overlay_transaction_result_t> overlay_journal_t::redo(
+    std::optional<std::uint64_t> expected_revision,
+    const cancellation_token_t& cancel) {
+    return history_action(true, expected_revision, cancel);
 }
 
 overlay_target_identity_v9_t overlay_journal_t::fixed_target() const {
@@ -1065,6 +1546,101 @@ std::shared_ptr<const analysis::analysis_snapshot_t> analysis_snapshot(
     return snapshot;
 }
 
+[[noreturn]] void preview_fixture_failure(
+    const std::string& stage, const analysis::workspace_error_t& error) {
+    throw std::runtime_error(stage + ": " + error.stable_code() + ": " +
+                             error.message);
+}
+
+void preview_fixture_require(bool condition, const char* stage) {
+    if (!condition)
+        throw std::runtime_error(std::string(stage) +
+                                 ": deterministic preview invariant failed");
+}
+
+void validate_preview_overlay_history(
+    const std::shared_ptr<analysis::analysis_workspace_t>& workspace,
+    const std::shared_ptr<analysis::overlay_journal_t>& overlay) {
+    analysis::overlay_operation_t first_operation;
+    first_operation.kind = analysis::overlay_operation_kind_t::comment;
+    first_operation.address = rva(0x3F00);
+    first_operation.text = "Preview history probe A";
+    analysis::overlay_transaction_request_t first_request;
+    first_request.expected_revision = overlay->snapshot().revision;
+    first_request.operations.push_back(first_operation);
+    auto first = overlay->transact(first_request, {});
+    if (!first)
+        preview_fixture_failure("preview overlay probe transact", first.error());
+    preview_fixture_require(first.value().committed &&
+        first.value().transaction_id == 1 && first.value().revision == 1,
+        "preview overlay probe transact result");
+    auto first_history = overlay->history_snapshot();
+    auto first_presentation = workspace->overlay_presentation();
+    preview_fixture_require(first_history.can_undo() && !first_history.can_redo() &&
+        first_history.history_cursor == 1 && first_history.next_transaction_id == 2 &&
+        workspace->overlay_revision() == 1 && first_presentation &&
+        first_presentation->overlay_revision == 1 &&
+        first_presentation->comments.size() == 1 &&
+        first_presentation->comments.front().text == first_operation.text,
+        "preview overlay probe publication");
+
+    auto first_undo = overlay->undo(first.value().revision, {});
+    if (!first_undo)
+        preview_fixture_failure("preview overlay probe undo", first_undo.error());
+    auto undone_history = overlay->history_snapshot();
+    auto undone_presentation = workspace->overlay_presentation();
+    preview_fixture_require(first_undo.value().transaction_id == 1 &&
+        first_undo.value().revision == 2 && !undone_history.can_undo() &&
+        undone_history.can_redo() && undone_history.history_cursor == 0 &&
+        overlay->snapshot().items.empty() && workspace->overlay_revision() == 2 &&
+        undone_presentation && undone_presentation->comments.empty(),
+        "preview overlay probe undo publication");
+
+    auto first_redo = overlay->redo(first_undo.value().revision, {});
+    if (!first_redo)
+        preview_fixture_failure("preview overlay probe redo", first_redo.error());
+    auto redone_history = overlay->history_snapshot();
+    preview_fixture_require(first_redo.value().transaction_id == 1 &&
+        first_redo.value().revision == 3 && redone_history.can_undo() &&
+        !redone_history.can_redo() && overlay->snapshot().items.size() == 1 &&
+        workspace->overlay_revision() == 3,
+        "preview overlay probe redo publication");
+
+    auto branch_undo = overlay->undo(first_redo.value().revision, {});
+    if (!branch_undo)
+        preview_fixture_failure("preview overlay branch undo", branch_undo.error());
+    analysis::overlay_operation_t branch_operation = first_operation;
+    branch_operation.text = "Preview history probe B";
+    analysis::overlay_transaction_request_t branch_request;
+    branch_request.expected_revision = branch_undo.value().revision;
+    branch_request.operations.push_back(branch_operation);
+    auto branch = overlay->transact(branch_request, {});
+    if (!branch)
+        preview_fixture_failure("preview overlay branch transact", branch.error());
+    const auto branch_history = overlay->history_snapshot();
+    preview_fixture_require(branch.value().transaction_id == 2 &&
+        branch.value().revision == 5 && branch_history.history_epoch == 2 &&
+        branch_history.history_cursor == 2 &&
+        branch_history.next_transaction_id == 3 && !branch_history.can_redo(),
+        "preview overlay redo truncation");
+    auto truncated_redo = overlay->redo(branch.value().revision, {});
+    preview_fixture_require(!truncated_redo &&
+        truncated_redo.error().code == analysis::workspace_error_code_t::target_not_found,
+        "preview overlay truncated redo rejection");
+    auto branch_restore = overlay->undo(branch.value().revision, {});
+    if (!branch_restore)
+        preview_fixture_failure("preview overlay branch restoration",
+                                branch_restore.error());
+    const auto restored = overlay->snapshot();
+    const auto restored_history = overlay->history_snapshot();
+    const auto restored_presentation = workspace->overlay_presentation();
+    preview_fixture_require(restored.items.empty() && restored.revision == 6 &&
+        restored_history.history_cursor == 0 && restored_history.can_redo() &&
+        workspace->overlay_revision() == restored.revision &&
+        restored_presentation && restored_presentation->comments.empty(),
+        "preview overlay probe state restoration");
+}
+
 workspace_preview_fixture_t make_fixture() {
     workspace_preview_fixture_t fixture;
     fixture.session_id = "as_aida_preview_0001";
@@ -1101,6 +1677,7 @@ workspace_preview_fixture_t make_fixture() {
         fixture.workspace = created.take_value();
         auto overlay = analysis::overlay_journal_t::open_preview(fixture.workspace);
         if (overlay) {
+            validate_preview_overlay_history(fixture.workspace, overlay.value());
             static constexpr std::array<const char*, 12> analyst_notes{{
                 "Program entry; initializes the staged analysis pipeline",
                 "Validates image metadata before recursive traversal",
@@ -1116,7 +1693,8 @@ workspace_preview_fixture_t make_fixture() {
                 "Publishes findings without mutating the original sample"
             }};
             analysis::overlay_transaction_request_t request;
-            request.operations.reserve(analyst_notes.size());
+            request.expected_revision = overlay.value()->snapshot().revision;
+            request.operations.reserve(analyst_notes.size() + 3U);
             for (std::size_t index = 0; index < analyst_notes.size(); ++index) {
                 analysis::overlay_operation_t operation;
                 operation.kind = analysis::overlay_operation_kind_t::comment;
@@ -1124,7 +1702,39 @@ workspace_preview_fixture_t make_fixture() {
                 operation.text = analyst_notes[index];
                 request.operations.push_back(std::move(operation));
             }
-            static_cast<void>(overlay.value()->transact(request, {}));
+            for (const auto& bookmark : std::array{
+                     std::pair{0x1460ULL, "Parser entry"},
+                     std::pair{0x1C40ULL, "Unpacking review"},
+                     std::pair{0x2420ULL, "Command channel"}}) {
+                analysis::overlay_operation_t operation;
+                operation.kind = analysis::overlay_operation_kind_t::bookmark;
+                operation.address = rva(bookmark.first);
+                operation.name = bookmark.second;
+                request.operations.push_back(std::move(operation));
+            }
+            auto seeded = overlay.value()->transact(request, {});
+            if (!seeded)
+                preview_fixture_failure("preview overlay seed transaction",
+                                        seeded.error());
+            const auto seeded_snapshot = overlay.value()->snapshot();
+            const auto seeded_history = overlay.value()->history_snapshot();
+            const auto seeded_presentation = fixture.workspace->overlay_presentation();
+            preview_fixture_require(seeded.value().committed &&
+                seeded.value().transaction_id == 3 && seeded.value().revision == 7 &&
+                seeded_snapshot.revision == seeded.value().revision &&
+                seeded_snapshot.items.size() == analyst_notes.size() + 3U &&
+                seeded_history.history_cursor == seeded.value().transaction_id &&
+                seeded_history.next_transaction_id == 4 &&
+                seeded_history.history_epoch == 3 && seeded_history.can_undo() &&
+                !seeded_history.can_redo() && seeded_presentation &&
+                seeded_presentation->overlay_revision == seeded.value().revision &&
+                seeded_presentation->comments.size() == analyst_notes.size() &&
+                seeded_presentation->bookmarks.size() == 3 &&
+                seeded_presentation->workspace_bookmarks.size() == 3 &&
+                fixture.workspace->overlay_revision() == seeded.value().revision,
+                "preview overlay seeded publication");
+        } else {
+            preview_fixture_failure("preview overlay open", overlay.error());
         }
         static_cast<void>(fixture.workspace->update_view_state([](auto& view) {
             view.selection = rva(0x1000);

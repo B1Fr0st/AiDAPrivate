@@ -1108,7 +1108,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			return aida::ui::action_handler_result_t::completed();
 		});
 		add_action("types.reconstruction.field.declare_apply", valid_field,
-			"The retained field is stale", [&st] {
+			"The retained field is stale", [] {
 			const auto result = declare_and_apply_current();
 			st.operation_status = result.detail;
 			st.operation_error = !result.completed;

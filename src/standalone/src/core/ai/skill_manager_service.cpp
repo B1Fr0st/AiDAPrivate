@@ -16,7 +16,6 @@ namespace {
 
 struct runtime_t {
 	std::shared_ptr<const snapshot_t> publication;
-	std::shared_ptr<const snapshot_t> completion;
 	std::atomic<std::uint64_t> generation{1};
 	std::atomic<std::uint64_t> request_generation{1};
 	std::atomic<bool> pending{false};
@@ -68,10 +67,45 @@ void refresh_catalog(snapshot_t& next)
 }
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-void queue_completion(std::shared_ptr<snapshot_t> completion)
+struct pending_lifecycle_t {
+	explicit pending_lifecycle_t(std::atomic<bool>& value) noexcept : pending(value) {}
+
+	template <typename Publisher>
+	bool finish(Publisher&& publisher) noexcept
+	{
+		bool expected = false;
+		if (!finished.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+			return false;
+		try { publisher(); }
+		catch (...) {}
+		pending.store(false, std::memory_order_release);
+		return true;
+	}
+
+	bool release() noexcept
+	{
+		return finish([]() noexcept {});
+	}
+
+	std::atomic<bool>& pending;
+	std::atomic<bool> finished{false};
+};
+
+struct pending_scope_t {
+	explicit pending_scope_t(std::shared_ptr<pending_lifecycle_t> value) noexcept
+		: lifecycle(std::move(value)) {}
+	~pending_scope_t() { if (active && lifecycle) lifecycle->release(); }
+	void dismiss() noexcept { active = false; }
+
+	std::shared_ptr<pending_lifecycle_t> lifecycle;
+	bool active = true;
+};
+
+void publish_terminal(std::shared_ptr<snapshot_t> terminal)
 {
-	std::atomic_store_explicit(&runtime().completion,
-		std::shared_ptr<const snapshot_t>(std::move(completion)),
+	std::atomic_store_explicit(&runtime().publication,
+		std::shared_ptr<const snapshot_t>(std::move(terminal)),
 		std::memory_order_release);
 }
 
@@ -83,93 +117,159 @@ bool submit(const char* label, const char* action,
 	std::string* error)
 {
 	auto& rt = runtime();
+	const auto lifecycle = std::make_shared<pending_lifecycle_t>(rt.pending);
 	bool expected = false;
 	if (!rt.pending.compare_exchange_strong(expected, true,
 		std::memory_order_acq_rel)) {
 		if (error) *error = "Another Skills operation is already running";
 		return false;
 	}
-	auto loading = copy_publication(operation_state_t::loading, label, {});
-	std::atomic_store_explicit(&rt.publication,
-		std::shared_ptr<const snapshot_t>(std::move(loading)),
-		std::memory_order_release);
-	const auto cancelled = std::make_shared<std::atomic<bool>>(false);
-	aida::infra::executor::submission_t submission;
-	submission.owner_subsystem = "ai_skill_manager";
-	submission.label = label;
-	submission.thread_class = "bounded_task";
-	submission.domain = domain;
-	submission.priority = 3;
-	submission.generation = rt.request_generation.fetch_add(1,
-		std::memory_order_acq_rel);
-	submission.cancel_hook = [cancelled]() {
-		cancelled->store(true, std::memory_order_release);
-	};
-	submission.body = [cancelled, operation = std::move(operation),
-		label = std::string(label)]() mutable {
-		operation_state_t state = operation_state_t::succeeded;
-		std::string detail = label + " completed";
-		auto next = copy_publication(state, label, detail);
-		try {
-			if (cancelled->load(std::memory_order_acquire)) {
-				state = operation_state_t::cancelled;
-				detail = label + " was cancelled";
-			} else {
-				operation(*next, cancelled);
+	pending_scope_t setup_scope(lifecycle);
+	std::shared_ptr<std::atomic<bool>> cancelled;
+	std::uint64_t submitted_task_id = 0;
+	try {
+		auto loading = copy_publication(operation_state_t::loading, label, {});
+		std::atomic_store_explicit(&rt.publication,
+			std::shared_ptr<const snapshot_t>(std::move(loading)),
+			std::memory_order_release);
+		cancelled = std::make_shared<std::atomic<bool>>(false);
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "ai_skill_manager";
+		submission.label = label;
+		submission.thread_class = "bounded_task";
+		submission.domain = domain;
+		submission.priority = 3;
+		submission.generation = rt.request_generation.fetch_add(1,
+			std::memory_order_acq_rel);
+		submission.cancel_hook = [cancelled]() {
+			cancelled->store(true, std::memory_order_release);
+		};
+		submission.body = [cancelled, lifecycle, operation = std::move(operation),
+			label = std::string(label)]() mutable {
+			pending_scope_t worker_scope(lifecycle);
+			operation_state_t state = operation_state_t::succeeded;
+			std::string detail;
+			std::shared_ptr<snapshot_t> next;
+			try {
+				detail = label + " completed";
+				next = copy_publication(state, label, detail);
 				if (cancelled->load(std::memory_order_acquire)) {
 					state = operation_state_t::cancelled;
 					detail = label + " was cancelled";
+				} else {
+					operation(*next, cancelled);
+					if (cancelled->load(std::memory_order_acquire)) {
+						state = operation_state_t::cancelled;
+						detail = label + " was cancelled";
+					}
 				}
+			} catch (const std::exception& exception) {
+				state = operation_state_t::failed;
+				try { detail = exception.what(); }
+				catch (...) { detail.clear(); }
+			} catch (...) {
+				state = operation_state_t::failed;
+				try { detail = "Skills operation failed"; }
+				catch (...) { detail.clear(); }
 			}
-		} catch (const std::exception& exception) {
-			state = operation_state_t::failed;
-			detail = exception.what();
-		} catch (...) {
-			state = operation_state_t::failed;
-			detail = "Skills operation failed";
+			const bool terminal_owner = worker_scope.lifecycle->finish([&]() {
+				try {
+					if (!next) next = copy_publication(state, label, detail);
+					next->state = state;
+					next->operation = label;
+					next->detail = detail;
+					publish_terminal(std::move(next));
+				} catch (...) {
+					state = operation_state_t::failed;
+					try {
+						detail = "Skills Manager could not publish the operation result";
+						auto failure = copy_publication(state, label, detail);
+						publish_terminal(std::move(failure));
+					} catch (...) {}
+				}
+			});
+			worker_scope.dismiss();
+			if (!terminal_owner) return;
+			if (state == operation_state_t::failed)
+				throw std::runtime_error(detail.empty()
+					? "Skills operation failed" : detail);
+		};
+		const auto submitted = aida::infra::executor::submit(std::move(submission));
+		if (!submitted.submitted) {
+			const std::string detail = submitted.reject_reason.empty()
+				? "Skills executor rejected the operation" : submitted.reject_reason;
+			static_cast<void>(lifecycle->finish([&]() {
+				publish_terminal(copy_publication(operation_state_t::failed, label, detail));
+			}));
+			setup_scope.dismiss();
+			if (error) *error = detail;
+			return false;
 		}
-		next->state = state;
-		next->operation = label;
-		next->detail = detail;
-		queue_completion(std::move(next));
-		runtime().pending.store(false, std::memory_order_release);
-		if (state == operation_state_t::failed)
-			throw std::runtime_error(detail);
-	};
-	const auto submitted = aida::infra::executor::submit(std::move(submission));
-	if (!submitted.submitted) {
-		rt.pending.store(false, std::memory_order_release);
-		const std::string detail = submitted.reject_reason.empty()
-			? "Skills executor rejected the operation" : submitted.reject_reason;
-		queue_completion(copy_publication(operation_state_t::failed, label, detail));
-		if (error) *error = detail;
+		submitted_task_id = submitted.task_id;
+		aida::ui::task_center::task_registration_t registration;
+		registration.id = "skills.manager." + std::to_string(submitted.task_id);
+		registration.source = "Skills";
+		registration.owner = "ai_skill_manager";
+		registration.owner_view = "view.ai.skills";
+		registration.owner_action = action;
+		registration.label = label;
+		registration.stage = "Queued";
+		registration.affected_entity = "skill catalog";
+		registration.cancellation_is_safe = true;
+		registration.callbacks.cancel = [cancelled, task_id = submitted.task_id]() {
+			cancelled->store(true, std::memory_order_release);
+			return aida::infra::executor::cancel(task_id);
+		};
+		if (!aida::ui::task_center::try_register_executor_job(submitted.task_id,
+			std::move(registration))) {
+			cancelled->store(true, std::memory_order_release);
+			static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+			const std::string detail = "Task Center rejected Skills ownership";
+			static_cast<void>(lifecycle->finish([&]() {
+				publish_terminal(copy_publication(operation_state_t::failed, label, detail));
+			}));
+			setup_scope.dismiss();
+			if (error) *error = detail;
+			return false;
+		}
+		setup_scope.dismiss();
+		return true;
+	} catch (const std::exception& exception) {
+		if (cancelled) cancelled->store(true, std::memory_order_release);
+		if (submitted_task_id != 0) {
+			try { static_cast<void>(aida::infra::executor::cancel(submitted_task_id)); }
+			catch (...) {}
+		}
+		std::string detail;
+		try { detail = exception.what(); }
+		catch (...) {
+			try { detail = "Skills Manager setup failed"; } catch (...) {}
+		}
+		static_cast<void>(lifecycle->finish([&]() {
+			publish_terminal(copy_publication(operation_state_t::failed, label, detail));
+		}));
+		setup_scope.dismiss();
+		if (error) {
+			try { *error = detail; } catch (...) {}
+		}
+		return false;
+	} catch (...) {
+		if (cancelled) cancelled->store(true, std::memory_order_release);
+		if (submitted_task_id != 0) {
+			try { static_cast<void>(aida::infra::executor::cancel(submitted_task_id)); }
+			catch (...) {}
+		}
+		try {
+			const std::string detail = "Skills Manager setup failed";
+			static_cast<void>(lifecycle->finish([&]() {
+				publish_terminal(copy_publication(operation_state_t::failed, label, detail));
+			}));
+			if (error) *error = detail;
+		} catch (...) {}
+		static_cast<void>(lifecycle->release());
+		setup_scope.dismiss();
 		return false;
 	}
-	aida::ui::task_center::task_registration_t registration;
-	registration.id = "skills.manager." + std::to_string(submitted.task_id);
-	registration.source = "Skills";
-	registration.owner = "ai_skill_manager";
-	registration.owner_view = "view.ai.skills";
-	registration.owner_action = action;
-	registration.label = label;
-	registration.stage = "Queued";
-	registration.affected_entity = "skill catalog";
-	registration.cancellation_is_safe = true;
-	registration.callbacks.cancel = [cancelled, task_id = submitted.task_id]() {
-		cancelled->store(true, std::memory_order_release);
-		return aida::infra::executor::cancel(task_id);
-	};
-	if (!aida::ui::task_center::try_register_executor_job(submitted.task_id,
-		std::move(registration))) {
-		cancelled->store(true, std::memory_order_release);
-		static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
-		const std::string detail = "Task Center rejected Skills ownership";
-		rt.pending.store(false, std::memory_order_release);
-		queue_completion(copy_publication(operation_state_t::failed, label, detail));
-		if (error) *error = detail;
-		return false;
-	}
-	return true;
 }
 
 #endif
@@ -201,11 +301,6 @@ const aida::skills::skill_metadata_t* find(const snapshot_ptr& publication,
 void begin_frame()
 {
 	auto& rt = runtime();
-	auto completion = std::atomic_exchange_explicit(&rt.completion,
-		std::shared_ptr<const snapshot_t>{}, std::memory_order_acq_rel);
-	if (completion)
-		std::atomic_store_explicit(&rt.publication, std::move(completion),
-			std::memory_order_release);
 	bool expected = false;
 	if (!rt.initialized.compare_exchange_strong(expected, true,
 		std::memory_order_acq_rel)) return;

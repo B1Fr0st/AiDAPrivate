@@ -2923,13 +2923,6 @@ void helpers::render_title()
 	globals::ui::accent = aida::ui::resolved().accent;
 
 	const auto& shell_theme = aida::ui::resolved();
-	const int th_pb_r = (shell_theme.panel_bg >>  0) & 0xFF;
-	const int th_pb_g = (shell_theme.panel_bg >>  8) & 0xFF;
-	const int th_pb_b = (shell_theme.panel_bg >> 16) & 0xFF;
-	const int th_bb_r = (shell_theme.bg_base >>  0) & 0xFF;
-	const int th_bb_g = (shell_theme.bg_base >>  8) & 0xFF;
-	const int th_bb_b = (shell_theme.bg_base >> 16) & 0xFF;
-
 
 	if (!ImGui::GetIO().WantTextInput) {
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)

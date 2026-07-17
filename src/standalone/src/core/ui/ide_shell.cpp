@@ -9,6 +9,7 @@
 #include "core/ui/workspace_layout.hpp"
 #include "core/ai/standalone_chat.hpp"
 #include "core/debugger/debugger_engine.hpp"
+#include "core/debugger/debugger_view.hpp"
 #include "core/disasm/disasm_view.hpp"
 #include "core/editor/code_editor.hpp"
 #include "core/network/network_view.hpp"
@@ -772,6 +773,7 @@ void render_primary_surfaces() noexcept
     application_views::render_registry_owned_windows();
     explorer_views::render_global_file_operation_dialogs();
     disasm_view::render_static_patch_workflow();
+    debugger_view::render_global_dialogs();
     render_activity_bar();
     render_status_bar();
     current.primary_surfaces_frame = frame;

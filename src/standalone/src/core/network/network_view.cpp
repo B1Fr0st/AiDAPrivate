@@ -341,7 +341,8 @@ static std::uint64_t artifact_hash(const std::vector<std::uint8_t>& bytes) {
 
 static std::uint64_t artifact_hash(std::string_view text) {
     std::uint64_t hash = 14695981039346656037ULL;
-    for (const unsigned char value : text) {
+    for (const char character : text) {
+        const auto value = static_cast<unsigned char>(character);
         hash ^= value;
         hash *= 1099511628211ULL;
     }
@@ -2397,7 +2398,6 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         compute_row_entrance(s_conn_rows, filtered_indices.size(), row_alpha, row_xoff, visible_index);
         float r_alpha = alpha * row_alpha;
 
-        float ry = ImGui::GetCursorPosY();
         float abs_ry = ImGui::GetCursorScreenPos().y;
 
         if (conn_visible_row & 1)
@@ -2463,7 +2463,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         dl->AddText(ImVec2(cx, abs_ry + text_oy), txt_col, remote_str.c_str());
 
         conn_visible_row++;
-        ImGui::SetCursorPosY(ry + row_h);
+        ImGui::Dummy(ImVec2(1.f, (std::max)(1.f, row_h - ImGui::GetStyle().ItemSpacing.y)));
     }
     }
 
@@ -2783,8 +2783,9 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             ? "Packets will stream in here as they are observed by the kernel driver."
             : "Press Start Capture above to begin recording network traffic.";
         aida::ui::empty_state::render(ImVec2(list_org.x, list_org.y), ImVec2(list_sz.x, list_h), cfg);
-        ImGui::Dummy(ImVec2(0.f, list_h));
+        ImGui::Dummy(ImVec2(0.f, 0.f));
         ImGui::EndChild();
+        ImGui::Dummy(ImVec2(0.f, 0.f));
         ImGui::EndChild();
         return;
     }

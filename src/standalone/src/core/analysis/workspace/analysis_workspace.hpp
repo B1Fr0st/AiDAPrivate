@@ -30,6 +30,7 @@ class workspace_registry_t;
 struct workspace_publication_state_t;
 struct projection_invalidation_set_t;
 struct managed_artifact_publication_t;
+struct workspace_overlay_presentation_t;
 
 class workspace_analysis_run_t final {
 public:
@@ -84,11 +85,14 @@ struct analysis_publication_t final {
                            std::shared_ptr<search_index_t> search_index_value,
                            workspace_readiness_t readiness_value,
                            std::shared_ptr<const managed_artifact_publication_t>
-                               managed_artifacts_value = {}) noexcept
+                               managed_artifacts_value = {},
+                           std::shared_ptr<const workspace_overlay_presentation_t>
+                               overlay_presentation_value = {}) noexcept
         : snapshot(std::move(snapshot_value)),
           provider(std::move(provider_value)),
           search_index(std::move(search_index_value)),
           managed_artifacts(std::move(managed_artifacts_value)),
+          overlay_presentation(std::move(overlay_presentation_value)),
           binary_id(snapshot ? snapshot->binary_id : binary_id_t{}),
           load_profile_hash(snapshot ? snapshot->load_profile_hash : sha256_digest_t{}),
           generation(snapshot ? snapshot->generation : 0),
@@ -102,6 +106,7 @@ struct analysis_publication_t final {
     const std::shared_ptr<const byte_provider_t> provider;
     const std::shared_ptr<search_index_t> search_index;
     const std::shared_ptr<const managed_artifact_publication_t> managed_artifacts;
+    const std::shared_ptr<const workspace_overlay_presentation_t> overlay_presentation;
     const binary_id_t binary_id;
     const sha256_digest_t load_profile_hash;
     const std::uint64_t generation;
@@ -138,6 +143,19 @@ struct workspace_view_state_t {
     std::optional<address_t> selection;
     std::vector<address_t> bookmarks;
     std::uint64_t revision = 0;
+};
+
+struct workspace_overlay_presentation_entry_t {
+    address_t address;
+    std::string text;
+};
+
+struct workspace_overlay_presentation_t {
+    std::uint64_t overlay_revision = 0;
+    std::vector<workspace_overlay_presentation_entry_t> comments;
+    std::vector<workspace_overlay_presentation_entry_t> renames;
+    std::vector<workspace_overlay_presentation_entry_t> bookmarks;
+    std::vector<address_t> workspace_bookmarks;
 };
 
 class workspace_lifecycle_participant_t {
@@ -217,10 +235,21 @@ public:
         std::uint64_t target_generation,
         std::uint64_t target_overlay_revision,
         std::shared_ptr<const byte_provider_t> projected_provider,
+        std::shared_ptr<const workspace_overlay_presentation_t> projected_presentation,
         const projection_invalidation_set_t& invalidation,
         std::function<workspace_result_t<void>(
             const std::shared_ptr<const analysis_snapshot_t>&,
             const std::shared_ptr<search_index_t>&)> finalizer);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    workspace_result_t<void> publish_preview_overlay_generation(
+        std::uint64_t expected_generation,
+        std::uint64_t expected_analysis_revision,
+        std::uint64_t expected_overlay_revision,
+        std::uint64_t target_generation,
+        std::uint64_t target_overlay_revision,
+        std::shared_ptr<const workspace_overlay_presentation_t> presentation,
+        std::function<workspace_result_t<void>()> finalizer);
+#endif
 
     std::uint64_t generation() const noexcept;
     std::uint64_t analysis_revision() const noexcept;
@@ -255,6 +284,11 @@ public:
     workspace_view_state_t view_state() const;
     workspace_result_t<void> update_view_state(
         const std::function<void(workspace_view_state_t&)>& mutation);
+    std::shared_ptr<const workspace_overlay_presentation_t>
+        overlay_presentation() const noexcept;
+    workspace_result_t<void> publish_overlay_presentation(
+        std::uint64_t expected_overlay_revision,
+        std::shared_ptr<const workspace_overlay_presentation_t> presentation);
 
     workspace_result_t<void> register_lifecycle_participant(
         std::shared_ptr<workspace_lifecycle_participant_t> participant);

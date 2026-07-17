@@ -29,7 +29,6 @@
 #include <windows.h>
 #include <intrin.h>
 
-#include "../infra/executor.hpp"
 #include "theme.hpp"
 #include "mcp_standalone.hpp"
 #include "mcp_client.hpp"
@@ -110,6 +109,8 @@
 
 #endif
 
+#include "../infra/executor.hpp"
+#include "../analysis/workspace/overlay_journal.hpp"
 #include "../settings/settings_persistence_service.hpp"
 #include "../settings/theme_transfer_service.hpp"
 #include "../editor/code_editor.hpp"
@@ -128,6 +129,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <limits>
 #include <mutex>
@@ -3353,6 +3355,44 @@ std::string start_new_conversation()
 
 #endif
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+namespace {
+
+bool submit_chat_task(const char* label,
+                      aida::infra::executor::domain_t domain,
+                      const char* thread_class,
+                      int priority,
+                      std::function<void()> body)
+{
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "ai_chat";
+    submission.label = label;
+    submission.thread_class = thread_class;
+    submission.domain = domain;
+    submission.priority = priority;
+    submission.body = std::move(body);
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (submitted.submitted && submitted.task_id != 0) {
+        aida::ui::task_center::task_registration_t registration;
+        registration.owner = "automation";
+        registration.owner_view = "view.ai_chat";
+        registration.owner_action = label ? label : "ai_chat.task";
+        registration.label = label ? label : "AI Chat task";
+        registration.stage = "Queued";
+        registration.cancellation_is_safe = false;
+        registration.callbacks.focus = [] {
+            (void)aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.ai_chat"));
+        };
+        (void)aida::ui::task_center::register_executor_job(
+            submitted.task_id, std::move(registration));
+    }
+    return submitted.submitted;
+}
+
+}
+#endif
+
 namespace aida::automation_ui {
 
 namespace {
@@ -4449,22 +4489,55 @@ action_result_t queue_reverse_engineering_proposal_apply(
                                    context = binding.workspace,
                                    address = binding.address](
                     bool succeeded, std::string error) {
-                    bool verified = succeeded;
-                    if (verified && proposal.kind ==
-                            reverse_engineering_proposal_kind_t::analysis_rename)
-                        verified = disasm_view::resolve_name(context, address) ==
-                            proposal.after_value;
-                    else if (verified && proposal.kind ==
-                            reverse_engineering_proposal_kind_t::analysis_comment)
-                        verified = disasm_view::comment(context, address) ==
-                            proposal.after_value;
-                    else if (verified && proposal.kind ==
-                            reverse_engineering_proposal_kind_t::analysis_type)
-                        verified = overlay_type_at(context, address) ==
-                            proposal.after_value;
-                    if (succeeded && !verified)
-                        error = "The proposal-specific analysis mutation completed without an exact terminal readback match.";
-                    finish_reverse_engineering_proposal(operation_id, verified,
+                    bool verified = false;
+                    try {
+                        if (succeeded && context.workspace &&
+                            proposal.expected_generation !=
+                                (std::numeric_limits<std::uint64_t>::max)() &&
+                            proposal.expected_overlay_revision !=
+                                (std::numeric_limits<std::uint64_t>::max)()) {
+                            auto terminal = context;
+                            terminal.publication =
+                                context.workspace->analysis_publication();
+                            terminal.image = terminal.publication &&
+                                    terminal.publication->snapshot
+                                ? terminal.publication->snapshot->image
+                                : nullptr;
+                            const bool terminal_fence = terminal.publication &&
+                                terminal.publication->generation ==
+                                    proposal.expected_generation + 1U &&
+                                terminal.publication->analysis_revision ==
+                                    proposal.expected_revision &&
+                                terminal.publication->overlay_revision ==
+                                    proposal.expected_overlay_revision + 1U;
+                            if (terminal_fence && proposal.kind ==
+                                    reverse_engineering_proposal_kind_t::analysis_rename)
+                                verified = disasm_view::resolve_name(
+                                    terminal, address) == proposal.after_value;
+                            else if (terminal_fence && proposal.kind ==
+                                    reverse_engineering_proposal_kind_t::analysis_comment)
+                                verified = disasm_view::comment(
+                                    terminal, address) == proposal.after_value;
+                            else if (terminal_fence && proposal.kind ==
+                                    reverse_engineering_proposal_kind_t::analysis_type)
+                                verified = overlay_type_at(
+                                    terminal, address) == proposal.after_value;
+                            verified = verified &&
+                                context.workspace->analysis_publication() ==
+                                    terminal.publication;
+                        }
+                    } catch (const std::exception& exception) {
+                        if (succeeded)
+                            error = std::string(
+                                "The authoritative analysis overlay committed, but exact terminal readback failed: ") +
+                                exception.what();
+                    } catch (...) {
+                        if (succeeded)
+                            error = "The authoritative analysis overlay committed, but exact terminal readback failed.";
+                    }
+                    if (succeeded && !verified && error.empty())
+                        error = "The authoritative analysis overlay committed, but its exact generation-fenced terminal readback did not match the proposal.";
+                    finish_reverse_engineering_proposal(operation_id, succeeded,
                         verified
                             ? "The authoritative analysis overlay committed and its proposal-specific completion matched."
                             : error.empty()
@@ -6227,8 +6300,7 @@ void render_evidence_view(float width, float height)
                         capability.disabled_reason.empty()
                             ? "This proposal operation is unavailable"
                             : capability.disabled_reason);
-                item.invoke = [source = proposal.source, action, &apply_requested,
-                               &feedback] {
+                item.invoke = [source = proposal.source, action] {
                     if (action == message_action_t::apply_change) {
                         apply_requested = true;
                         return aida::ui::action_handler_result_t::completed();

@@ -6,8 +6,6 @@
 #include "zydis_disasm.hpp"
 #include "disasm_view.hpp"
 #include "function_index.hpp"
-#include "rename_store.hpp"
-#include "comment_store.hpp"
 #include "xref_db.hpp"
 #include "xref_engine.hpp"
 #include "pe_parser.hpp"

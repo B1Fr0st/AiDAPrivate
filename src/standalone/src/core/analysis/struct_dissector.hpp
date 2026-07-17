@@ -412,24 +412,50 @@ inline void ensure_preview_fixture() {
 	struct_def_t context;
 	context.name = "IMAGE_RUNTIME_CONTEXT";
 	context.fields = {
-		{"image_base", field_type_t::pointer, 0x00, 8, 1, -1, {}, true, -1, "Mapped image base"},
-		{"entry_point", field_type_t::pointer, 0x08, 8, 1, -1, {}, true, -1, "Resolved entry point"},
-		{"image_size", field_type_t::uint32, 0x10, 4, 1, -1, {}, false, -1, "Size of image"},
-		{"machine", field_type_t::uint16, 0x14, 2, 1, -1, {}, false, -1, "PE machine type"},
-		{"section_count", field_type_t::uint16, 0x16, 2, 1, -1, {}, false, -1, "Number of sections"},
-		{"flags", field_type_t::uint32, 0x18, 4, 1, -1, {}, false, -1, "Analysis flags"},
-		{"module_name", field_type_t::ascii_string, 0x20, 16, 1, -1, {}, false, -1, "Target module"}
+		{"image_base", field_type_t::pointer, 0x00, 8, 1, -1,
+			std::vector<int>{}, true, -1, "Mapped image base", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"entry_point", field_type_t::pointer, 0x08, 8, 1, -1,
+			std::vector<int>{}, true, -1, "Resolved entry point", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"image_size", field_type_t::uint32, 0x10, 4, 1, -1,
+			std::vector<int>{}, false, -1, "Size of image", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"machine", field_type_t::uint16, 0x14, 2, 1, -1,
+			std::vector<int>{}, false, -1, "PE machine type", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"section_count", field_type_t::uint16, 0x16, 2, 1, -1,
+			std::vector<int>{}, false, -1, "Number of sections", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"flags", field_type_t::uint32, 0x18, 4, 1, -1,
+			std::vector<int>{}, false, -1, "Analysis flags", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"module_name", field_type_t::ascii_string, 0x20, 16, 1, -1,
+			std::vector<int>{}, false, -1, "Target module", 0, 0, 0,
+			std::string{}, 0, 0, 0}
 	};
 	context.total_size = 0x30;
 	struct_def_t node;
 	node.name = "CONTROL_FLOW_NODE";
 	node.fields = {
-		{"address", field_type_t::pointer, 0x00, 8, 1, -1, {}, true, -1, "Block start"},
-		{"successors", field_type_t::pointer, 0x08, 8, 1, -1, {}, true, -1, "Successor array"},
-		{"successor_count", field_type_t::uint32, 0x10, 4, 1, -1, {}, false, -1, "Outgoing edge count"},
-		{"instruction_count", field_type_t::uint32, 0x14, 4, 1, -1, {}, false, -1, "Instruction count"},
-		{"flags", field_type_t::uint64, 0x18, 8, 1, -1, {}, false, -1, "Node flags"},
-		{"confidence", field_type_t::float32, 0x20, 4, 1, -1, {}, false, -1, "Recovery confidence"}
+		{"address", field_type_t::pointer, 0x00, 8, 1, -1,
+			std::vector<int>{}, true, -1, "Block start", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"successors", field_type_t::pointer, 0x08, 8, 1, -1,
+			std::vector<int>{}, true, -1, "Successor array", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"successor_count", field_type_t::uint32, 0x10, 4, 1, -1,
+			std::vector<int>{}, false, -1, "Outgoing edge count", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"instruction_count", field_type_t::uint32, 0x14, 4, 1, -1,
+			std::vector<int>{}, false, -1, "Instruction count", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"flags", field_type_t::uint64, 0x18, 8, 1, -1,
+			std::vector<int>{}, false, -1, "Node flags", 0, 0, 0,
+			std::string{}, 0, 0, 0},
+		{"confidence", field_type_t::float32, 0x20, 4, 1, -1,
+			std::vector<int>{}, false, -1, "Recovery confidence", 0, 0, 0,
+			std::string{}, 0, 0, 0}
 	};
 	node.total_size = 0x24;
 	context.stable_id = allocate_stable_id_locked();

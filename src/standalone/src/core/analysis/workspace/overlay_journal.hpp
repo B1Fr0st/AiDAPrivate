@@ -197,6 +197,20 @@ private:
         bool redo, std::optional<std::uint64_t> expected_revision,
         const cancellation_token_t& cancel);
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    struct preview_history_operation_t {
+        std::size_t index = 0;
+        std::string entity_key;
+        std::optional<overlay_operation_t> before;
+        std::optional<overlay_operation_t> after;
+    };
+
+    struct preview_history_transaction_t {
+        std::uint64_t transaction_id = 0;
+        std::vector<preview_history_operation_t> operations;
+    };
+#endif
+
     std::weak_ptr<analysis_workspace_t> workspace_;
     std::shared_ptr<workspace_database_t> database_;
     overlay_limits_t limits_;
@@ -209,6 +223,9 @@ private:
     std::uint64_t history_cursor_ = 0;
     std::uint64_t next_transaction_id_ = 1;
     std::uint64_t history_epoch_ = 1;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    std::vector<preview_history_transaction_t> preview_history_;
+#endif
     cancellation_source_t cancellation_;
 };
 

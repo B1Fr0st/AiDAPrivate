@@ -39,8 +39,8 @@ struct snapshot_t {
 
 inline std::uint64_t hash_text(const std::string& value) noexcept {
     std::uint64_t hash = 1469598103934665603ULL;
-    for (const unsigned char character : value) {
-        hash ^= character;
+    for (const char character : value) {
+        hash ^= static_cast<std::uint64_t>(static_cast<unsigned char>(character));
         hash *= 1099511628211ULL;
     }
     return hash == 0 ? 1 : hash;

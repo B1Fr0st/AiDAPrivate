@@ -3747,6 +3747,13 @@ namespace binary_map_view {
 							fn.xref_count, fn.callee_count,
 							fn.pinned ? 1 : 0);
 					}
+					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
+						diag::log_tagged_fmt("binary_map",
+							"function_row_double_click name='%s' va=0x%llX",
+							fn.name.c_str(),
+							static_cast<unsigned long long>(fn.va));
+						detail::jump_to_address(s, fn.va);
+					}
 					const bool function_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
 					const bool function_keyboard_context = detail::keyboard_context_requested(sel);
 					if (function_pointer_context || function_keyboard_context) {
@@ -3757,14 +3764,6 @@ namespace binary_map_view {
 							"function_row_right_click name='%s' va=0x%llX",
 							fn.name.c_str(),
 							static_cast<unsigned long long>(fn.va));
-					}
-					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
-						diag::log_tagged_fmt("binary_map",
-							"function_row_double_click name='%s' va=0x%llX",
-							fn.name.c_str(),
-							static_cast<unsigned long long>(fn.va));
-						detail::jump_to_address(s, fn.va);
-					}
 						aida::ui::application_ui::retained_entity_context_t retained;
 						retained.owner_id = "analysis.binary_map.function";
 						retained.entity_id = std::to_string(fn.va) + ":" + fn.name;

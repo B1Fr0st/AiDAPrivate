@@ -417,6 +417,7 @@ void render_audits_pane(float w, float h, float alpha)
             }
         }
     }
+    ImGui::Dummy(ImVec2(0.f, 0.f));
     if (audits.empty()) {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                            "No audits yet. Click 'New Audit' to start.");

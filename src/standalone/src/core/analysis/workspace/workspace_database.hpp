@@ -280,6 +280,8 @@ private:
     workspace_result_t<void> discard_candidate(
         const workspace_persistence_candidate_t& candidate,
         const cancellation_token_t& cancel);
+    void acknowledge_promoted_candidate(
+        const workspace_persistence_candidate_t& candidate) noexcept;
 
     workspace_database_options_t options_;
     std::shared_ptr<connection_state_t> state_;

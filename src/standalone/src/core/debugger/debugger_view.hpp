@@ -202,6 +202,7 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 void render_execution_controls(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b);
 void render_global_target_dialog();
+void render_global_dialogs();
 execution_capability_t execution_capability(execution_command_t command);
 bool execute_command(execution_command_t command, std::string* error = nullptr);
 execution_capability_t patch_panel_capability(patch_panel_command_t command);

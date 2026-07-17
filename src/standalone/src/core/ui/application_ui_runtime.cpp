@@ -22,6 +22,7 @@
 #include "../disasm/disasm_view.hpp"
 #include "../disasm/pseudocode_view.hpp"
 #include "../disasm/rename_dialog.hpp"
+#include "../analysis/workspace/overlay_journal.hpp"
 #include "../analysis/struct_recon_view.hpp"
 #include "../analysis/types_hub_view.hpp"
 #include "../analysis/analysis_relationship_views.hpp"

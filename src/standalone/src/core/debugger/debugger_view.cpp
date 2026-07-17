@@ -130,8 +130,6 @@ std::atomic<std::uint64_t> g_code_cave_publication_sequence{1};
 std::shared_ptr<const code_cave_publication_t> g_code_cave_publication =
 	std::make_shared<const code_cave_publication_t>();
 
-bool dispatch_patch_panel_command(patch_panel_command_t command, std::string* error);
-
 template <typename Fn>
 bool post_debugger_ui(Fn&& fn, const char* label) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -226,6 +224,8 @@ bool write_file_atomic_exact(const std::string& destination,
 #endif
 
 }
+
+bool dispatch_patch_panel_command(patch_panel_command_t command, std::string* error);
 
 void register_debugger_task(const aida::infra::executor::submit_result_t& submitted,
 	const char* owner_view, const char* owner_action, const char* label,
@@ -6910,8 +6910,10 @@ static void render_debugger_status_bar(ImVec2 pos, float width,
 
 execution_capability_t address_mutation_capability(std::uint64_t address,
 	bool toggle_breakpoint, std::uint32_t expected_pid) {
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	if (g_target_mutation_pending.load(std::memory_order_acquire))
 		return {false, "Another live-target mutation is still pending"};
+#endif
 	const auto context = debugger_interaction::capture(
 		debugger_interaction::kind_t::instruction, address);
 	if (expected_pid == 0)
@@ -7200,7 +7202,6 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 	(void)accent_b;
 	if (!is_visible_sub_tab(pane) || width <= 0.f || height <= 0.f)
 		return;
-	auto& ui = g_ui;
 
 	const auto status = debugger_engine::g_state.status.load(std::memory_order_acquire);
 	debugger_interaction::synchronize_target(driver_bridge::attached_pid(),
@@ -7308,114 +7309,109 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 	}
 	ImGui::EndChild();
 	ImGui::PopID();
+	g_ui.active_tab = previous_tab;
+}
 
+void render_global_dialogs() {
+	auto& ui = g_ui;
 	if (ui.patch_stage_open &&
 		!ImGui::IsPopupOpen("Stage Patch Review###debugger_patch_stage"))
 		aida::ui::design::open_dialog("debugger_patch_stage", "Stage Patch Review");
-	if (aida::ui::design::begin_dialog("debugger_patch_stage", "Stage Patch Review",
-			ImVec2(620.f, 420.f), ImVec2(420.f, 300.f))) {
-		const auto dialog_metrics = aida::ui::design::metrics();
-		const float body_height = (std::max)(120.f,
-			ImGui::GetContentRegionAvail().y - dialog_metrics.dialog_footer_height);
-		ImGui::BeginChild("##patch_stage_body", ImVec2(0.f, body_height), false,
-			ImGuiWindowFlags_AlwaysVerticalScrollbar);
-		ImGui::TextUnformatted("Review a patch definition");
-		ImGui::TextDisabled("This stages an inactive definition. It does not write target memory.");
-		ImGui::Separator();
-		ImGui::Text("Address: 0x%016" PRIX64, ui.patch_stage_address);
-		if (ui.patch_stage_extent != 0)
-			ImGui::Text("Selected range: %" PRIu64 " bytes", ui.patch_stage_extent);
-		ImGui::TextUnformatted("Replacement bytes (hex)");
-		ImGui::SetNextItemWidth(-1.f);
-		if (ImGui::InputTextWithHint("##patch_stage_bytes", "90 90 90",
-				ui.patch_stage_bytes_buf, sizeof(ui.patch_stage_bytes_buf)))
-			refresh_patch_stage_parse_cache();
-		ImGui::TextUnformatted("Description");
-		ImGui::SetNextItemWidth(-1.f);
-		ImGui::InputText("##patch_stage_description", ui.patch_stage_description_buf,
-			sizeof(ui.patch_stage_description_buf));
+	if (!aida::ui::design::begin_dialog("debugger_patch_stage", "Stage Patch Review",
+			ImVec2(620.f, 420.f), ImVec2(420.f, 300.f)))
+		return;
 
-		bool valid = ui.patch_stage_parse_valid;
-		if (!valid && ui.patch_stage_bytes_buf[0] != '\0')
-			ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
-				"Enter complete two-digit hex bytes separated by whitespace (maximum 4096 bytes).");
-		if (ui.patch_stage_extent != 0 && valid &&
-			ui.patch_stage_parsed_bytes.size() > ui.patch_stage_extent) {
-			valid = false;
-			ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
-				"Replacement bytes exceed the retained selected range.");
-		} else if (ui.patch_stage_extent != 0 && valid &&
-			ui.patch_stage_parsed_bytes.size() < ui.patch_stage_extent)
-			ImGui::TextColored(ImVec4(1.f, 0.72f, 0.25f, 1.f),
-				"Replacement bytes cover only part of the retained selected range; review before staging.");
-		if (ui.patch_stage_exact && valid &&
-			ui.patch_stage_parsed_bytes.size() != ui.patch_stage_expected_before.size()) {
-			valid = false;
-			ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
-				"The reviewed replacement must preserve the exact proposal byte range.");
-		}
-		const bool target_ready = driver_bridge::is_loaded() &&
-			driver_bridge::attached_pid() != 0 &&
-			(ui.patch_stage_expected_pid == 0 ||
-			 driver_bridge::attached_pid() == ui.patch_stage_expected_pid) &&
-			(ui.patch_stage_expected_stop_generation == 0 ||
-			 debugger_interaction::current_stop_generation() ==
-				ui.patch_stage_expected_stop_generation);
-		if (!target_ready)
-			ImGui::TextDisabled("The reviewed live target or debugger stop is unavailable; cancel and capture a new patch review.");
-		ImGui::EndChild();
+	const auto dialog_metrics = aida::ui::design::metrics();
+	const float body_height = (std::max)(120.f,
+		ImGui::GetContentRegionAvail().y - dialog_metrics.dialog_footer_height);
+	ImGui::BeginChild("##patch_stage_body", ImVec2(0.f, body_height), false,
+		ImGuiWindowFlags_AlwaysVerticalScrollbar);
+	ImGui::TextUnformatted("Review a patch definition");
+	ImGui::TextDisabled("This stages an inactive definition. It does not write target memory.");
+	ImGui::Separator();
+	ImGui::Text("Address: 0x%016" PRIX64, ui.patch_stage_address);
+	if (ui.patch_stage_extent != 0)
+		ImGui::Text("Selected range: %" PRIu64 " bytes", ui.patch_stage_extent);
+	ImGui::TextUnformatted("Replacement bytes (hex)");
+	ImGui::SetNextItemWidth(-1.f);
+	if (ImGui::InputTextWithHint("##patch_stage_bytes", "90 90 90",
+			ui.patch_stage_bytes_buf, sizeof(ui.patch_stage_bytes_buf)))
+		refresh_patch_stage_parse_cache();
+	ImGui::TextUnformatted("Description");
+	ImGui::SetNextItemWidth(-1.f);
+	ImGui::InputText("##patch_stage_description", ui.patch_stage_description_buf,
+		sizeof(ui.patch_stage_description_buf));
 
-		const auto footer = aida::ui::design::dialog_footer("debugger_patch_stage_footer",
-			"Stage Inactive", valid && target_ready, false, "Cancel");
-		if (footer.confirmed) {
-			const std::uint64_t address = ui.patch_stage_address;
-			const std::uint64_t extent = ui.patch_stage_extent;
-			const std::string description(ui.patch_stage_description_buf);
-			const bool exact = ui.patch_stage_exact;
-			const std::uint32_t expected_pid = ui.patch_stage_expected_pid;
-			const auto expected_before = ui.patch_stage_expected_before;
-			const auto parsed = ui.patch_stage_parsed_bytes;
-			const auto context = debugger_interaction::capture(
-				debugger_interaction::kind_t::instruction, address, 0, -1, 0,
-				extent == 0 ? static_cast<std::uint64_t>(parsed.size()) : extent,
-				description);
-			const bool queued = queue_debugger_mutation("Capture patch rollback bytes",
-				"debugger.patch_stage", context,
-				[address, parsed, description, exact, expected_pid, expected_before]() mutable {
-					mutation_result_t result;
-					const int index = exact
-						? code_patcher::create_patch_exact(address, expected_before,
-							parsed, expected_pid, description)
-						: code_patcher::create_patch(address, parsed, description);
-					result.ok = result.verified = index >= 0;
-					if (!result.verified)
-						result.detail = "Unable to capture exact rollback bytes; no patch was staged.";
-					else {
-						const bool posted = post_debugger_ui([index]() {
-							g_ui.patches_panel.selected = index;
-							aida::ui::application_views::open_or_focus(
-								aida::ui::stable_view_id_t("view.debug.patches"));
-						}, "patch_stage_selection");
-						if (!posted) {
-							static_cast<void>(code_patcher::remove_patch(index));
-							result.ok = result.verified = false;
-							result.detail = "Patch staging could not publish its reviewed definition.";
-						}
+	bool valid = ui.patch_stage_parse_valid;
+	if (!valid && ui.patch_stage_bytes_buf[0] != '\0')
+		ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
+			"Enter complete two-digit hex bytes separated by whitespace (maximum 4096 bytes).");
+	if (ui.patch_stage_extent != 0 && valid &&
+		ui.patch_stage_parsed_bytes.size() > ui.patch_stage_extent) {
+		valid = false;
+		ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
+			"Replacement bytes exceed the retained selected range.");
+	} else if (ui.patch_stage_extent != 0 && valid &&
+		ui.patch_stage_parsed_bytes.size() < ui.patch_stage_extent)
+		ImGui::TextColored(ImVec4(1.f, 0.72f, 0.25f, 1.f),
+			"Replacement bytes cover only part of the retained selected range; review before staging.");
+	if (ui.patch_stage_exact && valid &&
+		ui.patch_stage_parsed_bytes.size() != ui.patch_stage_expected_before.size()) {
+		valid = false;
+		ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
+			"The reviewed replacement must preserve the exact proposal byte range.");
+	}
+	const bool target_ready = driver_bridge::is_loaded() &&
+		driver_bridge::attached_pid() != 0 &&
+		(ui.patch_stage_expected_pid == 0 ||
+		 driver_bridge::attached_pid() == ui.patch_stage_expected_pid) &&
+		(ui.patch_stage_expected_stop_generation == 0 ||
+		 debugger_interaction::current_stop_generation() ==
+			ui.patch_stage_expected_stop_generation);
+	if (!target_ready)
+		ImGui::TextDisabled("The reviewed live target or debugger stop is unavailable; cancel and capture a new patch review.");
+	ImGui::EndChild();
+
+	const auto footer = aida::ui::design::dialog_footer("debugger_patch_stage_footer",
+		"Stage Inactive", valid && target_ready, false, "Cancel");
+	if (footer.confirmed) {
+		const std::uint64_t address = ui.patch_stage_address;
+		const std::uint64_t extent = ui.patch_stage_extent;
+		const std::string description(ui.patch_stage_description_buf);
+		const bool exact = ui.patch_stage_exact;
+		const std::uint32_t expected_pid = ui.patch_stage_expected_pid;
+		const auto expected_before = ui.patch_stage_expected_before;
+		const auto parsed = ui.patch_stage_parsed_bytes;
+		const auto context = debugger_interaction::capture(
+			debugger_interaction::kind_t::instruction, address, 0, -1, 0,
+			extent == 0 ? static_cast<std::uint64_t>(parsed.size()) : extent,
+			description);
+		const bool queued = queue_debugger_mutation("Capture patch rollback bytes",
+			"debugger.patch_stage", context,
+			[address, parsed, description, exact, expected_pid, expected_before]() mutable {
+				mutation_result_t result;
+				const int index = exact
+					? code_patcher::create_patch_exact(address, expected_before,
+						parsed, expected_pid, description)
+					: code_patcher::create_patch(address, parsed, description);
+				result.ok = result.verified = index >= 0;
+				if (!result.verified)
+					result.detail = "Unable to capture exact rollback bytes; no patch was staged.";
+				else {
+					const bool posted = post_debugger_ui([index]() {
+						g_ui.patches_panel.selected = index;
+						aida::ui::application_views::open_or_focus(
+							aida::ui::stable_view_id_t("view.debug.patches"));
+					}, "patch_stage_selection");
+					if (!posted) {
+						static_cast<void>(code_patcher::remove_patch(index));
+						result.ok = result.verified = false;
+						result.detail = "Patch staging could not publish its reviewed definition.";
 					}
-					return result;
-				}, false);
-			if (queued) {
-				ui.patch_stage_open = false;
-				ui.patch_stage_exact = false;
-				ui.patch_stage_expected_pid = 0;
-				ui.patch_stage_expected_stop_generation = 0;
-				ui.patch_stage_expected_before.clear();
-				ui.patch_stage_parsed_bytes.clear();
-				ui.patch_stage_parse_valid = false;
-				ImGui::CloseCurrentPopup();
-			}
-		}
-		if (footer.cancelled) {
+				}
+				return result;
+			}, false);
+		if (queued) {
 			ui.patch_stage_open = false;
 			ui.patch_stage_exact = false;
 			ui.patch_stage_expected_pid = 0;
@@ -7425,9 +7421,18 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 			ui.patch_stage_parse_valid = false;
 			ImGui::CloseCurrentPopup();
 		}
-		ImGui::EndPopup();
 	}
-	g_ui.active_tab = previous_tab;
+	if (footer.cancelled) {
+		ui.patch_stage_open = false;
+		ui.patch_stage_exact = false;
+		ui.patch_stage_expected_pid = 0;
+		ui.patch_stage_expected_stop_generation = 0;
+		ui.patch_stage_expected_before.clear();
+		ui.patch_stage_parsed_bytes.clear();
+		ui.patch_stage_parse_valid = false;
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::EndPopup();
 }
 
 void render_execution_controls(float pos_x, float pos_y, float width, float height,

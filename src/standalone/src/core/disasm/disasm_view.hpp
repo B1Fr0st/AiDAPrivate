@@ -53,6 +53,9 @@ struct mutation_state_t {
     std::uint32_t pending = 0;
     std::uint64_t overlay_revision = 0;
     std::string error;
+    bool derived_publication_pending = false;
+    std::uint64_t derived_publication_revision = 0;
+    std::string derived_publication_error;
 };
 
 enum class metadata_line_kind_t : std::uint8_t {
@@ -102,6 +105,10 @@ struct state_t {
     std::uint64_t cached_overlay_revision = 0;
     std::string format_error;
     std::string mutation_error;
+    std::atomic<bool> derived_publication_retry_pending{false};
+    std::uint64_t derived_publication_revision = 0;
+    std::uint64_t derived_publication_target_revision = 0;
+    std::string derived_publication_error;
     bool rebase_popup_open = false;
     char rebase_buf[64] = {};
     std::string rebase_error;
@@ -166,6 +173,9 @@ std::string comment(const workspace_context_t& context,
                     const aida::analysis::address_t& address);
 std::string auto_comment(const workspace_context_t& context,
                          const aida::analysis::address_t& address);
+std::vector<bookmark_t> bookmark_snapshot(const workspace_context_t& context);
+bool bookmarked(const workspace_context_t& context,
+                const aida::analysis::address_t& address);
 void request_format_range(const workspace_context_t& context,
                           std::size_t begin, std::size_t end);
 std::optional<formatted_instruction_t> formatted_instruction(

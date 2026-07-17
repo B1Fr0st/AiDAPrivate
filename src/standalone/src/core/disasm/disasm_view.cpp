@@ -5,8 +5,6 @@
 #include "file_metadata_banner.hpp"
 #include "pseudocode_view.hpp"
 #include "rename_dialog.hpp"
-#include "rename_store.hpp"
-#include "comment_store.hpp"
 #include "../analysis/auto_comment_store.hpp"
 #include "../analysis/types_hub_view.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -52,6 +50,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include <fstream>
 #endif
@@ -65,11 +64,8 @@ namespace disasm_view {
 
 struct workspace_model_t {
     explicit workspace_model_t(const aida::analysis::binary_id_t& id)
-        : comments(id), renames(id), automatic_comments(id),
-          view(std::make_shared<state_t>()) {}
+        : automatic_comments(id), view(std::make_shared<state_t>()) {}
 
-    comment_store::workspace_store_t comments;
-    rename_store::workspace_store_t renames;
     auto_comment_store::workspace_store_t automatic_comments;
     std::shared_ptr<state_t> view;
     std::mutex mutation_mutex;
@@ -122,39 +118,6 @@ void initialize_model(const std::shared_ptr<analysis_workspace_t>& workspace,
     std::lock_guard<std::mutex> lock(model->initialization_mutex);
     if (model->initialized.load(std::memory_order_acquire))
         return;
-    if (auto overlay = workspace->overlay()) {
-        const auto snapshot = overlay->snapshot();
-        for (const auto& item : snapshot.items) {
-            const auto& operation = item.second;
-            switch (operation.kind) {
-            case overlay_operation_kind_t::comment:
-                model->comments.set(operation.address, operation.text);
-                break;
-            case overlay_operation_kind_t::name:
-                model->renames.set(operation.address, operation.name);
-                break;
-            case overlay_operation_kind_t::bookmark: {
-                const auto runtime = operation.address.value;
-                std::lock_guard<std::mutex> view_lock(model->view->mutex);
-                auto found = std::find_if(model->view->bookmarks.begin(),
-                    model->view->bookmarks.end(), [&](const bookmark_t& bookmark) {
-                        return bookmark.addr == runtime;
-                    });
-                if (operation.name.empty()) {
-                    if (found != model->view->bookmarks.end())
-                        model->view->bookmarks.erase(found);
-                } else if (found == model->view->bookmarks.end()) {
-                    model->view->bookmarks.push_back({runtime, operation.name});
-                } else {
-                    found->label = operation.name;
-                }
-                break;
-            }
-            default:
-                break;
-            }
-        }
-    }
     model->initialized.store(true, std::memory_order_release);
 }
 
@@ -388,77 +351,209 @@ void request_format_page(const workspace_context_t& context,
 
 bool reconcile_committed_overlay_state(const workspace_context_t& context,
                                        std::string& error) {
-    if (!context.model || !context.view || !context.workspace) {
-        error = "The workspace presentation state is unavailable.";
-        return false;
-    }
-    const auto overlay = context.workspace->overlay();
-    if (!overlay) {
-        error = "The committed workspace overlay is unavailable.";
-        return false;
-    }
-    const auto snapshot = overlay->snapshot();
-    std::vector<std::pair<address_t, std::string>> comments;
-    std::vector<std::pair<address_t, std::string>> renames;
-    std::vector<bookmark_t> bookmarks;
-    std::vector<address_t> workspace_bookmarks;
-    comments.reserve(snapshot.items.size());
-    renames.reserve(snapshot.items.size());
-    bookmarks.reserve(snapshot.items.size());
-    workspace_bookmarks.reserve(snapshot.items.size());
-    for (const auto& item : snapshot.items) {
-        const auto& operation = item.second;
-        if (operation.target_discriminator !=
-            overlay_target_discriminator_v9_t::native_address)
-            continue;
-        switch (operation.kind) {
-        case overlay_operation_kind_t::comment:
-        case overlay_operation_kind_t::comment_update:
-            comments.emplace_back(operation.address, operation.text);
-            break;
-        case overlay_operation_kind_t::name:
-            renames.emplace_back(operation.address, operation.name);
-            break;
-        case overlay_operation_kind_t::bookmark:
-            bookmarks.push_back({operation.address.value, operation.name});
-            workspace_bookmarks.push_back(operation.address);
-            break;
-        default:
-            break;
-        }
-    }
-    const auto address_less = [](const auto& left, const auto& right) {
-        return left.first < right.first;
-    };
-    std::sort(comments.begin(), comments.end(), address_less);
-    std::sort(renames.begin(), renames.end(), address_less);
-    std::sort(bookmarks.begin(), bookmarks.end(), [](const auto& left, const auto& right) {
-        return left.addr < right.addr;
-    });
-    std::sort(workspace_bookmarks.begin(), workspace_bookmarks.end());
-    const auto view_result = context.workspace->update_view_state(
-        [&workspace_bookmarks](workspace_view_state_t& state) {
-            state.bookmarks = workspace_bookmarks;
-        });
-    if (!view_result) {
-        error = view_result.error().stable_code() + ": " + view_result.error().message;
-        return false;
-    }
     try {
-        context.model->comments.replace(comments);
-        context.model->renames.replace(renames);
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        context.view->bookmarks = std::move(bookmarks);
+        if (!context.workspace) {
+            error = "The workspace presentation state is unavailable.";
+            return false;
+        }
+        const auto existing = context.workspace->overlay_presentation();
+        if (existing && existing->overlay_revision ==
+                context.workspace->overlay_revision()) {
+            error.clear();
+            return true;
+        }
+        const auto overlay = context.workspace->overlay();
+        if (!overlay) {
+            error = "The committed workspace overlay is unavailable.";
+            return false;
+        }
+        const auto snapshot = overlay->snapshot();
+        if (snapshot.revision != context.workspace->overlay_revision()) {
+            error = "The authoritative overlay revision changed before derived publication.";
+            return false;
+        }
+        auto next = std::make_shared<workspace_overlay_presentation_t>();
+        next->overlay_revision = snapshot.revision;
+        next->comments.reserve(snapshot.items.size());
+        next->renames.reserve(snapshot.items.size());
+        next->bookmarks.reserve(snapshot.items.size());
+        next->workspace_bookmarks.reserve(snapshot.items.size());
+        for (const auto& item : snapshot.items) {
+            const auto& operation = item.second;
+            if (operation.target_discriminator !=
+                overlay_target_discriminator_v9_t::native_address)
+                continue;
+            switch (operation.kind) {
+            case overlay_operation_kind_t::comment:
+            case overlay_operation_kind_t::comment_update:
+                next->comments.push_back({operation.address, operation.text});
+                break;
+            case overlay_operation_kind_t::name:
+                next->renames.push_back({operation.address, operation.name});
+                break;
+            case overlay_operation_kind_t::bookmark:
+                next->bookmarks.push_back({operation.address, operation.name});
+                next->workspace_bookmarks.push_back(operation.address);
+                break;
+            default:
+                break;
+            }
+        }
+        const auto address_less = [](const auto& left, const auto& right) {
+            return left.address < right.address;
+        };
+        std::sort(next->comments.begin(), next->comments.end(), address_less);
+        std::sort(next->renames.begin(), next->renames.end(), address_less);
+        std::sort(next->bookmarks.begin(), next->bookmarks.end(), address_less);
+        std::sort(next->workspace_bookmarks.begin(), next->workspace_bookmarks.end());
+        auto published = context.workspace->publish_overlay_presentation(
+            snapshot.revision,
+            std::static_pointer_cast<const workspace_overlay_presentation_t>(
+                std::move(next)));
+        if (!published) {
+            error = published.error().stable_code() + ": " +
+                published.error().message;
+            return false;
+        }
+        error.clear();
+        return true;
     } catch (const std::exception& exception) {
-        error = std::string("Committed overlay state could not be republished: ") +
+        error = std::string("Derived overlay publication preparation failed: ") +
             exception.what();
         return false;
     } catch (...) {
-        error = "Committed overlay state could not be republished.";
+        error = "Derived overlay publication preparation failed.";
         return false;
     }
-    error.clear();
+}
+
+class pending_mutation_guard_t final {
+public:
+    explicit pending_mutation_guard_t(std::shared_ptr<state_t> state) noexcept
+        : state_(std::move(state)) {}
+
+    ~pending_mutation_guard_t() {
+        if (state_)
+            state_->pending_mutations.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    void release() noexcept {
+        state_.reset();
+    }
+
+private:
+    std::shared_ptr<state_t> state_;
+};
+
+class derived_publication_retry_guard_t final {
+public:
+    explicit derived_publication_retry_guard_t(
+        std::shared_ptr<state_t> state) noexcept
+        : state_(std::move(state)) {}
+
+    ~derived_publication_retry_guard_t() {
+        if (state_)
+            state_->derived_publication_retry_pending.store(
+                false, std::memory_order_release);
+    }
+
+private:
+    std::shared_ptr<state_t> state_;
+};
+
+void record_overlay_presentation_result(const workspace_context_t& context,
+                                        bool published,
+                                        std::string detail) {
+    if (!context.view || !context.workspace)
+        return;
+    const auto publication = context.workspace->analysis_publication();
+    const auto presentation = publication
+        ? publication->overlay_presentation : nullptr;
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    context.view->derived_publication_target_revision =
+        publication ? publication->overlay_revision : 0;
+    context.view->derived_publication_revision = presentation
+        ? presentation->overlay_revision : 0;
+    context.view->derived_publication_error = published
+        ? std::string() : (detail.empty()
+            ? "The committed overlay is awaiting derived presentation publication."
+            : std::move(detail));
+}
+
+bool queue_overlay_presentation_retry(const workspace_context_t& context) {
+    if (!context || !context.workspace->overlay())
+        return false;
+    bool expected = false;
+    if (!context.view->derived_publication_retry_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+        return false;
+    auto body = [context]() {
+        derived_publication_retry_guard_t pending(context.view);
+        std::string detail;
+        bool published = false;
+        try {
+            std::lock_guard<std::mutex> mutation_lock(context.model->mutation_mutex);
+            published = reconcile_committed_overlay_state(context, detail);
+        } catch (const std::exception& exception) {
+            detail = std::string("Derived overlay publication retry failed: ") +
+                exception.what();
+        } catch (...) {
+            detail = "Derived overlay publication retry failed.";
+        }
+        try {
+            record_overlay_presentation_result(
+                context, published, std::move(detail));
+        } catch (...) {
+        }
+    };
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    body();
     return true;
+#else
+    try {
+        aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+        descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+        descriptor.owner_subsystem = "analysis_ui";
+        descriptor.label = "workspace_overlay_presentation_retry";
+        const std::string target_id = context.workspace->identity().binary_id().to_hex();
+        descriptor.target_id = target_id.c_str();
+        descriptor.generation = context.workspace->generation();
+        descriptor.cancellable_body = [body = std::move(body)](
+            const aida::infra::taskflow_runtime::cancellation_token_t&) mutable {
+            body();
+        };
+        const auto submitted = aida::infra::taskflow_runtime::submit(
+            std::move(descriptor));
+        if (submitted.submitted)
+            return true;
+        context.view->derived_publication_retry_pending.store(
+            false, std::memory_order_release);
+        record_overlay_presentation_result(context, false,
+            submitted.reject_reason.empty()
+                ? "The derived overlay publication retry queue rejected the request."
+                : submitted.reject_reason);
+        return false;
+    } catch (const std::exception& exception) {
+        context.view->derived_publication_retry_pending.store(
+            false, std::memory_order_release);
+        try {
+            record_overlay_presentation_result(context, false,
+                std::string("The derived overlay publication retry could not be queued: ") +
+                    exception.what());
+        } catch (...) {
+        }
+        return false;
+    } catch (...) {
+        context.view->derived_publication_retry_pending.store(
+            false, std::memory_order_release);
+        try {
+            record_overlay_presentation_result(context, false,
+                "The derived overlay publication retry could not be queued.");
+        } catch (...) {
+        }
+        return false;
+    }
+#endif
 }
 
 bool queue_overlay_transaction(const workspace_context_t& context,
@@ -479,8 +574,11 @@ bool queue_overlay_transaction(const workspace_context_t& context,
         context.workspace->analysis_revision() != expected_analysis_revision ||
         context.workspace->overlay_revision() != expected_overlay_revision)
         return false;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     const std::size_t operation_count = operations.size();
+#endif
     context.view->pending_mutations.fetch_add(1, std::memory_order_acq_rel);
+    pending_mutation_guard_t setup_pending(context.view);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     const auto preview_kind = operations.front().kind;
     const auto preview_address = operations.front().address.value;
@@ -489,41 +587,84 @@ bool queue_overlay_transaction(const workspace_context_t& context,
                           expected_generation, expected_analysis_revision,
                           expected_overlay_revision, completion = std::move(completion)](
         bool cancelled) mutable {
+        pending_mutation_guard_t pending(context.view);
         std::string error;
-        if (cancelled) {
-            error = "Mutation cancelled before execution.";
-        } else if (context.workspace->generation() != expected_generation ||
-                   context.workspace->analysis_revision() != expected_analysis_revision) {
-            error = "The analysis publication changed before the mutation ran; select the item and retry.";
-        } else {
-            std::lock_guard<std::mutex> mutation_lock(context.model->mutation_mutex);
-            auto overlay = context.workspace->overlay();
-            if (!overlay) {
-                error = "Workspace overlay is unavailable.";
+        bool authoritative_succeeded = false;
+        try {
+            if (cancelled) {
+                error = "Mutation cancelled before execution.";
+            } else if (context.workspace->generation() != expected_generation ||
+                       context.workspace->analysis_revision() != expected_analysis_revision) {
+                error = "The analysis publication changed before the mutation ran; select the item and retry.";
             } else {
-                overlay_transaction_request_t request;
-                request.expected_revision = expected_overlay_revision;
-                request.operations = operations;
-                auto result = overlay->transact(request, context.workspace->cancellation_token());
-                if (result) {
-                    static_cast<void>(reconcile_committed_overlay_state(context, error));
+                std::lock_guard<std::mutex> mutation_lock(
+                    context.model->mutation_mutex);
+                auto overlay = context.workspace->overlay();
+                if (!overlay) {
+                    error = "Workspace overlay is unavailable.";
                 } else {
-                    error = result.error().stable_code() + ": " + result.error().message;
+                    overlay_transaction_request_t request;
+                    request.expected_revision = expected_overlay_revision;
+                    request.operations = operations;
+                    auto result = overlay->transact(
+                        request, context.workspace->cancellation_token());
+                    if (result) {
+                        authoritative_succeeded = true;
+                        try {
+                            std::string publication_detail;
+                            const bool published =
+                                reconcile_committed_overlay_state(
+                                    context, publication_detail);
+                            record_overlay_presentation_result(
+                                context, published,
+                                std::move(publication_detail));
+                        } catch (const std::exception& exception) {
+                            try {
+                                record_overlay_presentation_result(context, false,
+                                    std::string("Derived overlay publication failed: ") +
+                                        exception.what());
+                            } catch (...) {
+                            }
+                        } catch (...) {
+                            try {
+                                record_overlay_presentation_result(context, false,
+                                    "Derived overlay publication failed.");
+                            } catch (...) {
+                            }
+                        }
+                    } else {
+                        error = result.error().stable_code() + ": " +
+                            result.error().message;
+                    }
                 }
             }
+        } catch (const std::exception& exception) {
+            if (!authoritative_succeeded)
+                error = std::string("Overlay mutation execution failed: ") +
+                    exception.what();
+        } catch (...) {
+            if (!authoritative_succeeded)
+                error = "Overlay mutation execution failed.";
         }
-        const bool succeeded = error.empty();
-        const std::string completion_error = error;
-        {
+        const bool succeeded = authoritative_succeeded && error.empty();
+        std::string completion_error;
+        try {
+            completion_error = error;
             std::lock_guard<std::mutex> lock(context.view->mutex);
             context.view->mutation_error = std::move(error);
             context.view->formatted.clear();
             context.view->cached_overlay_revision = context.workspace->overlay_revision();
+        } catch (...) {
         }
-        context.view->pending_mutations.fetch_sub(1, std::memory_order_acq_rel);
-        if (completion) completion(succeeded, completion_error);
+        if (completion) {
+            try {
+                completion(succeeded, completion_error);
+            } catch (...) {
+            }
+        }
     };
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    setup_pending.release();
     mutation_body(false);
     bool succeeded = false;
     std::string mutation_detail;
@@ -538,42 +679,72 @@ bool queue_overlay_transaction(const workspace_context_t& context,
         std::move(mutation_detail));
     return succeeded;
 #else
-    const std::string target_id = context.workspace->identity().binary_id().to_hex();
-    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
-    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
-    descriptor.owner_subsystem = "analysis_ui";
-    descriptor.label = "workspace_overlay_mutation";
-    descriptor.target_id = target_id.c_str();
-    descriptor.generation = context.publication->generation;
-    descriptor.cancellable_body = [mutation_body = std::move(mutation_body)](
-        const aida::infra::taskflow_runtime::cancellation_token_t& runtime_cancel) mutable {
-        mutation_body(runtime_cancel.requested.load(std::memory_order_acquire));
-    };
-    const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
-    if (!submitted.submitted) {
-        context.view->pending_mutations.fetch_sub(1, std::memory_order_acq_rel);
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        context.view->mutation_error = submitted.reject_reason.empty()
-            ? "Mutation queue rejected the request." : submitted.reject_reason;
+    bool accepted = false;
+    try {
+        const std::string target_id =
+            context.workspace->identity().binary_id().to_hex();
+        aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+        descriptor.domain =
+            aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+        descriptor.owner_subsystem = "analysis_ui";
+        descriptor.label = "workspace_overlay_mutation";
+        descriptor.target_id = target_id.c_str();
+        descriptor.generation = context.publication->generation;
+        descriptor.cancellable_body = [mutation_body = std::move(mutation_body)](
+            const aida::infra::taskflow_runtime::cancellation_token_t&
+                runtime_cancel) mutable {
+            mutation_body(runtime_cancel.requested.load(
+                std::memory_order_acquire));
+        };
+        const auto submitted = aida::infra::taskflow_runtime::submit(
+            std::move(descriptor));
+        if (!submitted.submitted) {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error = submitted.reject_reason.empty()
+                ? "Mutation queue rejected the request."
+                : submitted.reject_reason;
+            return false;
+        }
+        setup_pending.release();
+        accepted = true;
+        aida::ui::task_center::task_registration_t registration;
+        registration.owner = "analysis";
+        registration.owner_view = "document.disassembly";
+        registration.owner_action = "analysis.overlay.mutate";
+        registration.target = target_id;
+        registration.label = "Apply reviewed analysis overlay mutation";
+        registration.stage = "Queued";
+        registration.affected_entity = std::to_string(operation_count) +
+            " overlay operation(s)";
+        registration.progress = -1.f;
+        registration.cancellation_is_safe = true;
+        registration.callbacks.focus = [] {
+            static_cast<void>(aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("document.disassembly")));
+        };
+        static_cast<void>(aida::ui::task_center::register_taskflow_job(
+            submitted.handle, std::move(registration)));
+        return true;
+    } catch (const std::exception& exception) {
+        if (accepted)
+            return true;
+        try {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error =
+                std::string("Mutation queue setup failed: ") + exception.what();
+        } catch (...) {
+        }
+        return false;
+    } catch (...) {
+        if (accepted)
+            return true;
+        try {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error = "Mutation queue setup failed.";
+        } catch (...) {
+        }
         return false;
     }
-    aida::ui::task_center::task_registration_t registration;
-    registration.owner = "analysis";
-    registration.owner_view = "document.disassembly";
-    registration.owner_action = "analysis.overlay.mutate";
-    registration.target = target_id;
-    registration.label = "Apply reviewed analysis overlay mutation";
-    registration.stage = "Queued";
-    registration.affected_entity = std::to_string(operation_count) + " overlay operation(s)";
-    registration.progress = -1.f;
-    registration.cancellation_is_safe = true;
-    registration.callbacks.focus = [] {
-        static_cast<void>(aida::ui::application_views::open_or_focus(
-            aida::ui::stable_view_id_t("document.disassembly")));
-    };
-    static_cast<void>(aida::ui::task_center::register_taskflow_job(
-        submitted.handle, std::move(registration)));
-    return true;
 #endif
 }
 
@@ -672,64 +843,126 @@ bool queue_overlay_history(const workspace_context_t& context, bool redo,
         context.workspace->overlay_revision() != expected_overlay_revision)
         return false;
     context.view->pending_mutations.fetch_add(1, std::memory_order_acq_rel);
+    pending_mutation_guard_t setup_pending(context.view);
     auto body = [context, redo, expected_generation, expected_analysis_revision,
                  expected_overlay_revision](bool cancelled) {
+        pending_mutation_guard_t pending(context.view);
         std::string error;
-        if (cancelled) {
-            error = "Overlay history request was cancelled before execution.";
-        } else if (context.workspace->generation() != expected_generation ||
-                   context.workspace->analysis_revision() != expected_analysis_revision) {
-            error = "The analysis publication changed before the overlay history request ran.";
-        } else {
-            std::lock_guard<std::mutex> mutation_lock(context.model->mutation_mutex);
-            auto overlay = context.workspace->overlay();
-            if (!overlay) {
-                error = "Workspace overlay history is unavailable.";
+        bool authoritative_succeeded = false;
+        try {
+            if (cancelled) {
+                error = "Overlay history request was cancelled before execution.";
+            } else if (context.workspace->generation() != expected_generation ||
+                       context.workspace->analysis_revision() != expected_analysis_revision) {
+                error = "The analysis publication changed before the overlay history request ran.";
             } else {
-                const auto result = redo
-                    ? overlay->redo(expected_overlay_revision,
-                        context.workspace->cancellation_token())
-                    : overlay->undo(expected_overlay_revision,
-                        context.workspace->cancellation_token());
-                if (!result)
-                    error = result.error().stable_code() + ": " + result.error().message;
-                else
-                    static_cast<void>(reconcile_committed_overlay_state(context, error));
+                std::lock_guard<std::mutex> mutation_lock(
+                    context.model->mutation_mutex);
+                auto overlay = context.workspace->overlay();
+                if (!overlay) {
+                    error = "Workspace overlay history is unavailable.";
+                } else {
+                    const auto result = redo
+                        ? overlay->redo(expected_overlay_revision,
+                            context.workspace->cancellation_token())
+                        : overlay->undo(expected_overlay_revision,
+                            context.workspace->cancellation_token());
+                    if (!result) {
+                        error = result.error().stable_code() + ": " +
+                            result.error().message;
+                    } else {
+                        authoritative_succeeded = true;
+                        try {
+                            std::string publication_detail;
+                            const bool published =
+                                reconcile_committed_overlay_state(
+                                    context, publication_detail);
+                            record_overlay_presentation_result(
+                                context, published,
+                                std::move(publication_detail));
+                        } catch (const std::exception& exception) {
+                            try {
+                                record_overlay_presentation_result(context, false,
+                                    std::string("Derived overlay publication failed: ") +
+                                        exception.what());
+                            } catch (...) {
+                            }
+                        } catch (...) {
+                            try {
+                                record_overlay_presentation_result(context, false,
+                                    "Derived overlay publication failed.");
+                            } catch (...) {
+                            }
+                        }
+                    }
+                }
             }
+        } catch (const std::exception& exception) {
+            if (!authoritative_succeeded)
+                error = std::string("Overlay history execution failed: ") +
+                    exception.what();
+        } catch (...) {
+            if (!authoritative_succeeded)
+                error = "Overlay history execution failed.";
         }
-        {
+        try {
             std::lock_guard<std::mutex> lock(context.view->mutex);
             context.view->mutation_error = std::move(error);
             context.view->formatted.clear();
             context.view->cached_overlay_revision = context.workspace->overlay_revision();
+        } catch (...) {
         }
-        context.view->pending_mutations.fetch_sub(1, std::memory_order_acq_rel);
     };
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    setup_pending.release();
     body(false);
     std::lock_guard<std::mutex> lock(context.view->mutex);
     return context.view->mutation_error.empty();
 #else
-    aida::infra::taskflow_runtime::task_descriptor_t descriptor;
-    descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
-    descriptor.owner_subsystem = "analysis_ui";
-    descriptor.label = redo ? "workspace_overlay_redo" : "workspace_overlay_undo";
-    const std::string target_id = context.workspace->identity().binary_id().to_hex();
-    descriptor.target_id = target_id.c_str();
-    descriptor.generation = expected_generation;
-    descriptor.cancellable_body = [body = std::move(body)](
-        const aida::infra::taskflow_runtime::cancellation_token_t& cancel) mutable {
-        body(cancel.requested.load(std::memory_order_acquire));
-    };
-    const auto submitted = aida::infra::taskflow_runtime::submit(std::move(descriptor));
-    if (!submitted.submitted) {
-        context.view->pending_mutations.fetch_sub(1, std::memory_order_acq_rel);
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        context.view->mutation_error = submitted.reject_reason.empty()
-            ? "Overlay history queue rejected the request." : submitted.reject_reason;
+    try {
+        aida::infra::taskflow_runtime::task_descriptor_t descriptor;
+        descriptor.domain =
+            aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
+        descriptor.owner_subsystem = "analysis_ui";
+        descriptor.label = redo
+            ? "workspace_overlay_redo" : "workspace_overlay_undo";
+        const std::string target_id =
+            context.workspace->identity().binary_id().to_hex();
+        descriptor.target_id = target_id.c_str();
+        descriptor.generation = expected_generation;
+        descriptor.cancellable_body = [body = std::move(body)](
+            const aida::infra::taskflow_runtime::cancellation_token_t& cancel) mutable {
+            body(cancel.requested.load(std::memory_order_acquire));
+        };
+        const auto submitted = aida::infra::taskflow_runtime::submit(
+            std::move(descriptor));
+        if (!submitted.submitted) {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error = submitted.reject_reason.empty()
+                ? "Overlay history queue rejected the request."
+                : submitted.reject_reason;
+            return false;
+        }
+        setup_pending.release();
+        return true;
+    } catch (const std::exception& exception) {
+        try {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error =
+                std::string("Overlay history queue setup failed: ") +
+                    exception.what();
+        } catch (...) {
+        }
+        return false;
+    } catch (...) {
+        try {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            context.view->mutation_error =
+                "Overlay history queue setup failed.";
+        } catch (...) {
+        }
         return false;
     }
-    return true;
 #endif
 }
 
@@ -1042,6 +1275,51 @@ workspace_context_t capture_workspace(
     context.view = context.model ? context.model->view : nullptr;
     context.progress = workspace->progress();
     initialize_model(workspace, context.model);
+    if (context.model && context.view && context.publication &&
+        context.publication->overlay_revision != 0) {
+        const auto presentation = context.publication->overlay_presentation;
+        bool attempted = false;
+        {
+            std::lock_guard<std::mutex> lock(context.view->mutex);
+            attempted = context.view->derived_publication_target_revision ==
+                context.publication->overlay_revision;
+        }
+        if ((!presentation || presentation->overlay_revision !=
+                context.publication->overlay_revision) && !attempted &&
+            context.view->pending_mutations.load(std::memory_order_acquire) == 0) {
+            try {
+                std::unique_lock<std::mutex> mutation_lock(
+                    context.model->mutation_mutex, std::try_to_lock);
+                if (mutation_lock.owns_lock()) {
+                    std::string detail;
+                    const bool published = reconcile_committed_overlay_state(
+                        context, detail);
+                    record_overlay_presentation_result(
+                        context, published, std::move(detail));
+                    if (published) {
+                        const auto refreshed = workspace->analysis_publication();
+                        if (refreshed &&
+                            refreshed->generation ==
+                                context.publication->generation &&
+                            refreshed->analysis_revision ==
+                                context.publication->analysis_revision &&
+                            refreshed->overlay_revision ==
+                                context.publication->overlay_revision) {
+                            context.publication = refreshed;
+                            context.image = refreshed->snapshot
+                                ? refreshed->snapshot->image : workspace->image();
+                        }
+                    }
+                }
+            } catch (...) {
+                try {
+                    record_overlay_presentation_result(context, false,
+                        "Derived overlay publication recovery failed.");
+                } catch (...) {
+                }
+            }
+        }
+    }
     if (context.view && context.publication) {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         if (context.view->cached_generation != context.publication->generation ||
@@ -1196,14 +1474,35 @@ std::string resolve_symbol(const workspace_context_t& context,
 
 std::string resolve_name(const workspace_context_t& context,
                          const aida::analysis::address_t& address) {
-    if (!context.model)
-        return resolve_symbol(context, address);
-    return context.model->renames.resolve_or(address, resolve_symbol(context, address));
+    const auto presentation = context.publication
+        ? context.publication->overlay_presentation : nullptr;
+    if (presentation &&
+        presentation->overlay_revision == context.publication->overlay_revision) {
+        const auto found = std::lower_bound(
+            presentation->renames.begin(), presentation->renames.end(), address,
+            [](const auto& entry, const auto& value) {
+                return entry.address < value;
+            });
+        if (found != presentation->renames.end() && found->address == address)
+            return found->text;
+    }
+    return resolve_symbol(context, address);
 }
 
 std::string comment(const workspace_context_t& context,
                     const aida::analysis::address_t& address) {
-    return context.model ? context.model->comments.get(address) : std::string();
+    const auto presentation = context.publication
+        ? context.publication->overlay_presentation : nullptr;
+    if (!presentation ||
+        presentation->overlay_revision != context.publication->overlay_revision)
+        return {};
+    const auto found = std::lower_bound(
+        presentation->comments.begin(), presentation->comments.end(), address,
+        [](const auto& entry, const auto& value) {
+            return entry.address < value;
+        });
+    return found != presentation->comments.end() && found->address == address
+        ? found->text : std::string();
 }
 
 std::string auto_comment(const workspace_context_t& context,
@@ -1252,6 +1551,34 @@ bool queue_rename(const workspace_context_t& context,
     operation.name = std::move(name);
     return queue_overlay_operation(context, std::move(operation), required_generation,
         required_analysis_revision, required_overlay_revision, std::move(completion));
+}
+
+std::vector<bookmark_t> bookmark_snapshot(const workspace_context_t& context) {
+    std::vector<bookmark_t> result;
+    const auto presentation = context.publication
+        ? context.publication->overlay_presentation : nullptr;
+    if (!presentation ||
+        presentation->overlay_revision != context.publication->overlay_revision)
+        return result;
+    result.reserve(presentation->bookmarks.size());
+    for (const auto& entry : presentation->bookmarks)
+        result.push_back({entry.address.value, entry.text});
+    return result;
+}
+
+bool bookmarked(const workspace_context_t& context,
+                const aida::analysis::address_t& address) {
+    const auto presentation = context.publication
+        ? context.publication->overlay_presentation : nullptr;
+    if (!presentation ||
+        presentation->overlay_revision != context.publication->overlay_revision)
+        return false;
+    const auto found = std::lower_bound(
+        presentation->bookmarks.begin(), presentation->bookmarks.end(), address,
+        [](const auto& entry, const auto& value) {
+            return entry.address < value;
+        });
+    return found != presentation->bookmarks.end() && found->address == address;
 }
 
 bool queue_bookmark(const workspace_context_t& context,
@@ -1535,6 +1862,13 @@ mutation_state_t mutation_state(const workspace_context_t& context) {
     result.overlay_revision = context.workspace->overlay_revision();
     std::lock_guard<std::mutex> lock(context.view->mutex);
     result.error = context.view->mutation_error;
+    result.derived_publication_pending =
+        context.view->derived_publication_retry_pending.load(
+            std::memory_order_acquire);
+    result.derived_publication_revision =
+        context.view->derived_publication_revision;
+    result.derived_publication_error =
+        context.view->derived_publication_error;
     return result;
 }
 
@@ -2235,13 +2569,7 @@ void open_instruction_menu(const workspace_context_t& context,
         return action_handler_result_t::completed();
     };
     menu.actions["analysis.modify.retype"].capability = capability_state_t::available();
-    bool bookmarked;
-    {
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        bookmarked = std::any_of(context.view->bookmarks.begin(), context.view->bookmarks.end(),
-            [&](const bookmark_t& item) { return item.addr == instruction.address.value; });
-    }
-    if (bookmarked) {
+    if (disasm_view::bookmarked(context, instruction.address)) {
         menu.actions["analysis.modify.remove_bookmark"].invoke = [context, value = instruction.address]() {
             return queue_bookmark(context, value, {})
                 ? action_handler_result_t::completed()
@@ -2658,12 +2986,18 @@ void render(float, float, float width, float height,
             aida::ui::status_kind_t::error);
     }
     std::string mutation_error;
+    std::string derived_publication_error;
+    bool derived_publication_pending = false;
     std::string format_error;
     std::string export_error;
     std::string export_status;
     {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         mutation_error = context.view->mutation_error;
+        derived_publication_error = context.view->derived_publication_error;
+        derived_publication_pending =
+            context.view->derived_publication_retry_pending.load(
+                std::memory_order_acquire);
         format_error = context.view->format_error;
         export_error = context.view->export_error;
         export_status = context.view->export_status;
@@ -2671,6 +3005,12 @@ void render(float, float, float width, float height,
     if (!mutation_error.empty())
         aida::ui::inline_notice("overlay_error", "Overlay update failed",
             mutation_error.c_str(), aida::ui::status_kind_t::error);
+    if (!derived_publication_error.empty() &&
+        aida::ui::inline_notice("overlay_derived_publication_error",
+            "Overlay committed; presentation refresh pending",
+            derived_publication_error.c_str(), aida::ui::status_kind_t::warning,
+            derived_publication_pending ? nullptr : "Retry"))
+        static_cast<void>(queue_overlay_presentation_retry(context));
     if (!format_error.empty() &&
         aida::ui::inline_notice("format_error", "Formatting failed", format_error.c_str(),
             aida::ui::status_kind_t::error, "Retry")) {
@@ -2978,8 +3318,8 @@ void render(float, float, float width, float height,
         std::lock_guard<std::mutex> lock(context.view->mutex);
         selection = context.view->selection;
         scroll_to_selection = context.view->scroll_to_selection;
-        bookmarks = context.view->bookmarks;
     }
+    bookmarks = bookmark_snapshot(context);
     if (scroll_to_selection && selection) {
         auto found = std::lower_bound(instructions.begin() + static_cast<std::ptrdiff_t>(range->first),
             instructions.begin() + static_cast<std::ptrdiff_t>(range->second), *selection,

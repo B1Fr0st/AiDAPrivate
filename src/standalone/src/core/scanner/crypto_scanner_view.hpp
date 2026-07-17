@@ -1460,6 +1460,16 @@ inline void render(float, float, float width, float height,
 		});
 		if (current_hit != filtered.end()) {
 			const auto hit = *current_hit;
+			const auto workspace_hit = std::find_if(scan_snapshot->results.begin(),
+				scan_snapshot->results.end(), [&](const auto& item) {
+					const auto runtime = disasm_view::runtime_address(context, item.address);
+					return runtime && *runtime == hit.address &&
+						item.algorithm == hit.algorithm &&
+						item.signature_name == hit.signature_name;
+				});
+			const bool hit_identity_available = workspace_hit != scan_snapshot->results.end();
+			const auto hit_address_identity = hit_identity_available
+				? workspace_hit->address : aida::analysis::address_t{};
 			const auto workspace = context.workspace;
 			const auto generation = context.publication ? context.publication->generation : 0;
 			const auto target_pid = driver_bridge::attached_pid();
@@ -1468,15 +1478,19 @@ inline void render(float, float, float width, float height,
 			retained.entity_id = hit.algorithm + "@" + std::to_string(hit.address);
 			retained.entity_generation = generation;
 			retained.active_view = aida::ui::stable_view_id_t("view.memory.crypto");
-			retained.validate_identity = [workspace, generation, hit, scan_snapshot, target_pid]() {
+			retained.validate_identity = [workspace, generation, hit, scan_snapshot, target_pid,
+				hit_identity_available, hit_address_identity]() {
 				if (!workspace) return aida::ui::capability_state_t::unavailable("The crypto workspace was closed.");
 				if (driver_bridge::attached_pid() != target_pid)
 					return aida::ui::capability_state_t::unavailable("The crypto scan target process changed; reopen the menu.");
 				const auto publication = workspace->analysis_publication();
 				if (!publication || publication->generation != generation)
 					return aida::ui::capability_state_t::unavailable("The analysis publication changed; reopen the menu.");
+				if (!hit_identity_available)
+					return aida::ui::capability_state_t::unavailable("The selected crypto hit identity is no longer available.");
 				const bool current = std::any_of(scan_snapshot->results.begin(), scan_snapshot->results.end(), [&](const auto& item) {
-					return item.address == hit.address && item.algorithm == hit.algorithm && item.signature_name == hit.signature_name;
+					return item.address == hit_address_identity && item.algorithm == hit.algorithm &&
+						item.signature_name == hit.signature_name;
 				});
 				return current ? aida::ui::capability_state_t::available()
 					: aida::ui::capability_state_t::unavailable("The selected crypto hit changed or was removed.");
@@ -1560,12 +1574,12 @@ inline void render(float, float, float width, float height,
 			evidence.return_to_source = [workspace, generation, evidence_hit_address,
 				evidence_hit_algorithm, evidence_hit_signature, evidence_hit_module,
 				evidence_hit_module_offset, evidence_hit_reference_count, scan_snapshot,
-				view_state](std::string& reason) {
+				view_state, hit_identity_available, hit_address_identity](std::string& reason) {
 			const auto publication = workspace ? workspace->analysis_publication() : nullptr;
-			if (!publication || publication->generation != generation ||
+			if (!publication || publication->generation != generation || !hit_identity_available ||
 				!std::any_of(scan_snapshot->results.begin(), scan_snapshot->results.end(),
 					[&](const auto& item) {
-						return item.address == evidence_hit_address &&
+						return item.address == hit_address_identity &&
 							item.algorithm == evidence_hit_algorithm &&
 							item.signature_name == evidence_hit_signature &&
 							item.module_name == evidence_hit_module &&

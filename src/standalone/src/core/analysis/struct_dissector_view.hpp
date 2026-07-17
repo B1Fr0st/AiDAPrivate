@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -106,11 +107,17 @@ struct ui_state_t {
 	edit_target_t edit_target = edit_target_t::none;
 	int   edit_target_field = -1;
 	bool  table_focused = false;
+	bool  list_focused = false;
 	uint64_t context_refresh_seq = 0;
 	uint64_t context_base_address = 0;
 	uint32_t context_target_pid = 0;
 	uint64_t edit_base_address = 0;
-	int pending_remove_field = -1;
+	std::uint64_t pending_remove_structure_id = 0;
+	std::uint64_t pending_remove_structure_revision = 0;
+	std::uint64_t pending_remove_field_id = 0;
+	std::uint64_t edit_structure_id = 0;
+	std::uint64_t edit_structure_revision = 0;
+	std::uint64_t edit_field_id = 0;
 	bool remove_confirmation_requested = false;
 	bool inline_edit_popup_requested = false;
 	bool layout_popup_requested = false;
@@ -1211,6 +1218,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	dl->AddLine(ImVec2(ox + left_w, body_y), ImVec2(ox + left_w, body_y + body_h),
 		aida::ui::with_alpha(th.border_subtle, alpha));
+	bool structure_context_requested = false;
+	int structure_context_index = -1;
+	aida::ui::context_menu_open_origin_t structure_context_origin =
+		aida::ui::context_menu_open_origin_t::menu_key;
+	int active_struct_idx = -1;
 
 	{
 		float lx = ox;
@@ -1251,7 +1263,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		std::vector<std::pair<std::string, uint32_t>> entries;
 		std::vector<int> entry_index;
-		int active_struct_idx = -1;
 		std::string filter_lc;
 		filter_lc.reserve(64);
 		for (std::size_t i = 0; i < sizeof(ui.list_filter) && ui.list_filter[i] != '\0'; ++i) {
@@ -1281,9 +1292,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 		}
 		const std::size_t struct_count = entries.size();
-		bool structure_context_requested = false;
-		bool structure_context_pointer = false;
-		int structure_context_index = -1;
 
 		float content_h = static_cast<float>(struct_count) * line_h;
 		if (ui.list_target_scroll_y < 0.f) ui.list_target_scroll_y = 0.f;
@@ -1324,11 +1332,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 				ui.list_focused = true;
+				ui.table_focused = false;
 				std::string sel_name;
 				{
 					std::lock_guard<std::mutex> lk(st.mtx);
-					st.active_struct = sd_idx;
 					if (struct_dissector::valid_index(sd_idx, st.structs.size())) {
+						st.active_struct = sd_idx;
+						active_struct_idx = sd_idx;
 						sel_name = st.structs[static_cast<std::size_t>(sd_idx)].name;
 					}
 					ui.selected_field = -1;
@@ -1338,6 +1348,28 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				diag::log_tagged_fmt("dissector",
 					"struct_selected idx=%d name='%s'",
 					sd_idx, sel_name.c_str());
+			}
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+				bool selected = false;
+				{
+					std::lock_guard<std::mutex> lock(st.mtx);
+					if (struct_dissector::valid_index(sd_idx, st.structs.size())) {
+						st.active_struct = sd_idx;
+						active_struct_idx = sd_idx;
+						selected = true;
+					}
+				}
+				if (selected) {
+					ui.list_focused = true;
+					ui.table_focused = false;
+					ui.selected_field = -1;
+					ui.editing_field = -1;
+					ui.edit_target = edit_target_t::none;
+					structure_context_requested = true;
+					structure_context_index = sd_idx;
+					structure_context_origin =
+						aida::ui::context_menu_open_origin_t::pointer;
+				}
 			}
 
 			dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
@@ -1429,17 +1461,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					deleted_name = st.structs[static_cast<std::size_t>(st.active_struct)].name;
 				}
 			}
-			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-				ui.list_focused = true;
-				{
-					std::lock_guard<std::mutex> lock(st.mtx);
-					st.active_struct = sd_idx;
-				}
-				ui.selected_field = -1;
-				structure_context_requested = true;
-				structure_context_pointer = true;
-				structure_context_index = sd_idx;
-			}
 			std::string error;
 			if (removed_idx >= 0 && struct_dissector::remove_structure(removed_idx, error)) {
 				ui.selected_field = -1;
@@ -1456,7 +1477,186 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					"delete_struct_skipped reason='%s'", ui.operation_status.c_str());
 			}
 		}
+		{
+			std::lock_guard<std::mutex> lock(st.mtx);
+			active_struct_idx = st.active_struct;
+		}
+		const bool active_structure_visible = std::find(
+			entry_index.begin(), entry_index.end(), active_struct_idx) !=
+			entry_index.end();
+		const bool structure_menu_key =
+			ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+		const bool structure_shift_f10 = ImGui::GetIO().KeyShift &&
+			ImGui::IsKeyPressed(ImGuiKey_F10, false);
+		if (!structure_context_requested && ui.list_focused &&
+			active_struct_idx >= 0 && active_structure_visible &&
+			(structure_menu_key || structure_shift_f10)) {
+			structure_context_requested = true;
+			structure_context_index = active_struct_idx;
+			structure_context_origin = structure_menu_key
+				? aida::ui::context_menu_open_origin_t::menu_key
+				: aida::ui::context_menu_open_origin_t::shift_f10;
+		}
 	}
+	if (structure_context_requested) {
+		struct_dissector::struct_def_t snapshot;
+		bool valid_structure = false;
+		{
+			std::lock_guard<std::mutex> lock(st.mtx);
+			if (struct_dissector::valid_index(
+					structure_context_index, st.structs.size())) {
+				snapshot = st.structs[
+					static_cast<std::size_t>(structure_context_index)];
+				valid_structure = snapshot.stable_id != 0;
+			}
+		}
+		if (valid_structure) {
+			const std::uint64_t retained_id = snapshot.stable_id;
+			const std::uint64_t retained_revision = snapshot.layout_revision;
+			const auto resolve_structure = [retained_id, retained_revision]()
+				-> std::optional<int> {
+				auto& state = struct_dissector::g_state;
+				std::lock_guard<std::mutex> lock(state.mtx);
+				const int index =
+					struct_dissector::structure_index_by_id_locked(retained_id);
+				if (!struct_dissector::valid_index(index, state.structs.size()) ||
+					state.structs[static_cast<std::size_t>(index)].stable_id !=
+						retained_id ||
+					state.structs[static_cast<std::size_t>(index)].layout_revision !=
+						retained_revision)
+					return std::nullopt;
+				return index;
+			};
+			aida::ui::application_ui::retained_entity_context_t retained;
+			retained.owner_id = "types.dissector.structure";
+			retained.entity_id = std::to_string(retained_id);
+			retained.entity_generation = retained_revision;
+			retained.active_view =
+				aida::ui::stable_view_id_t("view.types.dissector");
+			retained.validate_identity = [resolve_structure] {
+				return resolve_structure()
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(
+						"The structure layout changed; select it again");
+			};
+			auto add_structure_action = [&retained](std::string id,
+				bool enabled, const char* reason,
+				std::function<aida::ui::action_handler_result_t()> invoke) {
+				aida::ui::application_ui::retained_entity_action_t action;
+				action.action_id = std::move(id);
+				action.capability = enabled
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(reason);
+				action.invoke = std::move(invoke);
+				retained.actions.push_back(std::move(action));
+			};
+			add_structure_action("types.dissector.structure.copy_name", true,
+				"The retained structure is stale", [resolve_structure] {
+					const auto index = resolve_structure();
+					if (!index)
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					std::string name;
+					{
+						auto& state = struct_dissector::g_state;
+						std::lock_guard<std::mutex> lock(state.mtx);
+						if (!struct_dissector::valid_index(
+								*index, state.structs.size()))
+							return aida::ui::action_handler_result_t::failed(
+								"The retained structure is stale");
+						name = state.structs[static_cast<std::size_t>(*index)].name;
+					}
+					ImGui::SetClipboardText(name.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_structure_action(
+				"types.dissector.structure.copy_declaration", true,
+				"The retained structure is stale", [resolve_structure] {
+					const auto index = resolve_structure();
+					if (!index)
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					const std::string declaration =
+						struct_dissector::export_to_c(*index);
+					if (declaration.empty())
+						return aida::ui::action_handler_result_t::failed(
+							"The structure could not be exported");
+					ImGui::SetClipboardText(declaration.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_structure_action(
+				"types.dissector.structure.configure_layout", true,
+				"The retained structure is stale", [resolve_structure] {
+					const auto index = resolve_structure();
+					if (!index)
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					{
+						auto& state = struct_dissector::g_state;
+						std::lock_guard<std::mutex> lock(state.mtx);
+						if (!struct_dissector::valid_index(
+								*index, state.structs.size()))
+							return aida::ui::action_handler_result_t::failed(
+								"The retained structure is stale");
+						state.active_struct = *index;
+					}
+					g_ui.layout_popup_requested = true;
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_structure_action("types.dissector.structure.toggle_union", true,
+				"The retained structure is stale",
+				[resolve_structure, kind = snapshot.kind] {
+					const auto index = resolve_structure();
+					if (!index)
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					const bool applied = struct_dissector::set_structure_kind(
+						*index, kind == struct_dissector::structure_kind_t::union_type
+							? struct_dissector::structure_kind_t::structure
+							: struct_dissector::structure_kind_t::union_type);
+					return applied
+						? aida::ui::action_handler_result_t::completed()
+						: aida::ui::action_handler_result_t::failed(
+							"The structure kind change failed validation");
+				});
+			const bool persistence_available =
+				!st.persistence_in_flight.load(std::memory_order_acquire);
+			add_structure_action("types.dissector.structure.save_catalog",
+				persistence_available,
+				"Another structure catalog operation is running",
+				[resolve_structure] {
+					if (!resolve_structure())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					return struct_dissector::request_save_schema()
+						? aida::ui::action_handler_result_t::completed(
+							"Structure schema save queued")
+						: aida::ui::action_handler_result_t::failed(
+							"Structure schema save was not queued");
+				});
+			add_structure_action("types.dissector.structure.load_catalog",
+				persistence_available,
+				"Another structure catalog operation is running",
+				[resolve_structure] {
+					if (!resolve_structure())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained structure is stale");
+					return struct_dissector::request_load_schema()
+						? aida::ui::action_handler_result_t::completed(
+							"Structure schema load queued")
+						: aida::ui::action_handler_result_t::failed(
+							"Structure schema load was not queued");
+				});
+			aida::ui::application_ui::open_retained_entity_context_menu(
+				std::move(retained), structure_context_origin);
+		} else {
+			ui.operation_error = true;
+			ui.operation_status =
+				"The requested structure no longer exists";
+		}
+	}
+	aida::ui::application_ui::render_retained_entity_context_menu(
+		"types.dissector.structure");
 
 	{
 		float rx = ox + left_w + 1.f;
@@ -1530,8 +1730,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImVec2(rx, table_y), ImVec2(rx + rw, table_y + table_h));
 		if (table_hovered) {
 			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-				ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 				ui.table_focused = true;
+				ui.list_focused = false;
+			}
 			float wheel = ImGui::GetIO().MouseWheel;
 			if (wheel != 0.f) ui.target_scroll_y -= wheel * line_h * 3.f;
 		}
@@ -1547,8 +1749,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			std::string seed_text;
 		} pending_edit;
 		bool ctx_open_request = false;
-		bool ctx_pointer_request = false;
 		int  ctx_open_field = -1;
+		aida::ui::context_menu_open_origin_t ctx_open_origin =
+			aida::ui::context_menu_open_origin_t::menu_key;
 		struct visible_field_t {
 			std::size_t index = 0;
 			struct_dissector::field_def_t field;
@@ -1647,7 +1850,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 						ui.selected_field = fi;
 						ctx_open_request = true;
 						ctx_open_field = fi;
-						ctx_pointer_request = true;
+						ctx_open_origin =
+							aida::ui::context_menu_open_origin_t::pointer;
 						publish_field_selection(active_structure_name, f);
 					}
 					float fx = rx + 8.f;
@@ -1691,7 +1895,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 							mp.y >= row_y && mp.y <= row_y + line_h) {
 							ctx_open_request = true;
 							ctx_open_field = fi;
-							ctx_pointer_request = true;
+							ctx_open_origin =
+								aida::ui::context_menu_open_origin_t::pointer;
 						}
 					}
 					fx += col_type_w;
@@ -1781,93 +1986,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 		}
 		ImGui::PopClipRect();
-		if (!structure_context_requested && ui.list_focused && active_struct_idx >= 0 &&
-			(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-				(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
-			structure_context_requested = true;
-			structure_context_index = active_struct_idx;
-		}
-		if (structure_context_requested) {
-			struct_dissector::struct_def_t snapshot;
-			bool valid_structure = false;
-			{
-				std::lock_guard<std::mutex> lock(st.mtx);
-				if (struct_dissector::valid_index(structure_context_index, st.structs.size())) {
-					snapshot = st.structs[static_cast<std::size_t>(structure_context_index)];
-					valid_structure = true;
-				}
-			}
-			aida::ui::application_ui::retained_entity_context_t retained;
-			retained.owner_id = "types.dissector.structure";
-			retained.entity_id = std::to_string(snapshot.stable_id);
-			retained.entity_generation = snapshot.layout_revision;
-			retained.active_view = aida::ui::stable_view_id_t("view.types.dissector");
-			const auto retained_id = snapshot.stable_id;
-			const auto retained_revision = snapshot.layout_revision;
-			retained.validate_identity = [retained_id, retained_revision] {
-				auto& state = struct_dissector::g_state;
-				std::lock_guard<std::mutex> lock(state.mtx);
-				const int index = struct_dissector::structure_index_by_id_locked(retained_id);
-				return struct_dissector::valid_index(index, state.structs.size()) &&
-					state.structs[static_cast<std::size_t>(index)].layout_revision == retained_revision
-					? aida::ui::capability_state_t::available()
-					: aida::ui::capability_state_t::unavailable(
-						"The structure layout changed; select it again");
-			};
-			auto add_structure_action = [&retained](std::string id, bool enabled,
-				const char* reason, auto invoke) {
-				aida::ui::application_ui::retained_entity_action_t action;
-				action.action_id = std::move(id);
-				action.capability = enabled ? aida::ui::capability_state_t::available() :
-					aida::ui::capability_state_t::unavailable(reason);
-				action.invoke = std::move(invoke);
-				retained.actions.push_back(std::move(action));
-			};
-			const int target_index = structure_context_index;
-			add_structure_action("types.dissector.structure.copy_name", valid_structure,
-				"The retained structure is stale", [name = snapshot.name] {
-					ImGui::SetClipboardText(name.c_str());
-					return aida::ui::action_handler_result_t::completed();
-				});
-			add_structure_action("types.dissector.structure.copy_declaration", valid_structure,
-				"The retained structure is stale", [target_index] {
-					const std::string declaration = struct_dissector::export_to_c(target_index);
-					if (declaration.empty())
-						return aida::ui::action_handler_result_t::failed("The structure could not be exported");
-					ImGui::SetClipboardText(declaration.c_str());
-					return aida::ui::action_handler_result_t::completed();
-				});
-			add_structure_action("types.dissector.structure.configure_layout", valid_structure,
-				"The retained structure is stale", [&ui] {
-					ui.layout_popup_requested = true;
-					return aida::ui::action_handler_result_t::completed();
-				});
-			add_structure_action("types.dissector.structure.toggle_union", valid_structure,
-				"The retained structure is stale", [target_index, kind = snapshot.kind] {
-					const bool applied = struct_dissector::set_structure_kind(target_index,
-						kind == struct_dissector::structure_kind_t::union_type
-							? struct_dissector::structure_kind_t::structure
-							: struct_dissector::structure_kind_t::union_type);
-					return applied ? aida::ui::action_handler_result_t::completed() :
-						aida::ui::action_handler_result_t::failed("The structure kind change failed validation");
-				});
-			const bool persistence_available = !st.persistence_in_flight.load(std::memory_order_acquire);
-			add_structure_action("types.dissector.structure.save_catalog", persistence_available,
-				"Another structure catalog operation is running", [] {
-					return struct_dissector::request_save_schema()
-						? aida::ui::action_handler_result_t::completed("Structure schema save queued")
-						: aida::ui::action_handler_result_t::failed("Structure schema save was not queued");
-				});
-			add_structure_action("types.dissector.structure.load_catalog", persistence_available,
-				"Another structure catalog operation is running", [] {
-					return struct_dissector::request_load_schema()
-						? aida::ui::action_handler_result_t::completed("Structure schema load queued")
-						: aida::ui::action_handler_result_t::failed("Structure schema load was not queued");
-				});
-			aida::ui::application_ui::open_retained_entity_context_menu(std::move(retained),
-				structure_context_pointer ? aida::ui::context_menu_open_origin_t::pointer :
-					aida::ui::context_menu_open_origin_t::menu_key);
-		}
 		const std::size_t layout_errors = static_cast<std::size_t>(std::count_if(
 			ui.validation.issues.begin(), ui.validation.issues.end(), [](const struct_dissector::layout_issue_t& issue) {
 				return issue.severity == struct_dissector::layout_issue_severity_t::error;
@@ -1885,16 +2003,37 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(ui.operation_error ? th.error : th.text_secondary, alpha),
 				ui.operation_status.c_str());
 
+		const bool field_menu_key = ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+		const bool field_shift_f10 = ImGui::GetIO().KeyShift &&
+			ImGui::IsKeyPressed(ImGuiKey_F10, false);
 		if (!ctx_open_request && ui.table_focused && ui.selected_field >= 0 &&
-			(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-				(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+			(field_menu_key || field_shift_f10)) {
 			ctx_open_request = true;
 			ctx_open_field = ui.selected_field;
+			ctx_open_origin = field_menu_key
+				? aida::ui::context_menu_open_origin_t::menu_key
+				: aida::ui::context_menu_open_origin_t::shift_f10;
 		}
 
 		if (pending_edit.target != edit_target_t::none && pending_edit.field_idx >= 0) {
 			ui.edit_target = pending_edit.target;
 			ui.edit_target_field = pending_edit.field_idx;
+			ui.edit_structure_id = 0;
+			ui.edit_structure_revision = 0;
+			ui.edit_field_id = 0;
+			{
+				std::lock_guard<std::mutex> lock(st.mtx);
+				if (struct_dissector::valid_index(active_idx, st.structs.size())) {
+					const auto& structure = st.structs[static_cast<std::size_t>(active_idx)];
+					if (struct_dissector::valid_index(pending_edit.field_idx,
+						structure.fields.size())) {
+						ui.edit_structure_id = structure.stable_id;
+						ui.edit_structure_revision = structure.layout_revision;
+						ui.edit_field_id = structure.fields[
+							static_cast<std::size_t>(pending_edit.field_idx)].stable_id;
+					}
+				}
+			}
 			std::strncpy(ui.rename_buf, pending_edit.seed_text.c_str(),
 				sizeof(ui.rename_buf) - 1);
 			ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
@@ -1948,17 +2087,45 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::PopItemWidth();
 			ImGui::SameLine();
 			if (ImGui::Button(commit) || accept) {
+				int mutation_struct_idx = active_idx;
 				int tgt_field = ui.edit_target_field;
+				bool edit_identity_valid = true;
+				if (ui.edit_structure_id != 0 && ui.edit_field_id != 0) {
+					edit_identity_valid = false;
+					const auto edit_field_id = ui.edit_field_id;
+					std::lock_guard<std::mutex> lock(st.mtx);
+					mutation_struct_idx = struct_dissector::structure_index_by_id_locked(
+						ui.edit_structure_id);
+					if (struct_dissector::valid_index(mutation_struct_idx, st.structs.size())) {
+						const auto& structure = st.structs[
+							static_cast<std::size_t>(mutation_struct_idx)];
+						if (structure.stable_id == ui.edit_structure_id &&
+							structure.layout_revision == ui.edit_structure_revision) {
+							const auto found = std::find_if(structure.fields.begin(),
+								structure.fields.end(), [edit_field_id](const auto& field) {
+									return field.stable_id == edit_field_id;
+								});
+							if (found != structure.fields.end()) {
+								const auto distance = static_cast<std::size_t>(
+									std::distance(structure.fields.begin(), found));
+								if (struct_dissector::index_fits_int(distance)) {
+									tgt_field = static_cast<int>(distance);
+									edit_identity_valid = true;
+								}
+							}
+						}
+					}
+				}
 				bool applied = false;
-				switch (ui.edit_target) {
+				if (edit_identity_valid) switch (ui.edit_target) {
 				case edit_target_t::field_name:
 					if (tgt_field >= 0 && ui.rename_buf[0] != '\0')
-						applied = struct_dissector::rename_field(active_idx, tgt_field, ui.rename_buf);
+						applied = struct_dissector::rename_field(mutation_struct_idx, tgt_field, ui.rename_buf);
 					break;
 				case edit_target_t::field_size: {
 					uint32_t nsz = 0;
 					if (std::sscanf(ui.rename_buf, "%u", &nsz) == 1 && nsz > 0)
-						applied = struct_dissector::set_field_size(active_idx, tgt_field, nsz);
+						applied = struct_dissector::set_field_size(mutation_struct_idx, tgt_field, nsz);
 					else
 						diag::log_tagged_fmt("dissector",
 							"set_field_size_input_invalid input='%s'", ui.rename_buf);
@@ -1966,7 +2133,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				}
 				case edit_target_t::field_comment:
 					if (tgt_field >= 0)
-						applied = struct_dissector::set_field_comment(active_idx, tgt_field, ui.rename_buf);
+						applied = struct_dissector::set_field_comment(mutation_struct_idx, tgt_field, ui.rename_buf);
 					break;
 				case edit_target_t::struct_name:
 					if (active_idx >= 0 && ui.rename_buf[0] != '\0')
@@ -1977,31 +2144,31 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					char* end = nullptr;
 					value = std::strtoul(ui.rename_buf, &end, 0);
 					if (end && *end == '\0' && value <= 1048576)
-						applied = struct_dissector::set_field_array_count(active_idx, tgt_field,
+						applied = struct_dissector::set_field_array_count(mutation_struct_idx, tgt_field,
 							static_cast<std::uint32_t>(value));
 					break;
 				}
 				case edit_target_t::nested_target:
-					applied = struct_dissector::set_field_nested_target_by_name(active_idx,
+					applied = struct_dissector::set_field_nested_target_by_name(mutation_struct_idx,
 						tgt_field, ui.rename_buf, false);
 					break;
 				case edit_target_t::pointer_target:
-					applied = struct_dissector::set_field_nested_target_by_name(active_idx,
+					applied = struct_dissector::set_field_nested_target_by_name(mutation_struct_idx,
 						tgt_field, ui.rename_buf, true);
 					break;
 				case edit_target_t::enum_reference:
-					applied = struct_dissector::set_field_enum_reference(active_idx,
+					applied = struct_dissector::set_field_enum_reference(mutation_struct_idx,
 						tgt_field, ui.rename_buf);
 					break;
 				case edit_target_t::bitfield: {
 					if (std::strcmp(ui.rename_buf, "none") == 0 || std::strcmp(ui.rename_buf, "0") == 0)
-						applied = struct_dissector::set_field_bitfield(active_idx, tgt_field, 0, 0);
+						applied = struct_dissector::set_field_bitfield(mutation_struct_idx, tgt_field, 0, 0);
 					else {
 						unsigned int offset = 0;
 						unsigned int width = 0;
 						if (std::sscanf(ui.rename_buf, "%u:%u", &offset, &width) == 2 &&
 							offset <= 65535 && width <= 65535)
-							applied = struct_dissector::set_field_bitfield(active_idx, tgt_field,
+							applied = struct_dissector::set_field_bitfield(mutation_struct_idx, tgt_field,
 								static_cast<std::uint16_t>(offset), static_cast<std::uint16_t>(width));
 					}
 					break;
@@ -2009,7 +2176,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				case edit_target_t::field_alignment: {
 					unsigned int alignment = 0;
 					if (std::sscanf(ui.rename_buf, "%u", &alignment) == 1 && alignment <= 4096)
-						applied = struct_dissector::set_field_alignment(active_idx, tgt_field,
+						applied = struct_dissector::set_field_alignment(mutation_struct_idx, tgt_field,
 							static_cast<std::uint16_t>(alignment));
 					break;
 				}
@@ -2020,6 +2187,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 					"Layout change rejected; check ranges, overlap, recursion, and alignment";
 				ui.edit_target = edit_target_t::none;
 				ui.edit_target_field = -1;
+				ui.edit_structure_id = 0;
+				ui.edit_structure_revision = 0;
+				ui.edit_field_id = 0;
 				ui.rename_buf[0] = '\0';
 				ImGui::CloseCurrentPopup();
 			}
@@ -2027,12 +2197,19 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			if (ImGui::Button("Cancel")) {
 				ui.edit_target = edit_target_t::none;
 				ui.edit_target_field = -1;
+				ui.edit_structure_id = 0;
+				ui.edit_structure_revision = 0;
+				ui.edit_field_id = 0;
 				ui.rename_buf[0] = '\0';
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::EndPopup();
 		} else if (ui.edit_target != edit_target_t::none) {
 			ui.edit_target = edit_target_t::none;
+			ui.edit_target_field = -1;
+			ui.edit_structure_id = 0;
+			ui.edit_structure_revision = 0;
+			ui.edit_field_id = 0;
 		}
 
 		if (ctx_open_request) {
@@ -2040,12 +2217,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			struct_dissector::field_def_t field_snapshot;
 			struct_dissector::live_value_t value_snapshot;
 			bool valid_field = false;
+			std::uint64_t retained_structure_id = 0;
+			std::uint64_t retained_structure_revision = 0;
 			{
 				std::lock_guard<std::mutex> lk(st.mtx);
 				if (struct_dissector::valid_index(active_idx, st.structs.size())) {
-					const auto& fields = st.structs[static_cast<std::size_t>(active_idx)].fields;
+					const auto& selected =
+						st.structs[static_cast<std::size_t>(active_idx)];
+					const auto& fields = selected.fields;
 					if (struct_dissector::valid_index(tgt_field, fields.size())) {
 						field_snapshot = fields[static_cast<std::size_t>(tgt_field)];
+						retained_structure_id = selected.stable_id;
+						retained_structure_revision = selected.layout_revision;
 						if (static_cast<std::size_t>(tgt_field) < st.cached_values.size())
 							value_snapshot = st.cached_values[static_cast<std::size_t>(tgt_field)];
 						valid_field = true;
@@ -2061,41 +2244,57 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				active_base_address == ui.context_base_address &&
 				st.last_completed_seq.load(std::memory_order_acquire) == ui.context_refresh_seq;
 #endif
+			if (!valid_field || retained_structure_id == 0 ||
+				retained_structure_revision == 0 || field_snapshot.stable_id == 0) {
+				ui.operation_error = true;
+				ui.operation_status = "The field context is stale; select it again";
+			} else {
 			aida::ui::application_ui::retained_entity_context_t retained;
 			retained.owner_id = "types.dissector.field";
-			retained.entity_id = active_structure_name + ":" + field_snapshot.name + ":" +
-				std::to_string(field_snapshot.offset);
-			retained.entity_generation = st.last_completed_seq.load(std::memory_order_acquire);
+			retained.entity_id = std::to_string(retained_structure_id) + ":" +
+				std::to_string(field_snapshot.stable_id);
+			retained.entity_generation = retained_structure_revision;
 			retained.active_view = aida::ui::stable_view_id_t("view.types.dissector");
-			std::uint64_t identity = 0;
-			{
-				std::lock_guard<std::mutex> lock(st.mtx);
-				identity = structure_identity_locked(active_idx);
-			}
-			const int retained_structure = active_idx;
-			const int retained_field = tgt_field;
-			const std::uint32_t retained_offset = field_snapshot.offset;
-			const std::string retained_name = field_snapshot.name;
-			retained.validate_identity = [retained_structure, retained_field, retained_offset,
-				retained_name, identity] {
+			const std::uint64_t retained_field_id = field_snapshot.stable_id;
+			const auto resolve_field = [retained_structure_id,
+				retained_structure_revision, retained_field_id]()
+				-> std::optional<std::pair<int, int>> {
 				auto& state = struct_dissector::g_state;
 				std::lock_guard<std::mutex> lock(state.mtx);
-				if (!struct_dissector::valid_index(retained_structure, state.structs.size()) ||
-					structure_identity_locked(retained_structure) != identity)
-					return aida::ui::capability_state_t::unavailable(
-						"The structure definition changed; select the field again");
-				const auto& fields = state.structs[static_cast<std::size_t>(retained_structure)].fields;
-				if (!struct_dissector::valid_index(retained_field, fields.size()))
-					return aida::ui::capability_state_t::unavailable(
-						"The retained field no longer exists");
-				const auto& candidate = fields[static_cast<std::size_t>(retained_field)];
-				return candidate.offset == retained_offset && candidate.name == retained_name
+				const int structure_index =
+					struct_dissector::structure_index_by_id_locked(
+						retained_structure_id);
+				if (!struct_dissector::valid_index(
+						structure_index, state.structs.size()))
+					return std::nullopt;
+				const auto& structure =
+					state.structs[static_cast<std::size_t>(structure_index)];
+				if (structure.stable_id != retained_structure_id ||
+					structure.layout_revision != retained_structure_revision)
+					return std::nullopt;
+				const auto found = std::find_if(
+					structure.fields.begin(), structure.fields.end(),
+					[retained_field_id](const auto& field) {
+						return field.stable_id == retained_field_id;
+					});
+				if (found == structure.fields.end())
+					return std::nullopt;
+				const auto distance = static_cast<std::size_t>(
+					std::distance(structure.fields.begin(), found));
+				if (!struct_dissector::index_fits_int(distance))
+					return std::nullopt;
+				return std::pair<int, int>{structure_index,
+					static_cast<int>(distance)};
+			};
+			retained.validate_identity = [resolve_field] {
+				return resolve_field()
 					? aida::ui::capability_state_t::available()
 					: aida::ui::capability_state_t::unavailable(
-						"The retained field identity no longer matches the structure");
+						"The structure or retained field changed; select it again");
 			};
 			auto add_action = [&retained](std::string id, bool enabled,
-				const char* reason, auto invoke) {
+				const char* reason,
+				std::function<aida::ui::action_handler_result_t()> invoke) {
 				aida::ui::application_ui::retained_entity_action_t action;
 				action.action_id = std::move(id);
 				action.capability = enabled ? aida::ui::capability_state_t::available()
@@ -2103,14 +2302,62 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				action.invoke = std::move(invoke);
 				retained.actions.push_back(std::move(action));
 			};
+			const auto activate_retained_field = [resolve_field, retained_structure_id,
+				retained_structure_revision, retained_field_id]()
+				-> std::optional<std::pair<int, int>> {
+				const auto resolved = resolve_field();
+				if (!resolved)
+					return std::nullopt;
+				auto& state = struct_dissector::g_state;
+				std::lock_guard<std::mutex> lock(state.mtx);
+				if (!struct_dissector::valid_index(
+						resolved->first, state.structs.size()))
+					return std::nullopt;
+				const auto& structure =
+					state.structs[static_cast<std::size_t>(resolved->first)];
+				if (structure.stable_id != retained_structure_id ||
+					structure.layout_revision != retained_structure_revision ||
+					!struct_dissector::valid_index(
+						resolved->second, structure.fields.size()) ||
+					structure.fields[static_cast<std::size_t>(resolved->second)].stable_id !=
+						retained_field_id)
+					return std::nullopt;
+				state.active_struct = resolved->first;
+				return resolved;
+			};
+			const auto open_field_edit = [activate_retained_field,
+				retained_structure_id, retained_structure_revision, retained_field_id](
+				edit_target_t target, std::string seed) {
+				const auto resolved = activate_retained_field();
+				if (!resolved)
+					return aida::ui::action_handler_result_t::failed(
+						"The retained field is stale");
+				g_ui.edit_target = target;
+				g_ui.edit_target_field = resolved->second;
+				g_ui.edit_structure_id = retained_structure_id;
+				g_ui.edit_structure_revision = retained_structure_revision;
+				g_ui.edit_field_id = retained_field_id;
+				std::strncpy(g_ui.rename_buf, seed.c_str(),
+					sizeof(g_ui.rename_buf) - 1);
+				g_ui.rename_buf[sizeof(g_ui.rename_buf) - 1] = '\0';
+				ImGui::CloseCurrentPopup();
+				g_ui.inline_edit_popup_requested = true;
+				return aida::ui::action_handler_result_t::completed();
+			};
 			const std::string field_name = field_snapshot.name;
 			add_action("types.dissector.field.copy_name", valid_field,
-				"The retained field is stale", [field_name] {
+				"The retained field is stale", [resolve_field, field_name] {
+					if (!resolve_field())
+						return aida::ui::action_handler_result_t::failed(
+							"The retained field is stale");
 					ImGui::SetClipboardText(field_name.c_str());
 					return aida::ui::action_handler_result_t::completed();
 				});
 			add_action("types.dissector.field.copy_offset", valid_field,
-				"The retained field is stale", [field_snapshot] {
+				"The retained field is stale", [resolve_field, field_snapshot] {
+				if (!resolve_field())
+					return aida::ui::action_handler_result_t::failed(
+						"The retained field is stale");
 				char text[24]{};
 				std::snprintf(text, sizeof(text), "0x%X", field_snapshot.offset);
 				ImGui::SetClipboardText(text);
@@ -2119,7 +2366,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			const std::uint64_t absolute_address = ui.context_base_address + field_snapshot.offset;
 			add_action("types.dissector.field.copy_absolute_address",
 				valid_field && ui.context_base_address != 0,
-				"No live base address is selected", [absolute_address] {
+				"No live base address is selected", [resolve_field, absolute_address] {
+				if (!resolve_field())
+					return aida::ui::action_handler_result_t::failed(
+						"The retained field is stale");
 				char text[32]{};
 				std::snprintf(text, sizeof(text), "0x%016llX",
 					static_cast<unsigned long long>(absolute_address));
@@ -2129,53 +2379,45 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			const std::string display_value = value_snapshot.display_text;
 			add_action("types.dissector.field.copy_current_value",
 				live_current && !display_value.empty(),
-				"A current live value is unavailable for this field", [display_value] {
-					ImGui::SetClipboardText(display_value.c_str());
-					return aida::ui::action_handler_result_t::completed();
-				});
+				"A current live value is unavailable for this field", [resolve_field, display_value] {
+				if (!resolve_field()) {
+					return aida::ui::action_handler_result_t::failed(
+						"The retained field is stale");
+				}
+				ImGui::SetClipboardText(display_value.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
 			add_action("types.dissector.field.edit_live_value",
 				live_current && !value_snapshot.raw_bytes.empty(),
 				"Attach the original target and reselect the field before editing live memory",
-				[&ui, tgt_field, value_snapshot] {
-				ui.editing_field = tgt_field;
-				ui.edit_base_address = ui.context_base_address;
-				std::strncpy(ui.edit_value_buf, value_snapshot.display_text.c_str(),
-					sizeof(ui.edit_value_buf) - 1);
-				ui.edit_value_buf[sizeof(ui.edit_value_buf) - 1] = '\0';
+				[activate_retained_field, value_snapshot] {
+				const auto resolved = activate_retained_field();
+				if (!resolved)
+					return aida::ui::action_handler_result_t::failed(
+						"The retained field is stale");
+				g_ui.editing_field = resolved->second;
+				g_ui.edit_base_address = g_ui.context_base_address;
+				std::strncpy(g_ui.edit_value_buf,
+					value_snapshot.display_text.c_str(),
+					sizeof(g_ui.edit_value_buf) - 1);
+				g_ui.edit_value_buf[sizeof(g_ui.edit_value_buf) - 1] = '\0';
 				return aida::ui::action_handler_result_t::completed();
 			});
 			add_action("types.dissector.field.refresh_live_value", false,
 				"Attach the original target and reselect the field before reading live memory",
 				[] { return aida::ui::action_handler_result_t::completed(); });
 			add_action("types.dissector.field.rename", valid_field,
-				"The retained field is stale", [&ui, tgt_field, field_name] {
-				ui.edit_target = edit_target_t::field_name;
-				ui.edit_target_field = tgt_field;
-				std::strncpy(ui.rename_buf, field_name.c_str(), sizeof(ui.rename_buf) - 1);
-				ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
-				ImGui::CloseCurrentPopup();
-				ui.inline_edit_popup_requested = true;
-				return aida::ui::action_handler_result_t::completed();
+				"The retained field is stale", [open_field_edit, field_name] {
+				return open_field_edit(edit_target_t::field_name, field_name);
 			});
 			add_action("types.dissector.field.set_size", valid_field,
-				"The retained field is stale", [&ui, tgt_field] {
-				ui.edit_target = edit_target_t::field_size;
-				ui.edit_target_field = tgt_field;
-				ui.rename_buf[0] = '\0';
-				ImGui::CloseCurrentPopup();
-				ui.inline_edit_popup_requested = true;
-				return aida::ui::action_handler_result_t::completed();
+				"The retained field is stale", [open_field_edit] {
+				return open_field_edit(edit_target_t::field_size, {});
 			});
 			const std::string field_comment = field_snapshot.description;
 			add_action("types.dissector.field.set_comment", valid_field,
-				"The retained field is stale", [&ui, tgt_field, field_comment] {
-				ui.edit_target = edit_target_t::field_comment;
-				ui.edit_target_field = tgt_field;
-				std::strncpy(ui.rename_buf, field_comment.c_str(), sizeof(ui.rename_buf) - 1);
-				ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
-				ImGui::CloseCurrentPopup();
-				ui.inline_edit_popup_requested = true;
-				return aida::ui::action_handler_result_t::completed();
+				"The retained field is stale", [open_field_edit, field_comment] {
+				return open_field_edit(edit_target_t::field_comment, field_comment);
 			});
 			bool nested_available = false;
 			{
@@ -2187,51 +2429,36 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				add_action("types.dissector.field.change_type." + std::to_string(type_index),
 					valid_field && (type_index != static_cast<std::size_t>(struct_dissector::field_type_t::nested_struct) || nested_available),
 					nested_available ? "The retained field is stale" : "Create another structure before selecting a nested type",
-					[&ui, active_idx, tgt_field, type_index] {
+					[activate_retained_field, open_field_edit, type_index] {
 						if (type_index == static_cast<std::size_t>(struct_dissector::field_type_t::nested_struct)) {
-							ui.edit_target = edit_target_t::nested_target;
-							ui.edit_target_field = tgt_field;
-							ui.rename_buf[0] = '\0';
-							ImGui::CloseCurrentPopup();
-							ui.inline_edit_popup_requested = true;
-							return aida::ui::action_handler_result_t::completed();
+							return open_field_edit(edit_target_t::nested_target, {});
 						}
-						return struct_dissector::retype_field(active_idx, tgt_field,
+						const auto resolved = activate_retained_field();
+						if (!resolved)
+							return aida::ui::action_handler_result_t::failed(
+								"The retained field is stale");
+						return struct_dissector::retype_field(resolved->first, resolved->second,
 							static_cast<struct_dissector::field_type_t>(type_index))
 							? aida::ui::action_handler_result_t::completed()
 							: aida::ui::action_handler_result_t::failed("The field type change failed layout validation");
 					});
 			}
 			add_action("types.dissector.field.set_array_count", valid_field,
-				"The retained field is stale", [&ui, tgt_field, field_snapshot] {
-				ui.edit_target = edit_target_t::array_count;
-				ui.edit_target_field = tgt_field;
-				std::snprintf(ui.rename_buf, sizeof(ui.rename_buf), "%u", field_snapshot.array_count);
-				ImGui::CloseCurrentPopup();
-				ui.inline_edit_popup_requested = true;
-				return aida::ui::action_handler_result_t::completed();
+				"The retained field is stale", [open_field_edit, field_snapshot] {
+				return open_field_edit(edit_target_t::array_count,
+					std::to_string(field_snapshot.array_count));
 			});
 			add_action("types.dissector.field.choose_nested", valid_field && nested_available,
 				nested_available ? "The retained field is stale" : "Create another structure before linking a nested value",
-				[&ui, tgt_field, field_snapshot] {
-					ui.edit_target = edit_target_t::nested_target;
-					ui.edit_target_field = tgt_field;
-					std::strncpy(ui.rename_buf, field_snapshot.referenced_type_name.c_str(), sizeof(ui.rename_buf) - 1);
-					ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
-					ImGui::CloseCurrentPopup();
-					ui.inline_edit_popup_requested = true;
-					return aida::ui::action_handler_result_t::completed();
+				[open_field_edit, field_snapshot] {
+					return open_field_edit(edit_target_t::nested_target,
+						field_snapshot.referenced_type_name);
 				});
 			add_action("types.dissector.field.choose_pointer_target", valid_field && nested_available,
 				nested_available ? "The retained field is stale" : "Create another structure before selecting a pointee type",
-				[&ui, tgt_field, field_snapshot] {
-					ui.edit_target = edit_target_t::pointer_target;
-					ui.edit_target_field = tgt_field;
-					std::strncpy(ui.rename_buf, field_snapshot.referenced_type_name.c_str(), sizeof(ui.rename_buf) - 1);
-					ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
-					ImGui::CloseCurrentPopup();
-					ui.inline_edit_popup_requested = true;
-					return aida::ui::action_handler_result_t::completed();
+				[open_field_edit, field_snapshot] {
+					return open_field_edit(edit_target_t::pointer_target,
+						field_snapshot.referenced_type_name);
 				});
 			bool enum_available = false;
 			{
@@ -2240,14 +2467,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 			add_action("types.dissector.field.choose_enum", valid_field && enum_available,
 				enum_available ? "The retained field is stale" : "Import an enum definition before applying an enum type",
-				[&ui, tgt_field, field_snapshot] {
-					ui.edit_target = edit_target_t::enum_reference;
-					ui.edit_target_field = tgt_field;
-					std::strncpy(ui.rename_buf, field_snapshot.referenced_type_name.c_str(), sizeof(ui.rename_buf) - 1);
-					ui.rename_buf[sizeof(ui.rename_buf) - 1] = '\0';
-					ImGui::CloseCurrentPopup();
-					ui.inline_edit_popup_requested = true;
-					return aida::ui::action_handler_result_t::completed();
+				[open_field_edit, field_snapshot] {
+					return open_field_edit(edit_target_t::enum_reference,
+						field_snapshot.referenced_type_name);
 				});
 			const std::size_t bitfield_size = field_snapshot.size == 0
 				? struct_dissector::field_type_size(field_snapshot.type) : field_snapshot.size;
@@ -2256,41 +2478,33 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				field_snapshot.type != struct_dissector::field_type_t::nested_struct;
 			add_action("types.dissector.field.configure_bitfield", bitfield_capable,
 				"Bitfields require one 1-8 byte non-pointer scalar",
-				[&ui, tgt_field, field_snapshot] {
-					ui.edit_target = edit_target_t::bitfield;
-					ui.edit_target_field = tgt_field;
-					if (field_snapshot.bit_width == 0)
-						std::strncpy(ui.rename_buf, "0:1", sizeof(ui.rename_buf) - 1);
-					else
-						std::snprintf(ui.rename_buf, sizeof(ui.rename_buf), "%u:%u",
-							static_cast<unsigned int>(field_snapshot.bit_offset),
-							static_cast<unsigned int>(field_snapshot.bit_width));
-					ImGui::CloseCurrentPopup();
-					ui.inline_edit_popup_requested = true;
-					return aida::ui::action_handler_result_t::completed();
+				[open_field_edit, field_snapshot] {
+					const std::string seed = field_snapshot.bit_width == 0
+						? "0:1" : std::to_string(field_snapshot.bit_offset) + ":" +
+							std::to_string(field_snapshot.bit_width);
+					return open_field_edit(edit_target_t::bitfield, seed);
 				});
 			add_action("types.dissector.field.set_alignment", valid_field,
-				"The retained field is stale", [&ui, tgt_field, field_snapshot] {
-				ui.edit_target = edit_target_t::field_alignment;
-				ui.edit_target_field = tgt_field;
-				std::snprintf(ui.rename_buf, sizeof(ui.rename_buf), "%u",
-					static_cast<unsigned int>(field_snapshot.explicit_alignment));
-				ImGui::CloseCurrentPopup();
-				ui.inline_edit_popup_requested = true;
-				return aida::ui::action_handler_result_t::completed();
+				"The retained field is stale", [open_field_edit, field_snapshot] {
+				return open_field_edit(edit_target_t::field_alignment,
+					std::to_string(field_snapshot.explicit_alignment));
 			});
 			add_action("types.dissector.field.remove", valid_field,
-				"The retained field is stale", [&ui, tgt_field] {
-				ui.pending_remove_field = tgt_field;
-				ui.remove_confirmation_requested = true;
+				"The retained field is stale", [activate_retained_field,
+					retained_structure_id, retained_structure_revision, retained_field_id] {
+				const auto resolved = activate_retained_field();
+				if (!resolved)
+					return aida::ui::action_handler_result_t::failed(
+						"The retained field is stale");
+				g_ui.pending_remove_structure_id = retained_structure_id;
+				g_ui.pending_remove_structure_revision = retained_structure_revision;
+				g_ui.pending_remove_field_id = retained_field_id;
+				g_ui.remove_confirmation_requested = true;
 				return aida::ui::action_handler_result_t::completed();
 			});
 			aida::ui::application_ui::open_retained_entity_context_menu(
-				std::move(retained), ctx_pointer_request
-					? aida::ui::context_menu_open_origin_t::pointer
-					: ImGui::IsKeyPressed(ImGuiKey_Menu, false)
-					? aida::ui::context_menu_open_origin_t::menu_key
-					: aida::ui::context_menu_open_origin_t::shift_f10);
+				std::move(retained), ctx_open_origin);
+			}
 		}
 		aida::ui::application_ui::render_retained_entity_context_menu(
 			"types.dissector.field");
@@ -2308,17 +2522,45 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::TextUnformatted("Remove this field from the structure definition?");
 			ImGui::TextDisabled("This backend has no field-removal undo journal.");
 			if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
-				ui.pending_remove_field = -1;
+				ui.pending_remove_structure_id = 0;
+				ui.pending_remove_structure_revision = 0;
+				ui.pending_remove_field_id = 0;
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::SameLine();
 			if (ImGui::Button("Remove", ImVec2(110.f, 0.f))) {
-				const int target = ui.pending_remove_field;
-				if (target >= 0 && struct_dissector::remove_field(active_idx, target)) {
+				int structure_index = -1;
+				int target = -1;
+				const auto pending_remove_field_id = ui.pending_remove_field_id;
+				{
+					std::lock_guard<std::mutex> lock(st.mtx);
+					structure_index = struct_dissector::structure_index_by_id_locked(
+						ui.pending_remove_structure_id);
+					if (struct_dissector::valid_index(structure_index, st.structs.size())) {
+						const auto& structure = st.structs[
+							static_cast<std::size_t>(structure_index)];
+						if (structure.stable_id == ui.pending_remove_structure_id &&
+							structure.layout_revision == ui.pending_remove_structure_revision) {
+							const auto found = std::find_if(structure.fields.begin(),
+								structure.fields.end(), [pending_remove_field_id](const auto& field) {
+									return field.stable_id == pending_remove_field_id;
+								});
+							if (found != structure.fields.end()) {
+								const auto distance = static_cast<std::size_t>(
+									std::distance(structure.fields.begin(), found));
+								if (struct_dissector::index_fits_int(distance))
+									target = static_cast<int>(distance);
+							}
+						}
+					}
+				}
+				if (target >= 0 && struct_dissector::remove_field(structure_index, target)) {
 					if (ui.selected_field == target) ui.selected_field = -1;
 					if (ui.editing_field == target) ui.editing_field = -1;
 				}
-				ui.pending_remove_field = -1;
+				ui.pending_remove_structure_id = 0;
+				ui.pending_remove_structure_revision = 0;
+				ui.pending_remove_field_id = 0;
 				ImGui::CloseCurrentPopup();
 			}
 			ImGui::EndPopup();

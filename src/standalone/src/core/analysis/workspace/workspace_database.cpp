@@ -6711,6 +6711,19 @@ workspace_result_t<void> workspace_database_t::finalize_candidate(
     return workspace_result_t<void>::success();
 }
 
+void workspace_database_t::acknowledge_promoted_candidate(
+    const workspace_persistence_candidate_t& candidate) noexcept {
+    state_->persisted_generation.store(candidate.generation_, std::memory_order_release);
+    state_->persisted_analysis_revision.store(
+        candidate.analysis_revision_, std::memory_order_release);
+    state_->persisted_overlay_revision.store(
+        candidate.overlay_revision_, std::memory_order_release);
+    state_->candidate_pending.store(false, std::memory_order_release);
+    state_->candidate_generation.store(0, std::memory_order_release);
+    state_->candidate_analysis_revision.store(0, std::memory_order_release);
+    state_->candidate_overlay_revision.store(0, std::memory_order_release);
+}
+
 workspace_result_t<void> workspace_database_t::discard_candidate(
     const workspace_persistence_candidate_t& candidate,
     const cancellation_token_t& cancel) {

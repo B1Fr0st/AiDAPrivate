@@ -428,6 +428,9 @@ bool analysis_publication_t::coherent_with(
         !managed_artifacts->coherent_with(identity, *provider, generation,
                                            analysis_revision, overlay_revision))
         return false;
+    if (overlay_presentation &&
+        overlay_presentation->overlay_revision != overlay_revision)
+        return false;
     if (readiness == workspace_readiness_t::baseline_ready)
         return snapshot->baseline_complete && search_index != nullptr;
     return !snapshot->baseline_complete;
@@ -456,6 +459,16 @@ rebind_publication_managed_artifacts(
     return rebind_managed_artifact_publication(
         *source, identity, *provider, pe_image, generation,
         analysis_revision, overlay_revision, cancel);
+}
+
+std::shared_ptr<const workspace_overlay_presentation_t>
+presentation_for_overlay(
+    const std::shared_ptr<const analysis_publication_t>& publication,
+    std::uint64_t overlay_revision) noexcept {
+    if (!publication || !publication->overlay_presentation ||
+        publication->overlay_presentation->overlay_revision != overlay_revision)
+        return nullptr;
+    return publication->overlay_presentation;
 }
 
 }
@@ -1651,6 +1664,193 @@ analysis_workspace_t::create_preview(
     return workspace_result_t<std::shared_ptr<analysis_workspace_t>>::success(
         std::move(workspace));
 }
+
+workspace_result_t<void>
+analysis_workspace_t::publish_preview_overlay_generation(
+    std::uint64_t expected_generation,
+    std::uint64_t expected_analysis_revision,
+    std::uint64_t expected_overlay_revision,
+    std::uint64_t target_generation,
+    std::uint64_t target_overlay_revision,
+    std::shared_ptr<const workspace_overlay_presentation_t> presentation,
+    std::function<workspace_result_t<void>()> finalizer) {
+    if (!presentation || !finalizer ||
+        expected_generation == (std::numeric_limits<std::uint64_t>::max)() ||
+        expected_overlay_revision == (std::numeric_limits<std::uint64_t>::max)() ||
+        target_generation != expected_generation + 1 ||
+        target_overlay_revision != expected_overlay_revision + 1 ||
+        presentation->overlay_revision != target_overlay_revision ||
+        target_kind() != target_kind_t::static_file)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "preview overlay publication identity is invalid",
+            "workspace_preview_overlay_publish"));
+    constexpr std::size_t maximum_entries = 65536;
+    if (presentation->comments.size() > maximum_entries ||
+        presentation->renames.size() > maximum_entries ||
+        presentation->bookmarks.size() > maximum_entries ||
+        presentation->workspace_bookmarks.size() > maximum_entries)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "preview overlay presentation exceeds its publication limits",
+            "workspace_preview_overlay_publish"));
+    const auto entries_valid = [&](const auto& entries) {
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (!valid_workspace_address(entries[index].address, *identity_) ||
+                (index != 0 &&
+                 !(entries[index - 1].address < entries[index].address)))
+                return false;
+        }
+        return true;
+    };
+    if (!entries_valid(presentation->comments) ||
+        !entries_valid(presentation->renames) ||
+        !entries_valid(presentation->bookmarks) ||
+        !std::is_sorted(presentation->workspace_bookmarks.begin(),
+                        presentation->workspace_bookmarks.end()) ||
+        std::adjacent_find(presentation->workspace_bookmarks.begin(),
+                           presentation->workspace_bookmarks.end()) !=
+            presentation->workspace_bookmarks.end() ||
+        !std::all_of(presentation->workspace_bookmarks.begin(),
+                     presentation->workspace_bookmarks.end(),
+                     [&](const auto& address) {
+                         return valid_workspace_address(address, *identity_);
+                     }))
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "preview overlay presentation is not sorted, unique, and workspace-bound",
+            "workspace_preview_overlay_publish"));
+    if (closing() || closed())
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::workspace_closing,
+            "workspace is closing", "workspace_preview_overlay_publish"));
+    const auto source = analysis_publication();
+    if (!source || !source->snapshot || !source->provider ||
+        source->generation != expected_generation ||
+        source->analysis_revision != expected_analysis_revision ||
+        source->overlay_revision != expected_overlay_revision)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "workspace publication changed before preview overlay preparation",
+            "workspace_preview_overlay_publish"));
+    const auto& provider_identity = source->provider->identity();
+    if (!provider_identity.immutable_snapshot ||
+        !provider_identity.content_sha256 ||
+        provider_identity.content_sha256->empty() ||
+        provider_identity.normalized_source.empty() ||
+        provider_identity.size != source->provider->size())
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::provider_binding_mismatch,
+            "preview overlay provider is not an immutable bound snapshot",
+            "workspace_preview_overlay_publish"));
+    const auto workspace_cancel = cancellation_token();
+    if (workspace_cancel.stop_requested())
+        return workspace_result_t<void>::failure(
+            workspace_stop_error(workspace_cancel,
+                                 "workspace_preview_overlay_publish"));
+    std::shared_ptr<const analysis_snapshot_t> projected_snapshot;
+    std::shared_ptr<const analysis_publication_t> replacement;
+    std::optional<cancellation_source_t> replacement_cancellation;
+    try {
+        replacement_cancellation.emplace();
+        auto next = std::make_shared<analysis_snapshot_t>(*source->snapshot);
+        next->generation = target_generation;
+        next->overlay_revision = target_overlay_revision;
+        projected_snapshot =
+            std::static_pointer_cast<const analysis_snapshot_t>(std::move(next));
+        auto snapshot_validation = validate_analysis_snapshot(
+            *projected_snapshot, projected_snapshot->baseline_complete,
+            workspace_cancel);
+        if (!snapshot_validation)
+            return workspace_result_t<void>::failure(
+                snapshot_validation.error());
+        if (source->search_index &&
+            (!source->search_index->matches(projected_snapshot) ||
+             !source->search_index->matches(
+                 identity_->binary_id(), identity_->load_profile_hash(),
+                 target_generation, expected_analysis_revision,
+                 target_overlay_revision)))
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::service_conflict,
+                "preview overlay search publication cannot retain a stale identity",
+                "workspace_preview_overlay_publish"));
+        if (source->managed_artifacts &&
+            !source->managed_artifacts->coherent_with(
+                *identity_, *source->provider, target_generation,
+                expected_analysis_revision, target_overlay_revision))
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::service_conflict,
+                "preview overlay managed publication cannot retain a stale identity",
+                "workspace_preview_overlay_publish"));
+        replacement = std::make_shared<const analysis_publication_t>(
+            projected_snapshot, source->provider, source->search_index,
+            source->readiness, source->managed_artifacts, std::move(presentation));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "preview overlay publication allocation failed",
+            "workspace_preview_overlay_publish"));
+    }
+    if (!replacement->coherent_with(*identity_))
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "preview overlay publication is incoherent",
+            "workspace_preview_overlay_publish"));
+    if (publication_finalizer_active_.load(std::memory_order_acquire))
+        return workspace_result_t<void>::failure(
+            publication_finalizer_conflict(
+                "workspace_preview_overlay_publish"));
+    std::unique_lock<std::shared_mutex> mutation_lock(
+        mutation_mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> publication_lock(
+        publication_mutex_, std::defer_lock);
+    std::lock(mutation_lock, publication_lock);
+    std::unique_lock state_lock(state_mutex_);
+    if (closing() || closed())
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::workspace_closing,
+            "workspace is closing", "workspace_preview_overlay_publish"));
+    const auto current = analysis_publication();
+    if (!current || current != source ||
+        current->generation != expected_generation ||
+        current->analysis_revision != expected_analysis_revision ||
+        current->overlay_revision != expected_overlay_revision ||
+        target_generation != current->generation + 1 ||
+        target_overlay_revision != current->overlay_revision + 1)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::revision_conflict,
+            "workspace revisions changed before preview overlay publication",
+            "workspace_preview_overlay_publish"));
+    if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::analysis_in_progress,
+            "preview overlay generation cannot publish during analysis",
+            "workspace_preview_overlay_publish"));
+    if (workspace_cancel.stop_requested())
+        return workspace_result_t<void>::failure(
+            workspace_stop_error(workspace_cancel,
+                                 "workspace_preview_overlay_publish"));
+    publication_finalizer_active_.store(true, std::memory_order_release);
+    workspace_result_t<void> finalized = workspace_result_t<void>::success();
+    try {
+        finalized = finalizer();
+    } catch (...) {
+        finalized = workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::persistence_failure,
+            "preview overlay publication finalizer threw an exception",
+            "workspace_preview_overlay_publish"));
+    }
+    publication_finalizer_active_.store(false, std::memory_order_release);
+    if (!finalized)
+        return workspace_result_t<void>::failure(finalized.error());
+    cancellation_.request_cancel();
+    cancellation_ = std::move(*replacement_cancellation);
+    progress_.cancellation_requested = false;
+    std::atomic_store_explicit(&publication_state_->publication,
+                               std::move(replacement),
+                               std::memory_order_release);
+    return workspace_result_t<void>::success();
+}
 #endif
 
 workspace_result_t<std::shared_ptr<analysis_workspace_t>> analysis_workspace_t::create_impl(
@@ -2162,7 +2362,8 @@ workspace_result_t<void> analysis_workspace_t::publish_normalized_image(
     const auto replacement = std::make_shared<const analysis_publication_t>(
         std::static_pointer_cast<const analysis_snapshot_t>(updated),
         current_publication->provider, nullptr, workspace_readiness_t::parsed,
-        current_publication->managed_artifacts);
+        current_publication->managed_artifacts,
+        presentation_for_overlay(current_publication, updated->overlay_revision));
     std::string parsed_phase = "parsed";
     {
         std::lock_guard state_lock(state_mutex_);
@@ -2237,7 +2438,9 @@ workspace_result_t<void> analysis_workspace_t::publish_snapshot(
         return workspace_result_t<void>::failure(rebound_managed.error());
     const auto replacement = std::make_shared<const analysis_publication_t>(
         snapshot_value, publication_provider, nullptr,
-        workspace_readiness_t::partial, rebound_managed.take_value());
+        workspace_readiness_t::partial, rebound_managed.take_value(),
+        presentation_for_overlay(source_publication,
+                                 snapshot_value->overlay_revision));
     if (publication_finalizer_active_.load(std::memory_order_acquire))
         return workspace_result_t<void>::failure(
             publication_finalizer_conflict("workspace_publish"));
@@ -2364,7 +2567,9 @@ workspace_result_t<void> analysis_workspace_t::publish_analysis_bundle(
     const auto readiness = publication_readiness(*snapshot_value);
     const auto replacement = std::make_shared<const analysis_publication_t>(
         snapshot_value, publication_provider, search_index_value, readiness,
-        rebound_managed.take_value());
+        rebound_managed.take_value(),
+        presentation_for_overlay(source_publication,
+                                 snapshot_value->overlay_revision));
     auto replacement_progress = publication_progress(
         readiness, executable_bytes.value());
     if (publication_finalizer_active_.load(std::memory_order_acquire))
@@ -2504,7 +2709,8 @@ workspace_result_t<void> analysis_workspace_t::publish_managed_artifacts(
     try {
         replacement = std::make_shared<const analysis_publication_t>(
             snapshot_value, source->provider, source->search_index, readiness,
-            std::move(managed_artifacts));
+            std::move(managed_artifacts),
+            presentation_for_overlay(source, snapshot_value->overlay_revision));
     } catch (const std::bad_alloc&) {
         return workspace_result_t<void>::failure(
             make_workspace_error(workspace_error_code_t::limit_exceeded,
@@ -3380,15 +3586,17 @@ analysis_workspace_t::publish_projected_generation(
     std::uint64_t target_generation,
     std::uint64_t target_overlay_revision,
     std::shared_ptr<const byte_provider_t> projected_provider,
+    std::shared_ptr<const workspace_overlay_presentation_t> projected_presentation,
     const projection_invalidation_set_t& invalidation,
     std::function<workspace_result_t<void>(
         const std::shared_ptr<const analysis_snapshot_t>&,
         const std::shared_ptr<search_index_t>&)> finalizer) {
-    if (!projected_provider || !finalizer ||
+    if (!projected_provider || !projected_presentation || !finalizer ||
         expected_generation == (std::numeric_limits<std::uint64_t>::max)() ||
         target_generation != expected_generation + 1 ||
         target_overlay_revision == 0 ||
-        target_kind() != target_kind_t::static_file) {
+        target_kind() != target_kind_t::static_file ||
+        projected_presentation->overlay_revision != target_overlay_revision) {
         return workspace_result_t<std::size_t>::failure(
             make_workspace_error(workspace_error_code_t::invalid_argument,
                                  "projected generation publication is invalid",
@@ -3587,7 +3795,7 @@ analysis_workspace_t::publish_projected_generation(
     try {
         replacement = std::make_shared<const analysis_publication_t>(
             projected_snapshot, projected_provider, projected_index, readiness,
-            projected_managed.take_value());
+            projected_managed.take_value(), std::move(projected_presentation));
         replacement_progress = publication_progress(
             readiness, executable_bytes.value());
     } catch (const std::bad_alloc&) {
@@ -3610,35 +3818,34 @@ analysis_workspace_t::publish_projected_generation(
     std::unique_lock<std::shared_mutex> publication_lock(
         publication_mutex_, std::defer_lock);
     std::lock(mutation_lock, publication_lock);
-    {
-        std::lock_guard state_lock(state_mutex_);
-        if (closing() || closed())
-            return workspace_result_t<std::size_t>::failure(
-                make_workspace_error(workspace_error_code_t::workspace_closing,
-                                     "workspace is closing",
-                                     "workspace_overlay_publish"));
-        const auto current = analysis_publication();
-        if (!current || current != source ||
-            current->generation != expected_generation)
-            return workspace_result_t<std::size_t>::failure(
-                make_workspace_error(workspace_error_code_t::stale_generation,
-                                     "workspace generation changed before projected publication",
-                                     "workspace_overlay_publish"));
-        if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
-            return workspace_result_t<std::size_t>::failure(
-                make_workspace_error(workspace_error_code_t::analysis_in_progress,
-                                     "projected generation cannot publish during analysis",
-                                     "workspace_overlay_publish"));
-        if (current->analysis_revision != expected_analysis_revision ||
-            current->overlay_revision ==
-                (std::numeric_limits<std::uint64_t>::max)() ||
-            target_overlay_revision != current->overlay_revision + 1 ||
-            projected_snapshot->image != current->snapshot->image)
-            return workspace_result_t<std::size_t>::failure(
-                make_workspace_error(workspace_error_code_t::revision_conflict,
-                                     "projected generation conflicts with workspace revisions",
-                                     "workspace_overlay_publish"));
-    }
+    cancellation_source_t replacement_cancellation;
+    std::unique_lock state_lock(state_mutex_);
+    if (closing() || closed())
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::workspace_closing,
+                                 "workspace is closing",
+                                 "workspace_overlay_publish"));
+    const auto current = analysis_publication();
+    if (!current || current != source ||
+        current->generation != expected_generation)
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::stale_generation,
+                                 "workspace generation changed before projected publication",
+                                 "workspace_overlay_publish"));
+    if (active_analysis_generation_.load(std::memory_order_acquire) != 0)
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::analysis_in_progress,
+                                 "projected generation cannot publish during analysis",
+                                 "workspace_overlay_publish"));
+    if (current->analysis_revision != expected_analysis_revision ||
+        current->overlay_revision ==
+            (std::numeric_limits<std::uint64_t>::max)() ||
+        target_overlay_revision != current->overlay_revision + 1 ||
+        projected_snapshot->image != current->snapshot->image)
+        return workspace_result_t<std::size_t>::failure(
+            make_workspace_error(workspace_error_code_t::revision_conflict,
+                                 "projected generation conflicts with workspace revisions",
+                                 "workspace_overlay_publish"));
 
     publication_finalizer_active_.store(true, std::memory_order_release);
     workspace_result_t<void> finalized = workspace_result_t<void>::success();
@@ -3654,17 +3861,13 @@ analysis_workspace_t::publish_projected_generation(
     if (!finalized)
         return workspace_result_t<std::size_t>::failure(finalized.error());
 
-    {
-        std::lock_guard state_lock(state_mutex_);
-        cancellation_source_t replacement_cancellation;
-        cancellation_.request_cancel();
-        cancellation_ = std::move(replacement_cancellation);
-        replacement_progress.cancellation_requested = false;
-        progress_ = std::move(replacement_progress);
-        std::atomic_store_explicit(
-            &publication_state_->publication, replacement,
-            std::memory_order_release);
-    }
+    cancellation_.request_cancel();
+    cancellation_ = std::move(replacement_cancellation);
+    replacement_progress.cancellation_requested = false;
+    progress_ = std::move(replacement_progress);
+    std::atomic_store_explicit(
+        &publication_state_->publication, replacement,
+        std::memory_order_release);
     return workspace_result_t<std::size_t>::success(retired_index_entries);
 }
 
@@ -3718,7 +3921,8 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::begin_new_generation() {
     const auto replacement = std::make_shared<const analysis_publication_t>(
         std::static_pointer_cast<const analysis_snapshot_t>(empty),
         current_publication->provider, nullptr, readiness,
-        std::move(managed_artifacts));
+        std::move(managed_artifacts),
+        presentation_for_overlay(current_publication, empty->overlay_revision));
     if (!replacement->coherent_with(*identity_))
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
@@ -3826,7 +4030,8 @@ workspace_result_t<std::uint64_t> analysis_workspace_t::restore_overlay_revision
             restored_managed.error());
     const auto replacement = std::make_shared<const analysis_publication_t>(
         restored_snapshot, publication_provider, nullptr, source->readiness,
-        restored_managed.take_value());
+        restored_managed.take_value(),
+        presentation_for_overlay(source, persisted_revision));
     if (!replacement->coherent_with(*identity_))
         return workspace_result_t<std::uint64_t>::failure(
             make_workspace_error(workspace_error_code_t::integrity_failure,
@@ -3943,7 +4148,8 @@ workspace_result_t<void> analysis_workspace_t::restore_projected_provider(
         return workspace_result_t<void>::failure(restored_managed.error());
     const auto replacement = std::make_shared<const analysis_publication_t>(
         restored_snapshot, projected_provider, restored_index, source->readiness,
-        restored_managed.take_value());
+        restored_managed.take_value(),
+        presentation_for_overlay(source, expected_overlay_revision));
     if (!replacement->coherent_with(*identity_))
         return workspace_result_t<void>::failure(make_workspace_error(
             workspace_error_code_t::integrity_failure,
@@ -4117,7 +4323,93 @@ workspace_result_t<void> analysis_workspace_t::record_analysis_attempt_failure(
 
 workspace_view_state_t analysis_workspace_t::view_state() const {
     std::lock_guard lock(state_mutex_);
-    return view_state_;
+    auto result = view_state_;
+    const auto publication = analysis_publication();
+    const auto presentation = publication
+        ? publication->overlay_presentation : nullptr;
+    if (presentation && publication &&
+        presentation->overlay_revision == publication->overlay_revision)
+        result.bookmarks = presentation->workspace_bookmarks;
+    return result;
+}
+
+std::shared_ptr<const workspace_overlay_presentation_t>
+analysis_workspace_t::overlay_presentation() const noexcept {
+    const auto publication = analysis_publication();
+    return publication ? publication->overlay_presentation : nullptr;
+}
+
+workspace_result_t<void> analysis_workspace_t::publish_overlay_presentation(
+    std::uint64_t expected_overlay_revision,
+    std::shared_ptr<const workspace_overlay_presentation_t> presentation) {
+    if (!presentation || expected_overlay_revision == 0 ||
+        presentation->overlay_revision != expected_overlay_revision)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::invalid_argument,
+            "overlay presentation identity is invalid",
+            "workspace_overlay_presentation"));
+    constexpr std::size_t maximum_entries = 65536;
+    if (presentation->comments.size() > maximum_entries ||
+        presentation->renames.size() > maximum_entries ||
+        presentation->bookmarks.size() > maximum_entries ||
+        presentation->workspace_bookmarks.size() > maximum_entries)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "overlay presentation exceeds its publication limits",
+            "workspace_overlay_presentation"));
+    const auto entries_valid = [&](const auto& entries) {
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (!valid_workspace_address(entries[index].address, *identity_) ||
+                (index != 0 && !(entries[index - 1].address < entries[index].address)))
+                return false;
+        }
+        return true;
+    };
+    if (!entries_valid(presentation->comments) ||
+        !entries_valid(presentation->renames) ||
+        !entries_valid(presentation->bookmarks) ||
+        !std::is_sorted(presentation->workspace_bookmarks.begin(),
+            presentation->workspace_bookmarks.end()) ||
+        std::adjacent_find(presentation->workspace_bookmarks.begin(),
+            presentation->workspace_bookmarks.end()) !=
+                presentation->workspace_bookmarks.end() ||
+        !std::all_of(presentation->workspace_bookmarks.begin(),
+            presentation->workspace_bookmarks.end(), [&](const auto& address) {
+                return valid_workspace_address(address, *identity_);
+            }))
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "overlay presentation is not sorted, unique, and workspace-bound",
+            "workspace_overlay_presentation"));
+    std::unique_lock publication_lock(publication_mutex_);
+    const auto publication = analysis_publication();
+    if (closing() || closed() || !publication ||
+        publication->overlay_revision != expected_overlay_revision)
+        return workspace_result_t<void>::failure(make_workspace_error(
+            closing() || closed() ? workspace_error_code_t::workspace_closing
+                                  : workspace_error_code_t::revision_conflict,
+            "workspace overlay changed before presentation publication",
+            "workspace_overlay_presentation"));
+    std::shared_ptr<const analysis_publication_t> replacement;
+    try {
+        replacement = std::make_shared<const analysis_publication_t>(
+            publication->snapshot, publication->provider,
+            publication->search_index, publication->readiness,
+            publication->managed_artifacts, std::move(presentation));
+    } catch (const std::bad_alloc&) {
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::limit_exceeded,
+            "overlay presentation publication allocation failed",
+            "workspace_overlay_presentation"));
+    }
+    if (!replacement->coherent_with(*identity_))
+        return workspace_result_t<void>::failure(make_workspace_error(
+            workspace_error_code_t::integrity_failure,
+            "overlay presentation publication is incoherent",
+            "workspace_overlay_presentation"));
+    std::atomic_store_explicit(&publication_state_->publication,
+        std::move(replacement), std::memory_order_release);
+    return workspace_result_t<void>::success();
 }
 
 workspace_result_t<void> analysis_workspace_t::update_view_state(
@@ -4341,7 +4633,8 @@ workspace_result_t<void> analysis_workspace_t::install_search_index(
                                  "workspace_service"));
     const auto replacement = std::make_shared<const analysis_publication_t>(
         current->snapshot, current->provider, std::move(index_value),
-        current->readiness, current->managed_artifacts);
+        current->readiness, current->managed_artifacts,
+        presentation_for_overlay(current, current->overlay_revision));
     std::atomic_store_explicit(&publication_state_->publication, replacement,
                                std::memory_order_release);
     return workspace_result_t<void>::success();

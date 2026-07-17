@@ -2479,12 +2479,70 @@ projection_invalidation_hook_result_t invalidate_decompiler_cache(
     return result;
 }
 
+workspace_result_t<std::shared_ptr<const workspace_overlay_presentation_t>>
+build_overlay_presentation(
+    const std::unordered_map<std::string, overlay_operation_t>& items,
+    std::uint64_t overlay_revision) {
+    try {
+        auto presentation = std::make_shared<workspace_overlay_presentation_t>();
+        presentation->overlay_revision = overlay_revision;
+        presentation->comments.reserve(items.size());
+        presentation->renames.reserve(items.size());
+        presentation->bookmarks.reserve(items.size());
+        presentation->workspace_bookmarks.reserve(items.size());
+        for (const auto& item : items) {
+            const auto& operation = item.second;
+            if (operation.target_discriminator !=
+                overlay_target_discriminator_v9_t::native_address)
+                continue;
+            switch (operation.kind) {
+            case overlay_operation_kind_t::comment:
+            case overlay_operation_kind_t::comment_update:
+                presentation->comments.push_back(
+                    {operation.address, operation.text});
+                break;
+            case overlay_operation_kind_t::name:
+                presentation->renames.push_back(
+                    {operation.address, operation.name});
+                break;
+            case overlay_operation_kind_t::bookmark:
+                presentation->bookmarks.push_back(
+                    {operation.address, operation.name});
+                presentation->workspace_bookmarks.push_back(operation.address);
+                break;
+            default:
+                break;
+            }
+        }
+        const auto address_less = [](const auto& left, const auto& right) {
+            return left.address < right.address;
+        };
+        std::sort(presentation->comments.begin(), presentation->comments.end(),
+            address_less);
+        std::sort(presentation->renames.begin(), presentation->renames.end(),
+            address_less);
+        std::sort(presentation->bookmarks.begin(), presentation->bookmarks.end(),
+            address_less);
+        std::sort(presentation->workspace_bookmarks.begin(),
+            presentation->workspace_bookmarks.end());
+        return workspace_result_t<std::shared_ptr<const workspace_overlay_presentation_t>>::success(
+            std::static_pointer_cast<const workspace_overlay_presentation_t>(
+                std::move(presentation)));
+    } catch (...) {
+        return workspace_result_t<std::shared_ptr<const workspace_overlay_presentation_t>>::failure(
+            make_workspace_error(workspace_error_code_t::limit_exceeded,
+                "overlay presentation allocation failed",
+                "overlay_journal.presentation"));
+    }
+}
+
 projection_finalize_result_t publish_projected_overlay(
     overlay_static_state_v9_t& state,
     const projection_result_t& prepared,
     const std::shared_ptr<analysis_workspace_t>& workspace,
     const std::shared_ptr<workspace_database_t>& database,
     const std::shared_ptr<const byte_provider_t>& projected_provider,
+    std::shared_ptr<const workspace_overlay_presentation_t> projected_presentation,
     std::function<workspace_result_t<void>(
         const std::shared_ptr<const analysis_snapshot_t>&,
         const std::shared_ptr<search_index_t>&,
@@ -2501,6 +2559,7 @@ projection_finalize_result_t publish_projected_overlay(
             };
         hooks.packed_index =
             [workspace, projected_provider,
+             projected_presentation = std::move(projected_presentation),
              target_overlay_revision = prepared.revision,
              invalidation = prepared.invalidation,
              persistence_finalizer = std::move(persistence_finalizer)](
@@ -2547,6 +2606,7 @@ projection_finalize_result_t publish_projected_overlay(
                     request.target_generation,
                     target_overlay_revision,
                     projected_provider,
+                    projected_presentation,
                     invalidation,
                     std::move(persisted));
                 if (!published) {
@@ -3535,6 +3595,11 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                 "overlay publication state allocation failed",
                 "overlay_journal.transact"));
     }
+    auto next_presentation = build_overlay_presentation(
+        *next_items, prepared.revision);
+    if (!next_presentation)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            next_presentation.error());
 
     auto result_holder = std::make_shared<overlay_transaction_result_t>();
     auto committed_state = std::make_shared<overlay_db_state_t>();
@@ -3551,14 +3616,12 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
                  const std::shared_ptr<const managed_artifact_publication_t>&
                      managed_publication)
             -> workspace_result_t<void> {
-        {
-            std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
-            if (revision_ != local_revision || fixed_target_ != target) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::revision_conflict,
-                    "overlay journal changed before atomic publication",
+        std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
+        if (revision_ != local_revision || fixed_target_ != target) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::revision_conflict,
+                "overlay journal changed before atomic publication",
                 "overlay_journal.commit"));
-            }
         }
         auto staged = stage_projected_candidate(
             database, snapshot, index, managed_publication, cancel);
@@ -3760,31 +3823,28 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             static_cast<void>(candidate->discard());
             return waited;
         }
-        auto acknowledged = candidate->finalize();
-        if (!acknowledged)
-            return acknowledged;
+        database->acknowledge_promoted_candidate(*candidate);
         publication_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        {
-            std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
-            items_.swap(*next_items);
-            revision_ = committed_state->revision;
-            history_cursor_ = committed_state->cursor;
-            next_transaction_id_ = committed_state->next_transaction;
-            history_epoch_ = committed_state->epoch;
-            fixed_target_ = next_target;
-        }
+        items_.swap(*next_items);
+        revision_ = committed_state->revision;
+        history_cursor_ = committed_state->cursor;
+        next_transaction_id_ = committed_state->next_transaction;
+        history_epoch_ = committed_state->epoch;
+        fixed_target_ = next_target;
         return workspace_result_t<void>::success();
     };
     mutation_lock.unlock();
     const auto finalized = publish_projected_overlay(
         preflight_state.value(), prepared, workspace, database_,
-        projected_provider.value(), std::move(persistence_finalizer), cancel);
+        projected_provider.value(), next_presentation.take_value(),
+        std::move(persistence_finalizer), cancel);
     if ((publication_epoch_.load(std::memory_order_acquire) & 1U) != 0)
         publication_epoch_.fetch_add(1, std::memory_order_release);
     if (!finalized)
         return workspace_result_t<overlay_transaction_result_t>::failure(
             projection_finalize_error(finalized, "overlay_journal.transact"));
-    return workspace_result_t<overlay_transaction_result_t>::success(*result_holder);
+    return workspace_result_t<overlay_transaction_result_t>::success(
+        std::move(*result_holder));
 }
 
 workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact_v9(
@@ -4066,6 +4126,11 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                 "overlay history publication state allocation failed",
                 "overlay_journal.history"));
     }
+    auto next_presentation = build_overlay_presentation(
+        *next_items, prepared.revision);
+    if (!next_presentation)
+        return workspace_result_t<overlay_transaction_result_t>::failure(
+            next_presentation.error());
     auto result_holder = std::make_shared<overlay_transaction_result_t>();
     auto committed_state = std::make_shared<overlay_db_state_t>();
     const auto next_target = target_at_generation(target, prepared.new_generation);
@@ -4079,14 +4144,12 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
                  const std::shared_ptr<const managed_artifact_publication_t>&
                      managed_publication)
             -> workspace_result_t<void> {
-        {
-            std::shared_lock<std::shared_mutex> state_lock(state_mutex_);
-            if (revision_ != local_revision || fixed_target_ != target) {
-                return workspace_result_t<void>::failure(make_workspace_error(
-                    workspace_error_code_t::revision_conflict,
-                    "overlay journal changed before atomic history publication",
+        std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
+        if (revision_ != local_revision || fixed_target_ != target) {
+            return workspace_result_t<void>::failure(make_workspace_error(
+                workspace_error_code_t::revision_conflict,
+                "overlay journal changed before atomic history publication",
                 "overlay_journal.history"));
-            }
         }
         auto staged = stage_projected_candidate(
             database, snapshot, index, managed_publication, cancel);
@@ -4294,31 +4357,28 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
             static_cast<void>(candidate->discard());
             return waited;
         }
-        auto acknowledged = candidate->finalize();
-        if (!acknowledged)
-            return acknowledged;
+        database->acknowledge_promoted_candidate(*candidate);
         publication_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        {
-            std::unique_lock<std::shared_mutex> state_lock(state_mutex_);
-            items_.swap(*next_items);
-            revision_ = committed_state->revision;
-            history_cursor_ = committed_state->cursor;
-            next_transaction_id_ = committed_state->next_transaction;
-            history_epoch_ = committed_state->epoch;
-            fixed_target_ = next_target;
-        }
+        items_.swap(*next_items);
+        revision_ = committed_state->revision;
+        history_cursor_ = committed_state->cursor;
+        next_transaction_id_ = committed_state->next_transaction;
+        history_epoch_ = committed_state->epoch;
+        fixed_target_ = next_target;
         return workspace_result_t<void>::success();
     };
     mutation_lock.unlock();
     const auto finalized = publish_projected_overlay(
         preflight_state.value(), prepared, workspace, database_,
-        projected_provider.value(), std::move(persistence_finalizer), cancel);
+        projected_provider.value(), next_presentation.take_value(),
+        std::move(persistence_finalizer), cancel);
     if ((publication_epoch_.load(std::memory_order_acquire) & 1U) != 0)
         publication_epoch_.fetch_add(1, std::memory_order_release);
     if (!finalized)
         return workspace_result_t<overlay_transaction_result_t>::failure(
             projection_finalize_error(finalized, "overlay_journal.history"));
-    return workspace_result_t<overlay_transaction_result_t>::success(*result_holder);
+    return workspace_result_t<overlay_transaction_result_t>::success(
+        std::move(*result_holder));
 }
 
 workspace_result_t<overlay_transaction_result_t> overlay_journal_t::undo(

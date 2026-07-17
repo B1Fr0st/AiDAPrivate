@@ -94,7 +94,7 @@ std::string definition_id(const std::string& canonical, std::uint32_t line)
 	return buffer;
 }
 
-void rebuild_publication_locked(runtime_t& rt)
+void rebuild_publication_locked(runtime_t& rt, bool operation_pending)
 {
 	auto next = std::make_shared<snapshot_t>();
 	next->generation = rt.publication_generation.fetch_add(1,
@@ -104,7 +104,7 @@ void rebuild_publication_locked(runtime_t& rt)
 	next->stop_generation = rt.stop_generation;
 	next->workspace_generation = rt.workspace_generation;
 	next->symbol_generation = rt.symbol_generation;
-	next->operation_pending = rt.operation_pending.load(std::memory_order_acquire);
+	next->operation_pending = operation_pending;
 	next->operation_label = rt.operation_label;
 	next->error = rt.error;
 	next->definitions = rt.definitions;
@@ -131,6 +131,12 @@ void rebuild_publication_locked(runtime_t& rt)
 	std::atomic_store_explicit(&rt.publication,
 		std::shared_ptr<const snapshot_t>(std::move(next)),
 		std::memory_order_release);
+}
+
+void rebuild_publication_locked(runtime_t& rt)
+{
+	rebuild_publication_locked(rt,
+		rt.operation_pending.load(std::memory_order_acquire));
 }
 
 void publish_current(runtime_t& rt, current_location_t current)
@@ -630,120 +636,205 @@ void reconcile_locked(runtime_t& rt, const context_t& context,
 using operation_t = std::function<void(runtime_t&, const context_t&,
 	const std::shared_ptr<std::atomic<bool>>&)>;
 
+struct pending_lifecycle_t {
+	explicit pending_lifecycle_t(runtime_t& value) noexcept : rt(value) {}
+
+	bool finish(std::string_view failure) noexcept
+	{
+		bool expected = false;
+		if (!finished.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+			return true;
+		bool pending_cleared = false;
+		const auto clear_pending = [&]() noexcept {
+			if (pending_cleared) return;
+			rt.operation_pending.store(false, std::memory_order_release);
+			pending_cleared = true;
+		};
+		try {
+			std::lock_guard<std::mutex> lock(rt.operation_mutex);
+			rt.operation_label.clear();
+			try { rt.error.assign(failure.data(), failure.size()); }
+			catch (...) {
+				try { rt.error = "Source-debug terminal diagnostic allocation failed"; }
+				catch (...) { rt.error.clear(); }
+			}
+			if (!failure.empty())
+				rt.last_context_signature.store(0, std::memory_order_release);
+			rebuild_publication_locked(rt, false);
+			clear_pending();
+			return true;
+		} catch (const std::exception& exception) {
+			clear_pending();
+			diag::log_tagged_fmt("source_debug",
+				"terminal_publication_failed detail='%s'", exception.what());
+		} catch (...) {
+			clear_pending();
+			diag::log_tagged_fmt("source_debug",
+				"terminal_publication_failed detail='unknown exception'");
+		}
+		return false;
+	}
+
+	runtime_t& rt;
+	std::atomic<bool> finished{false};
+};
+
+struct pending_scope_t {
+	pending_scope_t(std::shared_ptr<pending_lifecycle_t> value,
+		std::string_view fallback_value) noexcept
+		: lifecycle(std::move(value)), fallback(fallback_value) {}
+	~pending_scope_t() { if (active && lifecycle) lifecycle->finish(fallback); }
+	void dismiss() noexcept { active = false; }
+
+	std::shared_ptr<pending_lifecycle_t> lifecycle;
+	std::string_view fallback;
+	bool active = true;
+};
+
 bool submit_operation(const char* label, const char* action_id,
 	operation_t operation, std::string* error)
 {
 	auto& rt = runtime();
+	const auto lifecycle = std::make_shared<pending_lifecycle_t>(rt);
 	bool expected = false;
 	if (!rt.operation_pending.compare_exchange_strong(expected, true,
 		std::memory_order_acq_rel)) {
 		if (error) *error = "Another source-debug operation is already running";
 		return false;
 	}
-	context_t context;
-	if (!capture_context(context)) {
-		rt.operation_pending.store(false, std::memory_order_release);
-		std::unique_lock<std::mutex> lock(rt.operation_mutex, std::try_to_lock);
-		if (lock.owns_lock()) {
-			rt.error = "The current debugger/workspace context is temporarily busy";
-			rebuild_publication_locked(rt);
+	pending_scope_t setup_scope(lifecycle, "Source-debug operation setup failed");
+	std::shared_ptr<std::atomic<bool>> cancelled;
+	std::uint64_t submitted_task_id = 0;
+	try {
+		context_t context;
+		if (!capture_context(context)) {
+			const std::string detail =
+				"The current debugger/workspace context is temporarily busy";
+			lifecycle->finish(detail);
+			setup_scope.dismiss();
+			if (error) *error = detail;
+			return false;
 		}
-		if (error) *error = "The current debugger/workspace context is temporarily busy";
-		return false;
-	}
-	const auto cancelled = std::make_shared<std::atomic<bool>>(false);
-	const auto generation = rt.request_generation.fetch_add(1, std::memory_order_acq_rel);
-	std::string affected_entity;
-	{
-		std::lock_guard<std::mutex> lock(rt.operation_mutex);
-		rt.operation_label = label;
-		rt.error.clear();
-		rebuild_publication_locked(rt);
-		affected_entity = rt.target_key;
-	}
-	aida::infra::executor::submission_t submission;
-	submission.owner_subsystem = "source_debug";
-	submission.label = label;
-	submission.thread_class = "target_mutation";
-	submission.domain = aida::infra::executor::domain_t::feature_worker;
-	submission.priority = 3;
-	submission.target_pid = context.pid;
-	submission.generation = generation;
-	submission.cancel_hook = [cancelled]() {
-		cancelled->store(true, std::memory_order_release);
-	};
-	submission.body = [context, cancelled, operation = std::move(operation), label]() mutable {
-		auto& inner = runtime();
-		std::string failure;
-		try {
-			std::lock_guard<std::mutex> lock(inner.operation_mutex);
-			operation(inner, context, cancelled);
-			inner.error.clear();
-		} catch (const std::exception& exception) {
-			failure = exception.what();
-		} catch (...) {
-			failure = "Unknown source-debug worker failure";
-		}
+		cancelled = std::make_shared<std::atomic<bool>>(false);
+		const auto generation = rt.request_generation.fetch_add(1,
+			std::memory_order_acq_rel);
+		std::string affected_entity;
 		{
-			std::lock_guard<std::mutex> lock(inner.operation_mutex);
-			inner.operation_pending.store(false, std::memory_order_release);
-			if (!failure.empty())
-				inner.last_context_signature.store(0, std::memory_order_release);
-			inner.operation_label.clear();
-			inner.error = failure;
-			rebuild_publication_locked(inner);
-		}
-		if (!failure.empty()) {
-			diag::log_tagged_fmt("source_debug", "operation_failed label='%s' detail='%s'",
-				label, failure.c_str());
-			throw std::runtime_error(failure);
-		}
-	};
-	const auto submitted = aida::infra::executor::submit(std::move(submission));
-	if (!submitted.submitted) {
-		std::lock_guard<std::mutex> lock(rt.operation_mutex);
-		rt.operation_pending.store(false, std::memory_order_release);
-		rt.operation_label.clear();
-		rt.error = submitted.reject_reason.empty()
-			? "The source-debug executor rejected the operation"
-			: submitted.reject_reason;
-		rebuild_publication_locked(rt);
-		if (error) *error = rt.error;
-		return false;
-	}
-	aida::ui::task_center::task_registration_t registration;
-	registration.id = "source.debug." + std::to_string(submitted.task_id);
-	registration.source = "Source Debugger";
-	registration.owner = "source_debug";
-	registration.owner_view = "view.debug.source";
-	registration.owner_action = action_id;
-	registration.target = context.pid == 0 ? context.workspace_binary_id
-		: "PID " + std::to_string(context.pid);
-	registration.label = label;
-	registration.stage = "Queued";
-	registration.affected_entity = std::move(affected_entity);
-	registration.cancellation_is_safe = true;
-	registration.callbacks.cancel = [cancelled, task_id = submitted.task_id]() {
-		cancelled->store(true, std::memory_order_release);
-		return aida::infra::executor::cancel(task_id);
-	};
-	if (!aida::ui::task_center::try_register_executor_job(submitted.task_id,
-		std::move(registration))) {
-		cancelled->store(true, std::memory_order_release);
-		static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
-		{
-			std::unique_lock<std::mutex> lock(rt.operation_mutex, std::try_to_lock);
-			if (lock.owns_lock()) {
-			rt.operation_pending.store(false, std::memory_order_release);
-			rt.operation_label.clear();
-			rt.error = "Task Center rejected source-debug ownership";
+			std::lock_guard<std::mutex> lock(rt.operation_mutex);
+			rt.operation_label = label;
+			rt.error.clear();
 			rebuild_publication_locked(rt);
+			affected_entity = rt.target_key;
+		}
+		aida::infra::executor::submission_t submission;
+		submission.owner_subsystem = "source_debug";
+		submission.label = label;
+		submission.thread_class = "target_mutation";
+		submission.domain = aida::infra::executor::domain_t::feature_worker;
+		submission.priority = 3;
+		submission.target_pid = context.pid;
+		submission.generation = generation;
+		submission.cancel_hook = [cancelled]() {
+			cancelled->store(true, std::memory_order_release);
+		};
+		submission.body = [context, cancelled, lifecycle,
+			operation = std::move(operation), label = std::string(label)]() mutable {
+			pending_scope_t worker_scope(lifecycle,
+				"Source-debug worker terminated before publishing a result");
+			auto& inner = runtime();
+			std::string failure;
+			try {
+				std::lock_guard<std::mutex> lock(inner.operation_mutex);
+				operation(inner, context, cancelled);
+				inner.error.clear();
+			} catch (const std::exception& exception) {
+				try { failure = exception.what(); }
+				catch (...) { failure.clear(); }
+			} catch (...) {
+				try { failure = "Unknown source-debug worker failure"; }
+				catch (...) { failure.clear(); }
 			}
+			const bool published = lifecycle->finish(failure);
+			worker_scope.dismiss();
+			if (!published && failure.empty())
+				failure = "Source-debug terminal publication failed";
+			if (!failure.empty()) {
+				diag::log_tagged_fmt("source_debug", "operation_failed label='%s' detail='%s'",
+					label.c_str(), failure.c_str());
+				throw std::runtime_error(failure);
+			}
+		};
+		const auto submitted = aida::infra::executor::submit(std::move(submission));
+		if (!submitted.submitted) {
+			const std::string detail = submitted.reject_reason.empty()
+				? "The source-debug executor rejected the operation"
+				: submitted.reject_reason;
+			lifecycle->finish(detail);
+			setup_scope.dismiss();
+			if (error) *error = detail;
+			return false;
 		}
-		if (error) *error = "Task Center rejected source-debug ownership";
+		submitted_task_id = submitted.task_id;
+		aida::ui::task_center::task_registration_t registration;
+		registration.id = "source.debug." + std::to_string(submitted.task_id);
+		registration.source = "Source Debugger";
+		registration.owner = "source_debug";
+		registration.owner_view = "view.debug.source";
+		registration.owner_action = action_id;
+		registration.target = context.pid == 0 ? context.workspace_binary_id
+			: "PID " + std::to_string(context.pid);
+		registration.label = label;
+		registration.stage = "Queued";
+		registration.affected_entity = std::move(affected_entity);
+		registration.cancellation_is_safe = true;
+		registration.callbacks.cancel = [cancelled, task_id = submitted.task_id]() {
+			cancelled->store(true, std::memory_order_release);
+			return aida::infra::executor::cancel(task_id);
+		};
+		if (!aida::ui::task_center::try_register_executor_job(submitted.task_id,
+			std::move(registration))) {
+			cancelled->store(true, std::memory_order_release);
+			static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+			const std::string detail = "Task Center rejected source-debug ownership";
+			lifecycle->finish(detail);
+			setup_scope.dismiss();
+			if (error) *error = detail;
+			return false;
+		}
+		setup_scope.dismiss();
+		return true;
+	} catch (const std::exception& exception) {
+		if (cancelled) cancelled->store(true, std::memory_order_release);
+		if (submitted_task_id != 0) {
+			try { static_cast<void>(aida::infra::executor::cancel(submitted_task_id)); }
+			catch (...) {}
+		}
+		std::string detail;
+		try { detail = exception.what(); }
+		catch (...) {
+			try { detail = "Source-debug operation setup failed"; } catch (...) {}
+		}
+		lifecycle->finish(detail);
+		setup_scope.dismiss();
+		if (error) {
+			try { *error = detail; } catch (...) {}
+		}
+		return false;
+	} catch (...) {
+		if (cancelled) cancelled->store(true, std::memory_order_release);
+		if (submitted_task_id != 0) {
+			try { static_cast<void>(aida::infra::executor::cancel(submitted_task_id)); }
+			catch (...) {}
+		}
+		constexpr std::string_view detail = "Source-debug operation setup failed";
+		lifecycle->finish(detail);
+		setup_scope.dismiss();
+		if (error) {
+			try { *error = detail; } catch (...) {}
+		}
 		return false;
 	}
-	return true;
 }
 
 #endif

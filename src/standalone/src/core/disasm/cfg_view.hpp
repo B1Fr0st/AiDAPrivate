@@ -2915,14 +2915,7 @@ inline void render(float, float, float width, float height,
 			unavailable("analysis.evidence.agent", "Block formatting is still in progress");
 		}
 		if (typed) {
-			bool bookmarked = false;
-			{
-				std::lock_guard<std::mutex> lock(context.view->mutex);
-				bookmarked = std::any_of(context.view->bookmarks.begin(),
-					context.view->bookmarks.end(), [&](const disasm_view::bookmark_t& item) {
-						return item.addr == typed->value;
-					});
-			}
+			const bool bookmarked = disasm_view::bookmarked(context, *typed);
 			menu.actions["analysis.modify.rename"].invoke = [context, value = *typed]() {
 				rename_dialog::open(context, value);
 				return action_handler_result_t::completed();
