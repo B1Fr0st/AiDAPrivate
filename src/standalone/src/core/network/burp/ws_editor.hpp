@@ -40,6 +40,7 @@ struct ws_status_t
 
 struct ws_frame_log_t
 {
+    uint64_t                id = 0;
     uint64_t                ts_ms = 0;
     bool                    outbound = false;
     uint8_t                 opcode = 0;
@@ -56,6 +57,7 @@ bool        disconnect_all();
 
 std::vector<ws_status_t>    list_connections();
 bool                        get_status(uint64_t conn_id, ws_status_t& out);
+bool                        get_frame(uint64_t conn_id, uint64_t frame_id, ws_frame_log_t& out);
 
 bool        send_text(uint64_t conn_id, const std::string& msg);
 bool        send_binary(uint64_t conn_id, const std::vector<uint8_t>& data);

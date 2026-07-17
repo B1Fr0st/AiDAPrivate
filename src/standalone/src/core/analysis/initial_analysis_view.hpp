@@ -26,6 +26,8 @@
 #include "../ui/components.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/blur_layer.hpp"
+#include "../ui/ide_shell.hpp"
+#include "../ui/workspace_layout.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/win32_dialog.hpp"
 #endif
@@ -252,27 +254,44 @@ inline void render_progress(const disasm_view::workspace_context_t& context,
 	const auto progress = context.workspace->progress();
 #endif
 	using aida::analysis::workspace_readiness_t;
+	const bool completed_without_error = progress.total_units != 0 &&
+		progress.completed_units >= progress.total_units && !progress.error;
 	const bool visible = progress.readiness == workspace_readiness_t::analyzing ||
-		progress.readiness == workspace_readiness_t::baseline_ready ||
 		progress.readiness == workspace_readiness_t::cancelling ||
 		progress.readiness == workspace_readiness_t::failed ||
-		progress.readiness == workspace_readiness_t::partial;
+		(progress.readiness == workspace_readiness_t::partial &&
+			!completed_without_error);
 	if (!visible) return;
 	const auto& theme = aida::ui::resolved();
-	const ImGuiViewport* viewport = ImGui::GetMainViewport();
 	const ImVec2 size(430.0f,
 		(progress.error || !state->analysis_error.empty()) ? 196.0f : 166.0f);
-	const ImVec2 position(viewport->WorkPos.x + viewport->WorkSize.x - size.x - 20.0f,
-		viewport->WorkPos.y + 20.0f);
-	ImGui::SetNextWindowPos(position, ImGuiCond_Always);
-	ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+#if defined(IMGUI_HAS_DOCK)
+	const ImGuiID bottom_node = aida::ui::workspace_layout::node_id(
+		aida::ui::workspace_layout::dock_role_t::bottom);
+	const ImGuiID target_node = bottom_node != 0
+		? bottom_node : aida::ui::ide_shell::root_dockspace_id();
+	if (target_node != 0)
+		ImGui::SetNextWindowDockID(target_node, ImGuiCond_Appearing);
+#else
+	const ImGuiViewport* viewport = ImGui::GetMainViewport();
+	const ImVec2 position(viewport->WorkPos.x + (viewport->WorkSize.x - size.x) * 0.5f,
+		viewport->WorkPos.y + aida::ui::ide_shell::reserved_chrome_height() + 20.0f);
+	ImGui::SetNextWindowPos(position, ImGuiCond_Appearing);
+#endif
+	ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, aida::ui::with_alpha(theme.bg_elevated, 0.98f));
 	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(theme.border_strong, 1.0f));
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f, 16.0f));
-	ImGui::Begin("Workspace analysis##workspace_analysis_progress", nullptr,
-		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	const bool window_visible = ImGui::Begin(
+		"Workspace Analysis###aida.workspace.analysis.progress", nullptr,
+		ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+	if (!window_visible) {
+		ImGui::End();
+		ImGui::PopStyleVar(2);
+		ImGui::PopStyleColor(2);
+		return;
+	}
 	ImGui::PushFont(aida::ui::fonts::body_em());
 	ImGui::TextUnformatted(context.workspace->identity().bin_name().c_str());
 	ImGui::PopFont();

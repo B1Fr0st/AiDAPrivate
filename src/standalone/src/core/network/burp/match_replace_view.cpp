@@ -12,6 +12,7 @@
 
 #include "match_replace_view.hpp"
 #include "match_replace.hpp"
+#include "burp_ui_operation.hpp"
 
 #include "imgui/imgui.h"
 #include "imgui/imgui_internal.h"
@@ -25,8 +26,11 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace aida {
 namespace burp {
@@ -60,6 +64,16 @@ struct view_state_t
     char        test_sample[4096] = {};
     std::string test_result;
     bool        initialized = false;
+    bool        initialization_requested = false;
+    bool        initialization_attempted = false;
+    std::shared_ptr<const std::vector<match_replace::rule_t>> rules =
+        std::make_shared<const std::vector<match_replace::rule_t>>();
+    std::atomic<bool> refresh_pending{false};
+    aida::burp::ui_operation::state_t operation;
+    std::uint64_t observed_operation_generation = 0;
+    int review_operation = 0;
+    match_replace::rule_t reviewed_rule;
+    std::vector<match_replace::rule_t> reviewed_rules;
 };
 
 view_state_t& s()
@@ -98,6 +112,118 @@ void load_into_edit(view_state_t& st, const match_replace::rule_t& r)
     st.edit_dirty = false;
 }
 
+bool same_rule_definition(const match_replace::rule_t& left,
+    const match_replace::rule_t& right)
+{
+    return left.id == right.id && left.label == right.label && left.target == right.target &&
+        left.match_regex == right.match_regex && left.replacement == right.replacement &&
+        left.regex == right.regex && left.case_insensitive == right.case_insensitive &&
+        left.active == right.active && left.host_filter == right.host_filter &&
+        left.scheme_filter == right.scheme_filter;
+}
+
+void request_rules_refresh()
+{
+    auto& state = s();
+    bool expected = false;
+    if (!state.refresh_pending.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel))
+        return;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "burp.match_replace";
+    submission.label = "match_replace.refresh_rules";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::external_tool;
+    submission.priority = 4;
+    submission.body = []() {
+        std::shared_ptr<const std::vector<match_replace::rule_t>> publication =
+            std::make_shared<const std::vector<match_replace::rule_t>>(match_replace::list());
+        std::atomic_store_explicit(&s().rules, std::move(publication),
+            std::memory_order_release);
+        s().refresh_pending.store(false, std::memory_order_release);
+    };
+    if (!aida::infra::executor::submit(std::move(submission)).submitted)
+        state.refresh_pending.store(false, std::memory_order_release);
+}
+
+void submit_initialize()
+{
+    auto& state = s();
+    state.initialization_requested = true;
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.match_replace";
+    request.owner_view = "view.network.match_replace";
+    request.owner_action = "network.match_replace.initialize";
+    request.label = "Load Match and Replace rules";
+    request.target = "Match and Replace catalog";
+    request.affected_entity = "Persisted rule catalog";
+    request.execute = []() {
+        aida::burp::ui_operation::result_t result;
+        result.success = match_replace::initialize();
+        result.message = result.success ? "Match and Replace rules loaded."
+                                        : match_replace::last_error();
+        return result;
+    };
+    if (!state.operation.submit(std::move(request)))
+        state.initialization_requested = false;
+}
+
+void submit_rule_change(int operation, match_replace::rule_t rule,
+    std::vector<match_replace::rule_t> reviewed, int delta = 0)
+{
+    auto& state = s();
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.match_replace";
+    request.owner_view = "view.network.match_replace";
+    request.owner_action = "network.match_replace.mutate";
+    request.label = operation == 1 ? "Add Match and Replace rule" :
+        operation == 2 ? "Update Match and Replace rule" :
+        operation == 3 ? "Delete Match and Replace rule" :
+        operation == 4 ? "Move Match and Replace rule" : "Clear Match and Replace rules";
+    request.target = operation == 5 ? std::to_string(reviewed.size()) + " rules"
+                                    : "Rule " + std::to_string(rule.id);
+    request.affected_entity = request.target;
+    request.execute = [operation, rule = std::move(rule), reviewed = std::move(reviewed), delta]() mutable {
+        aida::burp::ui_operation::result_t result;
+        auto current = match_replace::list();
+        if (operation != 1) {
+            if (operation == 5) {
+                if (current.size() != reviewed.size() ||
+                    !std::equal(current.begin(), current.end(), reviewed.begin(),
+                        [](const auto& left, const auto& right) {
+                            return same_rule_definition(left, right);
+                        })) {
+                    result.message = "The rule catalog changed after review; no rules were cleared.";
+                    return result;
+                }
+            } else {
+                const auto found = std::find_if(current.begin(), current.end(),
+                    [&](const auto& item) { return item.id == rule.id; });
+                const auto reviewed_found = std::find_if(reviewed.begin(), reviewed.end(),
+                    [&](const auto& item) { return item.id == rule.id; });
+                if (found == current.end() || reviewed_found == reviewed.end() ||
+                    !same_rule_definition(*found, *reviewed_found)) {
+                    result.message = "The selected rule changed after review; no mutation was applied.";
+                    return result;
+                }
+                rule.hit_count = found->hit_count;
+            }
+        }
+        if (operation == 1) result.success = match_replace::add(std::move(rule)) != 0;
+        else if (operation == 2) result.success = match_replace::update(rule);
+        else if (operation == 3) result.success = match_replace::remove(rule.id);
+        else if (operation == 4) result.success = match_replace::move(rule.id, delta);
+        else {
+            match_replace::clear();
+            result.success = match_replace::list().empty();
+        }
+        result.message = result.success ? "Match and Replace catalog updated."
+                                        : match_replace::last_error();
+        return result;
+    };
+    static_cast<void>(state.operation.submit(std::move(request)));
+}
+
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -107,10 +233,25 @@ void render(float pos_x, float pos_y, float width, float height,
     const auto& th = aida::ui::resolved();
     auto& st = s();
 
-    if (!st.initialized) {
-        match_replace::initialize();
-        st.initialized = true;
+    if (!st.initialized && !st.initialization_attempted) {
+        st.initialization_attempted = true;
+        submit_initialize();
     }
+    const auto operation_completion = st.operation.completion();
+    if (operation_completion &&
+        operation_completion->generation != st.observed_operation_generation) {
+        st.observed_operation_generation = operation_completion->generation;
+        if (st.initialization_requested) {
+            st.initialized = operation_completion->result.success;
+            st.initialization_requested = false;
+        }
+        if (operation_completion->result.success)
+            request_rules_refresh();
+    }
+    const auto rules = std::atomic_load_explicit(&st.rules, std::memory_order_acquire);
+    if (st.selected_id != 0 && std::none_of(rules->begin(), rules->end(),
+        [&](const auto& item) { return item.id == st.selected_id; }))
+        st.selected_id = 0;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##burp_mr_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
@@ -122,6 +263,20 @@ void render(float pos_x, float pos_y, float width, float height,
     dl->AddText(ImVec2(org.x + 8.f, org.y + 6.f),
                 aida::ui::with_alpha(th.text_primary, alpha),
                 "Match and Replace");
+    if (st.operation.pending()) {
+        dl->AddText(ImVec2(org.x + 170.f, org.y + 6.f),
+            aida::ui::with_alpha(th.info, alpha), "Operation running in Task Center");
+    } else if (operation_completion) {
+        dl->AddText(ImVec2(org.x + 170.f, org.y + 6.f),
+            aida::ui::with_alpha(operation_completion->result.success ? th.success : th.error, alpha),
+            operation_completion->result.message.c_str());
+        if (!st.initialized && !operation_completion->result.success &&
+            !st.operation.pending()) {
+            ImGui::SetCursorPos(ImVec2(8.f, 30.f));
+            if (ImGui::SmallButton("Retry initialization##match_replace"))
+                submit_initialize();
+        }
+    }
 
     const float top_y = 36.f;
     const float toolbar_h = 36.f;
@@ -143,6 +298,7 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     ImGui::Checkbox("active##mr_new_active", &st.new_active);
     ImGui::SameLine();
+    ImGui::BeginDisabled(!st.initialized || st.operation.pending());
     if (aida::ui::button("Add rule", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
         match_replace::rule_t r;
         r.label = st.new_label;
@@ -155,12 +311,9 @@ void render(float pos_x, float pos_y, float width, float height,
         r.host_filter = st.new_host_filter;
         if (st.new_scheme == 1) r.scheme_filter = "http";
         else if (st.new_scheme == 2) r.scheme_filter = "https";
-        match_replace::add(r);
-        st.new_label[0] = '\0';
-        st.new_match[0] = '\0';
-        st.new_replace[0] = '\0';
-        st.new_host_filter[0] = '\0';
+        submit_rule_change(1, std::move(r), {});
     }
+    ImGui::EndDisabled();
 
     ImGui::SetCursorPos(ImVec2(pos_x + 6.f, pos_y + top_y + toolbar_h));
     ImGui::SetNextItemWidth(width - 16.f);
@@ -205,16 +358,19 @@ void render(float pos_x, float pos_y, float width, float height,
     static float s_anim_time = 0.f;
     s_anim_time += ImGui::GetIO().DeltaTime;
 
-    const auto rules = match_replace::list();
-    int visible = 0;
-    for (const auto& r : rules) {
+    int visible = static_cast<int>(rules->size());
+    ImGuiListClipper rule_clipper;
+    rule_clipper.Begin(visible, row_h);
+    while (rule_clipper.Step()) {
+    for (int row = rule_clipper.DisplayStart; row < rule_clipper.DisplayEnd; ++row) {
+        const auto& r = (*rules)[static_cast<std::size_t>(row)];
         ImGui::PushID(static_cast<int>(r.id & 0x7FFFFFFF));
-        const float row_alpha_anim = ui_anim::render_row_entrance(visible, s_anim_time, 0.010f);
+        const float row_alpha_anim = ui_anim::render_row_entrance(row, s_anim_time, 0.010f);
         const float r_alpha = alpha * row_alpha_anim;
         const float abs_ry = ImGui::GetCursorScreenPos().y;
 
         const bool selected = (st.selected_id == r.id);
-        if (visible & 1) {
+        if (row & 1) {
             tdl->AddRectFilled(ImVec2(t_org.x, abs_ry), ImVec2(t_org.x + left_w, abs_ry + row_h),
                                aida::ui::with_alpha(th.hover_wash, r_alpha * 0.30f));
         }
@@ -249,7 +405,7 @@ void render(float pos_x, float pos_y, float width, float height,
             r.active ? aida::ui::with_alpha(th.success, r_alpha) : aida::ui::with_alpha(th.text_dim, r_alpha),
             r.active ? "yes" : "no");
         ImGui::PopID();
-        ++visible;
+    }
     }
 
     if (visible == 0) {
@@ -285,6 +441,7 @@ void render(float pos_x, float pos_y, float width, float height,
             ImVec2(right_w - 4.f, 64.f));
         ImGui::InputText("Host filter##mr_e_host_filter", st.edit_host_filter, sizeof(st.edit_host_filter));
 
+        ImGui::BeginDisabled(st.operation.pending() || !st.initialized);
         if (aida::ui::button("Save", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
             match_replace::rule_t r;
             r.id = st.selected_id;
@@ -299,28 +456,63 @@ void render(float pos_x, float pos_y, float width, float height,
             if (st.edit_scheme == 1) r.scheme_filter = "http";
             else if (st.edit_scheme == 2) r.scheme_filter = "https";
             else r.scheme_filter.clear();
-            for (const auto& cur : match_replace::list()) {
+            for (const auto& cur : *rules) {
                 if (cur.id == st.selected_id) { r.hit_count = cur.hit_count; break; }
             }
-            match_replace::update(r);
+            submit_rule_change(2, std::move(r), *rules);
         }
         ImGui::SameLine();
         if (aida::ui::button("Delete", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            match_replace::remove(st.selected_id);
-            st.selected_id = 0;
+            const auto found = std::find_if(rules->begin(), rules->end(),
+                [&](const auto& item) { return item.id == st.selected_id; });
+            if (found != rules->end()) {
+                st.review_operation = 3;
+                st.reviewed_rule = *found;
+                st.reviewed_rules = *rules;
+                ImGui::OpenPopup("Review Match and Replace mutation");
+            }
         }
         ImGui::SameLine();
         if (aida::ui::button("Up", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            match_replace::move(st.selected_id, -1);
+            const auto found = std::find_if(rules->begin(), rules->end(),
+                [&](const auto& item) { return item.id == st.selected_id; });
+            if (found != rules->end()) submit_rule_change(4, *found, *rules, -1);
         }
         ImGui::SameLine();
         if (aida::ui::button("Down", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-            match_replace::move(st.selected_id, 1);
+            const auto found = std::find_if(rules->begin(), rules->end(),
+                [&](const auto& item) { return item.id == st.selected_id; });
+            if (found != rules->end()) submit_rule_change(4, *found, *rules, 1);
         }
         ImGui::SameLine();
         if (aida::ui::button("Clear all", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            match_replace::clear();
-            st.selected_id = 0;
+            st.review_operation = 5;
+            st.reviewed_rules = *rules;
+            ImGui::OpenPopup("Review Match and Replace mutation");
+        }
+        ImGui::EndDisabled();
+
+        if (ImGui::BeginPopupModal("Review Match and Replace mutation", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+            const bool clear_all = st.review_operation == 5;
+            ImGui::TextUnformatted(clear_all ? "Permanently clear all Match and Replace rules?"
+                                             : "Permanently delete the selected rule?");
+            ImGui::Text("Affected rules: %zu", clear_all ? st.reviewed_rules.size() : 1U);
+            ImGui::TextWrapped("The exact reviewed catalog will be revalidated before persistence.");
+            if (aida::ui::button(clear_all ? "Clear all rules" : "Delete rule",
+                aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+                submit_rule_change(st.review_operation, st.reviewed_rule,
+                    st.reviewed_rules);
+                st.review_operation = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
+                aida::ui::size_t_::sm)) {
+                st.review_operation = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
 
         ImGui::Separator();

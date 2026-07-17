@@ -11,10 +11,14 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <cmath>
 
@@ -23,11 +27,13 @@
 #include "debugger_engine.hpp"
 #include "debugger_interaction_context.hpp"
 #include "../scanner/memory_interaction_context.hpp"
+#include "../ui/task_center.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/debugger_preview_runtime.hpp"
 #endif
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../infra/executor.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #else
 #include "../../preview/ui_task_executor.hpp"
 #endif
@@ -77,9 +83,17 @@ struct ui_state_t {
 	char                                       filter_buf[64] = {};
 	float                                      last_refresh = 0.f;
 	float                                      refresh_interval = 2.f;
-	std::vector<debugger_engine::memory_region_t> regions;
+	std::shared_ptr<const std::vector<debugger_engine::memory_region_t>> regions =
+		std::make_shared<const std::vector<debugger_engine::memory_region_t>>();
+	std::shared_ptr<const std::vector<debugger_engine::memory_region_t>> visible_regions;
+	std::vector<int>                           visible_region_indices;
+	std::string                                visible_filter;
+	uint64_t                                   visible_committed_bytes = 0;
+	int                                        visible_rwx_count = 0;
+	std::string                                  last_error;
 	std::mutex                                 regions_mutex;
 	std::atomic<bool>                          refreshing{false};
+	std::atomic<bool>                          protect_pending{false};
 	bool                                       scrollbar_dragging = false;
 	float                                      scrollbar_drag_offset = 0.f;
 	bool                                       change_protect_open = false;
@@ -100,6 +114,23 @@ struct ui_state_t {
 };
 
 inline ui_state_t g_ui;
+
+inline void register_background_task(const aida::infra::executor::submit_result_t& submitted,
+	const char* action, const char* label) {
+	if (!submitted.submitted || submitted.task_id == 0) return;
+	aida::ui::task_center::task_registration_t registration;
+	registration.owner = "debugger";
+	registration.owner_view = "view.debug.memory_map";
+	registration.owner_action = action;
+	registration.label = label;
+	registration.stage = "Queued";
+	registration.progress = -1.f;
+	registration.target = driver_bridge::attached_pid() == 0 ? std::string{} :
+		"PID " + std::to_string(driver_bridge::attached_pid());
+	registration.cancellation_is_safe = false;
+	static_cast<void>(aida::ui::task_center::register_executor_job(
+		submitted.task_id, std::move(registration)));
+}
 
 inline void refresh()
 {
@@ -127,22 +158,58 @@ inline void refresh()
 	sub.thread_class = "debugger_refresh";
 	sub.domain = aida::infra::executor::domain_t::feature_worker;
 	sub.priority = 3;
-	sub.target_pid = driver_bridge::attached_pid();
-	sub.body = []() {
-		auto map = debugger_engine::get_memory_map();
-		size_t n = map.size();
-		{
-			std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
-			g_ui.regions = std::move(map);
+	const std::uint32_t target_pid = driver_bridge::attached_pid();
+	const std::uint64_t target_generation = debugger_interaction::current_stop_generation();
+	sub.target_pid = target_pid;
+	sub.generation = target_generation;
+	sub.body = [target_pid, target_generation]() {
+		try {
+			if (driver_bridge::attached_pid() != target_pid ||
+				debugger_interaction::current_stop_generation() != target_generation) {
+				g_ui.refreshing.store(false);
+				return;
+			}
+			auto map = debugger_engine::get_memory_map();
+			if (map.empty()) {
+				const std::string detail = debugger_engine::last_error();
+				if (!detail.empty()) throw std::runtime_error(detail);
+			}
+			size_t n = map.size();
+			if (driver_bridge::attached_pid() == target_pid &&
+				debugger_interaction::current_stop_generation() == target_generation) {
+				std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
+				g_ui.regions = std::make_shared<const std::vector<debugger_engine::memory_region_t>>(
+					std::move(map));
+				g_ui.last_error.clear();
+			}
+			diag::log_tagged_fmt("memmap",
+				"memmap_refresh_done regions=%zu", n);
+			g_ui.refreshing.store(false);
+		} catch (const std::exception& exception) {
+			{
+				std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
+				g_ui.last_error = std::string("Memory-map refresh failed: ") + exception.what();
+			}
+			g_ui.refreshing.store(false);
+			throw;
+		} catch (...) {
+			{
+				std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
+				g_ui.last_error = "Memory-map refresh failed with an unknown error.";
+			}
+			g_ui.refreshing.store(false);
+			throw;
 		}
-		diag::log_tagged_fmt("memmap",
-			"memmap_refresh_done regions=%zu", n);
-		g_ui.refreshing.store(false);
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		diag::log_tagged("memmap", "memmap_refresh_post_failed");
+		std::unique_lock<std::mutex> lock(g_ui.regions_mutex, std::try_to_lock);
+		if (lock.owns_lock())
+			g_ui.last_error = "Memory-map refresh could not be queued: " + submitted.reject_reason;
 		g_ui.refreshing.store(false);
-	}
+	} else register_background_task(submitted, "debugger.memory_map_refresh",
+		"Refresh memory map");
 }
 
 namespace detail {
@@ -296,8 +363,12 @@ inline void format_counter(char* buf, size_t bufsz, float value, bool is_size, b
 
 inline bool find_region_by_base(uint64_t base, debugger_engine::memory_region_t& out)
 {
-	std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
-	for (const auto& r : g_ui.regions) {
+	std::unique_lock<std::mutex> lk(g_ui.regions_mutex, std::try_to_lock);
+	if (!lk.owns_lock()) return false;
+	const auto regions = g_ui.regions;
+	lk.unlock();
+	if (!regions) return false;
+	for (const auto& r : *regions) {
 		if (r.base == base) {
 			out = r;
 			return true;
@@ -538,8 +609,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
                    float alpha, float ar, float ag, float ab)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	if (g_ui.regions.empty())
-		refresh();
+	bool needs_preview_refresh = false;
+	{
+		std::lock_guard<std::mutex> lock(g_ui.regions_mutex);
+		needs_preview_refresh = !g_ui.regions || g_ui.regions->empty();
+	}
+	if (needs_preview_refresh) refresh();
 #endif
 	{
 		static bool s_mem_map_logged = false;
@@ -632,34 +707,48 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	std::vector<debugger_engine::memory_region_t> snapshot;
-	{
-		std::lock_guard<std::mutex> lk(g_ui.regions_mutex);
-		snapshot = g_ui.regions;
+	std::shared_ptr<const std::vector<debugger_engine::memory_region_t>> snapshot_handle;
+	static std::string error_snapshot;
+	std::unique_lock<std::mutex> regions_lock(g_ui.regions_mutex, std::try_to_lock);
+	if (regions_lock.owns_lock()) {
+		snapshot_handle = g_ui.regions;
+		error_snapshot = g_ui.last_error;
 	}
+	if (regions_lock.owns_lock()) regions_lock.unlock();
+	if (!snapshot_handle)
+		snapshot_handle = g_ui.visible_regions ? g_ui.visible_regions :
+			std::make_shared<const std::vector<debugger_engine::memory_region_t>>();
+	const auto& snapshot = *snapshot_handle;
 
-	std::vector<int> filtered_indices;
-	filtered_indices.reserve(snapshot.size());
-	for (size_t i = 0; i < snapshot.size(); ++i) {
-		if (detail::match_filter(snapshot[i], g_ui.filter_buf))
-			filtered_indices.push_back(static_cast<int>(i));
+	const std::string active_filter(g_ui.filter_buf);
+	if (g_ui.visible_regions != snapshot_handle || g_ui.visible_filter != active_filter) {
+		g_ui.visible_regions = snapshot_handle;
+		g_ui.visible_filter = active_filter;
+		g_ui.visible_region_indices.clear();
+		g_ui.visible_region_indices.reserve(snapshot.size());
+		g_ui.visible_committed_bytes = 0;
+		g_ui.visible_rwx_count = 0;
+		for (size_t i = 0; i < snapshot.size(); ++i) {
+			const auto& region = snapshot[i];
+			if (detail::match_filter(region, g_ui.filter_buf))
+				g_ui.visible_region_indices.push_back(static_cast<int>(i));
+			if (region.state == 0x1000)
+				g_ui.visible_committed_bytes += region.size;
+			const bool executable = (region.protect & 0xF0) != 0;
+			const bool writable = region.protect == 0x04 || region.protect == 0x08 ||
+				region.protect == 0x40 || region.protect == 0x80;
+			if (executable && writable) ++g_ui.visible_rwx_count;
+		}
 	}
+	const auto& filtered_indices = g_ui.visible_region_indices;
 
 	render_hero_map(dl, pos_x + 12.f, hero_y, width - 24.f, hero_h,
 		alpha, snapshot, filtered_indices);
 
 	{
 		size_t n_regions = snapshot.size();
-		uint64_t total_size = 0;
-		int rwx_count = 0;
-		for (auto& r : snapshot) {
-			if (r.state == 0x1000)
-				total_size += r.size;
-			bool exec = (r.protect & 0xF0) != 0;
-			bool write = (r.protect == 0x04) || (r.protect == 0x08)
-			          || (r.protect == 0x40) || (r.protect == 0x80);
-			if (exec && write) rwx_count++;
-		}
+		const uint64_t total_size = g_ui.visible_committed_bytes;
+		const int rwx_count = g_ui.visible_rwx_count;
 		uint32_t pid = driver_bridge::attached_pid();
 
 		detail::tween_counter(g_ui.stat_regions,    static_cast<float>(n_regions), dt);
@@ -763,8 +852,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (filtered_indices.empty() && !g_ui.refreshing.load()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::memory;
-		es.title = "No memory regions";
-		es.body  = (driver_bridge::attached_pid() == 0)
+		es.title = error_snapshot.empty() ? "No memory regions" : "Memory map unavailable";
+		es.body  = !error_snapshot.empty() ? error_snapshot : (driver_bridge::attached_pid() == 0)
 			? std::string("Attach to a process to enumerate its memory map.")
 			: std::string("Click Refresh to reload the memory map.");
 		aida::ui::empty_state::render(ImVec2(pos_x, list_y), ImVec2(width, list_h), es);
@@ -934,10 +1023,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::TextWrapped("Unavailable: %s", protect_gate.disabled_reason);
 
 		ImGui::Separator();
-		if (!protect_gate.enabled)
+		const bool protect_pending = g_ui.protect_pending.load(std::memory_order_acquire);
+		if (!protect_gate.enabled || protect_pending)
 			ImGui::BeginDisabled();
 		if (ImGui::Button("Apply", ImVec2(100.f, 0.f))) {
 			uint32_t new_protect = values[g_ui.change_protect_choice];
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			uint32_t old_protect = 0;
 			diag::log_tagged_critical_fmt("memmap",
 				"memmap_protect_request addr=0x%llx size=%llu new=0x%X",
@@ -978,8 +1069,92 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			}
 			g_ui.change_protect_open = false;
 			ImGui::CloseCurrentPopup();
+#else
+			bool expected = false;
+			if (g_ui.protect_pending.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel)) {
+				const auto context = g_ui.change_protect_context;
+				const std::uint64_t address = g_ui.change_protect_addr;
+				const std::uint64_t size = g_ui.change_protect_size;
+				struct result_t {
+					bool ok = false;
+					bool verified = false;
+					std::uint32_t old_protect = 0;
+				};
+				auto result = std::make_shared<result_t>();
+				aida::infra::executor::submission_t submission;
+				submission.owner_subsystem = "debugger";
+				submission.label = "Change memory protection";
+				submission.thread_class = "debugger_target_mutation";
+				submission.domain = aida::infra::executor::domain_t::feature_worker;
+				submission.priority = 2;
+				submission.target_pid = context.target_pid;
+				submission.generation = context.stop_generation;
+				submission.ui_access_policy = "post_completion_only";
+				submission.failure_policy = "fail_closed";
+				submission.body = [context, address, size, new_protect, result]() {
+					if (driver_bridge::attached_pid() == context.target_pid &&
+						debugger_interaction::current_stop_generation() == context.stop_generation) {
+						result->ok = driver_bridge::protect_memory(address, size, new_protect,
+							&result->old_protect);
+						if (result->ok) {
+							const auto regions = driver_bridge::enumerate_memory_regions();
+							for (const auto& region : regions)
+								if (region.base == address) {
+									result->verified = (region.protect & 0xFFu) == new_protect;
+									break;
+								}
+						}
+					}
+					const bool posted = aida::ui_thread::post([result, new_protect]() {
+						if (result->verified) {
+							char message[96];
+							std::snprintf(message, sizeof(message), "Protection changed 0x%X -> 0x%X",
+								result->old_protect, new_protect);
+							toast_notification::push(message, toast_notification::toast_type_t::success);
+							{
+								std::unique_lock<std::mutex> lock(g_ui.regions_mutex, std::try_to_lock);
+								if (lock.owns_lock()) g_ui.last_error.clear();
+							}
+							debugger_interaction::advance_stop_generation();
+							refresh();
+						} else {
+							const std::string failure = result->ok
+								? "Protection write succeeded but readback did not match."
+								: "Failed to change protection.";
+							toast_notification::push(failure, toast_notification::toast_type_t::error);
+							std::unique_lock<std::mutex> lock(g_ui.regions_mutex, std::try_to_lock);
+							if (lock.owns_lock()) g_ui.last_error = failure;
+						}
+						g_ui.protect_pending.store(false, std::memory_order_release);
+					}, "memory_map", "protect_completion", "worker_completion");
+					if (!posted) {
+						if (result->verified)
+							debugger_interaction::advance_stop_generation();
+						g_ui.protect_pending.store(false, std::memory_order_release);
+						throw std::runtime_error("Memory-protection completion could not be published to the UI thread");
+					}
+					if (!result->verified)
+						throw std::runtime_error(result->ok
+							? "Memory-protection readback did not match"
+							: "Memory-protection mutation failed");
+				};
+				const auto submitted = aida::infra::executor::submit(std::move(submission));
+				if (!submitted.submitted) {
+					g_ui.protect_pending.store(false, std::memory_order_release);
+					std::unique_lock<std::mutex> lock(g_ui.regions_mutex, std::try_to_lock);
+					if (lock.owns_lock())
+						g_ui.last_error = "Memory-protection task could not be queued: " + submitted.reject_reason;
+					toast_notification::push("Memory-protection queue rejected the task: " +
+						submitted.reject_reason, toast_notification::toast_type_t::error);
+				} else register_background_task(submitted, "debugger.memory_protection",
+					"Change memory protection");
+			}
+			g_ui.change_protect_open = false;
+			ImGui::CloseCurrentPopup();
+#endif
 		}
-		if (!protect_gate.enabled)
+		if (!protect_gate.enabled || protect_pending)
 			ImGui::EndDisabled();
 		ImGui::SameLine();
 		if (ImGui::Button("Cancel", ImVec2(100.f, 0.f))) {

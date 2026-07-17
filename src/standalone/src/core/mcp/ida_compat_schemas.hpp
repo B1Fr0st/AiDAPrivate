@@ -256,9 +256,32 @@ namespace mcp_standalone::ida_compat
                 "properties": {
                     "address": {"type": "string"},
                     "struct_name": {"type": "string"},
-                    "max_depth": {"type": "integer", "minimum": 0, "maximum": 16, "default": 4}
+                    "max_depth": {"type": "integer", "minimum": 0, "maximum": 16, "default": 4},
+                    "fields": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 256,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "minLength": 1, "maxLength": 256},
+                                "offset": {"oneOf": [{"type": "string"}, {"type": "integer", "minimum": 0}]},
+                                "type": {"type": "string", "minLength": 1, "maxLength": 64},
+                                "size": {"oneOf": [{"type": "string"}, {"type": "integer", "minimum": 1, "maximum": 1048576}]}
+                            },
+                            "required": ["name", "offset", "type"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "size": {"oneOf": [{"type": "string"}, {"type": "integer", "minimum": 1, "maximum": 1048576}]},
+                    "target": {"type": "string", "enum": ["auto", "guest", "host"]},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300000}
                 },
-                "required": ["address", "struct_name"],
+                "required": ["address"],
+                "oneOf": [
+                    {"required": ["struct_name"], "not": {"required": ["fields"]}},
+                    {"required": ["fields"], "not": {"required": ["struct_name"]}}
+                ],
                 "additionalProperties": false
             })");
 

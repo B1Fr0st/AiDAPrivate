@@ -11,6 +11,7 @@
 #endif
 
 #include "h2_editor_view.hpp"
+#include "../network_view.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_routed.hpp"
 #else
@@ -39,6 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -73,11 +75,30 @@ struct ui_state_t
 
     h2_editor::response_t                            last_response;
     bool                                             has_response = false;
+    std::atomic<bool>                                accepting{true};
     std::atomic<bool>                                in_flight{false};
+    std::atomic<uint64_t>                            lifetime_generation{1};
     std::mutex                                       resp_mtx;
+    uint64_t                                         next_exchange_id = 1;
+    uint64_t                                         retained_exchange_id = 0;
+    uint64_t                                         retained_generation = 0;
+    std::vector<uint8_t>                             retained_request;
+    std::vector<uint8_t>                             retained_response;
+    std::string                                      retained_host;
+    uint16_t                                         retained_port = 0;
+    bool                                             retained_tls = true;
+    bool                                             retained_raw_protocol = false;
+    uint64_t                                         retained_request_hash = 0;
+    uint64_t                                         retained_response_hash = 0;
+    size_t                                           retained_request_size = 0;
+    size_t                                           retained_response_size = 0;
 };
 
-static ui_state_t& ui() { static ui_state_t s; return s; }
+static std::shared_ptr<ui_state_t> ui()
+{
+    static const auto state = std::make_shared<ui_state_t>();
+    return state;
+}
 
 static bool hex_char(char c, uint8_t& out)
 {
@@ -119,15 +140,105 @@ static std::string hex_encode(const std::vector<uint8_t>& v, size_t max_bytes)
     return out;
 }
 
+static uint64_t artifact_hash(const std::vector<uint8_t>& bytes)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (uint8_t value : bytes) { hash ^= value; hash *= 1099511628211ULL; }
+    hash ^= static_cast<uint64_t>(bytes.size());
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+static std::vector<uint8_t> request_bytes(const h2_editor::request_t& request)
+{
+    if (request.use_raw_frames) {
+        std::vector<uint8_t> bytes;
+        for (const auto& frame : request.raw_frames) {
+            auto encoded = h2_editor::encode_frame(frame);
+            bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+        }
+        return bytes;
+    }
+    std::string raw = request.pseudo.method + " " + request.pseudo.path + " HTTP/2\r\n";
+    raw += "Host: " + request.pseudo.authority + "\r\n";
+    raw += ":scheme: " + request.pseudo.scheme + "\r\n";
+    for (const auto& header : request.headers) raw += header.first + ": " + header.second + "\r\n";
+    raw += "\r\n";
+    raw.append(reinterpret_cast<const char*>(request.body.data()), request.body.size());
+    return std::vector<uint8_t>(raw.begin(), raw.end());
+}
+
+static std::vector<uint8_t> response_bytes(const h2_editor::response_t& response)
+{
+    std::string raw = "HTTP/2 " + std::to_string(response.status_code) + "\r\n";
+    for (const auto& header : response.headers) raw += header.first + ": " + header.second + "\r\n";
+    raw += "\r\n";
+    raw.append(reinterpret_cast<const char*>(response.body.data()), response.body.size());
+    return std::vector<uint8_t>(raw.begin(), raw.end());
+}
+
+static network_view::artifact_identity_t artifact_identity(const ui_state_t& state, bool response)
+{
+    network_view::artifact_identity_t identity;
+    const uint64_t hash = response ? state.retained_response_hash : state.retained_request_hash;
+    const size_t size = response ? state.retained_response_size : state.retained_request_size;
+    if (hash == 0 || size == 0) return identity;
+    identity.kind = response ? network_view::artifact_kind_t::http2_response
+                             : network_view::artifact_kind_t::http2_request;
+    identity.id = "network.h2." + std::to_string(state.retained_exchange_id) +
+        (response ? ".response" : ".request");
+    identity.parent_id = "network.h2." + std::to_string(state.retained_exchange_id);
+    identity.source_view_id = "view.network.h2_editor";
+    identity.source_id = state.retained_exchange_id;
+    identity.timestamp = state.retained_generation;
+    identity.revision = state.retained_generation;
+    identity.content_size = size;
+    identity.content_hash = hash;
+    identity.label = response ? "HTTP/2 response" : "HTTP/2 request";
+    identity.target_host = state.retained_host;
+    identity.target_port = state.retained_port;
+    identity.use_tls = state.retained_tls;
+    identity.raw_protocol = !response && state.retained_raw_protocol;
+    return identity;
+}
+
+}
+
+bool resolve_retained_artifact(uint64_t exchange_id, uint64_t generation, bool response,
+                               std::vector<uint8_t>& bytes, std::string& unavailable_reason)
+{
+    const auto state = ui();
+    std::lock_guard<std::mutex> lk(state->resp_mtx);
+    if (!state->accepting.load(std::memory_order_acquire) ||
+        state->retained_exchange_id != exchange_id || state->retained_generation != generation) {
+        unavailable_reason = "The HTTP/2 editor now owns a newer exchange; reopen actions on the current request.";
+        return false;
+    }
+    bytes = response ? state->retained_response : state->retained_request;
+    if (bytes.empty()) {
+        unavailable_reason = response ? "The HTTP/2 exchange has no retained response."
+                                      : "The HTTP/2 exchange has no retained request.";
+        return false;
+    }
+    unavailable_reason.clear();
+    return true;
 }
 
 void initialize()
 {
+    const auto state = ui();
+    state->lifetime_generation.fetch_add(1, std::memory_order_acq_rel);
+    state->accepting.store(true, std::memory_order_release);
+    state->in_flight.store(false, std::memory_order_release);
     ::diag::log_tagged("h2_v", "initialize");
 }
 
 void shutdown()
 {
+    const auto state = ui();
+    state->accepting.store(false, std::memory_order_release);
+    state->lifetime_generation.fetch_add(1, std::memory_order_acq_rel);
+    state->in_flight.store(false, std::memory_order_release);
     ::diag::log_tagged("h2_v", "shutdown");
 }
 
@@ -136,7 +247,8 @@ void render(float pos_x, float pos_y, float width, float height,
 {
     (void)accent_r; (void)accent_g; (void)accent_b;
     const auto& th = aida::ui::resolved();
-    auto& st = ui();
+    const auto state = ui();
+    auto& st = *state;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##burp_h2_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
@@ -273,6 +385,26 @@ void render(float pos_x, float pos_y, float width, float height,
                 req.flags = flg;
             }
 
+            uint64_t exchange_id = 0;
+            uint64_t lifetime_generation = 0;
+            {
+                std::lock_guard<std::mutex> lk(st.resp_mtx);
+                exchange_id = st.next_exchange_id++;
+                lifetime_generation = st.lifetime_generation.load(std::memory_order_acquire);
+                st.retained_exchange_id = exchange_id;
+                st.retained_generation = exchange_id;
+                st.retained_request = request_bytes(req);
+                st.retained_response.clear();
+                st.retained_request_size = st.retained_request.size();
+                st.retained_request_hash = artifact_hash(st.retained_request);
+                st.retained_response_size = 0;
+                st.retained_response_hash = 0;
+                st.retained_host = req.host;
+                st.retained_port = req.port;
+                st.retained_tls = req.pseudo.scheme != "http";
+                st.retained_raw_protocol = req.use_raw_frames;
+                st.has_response = false;
+            }
             st.in_flight.store(true);
             try {
                 const ULONGLONG post_ms = GetTickCount64();
@@ -283,7 +415,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     sub.thread_class = "bounded_task";
                     sub.domain = aida::infra::executor::domain_t::external_tool;
                     sub.priority = 3;
-                    sub.body = [&st, req, post_ms]() {
+                    sub.body = [state, req, post_ms, exchange_id, lifetime_generation]() {
                     const DWORD tid = GetCurrentThreadId();
                     const ULONGLONG start_ms = GetTickCount64();
                     ::diag::log_tagged_fmt("h2_v",
@@ -299,9 +431,17 @@ void render(float pos_x, float pos_y, float width, float height,
                         const bool ok = r.ok;
                         const uint64_t latency_ms = r.latency_ms;
                         {
-                            std::lock_guard<std::mutex> lk(st.resp_mtx);
-                            st.last_response = std::move(r);
-                            st.has_response = true;
+                            std::lock_guard<std::mutex> lk(state->resp_mtx);
+                            if (state->accepting.load(std::memory_order_acquire) &&
+                                state->lifetime_generation.load(std::memory_order_acquire) == lifetime_generation) {
+                                state->last_response = r;
+                                if (state->retained_exchange_id == exchange_id) {
+                                    state->retained_response = response_bytes(r);
+                                    state->retained_response_size = state->retained_response.size();
+                                    state->retained_response_hash = artifact_hash(state->retained_response);
+                                    state->has_response = true;
+                                }
+                            }
                         }
                         ::diag::log_tagged_fmt("h2_v",
                             "send_worker_exit status=%d ok=%d latency=%llums elapsed_ms=%llu tid=%lu",
@@ -322,7 +462,9 @@ void render(float pos_x, float pos_y, float width, float height,
                             static_cast<unsigned long long>(GetTickCount64() - start_ms),
                             static_cast<unsigned long>(tid));
                     }
-                    st.in_flight.store(false);
+                    if (state->accepting.load(std::memory_order_acquire) &&
+                        state->lifetime_generation.load(std::memory_order_acquire) == lifetime_generation)
+                        state->in_flight.store(false, std::memory_order_release);
                 };
                     return ::aida::infra::executor::submit(std::move(sub)).submitted;
                 }();
@@ -368,10 +510,48 @@ void render(float pos_x, float pos_y, float width, float height,
 
     h2_editor::response_t r_copy;
     bool have;
+    size_t response_body_size = 0;
+    network_view::artifact_identity_t request_identity;
+    network_view::artifact_identity_t response_identity;
     {
         std::lock_guard<std::mutex> lk(st.resp_mtx);
-        r_copy = st.last_response;
+        r_copy.ok = st.last_response.ok;
+        r_copy.status_code = st.last_response.status_code;
+        r_copy.headers = st.last_response.headers;
+        r_copy.latency_ms = st.last_response.latency_ms;
+        r_copy.error_msg = st.last_response.error_msg;
+        response_body_size = st.last_response.body.size();
+        const size_t body_preview_size = (std::min)(st.last_response.body.size(), static_cast<size_t>(4096));
+        r_copy.body.assign(st.last_response.body.begin(),
+            st.last_response.body.begin() + static_cast<ptrdiff_t>(body_preview_size));
+        const size_t wire_preview_size = (std::min)(st.last_response.raw_wire_in.size(), static_cast<size_t>(1024));
+        r_copy.raw_wire_in.assign(st.last_response.raw_wire_in.begin(),
+            st.last_response.raw_wire_in.begin() + static_cast<ptrdiff_t>(wire_preview_size));
         have = st.has_response;
+        request_identity = artifact_identity(st, false);
+        response_identity = artifact_identity(st, true);
+    }
+    if (request_identity.valid()) {
+        if (aida::ui::button("Exchange actions", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+            network_view::open_exchange_context(request_identity, response_identity,
+                network_view::exchange_context_origin_t::pointer);
+        const bool menu_key_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool shift_f10_context = !menu_key_context &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        const bool keyboard_context = menu_key_context || shift_f10_context;
+        if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            network_view::open_exchange_context(response_identity.valid() ? response_identity : request_identity,
+                response_identity.valid() ? request_identity : network_view::artifact_identity_t{},
+                network_view::exchange_context_origin_t::pointer);
+        if (keyboard_context)
+            network_view::open_exchange_context(response_identity.valid() ? response_identity : request_identity,
+                response_identity.valid() ? request_identity : network_view::artifact_identity_t{},
+                menu_key_context
+                    ? network_view::exchange_context_origin_t::menu_key
+                    : network_view::exchange_context_origin_t::shift_f10);
+        ImGui::Separator();
     }
     if (!have) {
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
@@ -398,7 +578,7 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         ImGui::Separator();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Body (%zu bytes)", r_copy.body.size());
+                           "Body (%zu bytes)", response_body_size);
         std::string preview;
         size_t cap = r_copy.body.size() < 4096 ? r_copy.body.size() : 4096;
         preview.reserve(cap);

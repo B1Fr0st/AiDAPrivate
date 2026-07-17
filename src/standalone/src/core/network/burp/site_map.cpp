@@ -10,6 +10,7 @@
 #endif
 
 #include "site_map.hpp"
+#include "../network_view.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_burp_core.hpp"
 #else
@@ -21,6 +22,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#include "../../ui/application_ui_runtime.hpp"
 #include "../../infra/event_bus.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_executor.hpp"
@@ -38,6 +40,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -576,23 +579,61 @@ void render_tree_node(state_t& st, const std::shared_ptr<path_node_t>& node, con
             st.selected_path = label_full;
         }
 
-        if (item_right_clicked) ImGui::OpenPopup("##sitemap_node_ctx");
-
-        if (ImGui::BeginPopup("##sitemap_node_ctx")) {
+        const bool menu_key_context = selected &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool shift_f10_context = !menu_key_context && selected &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        const bool keyboard_context = menu_key_context || shift_f10_context;
+        if (item_right_clicked || keyboard_context) {
             char url_buf[1024];
             std::snprintf(url_buf, sizeof(url_buf), "%s://%s:%u%s", tls ? "https" : "http",
                           host.c_str(), port, label_full.c_str());
-            ImGui::TextDisabled("%s", url_buf);
-            ImGui::Separator();
-            if (ImGui::MenuItem("Add to scope")) {
-                scope::add_include_rule(tls ? "https" : "http", host, port, label_full);
-            }
-            if (ImGui::MenuItem("Exclude from scope")) {
-                scope::add_exclude_rule(tls ? "https" : "http", host, port, label_full);
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Copy URL")) ImGui::SetClipboardText(url_buf);
-            ImGui::EndPopup();
+            aida::ui::application_ui::retained_entity_context_t context;
+            context.owner_id = "network.site_map.path";
+            context.entity_id = url_buf;
+            context.entity_generation = node->last_seen_ms;
+            context.active_view = aida::ui::stable_view_id_t("view.network.site_map");
+            const std::weak_ptr<path_node_t> retained_node = node;
+            const auto retained_last_seen = node->last_seen_ms;
+            const auto retained_requests = node->total_requests;
+            context.validate_identity = [retained_node, retained_last_seen, retained_requests] {
+                const auto live = retained_node.lock();
+                return live && live->last_seen_ms == retained_last_seen &&
+                        live->total_requests == retained_requests
+                    ? aida::ui::capability_state_t::available()
+                    : aida::ui::capability_state_t::unavailable(
+                        "The site-map path was removed or replaced; select it again");
+            };
+            const auto add = [&context](const char* id,
+                    std::function<aida::ui::action_handler_result_t()> invoke) {
+                aida::ui::application_ui::retained_entity_action_t action;
+                action.action_id = id;
+                action.capability = aida::ui::capability_state_t::available();
+                action.invoke = std::move(invoke);
+                context.actions.push_back(std::move(action));
+            };
+            const auto scheme = std::string(tls ? "https" : "http");
+            add("network.site_map.path.include", [scheme, host, port, label_full] {
+                scope::add_include_rule(scheme, host, port, label_full);
+                return aida::ui::action_handler_result_t::completed();
+            });
+            add("network.site_map.path.exclude", [scheme, host, port, label_full] {
+                scope::add_exclude_rule(scheme, host, port, label_full);
+                return aida::ui::action_handler_result_t::completed();
+            });
+            const std::string retained_url = url_buf;
+            add("network.site_map.copy_url", [retained_url] {
+                ImGui::SetClipboardText(retained_url.c_str());
+                return aida::ui::action_handler_result_t::completed();
+            });
+            aida::ui::application_ui::open_retained_entity_context_menu(
+                std::move(context), item_right_clicked
+                    ? aida::ui::context_menu_open_origin_t::pointer
+                    : menu_key_context
+                    ? aida::ui::context_menu_open_origin_t::menu_key
+                    : aida::ui::context_menu_open_origin_t::shift_f10);
         }
 
         ImGui::PopID();
@@ -683,17 +724,57 @@ void render_tree(state_t& st, float width, float height, float alpha)
             st.selected_tls  = h.tls;
             st.selected_path.clear();
         }
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) ImGui::OpenPopup("##sitemap_host_ctx");
-        if (ImGui::BeginPopup("##sitemap_host_ctx")) {
-            ImGui::TextDisabled("%s://%s:%u", h.tls ? "https" : "http", h.host.c_str(), h.port);
-            ImGui::Separator();
-            if (ImGui::MenuItem("Add host to scope")) {
-                scope::add_include_rule(h.tls ? "https" : "http", h.host, h.port, std::string());
-            }
-            if (ImGui::MenuItem("Exclude host")) {
-                scope::add_exclude_rule(h.tls ? "https" : "http", h.host, h.port, std::string());
-            }
-            ImGui::EndPopup();
+        const bool host_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+        const bool host_menu_key_context = host_selected &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool host_shift_f10_context = !host_menu_key_context && host_selected &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        const bool host_keyboard_context = host_menu_key_context || host_shift_f10_context;
+        if (host_pointer_context || host_keyboard_context) {
+            aida::ui::application_ui::retained_entity_context_t context;
+            context.owner_id = "network.site_map.host";
+            context.entity_id = (h.tls ? "https://" : "http://") + h.host + ":" +
+                std::to_string(h.port);
+            context.entity_generation = h.last_seen_ms;
+            context.active_view = aida::ui::stable_view_id_t("view.network.site_map");
+            const std::weak_ptr<host_node_t> retained_host = kv.second;
+            const auto retained_last_seen = h.last_seen_ms;
+            const auto retained_requests = h.total_requests;
+            context.validate_identity = [retained_host, retained_last_seen, retained_requests] {
+                const auto live = retained_host.lock();
+                return live && live->last_seen_ms == retained_last_seen &&
+                        live->total_requests == retained_requests
+                    ? aida::ui::capability_state_t::available()
+                    : aida::ui::capability_state_t::unavailable(
+                        "The site-map host was removed or replaced; select it again");
+            };
+            const auto add = [&context](const char* id,
+                    std::function<aida::ui::action_handler_result_t()> invoke) {
+                aida::ui::application_ui::retained_entity_action_t action;
+                action.action_id = id;
+                action.capability = aida::ui::capability_state_t::available();
+                action.invoke = std::move(invoke);
+                context.actions.push_back(std::move(action));
+            };
+            const auto scheme = std::string(h.tls ? "https" : "http");
+            const auto retained_host_name = h.host;
+            const auto retained_port = h.port;
+            add("network.site_map.host.include", [scheme, retained_host_name, retained_port] {
+                scope::add_include_rule(scheme, retained_host_name, retained_port, std::string());
+                return aida::ui::action_handler_result_t::completed();
+            });
+            add("network.site_map.host.exclude", [scheme, retained_host_name, retained_port] {
+                scope::add_exclude_rule(scheme, retained_host_name, retained_port, std::string());
+                return aida::ui::action_handler_result_t::completed();
+            });
+            aida::ui::application_ui::open_retained_entity_context_menu(
+                std::move(context), host_pointer_context
+                    ? aida::ui::context_menu_open_origin_t::pointer
+                    : host_menu_key_context
+                    ? aida::ui::context_menu_open_origin_t::menu_key
+                    : aida::ui::context_menu_open_origin_t::shift_f10);
         }
 
         ImGui::PopID();
@@ -716,6 +797,11 @@ void render_tree(state_t& st, float width, float height, float alpha)
             ImVec2(c_org.x + (c_sz.x - sz.x) * 0.5f, c_org.y + (c_sz.y - sz.y) * 0.5f),
             aida::ui::with_alpha(aida::ui::resolved().text_dim, alpha * 0.85f), msg);
     }
+
+    aida::ui::application_ui::render_retained_entity_context_menu(
+        "network.site_map.path");
+    aida::ui::application_ui::render_retained_entity_context_menu(
+        "network.site_map.host");
 
     ImGui::EndChild();
     ImGui::PopID();
@@ -817,42 +903,6 @@ void render_response_block(const exchange_observed_t& e, float alpha)
         ImGui::EndTabBar();
     }
     ImGui::PopID();
-}
-
-std::string build_curl_command(const exchange_observed_t& e)
-{
-    std::string out = "curl -i -k -X ";
-    out.append(e.method.empty() ? "GET" : e.method);
-    out.append(" \"");
-    out.append(e.scheme.empty() ? "https" : e.scheme);
-    out.append("://");
-    out.append(e.host);
-    if (e.port != 0 && e.port != 80 && e.port != 443) {
-        out.append(":");
-        out.append(std::to_string(e.port));
-    }
-    out.append(e.path);
-    if (!e.query.empty()) { out.append("?"); out.append(e.query); }
-    out.append("\"");
-    for (const auto& h : e.req_headers) {
-        const std::string lk = [&]{ std::string r; for (char c : h.first) r.push_back(static_cast<char>(c | 0x20)); return r; }();
-        if (lk == "host" || lk == "content-length") continue;
-        out.append(" -H \"");
-        out.append(h.first);
-        out.append(": ");
-        out.append(h.second);
-        out.append("\"");
-    }
-    if (!e.req_body.empty()) {
-        out.append(" --data-binary \"");
-        for (uint8_t b : e.req_body) {
-            if (b == '"' || b == '\\') out.push_back('\\');
-            if (b >= 0x20 && b < 0x7F) out.push_back(static_cast<char>(b));
-            else                       out.push_back('?');
-        }
-        out.append("\"");
-    }
-    return out;
 }
 
 void render_right_pane(state_t& st, float width, float height, float alpha)
@@ -970,22 +1020,17 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
         ImGui::PushID(static_cast<int>(e.id));
         ImGui::InvisibleButton("##sm_row", ImVec2(width, row_h));
         if (ImGui::IsItemClicked()) st.selected_exchange_id.store(e.id);
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) ImGui::OpenPopup("##sm_row_ctx");
-        if (ImGui::BeginPopup("##sm_row_ctx")) {
-            if (ImGui::MenuItem("Send to Repeater"))  send_to(e.id, "repeater",  "sitemap");
-            if (ImGui::MenuItem("Send to Intruder"))  send_to(e.id, "intruder",  "sitemap");
-            if (ImGui::MenuItem("Send to Comparer"))  send_to(e.id, "comparer",  "sitemap");
-            if (ImGui::MenuItem("Send to Scanner"))   send_to(e.id, "scanner",   "sitemap");
-            if (ImGui::MenuItem("Send to Decoder"))   send_to(e.id, "decoder",   "sitemap");
-            ImGui::Separator();
-            if (ImGui::MenuItem("Copy as cURL")) {
-                const std::string c = build_curl_command(e);
-                ImGui::SetClipboardText(c.c_str());
-            }
-            if (ImGui::MenuItem("Add path to scope")) {
-                scope::add_include_rule(e.scheme, e.host, e.port, e.path);
-            }
-            ImGui::EndPopup();
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            st.selected_exchange_id.store(e.id);
+            network_view::artifact_identity_t request;
+            network_view::artifact_identity_t response;
+            std::string reason;
+            static_cast<void>(network_view::make_sitemap_artifact(
+                e.id, network_view::artifact_kind_t::sitemap_request, request, reason));
+            static_cast<void>(network_view::make_sitemap_artifact(
+                e.id, network_view::artifact_kind_t::sitemap_response, response, reason));
+            network_view::open_exchange_context(std::move(request), std::move(response),
+                network_view::exchange_context_origin_t::pointer);
         }
 
         ImU32 txt = aida::ui::with_alpha(th.text_primary, r_alpha);
@@ -1022,6 +1067,26 @@ void render_right_pane(state_t& st, float width, float height, float alpha)
 
         ImGui::PopID();
         ++visible;
+    }
+
+    const bool exchange_menu_key = sel_id != 0 &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+    const bool exchange_shift_f10 = !exchange_menu_key && sel_id != 0 &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+    if (exchange_menu_key || exchange_shift_f10) {
+        network_view::artifact_identity_t request;
+        network_view::artifact_identity_t response;
+        std::string reason;
+        static_cast<void>(network_view::make_sitemap_artifact(
+            sel_id, network_view::artifact_kind_t::sitemap_request, request, reason));
+        static_cast<void>(network_view::make_sitemap_artifact(
+            sel_id, network_view::artifact_kind_t::sitemap_response, response, reason));
+        network_view::open_exchange_context(std::move(request), std::move(response),
+            exchange_menu_key
+                ? network_view::exchange_context_origin_t::menu_key
+                : network_view::exchange_context_origin_t::shift_f10);
     }
 
     ImGui::EndChild();

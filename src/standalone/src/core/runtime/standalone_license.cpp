@@ -4,6 +4,7 @@
 #include "standalone_license.hpp"
 
 #include "standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #include "standalone_driver.hpp"
 #include "comm.h"
 #include "arc/arc.h"
@@ -6913,7 +6914,14 @@ namespace
 
         const bool arc_cache_ok = s_arc_loaded.load(std::memory_order_acquire);
         settings.license_arc_load_ok = arc_cache_ok;
-        settings.save();
+        std::string persistence_error;
+        if (!aida::settings_persistence::commit_lifecycle(settings,
+                persistence_error)) {
+            std::lock_guard<std::mutex> lk(s_state_mtx);
+            s_error = "Validated license state could not be committed durably.";
+            set_obfuscated_valid(false);
+            return false;
+        }
 
         return true;
     }
@@ -8583,7 +8591,12 @@ namespace
                         aida::license_state::flag_arc_loaded, 0, state_err);
                 }
                 settings.license_arc_load_ok = true;
-                settings.save();
+                std::string persistence_error;
+                if (!aida::settings_persistence::commit_lifecycle(settings,
+                        persistence_error)) {
+                    log_arc_status("arc_load_settings_commit_failed");
+                    __fastfail(0xA1DAFA18u);
+                }
                 log_arc_status("arc_load_ok_disk_cache_marked");
             }
             catch (const std::exception& ex)
@@ -8837,7 +8850,6 @@ namespace
             return false;
         }
         settings.license_arc_load_ok = s_arc_loaded.load(std::memory_order_acquire);
-        settings.save();
 
         payload = json::parse(settings.license_sig_payload, nullptr, false);
         if (payload.is_discarded() || !payload.is_object()) {
@@ -9056,7 +9068,10 @@ namespace
         settings.license_issued_at = 0;
         settings.license_ttl = 3600;
         settings.license_arc_load_ok = false;
-        settings.save();
+        std::string persistence_error;
+        if (!aida::settings_persistence::commit_lifecycle(settings,
+                persistence_error))
+            lic_log("pending_activation_settings_commit_failed");
         {
             std::lock_guard<std::mutex> lk(s_state_mtx);
             s_cached_hwid.clear();

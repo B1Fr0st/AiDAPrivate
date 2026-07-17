@@ -346,6 +346,23 @@ std::string last_error()
     return st.last_err;
 }
 
+bool stage_rule(const std::string& url, rule_kind_t kind, std::string& reason)
+{
+    const auto parsed = parse_url(url);
+    if (!parsed.valid || parsed.host.empty()) {
+        reason = "The selected artifact has no valid URL to stage as a scope rule.";
+        return false;
+    }
+    auto& st = s();
+    std::snprintf(st.new_protocol, sizeof(st.new_protocol), "%s", parsed.scheme.c_str());
+    std::snprintf(st.new_host, sizeof(st.new_host), "%s", parsed.host.c_str());
+    std::snprintf(st.new_port, sizeof(st.new_port), "%u", static_cast<unsigned>(parsed.port));
+    std::snprintf(st.new_path, sizeof(st.new_path), "%s", parsed.path.c_str());
+    st.new_kind = kind == rule_kind_t::exclude ? 1 : 0;
+    reason.clear();
+    return true;
+}
+
 std::string storage_path()
 {
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW

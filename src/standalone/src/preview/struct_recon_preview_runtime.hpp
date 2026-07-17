@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -96,6 +97,9 @@ struct reconstructed_struct_t {
 
 struct state_t {
 	reconstructed_struct_t current;
+	std::shared_ptr<const reconstructed_struct_t> publication =
+		std::make_shared<const reconstructed_struct_t>();
+	uint64_t current_revision = 0;
 	std::mutex mutex;
 	std::atomic<bool> monitoring{false};
 	std::atomic<bool> cancel{false};
@@ -110,6 +114,17 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline void publish_current_locked() {
+	++g_state.current_revision;
+	std::atomic_store_explicit(&g_state.publication,
+		std::make_shared<const reconstructed_struct_t>(g_state.current),
+		std::memory_order_release);
+}
+
+inline std::shared_ptr<const reconstructed_struct_t> capture_current_snapshot() {
+	return std::atomic_load_explicit(&g_state.publication, std::memory_order_acquire);
+}
 
 inline const char* field_type_name(field_type_t type) {
 	static constexpr const char* names[] = {
@@ -175,6 +190,7 @@ inline void ensure_preview_fixture() {
 		return;
 	g_state.current = preview_structure(0x0000000140005000ULL, 0x80, "RuntimeImageContext");
 	g_state.active = true;
+	publish_current_locked();
 	std::snprintf(g_state.address_input, sizeof(g_state.address_input), "%llX",
 		static_cast<unsigned long long>(g_state.current.base_address));
 	std::snprintf(g_state.name_input, sizeof(g_state.name_input), "%s", g_state.current.name.c_str());
@@ -185,6 +201,7 @@ inline void reconstruct_from_snapshot(uint64_t base, int size, const std::string
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	g_state.current = preview_structure(base, size, name);
 	g_state.active = true;
+	publish_current_locked();
 	g_state.progress.store(1.f);
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types, 5, "snapshot", g_state.current.name);
 }
@@ -201,12 +218,15 @@ inline void cancel() {
 	g_state.progress.store(0.f);
 }
 
-inline void refresh_value_history() {
+inline bool refresh_value_history(std::string& error) {
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	for (std::size_t index = 0; index < g_state.current.fields.size(); ++index)
 		g_state.current.fields[index].value_history.push(
 			g_state.current.base_address + g_state.current.fields[index].offset + index + 7);
+	publish_current_locked();
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types, 5, "refresh", g_state.current.name);
+	error.clear();
+	return true;
 }
 
 inline std::string export_as_cpp(const reconstructed_struct_t& structure) {
@@ -228,22 +248,30 @@ inline void ai_name_fields() {
 	g_state.ai_naming.store(true);
 	if (g_state.current.fields.size() > 5)
 		g_state.current.fields[5].name = "validated_section_count";
+	publish_current_locked();
 	g_state.ai_naming.store(false);
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types, 5, "ai_name", g_state.current.name);
 }
 
-inline void save_struct_to_disk(const reconstructed_struct_t& structure) {
+inline bool save_struct_to_disk(const reconstructed_struct_t& structure, std::string& error) {
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	g_state.saved_structs.push_back(structure);
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types, 5, "save", structure.name);
+	error.clear();
+	return true;
 }
 
-inline void load_structs_from_disk() {
+inline bool load_structs_from_disk(std::string& error) {
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	if (g_state.saved_structs.empty())
 		g_state.saved_structs.push_back(preview_structure(0x140005000ULL, 0x80, "SavedImageContext"));
+	g_state.current = g_state.saved_structs.front();
+	g_state.active = true;
+	publish_current_locked();
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types, 5, "load_all",
 		std::to_string(g_state.saved_structs.size()));
+	error.clear();
+	return true;
 }
 
 }

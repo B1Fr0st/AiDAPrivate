@@ -11,6 +11,8 @@
 #endif
 
 #include "scanner_view.hpp"
+#include "../network_view.hpp"
+#include "burp_ui_operation.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_routed.hpp"
 #else
@@ -22,6 +24,7 @@
 #endif
 
 #include "../../ui/components.hpp"
+#include "../../scanner/scanner_async_io.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_services.hpp"
 #else
@@ -33,6 +36,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -63,12 +67,196 @@ struct view_state_t
     char            filter_type[128] = {};
     char            status_msg[256] = {};
     std::atomic<bool> initialized{false};
+    std::atomic<bool> initialization_requested{false};
+    bool            initialization_attempted = false;
+    std::shared_ptr<const std::vector<issue_t>> issues =
+        std::make_shared<const std::vector<issue_t>>();
+    std::atomic<bool> issues_refresh_pending{false};
+    std::uint64_t issues_refresh_ms = 0;
+    std::string issues_filter_signature;
+    aida::burp::ui_operation::state_t operation;
+    std::uint64_t observed_operation_generation = 0;
+    std::atomic<std::uint64_t> started_audit_id{0};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reviewed_issue_identity;
 };
 
 view_state_t& vs()
 {
     static view_state_t s;
     return s;
+}
+
+void submit_initialization()
+{
+    auto& state = vs();
+    bool expected = false;
+    if (!state.initialization_requested.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel))
+        return;
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.scanner";
+    request.owner_view = "view.network.scanner";
+    request.owner_action = "network.scanner.initialize";
+    request.label = "Load Scanner state";
+    request.target = "Scanner issue and module catalogs";
+    request.affected_entity = "Scanner state";
+    request.execute = []() {
+        aida::burp::ui_operation::result_t result;
+        result.success = initialize();
+        result.message = result.success ? "Scanner state loaded." : "Scanner initialization failed.";
+        return result;
+    };
+    if (!state.operation.submit(std::move(request)))
+        state.initialization_requested.store(false, std::memory_order_release);
+}
+
+void request_issue_snapshot(issue_filter_t filter, std::string signature)
+{
+    auto& state = vs();
+    bool expected = false;
+    if (!state.issues_refresh_pending.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel))
+        return;
+    filter.limit = 10000;
+    state.issues_filter_signature = signature;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "burp.scanner";
+    submission.label = "scanner.refresh_issues";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::external_tool;
+    submission.priority = 4;
+    submission.body = [filter = std::move(filter)]() mutable {
+        auto finish_pending = std::unique_ptr<void, void(*)(void*)>(
+            reinterpret_cast<void*>(1), [](void*) {
+                vs().issues_refresh_pending.store(false, std::memory_order_release);
+            });
+        auto rows = issue_store::list(filter);
+        std::shared_ptr<const std::vector<issue_t>> publication =
+            std::make_shared<const std::vector<issue_t>>(std::move(rows));
+        std::atomic_store_explicit(&vs().issues, std::move(publication),
+            std::memory_order_release);
+    };
+    if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+        state.issues_filter_signature.clear();
+        state.issues_refresh_pending.store(false, std::memory_order_release);
+    }
+}
+
+void submit_issue_export()
+{
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.scanner";
+    request.owner_view = "view.network.scanner";
+    request.owner_action = "network.scanner.export_issues";
+    request.label = "Export Scanner issues";
+    request.target = "Scanner issue export";
+    request.affected_entity = "Scanner issues";
+    request.execute = []() {
+        aida::burp::ui_operation::result_t result;
+        issue_filter_t filter;
+        const auto document = issue_store::export_json(filter);
+        const std::string path = issue_store::storage_path() + ".export.json";
+        const std::string payload = document.dump(2);
+        if (payload.size() > scanner_async_io::max_serialized_bytes) {
+            result.message = "Scanner issue export exceeds the 64 MiB bound.";
+            return result;
+        }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        result.success = true;
+        result.message = "Scanner issue export prepared for Studio preview.";
+#else
+        const auto written = scanner_async_io::atomic_replace(path, payload, true, {}, []() {
+            return true;
+        });
+        result.success = written.success;
+        result.message = written.success ? "Scanner issues exported to " + path : written.error;
+#endif
+        return result;
+    };
+    static_cast<void>(vs().operation.submit(std::move(request)));
+}
+
+void submit_reviewed_issue_clear(std::vector<std::pair<std::uint64_t, std::uint64_t>> reviewed)
+{
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.scanner";
+    request.owner_view = "view.network.scanner";
+    request.owner_action = "network.scanner.clear_issues";
+    request.label = "Clear Scanner issues";
+    request.target = std::to_string(reviewed.size()) + " issues";
+    request.affected_entity = request.target;
+    request.execute = [reviewed = std::move(reviewed)]() {
+        aida::burp::ui_operation::result_t result;
+        issue_filter_t filter;
+        filter.limit = 10000;
+        const auto current = issue_store::list(filter);
+        if (current.size() != reviewed.size()) {
+            result.message = "The issue catalog changed after review; no issues were cleared.";
+            return result;
+        }
+        for (std::size_t index = 0; index < current.size(); ++index) {
+            if (current[index].id != reviewed[index].first ||
+                current[index].seen_ms != reviewed[index].second) {
+                result.message = "The issue catalog changed after review; no issues were cleared.";
+                return result;
+            }
+        }
+        issue_store::clear();
+        result.success = issue_store::count() == 0;
+        result.message = result.success ? "Scanner issues cleared."
+                                        : "Scanner issue clearing could not be verified.";
+        return result;
+    };
+    static_cast<void>(vs().operation.submit(std::move(request)));
+}
+
+void submit_audit(std::vector<std::uint8_t> raw, std::string url,
+    active_scanner::audit_config_t config)
+{
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.scanner";
+    request.owner_view = "view.network.scanner";
+    request.owner_action = "network.scanner.start_audit";
+    request.label = "Start Scanner audit";
+    request.target = url;
+    request.affected_entity = url;
+    request.execute = [raw = std::move(raw), url = std::move(url),
+                       config = std::move(config)]() mutable {
+        aida::burp::ui_operation::result_t result;
+        const std::uint64_t id = active_scanner::enqueue_target(raw, url, config);
+        result.success = id != 0;
+        result.message = result.success ? "Scanner audit started."
+                                        : active_scanner::last_error();
+        if (id != 0)
+            vs().started_audit_id.store(id, std::memory_order_release);
+        return result;
+    };
+    static_cast<void>(vs().operation.submit(std::move(request)));
+}
+
+void submit_passive_toggle(bool reviewed, bool desired)
+{
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.scanner";
+    request.owner_view = "view.network.scanner";
+    request.owner_action = "network.scanner.passive_toggle";
+    request.label = desired ? "Enable passive scanning" : "Disable passive scanning";
+    request.target = "Passive Scanner";
+    request.affected_entity = request.target;
+    request.execute = [reviewed, desired]() {
+        aida::burp::ui_operation::result_t result;
+        if (passive_scanner::is_enabled() != reviewed) {
+            result.message = "Passive Scanner state changed before the toggle was applied.";
+            return result;
+        }
+        passive_scanner::set_enabled(desired);
+        result.success = passive_scanner::is_enabled() == desired;
+        result.message = result.success
+            ? desired ? "Passive scanning enabled." : "Passive scanning disabled."
+            : "Passive Scanner did not reach the requested state.";
+        return result;
+    };
+    static_cast<void>(vs().operation.submit(std::move(request)));
 }
 
 ImU32 sev_color(severity_t s, float a)
@@ -91,6 +279,69 @@ ImU32 conf_color(confidence_t c, float a)
         case confidence_t::certain:   return aida::ui::with_alpha(IM_COL32(140, 230, 180, 255), a);
     }
     return aida::ui::with_alpha(IM_COL32(180, 180, 180, 255), a);
+}
+
+::network_view::artifact_identity_t evidence_identity(const issue_t& issue,
+    std::size_t evidence_index, bool response)
+{
+    const auto& text = response ? issue.evidence[evidence_index].response_raw
+                                : issue.evidence[evidence_index].request_raw;
+    const std::vector<std::uint8_t> bytes(text.begin(), text.end());
+    ::network_view::artifact_identity_t identity;
+    identity.id = "scanner." + std::to_string(issue.id) + ".evidence." +
+        std::to_string(evidence_index) + (response ? ".response" : ".request");
+    identity.parent_id = "scanner." + std::to_string(issue.id) + ".evidence." +
+        std::to_string(evidence_index);
+    identity.source_view_id = "view.network.scanner";
+    identity.session_id = issue.session_id;
+    identity.kind = response ? ::network_view::artifact_kind_t::scanner_response
+                             : ::network_view::artifact_kind_t::scanner_request;
+    identity.source_id = issue.id;
+    identity.timestamp = issue.seen_ms;
+    identity.revision = evidence_index;
+    identity.content_size = bytes.size();
+    identity.content_hash = ::network_view::artifact_content_hash(bytes);
+    identity.label = std::string("Scanner evidence ") + (response ? "response" : "request") +
+        " #" + std::to_string(evidence_index + 1);
+    identity.target_host = issue.host;
+    identity.target_port = issue.port;
+    identity.use_tls = issue.scheme == "https";
+    return identity;
+}
+
+void render_evidence_artifact(const issue_t& issue, std::size_t evidence_index,
+    bool response, float alpha)
+{
+    const auto& evidence = issue.evidence[evidence_index];
+    const auto& text = response ? evidence.response_raw : evidence.request_raw;
+    if (text.empty()) return;
+    ImGui::PushID(response ? "evidence_response" : "evidence_request");
+    ImGui::PushID(static_cast<int>(evidence_index));
+    ImGui::TextDisabled("%s:", response ? "Response" : "Request");
+    ImGui::BeginChild("##artifact", ImVec2(0.f, 112.f), true,
+        ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::TextUnformatted(text.c_str(), text.c_str() + text.size());
+    const bool pointer = ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+    const bool menu = ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+    const bool shift_f10 = ImGui::IsWindowFocused() && ImGui::GetIO().KeyShift &&
+        ImGui::IsKeyPressed(ImGuiKey_F10, false);
+    if (pointer || menu || shift_f10) {
+        const auto primary = evidence_identity(issue, evidence_index, response);
+        ::network_view::artifact_identity_t related;
+        const auto& related_text = response ? evidence.request_raw : evidence.response_raw;
+        if (!related_text.empty())
+            related = evidence_identity(issue, evidence_index, !response);
+        const auto origin = pointer ? ::network_view::exchange_context_origin_t::pointer
+            : shift_f10 ? ::network_view::exchange_context_origin_t::shift_f10
+                        : ::network_view::exchange_context_origin_t::menu_key;
+        ::network_view::open_exchange_context(primary, related, origin);
+    }
+    ImGui::EndChild();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Right-click, Menu, or Shift+F10 for request/response actions");
+    ImGui::PopID();
+    ImGui::PopID();
+    (void)alpha;
 }
 
 void render_audits_pane(float w, float h, float alpha)
@@ -213,7 +464,16 @@ void render_issues_pane(float w, float h, float alpha)
     if (s.filter_host[0]) f.host_substring = s.filter_host;
     if (s.filter_type[0]) f.type_key_substring = s.filter_type;
     if (s.selected_audit_id != 0) { f.has_audit_id = true; f.audit_id = s.selected_audit_id; }
-    auto issues = issue_store::list(f);
+    std::string filter_signature = std::to_string(s.filter_sev) + "\n" +
+        std::to_string(s.filter_conf) + "\n" + s.filter_host + "\n" +
+        s.filter_type + "\n" + std::to_string(s.selected_audit_id);
+    const std::uint64_t now = aida::infra::executor::now_ms();
+    if (!s.issues_refresh_pending.load(std::memory_order_acquire) &&
+        (s.issues_filter_signature != filter_signature || now - s.issues_refresh_ms >= 200)) {
+        s.issues_refresh_ms = now;
+        request_issue_snapshot(f, std::move(filter_signature));
+    }
+    const auto issues = std::atomic_load_explicit(&s.issues, std::memory_order_acquire);
 
     float top_used = 70.f;
     float list_h = (h - top_used) * 0.55f;
@@ -240,8 +500,11 @@ void render_issues_pane(float w, float h, float alpha)
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 4.f);
     }
 
-    for (size_t i = 0; i < issues.size(); ++i) {
-        const auto& it = issues[i];
+    ImGuiListClipper issue_clipper;
+    issue_clipper.Begin(static_cast<int>(issues->size()), row_h);
+    while (issue_clipper.Step()) {
+    for (int row = issue_clipper.DisplayStart; row < issue_clipper.DisplayEnd; ++row) {
+        const auto& it = (*issues)[static_cast<std::size_t>(row)];
         float ry = ImGui::GetCursorPosY();
         float abs_ry = ImGui::GetCursorScreenPos().y;
         bool hovered = ImGui::IsMouseHoveringRect(ImVec2(lo.x, abs_ry), ImVec2(lo.x + w, abs_ry + row_h), false);
@@ -270,6 +533,7 @@ void render_issues_pane(float w, float h, float alpha)
 
         ImGui::SetCursorPosY(ry + row_h);
     }
+    }
     ImGui::Dummy(ImVec2(0.f, 0.f));
     ImGui::EndChild();
 
@@ -278,8 +542,10 @@ void render_issues_pane(float w, float h, float alpha)
     float detail_h = h - top_used - list_h - 16.f;
     if (detail_h < 60.f) detail_h = 60.f;
     ImGui::BeginChild("##burp_issue_detail", ImVec2(w - 4.f, detail_h), false, ImGuiWindowFlags_NoBackground);
-    issue_t selected;
-    if (s.selected_issue_id != 0 && issue_store::get(s.selected_issue_id, selected)) {
+    const auto selected_it = std::find_if(issues->begin(), issues->end(),
+        [&](const auto& issue) { return issue.id == s.selected_issue_id; });
+    if (s.selected_issue_id != 0 && selected_it != issues->end()) {
+        const auto& selected = *selected_it;
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(sev_color(selected.severity, alpha)),
                            "%s", severity_label(selected.severity));
         ImGui::SameLine();
@@ -311,14 +577,8 @@ void render_issues_pane(float w, float h, float alpha)
                 const auto& ev = selected.evidence[i];
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                                    "Evidence #%zu  marker=%s", i + 1, ev.marker.c_str());
-                if (!ev.request_raw.empty()) {
-                    ImGui::TextDisabled("Request:");
-                    ImGui::TextWrapped("%s", ev.request_raw.c_str());
-                }
-                if (!ev.response_raw.empty()) {
-                    ImGui::TextDisabled("Response:");
-                    ImGui::TextWrapped("%s", ev.response_raw.c_str());
-                }
+                render_evidence_artifact(selected, i, false, alpha);
+                render_evidence_artifact(selected, i, true, alpha);
                 ImGui::Spacing();
             }
         }
@@ -402,6 +662,7 @@ void render_new_audit_dialog(float alpha)
         ImGui::EndChild();
 
         ImGui::Spacing();
+        ImGui::BeginDisabled(s.operation.pending());
         if (aida::ui::button("Start Audit", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
             std::string url = s.new_url;
             std::string raw = s.new_raw;
@@ -427,18 +688,10 @@ void render_new_audit_dialog(float alpha)
                     if (s.module_disabled.find(m.id) == s.module_disabled.end())
                         cfg.enabled_modules.push_back(m.id);
                 }
-                uint64_t id = active_scanner::enqueue_target(raw_bytes, url, cfg);
-                if (id == 0) {
-                    _snprintf_s(s.status_msg, sizeof(s.status_msg), _TRUNCATE,
-                                "Failed: %s", active_scanner::last_error().c_str());
-                } else {
-                    s.selected_audit_id = id;
-                    s.new_open = false;
-                    _snprintf_s(s.status_msg, sizeof(s.status_msg), _TRUNCATE,
-                                "Audit #%llu started.", static_cast<unsigned long long>(id));
-                }
+                submit_audit(std::move(raw_bytes), std::move(url), std::move(cfg));
             }
         }
+        ImGui::EndDisabled();
         ImGui::SameLine();
         if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             s.new_open = false;
@@ -459,10 +712,13 @@ bool initialize()
     auto& s = vs();
     bool expected = false;
     if (!s.initialized.compare_exchange_strong(expected, true)) return true;
-    issue_store::initialize();
-    passive_scanner::initialize();
-    active_scanner::initialize();
-    return true;
+    const bool issues_ready = issue_store::initialize();
+    const bool passive_ready = passive_scanner::initialize();
+    const bool active_ready = active_scanner::initialize();
+    const bool ready = issues_ready && passive_ready && active_ready;
+    if (!ready)
+        s.initialized.store(false, std::memory_order_release);
+    return ready;
 }
 
 void shutdown()
@@ -486,11 +742,77 @@ bool open_new_audit_with(const std::string& url, const std::string& raw_request)
     return true;
 }
 
+bool resolve_retained_artifact(std::uint64_t issue_id, std::uint64_t seen_ms,
+                               std::uint64_t evidence_index, bool response,
+                               std::vector<std::uint8_t>& bytes, std::string& reason)
+{
+    issue_t issue;
+    if (!issue_store::get(issue_id, issue) || issue.seen_ms != seen_ms) {
+        reason = "The Scanner issue changed or is no longer retained.";
+        return false;
+    }
+    if (evidence_index >= static_cast<std::uint64_t>(issue.evidence.size())) {
+        reason = "The reviewed Scanner evidence is no longer retained.";
+        return false;
+    }
+    const auto retained_index = static_cast<std::size_t>(evidence_index);
+    const auto& text = response ? issue.evidence[retained_index].response_raw
+                                : issue.evidence[retained_index].request_raw;
+    bytes.assign(text.begin(), text.end());
+    reason.clear();
+    return true;
+}
+
+bool resolve_retained_endpoint(std::uint64_t issue_id, std::uint64_t seen_ms,
+                               std::string& host, std::uint16_t& port, bool& use_tls,
+                               std::string& reason)
+{
+    issue_t issue;
+    if (!issue_store::get(issue_id, issue) || issue.seen_ms != seen_ms) {
+        reason = "The Scanner issue changed or is no longer retained.";
+        return false;
+    }
+    host = issue.host;
+    port = issue.port;
+    use_tls = issue.scheme == "https";
+    if (host.empty() || port == 0) {
+        reason = "The retained Scanner evidence has no canonical endpoint.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
     (void)accent_r; (void)accent_g; (void)accent_b;
-    if (!vs().initialized.load()) initialize();
+    if (!vs().initialized.load(std::memory_order_acquire) &&
+        !vs().initialization_attempted) {
+        vs().initialization_attempted = true;
+        submit_initialization();
+    }
+    const auto operation_completion = vs().operation.completion();
+    if (operation_completion &&
+        operation_completion->generation != vs().observed_operation_generation) {
+        vs().observed_operation_generation = operation_completion->generation;
+        if (vs().initialization_requested.exchange(false, std::memory_order_acq_rel))
+            vs().initialized.store(operation_completion->result.success,
+                std::memory_order_release);
+        if (operation_completion->result.success) {
+            const std::uint64_t audit_id = vs().started_audit_id.exchange(0,
+                std::memory_order_acq_rel);
+            if (audit_id != 0) {
+                vs().selected_audit_id = audit_id;
+                vs().new_open = false;
+            }
+            vs().issues_filter_signature.clear();
+            if (operation_completion->result.message.find("cleared") != std::string::npos)
+                vs().selected_issue_id = 0;
+        }
+        _snprintf_s(vs().status_msg, sizeof(vs().status_msg), _TRUNCATE,
+            "%s", operation_completion->result.message.c_str());
+    }
     const auto& th = aida::ui::resolved();
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
@@ -498,42 +820,61 @@ void render(float pos_x, float pos_y, float width, float height,
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Scanner");
+    if (!vs().initialized.load(std::memory_order_acquire) && operation_completion &&
+        !operation_completion->result.success && !vs().operation.pending()) {
+        ImGui::SameLine();
+        if (aida::ui::button("Retry initialization", aida::ui::button_kind_t::secondary,
+            aida::ui::size_t_::sm))
+            submit_initialization();
+    }
     ImGui::SameLine();
     if (aida::ui::button("New Audit", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
         vs().new_open = true;
     }
     ImGui::SameLine();
+    ImGui::BeginDisabled(vs().operation.pending() ||
+        !vs().initialized.load(std::memory_order_acquire));
     if (aida::ui::button("Export Issues", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-        issue_filter_t f;
-        auto doc = issue_store::export_json(f);
-        std::string path = issue_store::storage_path();
-        path += ".export.json";
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
+        const std::string path = issue_store::storage_path() + ".export.json";
         aida::preview::network::record_receipt("Scanner issue export", path);
-        _snprintf_s(vs().status_msg, sizeof(vs().status_msg), _TRUNCATE,
-                    "Prepared %zu issues at %s",
-                    doc.contains("count") ? doc["count"].get<size_t>() : 0, path.c_str());
-#else
-        FILE* fp = nullptr;
-        if (fopen_s(&fp, path.c_str(), "wb") == 0 && fp) {
-            std::string dump = doc.dump(2);
-            fwrite(dump.data(), 1, dump.size(), fp);
-            fclose(fp);
-            _snprintf_s(vs().status_msg, sizeof(vs().status_msg), _TRUNCATE,
-                        "Exported %zu issues to %s",
-                        doc.contains("count") ? doc["count"].get<size_t>() : 0, path.c_str());
-        }
 #endif
+        submit_issue_export();
     }
     ImGui::SameLine();
     if (aida::ui::button("Clear Issues", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-        issue_store::clear();
-        vs().selected_issue_id = 0;
+        const auto issues = std::atomic_load_explicit(&vs().issues, std::memory_order_acquire);
+        vs().reviewed_issue_identity.clear();
+        vs().reviewed_issue_identity.reserve(issues->size());
+        for (const auto& issue : *issues)
+            vs().reviewed_issue_identity.emplace_back(issue.id, issue.seen_ms);
+        ImGui::OpenPopup("Review Scanner issue clearing");
+    }
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopupModal("Review Scanner issue clearing", nullptr,
+        ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Permanently clear all Scanner issues?");
+        ImGui::Text("Affected issues: %zu", vs().reviewed_issue_identity.size());
+        ImGui::TextWrapped("The exact reviewed issue identities and timestamps will be revalidated before persistence.");
+        if (aida::ui::button("Clear issues", aida::ui::button_kind_t::destructive,
+            aida::ui::size_t_::sm)) {
+            submit_reviewed_issue_clear(vs().reviewed_issue_identity);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
+            aida::ui::size_t_::sm)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
     ImGui::SameLine();
-    bool passive = passive_scanner::is_enabled();
+    const bool passive_before = passive_scanner::is_enabled();
+    bool passive = passive_before;
+    ImGui::BeginDisabled(vs().operation.pending());
     aida::ui::toggle_switch("##bs_passive_en", &passive);
-    if (passive != passive_scanner::is_enabled()) passive_scanner::set_enabled(passive);
+    if (passive != passive_before) submit_passive_toggle(passive_before, passive);
+    ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                        "Passive");

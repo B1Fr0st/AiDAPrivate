@@ -87,6 +87,14 @@ struct workspace_path_snapshot_t {
 	bool truncated = false;
 };
 
+struct source_module_snapshot_t {
+	std::string module_name;
+	uint64_t base = 0;
+	uint64_t size = 0;
+	uint64_t load_generation = 0;
+	std::shared_ptr<const pdb_parser::source_line_table_t> source_lines;
+};
+
 class workspace_state_t {
 public:
 	explicit workspace_state_t(aida::analysis::binary_id_t binary_id)
@@ -384,6 +392,8 @@ private:
 	static constexpr size_t kMaximumStructs = 1024 * 1024;
 	static constexpr size_t kMaximumEnums = 1024 * 1024;
 	static constexpr size_t kMaximumMembers = 4 * 1024 * 1024;
+	static constexpr size_t kMaximumSourceLines = 4 * 1024 * 1024;
+	static constexpr size_t kMaximumSourceFiles = 1024 * 1024;
 	static constexpr size_t kMaximumUtf8Bytes = 512ULL * 1024ULL * 1024ULL;
 	static constexpr size_t kMaximumStringBytes = 64 * 1024;
 	static constexpr size_t kMaximumResolvedNameBytes = 128 * 1024;
@@ -393,6 +403,8 @@ private:
 		size_t structs = 0;
 		size_t enums = 0;
 		size_t members = 0;
+		size_t source_lines = 0;
+		size_t source_files = 0;
 		size_t utf8_bytes = 0;
 	};
 
@@ -455,6 +467,35 @@ private:
 		budget.symbols = module.pdb.symbols.size();
 		budget.structs = module.pdb.structs.size();
 		budget.enums = module.pdb.enums.size();
+		if (module.pdb.source_lines) {
+			const auto& source = *module.pdb.source_lines;
+			if (source.lines.size() > kMaximumSourceLines ||
+				source.files.size() > kMaximumSourceFiles ||
+				source.line_by_rva.size() > source.lines.size())
+				return false;
+			budget.source_lines = source.lines.size();
+			budget.source_files = source.files.size();
+			if (!add_string_budget(budget.utf8_bytes, source.detail)) return false;
+			for (const auto& file : source.files) {
+				if (!add_string_budget(budget.utf8_bytes, file.file_path) ||
+					!add_string_budget(budget.utf8_bytes, file.object_path))
+					return false;
+			}
+			for (const auto& line : source.lines) {
+				if (line.line == 0 || line.file_index >= source.files.size()) return false;
+			}
+			for (const auto& indexed : source.line_by_rva) {
+				if (indexed.second >= source.lines.size() ||
+					source.lines[indexed.second].rva != indexed.first)
+					return false;
+			}
+			for (const auto& indexed : source.lines_by_file_line) {
+				if (!add_string_budget(budget.utf8_bytes, indexed.first)) return false;
+				for (const auto line_index : indexed.second) {
+					if (line_index >= source.lines.size()) return false;
+				}
+			}
+		}
 		if (!add_string_budget(budget.utf8_bytes, module.module_name) ||
 			!add_string_budget(budget.utf8_bytes, module.status_text) ||
 			!add_string_budget(budget.utf8_bytes, module.pdb_path) ||
@@ -560,12 +601,16 @@ private:
 				value.structs > kMaximumStructs - total.structs ||
 				value.enums > kMaximumEnums - total.enums ||
 				value.members > kMaximumMembers - total.members ||
+				value.source_lines > kMaximumSourceLines - total.source_lines ||
+				value.source_files > kMaximumSourceFiles - total.source_files ||
 				value.utf8_bytes > kMaximumUtf8Bytes - total.utf8_bytes)
 				return false;
 			total.symbols += value.symbols;
 			total.structs += value.structs;
 			total.enums += value.enums;
 			total.members += value.members;
+			total.source_lines += value.source_lines;
+			total.source_files += value.source_files;
 			total.utf8_bytes += value.utf8_bytes;
 		}
 		return true;
@@ -583,6 +628,7 @@ private:
 
 inline state_t g_state;
 inline std::atomic<uint64_t> g_load_generation{1};
+inline std::atomic<uint64_t> g_source_line_generation{1};
 inline constexpr uint32_t k_explicit_pdb_load_timeout_ms = 120000;
 
 struct pdb_automation_context_t {
@@ -1293,6 +1339,7 @@ inline void load_pdb_for_module(const std::string& module_name, uint64_t base, u
 
 			if (ok) {
 				ms.pdb = std::move(info);
+				g_source_line_generation.fetch_add(1, std::memory_order_acq_rel);
 				ms.load_declined = false;
 				char buf[64];
 				snprintf(buf, sizeof(buf), "Loaded: %zu symbols, %zu types",
@@ -1563,6 +1610,7 @@ inline void load_pdb_with_hint(const std::string& module_name, uint64_t base, ui
 			if (parse_ok) {
 				ms.load_declined = false;
 				ms.pdb = std::move(info);
+				g_source_line_generation.fetch_add(1, std::memory_order_acq_rel);
 				char buf[96];
 				snprintf(buf, sizeof(buf), "Loaded: %zu symbols, %zu types",
 				         ms.pdb.symbols.size(), ms.pdb.structs.size());
@@ -1952,6 +2000,7 @@ inline void load_pdb_from_explicit_path(const std::string& module_name, uint64_t
 				ms.load_phase.clear();
 				if (parse_completed) {
 					ms.pdb = std::move(info);
+					g_source_line_generation.fetch_add(1, std::memory_order_acq_rel);
 					ms.parse_completed = ms.pdb.loaded;
 					ms.failed = false;
 					ms.load_declined = false;
@@ -2432,6 +2481,30 @@ inline std::vector<std::string> list_loaded_modules()
 	return out;
 }
 
+inline bool source_modules_snapshot(std::vector<source_module_snapshot_t>& output,
+	std::string& error, size_t maximum_modules = 4096)
+{
+	output.clear();
+	error.clear();
+	if (maximum_modules == 0 || maximum_modules > 4096) {
+		error = "Source-module snapshot bound is invalid";
+		return false;
+	}
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (g_state.modules.size() > maximum_modules) {
+		error = "Loaded source modules exceed the 4,096-module snapshot bound";
+		return false;
+	}
+	output.reserve(g_state.modules.size());
+	for (const auto& item : g_state.modules) {
+		const auto& module = item.second;
+		if (!module.pdb.loaded) continue;
+		output.push_back({module.module_name, module.base, module.size,
+			module.load_generation, module.pdb.source_lines});
+	}
+	return true;
+}
+
 inline const module_symbols_t* get_module(const std::string& name)
 {
 	std::lock_guard<std::mutex> lk(g_state.mutex);
@@ -2452,6 +2525,7 @@ inline void clear_all()
 				unloaded_names.push_back(kv.first);
 		}
 		g_state.modules.clear();
+		g_source_line_generation.fetch_add(1, std::memory_order_acq_rel);
 	}
 
 	for (auto& name : unloaded_names) {

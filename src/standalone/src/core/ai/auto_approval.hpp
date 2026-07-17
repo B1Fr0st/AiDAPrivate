@@ -322,6 +322,7 @@ inline tool_category_t categorize_tool(const std::string& tool_name)
         "net_udp_session_reassemble",
         "net_replay_mutate",
         "opaque_predicate_patch",
+        "driver_write_kernel_memory",
         "drv_hook_manage",
         "drv_send_ioctl",
         "smc_manage",
@@ -337,6 +338,9 @@ inline tool_category_t categorize_tool(const std::string& tool_name)
         name == "get_file_info" || name == "grep_in_files" ||
         name == "codebase_search" || name == "web_search" ||
         name == "read_memory" || name == "read_memory_string" ||
+        name == "read_struct" || name == "read_u8" || name == "read_u16" ||
+        name == "read_u32" || name == "read_u64" || name == "read_bytes" ||
+        name == "driver_read_kernel_memory" || name == "search_kernel_memory" ||
         name == "disassemble_zydis" || name == "disassemble_file" ||
         name == "get_imports" || name == "get_exports" ||
         name == "get_sections" || name == "get_pe_header" ||

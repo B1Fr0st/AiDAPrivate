@@ -17,7 +17,10 @@ enum class kind_t : std::uint8_t {
 	module,
 	trace_record,
 	handle,
-	patch
+	patch,
+	watch,
+	string_value,
+	bookmark
 };
 
 enum class capability_t : std::uint8_t {
@@ -62,6 +65,8 @@ struct capability_result_t {
 };
 
 void synchronize_target(std::uint32_t target_pid, bool stopped);
+void synchronize_target_snapshot(std::uint32_t target_pid, bool stopped,
+	std::uint64_t stop_address, std::uint32_t stop_thread);
 std::uint64_t current_stop_generation();
 void advance_stop_generation();
 context_t capture(kind_t kind, std::uint64_t address = 0,

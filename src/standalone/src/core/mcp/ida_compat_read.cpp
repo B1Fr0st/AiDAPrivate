@@ -2210,6 +2210,8 @@ namespace mcp_standalone::ida_compat
     }
 
     tool_result_t tool_read_struct(const json& params, const workspace_request_context_t& ctx) {
+        if (params.contains("fields"))
+            return mcp_standalone::read_live_struct(params);
         ws_state ws(ctx);
         std::string struct_name = params.value("struct_name", "");
         if (struct_name.empty()) return adapter_error(ctx, "struct_name required", "MISSING_PARAM");

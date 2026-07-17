@@ -127,6 +127,7 @@ size_t session_count();
 const analysis_session_t* session_at(size_t idx);
 std::shared_ptr<const analysis_session_t> session_handle_at(size_t idx);
 std::shared_ptr<aida::analysis::analysis_workspace_t> active_workspace();
+bool try_active_workspace(std::shared_ptr<aida::analysis::analysis_workspace_t>& output);
 std::shared_ptr<aida::analysis::analysis_workspace_t> workspace_for_session(size_t idx);
 std::shared_ptr<aida::analysis::analysis_workspace_t>
 workspace_for_session_id(const std::string& session_id);

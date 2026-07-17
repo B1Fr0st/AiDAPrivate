@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -17,6 +16,7 @@
 #include "imgui/imgui.h"
 
 #include "agent_registry.hpp"
+#include "agent_manager_service.hpp"
 #include "event_bus.hpp"
 #include "provider_catalog.hpp"
 #include "toast_notification.hpp"
@@ -32,6 +32,8 @@
 #include "../ui/theme.hpp"
 #include "../ui/transition.hpp"
 #include "../ui/responsive.hpp"
+#include "../ui/design_system.hpp"
+#include "../ui/application_ui_runtime.hpp"
 #include "../helpers/globals.h"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
@@ -62,7 +64,6 @@ namespace agent_manager {
 
 		struct manager_state_t
 		{
-			std::mutex                          mtx;
 			std::string                         err;
 			std::string                         selected_name;
 			bool                                initialized = false;
@@ -94,6 +95,11 @@ namespace agent_manager {
 			std::unordered_map<std::string, row_anim_t> row_anims;
 			aida::ui::flash_t                   dirty_flash;
 			bool                                last_dirty_state = false;
+			std::uint64_t                       observed_service_generation = 0;
+			std::string                         pending_selection;
+			std::string                         pending_delete_identity;
+			std::uint64_t                       pending_delete_catalog_generation = 0;
+			bool                                delete_dialog_requested = false;
 
 			bool                                section_perm_open = true;
 			bool                                section_prompt_open = true;
@@ -190,7 +196,9 @@ namespace agent_manager {
 			st.preserved_options = nlohmann::json::object();
 
 			if (st.selected_name.empty()) return;
-			const aida::agent::agent_info_t* info = aida::agent::get(st.selected_name);
+			const auto publication = aida::agent_manager_service::snapshot();
+			const aida::agent::agent_info_t* info =
+				aida::agent_manager_service::find(publication, st.selected_name);
 			if (info == nullptr) return;
 			st.preserved_options = info->options;
 
@@ -328,11 +336,9 @@ namespace agent_manager {
 	inline void initialize()
 	{
 		auto& st = detail::state();
-		std::lock_guard<std::mutex> lk(st.mtx);
 		if (st.initialized) return;
 		st.initialized = true;
-
-		aida::agent::load_custom_from_disk();
+		aida::agent_manager_service::begin_frame();
 
 		st.selected_name = aida::agent::active_agent_name();
 		if (st.selected_name.empty()) st.selected_name = aida::agent::default_agent_name();
@@ -353,7 +359,6 @@ namespace agent_manager {
 	inline void shutdown()
 	{
 		auto& st = detail::state();
-		std::lock_guard<std::mutex> lk(st.mtx);
 		if (st.sub_changed.valid()) {
 			aida::events::unsubscribe(st.sub_changed);
 			st.sub_changed = aida::events::subscription_handle_t{};
@@ -369,8 +374,39 @@ namespace agent_manager {
 	inline void render(float panel_w, float panel_h)
 	{
 		auto& st = detail::state();
+		aida::agent_manager_service::begin_frame();
+		const auto service = aida::agent_manager_service::snapshot();
 		const auto& th = aida::ui::resolved();
 		const float dt = aida::ui::clock::dt();
+		if (service && service->generation != st.observed_service_generation) {
+			st.observed_service_generation = service->generation;
+			if (service->state == aida::agent_manager_service::operation_state_t::succeeded) {
+				const bool selection_applied = !st.pending_selection.empty();
+				bool selection_invalidated = false;
+				if (!st.pending_selection.empty() &&
+					aida::agent_manager_service::find(service, st.pending_selection))
+					st.selected_name = st.pending_selection;
+				st.pending_selection.clear();
+				if (!aida::agent_manager_service::find(service, st.selected_name)) {
+					selection_invalidated = true;
+					st.selected_name = aida::agent::default_agent_name();
+					if (!aida::agent_manager_service::find(service, st.selected_name) &&
+						!service->agents.empty()) st.selected_name = service->agents.front().name;
+				}
+				st.err.clear();
+				if (!st.dirty || selection_applied || selection_invalidated)
+					detail::load_buffers_for_selected_locked();
+				if (!service->operation.empty())
+					toast_notification::push(service->detail,
+						toast_notification::toast_type_t::info, 3.5f);
+			} else if (service->state ==
+				aida::agent_manager_service::operation_state_t::failed) {
+				st.pending_selection.clear();
+				st.err = service->detail;
+				toast_notification::push(service->detail,
+					toast_notification::toast_type_t::error, 5.f);
+			}
+		}
 
 		float content_h = panel_h > 0.f ? panel_h : ImGui::GetContentRegionAvail().y;
 
@@ -393,6 +429,22 @@ namespace agent_manager {
 			panel_w < 520.f
 				? "Configure reverse-engineering agent roles."
 				: "Inspect built-in agents or configure custom reverse-engineering roles.");
+		if (service && service->state == aida::agent_manager_service::operation_state_t::loading)
+			root_dl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(root_pos.x + 12.f, root_pos.y + 43.f), th.info,
+				service->operation.c_str());
+		else if (!st.err.empty())
+			root_dl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(root_pos.x + 12.f, root_pos.y + 43.f), th.error,
+				st.err.c_str());
+		ImGui::SetCursorScreenPos(ImVec2(root_pos.x + panel_w - 96.f, root_pos.y + 8.f));
+		if (aida::ui::button("Reload", aida::ui::button_kind_t::ghost,
+			aida::ui::size_t_::sm, ImVec2(82.f, 28.f), service &&
+			service->state == aida::agent_manager_service::operation_state_t::loading)) {
+			std::string error;
+			if (!aida::agent_manager_service::request_reload(&error))
+				toast_notification::push(error, toast_notification::toast_type_t::error, 5.f);
+		}
 
 		const float gm_gap = 12.f;
 		const float gm_pad = 12.f;
@@ -444,7 +496,6 @@ namespace agent_manager {
 			std::memcpy(filter_local, st.left_filter, sizeof(filter_local));
 			if (aida::ui::input_text("##agent_filter", filter_local, sizeof(filter_local),
 					"Filter agents...", false, ImVec2((std::max)(120.f, ImGui::GetContentRegionAvail().x), 32.f))) {
-				std::lock_guard<std::mutex> lk(st.mtx);
 				std::memcpy(st.left_filter, filter_local, sizeof(st.left_filter));
 			}
 		}
@@ -457,7 +508,8 @@ namespace agent_manager {
 			filter_lower.push_back(c);
 		}
 
-		const auto& all = aida::agent::list();
+		const std::vector<aida::agent::agent_info_t> empty_agents;
+		const auto& all = service ? service->agents : empty_agents;
 		ImDrawList* ldl = ImGui::GetWindowDrawList();
 
 		for (const auto& a : all) {
@@ -471,7 +523,6 @@ namespace agent_manager {
 
 			detail::row_anim_t* ra = nullptr;
 			{
-				std::lock_guard<std::mutex> lk(st.mtx);
 				ra = &st.row_anims[a.name];
 			}
 
@@ -486,9 +537,13 @@ namespace agent_manager {
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked();
 			bool right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-			bool keyboard_context = selected_now && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-				(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-				 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+			const bool menu_key_context = selected_now &&
+				ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+				ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+			const bool shift_f10_context = !menu_key_context && selected_now &&
+				ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+				ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+			const bool keyboard_context = menu_key_context || shift_f10_context;
 
 			float hov_v = ra->hover.tick(hov, dt, aida::motion::spring::playful);
 			float lift = hov_v * 2.f;
@@ -542,33 +597,72 @@ namespace agent_manager {
 				detail::load_buffers_for_selected_locked();
 			}
 			if (right || keyboard_context)
-				ImGui::OpenPopup("##agent_row_context");
-			if (ImGui::BeginPopup("##agent_row_context")) {
-				if (ImGui::MenuItem("Set as Active Agent", nullptr,
-						aida::agent::active_agent_name() == a.name))
-					aida::agent::set_active_agent(a.name);
-				if (ImGui::MenuItem("Copy Agent Name"))
-					ImGui::SetClipboardText(a.name.c_str());
-				if (ImGui::MenuItem("Copy Description", nullptr, false, !a.description.empty()))
-					ImGui::SetClipboardText(a.description.c_str());
-				ImGui::Separator();
-				if (ImGui::MenuItem("Duplicate as Custom")) {
-					aida::agent::agent_info_t copy = a;
-					copy.name += "-custom";
-					copy.native = false;
-					if (aida::agent::register_custom(copy)) {
-						aida::agent::save_custom_to_disk();
-						st.selected_name = copy.name;
-						detail::load_buffers_for_selected_locked();
+			{
+				aida::ui::application_ui::retained_entity_context_t context;
+				context.owner_id = "ai.agent.catalog";
+				context.entity_id = a.name;
+				context.entity_generation = service ? service->catalog_generation : 0;
+				context.active_view = aida::ui::stable_view_id_t("view.ai.agents");
+				const auto retained_name = a.name;
+				const auto retained_description = a.description;
+				const auto retained_generation = service ? service->catalog_generation : 0;
+				context.validate_identity = [retained_name, retained_description,
+						retained_generation] {
+					const auto live = aida::agent_manager_service::snapshot();
+					const auto* current = aida::agent_manager_service::find(live, retained_name);
+					return live && live->catalog_generation == retained_generation && current &&
+							current->description == retained_description
+						? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable(
+							"The agent catalog changed; select the agent again");
+				};
+				const auto add = [&context](const char* id, bool enabled,
+						const char* reason,
+						std::function<aida::ui::action_handler_result_t()> invoke) {
+					aida::ui::application_ui::retained_entity_action_t action;
+					action.action_id = id;
+					action.capability = enabled
+						? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable(reason);
+					action.invoke = std::move(invoke);
+					context.actions.push_back(std::move(action));
+				};
+				add("ai.agent.set_active", true, "", [retained_name] {
+					aida::agent::set_active_agent(retained_name);
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.agent.copy_name", true, "", [retained_name] {
+					ImGui::SetClipboardText(retained_name.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.agent.copy_description", !retained_description.empty(),
+					"This agent has no description", [retained_description] {
+					ImGui::SetClipboardText(retained_description.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.agent.duplicate", service != nullptr, "The agent catalog is unavailable",
+					[retained_name, retained_generation] {
+					const std::string new_identity = retained_name + "-custom";
+					std::string error;
+					if (aida::agent_manager_service::request_duplicate(retained_name,
+						new_identity, retained_generation, &error)) {
+						detail::state().pending_selection = new_identity;
+						return aida::ui::action_handler_result_t::completed();
 					}
-				}
-				ImGui::BeginDisabled();
-				ImGui::MenuItem("Delete...");
-				ImGui::EndDisabled();
-				if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-					ImGui::SetTooltip("Select the custom agent and use its visible destructive action after reviewing the target; native agents cannot be deleted");
-				ImGui::EndPopup();
+					return aida::ui::action_handler_result_t::failed(error.empty()
+						? "Duplicate request was rejected" : error);
+				});
+				add("ai.agent.delete_review", false,
+					"Select the custom agent and use its visible destructive action after reviewing the target; native agents cannot be deleted", {});
+				aida::ui::application_ui::open_retained_entity_context_menu(
+					std::move(context), right
+						? aida::ui::context_menu_open_origin_t::pointer
+						: menu_key_context
+						? aida::ui::context_menu_open_origin_t::menu_key
+						: aida::ui::context_menu_open_origin_t::shift_f10);
 			}
+			aida::ui::application_ui::render_retained_entity_context_menu(
+				"ai.agent.catalog");
 			ImGui::PopID();
 
 			ImGui::SetCursorScreenPos(ImVec2(row_pos.x, row_pos.y + row_h));
@@ -583,9 +677,12 @@ namespace agent_manager {
 			ImVec2(right_w, gm_right_h), true,
 			ImGuiWindowFlags_NoSavedSettings);
 
-		const aida::agent::agent_info_t* selected_info = aida::agent::get(st.selected_name);
+		const aida::agent::agent_info_t* selected_info =
+			aida::agent_manager_service::find(service, st.selected_name);
 		bool is_native = selected_info != nullptr && selected_info->native;
 		bool empty_selection = selected_info == nullptr;
+		const bool operation_pending = service && service->state ==
+			aida::agent_manager_service::operation_state_t::loading;
 
 		if (empty_selection) {
 			ImVec2 region_pos = ImGui::GetCursorScreenPos();
@@ -1025,20 +1122,18 @@ namespace agent_manager {
 				if (aida::ui::button("Duplicate as custom",
 						aida::ui::button_kind_t::primary,
 						aida::ui::size_t_::md,
-						ImVec2((std::min)(180.f, footer_avail), 32.f))) {
+						ImVec2((std::min)(180.f, footer_avail), 32.f), operation_pending)) {
 					aida::agent::agent_info_t copy = detail::build_info_from_buffers_locked(false);
 					copy.name = st.selected_name + "-custom";
 					copy.native = false;
-					if (aida::agent::register_custom(copy)) {
-						aida::agent::save_custom_to_disk();
-						st.selected_name = copy.name;
-						detail::load_buffers_for_selected_locked();
-						toast_notification::push("Custom agent created: " + copy.name,
-							toast_notification::toast_type_t::info, 3.5f);
-					} else {
-						toast_notification::push("Duplicate failed: " + aida::agent::last_error(),
+					std::string error;
+					if (service && aida::agent_manager_service::request_upsert(copy, {},
+						service->catalog_generation, &error))
+						st.pending_selection = copy.name;
+					else
+						toast_notification::push(error.empty()
+							? "Duplicate request was rejected" : error,
 							toast_notification::toast_type_t::error, 5.f);
-					}
 				}
 			} else {
 				const float footer_avail = (std::max)(160.f, ImGui::GetContentRegionAvail().x);
@@ -1047,27 +1142,22 @@ namespace agent_manager {
 				if (aida::ui::button("Save",
 						aida::ui::button_kind_t::primary,
 						aida::ui::size_t_::md,
-						ImVec2(footer_btn_w, 32.f))) {
+						ImVec2(footer_btn_w, 32.f), operation_pending)) {
 					std::string trimmed_name(st.edit_name);
 					if (trimmed_name.empty()) {
 						toast_notification::push("Agent name cannot be empty",
 							toast_notification::toast_type_t::error, 4.f);
 					} else {
 						aida::agent::agent_info_t info = detail::build_info_from_buffers_locked(false);
-						bool need_unregister = (info.name != st.selected_name);
-						if (aida::agent::register_custom(info)) {
-							if (need_unregister && !st.selected_name.empty())
-								aida::agent::unregister_custom(st.selected_name);
-							aida::agent::save_custom_to_disk();
-							st.selected_name = info.name;
+						std::string error;
+						if (service && aida::agent_manager_service::request_upsert(info,
+							st.selected_name, service->catalog_generation, &error)) {
+							st.pending_selection = info.name;
 							st.dirty = false;
-							toast_notification::push("Saved agent: " + info.name,
-								toast_notification::toast_type_t::info, 3.5f);
-							detail::load_buffers_for_selected_locked();
-						} else {
-							toast_notification::push("Save failed: " + aida::agent::last_error(),
+						} else
+							toast_notification::push(error.empty()
+								? "Save request was rejected" : error,
 								toast_notification::toast_type_t::error, 5.f);
-						}
 					}
 				}
 				if (!footer_stack)
@@ -1085,23 +1175,59 @@ namespace agent_manager {
 				if (aida::ui::button("Delete",
 						aida::ui::button_kind_t::destructive,
 						aida::ui::size_t_::md,
-						ImVec2(footer_btn_w, 32.f))) {
-					if (aida::agent::unregister_custom(st.selected_name)) {
-						aida::agent::save_custom_to_disk();
-						toast_notification::push("Deleted: " + st.selected_name,
-							toast_notification::toast_type_t::info, 3.f);
-						st.selected_name = aida::agent::default_agent_name();
-						detail::load_buffers_for_selected_locked();
-					} else {
-						toast_notification::push("Delete failed: " + aida::agent::last_error(),
-							toast_notification::toast_type_t::error, 5.f);
-					}
+						ImVec2(footer_btn_w, 32.f), operation_pending)) {
+					st.pending_delete_identity = st.selected_name;
+					st.pending_delete_catalog_generation = service
+						? service->catalog_generation : 0;
+					st.delete_dialog_requested = true;
 				}
 			}
 		}
 
 		ImGui::EndChild();
 		ImGui::PopStyleColor(2);
+		if (st.delete_dialog_requested) {
+			aida::ui::design::open_dialog("agents.custom.delete", "Delete Custom Agent");
+			st.delete_dialog_requested = false;
+		}
+		if (aida::ui::design::begin_dialog("agents.custom.delete", "Delete Custom Agent",
+			ImVec2(520.f, 270.f), ImVec2(360.f, 230.f))) {
+			const auto* reviewed = aida::agent_manager_service::find(service,
+				st.pending_delete_identity);
+			const bool current = reviewed && !reviewed->native && service &&
+				service->catalog_generation == st.pending_delete_catalog_generation;
+			aida::ui::design::confirmation_t confirmation;
+			confirmation.verb = "Delete";
+			confirmation.target = st.pending_delete_identity.empty()
+				? "the selected custom agent" : st.pending_delete_identity.c_str();
+			confirmation.scope = "The exact custom agent definition and its persisted catalog entry";
+			confirmation.effect = "Removes this custom role from AiDA without changing native agents.";
+			confirmation.reversibility = "Recreate or reimport the custom definition to recover it.";
+			confirmation.prerequisite = current ? nullptr :
+				"The catalog or selected identity changed; close and review the deletion again.";
+			confirmation.confirm_label = "Delete Agent";
+			confirmation.destructive = true;
+			confirmation.confirm_enabled = current;
+			const auto result = aida::ui::design::confirmation_dialog(
+				"agents.custom.delete.confirmation", confirmation);
+			if (result.confirmed && current) {
+				std::string error;
+				if (aida::agent_manager_service::request_delete(
+					st.pending_delete_identity, st.pending_delete_catalog_generation, &error)) {
+					st.pending_selection = aida::agent::default_agent_name();
+					st.pending_delete_identity.clear();
+					ImGui::CloseCurrentPopup();
+				} else {
+					toast_notification::push(error.empty()
+						? "Delete request was rejected" : error,
+						toast_notification::toast_type_t::error, 5.f);
+				}
+			} else if (result.cancelled) {
+				st.pending_delete_identity.clear();
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::EndPopup();
+		}
 
 		ImGui::EndChild();
 		ImGui::PopID();

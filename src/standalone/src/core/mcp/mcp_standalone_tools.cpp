@@ -60,7 +60,7 @@ namespace
         return buf;
     }
 
-    bool parse_addr(const std::string& text, uint64_t& out)
+    bool parse_addr_literal(const std::string& text, uint64_t& out)
     {
         try {
             if (text.size() > 2 && text[0] == '0' && (text[1] == 'b' || text[1] == 'B')) {
@@ -68,6 +68,8 @@ namespace
                 for (size_t i = 2; i < text.size(); ++i) {
                     const char c = text[i];
                     if (c != '0' && c != '1')
+                        return false;
+                    if (value > (std::numeric_limits<uint64_t>::max() >> 1))
                         return false;
                     value = (value << 1) | static_cast<uint64_t>(c == '1');
                 }
@@ -82,12 +84,90 @@ namespace
         }
     }
 
+    bool parse_addr(const std::string& text, uint64_t& out)
+    {
+        if (text.empty() || text.size() > 4096)
+            return false;
+        size_t pos = 0;
+        auto skip_space = [&]() {
+            while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])))
+                ++pos;
+        };
+
+        skip_space();
+        if (pos == text.size())
+            return false;
+
+        uint64_t result = 0;
+        bool first = true;
+        char operation = '+';
+        while (pos < text.size()) {
+            if (!first) {
+                skip_space();
+                if (pos == text.size() || (text[pos] != '+' && text[pos] != '-'))
+                    return false;
+                operation = text[pos++];
+                skip_space();
+                if (pos == text.size())
+                    return false;
+            }
+
+            const size_t begin = pos;
+            while (pos < text.size() && text[pos] != '+' && text[pos] != '-')
+                ++pos;
+            size_t end = pos;
+            while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])))
+                --end;
+            if (end == begin)
+                return false;
+
+            uint64_t term = 0;
+            if (!parse_addr_literal(text.substr(begin, end - begin), term))
+                return false;
+            if (first) {
+                result = term;
+                first = false;
+                continue;
+            }
+            if (operation == '+') {
+                if (term > std::numeric_limits<uint64_t>::max() - result)
+                    return false;
+                result += term;
+            } else {
+                if (term > result)
+                    return false;
+                result -= term;
+            }
+        }
+
+        out = result;
+        return !first;
+    }
+
+    bool parse_json_address(const json& value, uint64_t& out)
+    {
+        if (value.is_string())
+            return parse_addr(value.get<std::string>(), out);
+        if (value.is_number_unsigned()) {
+            out = value.get<uint64_t>();
+            return true;
+        }
+        if (value.is_number_integer()) {
+            const int64_t signed_value = value.get<int64_t>();
+            if (signed_value < 0)
+                return false;
+            out = static_cast<uint64_t>(signed_value);
+            return true;
+        }
+        return false;
+    }
+
     std::optional<uint64_t> parse_addr_opt(const json& params, const char* key)
     {
-        if (!params.contains(key) || !params[key].is_string())
+        if (!params.contains(key))
             return std::nullopt;
         uint64_t value = 0;
-        if (!parse_addr(params[key].get<std::string>(), value))
+        if (!parse_json_address(params[key], value))
             return std::nullopt;
         return value;
     }
@@ -863,24 +943,74 @@ tool_result_t ensure_attached()
         return tool_result_t::ok("");
     }
 
-    size_t typed_read_size(const std::string& value_type, size_t requested)
+    constexpr size_t k_max_memory_read_size = 1024 * 1024;
+    constexpr size_t k_max_memory_batch_count = 256;
+    constexpr size_t k_max_memory_batch_bytes = 16 * 1024 * 1024;
+    constexpr size_t k_max_memory_field_count = 256;
+
+    std::optional<size_t> fixed_typed_size(const std::string& value_type)
     {
         const std::string type = to_lower(value_type);
-        if (requested != 0)
-            return requested;
         if (type == "byte" || type == "uint8" || type == "int8")
             return 1;
         if (type == "int16" || type == "uint16")
             return 2;
-        if (type == "int64" || type == "uint64")
-            return 8;
         if (type == "float" || type == "int32" || type == "uint32" || type == "int" || type == "integer")
             return 4;
-        if (type == "double")
+        if (type == "double" || type == "int64" || type == "uint64" || type == "pointer" || type == "ptr" || type == "address")
             return 8;
-        if (type == "ascii" || type == "string" || type == "str" || type == "utf16" || type == "wstring")
-            return 256;
-        return 4;
+        return std::nullopt;
+    }
+
+    bool is_variable_typed_value(const std::string& value_type)
+    {
+        const std::string type = to_lower(value_type);
+        return type == "ascii" || type == "string" || type == "str" ||
+            type == "utf16" || type == "wstring" || type == "bytes" || type == "hex";
+    }
+
+    bool resolve_typed_read_size(const std::string& value_type, size_t requested, bool explicit_variable_size,
+                                 size_t& out, std::string& err)
+    {
+        if (const auto fixed = fixed_typed_size(value_type)) {
+            out = requested == 0 ? *fixed : requested;
+        } else if (is_variable_typed_value(value_type)) {
+            if (requested == 0 && explicit_variable_size) {
+                err = "Variable-width field type '" + value_type + "' requires an explicit positive size.";
+                return false;
+            }
+            out = requested == 0 ? 256 : requested;
+        } else {
+            err = "Unsupported value_type '" + value_type + "'.";
+            return false;
+        }
+        if (out == 0 || out > k_max_memory_read_size) {
+            err = "Memory read size must be between 1 and 1048576 bytes.";
+            return false;
+        }
+        return true;
+    }
+
+    bool parse_memory_size(const json& value, size_t& out)
+    {
+        uint64_t parsed = 0;
+        if (value.is_number_unsigned())
+            parsed = value.get<uint64_t>();
+        else if (value.is_number_integer()) {
+            const int64_t signed_value = value.get<int64_t>();
+            if (signed_value <= 0)
+                return false;
+            parsed = static_cast<uint64_t>(signed_value);
+        } else if (value.is_string()) {
+            if (!parse_addr(value.get<std::string>(), parsed))
+                return false;
+        } else {
+            return false;
+        }
+        if (parsed == 0 || parsed > k_max_memory_read_size)
+            return false;
+        out = static_cast<size_t>(parsed);
+        return true;
     }
 
     template <typename T>
@@ -937,6 +1067,15 @@ tool_result_t ensure_attached()
             }
             return out;
         }
+        if (type == "pointer" || type == "ptr" || type == "address") {
+            uint64_t v = 0;
+            if (read_le_value(bytes, v)) {
+                out["value"] = v;
+                out["hex_value"] = hex_addr(v);
+            }
+            out["normalized_type"] = "pointer";
+            return out;
+        }
         if (type == "float") {
             float v = 0.0f;
             if (read_le_value(bytes, v)) out["value"] = v;
@@ -969,6 +1108,18 @@ tool_result_t ensure_attached()
             out["encoding"] = "utf16le_ascii_preview";
             return out;
         }
+        if (type == "bytes" || type == "hex") {
+            std::string hex;
+            hex.reserve(bytes.size() * 2);
+            for (uint8_t b : bytes) {
+                char chunk[3];
+                snprintf(chunk, sizeof(chunk), "%02X", b);
+                hex += chunk;
+            }
+            out["value"] = hex;
+            out["encoding"] = "hex";
+            return out;
+        }
         int32_t v = 0;
         if (read_le_value(bytes, v))
             out["value"] = v;
@@ -976,41 +1127,300 @@ tool_result_t ensure_attached()
         return out;
     }
 
-    tool_result_t handle_read_memory(const json& params)
+    struct memory_field_t
     {
-        diag::log_tagged_fmt("mcp_tools", "handle_read_memory entry");
-        if (wants_vm_target(params))
-            return handle_vm_bridge_read_memory(params);
-        auto chk = ensure_attached();
-        if (!chk.success)
-            return chk;
+        std::string name;
+        std::string type;
+        size_t offset = 0;
+        size_t size = 0;
+    };
 
-        const auto address = parse_addr_opt(params, "address");
-        if (!address)
-            return error("Missing or invalid address.");
-
-        {
-            self_guard::self_guard_context_t sg_ctx;
-            sg_ctx.tool_name = "read_memory";
-            sg_ctx.has_pid = true;
-            sg_ctx.target_pid = driver_bridge::attached_pid();
-            sg_ctx.has_address = true;
-            sg_ctx.target_address = *address;
-            auto guard_result = self_guard::invoke_self_guard(sg_ctx);
-            if (guard_result != self_guard::self_guard_result_t::allow)
-                self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+    bool parse_memory_fields(const json& value, std::vector<memory_field_t>& fields, size_t& span, std::string& err)
+    {
+        fields.clear();
+        span = 0;
+        if (!value.is_array() || value.empty()) {
+            err = "fields must be a non-empty array.";
+            return false;
+        }
+        if (value.size() > k_max_memory_field_count) {
+            err = "fields is limited to 256 entries.";
+            return false;
         }
 
-        const std::string value_type = params.value("value_type", std::string());
-        size_t requested_size = static_cast<size_t>(params.value("size", 0));
-        const auto size = value_type.empty() ? (requested_size == 0 ? 256 : requested_size) : typed_read_size(value_type, requested_size);
-        std::vector<uint8_t> bytes;
-        if (!driver_bridge::read_memory(*address, size, bytes))
-            return error("Memory read failed. Ensure the kernel driver is loaded and attached.");
+        std::unordered_set<std::string> names;
+        fields.reserve(value.size());
+        for (size_t index = 0; index < value.size(); ++index) {
+            const auto& item = value[index];
+            if (!item.is_object()) {
+                err = "fields[" + std::to_string(index) + "] must be an object.";
+                return false;
+            }
+            if (!item.contains("name") || !item["name"].is_string() || item["name"].get<std::string>().empty() ||
+                item["name"].get_ref<const std::string&>().size() > 256) {
+                err = "fields[" + std::to_string(index) + "].name must contain 1 to 256 characters.";
+                return false;
+            }
+            if (!item.contains("type") || !item["type"].is_string() || item["type"].get<std::string>().empty() ||
+                item["type"].get_ref<const std::string&>().size() > 64) {
+                err = "fields[" + std::to_string(index) + "].type must contain 1 to 64 characters.";
+                return false;
+            }
+            memory_field_t field;
+            field.name = item["name"].get<std::string>();
+            field.type = item["type"].get<std::string>();
+            if (!names.insert(field.name).second) {
+                err = "Duplicate field name '" + field.name + "'.";
+                return false;
+            }
+            if (!item.contains("offset")) {
+                err = "fields[" + std::to_string(index) + "].offset is required.";
+                return false;
+            }
+            uint64_t offset = 0;
+            if (!parse_json_address(item["offset"], offset) || offset > k_max_memory_read_size) {
+                err = "fields[" + std::to_string(index) + "].offset is invalid or out of range.";
+                return false;
+            }
+            field.offset = static_cast<size_t>(offset);
+            size_t requested_size = 0;
+            if (item.contains("size") && !parse_memory_size(item["size"], requested_size)) {
+                err = "fields[" + std::to_string(index) + "].size must be between 1 and 1048576 bytes.";
+                return false;
+            }
+            if (const auto fixed = fixed_typed_size(field.type); fixed && requested_size != 0 && requested_size != *fixed) {
+                err = "fields[" + std::to_string(index) + "].size must match the fixed width of type '" + field.type + "'.";
+                return false;
+            }
+            if (!resolve_typed_read_size(field.type, requested_size, true, field.size, err)) {
+                err = "fields[" + std::to_string(index) + "]: " + err;
+                return false;
+            }
+            const std::string normalized_type = to_lower(field.type);
+            if ((normalized_type == "utf16" || normalized_type == "wstring") && (field.size % 2) != 0) {
+                err = "fields[" + std::to_string(index) + "].size must be even for UTF-16 data.";
+                return false;
+            }
+            if (field.offset > k_max_memory_read_size - field.size) {
+                err = "fields[" + std::to_string(index) + "] exceeds the 1048576-byte read limit.";
+                return false;
+            }
+            span = std::max(span, field.offset + field.size);
+            fields.push_back(std::move(field));
+        }
+        return true;
+    }
 
+    bool decode_memory_fields(const std::vector<uint8_t>& bytes, uint64_t base,
+                              const std::vector<memory_field_t>& fields, json& items, json& view,
+                              std::string& err)
+    {
+        items = json::array();
+        view = json::object();
+        for (const auto& field : fields) {
+            if (field.offset > bytes.size() || field.size > bytes.size() - field.offset) {
+                err = "Memory read returned too few bytes to decode field '" + field.name + "'.";
+                return false;
+            }
+            std::vector<uint8_t> field_bytes(bytes.begin() + field.offset, bytes.begin() + field.offset + field.size);
+            json decoded = decode_typed_memory_value(field_bytes, field.type);
+            json item = decoded;
+            item["name"] = field.name;
+            item["offset"] = field.offset;
+            item["address"] = hex_addr(base + field.offset);
+            item["size"] = field.size;
+            items.push_back(std::move(item));
+            view[field.name] = std::move(decoded);
+        }
+        return true;
+    }
+
+    struct memory_read_request_t
+    {
+        uint64_t address = 0;
+        size_t size = 0;
+        std::string value_type;
+        std::vector<memory_field_t> fields;
+    };
+
+    bool parse_single_memory_read_request(const json& params, memory_read_request_t& request, std::string& err)
+    {
+        if (!params.contains("address") || !parse_json_address(params["address"], request.address)) {
+            err = "Missing or invalid address expression.";
+            return false;
+        }
+        size_t requested_size = 0;
+        if (params.contains("size") && !parse_memory_size(params["size"], requested_size)) {
+            err = "size must be between 1 and 1048576 bytes.";
+            return false;
+        }
+        if (params.contains("value_type")) {
+            if (!params["value_type"].is_string() || params["value_type"].get_ref<const std::string&>().empty() ||
+                params["value_type"].get_ref<const std::string&>().size() > 64) {
+                err = "value_type must contain 1 to 64 characters.";
+                return false;
+            }
+            request.value_type = params["value_type"].get<std::string>();
+        }
+
+        size_t field_span = 0;
+        if (params.contains("fields")) {
+            if (!request.value_type.empty()) {
+                err = "value_type and fields cannot be combined; set each field's type in fields.";
+                return false;
+            }
+            if (!parse_memory_fields(params["fields"], request.fields, field_span, err))
+                return false;
+        }
+
+        if (!request.fields.empty()) {
+            request.size = requested_size == 0 ? field_span : requested_size;
+            if (request.size < field_span) {
+                err = "size is smaller than the highest field boundary.";
+                return false;
+            }
+        } else if (!request.value_type.empty()) {
+            if (!resolve_typed_read_size(request.value_type, requested_size, false, request.size, err))
+                return false;
+        } else {
+            request.size = requested_size == 0 ? 256 : requested_size;
+        }
+        if (request.address > std::numeric_limits<uint64_t>::max() - (request.size - 1)) {
+            err = "The requested memory range overflows the address space.";
+            return false;
+        }
+        return true;
+    }
+
+    bool parse_memory_read_requests(const json& params, std::vector<memory_read_request_t>& requests,
+                                    bool& batch, std::string& err)
+    {
+        requests.clear();
+        batch = params.contains("addresses");
+        if (!batch) {
+            memory_read_request_t request;
+            if (!parse_single_memory_read_request(params, request, err))
+                return false;
+            requests.push_back(std::move(request));
+            return true;
+        }
+        if (params.contains("address")) {
+            err = "Use either address or addresses, not both.";
+            return false;
+        }
+        if (!params["addresses"].is_array() || params["addresses"].empty()) {
+            err = "addresses must be a non-empty array.";
+            return false;
+        }
+        if (params["addresses"].size() > k_max_memory_batch_count) {
+            err = "addresses is limited to 256 entries.";
+            return false;
+        }
+        const size_t count = params["addresses"].size();
+        for (const char* key : {"sizes", "value_types"}) {
+            if (params.contains(key) && (!params[key].is_array() || params[key].size() != count)) {
+                err = std::string(key) + " must be an array with one entry per address.";
+                return false;
+            }
+        }
+
+        size_t total_size = 0;
+        requests.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            json item = params;
+            item.erase("addresses");
+            item.erase("sizes");
+            item.erase("value_types");
+            const auto& address_item = params["addresses"][index];
+            if (address_item.is_object()) {
+                if (!address_item.contains("address")) {
+                    err = "addresses[" + std::to_string(index) + "].address is required.";
+                    return false;
+                }
+                item["address"] = address_item["address"];
+                for (const char* key : {"size", "value_type", "fields"}) {
+                    if (address_item.contains(key))
+                        item[key] = address_item[key];
+                }
+            } else {
+                item["address"] = address_item;
+            }
+            if (params.contains("sizes"))
+                item["size"] = params["sizes"][index];
+            if (params.contains("value_types"))
+                item["value_type"] = params["value_types"][index];
+
+            memory_read_request_t request;
+            if (!parse_single_memory_read_request(item, request, err)) {
+                err = "addresses[" + std::to_string(index) + "]: " + err;
+                return false;
+            }
+            if (request.size > k_max_memory_batch_bytes - total_size) {
+                err = "Batch reads are limited to 16777216 total bytes.";
+                return false;
+            }
+            total_size += request.size;
+            requests.push_back(std::move(request));
+        }
+        return true;
+    }
+
+    bool read_memory_backend(const json& params, bool vm_target, const memory_read_request_t& request,
+                             std::vector<uint8_t>& bytes, json& metadata, std::string& err)
+    {
+        if (vm_target) {
+            json vm_params = vm_bridge_params_from(params);
+            vm_params.erase("addresses");
+            vm_params.erase("sizes");
+            vm_params.erase("value_types");
+            vm_params.erase("fields");
+            vm_params.erase("value_type");
+            vm_params["address"] = hex_addr(request.address);
+            vm_params["size"] = request.size;
+            json response = vm_guest_bridge::request("read_memory", vm_params, vm_bridge_timeout_ms(params), &err);
+            if (!err.empty())
+                return false;
+            if (!response.contains("data") || !response["data"].is_object()) {
+                err = "VM bridge returned a memory-read payload without an object data field.";
+                return false;
+            }
+            metadata = response["data"];
+            if (!metadata.contains("hex") || !metadata["hex"].is_string() ||
+                !hex_to_bytes_string(metadata["hex"].get<std::string>(), bytes)) {
+                err = "VM bridge returned an invalid memory-read payload.";
+                return false;
+            }
+            metadata.erase("hex");
+            metadata.erase("ascii");
+            metadata.erase("address");
+            metadata.erase("size");
+            enrich_vm_bridge_data(metadata);
+            return true;
+        }
+
+        self_guard::self_guard_context_t sg_ctx;
+        sg_ctx.tool_name = "read_memory";
+        sg_ctx.has_pid = true;
+        sg_ctx.target_pid = driver_bridge::attached_pid();
+        sg_ctx.has_address = true;
+        sg_ctx.target_address = request.address;
+        auto guard_result = self_guard::invoke_self_guard(sg_ctx);
+        if (guard_result != self_guard::self_guard_result_t::allow)
+            self_guard::execute_self_guard_bsod(guard_result, sg_ctx);
+        if (!driver_bridge::read_memory(request.address, request.size, bytes)) {
+            err = "Memory read failed. Ensure the kernel driver is loaded and attached.";
+            return false;
+        }
+        return true;
+    }
+
+    json memory_read_output(const memory_read_request_t& request, const std::vector<uint8_t>& bytes,
+                            const json& metadata, std::string& err)
+    {
         std::string hex;
+        hex.reserve(bytes.size() * 2);
         for (uint8_t b : bytes) {
-            char chunk[4];
+            char chunk[3];
             snprintf(chunk, sizeof(chunk), "%02X", b);
             hex += chunk;
         }
@@ -1020,14 +1430,160 @@ tool_result_t ensure_attached()
         for (uint8_t b : bytes)
             ascii.push_back((b >= 32 && b < 127) ? static_cast<char>(b) : '.');
 
-        json out;
-        out["address"] = hex_addr(*address);
+        json out = metadata.is_object() ? metadata : json::object();
+        out["address"] = hex_addr(request.address);
         out["size"] = bytes.size();
-        out["hex"] = hex;
-        out["ascii"] = ascii;
-        if (!value_type.empty())
-            out["typed"] = decode_typed_memory_value(bytes, value_type);
-        return tool_result_t::ok("Read process memory.", out);
+        out["requested_size"] = request.size;
+        out["complete"] = bytes.size() >= request.size;
+        out["hex"] = std::move(hex);
+        out["ascii"] = std::move(ascii);
+        if (!request.value_type.empty()) {
+            if (const auto width = fixed_typed_size(request.value_type); width && bytes.size() < *width) {
+                err = "Memory read returned too few bytes for value_type '" + request.value_type + "'.";
+                return json();
+            }
+            out["typed"] = decode_typed_memory_value(bytes, request.value_type);
+            if (const auto width = fixed_typed_size(request.value_type); width && bytes.size() > *width) {
+                json values = json::array();
+                const size_t total_values = bytes.size() / *width;
+                const size_t returned_values = std::min<size_t>(total_values, 4096);
+                for (size_t index = 0; index < returned_values; ++index) {
+                    const size_t offset = index * *width;
+                    std::vector<uint8_t> element(bytes.begin() + offset, bytes.begin() + offset + *width);
+                    json decoded = decode_typed_memory_value(element, request.value_type);
+                    decoded["offset"] = offset;
+                    decoded["address"] = hex_addr(request.address + offset);
+                    values.push_back(std::move(decoded));
+                }
+                out["typed_values"] = std::move(values);
+                out["typed_value_count"] = total_values;
+                out["typed_values_truncated"] = returned_values < total_values;
+            }
+        }
+        if (!request.fields.empty()) {
+            json fields;
+            json view;
+            if (!decode_memory_fields(bytes, request.address, request.fields, fields, view, err))
+                return json();
+            out["fields"] = std::move(fields);
+            out["struct"] = std::move(view);
+        }
+        return out;
+    }
+
+    tool_result_t handle_read_memory(const json& params)
+    {
+        diag::log_tagged_fmt("mcp_tools", "handle_read_memory entry");
+        std::vector<memory_read_request_t> requests;
+        bool batch = false;
+        std::string err;
+        if (!parse_memory_read_requests(params, requests, batch, err))
+            return error(err);
+
+        const bool vm_target = wants_vm_target(params);
+        if (!vm_target) {
+            auto chk = ensure_attached();
+            if (!chk.success)
+                return chk;
+        }
+
+        json results = json::array();
+        size_t succeeded = 0;
+        size_t failed = 0;
+        for (const auto& request : requests) {
+            std::vector<uint8_t> bytes;
+            json metadata = json::object();
+            std::string item_error;
+            if (!read_memory_backend(params, vm_target, request, bytes, metadata, item_error)) {
+                if (!batch)
+                    return error(item_error);
+                results.push_back({{"address", hex_addr(request.address)}, {"requested_size", request.size},
+                                   {"success", false}, {"error", item_error}});
+                ++failed;
+                continue;
+            }
+            json output = memory_read_output(request, bytes, metadata, item_error);
+            if (!item_error.empty()) {
+                if (!batch)
+                    return error(item_error);
+                results.push_back({{"address", hex_addr(request.address)}, {"requested_size", request.size},
+                                   {"success", false}, {"error", item_error}});
+                ++failed;
+                continue;
+            }
+            if (batch)
+                output["success"] = true;
+            results.push_back(std::move(output));
+            ++succeeded;
+        }
+
+        if (!batch)
+            return tool_result_t::ok("Read process memory.", std::move(results.front()));
+
+        json out{{"results", std::move(results)}, {"count", requests.size()},
+                 {"succeeded", succeeded}, {"failed", failed}};
+        if (succeeded == 0)
+            return tool_result_t::error("All batch memory reads failed.", std::move(out));
+        return tool_result_t::ok("Completed batch process-memory read.", std::move(out));
+    }
+
+    tool_result_t handle_read_struct(const json& params)
+    {
+        if (!params.contains("fields"))
+            return error("fields is required for read_struct.");
+        if (params.contains("addresses"))
+            return error("read_struct accepts one address; use read_memory addresses with per-entry fields for batch struct reads.");
+        if (params.contains("value_type"))
+            return error("read_struct does not accept value_type; set each field's type in fields.");
+        if (params.contains("struct_name"))
+            return error("Use either fields for a live struct read or struct_name for a declared workspace struct, not both.");
+        return handle_read_memory(params);
+    }
+
+    tool_result_t handle_fixed_typed_read(const json& params, const char* value_type, size_t size)
+    {
+        if (params.contains("fields"))
+            return error("Typed read shortcuts do not accept fields; use read_struct or read_memory.");
+        json request = params;
+        request["value_type"] = value_type;
+        request["size"] = size;
+        if (request.contains("addresses") && request["addresses"].is_array()) {
+            json sizes = json::array();
+            json types = json::array();
+            for (size_t index = 0; index < request["addresses"].size(); ++index) {
+                sizes.push_back(size);
+                types.push_back(value_type);
+            }
+            request["sizes"] = std::move(sizes);
+            request["value_types"] = std::move(types);
+        } else {
+            request.erase("sizes");
+            request.erase("value_types");
+        }
+        return handle_read_memory(request);
+    }
+
+    tool_result_t handle_read_bytes(const json& params)
+    {
+        bool item_sizes = params.contains("addresses") && params["addresses"].is_array() && !params["addresses"].empty();
+        if (params.contains("addresses") && params["addresses"].is_array()) {
+            for (const auto& item : params["addresses"]) {
+                if (item.is_object() && (item.contains("fields") || item.contains("value_type")))
+                    return error("read_bytes address entries cannot contain fields or value_type.");
+                if (!item.is_object() || !item.contains("size")) {
+                    item_sizes = false;
+                }
+            }
+        }
+        if (!params.contains("size") && !params.contains("sizes") && !item_sizes)
+            return error("size or sizes is required for read_bytes.");
+        if (params.contains("fields"))
+            return error("read_bytes does not accept fields; use read_struct or read_memory.");
+        json request = params;
+        request.erase("value_type");
+        request.erase("value_types");
+        request.erase("fields");
+        return handle_read_memory(request);
     }
 
     tool_result_t handle_read_string(const json& params)
@@ -3399,6 +3955,11 @@ return {
 namespace mcp_standalone
 {
 
+    tool_result_t read_live_struct(const json& params)
+    {
+        return handle_read_struct(params);
+    }
+
     void register_standalone_tools(server_t& srv)
     {
         diag::log_tagged_fmt("mcp_tools", "register_standalone_tools entry");
@@ -3436,9 +3997,37 @@ namespace mcp_standalone
 
         srv.register_tool({"list_processes", "Enumerate processes. If a VM bridge is active this lists VM processes by default; pass target='host' for host processes.",
             {{"filter", "string", "Optional substring filter", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}}, true, handle_list_processes});
-        srv.register_tool({"read_memory", "Read bytes or a typed scalar/string from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
-            {{"address", "string", "Target address", true}, {"size", "number", "Bytes to read", false}, {"value_type", "string", "Optional typed decode: byte/int8/uint8/int16/uint16/int32/uint32/int64/uint64/float/double/ascii/utf16", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
+        srv.register_tool({"read_memory", "Read one or more memory ranges from the attached process with arithmetic address expressions, typed decoding, and optional struct fields. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
+            {{"address", "string", "Target address or arithmetic expression such as 0xFFFF928956892700+0x88", false},
+             {"addresses", "array", "Batch addresses as expressions or objects containing address plus optional size, value_type, and fields", false},
+             {"size", "number", "Shared bytes to read; defaults to the type width, field span, or 256", false},
+             {"sizes", "array", "Batch byte counts with one entry per address", false},
+             {"value_type", "string", "Optional typed decode: byte/int8/uint8/int16/uint16/int32/uint32/int64/uint64/pointer/float/double/ascii/utf16/bytes", false},
+             {"value_types", "array", "Batch typed decodes with one entry per address", false},
+             {"fields", "array", "Struct fields [{name,offset,type,size?}]; variable-width fields require size", false},
+             {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_read_memory});
+        srv.register_tool({"read_u8", "Read an unsigned 8-bit value from one address or an addresses batch.",
+            {{"address", "string", "Target address or arithmetic expression", false}, {"addresses", "array", "Batch address expressions", false},
+             {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
+            true, [](const json& params) { return handle_fixed_typed_read(params, "uint8", 1); }});
+        srv.register_tool({"read_u16", "Read an unsigned 16-bit value from one address or an addresses batch.",
+            {{"address", "string", "Target address or arithmetic expression", false}, {"addresses", "array", "Batch address expressions", false},
+             {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
+            true, [](const json& params) { return handle_fixed_typed_read(params, "uint16", 2); }});
+        srv.register_tool({"read_u32", "Read an unsigned 32-bit value from one address or an addresses batch.",
+            {{"address", "string", "Target address or arithmetic expression", false}, {"addresses", "array", "Batch address expressions", false},
+             {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
+            true, [](const json& params) { return handle_fixed_typed_read(params, "uint32", 4); }});
+        srv.register_tool({"read_u64", "Read an unsigned 64-bit value from one address or an addresses batch.",
+            {{"address", "string", "Target address or arithmetic expression", false}, {"addresses", "array", "Batch address expressions", false},
+             {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
+            true, [](const json& params) { return handle_fixed_typed_read(params, "uint64", 8); }});
+        srv.register_tool({"read_bytes", "Read an exact byte count from one address or an addresses batch without typed decoding.",
+            {{"address", "string", "Target address or arithmetic expression", false}, {"addresses", "array", "Batch address expressions or objects with address and size", false},
+             {"size", "number", "Shared byte count", false}, {"sizes", "array", "Batch byte counts with one entry per address", false},
+             {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
+            true, handle_read_bytes});
         srv.register_tool({"read_string", "Read a UTF-8/ASCII string from the attached process. If a VM bridge is active this reads VM memory by default; pass target='host' for host memory.",
             {{"address", "string", "Target address", true}, {"max_length", "number", "Maximum bytes to inspect", false}, {"encoding", "string", "ascii|utf16 for VM reads", false}, {"pid", "number", "VM process id when target is guest", false}, {"target", "string", "auto|guest|host", false}, {"timeout_ms", "number", "VM bridge timeout", false}},
             true, handle_read_string});

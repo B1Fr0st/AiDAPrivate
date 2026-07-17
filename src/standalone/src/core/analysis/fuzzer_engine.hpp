@@ -15,9 +15,11 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -135,22 +137,35 @@ struct fuzz_stats_t {
 	std::vector<uint64_t> exec_rate_history;
 };
 
+struct render_snapshot_t {
+	fuzz_stats_t stats;
+	std::vector<crash_info_t> unique_crashes;
+	std::uint64_t generation = 1;
+	bool crash_catalog_truncated = false;
+};
+
 struct state_t {
 	fuzz_config_t  config;
 	fuzz_stats_t   stats;
 	coverage_info_t coverage;
 
 	std::vector<corpus_entry_t> corpus;
-	std::vector<crash_info_t>   crashes;
 	std::vector<crash_info_t>   unique_crashes;
 	std::set<uint64_t>          crash_hashes;
 	std::string                 setup_error;
+	std::size_t                 retained_crash_bytes = 0;
+	bool                        crash_catalog_truncated = false;
+	std::shared_ptr<const render_snapshot_t> render_snapshot =
+		std::make_shared<const render_snapshot_t>();
+	std::uint64_t               render_generation = 1;
 
 	std::mutex      mutex;
 	std::atomic<bool> running{false};
 	std::atomic<bool> cancel{false};
 	std::atomic<bool> minimizing{false};
 	std::atomic<bool> analyzing_crash{false};
+	std::atomic<bool> exporting_crashes{false};
+	std::atomic<bool> importing_crashes{false};
 	std::atomic<bool> worker_active{false};
 	std::atomic<bool> setup_complete{false};
 	std::atomic<bool> setup_success{false};
@@ -164,6 +179,37 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+struct atomic_activity_reset_t {
+	std::atomic<bool>& value;
+	~atomic_activity_reset_t() { value.store(false, std::memory_order_release); }
+};
+
+inline std::size_t crash_retained_bytes(const crash_info_t& crash)
+{
+	return crash.input.size() + crash.minimized_input.size() +
+		crash.mutation.original.size() + crash.mutation.mutated.size() +
+		crash.description.size() + crash.crashing_instruction.size() +
+		crash.ai_analysis.size();
+}
+
+inline void publish_render_snapshot_locked()
+{
+	auto next = std::make_shared<render_snapshot_t>();
+	next->stats = g_state.stats;
+	next->unique_crashes = g_state.unique_crashes;
+	next->generation = ++g_state.render_generation;
+	next->crash_catalog_truncated = g_state.crash_catalog_truncated;
+	std::shared_ptr<const render_snapshot_t> immutable = std::move(next);
+	std::atomic_store_explicit(&g_state.render_snapshot, std::move(immutable),
+		std::memory_order_release);
+}
+
+inline std::shared_ptr<const render_snapshot_t> capture_render_snapshot()
+{
+	return std::atomic_load_explicit(&g_state.render_snapshot,
+		std::memory_order_acquire);
+}
 
 namespace detail {
 
@@ -553,14 +599,16 @@ inline bool start_fuzzing()
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		cfg_snapshot = g_state.config;
 		g_state.stats = {};
-		g_state.crashes.clear();
 		g_state.unique_crashes.clear();
 		g_state.crash_hashes.clear();
+		g_state.retained_crash_bytes = 0;
+		g_state.crash_catalog_truncated = false;
 		std::memset(g_state.coverage.bitmap, 0, sizeof(g_state.coverage.bitmap));
 		g_state.coverage.edge_count = 0;
 		g_state.coverage.total_edges_discovered = 0;
 		g_state.setup_error.clear();
 		g_state.active = true;
+		publish_render_snapshot_locked();
 	}
 
 	if (cfg_snapshot.target_address == 0 ||
@@ -789,13 +837,22 @@ inline bool start_fuzzing()
 				{
 					std::lock_guard<std::mutex> lk(g_state.mutex);
 					stats.total_crashes++;
-					g_state.crashes.push_back(crash);
-
 					if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
 						g_state.crash_hashes.insert(crash.crash_hash);
 						stats.total_unique_crashes++;
-						g_state.unique_crashes.push_back(crash);
 						is_unique = true;
+						constexpr std::size_t maximum_unique_crashes = 4096;
+						constexpr std::size_t maximum_retained_crash_bytes = 64u * 1024u * 1024u;
+						const std::size_t retained = crash_retained_bytes(crash);
+						if (g_state.unique_crashes.size() < maximum_unique_crashes &&
+							retained <= maximum_retained_crash_bytes -
+								(std::min)(g_state.retained_crash_bytes,
+									maximum_retained_crash_bytes)) {
+							g_state.unique_crashes.push_back(crash);
+							g_state.retained_crash_bytes += retained;
+						} else {
+							g_state.crash_catalog_truncated = true;
+						}
 					}
 				}
 				diag::log_tagged_fmt("fuzzer",
@@ -854,6 +911,7 @@ inline bool start_fuzzing()
 					last_rate_execs = stats.total_executions;
 					last_rate_update = now;
 					stats.elapsed_seconds = std::chrono::duration<double>(now - start_time).count();
+					publish_render_snapshot_locked();
 					crashes_snap = stats.total_crashes;
 					unique_snap = stats.total_unique_crashes;
 					eps_snap = stats.executions_per_second;
@@ -880,6 +938,7 @@ inline bool start_fuzzing()
 			final_crashes = stats.total_crashes;
 			final_unique = stats.total_unique_crashes;
 			final_elapsed = stats.elapsed_seconds;
+			publish_render_snapshot_locked();
 		}
 
 		diag::log_tagged_fmt("fuzzer",
@@ -915,20 +974,6 @@ inline bool start_fuzzing()
 			diag::log_tagged("fuzzer", "worker_exception type=unknown");
 		}
 	};
-	const bool run_inline = cfg_snapshot.max_iterations <= 32 &&
-		cfg_snapshot.input_size <= 4096 &&
-		cfg_snapshot.end_address > cfg_snapshot.target_address &&
-		(cfg_snapshot.end_address - cfg_snapshot.target_address) <= 0x1000;
-	if (run_inline) {
-		diag::log_tagged_fmt("fuzzer",
-			"start_inline_worker target=0x%llX end=0x%llX input_size=%d max_iterations=%u",
-			static_cast<unsigned long long>(cfg_snapshot.target_address),
-			static_cast<unsigned long long>(cfg_snapshot.end_address),
-			cfg_snapshot.input_size,
-			cfg_snapshot.max_iterations);
-		worker();
-		return true;
-	}
 	aida::infra::executor::submission_t submission;
 	submission.owner_subsystem = "fuzzer";
 	submission.label = "fuzzer.worker";
@@ -992,7 +1037,8 @@ inline bool reset_state()
 		diag::log_tagged("fuzzer", "[analysis_audit] reset_reject reason=fuzzer_running");
 		return false;
 	}
-	if (g_state.minimizing.load() || g_state.analyzing_crash.load()) {
+	if (g_state.minimizing.load() || g_state.analyzing_crash.load() ||
+		g_state.exporting_crashes.load() || g_state.importing_crashes.load()) {
 		diag::log_tagged("fuzzer", "[analysis_audit] reset_reject reason=async_active");
 		return false;
 	}
@@ -1002,20 +1048,22 @@ inline bool reset_state()
 	size_t prev_corpus = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
-		prev_crashes = g_state.crashes.size();
+		prev_crashes = static_cast<std::size_t>(g_state.stats.total_crashes);
 		prev_unique = g_state.unique_crashes.size();
 		prev_corpus = g_state.corpus.size();
 		g_state.stats = {};
-		g_state.crashes.clear();
 		g_state.unique_crashes.clear();
 		g_state.crash_hashes.clear();
 		g_state.corpus.clear();
+		g_state.retained_crash_bytes = 0;
+		g_state.crash_catalog_truncated = false;
 		std::memset(g_state.coverage.bitmap, 0, sizeof(g_state.coverage.bitmap));
 		g_state.coverage.edge_count = 0;
 		g_state.coverage.total_edges_discovered = 0;
 		g_state.coverage.prev_block = 0;
 		g_state.active = false;
 		g_state.cancel.store(false);
+		publish_render_snapshot_locked();
 	}
 
 	diag::log_tagged_fmt("fuzzer",
@@ -1024,7 +1072,7 @@ inline bool reset_state()
 	return true;
 }
 
-inline void ai_analyze_crash(int crash_index)
+inline void ai_analyze_crash(int crash_index, std::uint64_t expected_hash)
 {
 #ifdef __NT__
 	if (g_state.analyzing_crash.load()) return;
@@ -1032,7 +1080,8 @@ inline void ai_analyze_crash(int crash_index)
 	crash_info_t target_crash;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
-		if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size())) return;
+		if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size()) ||
+			g_state.unique_crashes[crash_index].crash_hash != expected_hash) return;
 		target_crash = g_state.unique_crashes[crash_index];
 	}
 
@@ -1045,7 +1094,7 @@ inline void ai_analyze_crash(int crash_index)
 	submission.domain = aida::infra::executor::domain_t::external_tool;
 	submission.priority = 3;
 	submission.failure_policy = "reject_not_started";
-	submission.body = [target_crash, crash_index]() {
+	submission.body = [target_crash, crash_index, expected_hash]() {
 		std::string prompt = "You are a vulnerability researcher analyzing a crash found by a fuzzer.\n\n";
 		prompt += "CRASH DETAILS:\n";
 		prompt += "Type: " + std::string(crash_type_name(target_crash.type)) + "\n";
@@ -1125,10 +1174,26 @@ inline void ai_analyze_crash(int crash_index)
 		std::string result = ai->chat_blocking(prompt, history, nullptr, nullptr);
 		auto t_ai1 = std::chrono::steady_clock::now();
 
+		if (result.size() > 256u * 1024u)
+			result.resize(256u * 1024u);
 		if (!result.empty()) {
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			if (crash_index < static_cast<int>(g_state.unique_crashes.size()))
-				g_state.unique_crashes[crash_index].ai_analysis = result;
+			if (crash_index < static_cast<int>(g_state.unique_crashes.size()) &&
+				g_state.unique_crashes[crash_index].crash_hash == expected_hash) {
+				auto& retained = g_state.unique_crashes[crash_index];
+				constexpr std::size_t maximum_retained_crash_bytes = 64u * 1024u * 1024u;
+				const std::size_t base = g_state.retained_crash_bytes -
+					(std::min)(g_state.retained_crash_bytes, retained.ai_analysis.size());
+				const std::size_t available = maximum_retained_crash_bytes -
+					(std::min)(base, maximum_retained_crash_bytes);
+				if (result.size() > available) {
+					result.resize(available);
+					g_state.crash_catalog_truncated = true;
+				}
+				g_state.retained_crash_bytes = base + result.size();
+				retained.ai_analysis = result;
+				publish_render_snapshot_locked();
+			}
 		}
 
 		diag::log_tagged_fmt("fuzzer",
@@ -1144,10 +1209,11 @@ inline void ai_analyze_crash(int crash_index)
 	}
 #else
 	(void)crash_index;
+	(void)expected_hash;
 #endif
 }
 
-inline void minimize_crash(int crash_index)
+inline void minimize_crash(int crash_index, std::uint64_t expected_hash)
 {
 #ifdef __NT__
 	if (g_state.minimizing.load()) return;
@@ -1155,7 +1221,8 @@ inline void minimize_crash(int crash_index)
 	crash_info_t target_crash;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
-		if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size())) return;
+		if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size()) ||
+			g_state.unique_crashes[crash_index].crash_hash != expected_hash) return;
 		target_crash = g_state.unique_crashes[crash_index];
 	}
 
@@ -1170,7 +1237,7 @@ inline void minimize_crash(int crash_index)
 	submission.domain = aida::infra::executor::domain_t::long_running;
 	submission.priority = 3;
 	submission.failure_policy = "reject_not_started";
-	submission.body = [target_crash, crash_index]() {
+	submission.body = [target_crash, crash_index, expected_hash]() {
 		auto& cfg = g_state.config;
 
 		emulation::process_snapshot_t snapshot;
@@ -1242,9 +1309,21 @@ inline void minimize_crash(int crash_index)
 		size_t orig_size = target_crash.input.size();
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			if (crash_index < static_cast<int>(g_state.unique_crashes.size())) {
-				g_state.unique_crashes[crash_index].minimized_input = current;
-				g_state.unique_crashes[crash_index].is_minimized = true;
+			if (crash_index < static_cast<int>(g_state.unique_crashes.size()) &&
+				g_state.unique_crashes[crash_index].crash_hash == expected_hash) {
+				auto& retained = g_state.unique_crashes[crash_index];
+				constexpr std::size_t maximum_retained_crash_bytes = 64u * 1024u * 1024u;
+				const std::size_t base = g_state.retained_crash_bytes -
+					(std::min)(g_state.retained_crash_bytes, retained.minimized_input.size());
+				if (current.size() <= maximum_retained_crash_bytes -
+					(std::min)(base, maximum_retained_crash_bytes)) {
+					g_state.retained_crash_bytes = base + current.size();
+					retained.minimized_input = current;
+					retained.is_minimized = true;
+				} else {
+					g_state.crash_catalog_truncated = true;
+				}
+				publish_render_snapshot_locked();
 			}
 		}
 
@@ -1261,6 +1340,7 @@ inline void minimize_crash(int crash_index)
 	}
 #else
 	(void)crash_index;
+	(void)expected_hash;
 #endif
 }
 
@@ -1273,149 +1353,305 @@ inline std::string get_crash_export_dir()
 
 inline void export_crashes()
 {
-	std::string dir = get_crash_export_dir();
-	if (dir.empty()) {
-		diag::log_tagged("fuzzer", "export_fail reason=no_appdata");
+	if (g_state.exporting_crashes.exchange(true)) return;
+	const std::string dir = get_crash_export_dir();
+	const auto snapshot = capture_render_snapshot();
+	if (dir.empty() || !snapshot) {
+		diag::log_tagged("fuzzer", "export_fail reason=no_export_target");
+		g_state.exporting_crashes.store(false);
 		return;
 	}
-
-	std::error_code ec;
-	std::filesystem::create_directories(dir, ec);
-	if (ec) {
-		diag::log_tagged_fmt("fuzzer",
-			"export_fail reason=mkdir_failed dir='%s' err='%s'",
-			dir.c_str(), ec.message().c_str());
-		return;
-	}
-
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	size_t written = g_state.unique_crashes.size();
-	diag::log_tagged_fmt("fuzzer",
-		"export_begin dir='%s' unique=%zu", dir.c_str(), written);
-	for (size_t i = 0; i < g_state.unique_crashes.size(); ++i) {
-		auto& crash = g_state.unique_crashes[i];
-
-		nlohmann::json j;
-		j["type"] = static_cast<int>(crash.type);
-		j["score"] = static_cast<int>(crash.score);
-		j["fault_address"] = crash.fault_address;
-		j["instruction_address"] = crash.instruction_address;
-		j["crash_hash"] = crash.crash_hash;
-		j["description"] = crash.description;
-		j["crashing_instruction"] = crash.crashing_instruction;
-		j["rip"] = crash.rip;
-		j["rax"] = crash.rax;
-		j["rbx"] = crash.rbx;
-		j["rcx"] = crash.rcx;
-		j["rdx"] = crash.rdx;
-		j["rsp"] = crash.rsp;
-		j["rbp"] = crash.rbp;
-		j["rsi"] = crash.rsi;
-		j["rdi"] = crash.rdi;
-
-		std::string input_hex;
-		for (auto b : crash.input) {
-			char hx[4];
-			std::snprintf(hx, sizeof(hx), "%02X", b);
-			input_hex += hx;
-		}
-		j["input_hex"] = input_hex;
-		j["ai_analysis"] = crash.ai_analysis;
-
-		if (crash.is_minimized) {
-			std::string min_hex;
-			for (auto b : crash.minimized_input) {
-				char hx[4];
-				std::snprintf(hx, sizeof(hx), "%02X", b);
-				min_hex += hx;
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "fuzzer";
+	submission.label = "fuzzer.export_crashes";
+	submission.thread_class = "fuzzer_persistence";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.failure_policy = "reject_not_started";
+	submission.body = [dir, snapshot]() {
+		atomic_activity_reset_t activity{g_state.exporting_crashes};
+		std::size_t written = 0;
+		std::size_t failed = 0;
+		try {
+			std::error_code ec;
+			std::filesystem::create_directories(dir, ec);
+			if (ec) {
+				diag::log_tagged_fmt("fuzzer",
+					"export_fail reason=mkdir_failed dir='%s' err='%s'",
+					dir.c_str(), ec.message().c_str());
+				throw std::runtime_error("The fuzzer crash export directory could not be created");
 			}
-			j["minimized_hex"] = min_hex;
+			diag::log_tagged_fmt("fuzzer", "export_begin dir='%s' unique=%zu generation=%llu",
+				dir.c_str(), snapshot->unique_crashes.size(),
+				static_cast<unsigned long long>(snapshot->generation));
+			for (std::size_t index = 0; index < snapshot->unique_crashes.size(); ++index) {
+				const auto& crash = snapshot->unique_crashes[index];
+				nlohmann::json json;
+				json["type"] = static_cast<int>(crash.type);
+				json["score"] = static_cast<int>(crash.score);
+				json["fault_address"] = crash.fault_address;
+				json["instruction_address"] = crash.instruction_address;
+				json["crash_hash"] = crash.crash_hash;
+				json["description"] = crash.description;
+				json["crashing_instruction"] = crash.crashing_instruction;
+				json["rip"] = crash.rip;
+				json["rax"] = crash.rax;
+				json["rbx"] = crash.rbx;
+				json["rcx"] = crash.rcx;
+				json["rdx"] = crash.rdx;
+				json["rsp"] = crash.rsp;
+				json["rbp"] = crash.rbp;
+				json["rsi"] = crash.rsi;
+				json["rdi"] = crash.rdi;
+				static constexpr char hex[] = "0123456789ABCDEF";
+				std::string input_hex(crash.input.size() * 2, '0');
+				for (std::size_t byte = 0; byte < crash.input.size(); ++byte) {
+					input_hex[byte * 2] = hex[crash.input[byte] >> 4];
+					input_hex[byte * 2 + 1] = hex[crash.input[byte] & 0x0F];
+				}
+				json["input_hex"] = std::move(input_hex);
+				json["ai_analysis"] = crash.ai_analysis;
+				if (crash.is_minimized) {
+					std::string minimized_hex(crash.minimized_input.size() * 2, '0');
+					for (std::size_t byte = 0; byte < crash.minimized_input.size(); ++byte) {
+						minimized_hex[byte * 2] = hex[crash.minimized_input[byte] >> 4];
+						minimized_hex[byte * 2 + 1] = hex[crash.minimized_input[byte] & 0x0F];
+					}
+					json["minimized_hex"] = std::move(minimized_hex);
+				}
+				char name[96];
+				std::snprintf(name, sizeof(name), "crash_%llX_%zu.json",
+					static_cast<unsigned long long>(crash.crash_hash), index);
+				const std::filesystem::path destination = std::filesystem::path(dir) / name;
+				const std::filesystem::path temporary = destination.string() + ".tmp";
+				std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+				if (!output.is_open()) {
+					++failed;
+					continue;
+				}
+				const std::string serialized = json.dump(2);
+				output.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+				output.flush();
+				const bool write_ok = output.good();
+				output.close();
+				if (!write_ok) {
+					std::filesystem::remove(temporary, ec);
+					++failed;
+					continue;
+				}
+				std::filesystem::remove(destination, ec);
+				ec.clear();
+				std::filesystem::rename(temporary, destination, ec);
+				if (ec) {
+					std::filesystem::remove(temporary, ec);
+					++failed;
+				} else {
+					++written;
+				}
+			}
+		} catch (const std::exception& exception) {
+			diag::log_tagged_fmt("fuzzer", "export_fail reason=exception detail='%s'",
+				exception.what());
+			throw;
+		} catch (...) {
+			diag::log_tagged("fuzzer", "export_fail reason=unknown_exception");
+			throw std::runtime_error("The fuzzer crash export failed unexpectedly");
 		}
-
-		char fname[256];
-		std::snprintf(fname, sizeof(fname), "%s\\crash_%llX_%zu.json",
-		              dir.c_str(), static_cast<unsigned long long>(crash.crash_hash), i);
-
-		std::ofstream ofs(fname);
-		if (ofs.is_open()) ofs << j.dump(2);
-		else diag::log_tagged_fmt("fuzzer", "export_write_fail path='%s'", fname);
+		diag::log_tagged_fmt("fuzzer", failed == 0
+			? "export_done unique=%zu failed=%zu dir='%s'"
+			: "export_partial unique=%zu failed=%zu dir='%s'",
+			written, failed, dir.c_str());
+		if (failed != 0)
+			throw std::runtime_error("One or more fuzzer crash records could not be exported");
+	};
+	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+		diag::log_tagged("fuzzer", "export_fail reason=queue_rejected");
+		g_state.exporting_crashes.store(false);
 	}
-	diag::log_tagged_fmt("fuzzer", "export_done unique=%zu dir='%s'", written, dir.c_str());
 }
 
 inline void import_crashes()
 {
-	std::string dir = get_crash_export_dir();
+	if (g_state.importing_crashes.exchange(true)) return;
+	const std::string dir = get_crash_export_dir();
 	if (dir.empty()) {
 		diag::log_tagged("fuzzer", "import_fail reason=no_appdata");
+		g_state.importing_crashes.store(false);
 		return;
 	}
-
-	std::error_code ec;
-	if (!std::filesystem::exists(dir, ec)) {
-		diag::log_tagged_fmt("fuzzer", "import_fail reason=dir_missing dir='%s'", dir.c_str());
-		return;
-	}
-
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	size_t loaded = 0;
-	size_t skipped = 0;
-
-	for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-		if (ec) break;
-		if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
-
-		std::ifstream ifs(entry.path());
-		if (!ifs.is_open()) continue;
-
-		auto j = nlohmann::json::parse(ifs, nullptr, false);
-		if (j.is_discarded()) continue;
-
-		crash_info_t crash;
-		crash.type = static_cast<crash_type_t>(j.value("type", 0));
-		crash.score = static_cast<exploit_score_t>(j.value("score", 0));
-		crash.fault_address = j.value("fault_address", uint64_t(0));
-		crash.instruction_address = j.value("instruction_address", uint64_t(0));
-		crash.crash_hash = j.value("crash_hash", uint64_t(0));
-		crash.description = j.value("description", std::string{});
-		crash.crashing_instruction = j.value("crashing_instruction", std::string{});
-		crash.rip = j.value("rip", uint64_t(0));
-		crash.rax = j.value("rax", uint64_t(0));
-		crash.rbx = j.value("rbx", uint64_t(0));
-		crash.rcx = j.value("rcx", uint64_t(0));
-		crash.rdx = j.value("rdx", uint64_t(0));
-		crash.rsp = j.value("rsp", uint64_t(0));
-		crash.rbp = j.value("rbp", uint64_t(0));
-		crash.rsi = j.value("rsi", uint64_t(0));
-		crash.rdi = j.value("rdi", uint64_t(0));
-		crash.ai_analysis = j.value("ai_analysis", std::string{});
-
-		std::string input_hex = j.value("input_hex", std::string{});
-		for (size_t k = 0; k + 2 <= input_hex.size(); k += 2) {
-			uint8_t byte = static_cast<uint8_t>(std::strtoul(input_hex.substr(k, 2).c_str(), nullptr, 16));
-			crash.input.push_back(byte);
-		}
-
-		if (j.contains("minimized_hex")) {
-			crash.is_minimized = true;
-			std::string min_hex = j["minimized_hex"].get<std::string>();
-			for (size_t k = 0; k + 2 <= min_hex.size(); k += 2) {
-				uint8_t byte = static_cast<uint8_t>(std::strtoul(min_hex.substr(k, 2).c_str(), nullptr, 16));
-				crash.minimized_input.push_back(byte);
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "fuzzer";
+	submission.label = "fuzzer.import_crashes";
+	submission.thread_class = "fuzzer_persistence";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.failure_policy = "reject_not_started";
+	submission.body = [dir]() {
+		atomic_activity_reset_t activity{g_state.importing_crashes};
+		std::vector<crash_info_t> imported;
+		std::size_t skipped = 0;
+		try {
+			std::error_code ec;
+			if (!std::filesystem::exists(dir, ec) || ec) {
+				diag::log_tagged_fmt("fuzzer", "import_fail reason=dir_missing dir='%s'",
+					dir.c_str());
+				throw std::runtime_error("The fuzzer crash import directory is unavailable");
 			}
+			constexpr std::size_t maximum_files = 4096;
+			constexpr std::uintmax_t maximum_file_bytes = 20u * 1024u * 1024u;
+			constexpr std::uintmax_t maximum_examined_bytes = 256u * 1024u * 1024u;
+			constexpr std::size_t maximum_blob_bytes = 8u * 1024u * 1024u;
+			constexpr std::size_t maximum_staged_bytes = 64u * 1024u * 1024u;
+			std::set<std::uint64_t> imported_hashes;
+			std::size_t visited = 0;
+			std::uintmax_t examined_bytes = 0;
+			std::size_t staged_bytes = 0;
+			for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+				if (ec || visited == maximum_files) break;
+				if (!entry.is_regular_file(ec) || ec || entry.path().extension() != ".json")
+					continue;
+				++visited;
+				const auto file_size = entry.file_size(ec);
+				if (ec || file_size == 0 || file_size > maximum_file_bytes) {
+					ec.clear();
+					++skipped;
+					continue;
+				}
+				if (file_size > maximum_examined_bytes -
+					(std::min)(examined_bytes, maximum_examined_bytes)) {
+					++skipped;
+					break;
+				}
+				examined_bytes += file_size;
+				std::ifstream input(entry.path(), std::ios::binary);
+				if (!input.is_open()) {
+					++skipped;
+					continue;
+				}
+				auto json = nlohmann::json::parse(input, nullptr, false);
+				if (json.is_discarded() || !json.is_object()) {
+					++skipped;
+					continue;
+				}
+				crash_info_t crash;
+				const int type = json.value("type", 0);
+				const int score = json.value("score", 0);
+				if (type < static_cast<int>(crash_type_t::none) ||
+					type > static_cast<int>(crash_type_t::assertion) ||
+					score < static_cast<int>(exploit_score_t::unknown) ||
+					score > static_cast<int>(exploit_score_t::critical)) {
+					++skipped;
+					continue;
+				}
+				crash.type = static_cast<crash_type_t>(type);
+				crash.score = static_cast<exploit_score_t>(score);
+				crash.fault_address = json.value("fault_address", std::uint64_t{0});
+				crash.instruction_address = json.value("instruction_address", std::uint64_t{0});
+				crash.crash_hash = json.value("crash_hash", std::uint64_t{0});
+				crash.description = json.value("description", std::string{});
+				crash.crashing_instruction = json.value("crashing_instruction", std::string{});
+				crash.rip = json.value("rip", std::uint64_t{0});
+				crash.rax = json.value("rax", std::uint64_t{0});
+				crash.rbx = json.value("rbx", std::uint64_t{0});
+				crash.rcx = json.value("rcx", std::uint64_t{0});
+				crash.rdx = json.value("rdx", std::uint64_t{0});
+				crash.rsp = json.value("rsp", std::uint64_t{0});
+				crash.rbp = json.value("rbp", std::uint64_t{0});
+				crash.rsi = json.value("rsi", std::uint64_t{0});
+				crash.rdi = json.value("rdi", std::uint64_t{0});
+				crash.ai_analysis = json.value("ai_analysis", std::string{});
+				if (crash.crash_hash == 0 || crash.description.size() > 64u * 1024u ||
+					crash.crashing_instruction.size() > 4096u ||
+					crash.ai_analysis.size() > 256u * 1024u ||
+					!imported_hashes.insert(crash.crash_hash).second) {
+					++skipped;
+					continue;
+				}
+				auto decode_hex = [maximum_blob_bytes](const std::string& encoded,
+					std::vector<std::uint8_t>& decoded) {
+					if ((encoded.size() & 1u) != 0 || encoded.size() / 2 > maximum_blob_bytes)
+						return false;
+					auto nibble = [](char value) -> int {
+						if (value >= '0' && value <= '9') return value - '0';
+						if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+						if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+						return -1;
+					};
+					decoded.resize(encoded.size() / 2);
+					for (std::size_t offset = 0; offset < decoded.size(); ++offset) {
+						const int high = nibble(encoded[offset * 2]);
+						const int low = nibble(encoded[offset * 2 + 1]);
+						if (high < 0 || low < 0) return false;
+						decoded[offset] = static_cast<std::uint8_t>((high << 4) | low);
+					}
+					return true;
+				};
+				const std::string input_hex = json.value("input_hex", std::string{});
+				if (!decode_hex(input_hex, crash.input)) {
+					++skipped;
+					continue;
+				}
+				if (json.contains("minimized_hex")) {
+					if (!json["minimized_hex"].is_string() ||
+						!decode_hex(json["minimized_hex"].get<std::string>(), crash.minimized_input)) {
+						++skipped;
+						continue;
+					}
+					crash.is_minimized = true;
+				}
+				const std::size_t retained = crash_retained_bytes(crash);
+				if (retained > maximum_staged_bytes -
+					(std::min)(staged_bytes, maximum_staged_bytes)) {
+					++skipped;
+					continue;
+				}
+				staged_bytes += retained;
+				imported.push_back(std::move(crash));
+			}
+		} catch (const std::exception& exception) {
+			diag::log_tagged_fmt("fuzzer", "import_fail reason=exception detail='%s'",
+				exception.what());
+			throw;
+		} catch (...) {
+			diag::log_tagged("fuzzer", "import_fail reason=unknown_exception");
+			throw std::runtime_error("The fuzzer crash import failed unexpectedly");
 		}
-
-		if (g_state.crash_hashes.find(crash.crash_hash) == g_state.crash_hashes.end()) {
-			g_state.crash_hashes.insert(crash.crash_hash);
-			g_state.unique_crashes.push_back(std::move(crash));
-			++loaded;
-		} else {
-			++skipped;
+		std::size_t loaded = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			constexpr std::size_t maximum_unique_crashes = 4096;
+			constexpr std::size_t maximum_retained_crash_bytes = 64u * 1024u * 1024u;
+			for (auto& crash : imported) {
+				if (g_state.crash_hashes.find(crash.crash_hash) != g_state.crash_hashes.end()) {
+					++skipped;
+					continue;
+				}
+				const std::size_t retained = crash_retained_bytes(crash);
+				if (g_state.unique_crashes.size() >= maximum_unique_crashes ||
+					retained > maximum_retained_crash_bytes -
+						(std::min)(g_state.retained_crash_bytes, maximum_retained_crash_bytes)) {
+					g_state.crash_catalog_truncated = true;
+					++skipped;
+					continue;
+				}
+				g_state.crash_hashes.insert(crash.crash_hash);
+				g_state.retained_crash_bytes += retained;
+				g_state.unique_crashes.push_back(std::move(crash));
+				++loaded;
+			}
+			g_state.stats.total_unique_crashes = (std::max)(g_state.stats.total_unique_crashes,
+				static_cast<std::uint64_t>(g_state.unique_crashes.size()));
+			g_state.stats.total_crashes = (std::max)(g_state.stats.total_crashes,
+				g_state.stats.total_unique_crashes);
+			publish_render_snapshot_locked();
 		}
+		diag::log_tagged_fmt("fuzzer", "import_done dir='%s' loaded=%zu skipped=%zu",
+			dir.c_str(), loaded, skipped);
+	};
+	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+		diag::log_tagged("fuzzer", "import_fail reason=queue_rejected");
+		g_state.importing_crashes.store(false);
 	}
-	diag::log_tagged_fmt("fuzzer",
-		"import_done dir='%s' loaded=%zu skipped_dupe=%zu",
-		dir.c_str(), loaded, skipped);
 }
 
 }

@@ -8618,7 +8618,24 @@ namespace driver_bridge
         }
 
         const size_t bytes_written = device->write_kernel_raw(address, data.data(), data.size());
-        return bytes_written > 0;
+        if (bytes_written != data.size()) {
+            diag::log_tagged_fmt("driver_bridge",
+                "write_kernel_memory_failed addr=0x%llX requested=%llu written=%llu complete=0 pid=%u dtb=0x%llX kdtb=0x%llX connected=%d",
+                static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(data.size()),
+                static_cast<unsigned long long>(bytes_written),
+                attached_pid(),
+                static_cast<unsigned long long>(device ? device->get_dtb() : 0),
+                static_cast<unsigned long long>(device ? device->get_kernel_dtb() : 0),
+                device && device->is_connected() ? 1 : 0);
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            set_last_error_locked(
+                "Kernel memory write was partial: requested=" + std::to_string(data.size()) +
+                " written=" + std::to_string(bytes_written), false);
+            return false;
+        }
+        clear_last_error_after_success("write_kernel_memory");
+        return true;
     }
 
     bool kernel_read_user_memory(uint64_t addr, void* out, size_t len)

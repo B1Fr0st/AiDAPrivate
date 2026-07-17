@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -36,6 +37,8 @@ struct scan_config_t {
 
 struct state_t {
 	std::vector<decrypted_string_t> results;
+	std::shared_ptr<const std::vector<decrypted_string_t>> published_results =
+		std::make_shared<const std::vector<decrypted_string_t>>();
 	std::mutex mutex;
 	std::atomic<bool> scanning{false};
 	std::atomic<bool> cancel{false};
@@ -50,6 +53,11 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline std::shared_ptr<const std::vector<decrypted_string_t>> capture_results()
+{
+	return std::atomic_load_explicit(&g_state.published_results, std::memory_order_acquire);
+}
 
 inline void scan_and_decrypt(std::uint64_t address, std::uint64_t size,
 	std::uint32_t = 5000, int = 4, float = .75f)
@@ -70,6 +78,9 @@ inline void scan_and_decrypt(std::uint64_t address, std::uint64_t size,
 	{
 		std::lock_guard<std::mutex> lock(g_state.mutex);
 		g_state.results = std::move(results);
+		std::atomic_store_explicit(&g_state.published_results,
+			std::make_shared<const std::vector<decrypted_string_t>>(g_state.results),
+			std::memory_order_release);
 		g_state.config.region_address = address;
 		g_state.config.region_size = size;
 		g_state.status_text = "Recovered 4 candidate strings from 4 decryptor references";

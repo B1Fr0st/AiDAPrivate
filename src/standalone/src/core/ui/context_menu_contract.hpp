@@ -35,7 +35,9 @@ enum class context_menu_visibility_t : std::uint8_t {
 struct context_menu_action_t {
     stable_action_id_t action;
     std::string label_override;
+    std::string description_override;
     std::string icon_override;
+    std::string shortcut_override;
     int order = 0;
     context_menu_visibility_t visibility = context_menu_visibility_t::show_disabled;
     bool close_menu_on_execute = true;

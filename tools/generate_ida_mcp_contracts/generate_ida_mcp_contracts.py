@@ -874,6 +874,126 @@ def override_py_exec_file_contract(contract: dict[str, Any]) -> None:
     )
 
 
+def override_read_struct_contract(contract: dict[str, Any]) -> None:
+    input_schema = contract["input_schema"]
+    input_properties = input_schema.get("properties")
+    input_required = input_schema.get("required")
+    if not isinstance(input_properties, dict) or not isinstance(input_required, list):
+        raise ContractGenerationError("read_struct input schema must remain object-shaped")
+    queries_schema = input_properties.get("queries")
+    if not isinstance(queries_schema, dict) or input_required != ["queries"]:
+        raise ContractGenerationError("read_struct archive input compatibility shape changed")
+
+    input_properties.update({
+        "address": {
+            "description": "Struct base address or arithmetic expression",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+        },
+        "struct_name": {
+            "description": "Declared workspace struct name",
+            "type": "string",
+            "minLength": 1,
+        },
+        "fields": {
+            "description": "Live struct fields with explicit names, offsets, and value types",
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 256,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "offset": {
+                        "oneOf": [
+                            {"type": "string", "minLength": 1, "maxLength": 4096},
+                            {"type": "integer", "minimum": 0},
+                        ],
+                    },
+                    "type": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "size": {
+                        "oneOf": [
+                            {"type": "string", "minLength": 1, "maxLength": 4096},
+                            {"type": "integer", "minimum": 1, "maximum": 1048576},
+                        ],
+                    },
+                },
+                "required": ["name", "offset", "type"],
+                "additionalProperties": False,
+            },
+        },
+        "size": {
+            "description": "Optional total live read size; it must cover every field",
+            "oneOf": [
+                {"type": "string", "minLength": 1, "maxLength": 4096},
+                {"type": "integer", "minimum": 1, "maximum": 1048576},
+            ],
+        },
+        "target": {"type": "string", "enum": ["auto", "guest", "host"]},
+        "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300000},
+    })
+    input_schema["required"] = []
+    input_schema["oneOf"] = [
+        {
+            "required": ["queries"],
+            "not": {"anyOf": [
+                {"required": ["address"]},
+                {"required": ["struct_name"]},
+                {"required": ["fields"]},
+            ]},
+        },
+        {
+            "required": ["address", "struct_name"],
+            "not": {"anyOf": [
+                {"required": ["queries"]},
+                {"required": ["fields"]},
+            ]},
+        },
+        {
+            "required": ["address", "fields"],
+            "not": {"anyOf": [
+                {"required": ["queries"]},
+                {"required": ["struct_name"]},
+            ]},
+        },
+    ]
+    input_schema["additionalProperties"] = False
+
+    legacy_output_schema = contract["output_schema"]
+    if not isinstance(legacy_output_schema, dict) or "result" not in legacy_output_schema.get("properties", {}):
+        raise ContractGenerationError("read_struct archive output compatibility shape changed")
+    live_output_schema = {
+        "type": "object",
+        "properties": {
+            "address": {"type": "string"},
+            "size": {"type": "integer"},
+            "requested_size": {"type": "integer"},
+            "complete": {"type": "boolean"},
+            "hex": {"type": "string"},
+            "ascii": {"type": "string"},
+            "fields": {"type": "array"},
+            "struct": {"type": "object"},
+        },
+        "required": ["address", "size", "requested_size", "complete", "hex", "ascii", "fields", "struct"],
+    }
+    contract["output_schema"] = {"oneOf": [legacy_output_schema, live_output_schema]}
+
+    annotations = contract["annotations"]
+    annotations["parameters"] = [
+        {"annotation": "list[StructRead] | StructRead", "name": "queries", "required": False},
+        {"annotation": "str", "name": "address", "required": False},
+        {"annotation": "str", "name": "struct_name", "required": False},
+        {"annotation": "list[LiveStructField]", "name": "fields", "required": False},
+        {"annotation": "int | str", "name": "size", "required": False},
+    ]
+    annotations["return"] = "list[ReadStructResult] | LiveStructReadResult"
+    contract["description"] = (
+        "Read declared workspace structs through the compatible queries form, or read a live struct "
+        "with an arithmetic address and explicit typed fields."
+    )
+
+
 def adapter_symbol(name: str) -> str:
     return f"aida::standalone::mcp::compat::adapters::{name}"
 
@@ -939,6 +1059,8 @@ def collect_archive_tools(modules: dict[str, Module]) -> list[dict[str, Any]]:
                 override_idb_save_contract(contract)
             if symbol == "py_exec_file":
                 override_py_exec_file_contract(contract)
+            if symbol == "read_struct":
+                override_read_struct_contract(contract)
             contracts.append(contract)
         unknown_direct = sorted(set(direct).difference(defined))
         if unknown_direct:

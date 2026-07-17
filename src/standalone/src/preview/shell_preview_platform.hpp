@@ -218,6 +218,7 @@ namespace workspace_search
 		std::atomic<bool> launch_pending{false};
 		std::atomic<int> files_scanned{42};
 		std::atomic<int> match_count{3};
+		std::atomic<bool> truncated{false};
 		bool panel_open = false;
 	};
 
@@ -228,5 +229,10 @@ namespace workspace_search
 		g_search.searching.store(false, std::memory_order_release);
 		g_search.files_scanned.store(42, std::memory_order_release);
 		g_search.match_count.store(static_cast<int>(g_search.results.size()), std::memory_order_release);
+	}
+
+	inline void start_search(const std::vector<std::string>& roots)
+	{
+		start_search(roots.empty() ? std::string{} : roots.front());
 	}
 }

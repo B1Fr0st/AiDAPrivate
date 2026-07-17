@@ -4,8 +4,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace stealth_engine {
@@ -74,15 +76,50 @@ inline std::vector<finding_t> preview_findings()
 }
 
 struct scan_state_t {
-	std::vector<finding_t> findings = preview_findings();
-	std::mutex mutex;
+	std::shared_ptr<const std::vector<finding_t>> findings =
+		std::make_shared<const std::vector<finding_t>>(preview_findings());
+	std::shared_ptr<const std::string> scan_status =
+		std::make_shared<const std::string>("Scan complete: 5 findings");
 	std::atomic<bool> scanning{false};
 	std::atomic<bool> cancel{false};
 	std::atomic<float> progress{1.f};
-	std::string scan_status = "Scan complete: 5 findings";
+	std::atomic<std::uint64_t> generation{1};
 };
 
 inline scan_state_t g_scan;
+
+inline std::shared_ptr<const std::vector<finding_t>> capture_protection_findings()
+{
+	return std::atomic_load_explicit(&g_scan.findings, std::memory_order_acquire);
+}
+
+inline std::shared_ptr<const std::string> capture_protection_scan_status()
+{
+	return std::atomic_load_explicit(&g_scan.scan_status, std::memory_order_acquire);
+}
+
+inline void publish_protection_findings(std::vector<finding_t> value,
+	std::string status)
+{
+	auto findings = std::make_shared<const std::vector<finding_t>>(std::move(value));
+	auto state = std::make_shared<const std::string>(std::move(status));
+	std::atomic_store_explicit(&g_scan.findings, std::move(findings),
+		std::memory_order_release);
+	std::atomic_store_explicit(&g_scan.scan_status, std::move(state),
+		std::memory_order_release);
+	g_scan.generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline bool clear_protection_findings(std::size_t& cleared)
+{
+	if (g_scan.scanning.load(std::memory_order_acquire))
+		return false;
+	const auto current = capture_protection_findings();
+	cleared = current ? current->size() : 0;
+	publish_protection_findings({}, {});
+	g_scan.progress.store(0.f, std::memory_order_release);
+	return true;
+}
 
 inline const char* severity_name(finding_severity_t severity)
 {
@@ -163,10 +200,10 @@ inline void run_protection_scan()
 	g_scan.cancel.store(false);
 	g_scan.progress.store(1.f);
 	g_scan.scanning.store(false);
-	std::lock_guard<std::mutex> lock(g_scan.mutex);
-	g_scan.findings = preview_findings();
-	g_scan.scan_status = "Scan complete: " + std::to_string(g_scan.findings.size()) + " findings";
-	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::protection, 0, "protection.scan", g_scan.scan_status);
+	auto findings = preview_findings();
+	const std::string status = "Scan complete: " + std::to_string(findings.size()) + " findings";
+	publish_protection_findings(std::move(findings), status);
+	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::protection, 0, "protection.scan", status);
 }
 
 inline void stop_protection_scan()

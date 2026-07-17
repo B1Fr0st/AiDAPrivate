@@ -1525,8 +1525,10 @@ void shutdown() {
 }
 
 
-int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
-				   const std::string& condition, int size) {
+static int add_breakpoint_impl(uint64_t address, bp_type_t type,
+	const std::string& name, const std::string& condition, int size,
+	const std::string& source_definition_id, const std::string& source_file,
+	uint32_t source_line, uint32_t source_location_ordinal) {
 	auto& st = g_state;
 	sync_attached_state();
 
@@ -1563,6 +1565,10 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 	bp.name = name;
 	bp.condition = condition;
 	bp.size = is_hw ? size : 1;
+	bp.source_definition_id = source_definition_id;
+	bp.source_file = source_file;
+	bp.source_line = source_line;
+	bp.source_location_ordinal = source_location_ordinal;
 
 
 	if (type == bp_type_t::software) {
@@ -1682,10 +1688,23 @@ int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
 	return new_index;
 }
 
-bool remove_breakpoint(int index) {
-	auto& st = g_state;
-	sync_attached_state();
-	std::lock_guard<std::mutex> lk(st.bp_mutex);
+int add_breakpoint(uint64_t address, bp_type_t type, const std::string& name,
+	const std::string& condition, int size) {
+	return add_breakpoint_impl(address, type, name, condition, size, {}, {}, 0, 0);
+}
+
+int add_source_breakpoint(uint64_t address, const std::string& definition_id,
+	const std::string& file_path, uint32_t line, uint32_t location_ordinal) {
+	if (definition_id.empty() || file_path.empty() || line == 0) {
+		set_last_error("add_source_breakpoint: invalid persistent source identity");
+		return -1;
+	}
+	return add_breakpoint_impl(address, bp_type_t::software,
+		file_path + ":" + std::to_string(line), {}, 1, definition_id,
+		file_path, line, location_ordinal);
+}
+
+static bool remove_breakpoint_locked(state_t& st, int index) {
 	if (index < 0 || index >= static_cast<int>(st.breakpoints.size()))
 		return false;
 
@@ -1729,6 +1748,51 @@ bool remove_breakpoint(int index) {
 		index,
 		static_cast<unsigned long long>(removed_addr),
 		removed_type);
+	return true;
+}
+
+bool remove_breakpoint(int index) {
+	auto& st = g_state;
+	sync_attached_state();
+	std::lock_guard<std::mutex> lk(st.bp_mutex);
+	return remove_breakpoint_locked(st, index);
+}
+
+bool remove_source_breakpoint(const std::string& definition_id,
+	uint32_t location_ordinal) {
+	if (definition_id.empty()) return false;
+	auto& st = g_state;
+	sync_attached_state();
+	std::lock_guard<std::mutex> lk(st.bp_mutex);
+	for (size_t index = 0; index < st.breakpoints.size(); ++index) {
+		const auto& breakpoint = st.breakpoints[index];
+		if (breakpoint.source_definition_id == definition_id &&
+			breakpoint.source_location_ordinal == location_ordinal)
+			return remove_breakpoint_locked(st, static_cast<int>(index));
+	}
+	return true;
+}
+
+bool discard_source_breakpoints_for_target_change(uint32_t previous_pid,
+	uint32_t current_pid) {
+	const uint32_t attached = driver_bridge::attached_pid();
+	if (attached != current_pid ||
+		(previous_pid != 0 && current_pid == previous_pid)) {
+		set_last_error("discard_source_breakpoints_for_target_change: target identity is not safely distinguishable");
+		return false;
+	}
+	auto& st = g_state;
+	std::lock_guard<std::mutex> lk(st.bp_mutex);
+	const auto previous_size = st.breakpoints.size();
+	st.breakpoints.erase(std::remove_if(st.breakpoints.begin(), st.breakpoints.end(),
+		[](breakpoint_t& breakpoint) {
+			if (breakpoint.source_definition_id.empty()) return false;
+			breakpoint.byte_written = false;
+			breakpoint.hw_slot = -1;
+			return true;
+		}), st.breakpoints.end());
+	if (st.breakpoints.size() != previous_size)
+		st.breakpoints_generation.fetch_add(1, std::memory_order_release);
 	return true;
 }
 
@@ -4312,6 +4376,14 @@ register_set_t cached_registers() {
 	auto& st = g_state;
 	std::lock_guard<std::mutex> lk(st.cache_mtx);
 	return st.cached_regs;
+}
+
+bool try_cached_registers(register_set_t& output) {
+	auto& st = g_state;
+	std::unique_lock<std::mutex> lk(st.cache_mtx, std::try_to_lock);
+	if (!lk.owns_lock()) return false;
+	output = st.cached_regs;
+	return true;
 }
 
 std::vector<cached_thread_t> cached_thread_list() {

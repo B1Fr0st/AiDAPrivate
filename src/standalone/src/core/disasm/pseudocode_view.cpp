@@ -1,7 +1,9 @@
 #include "pseudocode_view.hpp"
 
+#include "cfg_view.hpp"
 #include "comment_dialog.hpp"
 #include "rename_dialog.hpp"
+#include "../editor/hex_view.hpp"
 #include "../ui/analysis_context_menu.hpp"
 #include "../ui/application_view_registry.hpp"
 #include "../ui/components.hpp"
@@ -52,6 +54,8 @@ struct state_t {
     std::vector<tab_t> tabs;
     int active = -1;
     int selected_line = -1;
+    std::uint32_t selected_token_begin = 0;
+    std::uint32_t selected_token_end = 0;
     std::uint64_t generation = 0;
 };
 
@@ -228,8 +232,11 @@ void synchronize_tabs(
         active >= 0 && static_cast<std::size_t>(active) < state->tabs.size()
             ? tab_identity(state->tabs[static_cast<std::size_t>(active)])
             : std::string();
-    if (previous_active != current_active || generation_changed)
+    if (previous_active != current_active || generation_changed) {
         state->selected_line = -1;
+        state->selected_token_begin = 0;
+        state->selected_token_end = 0;
+    }
 }
 
 std::string pseudocode_error_text(
@@ -366,6 +373,226 @@ void navigate_to_disassembly(
     disasm_view::goto_address(target, context);
     aida::ui::application_views::open_or_focus(
         aida::ui::stable_view_id_t("document.disassembly"));
+}
+
+void navigate_to_graph(const disasm_view::workspace_context_t& context,
+                       std::uint64_t source_address)
+{
+    const auto typed = typed_source_address(context, source_address);
+    const auto runtime = typed
+        ? canonical_runtime_address(context, *typed) : source_address;
+    const auto function = disasm_view::enclosing_function_start(runtime, context);
+    if (function == 0)
+        return;
+    cfg_view::build_cfg(context, function);
+    aida::ui::application_views::open_or_focus(
+        aida::ui::stable_view_id_t("document.graph"));
+}
+
+bool navigate_to_hex(const disasm_view::workspace_context_t& context,
+                     const aida::analysis::address_t& address)
+{
+    std::string error;
+    if (!hex_view::focus_address(context, address, &error))
+        return false;
+    return aida::ui::application_views::open_or_focus(
+        aida::ui::stable_view_id_t("document.hex")).ok();
+}
+
+ImU32 token_color(
+    const aida::analysis::decompiler_document_token_kind_t kind,
+    const aida::ui::theme_t& theme, float alpha)
+{
+    using token_kind_t =
+        aida::analysis::decompiler_document_token_kind_t;
+    ImU32 color = theme.text_primary;
+    switch (kind) {
+    case token_kind_t::keyword: color = theme.syn_keyword; break;
+    case token_kind_t::identifier: color = theme.syn_identifier; break;
+    case token_kind_t::type_name: color = theme.syn_type; break;
+    case token_kind_t::literal: color = theme.syn_number; break;
+    case token_kind_t::operator_token: color = theme.syn_operator; break;
+    case token_kind_t::punctuation: color = theme.text_secondary; break;
+    case token_kind_t::whitespace: color = theme.text_primary; break;
+    case token_kind_t::unknown: color = theme.warning; break;
+    }
+    return aida::ui::with_alpha(color, alpha);
+}
+
+const aida::workbench::pseudocode_document::pseudocode_token_view_t*
+token_for_position(
+    const aida::workbench::pseudocode_document::pseudocode_page_t& page,
+    std::uint32_t position)
+{
+    for (const auto& token : page.tokens) {
+        if (token.range.begin <= position && position < token.range.end)
+            return &token;
+    }
+    return nullptr;
+}
+
+std::optional<std::uint64_t> token_source_address(
+    aida::workbench::pseudocode_document::pseudocode_document_model_t& model,
+    const aida::workbench::pseudocode_document::pseudocode_token_view_t* token,
+    const aida::workbench::pseudocode_document::pseudocode_line_view_t& line,
+    const aida::workbench::pseudocode_document::pseudocode_page_t& page)
+{
+    if (token) {
+        aida::workbench::pseudocode_document::pseudocode_address_map_entry_t mapped;
+        if (model.resolve_token(token->range.begin, mapped))
+            return mapped.address;
+    }
+    return line_source_address(model, line, page);
+}
+
+std::string canonical_address_text(std::uint64_t address)
+{
+    char buffer[32]{};
+    std::snprintf(buffer, sizeof(buffer), "%016llX",
+        static_cast<unsigned long long>(address));
+    return buffer;
+}
+
+std::uint64_t context_generation(
+    const disasm_view::workspace_context_t& context)
+{
+    const auto generation = context.workspace->generation();
+    const auto revision = context.workspace->analysis_revision();
+    return generation ^ (revision + 0x9E3779B97F4A7C15ull +
+        (generation << 6u) + (generation >> 2u));
+}
+
+void open_line_context_menu(
+    const disasm_view::workspace_context_t& context,
+    const aida::workbench::pseudocode_document::pseudocode_line_view_t& line,
+    std::optional<std::uint64_t> source_address,
+    std::string token_text,
+    const std::shared_ptr<state_t>& state,
+    int selected_line,
+    std::uint32_t selected_token_begin,
+    std::uint32_t selected_token_end,
+    aida::ui::context_menu_open_origin_t origin)
+{
+    using namespace aida::ui::analysis_context_menu;
+    using aida::ui::action_handler_result_t;
+    using aida::ui::capability_state_t;
+    context_t menu;
+    menu.kind = menu_kind_t::pseudocode;
+    menu.entity_id = "pseudocode-line:" + std::to_string(line.line_number) + ":" +
+        std::to_string(selected_token_begin) + ":" +
+        std::to_string(selected_token_end) + ":" +
+        std::to_string(source_address.value_or(0));
+    menu.generation = context_generation(context);
+    menu.live_generation = [workspace = context.workspace]() {
+        const auto generation = workspace->generation();
+        const auto revision = workspace->analysis_revision();
+        return generation ^ (revision + 0x9E3779B97F4A7C15ull +
+            (generation << 6u) + (generation >> 2u));
+    };
+    menu.validate_identity = [state, selected_line, selected_token_begin,
+                              selected_token_end]() {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return state->selected_line == selected_line &&
+            state->selected_token_begin == selected_token_begin &&
+            state->selected_token_end == selected_token_end
+            ? aida::ui::capability_state_t::available()
+            : aida::ui::capability_state_t::unavailable(
+                "The selected pseudocode token changed");
+    };
+    auto copy = [&](const char* id, std::string value) {
+        menu.actions[id].invoke = [value = std::move(value)]() {
+            ImGui::SetClipboardText(value.c_str());
+            return action_handler_result_t::completed();
+        };
+    };
+    copy("analysis.copy.line", line.text);
+    copy("analysis.copy.text", token_text.empty() ? line.text : token_text);
+    copy("analysis.export.line", line.text);
+    menu.actions["analysis.navigate.back"].invoke = [context]() {
+        disasm_view::navigate_back(context);
+        return action_handler_result_t::completed();
+    };
+    menu.actions["analysis.navigate.forward"].invoke = [context]() {
+        disasm_view::navigate_forward(context);
+        return action_handler_result_t::completed();
+    };
+    menu.actions["analysis.navigate.functions"].invoke = []() {
+        const auto result = aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.analysis.functions"));
+        return result.ok() ? action_handler_result_t::completed()
+            : action_handler_result_t::failed(result.detail);
+    };
+    menu.actions["analysis.navigate.structures"].invoke = []() {
+        const auto result = aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.types.structures"));
+        return result.ok() ? action_handler_result_t::completed()
+            : action_handler_result_t::failed(result.detail);
+    };
+    menu.actions["analysis.navigate.types"].invoke = []() {
+        const auto result = aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.types.inferred"));
+        return result.ok() ? action_handler_result_t::completed()
+            : action_handler_result_t::failed(result.detail);
+    };
+    if (source_address) {
+        const auto source = *source_address;
+        copy("analysis.copy.address", canonical_address_text(source));
+        copy("analysis.copy.address_va", "0x" + canonical_address_text(source));
+        menu.actions["analysis.navigate.disassembly"].invoke = [context, source]() {
+            navigate_to_disassembly(context, source);
+            return action_handler_result_t::completed();
+        };
+        menu.actions["analysis.navigate.graph"].invoke = [context, source]() {
+            navigate_to_graph(context, source);
+            return action_handler_result_t::completed();
+        };
+        menu.actions["analysis.navigate.pseudocode"].invoke = [context, source]() {
+            request_decompile(context, source, false);
+            aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("document.pseudocode"));
+            return action_handler_result_t::completed();
+        };
+    }
+    const auto typed = source_address
+        ? typed_source_address(context, *source_address) : std::nullopt;
+    if (typed) {
+        const auto value = *typed;
+        const auto runtime =
+            disasm_view::runtime_address(context, value).value_or(value.value);
+        menu.actions["analysis.navigate.hex"].invoke = [context, value]() {
+            return navigate_to_hex(context, value)
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(
+                    "The selected address is unavailable in the Hex document");
+        };
+        menu.actions["analysis.modify.rename"].invoke = [context, value]() {
+            rename_dialog::open(context, value);
+            return action_handler_result_t::completed();
+        };
+        menu.actions["analysis.modify.comment"].invoke = [context, value]() {
+            comment_dialog::open(context, value);
+            return action_handler_result_t::completed();
+        };
+        menu.actions["analysis.navigate.xrefs"].invoke = [context, runtime]() {
+            disasm_view::open_xrefs(runtime, context);
+            aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.analysis.references"));
+            return action_handler_result_t::completed();
+        };
+        const auto name = disasm_view::resolve_name(context, value);
+        if (!name.empty())
+            copy("analysis.copy.name", name);
+        menu.actions["analysis.modify.bookmark"].invoke = [context, value]() {
+            return disasm_view::queue_bookmark(context, value, {})
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(
+                    "The workspace rejected the bookmark request");
+        };
+    }
+    menu.actions["analysis.modify.retype"].capability =
+        capability_state_t::unavailable(
+            "Use Types > Apply Type until canonical type-entry validation is available here");
+    open(std::move(menu), origin);
 }
 
 void persist_line_selection(
@@ -892,15 +1119,6 @@ void render(float, float, float width, float height,
 
     const auto tabs = snapshot_tabs(context);
     const std::uint64_t header_address = active_tab_address(context);
-    const auto header = aida::ui::view_header("Pseudocode",
-        context.workspace->identity().bin_name().c_str(), "Refresh",
-        header_address != 0 ? "Disassembly" : nullptr,
-        tabs.empty() ? aida::ui::status_kind_t::neutral
-                     : aida::ui::status_kind_t::accent);
-    if (header.primary_clicked)
-        refresh_active_tab(context);
-    if (header.secondary_clicked && header_address != 0)
-        navigate_to_disassembly(context, header_address);
 
     int active = -1;
     {
@@ -910,11 +1128,12 @@ void render(float, float, float width, float height,
     std::optional<std::size_t> activate_index;
     std::optional<std::size_t> close_index;
     aida::ui::begin_toolbar("##pseudocode_tabs",
-        aida::ui::metrics::row::inspector +
-        aida::ui::metrics::toolbar::padding_y * 2.0f + 2.0f);
+        aida::ui::metrics::control::toolbar_h +
+        aida::ui::metrics::toolbar::padding_y * 2.0f);
+    ImGui::TextDisabled("Pseudocode");
+    ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
     for (std::size_t index = 0; index < tabs.size(); ++index) {
-        if (index != 0)
-            ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
         std::string label = tabs[index].label +
             (tabs[index].decompiling ? "  *" : tabs[index].is_error ? "  !" : "");
         if (label.size() > 48)
@@ -933,8 +1152,10 @@ void render(float, float, float width, float height,
         if (close_index)
             break;
     }
-    if (tabs.empty())
+    if (tabs.empty()) {
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
         aida::ui::status_badge("No open functions", aida::ui::status_kind_t::neutral);
+    }
     aida::ui::end_toolbar();
     if (activate_index) {
         const auto& tab = tabs[*activate_index];
@@ -954,6 +1175,8 @@ void render(float, float, float width, float height,
     tab_t active_tab;
     bool has_active = false;
     int selected_line = -1;
+    std::uint32_t selected_token_begin = 0;
+    std::uint32_t selected_token_end = 0;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->active >= 0 &&
@@ -961,6 +1184,8 @@ void render(float, float, float width, float height,
             active_tab = state->tabs[static_cast<std::size_t>(state->active)];
             has_active = true;
             selected_line = state->selected_line;
+            selected_token_begin = state->selected_token_begin;
+            selected_token_end = state->selected_token_end;
         }
     }
 
@@ -986,28 +1211,49 @@ void render(float, float, float width, float height,
     if (has_active) {
         aida::ui::begin_toolbar("##pseudocode_actions",
             aida::ui::metrics::control::toolbar_h +
-            aida::ui::metrics::toolbar::padding_y * 2.0f + 2.0f);
-        if (aida::ui::toolbar_button("copy", "Copy", false, !can_copy,
+            aida::ui::metrics::toolbar::padding_y * 2.0f);
+        if (aida::ui::toolbar_button("refresh", "Refresh  F5", false, false,
+                "Regenerate or focus this pseudocode document (F5)"))
+            refresh_active_tab(context);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        if (aida::ui::toolbar_button("graph", "Graph  Space", false,
+                header_address == 0,
+                "Open the current function as a control-flow graph (Space)") &&
+            header_address != 0)
+            navigate_to_graph(context, header_address);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        if (aida::ui::toolbar_button("disassembly", "Disassembly  Enter", false,
+                header_address == 0,
+                "Open the mapped disassembly location (Enter)") &&
+            header_address != 0)
+            navigate_to_disassembly(context, header_address);
+        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+        if (aida::ui::toolbar_button("copy", "Copy All", false, !can_copy,
                 "Copy the complete pseudocode document") && can_copy)
             ImGui::SetClipboardText(cached->document->rendered_text.c_str());
-        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
-        if (aida::ui::toolbar_button("cancel", "Cancel", false, !can_cancel,
-                "Cancel the active decompilation") && can_cancel)
-            cancel_active_decompile(context);
-        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
-        if (aida::ui::toolbar_button("retry", "Retry", false, !can_retry,
-                "Run decompilation again") && can_retry)
-            refresh_active_tab(context);
-        if (can_retry && !active_tab.error_acknowledged) {
+        if (can_cancel) {
             ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
-            if (aida::ui::toolbar_button("acknowledge", "Acknowledge", false, false,
-                    "Acknowledge the current diagnostic")) {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                if (state->active >= 0 &&
-                    static_cast<std::size_t>(state->active) < state->tabs.size())
-                    state->tabs[static_cast<std::size_t>(state->active)]
-                        .error_acknowledged = true;
-                active_tab.error_acknowledged = true;
+            if (aida::ui::toolbar_button("cancel", "Cancel", false, false,
+                    "Cancel the active decompilation"))
+                cancel_active_decompile(context);
+        }
+        if (can_retry) {
+            ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+            if (aida::ui::toolbar_button("retry", "Retry", false, false,
+                    "Run decompilation again"))
+                refresh_active_tab(context);
+            if (!active_tab.error_acknowledged) {
+                ImGui::SameLine(0.0f, aida::ui::metrics::spacing::xs);
+                if (aida::ui::toolbar_button("acknowledge", "Acknowledge",
+                        false, false, "Acknowledge the current diagnostic")) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    if (state->active >= 0 &&
+                        static_cast<std::size_t>(state->active) <
+                            state->tabs.size())
+                        state->tabs[static_cast<std::size_t>(state->active)]
+                            .error_acknowledged = true;
+                    active_tab.error_acknowledged = true;
+                }
             }
         }
         ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
@@ -1021,15 +1267,22 @@ void render(float, float, float width, float height,
             aida::ui::status_badge("Not generated", aida::ui::status_kind_t::neutral);
         aida::ui::end_toolbar();
     }
-    if (!diagnostics.empty() && ImGui::CollapsingHeader("Diagnostics")) {
-        for (std::size_t index = 0; index < diagnostics.size(); ++index) {
-            const auto& diagnostic = diagnostics[index];
-            const auto& message = diagnostic.message.empty()
-                ? diagnostic.localization_key : diagnostic.message;
-            const std::string notice_id = "diagnostic_" + std::to_string(index);
-            aida::ui::inline_notice(notice_id.c_str(), "Decompiler diagnostic",
-                message.empty() ? "No diagnostic details were provided." : message.c_str(),
-                aida::ui::status_kind_t::warning);
+    if (!diagnostics.empty()) {
+        const std::string diagnostic_label = "Decompiler diagnostics (" +
+            std::to_string(diagnostics.size()) + ")";
+        if (ImGui::CollapsingHeader(diagnostic_label.c_str())) {
+            for (std::size_t index = 0; index < diagnostics.size(); ++index) {
+                const auto& diagnostic = diagnostics[index];
+                const auto& message = diagnostic.message.empty()
+                    ? diagnostic.localization_key : diagnostic.message;
+                const std::string notice_id =
+                    "diagnostic_" + std::to_string(index);
+                aida::ui::inline_notice(notice_id.c_str(),
+                    "Decompiler diagnostic",
+                    message.empty()
+                        ? "No diagnostic details were provided." : message.c_str(),
+                    aida::ui::status_kind_t::warning);
+            }
         }
     }
 
@@ -1061,20 +1314,31 @@ void render(float, float, float width, float height,
                 failure_message, "Retry", ImVec2(0.0f, 152.0f)))
             refresh_active_tab(context);
     } else {
+        constexpr float gutter_width = 58.0f;
+        const float row_height = (std::max)(
+            ImGui::GetTextLineHeight() + 3.0f,
+            aida::ui::metrics::table::compact_row_h);
         ImGui::PushStyleColor(ImGuiCol_ChildBg,
             ImGui::ColorConvertU32ToFloat4(theme.panel_header));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-            ImVec2(aida::ui::metrics::table::cell_pad_x,
-                aida::ui::metrics::table::cell_pad_y));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::BeginChild("##pseudocode_header",
             ImVec2(0.0f, aida::ui::metrics::table::header_h), true,
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        ImGui::TextDisabled("Line");
-        ImGui::SameLine(64.0f);
-        ImGui::TextDisabled("Source");
+        const auto header_origin = ImGui::GetCursorScreenPos();
+        auto* header_draw = ImGui::GetWindowDrawList();
+        header_draw->AddText(ImVec2(header_origin.x + 12.0f,
+            header_origin.y + 3.0f), theme.text_dim, "LINE");
+        header_draw->AddLine(ImVec2(header_origin.x + gutter_width,
+            header_origin.y), ImVec2(header_origin.x + gutter_width,
+            header_origin.y + aida::ui::metrics::table::header_h),
+            theme.border_subtle);
+        header_draw->AddText(ImVec2(header_origin.x + gutter_width + 10.0f,
+            header_origin.y + 3.0f), theme.text_dim,
+            "PSEUDOCODE");
         ImGui::EndChild();
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::BeginChild("##pseudocode_lines", ImVec2(0.0f, 0.0f), false,
             ImGuiWindowFlags_HorizontalScrollbar);
         aida::workbench::pseudocode_document::pseudocode_page_t first_page;
@@ -1086,9 +1350,10 @@ void render(float, float, float width, float height,
                 static_cast<std::uint32_t>((std::numeric_limits<int>::max)())))
             : 0;
         ImGuiListClipper clipper;
-        const float row_height = (std::max)(aida::ui::metrics::table::compact_row_h,
-            ImGui::GetTextLineHeightWithSpacing());
         clipper.Begin(line_count, row_height);
+        std::optional<std::uint64_t> selected_source_address;
+        std::string selected_line_text;
+        std::string selected_token_text;
         while (clipper.Step()) {
             auto first = static_cast<std::uint32_t>(clipper.DisplayStart);
             const auto end = static_cast<std::uint32_t>(clipper.DisplayEnd);
@@ -1102,31 +1367,159 @@ void render(float, float, float width, float height,
                     break;
                 for (const auto& line : page.lines) {
                     const auto line_index = static_cast<int>(line.line_number - 1U);
-                    const auto source_address = line_source_address(
-                        *workbench.pseudocode_document, line, page);
                     ImGui::PushID(line_index);
-                    if (ImGui::Selectable("##pseudocode_line",
-                            selected_line == line_index,
-                            ImGuiSelectableFlags_AllowDoubleClick,
-                            ImVec2(0.0f, row_height))) {
+                    const auto line_origin = ImGui::GetCursorScreenPos();
+                    const float text_width = ImGui::CalcTextSize(
+                        line.text.c_str()).x;
+                    const float row_width = (std::max)(
+                        ImGui::GetContentRegionAvail().x,
+                        gutter_width + 18.0f + text_width);
+                    ImGui::InvisibleButton("##pseudocode_line",
+                        ImVec2(row_width, row_height));
+                    const bool hovered = ImGui::IsItemHovered();
+                    const bool left_clicked = ImGui::IsItemClicked(
+                        ImGuiMouseButton_Left);
+                    const bool right_clicked = ImGui::IsItemClicked(
+                        ImGuiMouseButton_Right);
+                    auto* draw = ImGui::GetWindowDrawList();
+                    if (selected_line == line_index)
+                        draw->AddRectFilled(line_origin,
+                            ImVec2(line_origin.x + row_width,
+                                line_origin.y + row_height),
+                            theme.selection);
+                    else if (hovered)
+                        draw->AddRectFilled(line_origin,
+                            ImVec2(line_origin.x + row_width,
+                                line_origin.y + row_height),
+                            theme.hover_wash);
+                    draw->AddRectFilled(line_origin,
+                        ImVec2(line_origin.x + gutter_width,
+                            line_origin.y + row_height),
+                        aida::ui::with_alpha(theme.bg_elevated, alpha));
+                    draw->AddLine(ImVec2(line_origin.x + gutter_width,
+                        line_origin.y), ImVec2(line_origin.x + gutter_width,
+                        line_origin.y + row_height), theme.border_subtle);
+                    char line_number[16]{};
+                    std::snprintf(line_number, sizeof(line_number), "%5u",
+                        line.line_number);
+                    draw->AddText(ImVec2(line_origin.x + 9.0f,
+                        line_origin.y + 1.0f),
+                        aida::ui::with_alpha(theme.text_lineno, alpha),
+                        line_number);
+
+                    const ImVec2 text_origin(line_origin.x + gutter_width + 10.0f,
+                        line_origin.y + 1.0f);
+                    const auto mouse = ImGui::GetIO().MousePos;
+                    const aida::workbench::pseudocode_document::pseudocode_token_view_t*
+                        hovered_token = nullptr;
+                    std::uint32_t rendered_until = line.text_begin;
+                    for (const auto& token : page.tokens) {
+                        const auto begin = (std::max)(token.range.begin,
+                            line.text_begin);
+                        const auto end = (std::min)(token.range.end,
+                            line.text_end);
+                        if (begin >= end)
+                            continue;
+                        if (begin > rendered_until) {
+                            const auto gap_begin = rendered_until - line.text_begin;
+                            const auto gap_end = begin - line.text_begin;
+                            const auto* text_begin = line.text.data();
+                            const float gap_x = text_origin.x +
+                                ImGui::CalcTextSize(text_begin,
+                                    text_begin + gap_begin).x;
+                            draw->AddText(ImVec2(gap_x, text_origin.y),
+                                aida::ui::with_alpha(theme.text_primary, alpha),
+                                text_begin + gap_begin, text_begin + gap_end);
+                        }
+                        const auto local_begin = begin - line.text_begin;
+                        const auto local_end = end - line.text_begin;
+                        if (local_end > line.text.size())
+                            continue;
+                        const auto* text_begin = line.text.data();
+                        const auto* span_begin = text_begin + local_begin;
+                        const auto* span_end = text_begin + local_end;
+                        const float span_x = text_origin.x +
+                            ImGui::CalcTextSize(text_begin, span_begin).x;
+                        const float span_width =
+                            ImGui::CalcTextSize(span_begin, span_end).x;
+                        if (selected_token_begin == token.range.begin &&
+                            selected_token_end == token.range.end &&
+                            selected_line == line_index && span_width > 0.0f)
+                            draw->AddRectFilled(ImVec2(span_x, line_origin.y),
+                                ImVec2(span_x + span_width,
+                                    line_origin.y + row_height),
+                                theme.selection_strong);
+                        draw->AddText(ImVec2(span_x, text_origin.y),
+                            token_color(token.kind, theme, alpha),
+                            span_begin, span_end);
+                        if (hovered && mouse.x >= span_x &&
+                            mouse.x < span_x + (std::max)(span_width, 2.0f))
+                            hovered_token = &token;
+                        rendered_until = (std::max)(rendered_until, end);
+                    }
+                    if (rendered_until < line.text_end) {
+                        const auto* text_begin = line.text.data();
+                        const auto gap_begin = rendered_until - line.text_begin;
+                        const float gap_x = text_origin.x +
+                            ImGui::CalcTextSize(text_begin,
+                                text_begin + gap_begin).x;
+                        draw->AddText(ImVec2(gap_x, text_origin.y),
+                            aida::ui::with_alpha(theme.text_primary, alpha),
+                            text_begin + gap_begin, line.text.data() + line.text.size());
+                    }
+                    const auto source_address = token_source_address(
+                        *workbench.pseudocode_document, hovered_token,
+                        line, page);
+                    if (source_address)
+                        draw->AddCircleFilled(ImVec2(line_origin.x + 4.0f,
+                            line_origin.y + row_height * 0.5f), 1.75f,
+                            theme.accent_u32);
+                    if (selected_line == line_index) {
+                        selected_source_address = token_source_address(
+                            *workbench.pseudocode_document,
+                            token_for_position(page, selected_token_begin),
+                            line, page);
+                        selected_line_text = line.text;
+                        if (selected_token_end > selected_token_begin &&
+                            selected_token_begin >= line.text_begin &&
+                            selected_token_end <= line.text_end) {
+                            selected_token_text = line.text.substr(
+                                selected_token_begin - line.text_begin,
+                                selected_token_end - selected_token_begin);
+                        }
+                    }
+                    if (hovered_token && hovered && source_address) {
+                        ImGui::SetTooltip("%s\nMapped address  0x%s\nEnter: disassembly   Space: graph",
+                            hovered_token->text.c_str(),
+                            canonical_address_text(*source_address).c_str());
+                    }
+                    if (left_clicked || right_clicked) {
+                        const auto token_begin = hovered_token
+                            ? hovered_token->range.begin : line.text_begin;
+                        const auto token_end = hovered_token
+                            ? hovered_token->range.end : line.text_end;
                         {
                             std::lock_guard<std::mutex> lock(state->mutex);
                             state->selected_line = line_index;
+                            state->selected_token_begin = token_begin;
+                            state->selected_token_end = token_end;
                         }
                         selected_line = line_index;
+                        selected_token_begin = token_begin;
+                        selected_token_end = token_end;
                         aida::workbench::pseudocode_document::pseudocode_selection_t selection;
                         selection.line_number = line.line_number;
                         if (source_address) {
                             selection.kind = aida::workbench::selection_kind_t::address;
                             selection.has_address = true;
                             selection.address = *source_address;
-                            selection.token_begin = line.text_begin;
+                            selection.token_begin = token_begin;
                             selection.token_end = (std::max)(
-                                line.text_end, line.text_begin + 1U);
+                                token_end, token_begin + 1U);
                         } else if (line.text_end > line.text_begin) {
                             selection.kind = aida::workbench::selection_kind_t::source;
-                            selection.token_begin = line.text_begin;
-                            selection.token_end = line.text_end;
+                            selection.token_begin = token_begin;
+                            selection.token_end = token_end;
                         }
                         if (selection.kind != aida::workbench::selection_kind_t::none)
                             static_cast<void>(
@@ -1138,72 +1531,26 @@ void render(float, float, float width, float height,
                             if (typed)
                                 disasm_view::select_address(*typed, context, false);
                         }
-                        if (source_address &&
+                        if (left_clicked && source_address &&
                             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                             navigate_to_disassembly(context, *source_address);
                     }
-                    ImGui::SameLine(0.0f, 0.0f);
-                    ImGui::TextDisabled("%4u", line.line_number);
-                    ImGui::SameLine(64.0f);
-                    ImGui::TextUnformatted(line.text.c_str());
-                    const bool typed_pointer_request = ImGui::IsItemClicked(ImGuiMouseButton_Right);
                     aida::ui::context_menu_open_origin_t menu_origin{};
-                    const bool pointer_menu = typed_pointer_request;
                     const bool keyboard_menu = selected_line == line_index &&
                         aida::ui::analysis_context_menu::keyboard_request(menu_origin);
-                    if (pointer_menu || keyboard_menu) {
-                        using namespace aida::ui::analysis_context_menu;
-                        using aida::ui::action_handler_result_t;
-                        context_t menu;
-                        menu.kind = menu_kind_t::pseudocode;
-                        const auto generation = context.workspace->generation();
-                        const auto revision = context.workspace->analysis_revision();
-                        menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
-                            (generation << 6u) + (generation >> 2u));
-                        menu.live_generation = [workspace = context.workspace]() {
-                            const auto current = workspace->generation();
-                            const auto current_revision = workspace->analysis_revision();
-                            return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
-                                (current << 6u) + (current >> 2u));
-                        };
-                        menu.actions["analysis.copy.line"].invoke = [text = line.text]() {
-                            ImGui::SetClipboardText(text.c_str());
-                            return action_handler_result_t::completed();
-                        };
-                        menu.actions["analysis.copy.text"] = menu.actions["analysis.copy.line"];
-                        const auto typed = source_address
-                            ? typed_source_address(context, *source_address) : std::nullopt;
-                        if (source_address) {
-                            menu.actions["analysis.navigate.disassembly"].invoke =
-                                [context, source = *source_address]() {
-                                    navigate_to_disassembly(context, source);
-                                    return action_handler_result_t::completed();
-                                };
-                            char address[32]{};
-                            std::snprintf(address, sizeof(address), "%016llX",
-                                static_cast<unsigned long long>(*source_address));
-                            menu.actions["analysis.copy.address"].invoke = [value = std::string(address)]() {
-                                ImGui::SetClipboardText(value.c_str());
-                                return action_handler_result_t::completed();
-                            };
-                        }
-                        if (typed) {
-                            menu.actions["analysis.modify.rename"].invoke = [context, value = *typed]() {
-                                rename_dialog::open(context, value);
-                                return action_handler_result_t::completed();
-                            };
-                            menu.actions["analysis.modify.comment"].invoke = [context, value = *typed]() {
-                                comment_dialog::open(context, value);
-                                return action_handler_result_t::completed();
-                            };
-                            const auto runtime = disasm_view::runtime_address(context, *typed).value_or(typed->value);
-                            menu.actions["analysis.navigate.xrefs"].invoke = [context, runtime]() {
-                                disasm_view::open_xrefs(runtime, context);
-                                return action_handler_result_t::completed();
-                            };
-                        }
-                        open(std::move(menu), pointer_menu
-                            ? aida::ui::context_menu_open_origin_t::pointer : menu_origin);
+                    if (right_clicked || keyboard_menu) {
+                        const auto menu_source = keyboard_menu
+                            ? token_source_address(*workbench.pseudocode_document,
+                                token_for_position(page, selected_token_begin),
+                                line, page)
+                            : source_address;
+                        const auto token_text = hovered_token
+                            ? hovered_token->text : selected_token_text;
+                        open_line_context_menu(context, line, menu_source,
+                            token_text, state, static_cast<int>(line_index),
+                            selected_token_begin, selected_token_end, right_clicked
+                                ? aida::ui::context_menu_open_origin_t::pointer
+                                : menu_origin);
                     }
                     ImGui::PopID();
                 }
@@ -1211,11 +1558,18 @@ void render(float, float, float width, float height,
             }
         }
         ImGui::EndChild();
+        ImGui::PopStyleVar();
+        const bool code_focused =
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        if (code_focused && selected_source_address) {
+            const auto& io = ImGui::GetIO();
+			if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+				ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
+                ImGui::SetClipboardText((selected_token_text.empty()
+                    ? selected_line_text : selected_token_text).c_str());
+        }
     }
     aida::ui::analysis_context_menu::render();
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        ImGui::IsKeyPressed(ImGuiKey_F5, false))
-        refresh_active_tab(context);
     ImGui::PopStyleColor();
     ImGui::EndChild();
     ImGui::PopID();

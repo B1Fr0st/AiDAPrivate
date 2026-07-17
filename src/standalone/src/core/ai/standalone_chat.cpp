@@ -18,8 +18,11 @@
 #include "../ui/fonts.hpp"
 #include "../ui/task_center.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
 #include "../ui/chat_render.hpp"
+#include "../ui/toast_notification.hpp"
 #include "../helpers/globals.h"
+#include "../../preview/shell_preview_platform.hpp"
 
 #else
 
@@ -73,6 +76,8 @@
 #include "../ui/task_center.hpp"
 #include "../ui/application_view_registry.hpp"
 #include "../ui/chat_render.hpp"
+#include "../../helpers/win32_dialog.hpp"
+#include "../ui/toast_notification.hpp"
 
 #include "../helpers/globals.h"
 #include "../session/analysis_session.hpp"
@@ -105,22 +110,34 @@
 
 #endif
 
+#include "../settings/settings_persistence_service.hpp"
+#include "../settings/theme_transfer_service.hpp"
 #include "../editor/code_editor.hpp"
+#include "../disasm/disasm_view.hpp"
+#include "../debugger/debugger_view.hpp"
+#include "../network/network_view.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
+
+extern HWND g_hwnd;
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 
@@ -1033,6 +1050,9 @@ std::string build_system_prompt(bool force_xml_fallback = false)
         "Users run `irm https://api.aidapro.net | iex`; that PowerShell launcher verifies the Camoufox browser sidecar while AiDA uses its packaged frozen reverse-MCP runtime when available. "
         "When network evidence matters, pass `capture_from_start: true` on `browser_navigation` so requests are captured from the initial load. "
         "Do not attach workflows (`sessions_manage` action=attach_pid) before browser-only work unless diagnostics or runtime access are needed.\n\n";
+    prompt +=
+        "## Human-reviewed reverse-engineering changes\n"
+        "Never mutate analysis metadata, static/live bytes, or network requests merely because you suggested a change in prose. When the user asks to review one exact change and current tool/evidence results provide every required identity and before value, emit one fenced `aida-proposal` JSON object with schema `aida.re-proposal/v1`, a bounded `provenance`, and a concrete `rationale`. Supported kinds are `analysis.rename`, `analysis.comment`, `analysis.type`, `patch.static`, `patch.live`, `network.request_edit`, and `network.replay_stage`. Analysis targets require `workspace_id`, `address`, `generation`, `analysis_revision`, and `overlay_revision`. Live patches require `pid` and `address`. Network targets require `artifact_id`, `artifact_kind`, `source_view_id`, `source_id`, `timestamp`, `revision`, `content_hash`, `content_size`, `host`, `port`, and `tls`. Include exact `before` and `after`; patch bytes are hexadecimal and network values are complete raw HTTP/1 requests. Do not invent missing identities or before values. AiDA will reject stale or incomplete proposals, show the exact scope in Evidence Review, require human confirmation, and route accepted proposals through the authoritative reversible review/service. Network replay proposals only stage Repeater drafts and never send traffic.\n\n";
 
     {
         auto& tools = s_mcp_server.get_tools();
@@ -2298,98 +2318,14 @@ void restore_workspace_state()
     else
         file_browser::refresh();
 
-    if (!g_sa_settings.workspace.open_tabs_json.empty()) {
-        try {
-            const auto document = json::parse(g_sa_settings.workspace.open_tabs_json);
-            const json* tab_items = document.is_array() ? &document : nullptr;
-            if (document.is_object()) {
-                const bool supported = document.value("schema", std::string{}) ==
-                        "aida.programming-documents" &&
-                    document.value("version", 0) == 1;
-                const auto found = document.find("tabs");
-                if (supported && found != document.end() && found->is_array())
-                    tab_items = &*found;
-            }
-            if (tab_items) {
-                std::size_t restored_tab_count = 0;
-                for (const auto& item : *tab_items) {
-                    if (restored_tab_count >= 4096)
-                        break;
-                    const bool legacy = item.is_string();
-                    if (!legacy && !item.is_object())
-                        continue;
-                    const std::string path = legacy
-                        ? item.get<std::string>()
-                        : item.value("path", std::string{});
-                    if (path.empty())
-                        continue;
-                    std::ifstream ifs(path, std::ios::binary);
-                    if (!ifs.is_open())
-                        continue;
-                    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-                    const auto filename = std::filesystem::path(path).filename().string();
-                    file_tabs::open_or_focus(path, filename, content);
-                    ++restored_tab_count;
-                    if (!legacy && file_tabs::is_valid_tab_index(file_tabs::active_tab)) {
-                        auto& restored = file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)];
-                        restored.document_id = item.value("document_id", std::uint64_t{0});
-                        restored.group_id = item.value("group_id", std::uint32_t{0});
-                        restored.pinned = item.value("pinned", false);
-                        restored.caret_line = item.value("caret_line", 0);
-                        restored.caret_column = item.value("caret_column", 0);
-                    }
-                }
-                file_tabs::normalize_document_identities();
-                if (document.is_object()) {
-                    const auto groups = document.find("groups");
-                    if (groups != document.end() && groups->is_array()) {
-                        std::size_t restored_group_count = 0;
-                        for (const auto& group_item : *groups) {
-                            if (restored_group_count >= 256) break;
-                            if (!group_item.is_object()) continue;
-                            ++restored_group_count;
-                            const auto group = group_item.value("group_id", std::uint32_t{0});
-                            const auto active_document = group_item.value(
-                                "active_document_id", std::uint64_t{0});
-                            const int active_index = file_tabs::find_document(active_document);
-                            if (active_index >= 0 &&
-                                file_tabs::tabs[file_tabs::tab_index(active_index)].group_id == group)
-                                file_tabs::active_document_by_group[group] = active_document;
-                            auto& history = file_tabs::navigation_by_group[group];
-                            const auto restore_history = [&](const char* name,
-                                                             std::deque<file_tabs::navigation_entry_t>& output) {
-                                const auto values = group_item.find(name);
-                                if (values == group_item.end() || !values->is_array()) return;
-                                for (const auto& value : *values) {
-                                    if (output.size() >= 128) break;
-                                    if (!value.is_object()) continue;
-                                    file_tabs::navigation_entry_t entry;
-                                    entry.document_id = value.value("document_id", std::uint64_t{0});
-                                    entry.caret_line = (std::max)(value.value("line", 0), 0);
-                                    entry.caret_column = (std::max)(value.value("column", 0), 0);
-                                    const int index = file_tabs::find_document(entry.document_id);
-                                    if (index >= 0 &&
-                                        file_tabs::tabs[file_tabs::tab_index(index)].group_id == group)
-                                        output.push_back(entry);
-                                }
-                            };
-                            restore_history("back", history.back);
-                            restore_history("forward", history.forward);
-                        }
-                    }
-                    const auto active_document = document.value(
-                        "active_document_id", std::uint64_t{0});
-                    const int active_index = file_tabs::find_document(active_document);
-                    if (active_index >= 0)
-                        file_tabs::switch_to(active_index, false);
-                } else if (g_sa_settings.workspace.active_tab >= 0 &&
-                    g_sa_settings.workspace.active_tab < static_cast<int>(file_tabs::tabs.size())) {
-                    file_tabs::switch_to(g_sa_settings.workspace.active_tab, false);
-                }
-            }
-        } catch (...) {
-        }
-    }
+    const auto restored = file_tabs::restore_programming_session(
+        g_sa_settings.workspace.open_tabs_json, g_sa_settings.workspace.active_tab);
+    if (!restored.succeeded)
+        diag::log_tagged_critical_fmt("programming_documents",
+            "session_restore_rejected reason=%.512s", restored.detail.c_str());
+    else if (!restored.detail.empty())
+        diag::log_tagged_fmt("programming_documents", "session_restore detail=%.512s",
+            restored.detail.c_str());
 
     if (!g_sa_settings.workspace.last_active_path.empty() &&
         g_sa_settings.workspace.active_view == "disasm") {
@@ -2403,63 +2339,13 @@ void persist_workspace_state()
     g_sa_settings.workspace.root_path = file_browser::current_dir;
     g_sa_settings.workspace.active_tab = file_tabs::active_tab;
 
-    file_tabs::snapshot_active_to_tab();
-    json document = {
-        {"schema", "aida.programming-documents"},
-        {"version", 1},
-        {"tabs", json::array()},
-        {"groups", json::array()},
-        {"active_document_id", std::uint64_t{0}}
-    };
-    file_tabs::normalize_document_identities();
-    if (file_tabs::is_valid_tab_index(file_tabs::active_tab))
-        document["active_document_id"] =
-            file_tabs::tabs[file_tabs::tab_index(file_tabs::active_tab)].document_id;
-    for (const auto& tab : file_tabs::tabs) {
-        if (tab.filepath.empty())
-            continue;
-        document["tabs"].push_back({
-            {"path", tab.filepath},
-            {"document_id", tab.document_id},
-            {"group_id", tab.group_id},
-            {"pinned", tab.pinned},
-            {"caret_line", tab.caret_line},
-            {"caret_column", tab.caret_column}
-        });
-    }
-    std::vector<std::uint32_t> persisted_groups;
-    for (const auto& tab : file_tabs::tabs) {
-        if (tab.filepath.empty() ||
-            std::find(persisted_groups.begin(), persisted_groups.end(), tab.group_id) !=
-                persisted_groups.end())
-            continue;
-        persisted_groups.push_back(tab.group_id);
-        json group = {
-            {"group_id", tab.group_id},
-            {"active_document_id", file_tabs::active_document_by_group[tab.group_id]},
-            {"back", json::array()},
-            {"forward", json::array()}
-        };
-        const auto history = file_tabs::navigation_by_group.find(tab.group_id);
-        if (history != file_tabs::navigation_by_group.end()) {
-            const auto append_history = [](json& target,
-                                           const std::deque<file_tabs::navigation_entry_t>& source) {
-                for (const auto& entry : source)
-                    target.push_back({
-                        {"document_id", entry.document_id},
-                        {"line", entry.caret_line},
-                        {"column", entry.caret_column}
-                    });
-            };
-            append_history(group["back"], history->second.back);
-            append_history(group["forward"], history->second.forward);
-        }
-        document["groups"].push_back(std::move(group));
-    }
-    g_sa_settings.workspace.open_tabs_json = document.dump();
+    file_tabs::write_hot_exit_snapshot_all();
+    g_sa_settings.workspace.open_tabs_json =
+        file_tabs::serialize_programming_session();
 
-    if (code_editor::active && !code_editor::filepath.empty()) {
-        g_sa_settings.workspace.last_active_path = code_editor::filepath;
+	const auto editor_document = code_editor_widget::document_state();
+	if (editor_document.active && !editor_document.filepath.empty()) {
+		g_sa_settings.workspace.last_active_path = editor_document.filepath;
         g_sa_settings.workspace.active_view = "editor";
     } else if (const auto workspace = analysis_session::active_workspace();
                workspace && !workspace->identity().normalized_source_path().empty()) {
@@ -2665,7 +2551,8 @@ void init_standalone_chat()
     if (!g_sa_settings.custom_themes_json.empty()) {
         try {
             auto arr = nlohmann::json::parse(g_sa_settings.custom_themes_json);
-            if (arr.is_array()) {
+            if (arr.is_array() &&
+                arr.size() <= aida::theme_transfer::maximum_theme_count) {
                 custom_themes::list.clear();
                 for (auto& jt : arr) {
                     CustomThemeData ct;
@@ -2685,6 +2572,17 @@ void init_standalone_chat()
                     ct.acrylic_color = jt.value("acrylic_color", (DWORD)ct.acrylic_color);
                     ct.icon_index    = jt.value("icon_index",    ct.icon_index);
                     ct.icon_file_path= jt.value("icon_file_path", std::string{});
+                    const bool accent_valid = std::isfinite(ct.accent[0]) &&
+                        std::isfinite(ct.accent[1]) && std::isfinite(ct.accent[2]) &&
+                        ct.accent[0] >= 0.0f && ct.accent[0] <= 1.0f &&
+                        ct.accent[1] >= 0.0f && ct.accent[1] <= 1.0f &&
+                        ct.accent[2] >= 0.0f && ct.accent[2] <= 1.0f;
+                    if (ct.name.empty() ||
+                        ct.name.size() > aida::theme_transfer::maximum_theme_name_bytes ||
+                        !accent_valid || ct.icon_index < -1 || ct.icon_index > 4095 ||
+                        ct.icon_file_path.size() >
+                            aida::theme_transfer::maximum_icon_path_bytes)
+                        continue;
                     custom_themes::list.push_back(std::move(ct));
                 }
             }
@@ -3038,6 +2936,17 @@ void shutdown_standalone_chat()
     const bool queues_quiescent = shutdown_queues_quiescent("queue_drain_after_executor");
     shutdown_phase_done("queue_drain", queue_start);
 
+    conversations::process_store_completion(false);
+    ULONGLONG conversation_commit_start = shutdown_phase_begin("conversation_store_commit");
+    std::string conversation_commit_error;
+    const bool conversation_committed = conversations::commit_shutdown(
+        conversation_commit_error);
+    diag::log_tagged_critical_fmt("chat",
+        "conversation_store_shutdown_commit_done committed=%d error_present=%d",
+        conversation_committed ? 1 : 0,
+        conversation_commit_error.empty() ? 0 : 1);
+    shutdown_phase_done("conversation_store_commit", conversation_commit_start);
+
     if (queues_quiescent) {
         ULONGLONG dependency_start = shutdown_phase_begin("driver_event_shutdown");
         driver_bridge::shutdown("chat.shutdown_after_queues");
@@ -3053,7 +2962,15 @@ void shutdown_standalone_chat()
 
     ULONGLONG persist_start = shutdown_phase_begin("persist_state");
     persist_workspace_state();
-    g_sa_settings.save();
+    std::string settings_commit_error;
+    const bool settings_committed = aida::settings_persistence::shutdown_commit(
+        g_sa_settings, settings_commit_error);
+    if (!settings_committed)
+        diag::log_tagged_critical_fmt("chat",
+            "settings_shutdown_commit_failed detail=%.512s",
+            settings_commit_error.c_str());
+    else
+        diag::log_tagged_critical("chat", "settings_shutdown_commit_done");
     g_sa_ai_client.reset();
     shutdown_phase_done("persist_state", persist_start);
 
@@ -3429,21 +3346,9 @@ void chat_record_assistant_message_id(const std::string& message_id)
 std::string start_new_conversation()
 {
     diag::log_tagged("chat", "start_new_conversation enter");
-    aida::session::session_info_t info;
-    std::string new_id;
-    if (aida::session::create(info, std::string{}, std::string{}, std::string{}))
-        new_id = info.id;
-
-    conversations::current_id = new_id;
-    chat_bind_session(new_id);
-    g_chat_messages.clear();
-    g_chat_buf[0] = '\0';
-    g_chat_scroll_to_bottom = true;
-
-    workflow_tools::get_repetition_detector().reset();
-
-    diag::log_tagged_fmt("chat", "start_new_conversation done new_id='%s'", new_id.c_str());
-    return new_id;
+    conversations::new_chat();
+    diag::log_tagged("chat", "start_new_conversation queued");
+    return {};
 }
 
 #endif
@@ -3457,10 +3362,69 @@ constexpr std::size_t max_rendered_messages = 256U;
 constexpr std::size_t max_evidence_items = 256U;
 std::mutex s_evidence_mutex;
 std::deque<evidence_envelope_t> s_evidence;
+std::deque<std::pair<std::string, std::function<bool(std::string&)>>>
+    s_evidence_source_returns;
+std::shared_ptr<const std::vector<evidence_envelope_t>> s_evidence_publication =
+    std::make_shared<const std::vector<evidence_envelope_t>>();
 std::atomic<std::uint64_t> s_evidence_sequence{1};
 std::string s_loaded_evidence_session;
+std::string s_requested_evidence_session;
+struct evidence_session_publication_t {
+    std::string loaded;
+    std::string requested;
+};
+std::shared_ptr<const evidence_session_publication_t> s_evidence_session_publication =
+    std::make_shared<const evidence_session_publication_t>();
+std::optional<aida::conversation_store::request_t> s_deferred_evidence_save;
 std::mutex s_editor_proposal_mutex;
 editor_proposal_snapshot_t s_editor_proposal;
+std::mutex s_reverse_engineering_proposal_mutex;
+reverse_engineering_proposal_snapshot_t s_reverse_engineering_proposal;
+std::atomic<std::uint64_t> s_reverse_engineering_proposal_operation{1};
+std::shared_ptr<const reverse_engineering_proposal_snapshot_t>
+    s_reverse_engineering_proposal_publication =
+        std::make_shared<const reverse_engineering_proposal_snapshot_t>();
+
+struct reverse_engineering_proposal_binding_t {
+    disasm_view::workspace_context_t workspace;
+    aida::analysis::address_t address;
+    std::vector<std::uint8_t> before_bytes;
+    std::vector<std::uint8_t> after_bytes;
+    network_view::artifact_identity_t network_source;
+    network_view::artifact_identity_t network_staged;
+    std::vector<std::uint8_t> network_after;
+    std::uint32_t target_pid = 0;
+};
+
+reverse_engineering_proposal_binding_t s_reverse_engineering_proposal_binding;
+
+void publish_reverse_engineering_proposal_locked()
+{
+    std::shared_ptr<const reverse_engineering_proposal_snapshot_t> publication =
+        std::make_shared<reverse_engineering_proposal_snapshot_t>(
+            s_reverse_engineering_proposal);
+    std::atomic_store_explicit(&s_reverse_engineering_proposal_publication,
+        std::move(publication), std::memory_order_release);
+}
+
+void publish_evidence_locked()
+{
+    auto publication = std::make_shared<const std::vector<evidence_envelope_t>>(
+        s_evidence.begin(), s_evidence.end());
+    std::atomic_store_explicit(&s_evidence_publication, std::move(publication),
+        std::memory_order_release);
+}
+
+void publish_evidence_session_locked()
+{
+    auto mutable_publication = std::make_shared<evidence_session_publication_t>();
+    mutable_publication->loaded = s_loaded_evidence_session;
+    mutable_publication->requested = s_requested_evidence_session;
+    std::shared_ptr<const evidence_session_publication_t> publication =
+        std::move(mutable_publication);
+    std::atomic_store_explicit(&s_evidence_session_publication,
+        std::move(publication), std::memory_order_release);
+}
 
 std::uint64_t hash_append(std::uint64_t hash, std::string_view text)
 {
@@ -3482,197 +3446,87 @@ std::string evidence_session_id()
 {
     std::string session = chat_active_session();
     if (session.empty()) session = conversations::current_id;
-    return bounded_metadata_string(std::move(session), 256U);
+    return session.size() <= 128U ? session : std::string{};
 }
-
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-std::filesystem::path evidence_metadata_path(const std::string& session)
-{
-    const std::string directory = conversations::get_storage_dir();
-    if (directory.empty() || session.empty()) return {};
-    std::uint64_t hash = hash_append(14695981039346656037ULL, session);
-    return std::filesystem::path(directory) /
-        ("evidence-" + std::to_string(hash) + ".json");
-}
-
-nlohmann::json evidence_metadata_json(const evidence_envelope_t& item)
-{
-    return {
-        {"id", item.id},
-        {"project_id", item.project_id},
-        {"workspace_id", item.workspace_id},
-        {"session_id", item.session_id},
-        {"source_view_id", item.source_view_id},
-        {"source_kind", item.source_kind},
-        {"entity_id", item.entity_id},
-        {"display_label", item.display_label},
-        {"return_target", item.return_target},
-        {"address", item.address},
-        {"revision", item.revision},
-        {"generation", item.generation},
-        {"snapshot_hash", item.snapshot_hash},
-        {"content_hash", item.content_hash},
-        {"created_ms", item.created_ms},
-        {"truncated", item.truncated},
-        {"sensitive", item.sensitive}
-	};
-}
-#endif
 
 void persist_evidence_metadata(const std::string& session,
-                               const std::vector<evidence_envelope_t>& items)
+                               std::vector<aida::conversation_store::evidence_t> items)
 {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    (void)session;
-    (void)items;
-#else
     if (session.empty()) return;
-    try {
-        const auto path = evidence_metadata_path(session);
-        if (path.empty()) return;
-        std::filesystem::create_directories(path.parent_path());
-        nlohmann::json document;
-        document["schema"] = "aida.conversation.evidence-metadata";
-        document["version"] = 1;
-        document["conversation_id"] = session;
-        document["items"] = nlohmann::json::array();
-        const std::size_t first = items.size() > max_evidence_items
-            ? items.size() - max_evidence_items : 0U;
-        for (std::size_t index = first; index < items.size(); ++index)
-            document["items"].push_back(evidence_metadata_json(items[index]));
-        const auto temporary = path.wstring() + L".tmp";
-        {
-            std::ofstream stream(std::filesystem::path(temporary), std::ios::binary | std::ios::trunc);
-            if (!stream.is_open()) return;
-            const std::string encoded = document.dump(2);
-            stream.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
-            stream.flush();
-            if (!stream.good()) return;
-        }
-        if (!MoveFileExW(temporary.c_str(), path.wstring().c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            std::error_code ignored;
-            std::filesystem::remove(std::filesystem::path(temporary), ignored);
-        }
-    } catch (...) {
+    aida::conversation_store::request_t request;
+    request.operation = aida::conversation_store::operation_t::save_evidence;
+    request.current.id = session;
+    request.current.revision = conversations::current_revision;
+    request.catalog_generation = conversations::catalog_generation;
+    if (items.size() > max_evidence_items)
+        items.erase(items.begin(), items.end() - max_evidence_items);
+    request.current.evidence = std::move(items);
+    const auto submitted = aida::conversation_store::submit(request);
+    if (submitted == aida::conversation_store::request_result_t::busy) {
+        s_deferred_evidence_save = std::move(request);
+    } else if (submitted == aida::conversation_store::request_result_t::queued ||
+        submitted == aida::conversation_store::request_result_t::preview_recorded) {
+        s_deferred_evidence_save.reset();
+    } else {
+        conversations::persistence_error = "Evidence metadata persistence was rejected.";
     }
-#endif
-}
-
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-std::string json_metadata_string(const nlohmann::json& object, const char* key,
-                                 std::size_t limit)
-{
-    const auto found = object.find(key);
-    if (found == object.end() || !found->is_string()) return {};
-    return bounded_metadata_string(found->get<std::string>(), limit);
-}
-
-std::uint64_t json_metadata_u64(const nlohmann::json& object, const char* key)
-{
-    const auto found = object.find(key);
-    if (found == object.end()) return 0;
-    if (found->is_number_unsigned()) return found->get<std::uint64_t>();
-    if (found->is_number_integer()) {
-        const auto value = found->get<std::int64_t>();
-        return value > 0 ? static_cast<std::uint64_t>(value) : 0;
-    }
-    return 0;
-}
-
-bool json_metadata_bool(const nlohmann::json& object, const char* key)
-{
-    const auto found = object.find(key);
-	return found != object.end() && found->is_boolean() && found->get<bool>();
-}
-#endif
-
-std::deque<evidence_envelope_t> load_evidence_metadata(const std::string& session)
-{
-    std::deque<evidence_envelope_t> loaded;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    (void)session;
-#else
-    if (session.empty()) return loaded;
-    try {
-        std::ifstream stream(evidence_metadata_path(session), std::ios::binary);
-        if (!stream.is_open()) return loaded;
-        const auto document = nlohmann::json::parse(stream, nullptr, false);
-        if (document.is_discarded() || !document.is_object()) return loaded;
-        const auto schema = document.find("schema");
-        const auto version = document.find("version");
-        const auto conversation = document.find("conversation_id");
-        const auto items = document.find("items");
-        if (schema == document.end() || !schema->is_string() ||
-            schema->get<std::string>() != "aida.conversation.evidence-metadata" ||
-            version == document.end() || !version->is_number_integer() || version->get<int>() != 1 ||
-            conversation == document.end() || !conversation->is_string() ||
-            conversation->get<std::string>() != session ||
-            items == document.end() || !items->is_array()) return loaded;
-        for (const auto& object : *items) {
-            if (loaded.size() >= max_evidence_items) break;
-            if (!object.is_object()) continue;
-            evidence_envelope_t item;
-            item.id = json_metadata_string(object, "id", 256U);
-            item.project_id = json_metadata_string(object, "project_id", 256U);
-            item.workspace_id = json_metadata_string(object, "workspace_id", 256U);
-            item.session_id = json_metadata_string(object, "session_id", 256U);
-            item.source_view_id = json_metadata_string(object, "source_view_id", 256U);
-            item.source_kind = json_metadata_string(object, "source_kind", 128U);
-            item.entity_id = json_metadata_string(object, "entity_id", 512U);
-            item.display_label = json_metadata_string(object, "display_label", 512U);
-            item.return_target = json_metadata_string(object, "return_target", 512U);
-            item.address = json_metadata_u64(object, "address");
-            item.revision = json_metadata_u64(object, "revision");
-            item.generation = json_metadata_u64(object, "generation");
-            item.snapshot_hash = json_metadata_u64(object, "snapshot_hash");
-            item.content_hash = json_metadata_u64(object, "content_hash");
-            item.created_ms = json_metadata_u64(object, "created_ms");
-            item.truncated = json_metadata_bool(object, "truncated");
-            item.sensitive = json_metadata_bool(object, "sensitive");
-            item.stale = true;
-            item.stale_reason = "Snapshot content is not persisted; return to source and recapture.";
-            if (item.id.empty() || item.source_view_id.empty() || item.source_kind.empty() ||
-                item.entity_id.empty() || item.content_hash == 0) continue;
-            if (item.session_id.empty()) item.session_id = session;
-            if (item.session_id != session) continue;
-            loaded.push_back(std::move(item));
-        }
-    } catch (...) {
-    }
-#endif
-    return loaded;
 }
 
 void synchronize_evidence_session()
 {
+    if (s_deferred_evidence_save) {
+        const auto persistence = aida::conversation_store::status();
+        if (persistence.pending || persistence.failed) return;
+        const auto submitted = aida::conversation_store::submit(*s_deferred_evidence_save);
+        if (submitted == aida::conversation_store::request_result_t::queued ||
+            submitted == aida::conversation_store::request_result_t::preview_recorded)
+            s_deferred_evidence_save.reset();
+        if (submitted != aida::conversation_store::request_result_t::busy)
+            return;
+    }
     const std::string session = evidence_session_id();
+    const auto published_session = std::atomic_load_explicit(
+        &s_evidence_session_publication, std::memory_order_acquire);
+    if (published_session && (session == published_session->loaded ||
+            session == published_session->requested))
+        return;
     {
         std::lock_guard<std::mutex> lock(s_evidence_mutex);
-        if (session == s_loaded_evidence_session) return;
+        if (session == s_loaded_evidence_session || session == s_requested_evidence_session)
+            return;
     }
-    auto loaded = load_evidence_metadata(session);
-    std::lock_guard<std::mutex> lock(s_evidence_mutex);
-    s_evidence = std::move(loaded);
-    s_loaded_evidence_session = session;
-}
-
-void remove_evidence_metadata(const std::string& session)
-{
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    (void)session;
+    std::lock_guard<std::mutex> lock(s_evidence_mutex);
+    s_evidence.clear();
+    s_evidence_source_returns.clear();
+    s_loaded_evidence_session = session;
+    s_requested_evidence_session.clear();
+    publish_evidence_session_locked();
+    publish_evidence_locked();
 #else
-    try {
-        std::error_code ignored;
-        std::filesystem::remove(evidence_metadata_path(session), ignored);
-    } catch (...) {
+    if (session.empty()) {
+        std::lock_guard<std::mutex> lock(s_evidence_mutex);
+        s_evidence.clear();
+        s_evidence_source_returns.clear();
+        s_loaded_evidence_session.clear();
+        s_requested_evidence_session.clear();
+        publish_evidence_session_locked();
+        publish_evidence_locked();
+        return;
+    }
+    const auto persistence = aida::conversation_store::status();
+    if (persistence.pending || persistence.failed) return;
+    aida::conversation_store::request_t request;
+    request.operation = aida::conversation_store::operation_t::load_evidence;
+    request.target_id = session;
+    request.catalog_generation = conversations::catalog_generation;
+    const auto submitted = aida::conversation_store::submit(std::move(request));
+    if (submitted == aida::conversation_store::request_result_t::queued) {
+        std::lock_guard<std::mutex> lock(s_evidence_mutex);
+        s_requested_evidence_session = session;
+        publish_evidence_session_locked();
     }
 #endif
-    std::lock_guard<std::mutex> lock(s_evidence_mutex);
-    if (s_loaded_evidence_session == session) {
-        s_evidence.clear();
-        s_loaded_evidence_session.clear();
-    }
 }
 
 std::uint64_t message_fingerprint(const ChatMessage& message)
@@ -3725,6 +3579,300 @@ action_result_t completed(std::string detail = {})
     return result;
 }
 
+constexpr std::size_t max_proposal_payload_bytes = 64U * 1024U;
+constexpr std::size_t max_proposal_text_bytes = 4096U;
+constexpr std::size_t max_proposal_patch_bytes = 4096U;
+constexpr std::size_t max_network_request_bytes = 65535U;
+
+std::string bounded_proposal_text(const nlohmann::json& value, const char* key,
+                                  std::size_t limit, std::string& reason,
+                                  bool required = false)
+{
+    if (!value.contains(key)) {
+        if (required) reason = std::string("The proposal is missing '") + key + "'.";
+        return {};
+    }
+    if (!value[key].is_string()) {
+        reason = std::string("The proposal field '") + key + "' must be text.";
+        return {};
+    }
+    std::string result = value[key].get<std::string>();
+    if (result.size() > limit) {
+        reason = std::string("The proposal field '") + key + "' exceeds its safety bound.";
+        return {};
+    }
+    if (required && result.empty())
+        reason = std::string("The proposal field '") + key + "' cannot be empty.";
+    return result;
+}
+
+bool proposal_document(const ChatMessage& message, nlohmann::json& document,
+                       std::string& reason)
+{
+    if (message.is_user || message.streaming) {
+        reason = message.is_user
+            ? "Only an assistant or tool result can originate a reviewed change."
+            : "Wait for the assistant response to finish before reviewing its change.";
+        return false;
+    }
+    constexpr std::string_view marker = "```aida-proposal";
+    const auto marker_position = message.text.find(marker);
+    if (marker_position == std::string::npos) {
+        reason = "No fenced aida-proposal document is present in this message.";
+        return false;
+    }
+    if (message.text.find("```") != marker_position) {
+        reason = "The aida-proposal document must be the message's only fenced block.";
+        return false;
+    }
+    if ((marker_position != 0 && message.text[marker_position - 1U] != '\n') ||
+        marker_position + marker.size() >= message.text.size() ||
+        (message.text[marker_position + marker.size()] != '\r' &&
+         message.text[marker_position + marker.size()] != '\n')) {
+        reason = "The aida-proposal fence label must be exact and begin on its own line.";
+        return false;
+    }
+    if (message.text.find(marker, marker_position + marker.size()) != std::string::npos) {
+        reason = "A message may contain exactly one aida-proposal fence.";
+        return false;
+    }
+    const auto opening_line_end = message.text.find('\n', marker_position + marker.size());
+    if (opening_line_end == std::string::npos) {
+        reason = "The aida-proposal fence has no JSON payload.";
+        return false;
+    }
+    const auto closing_line = message.text.find("\n```", opening_line_end + 1U);
+    if (closing_line == std::string::npos) {
+        reason = "The aida-proposal fence is not closed.";
+        return false;
+    }
+    const auto payload_begin = opening_line_end + 1U;
+    const auto payload_end = closing_line;
+    const auto closing_end = closing_line + 4U;
+    if (payload_end <= payload_begin ||
+        (closing_end < message.text.size() && message.text[closing_end] != '\r' &&
+         message.text[closing_end] != '\n')) {
+        reason = "The aida-proposal closing fence must be exact and on its own line.";
+        return false;
+    }
+    if (message.text.find("```", closing_end) != std::string::npos) {
+        reason = "A message containing aida-proposal may not contain additional code fences.";
+        return false;
+    }
+    const std::size_t payload_size = payload_end - payload_begin;
+    if (payload_size > max_proposal_payload_bytes) {
+        reason = "The aida-proposal payload exceeds 64 KiB.";
+        return false;
+    }
+    document = nlohmann::json::parse(
+        message.text.begin() + static_cast<std::ptrdiff_t>(payload_begin),
+        message.text.begin() + static_cast<std::ptrdiff_t>(payload_end), nullptr, false);
+    if (document.is_discarded() || !document.is_object()) {
+        reason = "The aida-proposal payload is not a valid JSON object.";
+        return false;
+    }
+    if (!document.contains("schema") || !document["schema"].is_string() ||
+        document["schema"].get<std::string>() != "aida.re-proposal/v1") {
+        reason = "The proposal schema must be aida.re-proposal/v1.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+reverse_engineering_proposal_kind_t proposal_kind(std::string_view value)
+{
+    if (value == "analysis.rename") return reverse_engineering_proposal_kind_t::analysis_rename;
+    if (value == "analysis.comment") return reverse_engineering_proposal_kind_t::analysis_comment;
+    if (value == "analysis.type") return reverse_engineering_proposal_kind_t::analysis_type;
+    if (value == "patch.static") return reverse_engineering_proposal_kind_t::static_patch;
+    if (value == "patch.live") return reverse_engineering_proposal_kind_t::live_patch;
+    if (value == "network.request_edit") return reverse_engineering_proposal_kind_t::network_request_edit;
+    if (value == "network.replay_stage") return reverse_engineering_proposal_kind_t::network_replay_staging;
+    return reverse_engineering_proposal_kind_t::none;
+}
+
+const char* proposal_kind_label(reverse_engineering_proposal_kind_t kind)
+{
+    switch (kind) {
+    case reverse_engineering_proposal_kind_t::analysis_rename: return "Analysis rename";
+    case reverse_engineering_proposal_kind_t::analysis_comment: return "Analysis comment";
+    case reverse_engineering_proposal_kind_t::analysis_type: return "Analysis type";
+    case reverse_engineering_proposal_kind_t::static_patch: return "Static patch";
+    case reverse_engineering_proposal_kind_t::live_patch: return "Live patch review";
+    case reverse_engineering_proposal_kind_t::network_request_edit: return "Network request edit";
+    case reverse_engineering_proposal_kind_t::network_replay_staging: return "Network replay staging";
+    default: return "Unknown proposal";
+    }
+}
+
+bool parse_u64(const nlohmann::json& value, std::uint64_t& result)
+{
+    if (value.is_number_unsigned()) {
+        result = value.get<std::uint64_t>();
+        return true;
+    }
+    if (!value.is_string()) return false;
+    const std::string text = value.get<std::string>();
+    if (text.empty() || text.size() > 20U) return false;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    int base = 10;
+    if (text.size() > 2U && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        if (text.size() > 18U) return false;
+        begin += 2;
+        base = 16;
+    }
+    const auto parsed = std::from_chars(begin, end, result, base);
+    return parsed.ec == std::errc{} && parsed.ptr == end;
+}
+
+bool required_u64(const nlohmann::json& object, const char* key,
+                  std::uint64_t& result, std::string& reason)
+{
+    if (!object.contains(key) || !parse_u64(object[key], result)) {
+        reason = std::string("The proposal target '") + key + "' is missing or invalid.";
+        return false;
+    }
+    return true;
+}
+
+bool parse_hex_bytes(std::string_view text, std::size_t limit,
+                     std::vector<std::uint8_t>& bytes, std::string& reason)
+{
+    bytes.clear();
+    int high = -1;
+    for (char character : text) {
+        if (std::isspace(static_cast<unsigned char>(character))) continue;
+        int nibble = -1;
+        if (character >= '0' && character <= '9') nibble = character - '0';
+        else if (character >= 'a' && character <= 'f') nibble = 10 + character - 'a';
+        else if (character >= 'A' && character <= 'F') nibble = 10 + character - 'A';
+        else {
+            reason = "Patch bytes must be hexadecimal pairs separated only by whitespace.";
+            return false;
+        }
+        if (high < 0) high = nibble;
+        else {
+            if (bytes.size() >= limit) {
+                reason = "The patch exceeds the 4096-byte reviewed-change bound.";
+                return false;
+            }
+            bytes.push_back(static_cast<std::uint8_t>((high << 4) | nibble));
+            high = -1;
+        }
+    }
+    if (high >= 0 || bytes.empty()) {
+        reason = high >= 0 ? "Patch bytes contain an incomplete hexadecimal pair."
+                           : "Patch bytes cannot be empty.";
+        return false;
+    }
+    return true;
+}
+
+std::string format_hex_bytes(const std::vector<std::uint8_t>& bytes)
+{
+    std::string result;
+    result.reserve(bytes.size() * 3U);
+    char value[4]{};
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        if (index != 0) result.push_back(' ');
+        std::snprintf(value, sizeof(value), "%02X", bytes[index]);
+        result.append(value);
+    }
+    return result;
+}
+
+std::string overlay_type_at(const disasm_view::workspace_context_t& context,
+                            const aida::analysis::address_t& address)
+{
+    const auto overlay = context.workspace ? context.workspace->overlay() : nullptr;
+    if (!overlay) return {};
+    const auto snapshot = overlay->snapshot();
+    for (const auto& item : snapshot.items) {
+        const auto& operation = item.second;
+        if (operation.kind == aida::analysis::overlay_operation_kind_t::type_application &&
+            operation.address == address)
+            return operation.type;
+    }
+    return "<analysis-default>";
+}
+
+std::vector<std::uint8_t> static_bytes_at(
+    const disasm_view::workspace_context_t& context,
+    const aida::analysis::address_t& address, std::size_t size,
+    std::string& reason)
+{
+    const auto overlay = context.workspace ? context.workspace->overlay() : nullptr;
+    if (overlay) {
+        const auto patches = overlay->patch_operations();
+        const auto found = std::find_if(patches.rbegin(), patches.rend(),
+            [&](const aida::analysis::overlay_operation_t& operation) {
+                return operation.address == address && operation.bytes.size() == size;
+            });
+        if (found != patches.rend()) return found->bytes;
+    }
+    auto read = disasm_view::read_bytes(context, address, size);
+    if (!read) {
+        reason = read.error().stable_code() + ": " + read.error().message;
+        return {};
+    }
+    return read.take_value();
+}
+
+bool parse_network_kind(std::string_view value, network_view::artifact_kind_t& kind)
+{
+    using kind_t = network_view::artifact_kind_t;
+    if (value == "request") kind = kind_t::request;
+    else if (value == "exchange") kind = kind_t::exchange;
+    else if (value == "sitemap_request") kind = kind_t::sitemap_request;
+    else if (value == "api_request") kind = kind_t::api_request;
+    else if (value == "scanner_request") kind = kind_t::scanner_request;
+    else if (value == "repeater_request") kind = kind_t::repeater_request;
+    else return false;
+    return true;
+}
+
+bool parse_network_identity(const nlohmann::json& target,
+                            network_view::artifact_identity_t& identity,
+                            std::string& reason)
+{
+    identity = {};
+    identity.id = bounded_proposal_text(target, "artifact_id", 512U, reason, true);
+    if (!reason.empty()) return false;
+    identity.source_view_id = bounded_proposal_text(target, "source_view_id", 128U, reason, true);
+    if (!reason.empty()) return false;
+    const std::string kind = bounded_proposal_text(target, "artifact_kind", 64U, reason, true);
+    if (!reason.empty() || !parse_network_kind(kind, identity.kind)) {
+        if (reason.empty()) reason = "The proposal artifact kind is not a supported HTTP/1 request kind.";
+        return false;
+    }
+    if (!required_u64(target, "source_id", identity.source_id, reason) ||
+        !required_u64(target, "timestamp", identity.timestamp, reason) ||
+        !required_u64(target, "revision", identity.revision, reason) ||
+        !required_u64(target, "content_hash", identity.content_hash, reason))
+        return false;
+    std::uint64_t content_size = 0;
+    std::uint64_t port = 0;
+    if (!required_u64(target, "content_size", content_size, reason) ||
+        !required_u64(target, "port", port, reason) || content_size > max_network_request_bytes ||
+        port == 0 || port > 65535U) {
+        if (reason.empty()) reason = "The proposal request size or target port is invalid.";
+        return false;
+    }
+    identity.content_size = static_cast<std::size_t>(content_size);
+    identity.target_port = static_cast<std::uint16_t>(port);
+    identity.target_host = bounded_proposal_text(target, "host", 253U, reason, true);
+    if (!reason.empty()) return false;
+    if (!target.contains("tls") || !target["tls"].is_boolean()) {
+        reason = "The proposal target 'tls' flag is missing or invalid.";
+        return false;
+    }
+    identity.use_tls = target["tls"].get<bool>();
+    identity.label = identity.id;
+    return identity.valid();
+}
+
 }
 
 std::size_t message_count()
@@ -3773,7 +3921,11 @@ action_result_t stage_editor_proposal(const message_identity_t& source,
     std::string reason;
     if (!resolve_message(source, reason)) return failed(std::move(reason));
     if (proposed_content.empty()) return failed("The proposed editor content is empty.");
+    const std::uint64_t document_id = code_editor_widget::active_document_id();
+    const std::uint64_t base_revision = code_editor_widget::document_revision();
     const std::uint64_t base_hash = code_editor_widget::document_content_fingerprint();
+    if (document_id == 0 || base_revision == 0 || base_hash == 0)
+        return failed("The active code document has no stable identity, revision, or content hash.");
     const std::string origin = "chat:" + source.session_id + ":" + std::to_string(source.fingerprint);
     if (!code_editor_widget::begin_agent_edit(origin))
         return failed(code_editor_widget::last_error());
@@ -3785,7 +3937,9 @@ action_result_t stage_editor_proposal(const message_identity_t& source,
     s_editor_proposal = editor_proposal_snapshot_t{};
     s_editor_proposal.id = "proposal.editor." + std::to_string(source.fingerprint);
     s_editor_proposal.source = source;
-    s_editor_proposal.target_document_id = "document.code";
+    s_editor_proposal.target_document_id = "document.code:" + std::to_string(document_id);
+    s_editor_proposal.target_document_numeric_id = document_id;
+    s_editor_proposal.base_document_revision = base_revision;
     s_editor_proposal.base_content_hash = base_hash;
     s_editor_proposal.generation = source.fingerprint;
     s_editor_proposal.pending = true;
@@ -3799,16 +3953,622 @@ editor_proposal_snapshot_t editor_proposal_snapshot()
 {
     std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
     editor_proposal_snapshot_t result = s_editor_proposal;
-    if (result.pending && code_editor_widget::document_content_fingerprint() != result.base_content_hash) {
+    if (result.pending && (code_editor_widget::active_document_id() != result.target_document_numeric_id ||
+            code_editor_widget::document_revision() != result.base_document_revision ||
+            code_editor_widget::document_content_fingerprint() != result.base_content_hash)) {
         result.stale = true;
-        result.detail = "The code document changed after the proposal was staged; reject or regenerate it.";
+        result.detail = "The target code document identity, revision, or content hash changed after staging; reject or regenerate the proposal.";
     }
+    return result;
+}
+
+action_result_t validate_reverse_engineering_proposal(
+    const message_identity_t& source, const nlohmann::json& document,
+    disasm_view::workspace_context_t captured_workspace,
+    std::uint64_t operation_id)
+{
+    std::string reason;
+    const std::string kind_text = bounded_proposal_text(
+        document, "kind", 64U, reason, true);
+    if (!reason.empty()) return failed(std::move(reason));
+    const auto kind = proposal_kind(kind_text);
+    if (kind == reverse_engineering_proposal_kind_t::none)
+        return failed("The aida-proposal kind is unsupported.");
+    if (!document.contains("target") || !document["target"].is_object())
+        return failed("The aida-proposal target must be an object.");
+    const auto& target = document["target"];
+
+    reverse_engineering_proposal_snapshot_t proposal;
+    reverse_engineering_proposal_binding_t binding;
+    proposal.id = "proposal.re." + std::to_string(source.fingerprint);
+    proposal.source = source;
+    proposal.kind = kind;
+    proposal.kind_label = proposal_kind_label(kind);
+    proposal.generation = source.fingerprint;
+    proposal.operation_id = operation_id;
+    proposal.state = reverse_engineering_proposal_state_t::valid;
+    proposal.provenance = bounded_proposal_text(document, "provenance", 512U, reason, true);
+    if (!reason.empty()) return failed(std::move(reason));
+    proposal.rationale = bounded_proposal_text(document, "rationale", 2048U, reason, true);
+    if (!reason.empty()) return failed(std::move(reason));
+    proposal.pending = true;
+    proposal.detail = "Review the exact before/after scope and consequence before applying.";
+
+    const bool analysis_kind = kind == reverse_engineering_proposal_kind_t::analysis_rename ||
+        kind == reverse_engineering_proposal_kind_t::analysis_comment ||
+        kind == reverse_engineering_proposal_kind_t::analysis_type ||
+        kind == reverse_engineering_proposal_kind_t::static_patch;
+    if (analysis_kind) {
+        binding.workspace = std::move(captured_workspace);
+        if (!binding.workspace)
+            return failed("Open the proposal's analysis workspace before reviewing this change.");
+        const std::string workspace_id = bounded_proposal_text(
+            target, "workspace_id", 128U, reason, true);
+        if (!reason.empty()) return failed(std::move(reason));
+        if (workspace_id != binding.workspace.workspace->identity().binary_id().to_hex())
+            return failed("The selected workspace does not match the proposal workspace identity.");
+        std::uint64_t runtime_address = 0;
+        if (!required_u64(target, "address", runtime_address, reason) ||
+            !required_u64(target, "generation", proposal.expected_generation, reason) ||
+            !required_u64(target, "analysis_revision", proposal.expected_revision, reason) ||
+            !required_u64(target, "overlay_revision", proposal.expected_overlay_revision, reason))
+            return failed(std::move(reason));
+        if (proposal.expected_generation != binding.workspace.publication->generation ||
+            proposal.expected_revision != binding.workspace.publication->analysis_revision ||
+            proposal.expected_overlay_revision != binding.workspace.workspace->overlay_revision())
+            return failed("The analysis generation or revision changed after the proposal was produced.");
+        const auto typed = disasm_view::typed_address(binding.workspace, runtime_address);
+        if (!typed) return failed("The proposal address is outside the selected workspace.");
+        binding.address = *typed;
+        char address_label[32]{};
+        std::snprintf(address_label, sizeof(address_label), "0x%016llX",
+            static_cast<unsigned long long>(runtime_address));
+        proposal.target_id = workspace_id + ":" + address_label;
+        proposal.target_label = std::string(address_label) + " in " + workspace_id.substr(0, 12U);
+        proposal.target_view_id = "document.disassembly";
+        proposal.rollback_action_id = "analysis.overlay.undo";
+
+        if (kind == reverse_engineering_proposal_kind_t::analysis_rename ||
+            kind == reverse_engineering_proposal_kind_t::analysis_comment ||
+            kind == reverse_engineering_proposal_kind_t::analysis_type) {
+            if (!document.contains("before"))
+                return failed("The proposal is missing its exact 'before' field.");
+            proposal.before_value = bounded_proposal_text(document, "before",
+                max_proposal_text_bytes, reason);
+            if (!reason.empty()) return failed(std::move(reason));
+            if (!document.contains("after"))
+                return failed("The proposal is missing its exact 'after' field.");
+            proposal.after_value = bounded_proposal_text(document, "after",
+                max_proposal_text_bytes, reason,
+                kind != reverse_engineering_proposal_kind_t::analysis_comment);
+            if (!reason.empty()) return failed(std::move(reason));
+            const std::string current = kind == reverse_engineering_proposal_kind_t::analysis_rename
+                ? disasm_view::resolve_name(binding.workspace, binding.address)
+                : kind == reverse_engineering_proposal_kind_t::analysis_comment
+                ? disasm_view::comment(binding.workspace, binding.address)
+                : overlay_type_at(binding.workspace, binding.address);
+            if (proposal.before_value != current)
+                return failed("The proposal's before value does not match the current analysis overlay state.");
+            if (proposal.after_value == proposal.before_value)
+                return failed("The proposal does not change the selected analysis value.");
+            if (kind == reverse_engineering_proposal_kind_t::analysis_rename) {
+                proposal.consequence = "Changes the displayed symbol name at exactly one address through the reversible analysis overlay; cross-view publications update after commit.";
+            } else if (kind == reverse_engineering_proposal_kind_t::analysis_comment) {
+                proposal.consequence = "Adds, replaces, or removes the comment at exactly one address through the reversible analysis overlay.";
+            } else {
+                proposal.consequence = "Applies the canonical type at exactly one address through the reversible analysis overlay and invalidates dependent presentation caches.";
+            }
+            proposal.reversibility = "Use Analysis Overlay Undo after the terminal commit to restore the previous overlay value.";
+        } else {
+            const std::string before = bounded_proposal_text(
+                document, "before", max_proposal_payload_bytes, reason, true);
+            if (!reason.empty() || !parse_hex_bytes(before, max_proposal_patch_bytes,
+                    binding.before_bytes, reason)) return failed(std::move(reason));
+            const std::string after = bounded_proposal_text(
+                document, "after", max_proposal_payload_bytes, reason, true);
+            if (!reason.empty() || !parse_hex_bytes(after, max_proposal_patch_bytes,
+                    binding.after_bytes, reason)) return failed(std::move(reason));
+            if (binding.before_bytes.size() != binding.after_bytes.size())
+                return failed("Static patch before/after ranges must have the same length.");
+            if (binding.before_bytes == binding.after_bytes)
+                return failed("The static patch does not change any bytes.");
+            const auto current = static_bytes_at(binding.workspace, binding.address,
+                binding.before_bytes.size(), reason);
+            if (!reason.empty()) return failed(std::move(reason));
+            if (current != binding.before_bytes)
+                return failed("The static bytes changed after the proposal was produced.");
+            proposal.before_value = format_hex_bytes(binding.before_bytes);
+            proposal.after_value = format_hex_bytes(binding.after_bytes);
+            proposal.consequence = "Opens the generation-fenced Static Patch Review with the exact AI before/after bytes prefilled. This confirmation does not commit the overlay; Apply Patch in that review is the second explicit human action.";
+            proposal.reversibility = "The Static Patch Review can be cancelled before commit and exposes generation-fenced Undo/Revert after a committed overlay patch.";
+        }
+    } else if (kind == reverse_engineering_proposal_kind_t::live_patch) {
+        std::uint64_t address = 0;
+        std::uint64_t pid = 0;
+        if (!required_u64(target, "address", address, reason) ||
+            !required_u64(target, "pid", pid, reason) || pid == 0 ||
+            pid > (std::numeric_limits<std::uint32_t>::max)())
+            return failed(reason.empty() ? "The live patch PID is invalid." : std::move(reason));
+        const std::string before = bounded_proposal_text(
+            document, "before", max_proposal_payload_bytes, reason, true);
+        if (!reason.empty() || !parse_hex_bytes(before, max_proposal_patch_bytes,
+                binding.before_bytes, reason)) return failed(std::move(reason));
+        const std::string after = bounded_proposal_text(
+            document, "after", max_proposal_payload_bytes, reason, true);
+        if (!reason.empty() || !parse_hex_bytes(after, max_proposal_patch_bytes,
+                binding.after_bytes, reason)) return failed(std::move(reason));
+        if (binding.before_bytes.size() != binding.after_bytes.size())
+            return failed("Live patch before/after ranges must have the same length.");
+        if (binding.before_bytes == binding.after_bytes)
+            return failed("The live patch does not change any bytes.");
+        binding.address.value = address;
+        binding.target_pid = static_cast<std::uint32_t>(pid);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        return failed("Live target patch review is unavailable in the Studio compatibility runtime.");
+#else
+        if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() != binding.target_pid)
+            return failed("Attach the driver-backed debugger to the proposal PID before reviewing the live patch.");
+        std::vector<std::uint8_t> current;
+        if (!driver_bridge::read_memory(address, binding.before_bytes.size(), current) ||
+            driver_bridge::attached_pid() != binding.target_pid ||
+            current != binding.before_bytes)
+            return failed("The live target bytes are unreadable or changed after the proposal was produced.");
+#endif
+        char target_label[64]{};
+        std::snprintf(target_label, sizeof(target_label), "PID %u at 0x%016llX",
+            binding.target_pid, static_cast<unsigned long long>(address));
+        proposal.target_id = std::string("process:") + std::to_string(binding.target_pid) +
+            ":" + std::to_string(address);
+        proposal.target_label = target_label;
+        proposal.before_value = format_hex_bytes(binding.before_bytes);
+        proposal.after_value = format_hex_bytes(binding.after_bytes);
+        proposal.target_view_id = "view.debug.patches";
+        proposal.rollback_action_id = "debugger.patch.revert";
+        proposal.consequence = "Stages the exact live-memory byte range in the debugger Patch Review surface; this confirmation does not write target memory. Applying the staged debugger patch is a second explicit reviewed action.";
+        proposal.reversibility = "A subsequently applied debugger patch retains its original bytes and can be reverted from Patches.";
+    } else {
+        if (!parse_network_identity(target, binding.network_source, reason))
+            return failed(std::move(reason));
+        const std::string before = bounded_proposal_text(
+            document, "before", max_network_request_bytes, reason, true);
+        if (!reason.empty()) return failed(std::move(reason));
+        const std::string after = bounded_proposal_text(
+            document, "after", max_network_request_bytes, reason, true);
+        if (!reason.empty()) return failed(std::move(reason));
+        network_view::artifact_snapshot_t current;
+        if (!network_view::resolve_artifact(binding.network_source, current, reason))
+            return failed(std::move(reason));
+        const std::vector<std::uint8_t> before_bytes(before.begin(), before.end());
+        if (current.bytes != before_bytes)
+            return failed("The proposal's request bytes do not match the retained Network artifact.");
+        binding.network_after.assign(after.begin(), after.end());
+        if (binding.network_after == before_bytes)
+            return failed("The Network proposal does not change the retained request.");
+        network_view::artifact_identity_t canonical_source;
+        if (!network_view::validate_reviewed_request(binding.network_source,
+                binding.network_after, canonical_source, reason))
+            return failed(std::move(reason));
+        binding.network_source = std::move(canonical_source);
+        proposal.target_id = binding.network_source.id;
+        proposal.target_label = binding.network_source.label.empty()
+            ? binding.network_source.id : binding.network_source.label;
+        proposal.before_value = before;
+        proposal.after_value = after;
+        proposal.expected_generation = binding.network_source.timestamp;
+        proposal.expected_revision = binding.network_source.revision;
+        proposal.expected_overlay_revision = binding.network_source.content_hash;
+        proposal.target_view_id = "view.network.repeater";
+        proposal.consequence = kind == reverse_engineering_proposal_kind_t::network_replay_staging
+            ? "Creates a reviewed Repeater draft with the proposed request. No network traffic is sent until the user separately presses Send in Repeater."
+            : "Creates an editable Repeater draft from the retained request and proposed bytes. The captured history remains unchanged and no request is sent.";
+        proposal.reversibility = "Close the staged Repeater tab to discard it; captured history and the original artifact are not modified.";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.operation_id != operation_id)
+            return failed("The proposal validation was superseded before publication.");
+        s_reverse_engineering_proposal = std::move(proposal);
+        s_reverse_engineering_proposal_binding = std::move(binding);
+        publish_reverse_engineering_proposal_locked();
+    }
+    action_result_t result = completed("Reverse-engineering proposal staged for exact before/after review.");
+    result.target_view_id = "view.ai.evidence";
+    return result;
+}
+
+action_result_t stage_reverse_engineering_proposal(const message_identity_t& source)
+{
+    std::string reason;
+    const ChatMessage* message = resolve_message(source, reason);
+    if (!message) return failed(std::move(reason));
+    nlohmann::json document;
+    if (!proposal_document(*message, document, reason)) return failed(std::move(reason));
+    const std::string kind_text = bounded_proposal_text(
+        document, "kind", 64U, reason, true);
+    if (!reason.empty()) return failed(std::move(reason));
+    const auto kind = proposal_kind(kind_text);
+    if (kind == reverse_engineering_proposal_kind_t::none)
+        return failed("The aida-proposal kind is unsupported.");
+    if (!document.contains("target") || !document["target"].is_object())
+        return failed("The aida-proposal target must be an object.");
+    const std::string provenance = bounded_proposal_text(
+        document, "provenance", 512U, reason, true);
+    if (!reason.empty()) return failed(std::move(reason));
+    const std::string rationale = bounded_proposal_text(
+        document, "rationale", 2048U, reason, true);
+    if (!reason.empty()) return failed(std::move(reason));
+
+    const bool analysis_kind = kind == reverse_engineering_proposal_kind_t::analysis_rename ||
+        kind == reverse_engineering_proposal_kind_t::analysis_comment ||
+        kind == reverse_engineering_proposal_kind_t::analysis_type ||
+        kind == reverse_engineering_proposal_kind_t::static_patch;
+    disasm_view::workspace_context_t workspace;
+    if (analysis_kind) workspace = disasm_view::capture_selected_workspace();
+    const std::uint64_t operation_id =
+        s_reverse_engineering_proposal_operation.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.pending)
+            return failed("Review, apply, or reject the currently pending reverse-engineering proposal first.");
+        s_reverse_engineering_proposal = {};
+        s_reverse_engineering_proposal.id = "proposal.re." +
+            std::to_string(source.fingerprint);
+        s_reverse_engineering_proposal.source = source;
+        s_reverse_engineering_proposal.kind = kind;
+        s_reverse_engineering_proposal.kind_label = proposal_kind_label(kind);
+        s_reverse_engineering_proposal.provenance = provenance;
+        s_reverse_engineering_proposal.rationale = rationale;
+        s_reverse_engineering_proposal.generation = source.fingerprint;
+        s_reverse_engineering_proposal.operation_id = operation_id;
+        s_reverse_engineering_proposal.state =
+            reverse_engineering_proposal_state_t::queued;
+        s_reverse_engineering_proposal.pending = true;
+        s_reverse_engineering_proposal.detail =
+            "Proposal validation is queued on the bounded AI review executor.";
+        s_reverse_engineering_proposal_binding = {};
+        publish_reverse_engineering_proposal_locked();
+    }
+    const bool submitted = submit_chat_task(
+        "ai.proposal.validate", aida::infra::executor::domain_t::general,
+        "bounded_task", 2,
+        [source, document, workspace = std::move(workspace), operation_id]() mutable {
+            {
+                std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+                if (s_reverse_engineering_proposal.operation_id != operation_id ||
+                    !s_reverse_engineering_proposal.pending)
+                    return;
+                s_reverse_engineering_proposal.state =
+                    reverse_engineering_proposal_state_t::running;
+                s_reverse_engineering_proposal.detail =
+                    "Validating proposal identity, exact before value, and retained target.";
+                publish_reverse_engineering_proposal_locked();
+            }
+            const auto validation = validate_reverse_engineering_proposal(
+                source, document, std::move(workspace), operation_id);
+            if (validation.succeeded) return;
+            std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+            if (s_reverse_engineering_proposal.operation_id != operation_id)
+                return;
+            s_reverse_engineering_proposal.pending = true;
+            s_reverse_engineering_proposal.state =
+                reverse_engineering_proposal_state_t::error;
+            s_reverse_engineering_proposal.stale = true;
+            s_reverse_engineering_proposal.disabled_reason = validation.detail;
+            s_reverse_engineering_proposal.detail = validation.detail;
+            publish_reverse_engineering_proposal_locked();
+        });
+    if (!submitted) {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.operation_id == operation_id) {
+            s_reverse_engineering_proposal.state =
+                reverse_engineering_proposal_state_t::error;
+            s_reverse_engineering_proposal.stale = true;
+            s_reverse_engineering_proposal.disabled_reason =
+                "The bounded AI proposal validator rejected the task.";
+            s_reverse_engineering_proposal.detail =
+                s_reverse_engineering_proposal.disabled_reason;
+            publish_reverse_engineering_proposal_locked();
+        }
+        return failed("The bounded AI proposal validator rejected the task.");
+    }
+    action_result_t result = completed("Proposal validation queued.");
+    result.target_view_id = "view.ai.evidence";
+    return result;
+}
+
+std::shared_ptr<const reverse_engineering_proposal_snapshot_t>
+reverse_engineering_proposal_snapshot()
+{
+    return std::atomic_load_explicit(&s_reverse_engineering_proposal_publication,
+        std::memory_order_acquire);
+}
+
+void finish_reverse_engineering_proposal(std::uint64_t operation_id,
+                                         bool succeeded,
+                                         std::string detail,
+                                         bool terminal_readback)
+{
+    std::string diagnostic_target;
+    std::string diagnostic_detail;
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (s_reverse_engineering_proposal.operation_id != operation_id) return;
+        s_reverse_engineering_proposal.applying = false;
+        s_reverse_engineering_proposal.pending = !succeeded;
+        s_reverse_engineering_proposal.review_staged = succeeded && !terminal_readback;
+        s_reverse_engineering_proposal.applied = succeeded && terminal_readback;
+        s_reverse_engineering_proposal.terminal_readback =
+            succeeded && terminal_readback;
+        s_reverse_engineering_proposal.stale = !succeeded;
+        s_reverse_engineering_proposal.state = succeeded
+            ? terminal_readback
+                ? reverse_engineering_proposal_state_t::applied
+                : reverse_engineering_proposal_state_t::staged_review
+            : reverse_engineering_proposal_state_t::stale;
+        s_reverse_engineering_proposal.disabled_reason = succeeded
+            ? std::string{} : detail;
+        s_reverse_engineering_proposal.detail = std::move(detail);
+        diagnostic_target = s_reverse_engineering_proposal.target_id;
+        diagnostic_detail = s_reverse_engineering_proposal.detail;
+        publish_reverse_engineering_proposal_locked();
+    }
+    if (!succeeded) {
+        aida::ui::task_center::diagnostic_registration_t diagnostic;
+        diagnostic.id = "diagnostic.ai.proposal." + std::to_string(operation_id);
+        diagnostic.owner = "ai_proposal";
+        diagnostic.target = std::move(diagnostic_target);
+        diagnostic.summary = "Reviewed AI proposal did not reach its authoritative review surface";
+        diagnostic.details = std::move(diagnostic_detail);
+        diagnostic.severity = aida::ui::task_center::diagnostic_severity_t::error;
+        diagnostic.callbacks.focus = [] {
+            static_cast<void>(aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.ai.evidence")));
+        };
+        static_cast<void>(aida::ui::task_center::raise_diagnostic(
+            std::move(diagnostic)));
+    }
+}
+
+bool revalidate_reverse_engineering_proposal(
+    const reverse_engineering_proposal_snapshot_t& proposal,
+    reverse_engineering_proposal_binding_t& binding,
+    std::string& reason)
+{
+    const bool analysis_kind =
+        proposal.kind == reverse_engineering_proposal_kind_t::analysis_rename ||
+        proposal.kind == reverse_engineering_proposal_kind_t::analysis_comment ||
+        proposal.kind == reverse_engineering_proposal_kind_t::analysis_type ||
+        proposal.kind == reverse_engineering_proposal_kind_t::static_patch;
+    if (analysis_kind) {
+        const auto& context = binding.workspace;
+        if (!context || context.workspace->closing() || context.workspace->closed() ||
+            context.workspace->generation() != proposal.expected_generation ||
+            context.workspace->analysis_revision() != proposal.expected_revision ||
+            context.workspace->overlay_revision() != proposal.expected_overlay_revision) {
+            reason = "The exact analysis publication fence changed before apply revalidation.";
+            return false;
+        }
+        std::string current;
+        if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_rename)
+            current = disasm_view::resolve_name(context, binding.address);
+        else if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_comment)
+            current = disasm_view::comment(context, binding.address);
+        else if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_type)
+            current = overlay_type_at(context, binding.address);
+        else {
+            const auto bytes = static_bytes_at(context, binding.address,
+                binding.before_bytes.size(), reason);
+            if (!reason.empty()) return false;
+            if (bytes != binding.before_bytes) {
+                reason = "The exact static patch bytes changed before apply revalidation.";
+                return false;
+            }
+            current = proposal.before_value;
+        }
+        if (current != proposal.before_value) {
+            reason = "The reviewed analysis before value changed before apply revalidation.";
+            return false;
+        }
+        reason.clear();
+        return true;
+    }
+    if (proposal.kind == reverse_engineering_proposal_kind_t::live_patch) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        reason = "Live target patch review is unavailable in Studio preview.";
+        return false;
+#else
+        std::vector<std::uint8_t> current;
+        if (!driver_bridge::is_loaded() ||
+            driver_bridge::attached_pid() != binding.target_pid ||
+            !driver_bridge::read_memory(binding.address.value,
+                binding.before_bytes.size(), current) ||
+            driver_bridge::attached_pid() != binding.target_pid ||
+            current != binding.before_bytes) {
+            reason = "The proposal PID, attachment, or exact live bytes changed before staging.";
+            return false;
+        }
+        reason.clear();
+        return true;
+#endif
+    }
+    network_view::artifact_snapshot_t current;
+    if (!network_view::resolve_artifact(binding.network_source, current, reason))
+        return false;
+    const std::vector<std::uint8_t> before(
+        proposal.before_value.begin(), proposal.before_value.end());
+    if (current.bytes != before) {
+        reason = "The retained Network request changed before Repeater staging.";
+        return false;
+    }
+    network_view::artifact_identity_t canonical_source;
+    if (!network_view::validate_reviewed_request(binding.network_source,
+            binding.network_after, canonical_source, reason)) return false;
+    binding.network_source = std::move(canonical_source);
+    reason.clear();
+    return true;
+}
+
+action_result_t queue_reverse_engineering_proposal_apply(
+    const reverse_engineering_proposal_snapshot_t& proposal)
+{
+    reverse_engineering_proposal_binding_t binding;
+    const std::uint64_t operation_id =
+        s_reverse_engineering_proposal_operation.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+        if (!s_reverse_engineering_proposal.pending ||
+            s_reverse_engineering_proposal.operation_id != proposal.operation_id ||
+            s_reverse_engineering_proposal.state !=
+                reverse_engineering_proposal_state_t::valid)
+            return failed("The proposal generation changed; review the current proposal.");
+        binding = s_reverse_engineering_proposal_binding;
+        s_reverse_engineering_proposal.operation_id = operation_id;
+        s_reverse_engineering_proposal.applying = true;
+        s_reverse_engineering_proposal.state =
+            reverse_engineering_proposal_state_t::applying;
+        s_reverse_engineering_proposal.detail =
+            "Apply-time identity and before-value revalidation is queued.";
+        publish_reverse_engineering_proposal_locked();
+    }
+    const bool submitted = submit_chat_task(
+        "ai.proposal.apply", aida::infra::executor::domain_t::general,
+        "bounded_task", 2,
+        [proposal, binding = std::move(binding), operation_id]() mutable {
+            std::string reason;
+            if (!revalidate_reverse_engineering_proposal(proposal, binding, reason)) {
+                finish_reverse_engineering_proposal(operation_id, false,
+                    reason.empty() ? "Apply-time proposal revalidation failed." :
+                        std::move(reason), false);
+                return;
+            }
+            if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_rename ||
+                proposal.kind == reverse_engineering_proposal_kind_t::analysis_comment ||
+                proposal.kind == reverse_engineering_proposal_kind_t::analysis_type) {
+                auto completion = [operation_id, proposal,
+                                   context = binding.workspace,
+                                   address = binding.address](
+                    bool succeeded, std::string error) {
+                    bool verified = succeeded;
+                    if (verified && proposal.kind ==
+                            reverse_engineering_proposal_kind_t::analysis_rename)
+                        verified = disasm_view::resolve_name(context, address) ==
+                            proposal.after_value;
+                    else if (verified && proposal.kind ==
+                            reverse_engineering_proposal_kind_t::analysis_comment)
+                        verified = disasm_view::comment(context, address) ==
+                            proposal.after_value;
+                    else if (verified && proposal.kind ==
+                            reverse_engineering_proposal_kind_t::analysis_type)
+                        verified = overlay_type_at(context, address) ==
+                            proposal.after_value;
+                    if (succeeded && !verified)
+                        error = "The proposal-specific analysis mutation completed without an exact terminal readback match.";
+                    finish_reverse_engineering_proposal(operation_id, verified,
+                        verified
+                            ? "The authoritative analysis overlay committed and its proposal-specific completion matched."
+                            : error.empty()
+                            ? "The authoritative analysis overlay rejected the proposal mutation."
+                            : std::move(error), verified);
+                };
+                bool accepted = false;
+                if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_rename)
+                    accepted = disasm_view::queue_rename(binding.workspace, binding.address,
+                        proposal.after_value, proposal.expected_generation,
+                        proposal.expected_revision, proposal.expected_overlay_revision,
+                        completion);
+                else if (proposal.kind == reverse_engineering_proposal_kind_t::analysis_comment)
+                    accepted = disasm_view::queue_comment(binding.workspace, binding.address,
+                        proposal.after_value, proposal.expected_generation,
+                        proposal.expected_revision, proposal.expected_overlay_revision,
+                        completion);
+                else
+                    accepted = disasm_view::queue_type_application(binding.workspace,
+                        binding.address, proposal.after_value, proposal.expected_generation,
+                        proposal.expected_revision, proposal.expected_overlay_revision,
+                        completion);
+                if (!accepted)
+                    finish_reverse_engineering_proposal(operation_id, false,
+                        "The generation-fenced analysis mutation queue rejected this proposal-specific operation.",
+                        false);
+                return;
+            }
+            aida::ui_thread::post_options_t options;
+            options.subsystem = "ai_proposal";
+            options.label = "proposal.review_surface";
+            options.phase = "apply_revalidated";
+            options.owner = "ai_proposal";
+            options.priority = aida::ui_thread::priority_t::high;
+            options.cancelled = [operation_id] {
+                std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+                return s_reverse_engineering_proposal.operation_id != operation_id ||
+                    !s_reverse_engineering_proposal.applying;
+            };
+            const auto posted = aida::ui_thread::post(
+                [proposal, binding = std::move(binding), operation_id]() mutable {
+                    bool accepted = false;
+                    std::string dispatch_reason;
+                    if (proposal.kind == reverse_engineering_proposal_kind_t::static_patch) {
+                        accepted = disasm_view::open_exact_static_patch_review(
+                            binding.workspace, binding.address, binding.before_bytes,
+                            binding.after_bytes, proposal.provenance,
+                            proposal.expected_generation, proposal.expected_revision,
+                            proposal.expected_overlay_revision, &dispatch_reason);
+                    } else if (proposal.kind ==
+                            reverse_engineering_proposal_kind_t::live_patch) {
+                        accepted = debugger_view::stage_exact_patch_review(
+                            binding.address.value, binding.before_bytes,
+                            binding.after_bytes, binding.target_pid,
+                            "AI proposal " + proposal.id + " from " +
+                                proposal.provenance, &dispatch_reason);
+                    } else {
+                        accepted = network_view::stage_validated_reviewed_request(
+                            binding.network_source, binding.network_after,
+                            proposal.provenance, binding.network_staged,
+                            dispatch_reason);
+                    }
+                    finish_reverse_engineering_proposal(operation_id, accepted,
+                        accepted
+                            ? proposal.kind == reverse_engineering_proposal_kind_t::static_patch
+                                ? "Exact static bytes were staged in the generation-fenced Static Patch Review; the overlay is unchanged until its second confirmation."
+                                : proposal.kind == reverse_engineering_proposal_kind_t::live_patch
+                                ? "Exact live bytes were revalidated off the UI thread and staged in debugger Patch Review; target memory is unchanged."
+                                : "The canonical retained endpoint and strict HTTP/1 draft were staged in Repeater; no request was sent."
+                            : dispatch_reason.empty()
+                                ? "The authoritative review surface rejected the proposal."
+                                : std::move(dispatch_reason), false);
+                }, std::move(options));
+            if (posted != aida::ui_thread::enqueue_result_t::accepted)
+                finish_reverse_engineering_proposal(operation_id, false,
+                    "The UI review-surface handoff was rejected by the bounded dispatcher.",
+                    false);
+        });
+    if (!submitted) {
+        finish_reverse_engineering_proposal(operation_id, false,
+            "The bounded apply-time proposal validator rejected the task.", false);
+        return failed("The bounded apply-time proposal validator rejected the task.");
+    }
+    action_result_t result = completed(
+        "Apply-time proposal revalidation queued; no bytes, metadata, or network traffic changed.");
+    result.target_view_id = proposal.target_view_id;
     return result;
 }
 
 action_capability_t message_action_capability(const message_identity_t& identity, message_action_t action)
 {
     action_capability_t result;
+    if (action == message_action_t::reject_change) {
+        const auto reverse_proposal_publication = reverse_engineering_proposal_snapshot();
+        const auto& reverse_proposal = *reverse_proposal_publication;
+        if (reverse_proposal.pending &&
+            reverse_proposal.source.session_id == identity.session_id &&
+            reverse_proposal.source.fingerprint == identity.fingerprint) {
+            result.enabled = !reverse_proposal.applying;
+            result.disabled_reason = result.enabled ? std::string{} :
+                "The proposal operation is already committing its reviewed handoff.";
+            return result;
+        }
+    }
     std::string reason;
     const ChatMessage* message = resolve_message(identity, reason);
     if (!message) {
@@ -3816,6 +4576,8 @@ action_capability_t message_action_capability(const message_identity_t& identity
         return result;
     }
     const bool busy = is_ai_busy();
+    const auto persistence = aida::conversation_store::status();
+    const bool persistence_blocked = persistence.pending || persistence.failed;
     switch (action) {
         case message_action_t::copy_text:
             result.enabled = !message->text.empty();
@@ -3835,10 +4597,12 @@ action_capability_t message_action_capability(const message_identity_t& identity
             result.disabled_reason = result.enabled ? "" : "This message has no text that can be handed off.";
             break;
         case message_action_t::edit_message:
-            result.enabled = message->is_user && !message->streaming && !busy;
+            result.enabled = message->is_user && !message->streaming && !busy &&
+                !persistence_blocked;
             result.disabled_reason = !message->is_user ? "Only user messages can be edited." :
                 message->streaming ? "Wait for the streaming message to finish." :
-                busy ? "Cancel or wait for the active AI operation before editing history." : "";
+                busy ? "Cancel or wait for the active AI operation before editing history." :
+                persistence_blocked ? "Resolve the conversation persistence transaction before editing history." : "";
             break;
         case message_action_t::retry_from_here:
             if (message->is_user) {
@@ -3847,6 +4611,10 @@ action_capability_t message_action_capability(const message_identity_t& identity
             }
             if (busy) {
                 result.disabled_reason = "Cancel or wait for the active AI operation before retrying.";
+                break;
+            }
+            if (persistence_blocked) {
+                result.disabled_reason = "Resolve the conversation persistence transaction before retrying history.";
                 break;
             }
             for (std::size_t index = identity.index; index > 0; --index) {
@@ -3858,9 +4626,10 @@ action_capability_t message_action_capability(const message_identity_t& identity
             if (!result.enabled) result.disabled_reason = "No earlier user message is available to retry.";
             break;
         case message_action_t::delete_message:
-            result.enabled = !message->streaming && !busy;
+            result.enabled = !message->streaming && !busy && !persistence_blocked;
             result.disabled_reason = message->streaming ? "Wait for the streaming message to finish." :
-                busy ? "Cancel or wait for the active AI operation before deleting history." : "";
+                busy ? "Cancel or wait for the active AI operation before deleting history." :
+                persistence_blocked ? "Resolve the conversation persistence transaction before deleting history." : "";
             break;
         case message_action_t::inspect_tool_activity:
             result.enabled = message->is_tool_result || !message->tool_name.empty();
@@ -3869,22 +4638,63 @@ action_capability_t message_action_capability(const message_identity_t& identity
         case message_action_t::review_change:
         case message_action_t::apply_change:
         case message_action_t::reject_change: {
-            const auto proposal = editor_proposal_snapshot();
-            const bool linked = proposal.pending && proposal.source.session_id == identity.session_id &&
-                proposal.source.fingerprint == identity.fingerprint;
-            if (!linked) {
-                result.disabled_reason = "No staged change identity is linked to this chat message.";
+            const auto reverse_proposal_publication = reverse_engineering_proposal_snapshot();
+            const auto& reverse_proposal = *reverse_proposal_publication;
+            const bool reverse_linked = reverse_proposal.pending &&
+                reverse_proposal.source.session_id == identity.session_id &&
+                reverse_proposal.source.fingerprint == identity.fingerprint;
+            if (reverse_linked) {
+                if (action == message_action_t::reject_change) {
+                    result.enabled = !reverse_proposal.applying;
+                    result.disabled_reason = result.enabled ? std::string{} :
+                        "The proposal operation is already committing its reviewed handoff.";
+                    break;
+                }
+                if (reverse_proposal.stale ||
+                    reverse_proposal.state == reverse_engineering_proposal_state_t::error ||
+                    reverse_proposal.state == reverse_engineering_proposal_state_t::stale) {
+                    result.disabled_reason = reverse_proposal.disabled_reason.empty()
+                        ? reverse_proposal.detail : reverse_proposal.disabled_reason;
+                    break;
+                }
+                result.enabled = !reverse_proposal.applying &&
+                    reverse_proposal.state == reverse_engineering_proposal_state_t::valid;
+                result.disabled_reason = result.enabled ? std::string{} :
+                    reverse_proposal.state == reverse_engineering_proposal_state_t::queued
+                    ? "Proposal validation is queued."
+                    : reverse_proposal.state == reverse_engineering_proposal_state_t::running
+                    ? "Proposal identity and before-value validation is running."
+                    : "The reviewed proposal is already being applied.";
                 break;
             }
-            if (proposal.stale) {
-                result.disabled_reason = proposal.detail;
+            const auto editor_proposal = editor_proposal_snapshot();
+            const bool editor_linked = editor_proposal.pending &&
+                editor_proposal.source.session_id == identity.session_id &&
+                editor_proposal.source.fingerprint == identity.fingerprint;
+            if (editor_linked) {
+                if (editor_proposal.stale) {
+                    result.disabled_reason = editor_proposal.detail;
+                    break;
+                }
+                if (action == message_action_t::apply_change &&
+                    code_editor_widget::pending_hunk_count() == 0) {
+                    result.disabled_reason = "The staged change has no pending editor hunks to apply.";
+                    break;
+                }
+                result.enabled = true;
                 break;
             }
-            if (action == message_action_t::apply_change && code_editor_widget::pending_hunk_count() == 0) {
-                result.disabled_reason = "The staged change has no pending editor hunks to apply.";
+            if (action == message_action_t::review_change) {
+                nlohmann::json document;
+                std::string proposal_reason;
+                if (proposal_document(*message, document, proposal_reason)) {
+                    result.enabled = true;
+                    break;
+                }
+                result.disabled_reason = std::move(proposal_reason);
                 break;
             }
-            result.enabled = true;
+            result.disabled_reason = "No pending reviewed change identity is linked to this chat message.";
             break;
         }
             break;
@@ -3900,6 +4710,32 @@ action_result_t execute_message_action(const message_identity_t& identity, messa
 {
     const auto capability = message_action_capability(identity, action);
     if (!capability.enabled) return failed(capability.disabled_reason);
+    if (action == message_action_t::reject_change) {
+        const auto reverse_proposal_publication = reverse_engineering_proposal_snapshot();
+        const auto& reverse_proposal = *reverse_proposal_publication;
+        if (reverse_proposal.pending &&
+            reverse_proposal.source.session_id == identity.session_id &&
+            reverse_proposal.source.fingerprint == identity.fingerprint) {
+            std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+            if (s_reverse_engineering_proposal.operation_id !=
+                reverse_proposal.operation_id)
+                return failed("The proposal generation changed; review the current proposal.");
+            if (s_reverse_engineering_proposal.applying)
+                return failed("The proposal is already committing its reviewed handoff.");
+            s_reverse_engineering_proposal.pending = false;
+            s_reverse_engineering_proposal.rejected = true;
+            s_reverse_engineering_proposal.state =
+                reverse_engineering_proposal_state_t::rejected;
+            s_reverse_engineering_proposal.operation_id =
+                s_reverse_engineering_proposal_operation.fetch_add(
+                    1, std::memory_order_acq_rel);
+            s_reverse_engineering_proposal.detail =
+                "The reverse-engineering proposal was rejected without dispatching a mutation.";
+            publish_reverse_engineering_proposal_locked();
+            return completed(
+                "Reverse-engineering proposal rejected without writes or network activity.");
+        }
+    }
     std::string reason;
     const ChatMessage* message = resolve_message(identity, reason);
     if (!message) return failed(std::move(reason));
@@ -3956,9 +4792,7 @@ action_result_t execute_message_action(const message_identity_t& identity, messa
             std::snprintf(chat_edit::buf, sizeof(chat_edit::buf), "%s", text.c_str());
             return completed("Message editor opened.");
         case message_action_t::delete_message:
-            g_chat_messages.erase(g_chat_messages.begin() + static_cast<std::ptrdiff_t>(identity.index));
-            conversations::save_current();
-            return completed("Message deleted.");
+            return failed("Delete Message requires confirmation in the Chat view.");
         case message_action_t::inspect_tool_activity: {
             action_result_t result = completed("Open the MCP Log view for the complete activity record.");
             result.target_view_id = "view.mcp_log";
@@ -3983,22 +4817,57 @@ action_result_t execute_message_action(const message_identity_t& identity, messa
             }
             return failed("No earlier user message is available to retry.");
         case message_action_t::review_change: {
-            action_result_t result = completed("Editor proposal opened for per-hunk review.");
-            result.target_view_id = "document.code";
-            return result;
+            const auto reverse_proposal_publication = reverse_engineering_proposal_snapshot();
+            const auto& reverse_proposal = *reverse_proposal_publication;
+            if (reverse_proposal.pending &&
+                reverse_proposal.source.session_id == identity.session_id &&
+                reverse_proposal.source.fingerprint == identity.fingerprint) {
+                action_result_t result = completed(
+                    "Reverse-engineering proposal opened for exact before/after review.");
+                result.target_view_id = "view.ai.evidence";
+                return result;
+            }
+            const auto editor_proposal = editor_proposal_snapshot();
+            if (editor_proposal.pending &&
+                editor_proposal.source.session_id == identity.session_id &&
+                editor_proposal.source.fingerprint == identity.fingerprint) {
+                action_result_t result = completed("Editor proposal opened for per-hunk review.");
+                result.target_view_id = "document.code";
+                return result;
+            }
+            return stage_reverse_engineering_proposal(identity);
         }
         case message_action_t::apply_change: {
+            const auto reverse_proposal_publication = reverse_engineering_proposal_snapshot();
+            const auto& reverse_proposal = *reverse_proposal_publication;
+            if (reverse_proposal.pending &&
+                reverse_proposal.source.session_id == identity.session_id &&
+                reverse_proposal.source.fingerprint == identity.fingerprint) {
+                if (reverse_proposal.stale)
+                    return failed(reverse_proposal.disabled_reason.empty()
+                        ? reverse_proposal.detail : reverse_proposal.disabled_reason);
+                return queue_reverse_engineering_proposal_apply(reverse_proposal);
+            }
             const auto proposal = editor_proposal_snapshot();
             if (!proposal.pending || proposal.source.fingerprint != identity.fingerprint)
                 return failed("The staged proposal is no longer linked to this message.");
-            if (proposal.stale || code_editor_widget::document_content_fingerprint() != proposal.base_content_hash)
+            if (proposal.stale || code_editor_widget::active_document_id() != proposal.target_document_numeric_id ||
+                code_editor_widget::document_revision() != proposal.base_document_revision ||
+                code_editor_widget::document_content_fingerprint() != proposal.base_content_hash)
                 return failed("The code document changed after review began; apply is blocked until the proposal is regenerated.");
+            const int pending_hunks = code_editor_widget::pending_hunk_count();
+            if (proposal.reviewed_generation != proposal.generation ||
+                proposal.reviewed_content_hash != proposal.base_content_hash ||
+                proposal.reviewed_pending_hunks != pending_hunks || pending_hunks <= 0)
+                return failed("Review and confirm the exact target revision, content hash, and pending hunks before applying.");
             {
                 std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
                 if (!s_editor_proposal.pending || s_editor_proposal.generation != proposal.generation)
                     return failed("The proposal generation changed; review the current proposal.");
                 s_editor_proposal.applying = true;
-                s_editor_proposal.detail = "Applying reviewed editor hunks.";
+                s_editor_proposal.detail = "Applying " + std::to_string(pending_hunks) +
+                    " reviewed editor hunks to document " +
+                    std::to_string(proposal.target_document_numeric_id) + ".";
             }
             code_editor_widget::accept_all();
             if (!code_editor_widget::commit_resolved_diff()) {
@@ -4126,7 +4995,6 @@ std::string register_evidence(evidence_envelope_t envelope)
             std::to_string(s_evidence_sequence.fetch_add(1, std::memory_order_relaxed));
     const std::string result_id = envelope.id;
     const std::string session = envelope.session_id;
-    std::vector<evidence_envelope_t> persisted;
     {
         std::lock_guard<std::mutex> lock(s_evidence_mutex);
         const auto duplicate = std::find_if(s_evidence.begin(), s_evidence.end(), [&](const evidence_envelope_t& current) {
@@ -4135,21 +5003,115 @@ std::string register_evidence(evidence_envelope_t envelope)
         if (duplicate != s_evidence.end()) *duplicate = std::move(envelope);
         else s_evidence.push_back(std::move(envelope));
         while (s_evidence.size() > max_evidence_items) s_evidence.pop_front();
-        if (!session.empty()) {
-            for (const auto& item : s_evidence) {
-                if (item.session_id == session) persisted.push_back(item);
-            }
-        }
+        publish_evidence_locked();
     }
-    if (!session.empty()) persist_evidence_metadata(session, persisted);
+    if (!session.empty())
+        persist_evidence_metadata(session, persisted_evidence_snapshot(session));
     return result_id;
 }
 
-std::vector<evidence_envelope_t> evidence_snapshot()
+void register_evidence_source_return(const std::string& evidence_id,
+    std::function<bool(std::string&)> navigate)
+{
+    if (evidence_id.empty() || !navigate) return;
+    std::lock_guard<std::mutex> lock(s_evidence_mutex);
+    const auto found = std::find_if(s_evidence.begin(), s_evidence.end(),
+        [&](const evidence_envelope_t& item) { return item.id == evidence_id; });
+    if (found == s_evidence.end()) return;
+    const auto existing = std::find_if(s_evidence_source_returns.begin(),
+        s_evidence_source_returns.end(), [&](const auto& item) {
+            return item.first == evidence_id;
+        });
+    if (existing != s_evidence_source_returns.end())
+        existing->second = std::move(navigate);
+    else
+        s_evidence_source_returns.emplace_back(evidence_id, std::move(navigate));
+    while (s_evidence_source_returns.size() > max_evidence_items)
+        s_evidence_source_returns.pop_front();
+}
+
+std::shared_ptr<const std::vector<evidence_envelope_t>> evidence_snapshot()
 {
     synchronize_evidence_session();
+    return std::atomic_load_explicit(&s_evidence_publication,
+        std::memory_order_acquire);
+}
+
+std::vector<aida::conversation_store::evidence_t> persisted_evidence_snapshot(
+    const std::string& session_id)
+{
+    std::vector<aida::conversation_store::evidence_t> result;
     std::lock_guard<std::mutex> lock(s_evidence_mutex);
-    return {s_evidence.begin(), s_evidence.end()};
+    result.reserve((std::min)(s_evidence.size(), max_evidence_items));
+    for (const auto& item : s_evidence) {
+        if (item.session_id != session_id || item.sensitive) continue;
+        aida::conversation_store::evidence_t persisted;
+        persisted.id = item.id;
+        persisted.project_id = item.project_id;
+        persisted.workspace_id = item.workspace_id;
+        persisted.session_id = item.session_id;
+        persisted.source_view_id = item.source_view_id;
+        persisted.source_kind = item.source_kind;
+        persisted.entity_id = item.entity_id;
+        persisted.display_label = item.display_label;
+        persisted.return_target = item.return_target;
+        persisted.address = item.address;
+        persisted.revision = item.revision;
+        persisted.generation = item.generation;
+        persisted.snapshot_hash = item.snapshot_hash;
+        persisted.content_hash = item.content_hash;
+        persisted.created_ms = item.created_ms;
+        persisted.truncated = item.truncated;
+        persisted.sensitive = item.sensitive;
+        result.push_back(std::move(persisted));
+        if (result.size() >= max_evidence_items) break;
+    }
+    return result;
+}
+
+bool persisted_evidence_session_loaded(const std::string& session_id)
+{
+    const auto publication = std::atomic_load_explicit(
+        &s_evidence_session_publication, std::memory_order_acquire);
+    return publication && session_id == publication->loaded;
+}
+
+void apply_persisted_evidence(const std::string& session_id,
+    std::vector<aida::conversation_store::evidence_t> evidence)
+{
+    std::deque<evidence_envelope_t> replacement;
+    for (auto& persisted : evidence) {
+        if (replacement.size() >= max_evidence_items) break;
+        if (persisted.session_id != session_id) continue;
+        evidence_envelope_t item;
+        item.id = std::move(persisted.id);
+        item.project_id = std::move(persisted.project_id);
+        item.workspace_id = std::move(persisted.workspace_id);
+        item.session_id = std::move(persisted.session_id);
+        item.source_view_id = std::move(persisted.source_view_id);
+        item.source_kind = std::move(persisted.source_kind);
+        item.entity_id = std::move(persisted.entity_id);
+        item.display_label = std::move(persisted.display_label);
+        item.return_target = std::move(persisted.return_target);
+        item.address = persisted.address;
+        item.revision = persisted.revision;
+        item.generation = persisted.generation;
+        item.snapshot_hash = persisted.snapshot_hash;
+        item.content_hash = persisted.content_hash;
+        item.created_ms = persisted.created_ms;
+        item.truncated = persisted.truncated;
+        item.sensitive = persisted.sensitive;
+        item.stale = true;
+        item.stale_reason = "Snapshot content is not persisted; return to source and recapture.";
+        replacement.push_back(std::move(item));
+    }
+    std::lock_guard<std::mutex> lock(s_evidence_mutex);
+    s_evidence = std::move(replacement);
+    s_evidence_source_returns.clear();
+    s_loaded_evidence_session = session_id;
+    s_requested_evidence_session.clear();
+    publish_evidence_session_locked();
+    publish_evidence_locked();
 }
 
 static bool evidence_payload(const std::string& evidence_id, evidence_envelope_t& envelope, std::string& reason)
@@ -4216,6 +5178,19 @@ bool navigate_to_evidence_source(const std::string& evidence_id, std::string& re
         }
         envelope = *found;
     }
+    std::function<bool(std::string&)> exact_return;
+    {
+        std::lock_guard<std::mutex> lock(s_evidence_mutex);
+        const auto found = std::find_if(s_evidence_source_returns.begin(),
+            s_evidence_source_returns.end(), [&](const auto& item) {
+                return item.first == evidence_id;
+            });
+        if (found != s_evidence_source_returns.end()) exact_return = found->second;
+    }
+    if (exact_return) {
+        reason.clear();
+        return exact_return(reason);
+    }
     const auto opened = aida::ui::application_views::open_or_focus(
         aida::ui::stable_view_id_t(envelope.source_view_id));
     if (!opened.ok()) {
@@ -4231,10 +5206,22 @@ void render_chat_view(float width, float height)
     static std::size_t previous_total = 0;
     static bool follow_latest = true;
     static std::string rendered_session;
-    static message_identity_t context_identity;
     static message_identity_t keyboard_identity;
+    static message_identity_t pending_delete_identity;
+    static bool delete_dialog_requested = false;
+    static message_identity_t pending_apply_identity;
+    static bool apply_dialog_requested = false;
+    static std::string pending_delete_conversation_id;
+    static std::uint64_t pending_delete_conversation_revision = 0;
+    static bool delete_conversation_dialog_requested = false;
+    static std::string history_keyboard_conversation_id;
     static std::string context_feedback;
     static char history_filter[128] = {};
+
+    const auto conversation_persistence = aida::conversation_store::status();
+    const bool conversation_store_pending = conversation_persistence.pending;
+    const bool conversation_store_blocked = conversation_persistence.pending ||
+        conversation_persistence.failed;
 
     const std::string conversation_session = conversations::current_id;
     if (!conversation_session.empty() && conversation_session != chat_active_session()) {
@@ -4247,8 +5234,26 @@ void render_chat_view(float width, float height)
         page_start = 0;
         previous_total = 0;
         follow_latest = true;
-        context_identity = {};
         keyboard_identity = {};
+        pending_delete_identity = {};
+        delete_dialog_requested = false;
+        pending_apply_identity = {};
+        apply_dialog_requested = false;
+        pending_delete_conversation_id.clear();
+        pending_delete_conversation_revision = 0;
+        delete_conversation_dialog_requested = false;
+        history_keyboard_conversation_id.clear();
+        {
+            std::lock_guard<std::mutex> lock(s_reverse_engineering_proposal_mutex);
+            if (s_reverse_engineering_proposal.kind !=
+                    reverse_engineering_proposal_kind_t::none &&
+                !s_reverse_engineering_proposal.applying &&
+                s_reverse_engineering_proposal.source.session_id != current_session) {
+                s_reverse_engineering_proposal = {};
+                s_reverse_engineering_proposal_binding = {};
+                publish_reverse_engineering_proposal_locked();
+            }
+        }
         synchronize_evidence_session();
     }
 
@@ -4259,41 +5264,99 @@ void render_chat_view(float width, float height)
     auto open_view = [](const char* id) {
         (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(id));
     };
-    if (ImGui::Button("New Chat")) {
+    const auto chat_metrics = aida::ui::design::metrics();
+    const auto scaled = [&](float value) {
+        return aida::ui::scale_px(value, chat_metrics.scale);
+    };
+    const float toolbar_width = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
+    const float history_sidebar_threshold = scaled(620.f);
+    const bool history_can_dock = toolbar_width >= history_sidebar_threshold;
+    const aida::ui::design::action_t toolbar_actions[] = {
+        {"chat.new", "New Chat", "New", "Start a new analysis conversation", nullptr, nullptr,
+            aida::ui::components::button_kind_t::primary,
+            !conversation_store_blocked && !is_ai_busy(), true, true},
+        {"chat.history", conversations::browser_open ? "Hide History" : "History",
+            conversations::browser_open ? "Hide" : "History",
+            history_can_dock ? "Show or hide conversation history beside the chat" :
+                "Open conversation history in a compact popup",
+            nullptr, nullptr, aida::ui::components::button_kind_t::secondary, true, false, true},
+        {"chat.providers", "Providers", "Providers", "Open AI provider and model configuration", nullptr, nullptr,
+            aida::ui::components::button_kind_t::secondary, true, false, true},
+        {"chat.agents", "Agents", "Agents", "Open the agent manager", nullptr, nullptr,
+            aida::ui::components::button_kind_t::secondary, true, false, true},
+        {"chat.skills", "Skills", "Skills", "Open the installed skills manager", nullptr, nullptr,
+            aida::ui::components::button_kind_t::secondary, true, false, true},
+        {"chat.evidence", "Evidence", "Evidence", "Review evidence attached to AI workflows", nullptr, nullptr,
+            aida::ui::components::button_kind_t::secondary, true, false, true},
+        {"chat.mcp-log", "MCP Log", "MCP", "Open the complete MCP request and tool activity log", nullptr, nullptr,
+            aida::ui::components::button_kind_t::secondary, true, false, true},
+        {"chat.settings", "Settings", "Settings", "Open AiDA settings", nullptr, nullptr,
+            aida::ui::components::button_kind_t::ghost, true, false, true}
+    };
+    const auto toolbar_result = aida::ui::design::render_toolbar(
+        "view.ai-chat.primary-actions", toolbar_actions,
+        sizeof(toolbar_actions) / sizeof(toolbar_actions[0]), toolbar_width);
+    if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.new") == 0 &&
+        !conversation_store_blocked && !is_ai_busy()) {
         conversations::new_chat();
-        chat_bind_session({});
-        synchronize_evidence_session();
-        rendered_session.clear();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(conversations::browser_open ? "Hide History" : "History")) {
+    } else if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.history") == 0) {
         conversations::browser_open = !conversations::browser_open;
-        if (conversations::browser_open) conversations::refresh_history();
+        if (conversations::browser_open && !conversation_store_blocked) {
+            conversations::refresh_history();
+            if (!history_can_dock) ImGui::OpenPopup("##registry_chat_history_popup");
+        }
+    } else if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.providers") == 0) {
+        open_view("view.ai.providers");
+    } else if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.agents") == 0) {
+        open_view("view.ai.agents");
+    } else if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.skills") == 0) {
+        open_view("view.ai.skills");
+    } else if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.evidence") == 0) {
+        open_view("view.ai.evidence");
+    } else if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.mcp-log") == 0) {
+        open_view("view.mcp_log");
+    } else if (toolbar_result.invoked && std::strcmp(toolbar_result.id, "chat.settings") == 0) {
+        open_view("view.settings");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Providers")) open_view("view.ai.providers");
-    ImGui::SameLine();
-    if (ImGui::Button("Agents")) open_view("view.ai.agents");
-    ImGui::SameLine();
-    if (ImGui::Button("Skills")) open_view("view.ai.skills");
-    ImGui::SameLine();
-    if (ImGui::Button("Evidence")) open_view("view.ai.evidence");
-    ImGui::SameLine();
-    if (ImGui::Button("MCP Log")) open_view("view.mcp_log");
-    ImGui::SameLine();
-    if (ImGui::Button("Settings")) open_view("view.settings");
 
     ImGui::Separator();
-    const float input_height = 84.f;
-    const float content_height = (std::max)(80.f, ImGui::GetContentRegionAvail().y - input_height - 8.f);
-    const bool history_visible = conversations::browser_open && ImGui::GetContentRegionAvail().x >= 620.f;
-    std::string delete_conversation_id;
-
-    if (history_visible) {
-        const float history_width = (std::min)(260.f,
-            (std::max)(190.f, ImGui::GetContentRegionAvail().x * 0.28f));
-        ImGui::BeginChild("##registry_chat_history", ImVec2(history_width, content_height), true);
-        ImGui::TextUnformatted("Conversations");
+    const std::string persistence_detail = !conversations::persistence_error.empty()
+        ? conversations::persistence_error : conversation_persistence.error;
+    if (conversation_store_pending) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().warning),
+            "%s", conversation_persistence.stage.c_str());
+    } else if (!persistence_detail.empty()) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::resolved().error),
+            "%s", persistence_detail.c_str());
+        if (conversation_persistence.retryable) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Retry##conversation_store_retry") &&
+                aida::conversation_store::request_retry())
+                conversations::persistence_error.clear();
+        }
+    }
+    const float body_width = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
+    const float body_height = (std::max)(1.f, ImGui::GetContentRegionAvail().y);
+    const bool busy = is_ai_busy();
+    const float composer_editor_height = (std::max)(chat_metrics.control_height,
+        ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().FramePadding.y * 2.f +
+            chat_metrics.spacing_xs);
+    const float composer_button_width = (std::max)(scaled(64.f),
+        ImGui::CalcTextSize(busy ? "Cancel" : "Send").x + chat_metrics.spacing_lg * 2.f);
+    const bool stacked_composer = body_width < composer_button_width + scaled(120.f) + chat_metrics.spacing_sm;
+    const float composer_button_height = chat_metrics.control_height;
+    const float composer_status_height = ImGui::GetTextLineHeightWithSpacing();
+    const float composer_area_height = composer_editor_height + chat_metrics.spacing_xs +
+        composer_status_height + (stacked_composer ? chat_metrics.spacing_xs + composer_button_height : 0.f);
+    const float minimum_message_height = scaled(48.f);
+    const float minimum_body_height = composer_area_height + minimum_message_height;
+    const bool tiny_height = body_height < minimum_body_height;
+    const bool tiny_width = body_width < scaled(96.f);
+    const float content_height = tiny_height || tiny_width ? 0.f :
+        (std::max)(1.f, body_height - composer_area_height - chat_metrics.spacing_sm);
+    const bool history_visible = conversations::browser_open && history_can_dock && !tiny_height && !tiny_width;
+    auto render_history = [&](bool show_heading) {
+        if (show_heading) ImGui::TextUnformatted("Conversations");
         ImGui::SetNextItemWidth(-1.f);
         ImGui::InputTextWithHint("##registry_chat_history_filter", "Filter conversations...",
             history_filter, sizeof(history_filter));
@@ -4301,62 +5364,280 @@ void render_chat_view(float width, float height)
         std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char value) {
             return static_cast<char>(std::tolower(value));
         });
-        for (const auto& conversation : conversations::history) {
-            std::string title = conversation.title.empty() ? "Untitled" : conversation.title;
-            std::string searchable = title;
-            std::transform(searchable.begin(), searchable.end(), searchable.begin(), [](unsigned char value) {
-                return static_cast<char>(std::tolower(value));
-            });
-            if (!filter.empty() && searchable.find(filter) == std::string::npos) continue;
+        const auto history_snapshot = conversations::catalog_snapshot();
+        static std::vector<std::size_t> filtered_indices;
+        filtered_indices.clear();
+        filtered_indices.reserve(history_snapshot->size());
+        auto matches_filter = [&](std::string_view candidate) {
+            if (filter.empty()) return true;
+            if (candidate.size() < filter.size()) return false;
+            for (std::size_t start = 0; start + filter.size() <= candidate.size(); ++start) {
+                bool matches = true;
+                for (std::size_t offset = 0; offset < filter.size(); ++offset) {
+                    const auto value = static_cast<unsigned char>(candidate[start + offset]);
+                    if (static_cast<char>(std::tolower(value)) != filter[offset]) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) return true;
+            }
+            return false;
+        };
+        for (std::size_t index = 0; index < history_snapshot->size(); ++index) {
+            const auto& conversation = (*history_snapshot)[index];
+            const std::string_view title = conversation.title.empty()
+                ? std::string_view("Untitled") : std::string_view(conversation.title);
+            if (matches_filter(title)) filtered_indices.push_back(index);
+        }
+        const float history_row_height = ImGui::GetTextLineHeightWithSpacing() * 1.7f;
+        ImGuiListClipper history_clipper;
+        history_clipper.Begin(static_cast<int>(filtered_indices.size()), history_row_height);
+        while (history_clipper.Step()) {
+        for (int visible_index = history_clipper.DisplayStart;
+                visible_index < history_clipper.DisplayEnd; ++visible_index) {
+            const auto& conversation = (*history_snapshot)[filtered_indices[
+                static_cast<std::size_t>(visible_index)]];
+            const std::string title = conversation.title.empty() ? "Untitled" : conversation.title;
             ImGui::PushID(conversation.id.c_str());
             const bool selected = conversation.id == conversations::current_id;
-            if (ImGui::Selectable(title.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick,
-                    ImVec2(0.f, ImGui::GetTextLineHeightWithSpacing() * 1.7f)) && !selected) {
-                conversations::save_current();
+            const std::string visible_title = conversation.pinned ? "[Pinned] " + title : title;
+            ImGui::BeginDisabled(conversation_store_blocked);
+            const bool opened = ImGui::Selectable(visible_title.c_str(), selected,
+                    ImGuiSelectableFlags_AllowDoubleClick,
+                    ImVec2(0.f, history_row_height));
+            ImGui::EndDisabled();
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+                history_keyboard_conversation_id = conversation.id;
+            if (opened && !selected && !conversation_store_blocked) {
                 conversations::load_conversation(conversation.id);
-                chat_bind_session(conversations::current_id);
-                synchronize_evidence_session();
-                rendered_session.clear();
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%d messages\n%s", conversation.msg_count, conversation.id.c_str());
-            if (ImGui::BeginPopupContextItem("##conversation_context")) {
-                if (ImGui::MenuItem("Open Conversation", nullptr, false, !selected)) {
-                    conversations::save_current();
-                    conversations::load_conversation(conversation.id);
-                    chat_bind_session(conversations::current_id);
-                    synchronize_evidence_session();
-                    rendered_session.clear();
-                }
-                if (ImGui::MenuItem("Copy Conversation ID"))
-                    ImGui::SetClipboardText(conversation.id.c_str());
-                ImGui::Separator();
-                if (ImGui::MenuItem("Delete Conversation"))
-                    delete_conversation_id = conversation.id;
-                ImGui::EndPopup();
+                ImGui::SetTooltip("%d messages%s\n%s", conversation.msg_count,
+                    conversation.pinned ? "\nPinned" : "", conversation.id.c_str());
+            const bool menu_key_context = history_keyboard_conversation_id == conversation.id &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+            const bool shift_f10_context = !menu_key_context &&
+                history_keyboard_conversation_id == conversation.id &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+            const bool keyboard_context = menu_key_context || shift_f10_context;
+            const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            if (pointer_context || keyboard_context) {
+                history_keyboard_conversation_id = conversation.id;
+                aida::ui::application_ui::retained_entity_context_t context;
+                context.owner_id = "ai.chat.conversation";
+                context.entity_id = conversation.id;
+                context.entity_generation = conversation.revision;
+                context.active_view = aida::ui::stable_view_id_t("view.ai_chat");
+                const auto retained_id = conversation.id;
+                const auto retained_revision = conversation.revision;
+                context.validate_identity = [retained_id, retained_revision] {
+                    const auto live = conversations::catalog_snapshot();
+                    const auto found = std::find_if(live->begin(), live->end(),
+                        [&retained_id](const ConversationSummary& item) {
+                            return item.id == retained_id;
+                        });
+                    return found != live->end() && found->revision == retained_revision
+                        ? aida::ui::capability_state_t::available()
+                        : aida::ui::capability_state_t::unavailable(
+                            "The conversation changed after the menu opened; select it again");
+                };
+                const auto add = [&context](const char* id, bool enabled,
+                        const char* reason,
+                        std::function<aida::ui::action_handler_result_t()> invoke) {
+                    aida::ui::application_ui::retained_entity_action_t action;
+                    action.action_id = id;
+                    action.capability = enabled
+                        ? aida::ui::capability_state_t::available()
+                        : aida::ui::capability_state_t::unavailable(reason);
+                    action.invoke = std::move(invoke);
+                    context.actions.push_back(std::move(action));
+                };
+                add("ai.chat.conversation.open", !selected && !conversation_store_blocked,
+                    selected ? "This conversation is already open"
+                        : "Wait for conversation persistence to recover", [retained_id] {
+                    conversations::load_conversation(retained_id);
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                const bool mutation_blocked = conversation_store_blocked || (selected && busy);
+                add("ai.chat.conversation.fork", !mutation_blocked,
+                    "Cancel or wait for the active AI or persistence operation before forking this conversation",
+                    [retained_id] {
+                    std::string forked_id;
+                    if (conversations::fork_conversation(retained_id, forked_id)) {
+                        toast_notification::push("Conversation fork queued",
+                            toast_notification::toast_type_t::info, 3.0f);
+                        return aida::ui::action_handler_result_t::completed();
+                    }
+                    return aida::ui::action_handler_result_t::failed(
+                        "Conversation could not be forked");
+                });
+                const bool retained_pinned = conversation.pinned;
+                add("ai.chat.conversation.toggle_pin", !conversation_store_blocked,
+                    "Wait for conversation persistence to recover",
+                    [retained_id, retained_pinned] {
+                    if (conversations::set_pinned(retained_id, !retained_pinned)) {
+                        toast_notification::push(retained_pinned ? "Conversation unpin queued" : "Conversation pin queued",
+                            toast_notification::toast_type_t::info, 3.0f);
+                        return aida::ui::action_handler_result_t::completed();
+                    }
+                    return aida::ui::action_handler_result_t::failed(
+                        "Conversation pin state could not be saved");
+                });
+                add("ai.chat.conversation.export", !conversation_store_blocked,
+                    "Wait for conversation persistence to recover", [retained_id] {
+                    char path[1024] = "AiDA Conversation.md";
+                    static const char filter[] =
+                        "Markdown files (*.md)\0*.md\0Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+                    if (win32_dialog::show_save_file_dialog(g_hwnd, "Export Conversation",
+                            filter, "md", path, sizeof(path), "chat_conversation_export")) {
+                        std::string error;
+                        if (conversations::export_markdown(retained_id, path, error)) {
+                            toast_notification::push("Conversation export queued",
+                                toast_notification::toast_type_t::info, 3.0f);
+                            return aida::ui::action_handler_result_t::completed();
+                        }
+                        return aida::ui::action_handler_result_t::failed(error.empty()
+                            ? "Conversation export failed" : error);
+                    }
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                add("ai.chat.conversation.copy_id", true, "", [retained_id] {
+                    ImGui::SetClipboardText(retained_id.c_str());
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                add("ai.chat.conversation.delete_review", !mutation_blocked,
+                    "Cancel or wait for the active AI or persistence operation before deleting this conversation",
+                    [retained_id, retained_revision] {
+                    pending_delete_conversation_id = retained_id;
+                    pending_delete_conversation_revision = retained_revision;
+                    delete_conversation_dialog_requested = true;
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                aida::ui::application_ui::open_retained_entity_context_menu(
+                    std::move(context), pointer_context
+                        ? aida::ui::context_menu_open_origin_t::pointer
+                        : menu_key_context
+                        ? aida::ui::context_menu_open_origin_t::menu_key
+                        : aida::ui::context_menu_open_origin_t::shift_f10);
             }
+            aida::ui::application_ui::render_retained_entity_context_menu(
+                "ai.chat.conversation");
             ImGui::PopID();
         }
+        }
+    };
+
+    if (history_visible) {
+        const float history_width = (std::min)(scaled(260.f),
+            (std::max)(scaled(190.f), ImGui::GetContentRegionAvail().x * 0.28f));
+        ImGui::BeginChild("##registry_chat_history", ImVec2(history_width, content_height), true,
+            ImGuiWindowFlags_NoSavedSettings);
+        render_history(true);
         ImGui::EndChild();
         ImGui::SameLine();
-    } else if (conversations::browser_open) {
-        ImGui::TextDisabled("Conversation history requires a wider dock. Enlarge this view or float it.");
     }
 
-    if (!delete_conversation_id.empty()) {
-        const bool deleting_current = delete_conversation_id == conversations::current_id;
-        remove_evidence_metadata(delete_conversation_id);
-        conversations::delete_conversation(delete_conversation_id);
-        if (deleting_current) {
-            chat_bind_session({});
-            rendered_session.clear();
+    if (conversations::browser_open && !history_can_dock) {
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        const float popup_width = (std::min)(scaled(360.f),
+            (std::max)(scaled(180.f), viewport->WorkSize.x - chat_metrics.spacing_lg * 2.f));
+        const float popup_height = (std::min)(scaled(420.f),
+            (std::max)(scaled(180.f), viewport->WorkSize.y - chat_metrics.spacing_lg * 2.f));
+        ImGui::SetNextWindowSize(ImVec2(popup_width, popup_height), ImGuiCond_Appearing);
+        if (ImGui::BeginPopup("##registry_chat_history_popup", ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::TextUnformatted("Conversation History");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Close")) {
+                conversations::browser_open = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            ImGui::BeginChild("##registry_chat_history_popup_content", ImGui::GetContentRegionAvail(), false,
+                ImGuiWindowFlags_NoSavedSettings);
+            render_history(false);
+            ImGui::EndChild();
+            ImGui::EndPopup();
+        } else if (!ImGui::IsPopupOpen("##registry_chat_history_popup")) {
+            conversations::browser_open = false;
         }
-        conversations::refresh_history();
     }
 
-    const float chat_width = (std::max)(220.f, ImGui::GetContentRegionAvail().x);
+    if (delete_conversation_dialog_requested) {
+        aida::ui::design::open_dialog("chat.conversation.delete", "Delete Conversation");
+        delete_conversation_dialog_requested = false;
+    }
+    if (aida::ui::design::begin_dialog("chat.conversation.delete", "Delete Conversation",
+            ImVec2(540.f, 280.f), ImVec2(360.f, 230.f))) {
+        const auto found = std::find_if(conversations::history.begin(), conversations::history.end(),
+            [&](const ConversationSummary& conversation) {
+                return conversation.id == pending_delete_conversation_id;
+            });
+        const bool available = found != conversations::history.end();
+        const bool reviewed_identity_current = available &&
+            found->revision == pending_delete_conversation_revision;
+        const bool deleting_current = available &&
+            pending_delete_conversation_id == conversations::current_id;
+        const bool can_delete = reviewed_identity_current && !conversation_store_blocked &&
+            !(deleting_current && busy);
+        const std::string target = available && !found->title.empty()
+            ? found->title : std::string("the selected conversation");
+        const std::string scope = available
+            ? std::to_string(found->msg_count) + " messages and their stored evidence metadata"
+            : std::string("The selected conversation and its stored evidence metadata");
+        const std::string prerequisite = !available
+            ? "The conversation no longer exists; refresh History."
+            : !reviewed_identity_current
+                ? "The conversation changed after review began; close and review the current revision."
+            : conversation_store_blocked
+                ? "Wait for the active conversation transaction before deleting another conversation."
+            : deleting_current && busy
+                ? "Cancel or wait for the active AI operation before deleting its conversation."
+                : std::string();
+        aida::ui::design::confirmation_t confirmation;
+        confirmation.verb = "Delete";
+        confirmation.target = target.c_str();
+        confirmation.scope = scope.c_str();
+        confirmation.effect = "Deletes the persisted conversation and its associated evidence metadata.";
+        confirmation.reversibility = "This conversation cannot be recovered after confirmation.";
+        confirmation.prerequisite = prerequisite.empty() ? nullptr : prerequisite.c_str();
+        confirmation.confirm_label = "Delete Conversation";
+        confirmation.destructive = true;
+        confirmation.confirm_enabled = can_delete;
+        const auto result = aida::ui::design::confirmation_dialog(
+            "chat.conversation.delete.confirmation", confirmation);
+        if (result.confirmed && can_delete) {
+            const std::string id = pending_delete_conversation_id;
+            conversations::delete_conversation(id, pending_delete_conversation_revision);
+            pending_delete_conversation_id.clear();
+            pending_delete_conversation_revision = 0;
+            ImGui::CloseCurrentPopup();
+        } else if (result.cancelled) {
+            pending_delete_conversation_id.clear();
+            pending_delete_conversation_revision = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (tiny_height || tiny_width) {
+        aida::ui::design::state_presentation_t tiny;
+        tiny.stable_id = "view.ai-chat.tiny";
+        tiny.state = aida::ui::design::view_state_t::tiny;
+        tiny.title = "AI Chat needs more room";
+        tiny.message = tiny_width ? "Widen this dock to at least 96 logical pixels." :
+            "Increase this dock until the message list and compact composer fit.";
+        tiny.hint = "The action overflow remains available while the dock is compact.";
+        (void)aida::ui::design::render_state(tiny, ImVec2(body_width, body_height));
+        ImGui::EndChild();
+        return;
+    }
+
+    const float chat_width = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
     ImGui::BeginChild("##registry_chat_messages", ImVec2(chat_width, content_height), true,
-        ImGuiWindowFlags_HorizontalScrollbar);
+        ImGuiWindowFlags_NoSavedSettings);
     const std::size_t total = message_count();
     if (total > previous_total && follow_latest)
         page_start = total > max_rendered_messages ? total - max_rendered_messages : 0U;
@@ -4394,18 +5675,96 @@ void render_chat_view(float width, float height)
         ImGui::Separator();
     }
 
-    auto open_message_menu = [&](std::size_t index, context_open_origin_t origin) {
-        const auto identity = message_identity(index);
+    const auto open_retained_message_context = [&](const message_identity_t& identity,
+            context_open_origin_t origin) {
         message_context_request_t request;
         std::string reason;
         if (!open_message_context(identity, origin, request, reason)) {
             context_feedback = std::move(reason);
             return;
         }
-        context_identity = identity;
         keyboard_identity = identity;
         context_feedback.clear();
-        ImGui::OpenPopup("##registry_chat_message_context");
+        aida::ui::application_ui::retained_entity_context_t context;
+        context.owner_id = "ai.chat.message";
+        context.entity_id = identity.session_id + ":" + std::to_string(identity.index);
+        context.entity_generation = identity.fingerprint;
+        context.active_view = aida::ui::stable_view_id_t("view.ai_chat");
+        context.validate_identity = [identity] {
+            std::string validation;
+            return resolve_message(identity, validation)
+                ? aida::ui::capability_state_t::available()
+                : aida::ui::capability_state_t::unavailable(validation.empty()
+                    ? "The chat message changed; select it again" : validation);
+        };
+        const auto add = [&context, identity](const char* id, message_action_t value) {
+            const auto capability = message_action_capability(identity, value);
+            aida::ui::application_ui::retained_entity_action_t action;
+            action.action_id = id;
+            action.capability = capability.enabled
+                ? aida::ui::capability_state_t::available()
+                : aida::ui::capability_state_t::unavailable(
+                    capability.disabled_reason.empty()
+                        ? "This operation is unavailable for the retained message"
+                        : capability.disabled_reason);
+            action.invoke = [identity, value] {
+                if (value == message_action_t::delete_message) {
+                    pending_delete_identity = identity;
+                    delete_dialog_requested = true;
+                    return aida::ui::action_handler_result_t::completed();
+                }
+                if (value == message_action_t::apply_change) {
+                    pending_apply_identity = identity;
+                    apply_dialog_requested = true;
+                    return aida::ui::action_handler_result_t::completed();
+                }
+                auto result = execute_message_action(identity, value);
+                if (result.succeeded && value == message_action_t::create_evidence_handoff) {
+                    std::string handoff_reason;
+                    if (!queue_evidence_for_chat(result.evidence.evidence_id, handoff_reason)) {
+                        result.succeeded = false;
+                        result.detail = std::move(handoff_reason);
+                    }
+                }
+                if (result.succeeded && !result.target_view_id.empty()) {
+                    const auto opened = aida::ui::application_views::open_or_focus(
+                        aida::ui::stable_view_id_t(result.target_view_id));
+                    if (!opened.ok()) {
+                        result.succeeded = false;
+                        result.detail = opened.detail;
+                    }
+                }
+                context_feedback = result.detail;
+                return result.succeeded
+                    ? aida::ui::action_handler_result_t::completed()
+                    : aida::ui::action_handler_result_t::failed(result.detail.empty()
+                        ? "The chat message operation was rejected" : result.detail);
+            };
+            context.actions.push_back(std::move(action));
+        };
+        add("ai.chat.message.copy", message_action_t::copy_text);
+        add("ai.chat.message.copy_reasoning", message_action_t::copy_reasoning);
+        add("ai.chat.message.copy_tool", message_action_t::copy_tool_name);
+        add("ai.chat.message.edit", message_action_t::edit_message);
+        add("ai.chat.message.retry", message_action_t::retry_from_here);
+        add("ai.chat.message.delete_review", message_action_t::delete_message);
+        add("ai.chat.message.add_input", message_action_t::send_to_chat_input);
+        add("ai.chat.message.create_evidence", message_action_t::create_evidence_handoff);
+        add("ai.chat.message.inspect_tool", message_action_t::inspect_tool_activity);
+        add("ai.chat.message.review_change", message_action_t::review_change);
+        add("ai.chat.message.apply_review", message_action_t::apply_change);
+        add("ai.chat.message.reject_change", message_action_t::reject_change);
+        add("ai.chat.message.cancel_operation", message_action_t::cancel_active_operation);
+        const auto retained_origin = origin == context_open_origin_t::pointer
+            ? aida::ui::context_menu_open_origin_t::pointer
+            : origin == context_open_origin_t::shift_f10
+            ? aida::ui::context_menu_open_origin_t::shift_f10
+            : aida::ui::context_menu_open_origin_t::menu_key;
+        aida::ui::application_ui::open_retained_entity_context_menu(
+            std::move(context), retained_origin);
+    };
+    auto open_message_menu = [&](std::size_t index, context_open_origin_t origin) {
+        open_retained_message_context(message_identity(index), origin);
     };
 
     bool message_deleted = false;
@@ -4424,6 +5783,7 @@ void render_chat_view(float width, float height)
             ImGui::SetNextItemWidth(-1.f);
             ImGui::InputTextMultiline("##registry_chat_edit", chat_edit::buf, sizeof(chat_edit::buf),
                 ImVec2(-1.f, 84.f), ImGuiInputTextFlags_CtrlEnterForNewLine);
+            ImGui::BeginDisabled(conversation_store_blocked);
             if (ImGui::Button("Save and Resend")) {
                 const std::string replacement = chat_edit::buf;
                 if (!replacement.empty()) {
@@ -4442,6 +5802,7 @@ void render_chat_view(float width, float height)
                 chat_edit::active = false;
                 chat_edit::msg_idx = -1;
             }
+            ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
                 chat_edit::active = false;
@@ -4478,8 +5839,8 @@ void render_chat_view(float width, float height)
             if (rich.action == chat_render::action_t::retry) {
                 (void)execute_message_action(message_identity(index), message_action_t::retry_from_here);
             } else if (rich.action == chat_render::action_t::delete_msg) {
-                const auto result = execute_message_action(message_identity(index), message_action_t::delete_message);
-                message_deleted = result.succeeded;
+                pending_delete_identity = message_identity(index);
+                delete_dialog_requested = true;
             } else if (rich.action == chat_render::action_t::edit_msg) {
                 (void)execute_message_action(message_identity(index), message_action_t::edit_message);
             } else if (rich.action == chat_render::action_t::copy) {
@@ -4503,66 +5864,18 @@ void render_chat_view(float width, float height)
         keyboard_identity = message_identity(window.last - 1U);
     const bool menu_key = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         ImGui::IsKeyPressed(ImGuiKey_Menu, false);
-    const bool shift_f10 = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+    const bool shift_f10 = !menu_key &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
         ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
     if ((menu_key || shift_f10) && keyboard_identity.fingerprint != 0) {
-        message_context_request_t request;
-        std::string reason;
         const auto origin = menu_key ? context_open_origin_t::menu_key : context_open_origin_t::shift_f10;
-        if (open_message_context(keyboard_identity, origin, request, reason)) {
-            context_identity = keyboard_identity;
-            context_feedback.clear();
-            ImGui::OpenPopup("##registry_chat_message_context");
-        } else {
-            context_feedback = std::move(reason);
-        }
+        open_retained_message_context(keyboard_identity, origin);
     }
 
-    if (ImGui::BeginPopup("##registry_chat_message_context")) {
-        auto action = [&](const char* label, message_action_t value) {
-            const auto capability = message_action_capability(context_identity, value);
-            ImGui::BeginDisabled(!capability.enabled);
-            const bool activated = ImGui::MenuItem(label);
-            ImGui::EndDisabled();
-            if (!capability.enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
-                !capability.disabled_reason.empty())
-                ImGui::SetTooltip("%s", capability.disabled_reason.c_str());
-            if (!activated || !capability.enabled) return;
-            auto result = execute_message_action(context_identity, value);
-            if (result.succeeded && value == message_action_t::create_evidence_handoff) {
-                std::string reason;
-                if (!queue_evidence_for_chat(result.evidence.evidence_id, reason))
-                    result.detail = std::move(reason);
-            }
-            if (result.succeeded && !result.target_view_id.empty()) open_view(result.target_view_id.c_str());
-            if (result.succeeded && value == message_action_t::delete_message) {
-                context_identity = {};
-                keyboard_identity = {};
-            }
-            context_feedback = std::move(result.detail);
-        };
-        action("Copy Message", message_action_t::copy_text);
-        action("Copy Reasoning", message_action_t::copy_reasoning);
-        action("Copy Tool Name", message_action_t::copy_tool_name);
-        ImGui::Separator();
-        action("Edit Message", message_action_t::edit_message);
-        action("Retry From Here", message_action_t::retry_from_here);
-        action("Delete Message", message_action_t::delete_message);
-        ImGui::Separator();
-        action("Add to Chat Input", message_action_t::send_to_chat_input);
-        action("Add as Evidence", message_action_t::create_evidence_handoff);
-        action("Inspect Tool Activity", message_action_t::inspect_tool_activity);
-        ImGui::Separator();
-        action("Review Staged Change", message_action_t::review_change);
-        action("Apply Staged Change", message_action_t::apply_change);
-        action("Reject Staged Change", message_action_t::reject_change);
-        action("Cancel Active Operation", message_action_t::cancel_active_operation);
-        if (!context_feedback.empty()) {
-            ImGui::Separator();
-            ImGui::TextWrapped("%s", context_feedback.c_str());
-        }
-        ImGui::EndPopup();
-    }
+    aida::ui::application_ui::render_retained_entity_context_menu(
+        "ai.chat.message");
+    if (!context_feedback.empty())
+        ImGui::TextWrapped("%s", context_feedback.c_str());
 
     if (g_chat_scroll_to_bottom) {
         ImGui::SetScrollHereY(1.f);
@@ -4570,24 +5883,225 @@ void render_chat_view(float width, float height)
     }
     ImGui::EndChild();
 
-    const bool busy = is_ai_busy();
-    if (busy) ImGui::TextDisabled("AI operation in progress");
-    else ImGui::TextDisabled("Enter sends  |  Ctrl+Enter inserts a line break");
-    const float button_width = busy ? 74.f : 64.f;
-    ImGui::SetNextItemWidth((std::max)(80.f, ImGui::GetContentRegionAvail().x - button_width - 8.f));
+    if (delete_dialog_requested) {
+        aida::ui::design::open_dialog("chat.message.delete", "Delete Chat Message");
+        delete_dialog_requested = false;
+    }
+    if (aida::ui::design::begin_dialog("chat.message.delete", "Delete Chat Message",
+            ImVec2(520.f, 260.f), ImVec2(360.f, 220.f))) {
+        std::string reason;
+        const ChatMessage* pending_message = resolve_message(pending_delete_identity, reason);
+        const auto capability = message_action_capability(
+            pending_delete_identity, message_action_t::delete_message);
+        const std::string target = pending_message
+            ? (pending_message->is_user ? "the selected user message" :
+                pending_message->is_tool_result ? "the selected tool result" :
+                "the selected assistant response")
+            : "the selected message";
+        aida::ui::design::confirmation_t confirmation;
+        confirmation.verb = "Delete";
+        confirmation.target = target.c_str();
+        confirmation.scope = "Only this message in the current conversation";
+        confirmation.effect = "Removes the message from the visible history and the persisted conversation.";
+        confirmation.reversibility = "This deletion cannot be undone after confirmation.";
+        confirmation.prerequisite = capability.enabled ? nullptr :
+            (capability.disabled_reason.empty() ? reason.c_str() : capability.disabled_reason.c_str());
+        confirmation.confirm_label = "Delete Message";
+        confirmation.destructive = true;
+        confirmation.confirm_enabled = pending_message != nullptr && capability.enabled;
+        const auto result = aida::ui::design::confirmation_dialog(
+            "chat.message.delete.confirmation", confirmation);
+        if (result.confirmed && pending_message && capability.enabled) {
+            g_chat_messages.erase(g_chat_messages.begin() +
+                static_cast<std::ptrdiff_t>(pending_delete_identity.index));
+            conversations::save_current();
+            keyboard_identity = {};
+            context_feedback = "Message deleted.";
+            pending_delete_identity = {};
+            ImGui::CloseCurrentPopup();
+        } else if (result.cancelled) {
+            pending_delete_identity = {};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (apply_dialog_requested) {
+        aida::ui::design::open_dialog("chat.proposal.apply", "Apply AI Change");
+        apply_dialog_requested = false;
+    }
+    if (aida::ui::design::begin_dialog("chat.proposal.apply", "Apply AI Change",
+            ImVec2(620.f, 340.f), ImVec2(420.f, 280.f))) {
+        const auto capability = message_action_capability(
+            pending_apply_identity, message_action_t::apply_change);
+        const auto reverse_proposal_publication = reverse_engineering_proposal_snapshot();
+        const auto& reverse_proposal = *reverse_proposal_publication;
+        const bool reverse_linked = reverse_proposal.pending &&
+            reverse_proposal.source.session_id == pending_apply_identity.session_id &&
+            reverse_proposal.source.fingerprint == pending_apply_identity.fingerprint;
+        if (reverse_linked) {
+            const std::string scope = reverse_proposal.kind_label + "; expected generation " +
+                std::to_string(reverse_proposal.expected_generation) + "; expected revision " +
+                std::to_string(reverse_proposal.expected_revision) + "; overlay/artifact fence " +
+                std::to_string(reverse_proposal.expected_overlay_revision);
+            aida::ui::design::confirmation_t confirmation;
+            confirmation.verb = "Apply";
+            confirmation.target = reverse_proposal.target_label.c_str();
+            confirmation.scope = scope.c_str();
+            confirmation.effect = reverse_proposal.consequence.c_str();
+            confirmation.reversibility = reverse_proposal.reversibility.c_str();
+            confirmation.prerequisite = capability.enabled ? nullptr :
+                capability.disabled_reason.c_str();
+            confirmation.confirm_label = reverse_proposal.kind ==
+                    reverse_engineering_proposal_kind_t::static_patch
+                ? "Open Static Patch Review" : reverse_proposal.kind ==
+                    reverse_engineering_proposal_kind_t::live_patch
+                ? "Stage in Patch Review" : reverse_proposal.kind ==
+                    reverse_engineering_proposal_kind_t::network_replay_staging
+                ? "Stage in Repeater" : "Apply Reviewed Change";
+            confirmation.destructive = true;
+            confirmation.confirm_enabled = capability.enabled && !reverse_proposal.stale &&
+                !reverse_proposal.applying;
+            ImGui::TextDisabled("BEFORE");
+            ImGui::BeginChild("##proposal_before", ImVec2(-1.f, 52.f), true,
+                ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(reverse_proposal.before_value.c_str());
+            ImGui::EndChild();
+            ImGui::TextDisabled("AFTER");
+            ImGui::BeginChild("##proposal_after", ImVec2(-1.f, 52.f), true,
+                ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(reverse_proposal.after_value.c_str());
+            ImGui::EndChild();
+            const auto result = aida::ui::design::confirmation_dialog(
+                "chat.proposal.apply.confirmation", confirmation);
+            if (result.confirmed && confirmation.confirm_enabled) {
+                auto applied = execute_message_action(
+                    pending_apply_identity, message_action_t::apply_change);
+                context_feedback = applied.detail;
+                if (applied.succeeded) {
+                    if (!applied.target_view_id.empty()) open_view(applied.target_view_id.c_str());
+                    pending_apply_identity = {};
+                    ImGui::CloseCurrentPopup();
+                }
+            } else if (result.cancelled) {
+                pending_apply_identity = {};
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+        const auto proposal = editor_proposal_snapshot();
+        const int pending_hunks = code_editor_widget::pending_hunk_count();
+        std::ostringstream hash_stream;
+        hash_stream << "0x" << std::hex << std::uppercase << proposal.base_content_hash;
+        const std::string target = proposal.target_document_numeric_id != 0
+            ? "code document " + std::to_string(proposal.target_document_numeric_id)
+            : std::string("the staged code document");
+        const std::string scope = std::to_string((std::max)(pending_hunks, 0)) +
+            " pending hunks; base revision " + std::to_string(proposal.base_document_revision) +
+            "; base hash " + hash_stream.str();
+        aida::ui::design::confirmation_t confirmation;
+        confirmation.verb = "Apply";
+        confirmation.target = target.c_str();
+        confirmation.scope = scope.c_str();
+        confirmation.effect = "Applies every pending reviewed hunk to the in-memory editor buffer; it does not save the file to disk.";
+        confirmation.reversibility = "Use the code editor Undo command before saving to reverse the applied buffer change.";
+        confirmation.prerequisite = capability.enabled ? nullptr : capability.disabled_reason.c_str();
+        confirmation.confirm_label = "Apply Reviewed Hunks";
+        confirmation.destructive = true;
+        confirmation.confirm_enabled = capability.enabled && pending_hunks > 0 &&
+            proposal.pending && !proposal.stale;
+        const auto result = aida::ui::design::confirmation_dialog(
+            "chat.proposal.apply.confirmation", confirmation);
+        if (result.confirmed && confirmation.confirm_enabled) {
+            bool reviewed = false;
+            {
+                std::lock_guard<std::mutex> lock(s_editor_proposal_mutex);
+                if (s_editor_proposal.pending && !s_editor_proposal.stale &&
+                    s_editor_proposal.generation == proposal.generation &&
+                    s_editor_proposal.target_document_numeric_id ==
+                        code_editor_widget::active_document_id() &&
+                    s_editor_proposal.base_document_revision ==
+                        code_editor_widget::document_revision() &&
+                    s_editor_proposal.base_content_hash ==
+                        code_editor_widget::document_content_fingerprint() &&
+                    pending_hunks == code_editor_widget::pending_hunk_count()) {
+                    s_editor_proposal.reviewed_generation = proposal.generation;
+                    s_editor_proposal.reviewed_content_hash = proposal.base_content_hash;
+                    s_editor_proposal.reviewed_pending_hunks = pending_hunks;
+                    reviewed = true;
+                }
+            }
+            if (reviewed) {
+                auto applied = execute_message_action(
+                    pending_apply_identity, message_action_t::apply_change);
+                context_feedback = applied.detail;
+                if (applied.succeeded) {
+                    if (!applied.target_view_id.empty()) open_view(applied.target_view_id.c_str());
+                    pending_apply_identity = {};
+                    ImGui::CloseCurrentPopup();
+                }
+            } else {
+                context_feedback = "The target document or staged hunk set changed before confirmation; review the current proposal again.";
+            }
+        } else if (result.cancelled) {
+            pending_apply_identity = {};
+            ImGui::CloseCurrentPopup();
+        }
+        }
+        ImGui::EndPopup();
+    }
+
+    const float input_width = stacked_composer ? body_width :
+        (std::max)(1.f, body_width - composer_button_width - chat_metrics.spacing_sm);
+    ImGui::SetNextItemWidth(input_width);
+    ImGui::BeginDisabled(conversation_store_blocked);
     const bool enter = ImGui::InputTextMultiline("##registry_chat_input", g_chat_buf, sizeof(g_chat_buf),
-        ImVec2(0.f, 56.f), ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
+        ImVec2(input_width, composer_editor_height),
+        ImGuiInputTextFlags_CtrlEnterForNewLine | ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::EndDisabled();
+    if (stacked_composer) ImGui::Dummy(ImVec2(0.f, chat_metrics.spacing_xs));
+    else {
+        ImGui::SameLine(0.f, chat_metrics.spacing_sm);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+            (std::max)(0.f, (composer_editor_height - composer_button_height) * 0.5f));
+    }
     bool submit = false;
-    if (busy) {
-        if (ImGui::Button("Cancel", ImVec2(button_width, 56.f))) chat_request_cancel();
-    } else {
-        const bool has_text = g_chat_buf[0] != '\0';
-        ImGui::BeginDisabled(!has_text);
-        submit = ImGui::Button("Send", ImVec2(button_width, 56.f));
+    if (conversation_store_blocked) {
+        ImGui::BeginDisabled();
+        ImGui::Button(conversation_store_pending
+                ? "Saving...###registry_chat_primary_action"
+                : "Retry storage###registry_chat_primary_action",
+            ImVec2(stacked_composer ? body_width : composer_button_width,
+                composer_button_height));
         ImGui::EndDisabled();
+        aida::ui::design::tooltip_for_last_item(conversation_store_pending
+            ? "Wait for the conversation transaction to finish"
+            : "Use Retry above to reconcile the retained conversation transaction");
+    } else if (busy) {
+        if (ImGui::Button("Cancel###registry_chat_primary_action",
+                ImVec2(stacked_composer ? body_width : composer_button_width,
+                composer_button_height)))
+            chat_request_cancel();
+        aida::ui::design::tooltip_for_last_item("Cancel the active AI operation");
+    } else {
+        const bool has_text = std::any_of(g_chat_buf, g_chat_buf + std::strlen(g_chat_buf), [](unsigned char value) {
+            return !std::isspace(value);
+        });
+        ImGui::BeginDisabled(!has_text);
+        submit = ImGui::Button("Send###registry_chat_primary_action",
+            ImVec2(stacked_composer ? body_width : composer_button_width,
+            composer_button_height));
+        ImGui::EndDisabled();
+        aida::ui::design::tooltip_for_last_item(has_text ? "Send this message" :
+            "Type a message to enable Send", "Enter");
         submit = (submit || enter) && has_text;
     }
+    const bool compact_status = body_width < scaled(280.f);
+    if (conversation_store_pending) ImGui::TextDisabled("Conversation transaction in progress");
+    else if (conversation_persistence.failed) ImGui::TextDisabled("Conversation persistence requires retry");
+    else if (busy) ImGui::TextDisabled("AI operation in progress");
+    else ImGui::TextDisabled(compact_status ? "Enter sends" : "Enter sends  |  Ctrl+Enter inserts a line break");
+    if (!busy && compact_status)
+        aida::ui::design::tooltip_for_last_item("Enter sends. Ctrl+Enter inserts a line break.");
     if (submit) {
         std::string prompt = g_chat_buf;
         const auto first = prompt.find_first_not_of(" \t\r\n");
@@ -4603,8 +6117,9 @@ void render_chat_view(float width, float height)
             g_chat_buf[0] = '\0';
             g_chat_scroll_to_bottom = true;
             follow_latest = true;
+            const bool assigned_new_session = conversations::current_id.empty();
             conversations::save_current();
-            if (chat_active_session() != conversations::current_id) {
+            if (assigned_new_session && !conversations::current_id.empty()) {
                 chat_bind_session(conversations::current_id);
                 synchronize_evidence_session();
             }
@@ -4616,19 +6131,202 @@ void render_chat_view(float width, float height)
 
 void render_evidence_view(float width, float height)
 {
+    static bool apply_requested = false;
+    static std::string feedback;
+    const auto proposal_publication = reverse_engineering_proposal_snapshot();
+    const auto& proposal = *proposal_publication;
+    float proposal_height = 0.f;
+    if (proposal.kind != reverse_engineering_proposal_kind_t::none &&
+        (proposal.pending || proposal.applying || proposal.review_staged || proposal.applied ||
+         proposal.rejected || proposal.stale)) {
+        proposal_height = (std::min)(height, 278.f);
+        ImGui::BeginChild("##reverse_engineering_proposal_review",
+            ImVec2(width, proposal_height), true,
+            ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::TextUnformatted("AI CHANGE REVIEW");
+        ImGui::SameLine();
+        if (proposal.state == reverse_engineering_proposal_state_t::queued)
+            ImGui::TextDisabled("QUEUED");
+        else if (proposal.state == reverse_engineering_proposal_state_t::running)
+            ImGui::TextDisabled("VALIDATING");
+        else if (proposal.state == reverse_engineering_proposal_state_t::error)
+            ImGui::TextDisabled("ERROR");
+        else if (proposal.applying) ImGui::TextDisabled("APPLYING");
+        else if (proposal.review_staged) ImGui::TextDisabled("STAGED / REVIEW REQUIRED");
+        else if (proposal.applied && proposal.terminal_readback) ImGui::TextDisabled("VERIFIED");
+        else if (proposal.rejected) ImGui::TextDisabled("REJECTED");
+        else if (proposal.stale) ImGui::TextDisabled("STALE");
+        else ImGui::TextDisabled("PENDING");
+        ImGui::Text("%s  |  %s", proposal.kind_label.c_str(),
+            proposal.target_label.c_str());
+        ImGui::TextDisabled("Provenance: %s", proposal.provenance.c_str());
+        ImGui::TextWrapped("%s", proposal.rationale.c_str());
+        ImGui::Columns(2, "##proposal_values", true);
+        ImGui::TextDisabled("BEFORE");
+        ImGui::BeginChild("##proposal_before_value", ImVec2(-1.f, 58.f), true,
+            ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::TextUnformatted(proposal.before_value.c_str());
+        ImGui::EndChild();
+        ImGui::NextColumn();
+        ImGui::TextDisabled("AFTER");
+        ImGui::BeginChild("##proposal_after_value", ImVec2(-1.f, 58.f), true,
+            ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::TextUnformatted(proposal.after_value.c_str());
+        ImGui::EndChild();
+        ImGui::Columns(1);
+        ImGui::TextWrapped("Consequence: %s", proposal.consequence.c_str());
+        if (proposal.pending && !proposal.applying) {
+            const auto capability = message_action_capability(
+                proposal.source, message_action_t::apply_change);
+            ImGui::BeginDisabled(!capability.enabled);
+            if (ImGui::Button("Apply Reviewed Change")) apply_requested = true;
+            ImGui::EndDisabled();
+            if (!capability.enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", capability.disabled_reason.c_str());
+            ImGui::SameLine();
+            if (ImGui::Button("Reject")) {
+                const auto rejected = execute_message_action(
+                    proposal.source, message_action_t::reject_change);
+                feedback = rejected.detail;
+            }
+        }
+        if (!proposal.detail.empty()) ImGui::TextWrapped("%s", proposal.detail.c_str());
+        if (!feedback.empty()) ImGui::TextWrapped("%s", feedback.c_str());
+        const bool proposal_hovered = ImGui::IsWindowHovered();
+        const bool proposal_focused = ImGui::IsWindowFocused();
+        const bool pointer_context = proposal_hovered &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+        const bool menu_context = proposal_focused &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool shift_f10_context = proposal_focused && ImGui::GetIO().KeyShift &&
+            ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        if (pointer_context || menu_context || shift_f10_context) {
+            aida::ui::application_ui::retained_entity_context_t context;
+            context.owner_id = "ai.evidence.proposal";
+            context.entity_id = proposal.id;
+            context.entity_generation = proposal.operation_id;
+            context.active_view = aida::ui::stable_view_id_t("view.ai.evidence");
+            context.validate_identity = [source = proposal.source,
+                                         operation_id = proposal.operation_id] {
+                const auto current_publication = reverse_engineering_proposal_snapshot();
+                const auto& current = *current_publication;
+                return current.source.session_id == source.session_id &&
+                    current.source.fingerprint == source.fingerprint &&
+                    current.operation_id == operation_id && current.pending
+                    ? aida::ui::capability_state_t::available()
+                    : aida::ui::capability_state_t::unavailable(
+                        "The reviewed proposal identity changed; reopen its context menu");
+            };
+            const auto add = [&](const char* action_id, message_action_t action) {
+                const auto capability = message_action_capability(proposal.source, action);
+                aida::ui::application_ui::retained_entity_action_t item;
+                item.action_id = action_id;
+                item.capability = capability.enabled
+                    ? aida::ui::capability_state_t::available()
+                    : aida::ui::capability_state_t::unavailable(
+                        capability.disabled_reason.empty()
+                            ? "This proposal operation is unavailable"
+                            : capability.disabled_reason);
+                item.invoke = [source = proposal.source, action, &apply_requested,
+                               &feedback] {
+                    if (action == message_action_t::apply_change) {
+                        apply_requested = true;
+                        return aida::ui::action_handler_result_t::completed();
+                    }
+                    const auto result = execute_message_action(source, action);
+                    feedback = result.detail;
+                    if (result.succeeded && !result.target_view_id.empty())
+                        static_cast<void>(aida::ui::application_views::open_or_focus(
+                            aida::ui::stable_view_id_t(result.target_view_id)));
+                    return result.succeeded
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(
+                            result.detail.empty() ? "The proposal operation was rejected"
+                                                  : result.detail);
+                };
+                context.actions.push_back(std::move(item));
+            };
+            add("ai.chat.message.review_change", message_action_t::review_change);
+            add("ai.chat.message.apply_review", message_action_t::apply_change);
+            add("ai.chat.message.reject_change", message_action_t::reject_change);
+            const auto origin = pointer_context
+                ? aida::ui::context_menu_open_origin_t::pointer
+                : shift_f10_context
+                ? aida::ui::context_menu_open_origin_t::shift_f10
+                : aida::ui::context_menu_open_origin_t::menu_key;
+            aida::ui::application_ui::open_retained_entity_context_menu(
+                std::move(context), origin);
+        }
+        ImGui::EndChild();
+        ImGui::Dummy(ImVec2(0.f, 4.f));
+    }
+    if (apply_requested) {
+        aida::ui::design::open_dialog(
+            "evidence.proposal.apply", "Apply Reviewed AI Change");
+        apply_requested = false;
+    }
+    if (aida::ui::design::begin_dialog("evidence.proposal.apply",
+            "Apply Reviewed AI Change", ImVec2(640.f, 390.f), ImVec2(440.f, 300.f))) {
+        const auto current_publication = reverse_engineering_proposal_snapshot();
+        const auto& current = *current_publication;
+        const auto capability = message_action_capability(
+            current.source, message_action_t::apply_change);
+        const std::string scope = current.kind_label + "; generation " +
+            std::to_string(current.expected_generation) + "; revision " +
+            std::to_string(current.expected_revision) + "; overlay/artifact fence " +
+            std::to_string(current.expected_overlay_revision);
+        aida::ui::design::confirmation_t confirmation;
+        confirmation.verb = "Apply";
+        confirmation.target = current.target_label.c_str();
+        confirmation.scope = scope.c_str();
+        confirmation.effect = current.consequence.c_str();
+        confirmation.reversibility = current.reversibility.c_str();
+        confirmation.prerequisite = capability.enabled ? nullptr :
+            capability.disabled_reason.c_str();
+        confirmation.confirm_label = current.kind ==
+                reverse_engineering_proposal_kind_t::static_patch
+            ? "Open Static Patch Review" : current.kind ==
+                reverse_engineering_proposal_kind_t::live_patch
+            ? "Stage in Patch Review" : current.kind ==
+                reverse_engineering_proposal_kind_t::network_replay_staging
+            ? "Stage in Repeater" : "Apply Reviewed Change";
+        confirmation.destructive = true;
+        confirmation.confirm_enabled = capability.enabled && current.pending &&
+            !current.applying && !current.stale;
+        const auto result = aida::ui::design::confirmation_dialog(
+            "evidence.proposal.apply.confirmation", confirmation);
+        if (result.confirmed && confirmation.confirm_enabled) {
+            const auto applied = execute_message_action(
+                current.source, message_action_t::apply_change);
+            feedback = applied.detail;
+            if (applied.succeeded) {
+                if (!applied.target_view_id.empty()) {
+                    (void)aida::ui::application_views::open_or_focus(
+                        aida::ui::stable_view_id_t(applied.target_view_id));
+                }
+                ImGui::CloseCurrentPopup();
+            }
+        } else if (result.cancelled) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
     const auto items = evidence_snapshot();
-    if (items.empty()) {
-        ImGui::TextWrapped("No evidence has been collected. Use Add to Chat or Assign to Agent from a source context menu.");
+    if (!items || items->empty()) {
+        if (proposal_height == 0.f)
+            ImGui::TextWrapped("No evidence has been collected. Use Add to Chat or Assign to Agent from a source context menu.");
         return;
     }
     static std::string selected_id;
-    ImGui::BeginChild("##automation_evidence_list", ImVec2(width, height), false,
+    ImGui::BeginChild("##automation_evidence_list",
+        ImVec2(width, (std::max)(1.f, height - proposal_height -
+            (proposal_height > 0.f ? 4.f : 0.f))), false,
         ImGuiWindowFlags_HorizontalScrollbar);
     ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(items.size()), ImGui::GetTextLineHeightWithSpacing() * 2.5f);
+    clipper.Begin(static_cast<int>(items->size()), ImGui::GetTextLineHeightWithSpacing() * 2.5f);
     while (clipper.Step()) {
         for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
-            const auto& item = items[static_cast<std::size_t>(index)];
+            const auto& item = (*items)[static_cast<std::size_t>(index)];
             ImGui::PushID(item.id.c_str());
             const bool selected = selected_id == item.id;
             const char* label = item.display_label.empty() ? item.entity_id.c_str() : item.display_label.c_str();
@@ -4640,30 +6338,80 @@ void render_evidence_view(float width, float height)
                     (void)navigate_to_evidence_source(item.id, reason);
                 }
             }
-            const bool keyboard_context = selected && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-                (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Right) || keyboard_context)
-                ImGui::OpenPopup("##evidence_context");
-            if (ImGui::BeginPopup("##evidence_context")) {
-                std::string reason;
-                if (ImGui::MenuItem("Return to Source"))
-                    (void)navigate_to_evidence_source(item.id, reason);
-                if (ImGui::MenuItem("Add to Chat", nullptr, false, !item.stale))
-                    (void)queue_evidence_for_chat(item.id, reason);
-                if (ImGui::MenuItem("Assign to Agent", nullptr, false, !item.stale))
-                    (void)queue_evidence_for_agent(item.id, reason);
-                if (ImGui::MenuItem("Copy Evidence ID"))
-                    ImGui::SetClipboardText(item.id.c_str());
-                if (item.stale) {
-                    ImGui::BeginDisabled();
-                    ImGui::MenuItem("Evidence is stale");
-                    ImGui::EndDisabled();
-                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("%s", item.stale_reason.c_str());
-                }
-                ImGui::EndPopup();
+            const bool menu_key_context = selected &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+            const bool shift_f10_context = !menu_key_context && selected &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+            const bool keyboard_context = menu_key_context || shift_f10_context;
+            const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            if (pointer_context || keyboard_context) {
+                aida::ui::application_ui::retained_entity_context_t context;
+                context.owner_id = "ai.evidence.item";
+                context.entity_id = item.id;
+                context.entity_generation = item.generation;
+                context.active_view = aida::ui::stable_view_id_t("view.ai.evidence");
+                const auto retained_id = item.id;
+                const auto retained_generation = item.generation;
+                const auto retained_hash = item.snapshot_hash;
+                context.validate_identity = [retained_id, retained_generation, retained_hash] {
+                    const auto live = evidence_snapshot();
+                    const auto found = std::find_if(live->begin(), live->end(),
+                        [&retained_id](const evidence_envelope_t& candidate) {
+                            return candidate.id == retained_id;
+                        });
+                    return found != live->end() && found->generation == retained_generation &&
+                            found->snapshot_hash == retained_hash
+                        ? aida::ui::capability_state_t::available()
+                        : aida::ui::capability_state_t::unavailable(
+                            "The evidence envelope changed; select it again");
+                };
+                const auto add = [&context](const char* id, bool enabled,
+                        const char* reason,
+                        std::function<aida::ui::action_handler_result_t()> invoke) {
+                    aida::ui::application_ui::retained_entity_action_t action;
+                    action.action_id = id;
+                    action.capability = enabled
+                        ? aida::ui::capability_state_t::available()
+                        : aida::ui::capability_state_t::unavailable(reason);
+                    action.invoke = std::move(invoke);
+                    context.actions.push_back(std::move(action));
+                };
+                add("ai.evidence.return_source", true, "", [retained_id] {
+                    std::string reason;
+                    return navigate_to_evidence_source(retained_id, reason)
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(reason);
+                });
+                const char* stale_reason = item.stale_reason.empty()
+                    ? "This evidence is stale; return to its source and collect it again"
+                    : item.stale_reason.c_str();
+                add("ai.evidence.add_chat", !item.stale, stale_reason, [retained_id] {
+                    std::string reason;
+                    return queue_evidence_for_chat(retained_id, reason)
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(reason);
+                });
+                add("ai.evidence.assign_agent", !item.stale, stale_reason, [retained_id] {
+                    std::string reason;
+                    return queue_evidence_for_agent(retained_id, reason)
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(reason);
+                });
+                add("ai.evidence.copy_id", true, "", [retained_id] {
+                    ImGui::SetClipboardText(retained_id.c_str());
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                aida::ui::application_ui::open_retained_entity_context_menu(
+                    std::move(context), pointer_context
+                        ? aida::ui::context_menu_open_origin_t::pointer
+                        : menu_key_context
+                        ? aida::ui::context_menu_open_origin_t::menu_key
+                        : aida::ui::context_menu_open_origin_t::shift_f10);
             }
+            aida::ui::application_ui::render_retained_entity_context_menu(
+                "ai.evidence.item");
             ImGui::SameLine();
             ImGui::TextDisabled("%s%s", item.source_kind.c_str(), item.truncated ? "  bounded" : "");
             ImGui::PopID();
@@ -4896,27 +6644,28 @@ void plan_build_pill_meta(std::string& label, std::string& glyph, ImU32& bg, ImU
 
 }
 
-void chat_handle_agent_shortcuts()
+bool chat_toggle_agent_picker(std::string& error)
 {
-    bool ctrl = ImGui::GetIO().KeyCtrl;
-    bool shift = ImGui::GetIO().KeyShift;
-    if (!(ctrl && shift)) return;
+    if (aida::agent_picker::is_open())
+        aida::agent_picker::close();
+    else
+        aida::agent_picker::open();
+    error.clear();
+    return true;
+}
 
-    if (ImGui::IsKeyPressed(ImGuiKey_A, false)) {
-        if (aida::agent_picker::is_open())
-            aida::agent_picker::close();
-        else
-            aida::agent_picker::open();
-        return;
+bool chat_toggle_plan_build_agent(std::string& error)
+{
+    const std::string current = aida::agent::active_agent_name();
+    const std::string target = current == "plan" ? "build" : "plan";
+    if (!aida::agent::set_active_agent(target)) {
+        error = "The requested plan/build agent is unavailable.";
+        return false;
     }
-    if (ImGui::IsKeyPressed(ImGuiKey_M, false)) {
-        std::string current = aida::agent::active_agent_name();
-        std::string target = (current == "plan") ? std::string("build") : std::string("plan");
-        if (aida::agent::set_active_agent(target)) {
-            aida::events::publish(aida::events::event_agent_changed,
-                aida::events::agent_changed_t{ chat_active_session(), current, target });
-        }
-    }
+    aida::events::publish(aida::events::event_agent_changed,
+        aida::events::agent_changed_t{chat_active_session(), current, target});
+    error.clear();
+    return true;
 }
 
 namespace {
@@ -5005,11 +6754,22 @@ void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha)
 
     if (hov) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-        ImGui::SetTooltip("Active agent: %s\nClick to switch  |  Ctrl+Shift+M to toggle plan/build  |  Ctrl+Shift+A to open picker",
-            aida::agent::active_agent_name().c_str());
+        const auto picker = aida::ui::application_ui::present_action(
+            "ai.agent_picker.toggle");
+        const auto mode = aida::ui::application_ui::present_action(
+            "ai.agent_mode.toggle_plan_build");
+        const std::string picker_hint = picker.shortcut.empty()
+            ? std::string("unbound") : picker.shortcut;
+        const std::string mode_hint = mode.shortcut.empty()
+            ? std::string("unbound") : mode.shortcut;
+        ImGui::SetTooltip("Active agent: %s\nClick to switch  |  %s to toggle plan/build  |  %s to open picker",
+            aida::agent::active_agent_name().c_str(), mode_hint.c_str(),
+            picker_hint.c_str());
     }
     if (clicked) {
-        aida::agent_picker::open();
+        static_cast<void>(aida::ui::application_ui::execute_action(
+            "ai.agent_picker.toggle",
+            aida::ui::action_invocation_source_t::toolbar));
     }
     ImGui::PopID();
 }
@@ -5395,7 +7155,8 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
                             sa_settings_detail::io_mutex());
                         settings_sa_t settings_before = g_sa_settings;
                         g_sa_settings.default_provider_id = p->id;
-                        saved = g_sa_settings.save();
+                        saved = aida::settings_persistence::accepted(
+                            aida::settings_persistence::request_save(g_sa_settings));
                         if (!saved)
                             g_sa_settings = std::move(settings_before);
                     }
@@ -5542,7 +7303,8 @@ void chat_render_model_pill(float anchor_x, float anchor_y, float alpha)
                             prof->model = m->id;
                             g_sa_settings.sync_legacy_fields_from_active_profile();
                         }
-                        saved = g_sa_settings.save();
+                        saved = aida::settings_persistence::accepted(
+                            aida::settings_persistence::request_save(g_sa_settings));
                         if (!saved)
                             g_sa_settings = std::move(settings_before);
                     }

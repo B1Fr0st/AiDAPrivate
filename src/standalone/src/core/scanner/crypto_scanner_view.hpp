@@ -6,13 +6,17 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
+#include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -21,14 +25,21 @@
 #include "crypto_scanner.hpp"
 #include "disasm_view.hpp"
 #include "hex_view.hpp"
+#include "scanner_async_io.hpp"
 #include "ui_anim.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
+#include "../infra/executor.hpp"
+#include "../ui/task_center.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #endif
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -45,6 +56,24 @@
 
 namespace crypto_scanner_view {
 
+inline constexpr std::size_t k_max_crypto_reference_publication = 0x400000;
+
+enum class export_terminal_t : std::uint8_t {
+	idle,
+	queued,
+	running,
+	succeeded,
+	failed,
+	cancelled,
+	stale
+};
+
+struct export_status_t {
+	export_terminal_t terminal = export_terminal_t::idle;
+	std::string message;
+	std::string path;
+};
+
 struct state_t {
 	float  scroll_y = 0.f;
 	float  target_scroll_y = 0.f;
@@ -55,6 +84,14 @@ struct state_t {
 	int    sort_column = -1;
 	bool   sort_ascending = true;
 	int    ctx_hit_idx = -1;
+	uint64_t context_address = 0;
+	std::string context_algorithm;
+	std::string context_signature;
+	std::vector<std::uint64_t> reference_choices;
+	std::uint64_t reference_generation = 0;
+	bool open_reference_chooser = false;
+	int reference_selected = 0;
+	bool reference_focus_pending = false;
 	float  sort_arrow_anim = 0.f;
 	int    last_sort_column = -1;
 	std::mutex mutex;
@@ -75,9 +112,21 @@ struct state_t {
 	std::atomic<std::size_t> cipher_hits{0};
 	std::atomic<std::size_t> hash_hits{0};
 	std::atomic<std::size_t> referenced_hits{0};
+	export_status_t export_status;
+	std::atomic<bool> export_pending{false};
+	std::atomic<bool> export_dispatch_failed{false};
+	std::atomic<std::uint64_t> export_serial{0};
+	bool last_export_csv = false;
+	std::string last_export_path;
 };
 
 inline state_t g_state;
+
+inline bool context_key_pressed()
+{
+	return ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+		(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
+}
 
 inline std::mutex& workspace_states_mutex()
 {
@@ -534,7 +583,7 @@ inline void open_hit_in_hex(const disasm_view::workspace_context_t& context,
 	std::uint64_t address)
 {
 	if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
-		hex_view::read_live_memory(context, address, 256);
+		hex_view::request_live_memory(context, address, 256);
 		return;
 	}
 	hex_view::activate(context);
@@ -644,49 +693,107 @@ inline void request_filtered_results(
 	}
 }
 
-inline void export_results(const disasm_view::workspace_context_t& context,
-	std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t> snapshot,
-	std::string path,
-	bool csv)
+inline constexpr std::size_t max_export_results = 100000;
+inline constexpr std::size_t max_export_string = 512;
+
+inline void set_export_status(const std::shared_ptr<state_t>& state,
+	export_terminal_t terminal, std::string message, std::string path = {})
 {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	const std::size_t count = snapshot ? snapshot->results.size() : 0;
-	aida::preview::scan::record(csv ? "crypto.export.csv" : "crypto.export.json",
-		context.workspace->identity().bin_name() + ": " + std::to_string(count) + " results");
-	(void)path;
-#else
-	aida::infra::taskflow_runtime::task_descriptor_t descriptor;
-	descriptor.owner_subsystem = "scanner";
-	descriptor.label = csv ? "scanner.crypto.export.csv" : "scanner.crypto.export.json";
-	descriptor.thread_class = "bounded_task";
-	descriptor.domain = aida::infra::taskflow_runtime::executor_domain_t::feature_worker;
-	descriptor.priority = 2;
-	const std::string target_id = context.workspace->identity().binary_id().to_hex();
-	descriptor.target_id = target_id.c_str();
-	descriptor.generation = context.workspace->generation();
-	descriptor.body = [context, snapshot = std::move(snapshot), path = std::move(path), csv]() {
-		if (!snapshot) return;
-		std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-		if (!stream.is_open()) return;
-		if (csv) {
-			stream << "algorithm,signature,address,module,module_offset,references\n";
-			for (const auto& hit : snapshot->results) {
-				const auto address = disasm_view::runtime_address(context, hit.address);
-				if (!address) continue;
-				stream << '"' << hit.algorithm << "\",\"" << hit.signature_name << "\",0x"
-					<< std::hex << *address << std::dec << ",\"" << hit.module_name << "\",0x"
-					<< std::hex << hit.module_offset << std::dec << ','
-					<< hit.referencing_functions.size() << '\n';
-			}
-			return;
+	if (!state) return;
+	std::lock_guard<std::mutex> lock(state->mutex);
+	state->export_status = {terminal, std::move(message), std::move(path)};
+}
+
+inline bool export_workspace_matches(
+	const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+	const std::shared_ptr<state_t>& state,
+	const std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t>& snapshot,
+	const std::string& binary_id, std::uint64_t workspace_generation,
+	std::uint64_t publication_generation, std::uint32_t pid)
+{
+	if (!workspace || workspace->closing() || workspace->closed() ||
+		workspace->identity().binary_id().to_hex() != binary_id ||
+		workspace->generation() != workspace_generation) return false;
+	const auto publication = workspace->analysis_publication();
+	if (!publication || publication->generation != publication_generation) return false;
+	const auto process = workspace->identity().process();
+	if (pid == 0 ? static_cast<bool>(process) : !process || process->pid != pid) return false;
+	std::lock_guard<std::mutex> lock(state->mutex);
+	return state->snapshot == snapshot;
+}
+
+inline bool append_export(std::string& output, const std::string& value, std::string& error)
+{
+	if (output.size() > scanner_async_io::max_serialized_bytes ||
+		value.size() > scanner_async_io::max_serialized_bytes - output.size()) {
+		error = "Crypto export exceeds the 64 MiB serialized-output limit";
+		return false;
+	}
+	output.append(value);
+	return true;
+}
+
+inline std::string csv_field(const std::string& value)
+{
+	std::string output;
+	output.reserve(value.size() + 2);
+	output.push_back('"');
+	for (char character : value) {
+		if (character == '"') output.push_back('"');
+		output.push_back(character);
+	}
+	output.push_back('"');
+	return output;
+}
+
+inline bool serialize_export(const disasm_view::workspace_context_t& context,
+	const crypto_scanner::workspace_scan_snapshot_t& snapshot, bool csv,
+	const std::shared_ptr<std::atomic<bool>>& cancellation, std::string& output,
+	std::string& error)
+{
+	if (snapshot.results.size() > max_export_results) {
+		error = "Crypto export exceeds the 100000-result limit";
+		return false;
+	}
+	try {
+	output.clear();
+	output.reserve((std::min)(scanner_async_io::max_serialized_bytes,
+		snapshot.results.size() * static_cast<std::size_t>(192) + 256));
+	if (csv) {
+		if (!append_export(output,
+			"algorithm,signature,address,module,module_offset,references\n", error)) return false;
+	} else {
+		const std::string prefix = "{\n  \"binary_id\": " +
+			nlohmann::json(context.workspace->identity().binary_id().to_hex()).dump() +
+			",\n  \"bin_name\": " + nlohmann::json(context.workspace->identity().bin_name()).dump() +
+			",\n  \"results\": [";
+		if (!append_export(output, prefix, error)) return false;
+	}
+	bool first = true;
+	for (const auto& hit : snapshot.results) {
+		if (scanner_async_io::cancellation_requested(cancellation)) {
+			error = "Crypto export cancelled";
+			return false;
 		}
-		nlohmann::json output;
-		output["binary_id"] = context.workspace->identity().binary_id().to_hex();
-		output["bin_name"] = context.workspace->identity().bin_name();
-		output["results"] = nlohmann::json::array();
-		for (const auto& hit : snapshot->results) {
-			const auto address = disasm_view::runtime_address(context, hit.address);
-			if (!address) continue;
+		if (hit.algorithm.size() > max_export_string || hit.signature_name.size() > max_export_string ||
+			hit.module_name.size() > max_export_string) {
+			error = "Crypto export contains a string that exceeds 512 bytes";
+			return false;
+		}
+		const auto address = disasm_view::runtime_address(context, hit.address);
+		if (!address) continue;
+		char address_text[32]{};
+		char offset_text[32]{};
+		std::snprintf(address_text, sizeof(address_text), "0x%llX",
+			static_cast<unsigned long long>(*address));
+		std::snprintf(offset_text, sizeof(offset_text), "0x%llX",
+			static_cast<unsigned long long>(hit.module_offset));
+		std::string row;
+		if (csv) {
+			row = csv_field(hit.algorithm) + "," + csv_field(hit.signature_name) + "," +
+				address_text + "," + csv_field(hit.module_name) + "," + offset_text + "," +
+				std::to_string(hit.referencing_functions.size()) + "\n";
+		} else {
 			nlohmann::json item;
 			item["algorithm"] = hit.algorithm;
 			item["signature"] = hit.signature_name;
@@ -694,11 +801,186 @@ inline void export_results(const disasm_view::workspace_context_t& context,
 			item["module"] = hit.module_name;
 			item["module_offset"] = hit.module_offset;
 			item["references"] = hit.referencing_functions.size();
-			output["results"].push_back(std::move(item));
+			row = (first ? "\n    " : ",\n    ") + item.dump();
+			first = false;
 		}
-		stream << output.dump(2);
+		if (!append_export(output, row, error)) return false;
+	}
+	return csv || append_export(output, first ? "]\n}\n" : "\n  ]\n}\n", error);
+	} catch (const std::exception& exception) {
+		output.clear();
+		error = "Crypto export serialization failed: " + std::string(exception.what());
+		return false;
+	}
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::atomic<std::uint64_t> export_task_sequence{1};
+
+inline std::string register_export_task(bool csv, const std::string& target,
+	const std::shared_ptr<std::atomic<bool>>& cancellation,
+	const std::shared_ptr<std::atomic<std::uint8_t>>& commit_gate)
+{
+	const std::string id = "scanner.crypto.export." +
+		std::to_string(export_task_sequence.fetch_add(1, std::memory_order_acq_rel));
+	aida::ui::task_center::task_registration_t registration;
+	registration.id = id;
+	registration.source = "human";
+	registration.owner = "Crypto Scanner";
+	registration.owner_view = "view.memory.crypto";
+	registration.owner_action = csv ? "scanner.crypto.export.csv" : "scanner.crypto.export.json";
+	registration.target = target;
+	registration.label = csv ? "Export crypto results as CSV" : "Export crypto results as JSON";
+	registration.stage = "Queued";
+	registration.progress = -1.0f;
+	registration.cancellation_is_safe = true;
+	registration.callbacks.cancel = [cancellation, commit_gate] {
+		std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+		if (!commit_gate->compare_exchange_strong(expected_gate,
+			scanner_async_io::operation_cancelled, std::memory_order_acq_rel,
+			std::memory_order_acquire)) return false;
+		bool expected = false;
+		return cancellation->compare_exchange_strong(expected, true, std::memory_order_acq_rel);
 	};
-	aida::infra::taskflow_runtime::submit(std::move(descriptor));
+	registration.callbacks.focus = [] {
+		static_cast<void>(aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.memory.crypto")));
+	};
+	return aida::ui::task_center::register_task(std::move(registration)) ? id : std::string();
+}
+
+inline void finish_export_task(const std::string& id, export_terminal_t terminal,
+	const std::string& stage, const std::string& summary)
+{
+	if (id.empty()) return;
+	auto state = aida::ui::task_center::task_state_t::failed;
+	if (terminal == export_terminal_t::succeeded)
+		state = aida::ui::task_center::task_state_t::completed;
+	else if (terminal == export_terminal_t::cancelled || terminal == export_terminal_t::stale)
+		state = aida::ui::task_center::task_state_t::cancelled;
+	static_cast<void>(aida::ui::task_center::update_task(id, state, 1.0f, stage, summary));
+}
+#endif
+
+inline void export_results(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<state_t>& state,
+	std::shared_ptr<const crypto_scanner::workspace_scan_snapshot_t> snapshot,
+	std::string path, bool csv)
+{
+	if (!context.workspace || !context.publication || !state || !snapshot) return;
+	bool expected = false;
+	if (!state->export_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	const std::uint64_t serial = state->export_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+	{
+		std::lock_guard<std::mutex> lock(state->mutex);
+		state->last_export_csv = csv;
+		state->last_export_path = path;
+		state->export_status = {export_terminal_t::queued, "Queued immutable crypto export", path};
+	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(serial);
+	aida::preview::scan::record(csv ? "crypto.export.csv" : "crypto.export.json",
+		context.workspace->identity().binary_id().to_hex() + ":" +
+		std::to_string(snapshot->results.size()));
+	set_export_status(state, export_terminal_t::succeeded,
+		"Studio receipt recorded for immutable crypto export", path);
+	state->export_pending.store(false, std::memory_order_release);
+#else
+	const auto workspace = context.workspace;
+	const std::string binary_id = workspace->identity().binary_id().to_hex();
+	const std::uint64_t workspace_generation = workspace->generation();
+	const std::uint64_t publication_generation = context.publication->generation;
+	const auto process = workspace->identity().process();
+	const std::uint32_t pid = process ? process->pid : 0;
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	auto commit_gate = std::make_shared<std::atomic<std::uint8_t>>(
+		scanner_async_io::operation_reversible);
+	const std::string task_id = register_export_task(csv, binary_id, cancellation, commit_gate);
+	if (task_id.empty()) {
+		state->export_pending.store(false, std::memory_order_release);
+		set_export_status(state, export_terminal_t::failed,
+			"Task Center rejected crypto export ownership", path);
+		return;
+	}
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "scanner.crypto";
+	submission.label = csv ? "scanner.crypto.export.csv" : "scanner.crypto.export.json";
+	submission.thread_class = "bounded_task";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.target_pid = pid;
+	submission.generation = publication_generation;
+	submission.cancel_hook = [cancellation, commit_gate] {
+		std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+		if (commit_gate->compare_exchange_strong(expected_gate, scanner_async_io::operation_cancelled,
+			std::memory_order_acq_rel, std::memory_order_acquire))
+			cancellation->store(true, std::memory_order_release);
+	};
+	submission.body = [context, workspace, state, snapshot = std::move(snapshot), path = std::move(path),
+		csv, cancellation, task_id, binary_id, workspace_generation, publication_generation,
+		pid, serial, commit_gate]() mutable {
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::running, 0.1f, "Serializing bounded crypto results"));
+		static_cast<void>(aida::ui_thread::post([state, serial] {
+			if (state->export_serial.load(std::memory_order_acquire) == serial &&
+				state->export_pending.load(std::memory_order_acquire))
+				set_export_status(state, export_terminal_t::running,
+					"Serializing bounded crypto results");
+		}, "scanner.crypto", "publish_export_running", "worker_progress"));
+		std::string output;
+		std::string error;
+		bool serialized = serialize_export(context, *snapshot, csv, cancellation, output, error);
+		if (serialized && path.empty()) {
+			char* appdata = nullptr;
+			std::size_t length = 0;
+			_dupenv_s(&appdata, &length, "APPDATA");
+			if (appdata) {
+				path = (std::filesystem::path(appdata) / "AiDA" / "Standalone" /
+					("crypto_export_" + binary_id.substr(0, 16) + (csv ? ".csv" : ".json"))).string();
+				free(appdata);
+			}
+			if (path.empty()) { serialized = false; error = "APPDATA is unavailable for crypto export"; }
+		}
+		auto current = [workspace, state, snapshot, binary_id, workspace_generation,
+			publication_generation, pid] {
+			return export_workspace_matches(workspace, state, snapshot, binary_id,
+				workspace_generation, publication_generation, pid);
+		};
+		scanner_async_io::result_t write;
+		if (serialized && current())
+			write = scanner_async_io::atomic_replace(path, output, true, cancellation, current, commit_gate);
+		else if (serialized)
+			write.error = "Crypto workspace, target, publication, or snapshot changed";
+		const bool cancelled = scanner_async_io::cancellation_requested(cancellation) || write.cancelled;
+		const bool stale = !cancelled && !current();
+		const bool success = serialized && write.success && !stale;
+		if (!success && error.empty()) error = write.error;
+		const export_terminal_t terminal = success ? export_terminal_t::succeeded :
+			cancelled ? export_terminal_t::cancelled : stale ? export_terminal_t::stale :
+			export_terminal_t::failed;
+		auto publish = [state, serial, terminal, error = std::move(error), path, task_id]() mutable {
+			if (state->export_serial.load(std::memory_order_acquire) != serial) return;
+			set_export_status(state, terminal,
+				terminal == export_terminal_t::succeeded ? "Crypto export committed atomically" : error, path);
+			state->export_pending.store(false, std::memory_order_release);
+			finish_export_task(task_id, terminal,
+				terminal == export_terminal_t::succeeded ? "Crypto export complete" : "Crypto export failed",
+				terminal == export_terminal_t::succeeded ? path : error);
+		};
+		if (!aida::ui_thread::post(std::move(publish), "scanner.crypto", "publish_export", "worker_completion")) {
+			state->export_pending.store(false, std::memory_order_release);
+			state->export_dispatch_failed.store(true, std::memory_order_release);
+			finish_export_task(task_id, export_terminal_t::failed, "UI publication rejected",
+				"Crypto export completion was not published");
+		}
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		state->export_pending.store(false, std::memory_order_release);
+		set_export_status(state, export_terminal_t::failed,
+			"Worker queue rejected crypto export: " + submitted.reject_reason, state->last_export_path);
+		finish_export_task(task_id, export_terminal_t::failed, "Worker queue rejected", submitted.reject_reason);
+	}
 #endif
 }
 
@@ -720,6 +1002,9 @@ inline void render(float, float, float width, float height,
 		ImGui::EndChild();
 		return;
 	}
+	if (view_state->export_dispatch_failed.exchange(false, std::memory_order_acq_rel))
+		detail::set_export_status(view_state, export_terminal_t::failed,
+			"UI dispatcher rejected crypto export completion");
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	{
 		std::lock_guard<std::mutex> lock(view_state->mutex);
@@ -830,42 +1115,18 @@ inline void render(float, float, float width, float height,
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+		const bool export_pending = view_state->export_pending.load(std::memory_order_acquire);
 		if (aida::ui::button("JSON", aida::ui::button_kind_t::ghost,
-				aida::ui::size_t_::md)) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			detail::export_results(context, scan_snapshot, {}, false);
-#else
-			char* appdata = nullptr;
-			size_t len = 0;
-			_dupenv_s(&appdata, &len, "APPDATA");
-			if (appdata) {
-				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export_" +
-					context.workspace->identity().binary_id().to_hex().substr(0, 16) + ".json";
-				free(appdata);
-				detail::export_results(context, scan_snapshot, path, false);
-			}
-#endif
-		}
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f), export_pending))
+			detail::export_results(context, view_state, scan_snapshot, {}, false);
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 		if (aida::ui::button("CSV", aida::ui::button_kind_t::ghost,
-				aida::ui::size_t_::md)) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			detail::export_results(context, scan_snapshot, {}, true);
-#else
-			char* appdata = nullptr;
-			size_t len = 0;
-			_dupenv_s(&appdata, &len, "APPDATA");
-			if (appdata) {
-				std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_export_" +
-					context.workspace->identity().binary_id().to_hex().substr(0, 16) + ".csv";
-				free(appdata);
-				detail::export_results(context, scan_snapshot, path, true);
-			}
-#endif
-		}
+				aida::ui::size_t_::md, ImVec2(0.f, 0.f),
+				view_state->export_pending.load(std::memory_order_acquire)))
+			detail::export_results(context, view_state, scan_snapshot, {}, true);
 	}
 
 	if (scanning) {
@@ -886,6 +1147,34 @@ inline void render(float, float, float width, float height,
 		ui_anim::render_inline_callout(dl, ox + 16.f, cy, width - 32.f, 22.f,
 			scan_error.c_str(), ui_anim::callout_kind_t::error,
 			0.9f, 0.25f, 0.25f, alpha);
+		cy += 28.f;
+	}
+	export_status_t export_status;
+	{
+		std::lock_guard<std::mutex> lock(view_state->mutex);
+		export_status = view_state->export_status;
+	}
+	if (export_status.terminal != export_terminal_t::idle) {
+		const bool failed = export_status.terminal == export_terminal_t::failed ||
+			export_status.terminal == export_terminal_t::stale ||
+			export_status.terminal == export_terminal_t::cancelled;
+		ui_anim::render_inline_callout(dl, ox + 16.f, cy, width - 32.f, 22.f,
+			export_status.message.c_str(), failed ? ui_anim::callout_kind_t::error :
+			ui_anim::callout_kind_t::info, failed ? 0.9f : 0.3f,
+			failed ? 0.25f : 0.55f, failed ? 0.25f : 0.95f, alpha);
+		if (failed && !view_state->export_pending.load(std::memory_order_acquire)) {
+			bool csv = false;
+			std::string path;
+			{
+				std::lock_guard<std::mutex> lock(view_state->mutex);
+				csv = view_state->last_export_csv;
+				path = view_state->last_export_path;
+			}
+			ImGui::SetCursorScreenPos(ImVec2(ox + width - 82.f, cy - 4.f));
+			if (aida::ui::button("Retry", aida::ui::button_kind_t::secondary,
+					aida::ui::size_t_::sm))
+				detail::export_results(context, view_state, scan_snapshot, std::move(path), csv);
+		}
 		cy += 28.f;
 	}
 	if (!attached_now && !pe_loaded) {
@@ -1048,6 +1337,8 @@ inline void render(float, float, float width, float height,
 	if (!code_font) code_font = ImGui::GetFont();
 	const float code_font_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
 
+	bool open_crypto_context = false;
+	auto crypto_context_origin = aida::ui::context_menu_open_origin_t::pointer;
 	for (int i = first_visible; i < last_visible; ++i) {
 		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
 		if (ry + row_h < cy || ry > cy + visible_h) continue;
@@ -1071,10 +1362,19 @@ inline void render(float, float, float width, float height,
 			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(hit.address, context);
 		}
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			st.ctx_hit_idx = i;
+			st.context_address = hit.address;
+			st.context_algorithm = hit.algorithm;
+			st.context_signature = hit.signature_name;
+		}
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 			st.ctx_hit_idx = i;
-			ImGui::OpenPopup("##crypto_ctx");
+			st.context_address = hit.address;
+			st.context_algorithm = hit.algorithm;
+			st.context_signature = hit.signature_name;
+			open_crypto_context = true;
 		}
 
 		float rx = ox + 12.f;
@@ -1124,6 +1424,13 @@ inline void render(float, float, float width, float height,
 				aida::ui::with_alpha(t.accent_u32, alpha * entrance), ref_buf);
 		}
 	}
+	if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && context_key_pressed() &&
+		st.ctx_hit_idx >= 0) {
+		open_crypto_context = true;
+		crypto_context_origin = ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+			? aida::ui::context_menu_open_origin_t::menu_key
+			: aida::ui::context_menu_open_origin_t::shift_f10;
+	}
 
 	ImGui::PopClipRect();
 
@@ -1146,67 +1453,248 @@ inline void render(float, float, float width, float height,
 		}
 	}
 
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f);
-	if (ImGui::BeginPopup("##crypto_ctx")) {
-		if (st.ctx_hit_idx >= 0 && st.ctx_hit_idx < static_cast<int>(filtered.size())) {
-			auto& ctx_hit = filtered[static_cast<size_t>(st.ctx_hit_idx)];
-
-			if (ImGui::MenuItem("Go to Disassembly")) {
+	if (open_crypto_context) {
+		const auto current_hit = std::find_if(filtered.begin(), filtered.end(), [&](const auto& hit) {
+			return hit.address == st.context_address && hit.algorithm == st.context_algorithm &&
+				hit.signature_name == st.context_signature;
+		});
+		if (current_hit != filtered.end()) {
+			const auto hit = *current_hit;
+			const auto workspace = context.workspace;
+			const auto generation = context.publication ? context.publication->generation : 0;
+			const auto target_pid = driver_bridge::attached_pid();
+			aida::ui::application_ui::retained_entity_context_t retained;
+			retained.owner_id = "memory.crypto.hit";
+			retained.entity_id = hit.algorithm + "@" + std::to_string(hit.address);
+			retained.entity_generation = generation;
+			retained.active_view = aida::ui::stable_view_id_t("view.memory.crypto");
+			retained.validate_identity = [workspace, generation, hit, scan_snapshot, target_pid]() {
+				if (!workspace) return aida::ui::capability_state_t::unavailable("The crypto workspace was closed.");
+				if (driver_bridge::attached_pid() != target_pid)
+					return aida::ui::capability_state_t::unavailable("The crypto scan target process changed; reopen the menu.");
+				const auto publication = workspace->analysis_publication();
+				if (!publication || publication->generation != generation)
+					return aida::ui::capability_state_t::unavailable("The analysis publication changed; reopen the menu.");
+				const bool current = std::any_of(scan_snapshot->results.begin(), scan_snapshot->results.end(), [&](const auto& item) {
+					return item.address == hit.address && item.algorithm == hit.algorithm && item.signature_name == hit.signature_name;
+				});
+				return current ? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable("The selected crypto hit changed or was removed.");
+			};
+			auto add = [&](const char* id, auto invoke) {
+				retained.actions.push_back({id, aida::ui::capability_state_t::available(), invoke});
+			};
+			add("memory.entity.open_disassembly", [hit, context]() {
 				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-				disasm_view::goto_address(ctx_hit.address, context);
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] crypto_scanner ctx open_disasm");
-			}
-
-			if (ImGui::MenuItem("Open in Hex")) {
-				detail::open_hit_in_hex(context, ctx_hit.address);
+				disasm_view::goto_address(hit.address, context);
+				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx open_disasm");
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.entity.open_hex", [hit, context]() {
+				detail::open_hit_in_hex(context, hit.address);
 				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] crypto_scanner ctx open_hex");
+				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx open_hex");
+				return aida::ui::action_handler_result_t::completed();
+			});
+			if (!hit.referencing_functions.empty()) {
+				const bool bounded = hit.referencing_functions.size() <=
+					k_max_crypto_reference_publication;
+				retained.actions.push_back({"memory.crypto.show_references", bounded
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(
+						"The reference publication exceeds the 4 MiB scanner-module bound."),
+					[view_state, hit, generation]() {
+					view_state->reference_choices.clear();
+					view_state->reference_choices.reserve(hit.referencing_functions.size());
+					std::unordered_set<std::uint64_t> seen;
+					seen.reserve(hit.referencing_functions.size());
+					for (const auto address : hit.referencing_functions)
+						if (seen.insert(address).second)
+							view_state->reference_choices.push_back(address);
+					view_state->reference_generation = generation;
+					view_state->reference_selected = 0;
+					view_state->reference_focus_pending = true;
+					view_state->open_reference_chooser = true;
+					return aida::ui::action_handler_result_t::completed();
+				}});
 			}
-
-			if (!ctx_hit.referencing_functions.empty()) {
-				if (ImGui::BeginMenu("Show References")) {
-					for (auto ref_addr : ctx_hit.referencing_functions) {
-						char ref_label[64];
-						std::snprintf(ref_label, sizeof(ref_label), "0x%llX", static_cast<unsigned long long>(ref_addr));
-						std::string lbl;
-						if (const auto typed = disasm_view::typed_address(context, ref_addr))
-							lbl = disasm_view::resolve_name(context, *typed);
-						std::string menu_text = ref_label;
-						if (!lbl.empty()) menu_text += " (" + lbl + ")";
-						if (ImGui::MenuItem(menu_text.c_str())) {
-							aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-							disasm_view::goto_address(ref_addr, context);
-							anti_tamper::webhook::write_log("scan_audit",
-								"[scan_audit] crypto_scanner ctx show_ref");
-						}
-					}
-					ImGui::EndMenu();
+			add("memory.entity.copy_address", [hit]() {
+				char address[32]{};
+				std::snprintf(address, sizeof(address), "0x%llX", static_cast<unsigned long long>(hit.address));
+				ImGui::SetClipboardText(address);
+				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx copy_address");
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.crypto.copy_algorithm", [hit]() {
+				ImGui::SetClipboardText(hit.algorithm.c_str());
+				anti_tamper::webhook::write_log("scan_audit", "[scan_audit] crypto_scanner ctx copy_algo");
+				return aida::ui::action_handler_result_t::completed();
+			});
+			char evidence_address[24]{};
+			std::snprintf(evidence_address, sizeof(evidence_address), "0x%016llX",
+				static_cast<unsigned long long>(hit.address));
+			aida::automation_ui::entity_evidence::snapshot_t evidence;
+			evidence.workspace_id = target_pid != 0 ? "pid:" + std::to_string(target_pid)
+				: workspace->identity().binary_id().to_hex();
+			evidence.source_view_id = "view.memory.crypto";
+			evidence.source_kind = "crypto_scan_hit";
+			evidence.entity_id = retained.entity_id;
+			evidence.display_label = hit.algorithm + " / " + hit.signature_name;
+			evidence.excerpt = "PID: " + std::to_string(target_pid) +
+				"\nPublication generation: " + std::to_string(generation) +
+				"\nAlgorithm: " + hit.algorithm + "\nSignature: " + hit.signature_name +
+				"\nCategory: " + crypto_scanner::category_name(hit.category) +
+				"\nAddress: " + evidence_address + "\nModule: " + hit.module_name +
+				"\nModule offset: " + std::to_string(hit.module_offset) +
+				"\nReference count: " + std::to_string(hit.referencing_functions.size());
+			evidence.address = hit.address;
+			evidence.revision = generation;
+			evidence.generation = generation;
+			evidence.sensitive = target_pid != 0;
+			const auto evidence_hit_address = hit.address;
+			const auto evidence_hit_algorithm = hit.algorithm;
+			const auto evidence_hit_signature = hit.signature_name;
+			const auto evidence_hit_module = hit.module_name;
+			const auto evidence_hit_module_offset = hit.module_offset;
+			const auto evidence_hit_reference_count = hit.referencing_functions.size();
+			evidence.return_to_source = [workspace, generation, evidence_hit_address,
+				evidence_hit_algorithm, evidence_hit_signature, evidence_hit_module,
+				evidence_hit_module_offset, evidence_hit_reference_count, scan_snapshot,
+				view_state](std::string& reason) {
+			const auto publication = workspace ? workspace->analysis_publication() : nullptr;
+			if (!publication || publication->generation != generation ||
+				!std::any_of(scan_snapshot->results.begin(), scan_snapshot->results.end(),
+					[&](const auto& item) {
+						return item.address == evidence_hit_address &&
+							item.algorithm == evidence_hit_algorithm &&
+							item.signature_name == evidence_hit_signature &&
+							item.module_name == evidence_hit_module &&
+							item.module_offset == evidence_hit_module_offset &&
+							item.referencing_functions.size() == evidence_hit_reference_count;
+					})) {
+				reason = "The crypto publication or retained hit changed; capture it again.";
+				return false;
+			}
+			{
+				std::lock_guard<std::mutex> lock(view_state->mutex);
+				view_state->context_address = evidence_hit_address;
+				view_state->context_algorithm = evidence_hit_algorithm;
+				view_state->context_signature = evidence_hit_signature;
+				view_state->ctx_hit_idx = -1;
+				if (view_state->filtered_results) {
+					const auto found = std::find_if(view_state->filtered_results->begin(),
+						view_state->filtered_results->end(), [&](const auto& item) {
+							return item.address == evidence_hit_address &&
+								item.algorithm == evidence_hit_algorithm &&
+								item.signature_name == evidence_hit_signature;
+						});
+					if (found != view_state->filtered_results->end())
+						view_state->ctx_hit_idx = static_cast<int>(std::distance(
+							view_state->filtered_results->begin(), found));
 				}
 			}
-
-			ImGui::Separator();
-			if (ImGui::MenuItem("Copy Address")) {
-				char addr_copy[32];
-				std::snprintf(addr_copy, sizeof(addr_copy), "0x%llX", static_cast<unsigned long long>(ctx_hit.address));
-				ImGui::SetClipboardText(addr_copy);
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] crypto_scanner ctx copy_address");
+			const auto opened = aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.memory.crypto"));
+			if (!opened.ok()) {
+				reason = opened.detail;
+				return false;
 			}
-			if (ImGui::MenuItem("Copy Algorithm")) {
-				ImGui::SetClipboardText(ctx_hit.algorithm.c_str());
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] crypto_scanner ctx copy_algo");
-			}
+			reason.clear();
+			return true;
+		};
+			aida::automation_ui::entity_evidence::append_actions(retained,
+				std::move(evidence));
+			aida::ui::application_ui::open_retained_entity_context_menu(
+				std::move(retained), crypto_context_origin);
 		}
+	}
+	aida::ui::application_ui::render_retained_entity_context_menu("memory.crypto.hit");
+	if (st.open_reference_chooser) {
+		st.open_reference_chooser = false;
+		ImGui::OpenPopup("Crypto References##retained_chooser");
+	}
+	if (ImGui::BeginPopup("Crypto References##retained_chooser")) {
+		const bool current = context.publication &&
+			context.publication->generation == st.reference_generation;
+		auto activate_reference = [&](std::uint64_t address) {
+			if (!context.publication ||
+				context.publication->generation != st.reference_generation)
+				return false;
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.disassembly"));
+			disasm_view::goto_address(address, context);
+			anti_tamper::webhook::write_log(
+				"scan_audit", "[scan_audit] crypto_scanner ctx show_ref");
+			ImGui::CloseCurrentPopup();
+			return true;
+		};
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+			ImGui::CloseCurrentPopup();
+		if (current && !st.reference_choices.empty()) {
+			if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false))
+				st.reference_selected = (std::max)(0, st.reference_selected - 1);
+			if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false))
+				st.reference_selected = (std::min)(
+					static_cast<int>(st.reference_choices.size() - 1),
+					st.reference_selected + 1);
+			if (ImGui::IsKeyPressed(ImGuiKey_Enter, false))
+				static_cast<void>(activate_reference(st.reference_choices[
+					static_cast<std::size_t>(st.reference_selected)]));
+		}
+		if (!current)
+			ImGui::TextDisabled("The analysis publication changed; reopen the hit context menu.");
+		if (!current) ImGui::BeginDisabled();
+		ImGui::TextDisabled("%zu retained references", st.reference_choices.size());
+		ImGui::BeginChild("##crypto_reference_rows", ImVec2(460.f,
+			(std::min)(360.f, 28.f * static_cast<float>((std::max)(std::size_t{1}, st.reference_choices.size())))),
+			ImGuiChildFlags_Borders);
+		const float reference_row_height = ImGui::GetTextLineHeightWithSpacing();
+		if (st.reference_focus_pending) {
+			ImGui::SetScrollY(reference_row_height * static_cast<float>(st.reference_selected));
+		}
+		ImGuiListClipper reference_clipper;
+		const int clipped_reference_count = st.reference_choices.size() >
+			static_cast<std::size_t>((std::numeric_limits<int>::max)())
+			? (std::numeric_limits<int>::max)()
+			: static_cast<int>(st.reference_choices.size());
+		reference_clipper.Begin(clipped_reference_count, reference_row_height);
+		while (reference_clipper.Step()) for (int visible_index = reference_clipper.DisplayStart;
+			visible_index < reference_clipper.DisplayEnd; ++visible_index) {
+			const std::size_t index = static_cast<std::size_t>(visible_index);
+			const auto address = st.reference_choices[index];
+			char raw[32]{};
+			std::snprintf(raw, sizeof(raw), "0x%016llX", static_cast<unsigned long long>(address));
+			std::string label = raw;
+			if (const auto typed = disasm_view::typed_address(context, address)) {
+				const std::string name = disasm_view::resolve_name(context, *typed);
+				if (!name.empty()) label += "  " + name;
+			}
+			const std::string semantic_label = label + "##crypto.reference." +
+				std::to_string(address) + "." + std::to_string(index);
+			ImGui::PushID(static_cast<int>(index));
+			if (st.reference_focus_pending && visible_index == st.reference_selected)
+				ImGui::SetKeyboardFocusHere();
+			const bool selected = ImGui::Selectable(semantic_label.c_str(),
+				visible_index == st.reference_selected);
+			if (ImGui::IsItemFocused())
+				st.reference_selected = visible_index;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const std::string semantic_id = aida::preview::semantics::stable_id(
+				"aida.memory.crypto-reference", std::to_string(address) + "-" +
+					std::to_string(index) + "-" + std::to_string(st.reference_generation));
+			aida::preview::semantics::register_last_item(
+				semantic_id, "crypto-reference-row", false, !current);
+#endif
+			if (selected) {
+				static_cast<void>(activate_reference(address));
+			}
+			ImGui::PopID();
+		}
+		st.reference_focus_pending = false;
+		ImGui::EndChild();
+		if (!current) ImGui::EndDisabled();
 		ImGui::EndPopup();
 	}
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor(3);
 
 	{
 		float footer_h = 26.f;

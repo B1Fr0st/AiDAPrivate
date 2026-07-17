@@ -19,12 +19,15 @@
 #include "imgui/imgui.h"
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
+#include "debugger_interaction_context.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/debugger_preview_runtime.hpp"
 #endif
 #include "disasm_view.hpp"
 #include "ui_anim.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ui/task_center.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
@@ -75,6 +78,7 @@ struct seh_diagnostics_t {
 struct ui_state_t {
 	std::vector<seh_entry_t> entries;
 	seh_diagnostics_t        diagnostics;
+	std::string              last_error;
 	int                      selected = -1;
 	float                    scroll_y = 0.f;
 	float                    target_scroll_y = 0.f;
@@ -85,6 +89,22 @@ struct ui_state_t {
 };
 
 inline ui_state_t g_ui;
+
+inline void register_background_task(const aida::infra::executor::submit_result_t& submitted) {
+	if (!submitted.submitted || submitted.task_id == 0) return;
+	aida::ui::task_center::task_registration_t registration;
+	registration.owner = "debugger";
+	registration.owner_view = "view.debug.seh";
+	registration.owner_action = "debugger.seh_refresh";
+	registration.label = "Refresh SEH chain";
+	registration.stage = "Queued";
+	registration.progress = -1.f;
+	registration.target = driver_bridge::attached_pid() == 0 ? std::string{} :
+		"PID " + std::to_string(driver_bridge::attached_pid());
+	registration.cancellation_is_safe = false;
+	static_cast<void>(aida::ui::task_center::register_executor_job(
+		submitted.task_id, std::move(registration)));
+}
 
 inline void draw_clipped_text(ImDrawList* dl, ImVec2 pos, float width, float row_h, ImU32 color, const char* text)
 {
@@ -155,9 +175,17 @@ inline void refresh()
 		sub.thread_class = "debugger_refresh";
 		sub.domain = aida::infra::executor::domain_t::feature_worker;
 		sub.priority = 3;
-		sub.target_pid = driver_bridge::attached_pid();
-		sub.body = []() {
+		const std::uint32_t target_pid = driver_bridge::attached_pid();
+		const std::uint64_t target_generation = debugger_interaction::current_stop_generation();
+		sub.target_pid = target_pid;
+		sub.generation = target_generation;
+		sub.body = [target_pid, target_generation]() {
 		try {
+		if (driver_bridge::attached_pid() != target_pid ||
+			debugger_interaction::current_stop_generation() != target_generation) {
+			g_ui.refreshing.store(false);
+			return;
+		}
 		std::vector<seh_entry_t> entries;
 		seh_diagnostics_t diag_state{};
 		diag_state.target_pid = driver_bridge::attached_pid();
@@ -322,10 +350,12 @@ inline void refresh()
 		}
 
 		size_t n = entries.size();
-		{
+		if (driver_bridge::attached_pid() == target_pid &&
+			debugger_interaction::current_stop_generation() == target_generation) {
 			std::lock_guard<std::mutex> lk(g_ui.mutex);
 			g_ui.entries = std::move(entries);
 			g_ui.diagnostics = diag_state;
+			g_ui.last_error.clear();
 		}
 		diag::log_tagged_fmt("seh",
 			"seh_refresh_done pid=%u tid=%u chain_depth=%zu teb_query_ok=%d teb_va=0x%llX teb_read_ok=%d raw_exception_list=0x%llX sentinel=%d x64_empty_chain_proven=%d empty_reason=%s stack_attempted=%d stack_read_ok=%d stack_candidates=%u stack_found=%d stack_reason=%s chain_stop=%s",
@@ -348,21 +378,39 @@ inline void refresh()
 		g_ui.refreshing.store(false);
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("seh", "seh_refresh_worker_exception err='%s'", ex.what());
+			{
+				std::lock_guard<std::mutex> lk(g_ui.mutex);
+				g_ui.last_error = std::string("SEH refresh failed: ") + ex.what();
+			}
 			g_ui.refreshing.store(false);
+			throw;
 		} catch (...) {
 			diag::log_tagged("seh", "seh_refresh_worker_exception err='<unknown>'");
+			{
+				std::lock_guard<std::mutex> lk(g_ui.mutex);
+				g_ui.last_error = "SEH refresh failed with an unknown error.";
+			}
 			g_ui.refreshing.store(false);
+			throw;
 		}
 	};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted) {
 			diag::log_tagged("seh", "seh_refresh_worker_post_failed");
+			std::unique_lock<std::mutex> lock(g_ui.mutex, std::try_to_lock);
+			if (lock.owns_lock())
+				g_ui.last_error = "SEH refresh could not be queued: " + submitted.reject_reason;
 			g_ui.refreshing.store(false);
-		}
+		} else register_background_task(submitted);
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("seh", "seh_refresh_worker_create_failed err='%s'", ex.what());
+		std::unique_lock<std::mutex> lock(g_ui.mutex, std::try_to_lock);
+		if (lock.owns_lock()) g_ui.last_error = std::string("SEH refresh setup failed: ") + ex.what();
 		g_ui.refreshing.store(false);
 	} catch (...) {
 		diag::log_tagged("seh", "seh_refresh_worker_create_failed err='<unknown>'");
+		std::unique_lock<std::mutex> lock(g_ui.mutex, std::try_to_lock);
+		if (lock.owns_lock()) g_ui.last_error = "SEH refresh setup failed with an unknown error.";
 		g_ui.refreshing.store(false);
 	}
 }
@@ -380,6 +428,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const auto _ta = [alpha](ImU32 c) -> ImU32 {
 		return aida::ui::with_alpha(c, alpha);
 	};
+	static std::vector<seh_entry_t> snapshot;
+	static std::string error_snapshot;
+	std::unique_lock<std::mutex> seh_lock(g_ui.mutex, std::try_to_lock);
+	if (seh_lock.owns_lock()) error_snapshot = g_ui.last_error;
+	if (seh_lock.owns_lock() && g_ui.entries.size() <= 256U) {
+		snapshot = g_ui.entries;
+	}
+	if (seh_lock.owns_lock()) seh_lock.unlock();
 
 	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height),
 					  _ta(_t.bg_base));
@@ -412,11 +468,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		int distinct_modules = 0;
 		uint32_t active_tid = debugger_engine::g_state.active_tid;
 		{
-			std::lock_guard<std::mutex> lk(g_ui.mutex);
-			depth = static_cast<int>(g_ui.entries.size());
+			depth = static_cast<int>(snapshot.size());
 			std::vector<std::string> seen_modules;
-			seen_modules.reserve(g_ui.entries.size());
-			for (auto& e : g_ui.entries) {
+			seen_modules.reserve(snapshot.size());
+			for (auto& e : snapshot) {
 				if (e.module_name.empty()) unresolved++;
 				else {
 					bool already = false;
@@ -490,20 +545,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	dl->PushClipRect(ImVec2(pos_x, list_y), ImVec2(pos_x + width, list_y + list_h), true);
 
-	std::vector<seh_entry_t> snapshot;
-	{
-		std::lock_guard<std::mutex> lk(g_ui.mutex);
-		snapshot = g_ui.entries;
-	}
-
 	if (snapshot.empty()) {
 		float cw = std::min(width - 40.f, 540.f);
 		if (cw < 160.f) cw = std::max(160.f, width - 20.f);
 		float cx = pos_x + (width - cw) * 0.5f;
 		float cy = list_y + list_h * 0.5f - 34.f;
-		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f,
-			"No SEH chain found. Empty chains are normal for many x64 targets.",
-			ui_anim::callout_kind_t::info, ar, ag, ab, alpha);
+		const char* message = error_snapshot.empty()
+			? "No SEH chain found. Empty chains are normal for many x64 targets."
+			: error_snapshot.c_str();
+		ui_anim::render_inline_callout(dl, cx, cy, cw, 52.f, message,
+			error_snapshot.empty() ? ui_anim::callout_kind_t::info : ui_anim::callout_kind_t::warn,
+			ar, ag, ab, alpha);
 		const char* hint = "SEH is per active thread; switch threads and refresh when needed.";
 		ImVec2 hint_sz = ImGui::CalcTextSize(hint);
 		dl->AddText(ImVec2(pos_x + (width - hint_sz.x) * 0.5f, cy + 58.f),
@@ -525,6 +577,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (first_visible < 0) first_visible = 0;
 	int visible_count = static_cast<int>(list_h / row_h) + 2;
 
+	bool open_seh_context = false;
+	auto seh_context_origin = aida::ui::context_menu_open_origin_t::pointer;
 	for (int vi = 0; vi < visible_count; ++vi) {
 		int idx = first_visible + vi;
 		if (idx < 0) continue;
@@ -560,7 +614,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			_ta(_t.text_primary), e.handler_name.c_str());
 
 		if (idx == g_ui.selected && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-			ImGui::OpenPopup("##seh_ctx");
+			open_seh_context = true;
 	}
 
 	dl->PopClipRect();
@@ -570,30 +624,63 @@ inline void render(float pos_x, float pos_y, float width, float height,
 									 g_ui.scroll_y, content_h, list_h, alpha,
 									 g_ui.scrollbar_dragging, g_ui.scrollbar_drag_offset);
 
-	if (ImGui::BeginPopup("##seh_ctx")) {
+	if (g_ui.selected >= 0 && ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+		(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+		 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+		open_seh_context = true;
+		seh_context_origin = ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+			? aida::ui::context_menu_open_origin_t::menu_key
+			: aida::ui::context_menu_open_origin_t::shift_f10;
+	}
+	if (open_seh_context) {
 		if (g_ui.selected >= 0) {
 			const std::size_t selected_index = static_cast<std::size_t>(g_ui.selected);
 			if (selected_index < snapshot.size()) {
-				const std::uint64_t handler_address = snapshot[selected_index].handler_addr;
-				if (ImGui::MenuItem("Go to Handler")) {
+				const auto entry = snapshot[selected_index];
+				const auto target_pid = driver_bridge::attached_pid();
+				const auto generation = debugger_interaction::current_stop_generation();
+				aida::ui::application_ui::retained_entity_context_t retained;
+				retained.owner_id = "debugger.seh.handler";
+				retained.entity_id = std::to_string(entry.index) + "@" + std::to_string(entry.handler_addr);
+				retained.entity_generation = generation;
+				retained.active_view = aida::ui::stable_view_id_t("view.debug.seh");
+				retained.validate_identity = [entry, target_pid, generation]() {
+					if (driver_bridge::attached_pid() != target_pid ||
+						debugger_interaction::current_stop_generation() != generation)
+						return aida::ui::capability_state_t::unavailable("The target or debugger stop generation changed.");
+					std::lock_guard<std::mutex> lock(g_ui.mutex);
+					const bool exists = std::any_of(g_ui.entries.begin(), g_ui.entries.end(), [&](const auto& current) {
+						return current.index == entry.index && current.handler_addr == entry.handler_addr;
+					});
+					return exists ? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable("The exception handler is no longer published.");
+				};
+				retained.actions.push_back({"debugger.seh.follow_handler",
+					entry.handler_addr != 0 ? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable("The handler has no resolved address."), [entry]() {
 					diag::log_tagged_fmt("seh",
 						"seh_go_handler idx=%d handler=0x%llx",
-						g_ui.selected,
-						static_cast<unsigned long long>(handler_address));
+						entry.index,
+						static_cast<unsigned long long>(entry.handler_addr));
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-					disasm_view::goto_address(handler_address,
+					disasm_view::goto_address(entry.handler_addr,
 						disasm_view::capture_selected_workspace());
-				}
-				if (ImGui::MenuItem("Copy Address")) {
+					return aida::ui::action_handler_result_t::completed();
+				}});
+				retained.actions.push_back({"debugger.entity.copy_address",
+					aida::ui::capability_state_t::available(), [entry]() {
 					char abuf[24];
 					snprintf(abuf, sizeof(abuf), "%016llX",
-							 static_cast<unsigned long long>(handler_address));
+							 static_cast<unsigned long long>(entry.handler_addr));
 					ImGui::SetClipboardText(abuf);
-				}
+					return aida::ui::action_handler_result_t::completed();
+				}});
+				aida::ui::application_ui::open_retained_entity_context_menu(
+					std::move(retained), seh_context_origin);
 			}
 		}
-		ImGui::EndPopup();
 	}
+	aida::ui::application_ui::render_retained_entity_context_menu("debugger.seh.handler");
 }
 
 }

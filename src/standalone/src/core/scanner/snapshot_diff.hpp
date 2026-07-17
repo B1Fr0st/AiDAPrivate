@@ -10,11 +10,12 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
-#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -90,46 +91,56 @@ struct diff_result_t {
 	std::vector<changed_region_t> changes;
 	uint64_t                     total_changed_bytes = 0;
 	std::size_t                  changed_page_count = 0;
+	bool                         truncated = false;
 };
 
 struct state_t {
-	std::vector<snapshot_t>     snapshots;
+	std::vector<std::shared_ptr<const snapshot_t>> snapshots;
 	uint64_t                    snap_a_id = 0;
 	uint64_t                    snap_b_id = 0;
-	diff_result_t               diff;
+	std::shared_ptr<const diff_result_t> published_diff = std::make_shared<const diff_result_t>();
 	std::mutex                  mutex;
 	std::atomic<bool>           capturing{false};
 	std::atomic<bool>           comparing{false};
 	std::atomic<bool>           loading{false};
 	std::atomic<float>          progress{0.f};
 	std::atomic<bool>           cancel{false};
+	std::atomic<uint64_t>       operation_generation{1};
 	int                         snap_counter = 0;
 	std::atomic<uint64_t>       next_snap_id{1};
 	std::string                 last_error;
 
 	int                         selected_change = -1;
-	float                       scroll_y = 0.f;
-	float                       target_scroll_y = 0.f;
-	char                        filter_buf[128] = {};
-	uint64_t                    filter_min_addr = 0;
-	uint64_t                    filter_max_addr = 0;
-	bool                        show_only_changes = true;
+	std::shared_ptr<const diff_result_t> visible_diff;
 
-	int                         dragging_marker = -1;
 	float                       compare_cursor_t = 0.f;
 	bool                        compare_cursor_active = false;
-	std::unordered_set<uint64_t> prev_change_keys;
-	std::vector<float>           row_flash;
 };
 
 inline state_t g_state;
 
-inline const std::string& last_error()
+inline std::string last_error()
 {
+	std::lock_guard<std::mutex> lock(g_state.mutex);
 	return g_state.last_error;
 }
 
+inline void set_last_error(std::string error)
+{
+	std::lock_guard<std::mutex> lock(g_state.mutex);
+	g_state.last_error = std::move(error);
+}
+
 namespace detail {
+
+inline constexpr std::uint64_t maximum_snapshot_bytes = 1024ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint64_t maximum_region_bytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint32_t maximum_snapshot_regions = 4096;
+inline constexpr std::size_t maximum_diff_ranges = 250000;
+inline constexpr std::uint32_t maximum_snapshot_name_bytes = 128;
+inline constexpr std::uint64_t maximum_snapshot_file_bytes = maximum_snapshot_bytes +
+	static_cast<std::uint64_t>(maximum_snapshot_regions) * 20ULL +
+	maximum_snapshot_name_bytes + 32ULL;
 
 inline std::filesystem::path snapshot_dir()
 {
@@ -219,22 +230,47 @@ inline aida::ui::components::pill_kind_t change_pill_kind(change_type_t t)
 	}
 }
 
-inline void save_snapshot(const snapshot_t& snap)
+inline bool save_snapshot(const snapshot_t& snap, std::string& error)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	aida::preview::scan::record("snapshot.save", snap.name);
+	error.clear();
+	return true;
 #else
+	error.clear();
+	if (snap.regions.size() > maximum_snapshot_regions ||
+		snap.total_bytes > maximum_snapshot_bytes) {
+		error = "save_snapshot: snapshot exceeds the bounded persistence limit";
+		return false;
+	}
 	auto dir = snapshot_dir();
-	std::filesystem::create_directories(dir);
+	std::error_code filesystem_error;
+	std::filesystem::create_directories(dir, filesystem_error);
+	if (filesystem_error) {
+		error = "save_snapshot: cannot create snapshot directory: " + filesystem_error.message();
+		return false;
+	}
 
 	char fname[128];
-	snprintf(fname, sizeof(fname), "%s_%lld.bin", snap.name.c_str(), static_cast<long long>(snap.timestamp));
+	const auto unique_tick = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+	snprintf(fname, sizeof(fname), "snapshot_%lld_%llu_%llu.bin",
+		static_cast<long long>(snap.timestamp),
+		static_cast<unsigned long long>(snap.id),
+		static_cast<unsigned long long>(unique_tick));
 	auto path = dir / fname;
+	auto temporary = path;
+	temporary += ".aida-tmp";
+	std::filesystem::remove(temporary, filesystem_error);
+	filesystem_error.clear();
 
-	std::ofstream ofs(path, std::ios::binary);
-	if (!ofs.is_open()) return;
+	std::ofstream ofs(temporary, std::ios::binary | std::ios::trunc);
+	if (!ofs.is_open()) {
+		error = "save_snapshot: failed to create temporary snapshot";
+		return false;
+	}
 
-	uint32_t name_len = static_cast<uint32_t>(snap.name.size());
+	uint32_t name_len = static_cast<uint32_t>((std::min)(snap.name.size(),
+		static_cast<std::size_t>(maximum_snapshot_name_bytes)));
 	ofs.write(reinterpret_cast<const char*>(&name_len), 4);
 	ofs.write(snap.name.data(), name_len);
 	ofs.write(reinterpret_cast<const char*>(&snap.pid), 4);
@@ -243,36 +279,73 @@ inline void save_snapshot(const snapshot_t& snap)
 	ofs.write(reinterpret_cast<const char*>(&region_count), 4);
 
 	for (auto& r : snap.regions) {
+		if (r.data.size() > maximum_region_bytes) {
+			error = "save_snapshot: region exceeds the bounded persistence limit";
+			break;
+		}
 		ofs.write(reinterpret_cast<const char*>(&r.base), 8);
 		uint64_t rsize = r.data.size();
 		ofs.write(reinterpret_cast<const char*>(&rsize), 8);
 		ofs.write(reinterpret_cast<const char*>(&r.protect), 4);
 		if (rsize > 0)
 			ofs.write(reinterpret_cast<const char*>(r.data.data()), static_cast<std::streamsize>(rsize));
+		if (!ofs) {
+			error = "save_snapshot: snapshot write failed or was partial";
+			break;
+		}
 	}
+	ofs.flush();
+	if (!ofs && error.empty()) error = "save_snapshot: snapshot flush failed";
+	ofs.close();
+	if (!error.empty()) {
+		std::filesystem::remove(temporary, filesystem_error);
+		return false;
+	}
+	const auto encoded_size = std::filesystem::file_size(temporary, filesystem_error);
+	if (filesystem_error || encoded_size > maximum_snapshot_file_bytes) {
+		error = "save_snapshot: persisted snapshot size verification failed";
+		std::filesystem::remove(temporary, filesystem_error);
+		return false;
+	}
+	std::filesystem::rename(temporary, path, filesystem_error);
+	if (filesystem_error) {
+		error = "save_snapshot: atomic commit failed: " + filesystem_error.message();
+		std::filesystem::remove(temporary, filesystem_error);
+		return false;
+	}
+	return true;
 #endif
 }
 
-inline bool load_snapshot(const std::string& path, snapshot_t& out)
+inline bool load_snapshot(const std::string& path, snapshot_t& out, std::string& error)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	(void)path;
 	out = {};
+	error = "load_snapshot: preview fixture import is unavailable";
 	return false;
 #else
+	error.clear();
 	std::ifstream ifs(path, std::ios::binary);
 	if (!ifs.is_open()) {
-		g_state.last_error = "load_snapshot: failed to open file";
+		error = "load_snapshot: failed to open file";
 		return false;
 	}
+	ifs.seekg(0, std::ios::end);
+	const auto encoded_size = ifs.tellg();
+	if (encoded_size < 0 || static_cast<std::uint64_t>(encoded_size) > maximum_snapshot_file_bytes) {
+		error = "load_snapshot: file exceeds the bounded snapshot limit";
+		return false;
+	}
+	ifs.seekg(0, std::ios::beg);
 
 	uint32_t name_len = 0;
 	if (!ifs.read(reinterpret_cast<char*>(&name_len), 4)) {
-		g_state.last_error = "load_snapshot: failed reading name length";
+		error = "load_snapshot: failed reading name length";
 		return false;
 	}
-	if (name_len > 0x10000u) {
-		g_state.last_error = "load_snapshot: implausible name length";
+	if (name_len > maximum_snapshot_name_bytes) {
+		error = "load_snapshot: implausible name length";
 		return false;
 	}
 
@@ -280,7 +353,7 @@ inline bool load_snapshot(const std::string& path, snapshot_t& out)
 	name.resize(name_len);
 	if (name_len > 0) {
 		if (!ifs.read(name.data(), static_cast<std::streamsize>(name_len))) {
-			g_state.last_error = "load_snapshot: failed reading name";
+			error = "load_snapshot: failed reading name";
 			return false;
 		}
 	}
@@ -291,12 +364,12 @@ inline bool load_snapshot(const std::string& path, snapshot_t& out)
 	if (!ifs.read(reinterpret_cast<char*>(&pid), 4) ||
 	    !ifs.read(reinterpret_cast<char*>(&ts), 8) ||
 	    !ifs.read(reinterpret_cast<char*>(&region_count), 4)) {
-		g_state.last_error = "load_snapshot: failed reading header";
+		error = "load_snapshot: failed reading header";
 		return false;
 	}
 
-	if (region_count > 0x10000000u) {
-		g_state.last_error = "load_snapshot: implausible region count";
+	if (region_count > maximum_snapshot_regions) {
+		error = "load_snapshot: implausible region count";
 		return false;
 	}
 
@@ -312,12 +385,12 @@ inline bool load_snapshot(const std::string& path, snapshot_t& out)
 		if (!ifs.read(reinterpret_cast<char*>(&r.base), 8) ||
 		    !ifs.read(reinterpret_cast<char*>(&rsize), 8) ||
 		    !ifs.read(reinterpret_cast<char*>(&r.protect), 4)) {
-			g_state.last_error = "load_snapshot: failed reading region header";
+			error = "load_snapshot: failed reading region header";
 			return false;
 		}
 
-		if (rsize > 0x10000000ULL) {
-			g_state.last_error = "load_snapshot: implausible region size";
+		if (rsize > maximum_region_bytes || out.total_bytes > maximum_snapshot_bytes - rsize) {
+			error = "load_snapshot: implausible region size";
 			return false;
 		}
 
@@ -325,13 +398,17 @@ inline bool load_snapshot(const std::string& path, snapshot_t& out)
 		if (rsize > 0) {
 			r.data.resize(static_cast<std::size_t>(rsize));
 			if (!ifs.read(reinterpret_cast<char*>(r.data.data()), static_cast<std::streamsize>(rsize))) {
-				g_state.last_error = "load_snapshot: failed reading region data";
+				error = "load_snapshot: failed reading region data";
 				return false;
 			}
 		}
 
 		out.total_bytes += rsize;
 		out.regions.push_back(std::move(r));
+	}
+	if (ifs.peek() != std::char_traits<char>::eof()) {
+		error = "load_snapshot: unexpected trailing payload";
+		return false;
 	}
 
 	return true;
@@ -372,12 +449,12 @@ inline void take_snapshot(const std::string& name = "")
 	}
 	{
 		std::lock_guard<std::mutex> lock(g_state.mutex);
-		g_state.snapshots.push_back(std::move(snapshot));
+		g_state.snapshots.push_back(std::make_shared<const snapshot_t>(std::move(snapshot)));
 		if (g_state.snapshots.size() > 10) g_state.snapshots.erase(g_state.snapshots.begin());
 	}
 	g_state.progress.store(1.f);
 	g_state.capturing.store(false);
-	aida::preview::scan::record("snapshot.capture", g_state.snapshots.back().name);
+	aida::preview::scan::record("snapshot.capture", g_state.snapshots.back()->name);
 #else
 	if (g_state.capturing.load()) {
 		diag::log_tagged("snapshot_diff", "take_snapshot refused already_capturing");
@@ -386,13 +463,15 @@ inline void take_snapshot(const std::string& name = "")
 	if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0) {
 		diag::log_tagged_fmt("snapshot_diff", "take_snapshot refused not_attached driver_loaded=%d pid=%u",
 			static_cast<int>(driver_bridge::is_loaded()), driver_bridge::attached_pid());
-		g_state.last_error = "take_snapshot: no process attached";
+		set_last_error("take_snapshot: no process attached");
 		return;
 	}
 
 	g_state.capturing.store(true);
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
+	const std::uint64_t operation_generation =
+		g_state.operation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
 	std::string snap_name = name;
 	if (snap_name.empty()) {
@@ -412,7 +491,8 @@ inline void take_snapshot(const std::string& name = "")
 	sub.domain = aida::infra::executor::domain_t::long_running;
 	sub.priority = 2;
 	sub.target_pid = driver_bridge::attached_pid();
-	sub.body = [snap_name]() {
+	sub.generation = operation_generation;
+	sub.body = [snap_name, operation_generation]() {
 		auto t_start = std::chrono::steady_clock::now();
 		snapshot_t snap;
 		snap.id = g_state.next_snap_id.fetch_add(1);
@@ -438,14 +518,24 @@ inline void take_snapshot(const std::string& name = "")
 		if (total == 0) total = 1;
 		uint64_t done = 0;
 
+		bool bounded = false;
 		for (auto& r : readable) {
 			if (g_state.cancel.load()) break;
+			if (snap.total_bytes >= detail::maximum_snapshot_bytes) {
+				bounded = true;
+				break;
+			}
 
 			memory_region_t sr;
 			sr.base = r.base;
 			sr.protect = r.protect;
+			const std::uint64_t remaining = detail::maximum_snapshot_bytes - snap.total_bytes;
+			const std::uint64_t requested = (std::min)({r.size,
+				detail::maximum_region_bytes, remaining});
+			bounded = bounded || requested < r.size;
 
-			if (driver_bridge::read_memory(r.base, static_cast<std::size_t>(r.size), sr.data) && !sr.data.empty()) {
+			if (requested > 0 && driver_bridge::read_memory(r.base,
+				static_cast<std::size_t>(requested), sr.data) && !sr.data.empty()) {
 				sr.size = sr.data.size();
 				snap.total_bytes += sr.data.size();
 				snap.regions.push_back(std::move(sr));
@@ -454,22 +544,33 @@ inline void take_snapshot(const std::string& name = "")
 			done += r.size;
 			g_state.progress.store(static_cast<float>(done) / static_cast<float>(total));
 		}
+		if (g_state.cancel.load(std::memory_order_acquire) ||
+			g_state.operation_generation.load(std::memory_order_acquire) != operation_generation) {
+			g_state.progress.store(1.f);
+			g_state.capturing.store(false);
+			return;
+		}
 
-		detail::save_snapshot(snap);
+		std::string persistence_error;
+		const bool persisted = detail::save_snapshot(snap, persistence_error);
+		if (!persisted) {
+			std::lock_guard<std::mutex> lock(g_state.mutex);
+			g_state.last_error = persistence_error;
+		}
 
 		std::size_t region_count = snap.regions.size();
 		uint64_t total_bytes = snap.total_bytes;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (g_state.snapshots.size() >= 10) {
-				uint64_t evicted_id = g_state.snapshots.front().id;
+			uint64_t evicted_id = g_state.snapshots.front()->id;
 				g_state.snapshots.erase(g_state.snapshots.begin());
 				if (g_state.snap_a_id == evicted_id) g_state.snap_a_id = 0;
 				if (g_state.snap_b_id == evicted_id) g_state.snap_b_id = 0;
 				diag::log_tagged_fmt("snapshot_diff", "take_snapshot evicted_oldest id=%llu",
 					static_cast<unsigned long long>(evicted_id));
 			}
-			g_state.snapshots.push_back(std::move(snap));
+			g_state.snapshots.push_back(std::make_shared<const snapshot_t>(std::move(snap)));
 		}
 
 		auto t_end = std::chrono::steady_clock::now();
@@ -479,6 +580,13 @@ inline void take_snapshot(const std::string& name = "")
 			static_cast<unsigned long long>(total_bytes),
 			static_cast<unsigned long long>(dur_ms),
 			static_cast<int>(g_state.cancel.load()));
+		if (!persisted)
+			diag::log_tagged_fmt("snapshot_diff", "take_snapshot persistence_failed err='%s'",
+				persistence_error.c_str());
+		if (bounded)
+			diag::log_tagged_fmt("snapshot_diff", "take_snapshot bounded bytes=%llu limit=%llu",
+				static_cast<unsigned long long>(total_bytes),
+				static_cast<unsigned long long>(detail::maximum_snapshot_bytes));
 
 		g_state.progress.store(1.f);
 		g_state.capturing.store(false);
@@ -486,7 +594,7 @@ inline void take_snapshot(const std::string& name = "")
 	const auto submitted = aida::infra::executor::submit(std::move(sub));
 	if (!submitted.submitted) {
 		diag::log_tagged("snapshot_diff", "take_snapshot worker_queue_rejected");
-		g_state.last_error = "take_snapshot: worker queue rejected the task";
+		set_last_error("take_snapshot: worker queue rejected the task");
 		g_state.progress.store(1.f);
 		g_state.capturing.store(false);
 		return;
@@ -516,6 +624,8 @@ inline void load_from_disk(const std::string& path)
 	g_state.loading.store(true);
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
+	const std::uint64_t operation_generation =
+		g_state.operation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
 	std::string fallback_name;
 	{
@@ -534,12 +644,24 @@ inline void load_from_disk(const std::string& path)
 	sub.thread_class = "scanner_snapshot";
 	sub.domain = aida::infra::executor::domain_t::feature_worker;
 	sub.priority = 3;
-	sub.body = [path_copy, fallback_name]() {
+	sub.generation = operation_generation;
+	sub.body = [path_copy, fallback_name, operation_generation]() {
 		auto t_start = std::chrono::steady_clock::now();
 		snapshot_t snap;
-		if (!detail::load_snapshot(path_copy, snap)) {
+		std::string load_error;
+		if (!detail::load_snapshot(path_copy, snap, load_error)) {
+			{
+				std::lock_guard<std::mutex> lock(g_state.mutex);
+				g_state.last_error = load_error;
+			}
 			diag::log_tagged_fmt("snapshot_diff", "load_from_disk failed path='%s' err='%s'",
-				path_copy.c_str(), g_state.last_error.c_str());
+				path_copy.c_str(), load_error.c_str());
+			g_state.progress.store(1.f);
+			g_state.loading.store(false);
+			return;
+		}
+		if (g_state.cancel.load(std::memory_order_acquire) ||
+			g_state.operation_generation.load(std::memory_order_acquire) != operation_generation) {
 			g_state.progress.store(1.f);
 			g_state.loading.store(false);
 			return;
@@ -556,14 +678,14 @@ inline void load_from_disk(const std::string& path)
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (g_state.snapshots.size() >= 10) {
-				uint64_t evicted_id = g_state.snapshots.front().id;
+				uint64_t evicted_id = g_state.snapshots.front()->id;
 				g_state.snapshots.erase(g_state.snapshots.begin());
 				if (g_state.snap_a_id == evicted_id) g_state.snap_a_id = 0;
 				if (g_state.snap_b_id == evicted_id) g_state.snap_b_id = 0;
 				diag::log_tagged_fmt("snapshot_diff", "load_from_disk evicted_oldest id=%llu",
 					static_cast<unsigned long long>(evicted_id));
 			}
-			g_state.snapshots.push_back(std::move(snap));
+			g_state.snapshots.push_back(std::make_shared<const snapshot_t>(std::move(snap)));
 		}
 
 		auto t_end = std::chrono::steady_clock::now();
@@ -579,7 +701,7 @@ inline void load_from_disk(const std::string& path)
 	const auto submitted = aida::infra::executor::submit(std::move(sub));
 	if (!submitted.submitted) {
 		diag::log_tagged("snapshot_diff", "load_from_disk worker_queue_rejected");
-		g_state.last_error = "load_from_disk: worker queue rejected the task";
+		set_last_error("load_from_disk: worker queue rejected the task");
 		g_state.progress.store(1.f);
 		g_state.loading.store(false);
 		return;
@@ -595,21 +717,25 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	g_state.comparing.store(true);
 	diff_result_t result;
-	snapshot_t first;
-	snapshot_t second;
+	std::shared_ptr<const snapshot_t> first;
+	std::shared_ptr<const snapshot_t> second;
 	{
 		std::lock_guard<std::mutex> lock(g_state.mutex);
 		for (const auto& snapshot : g_state.snapshots) {
-			if (snapshot.id == id_a) first = snapshot;
-			if (snapshot.id == id_b) second = snapshot;
+			if (snapshot->id == id_a) first = snapshot;
+			if (snapshot->id == id_b) second = snapshot;
 		}
 	}
-	result.snap_a_name = first.name;
-	result.snap_b_name = second.name;
+	if (!first || !second) {
+		g_state.comparing.store(false);
+		return;
+	}
+	result.snap_a_name = first->name;
+	result.snap_b_name = second->name;
 	for (std::size_t region_index = 0;
-		region_index < first.regions.size() && region_index < second.regions.size(); ++region_index) {
-		const auto& old_region = first.regions[region_index];
-		const auto& new_region = second.regions[region_index];
+		region_index < first->regions.size() && region_index < second->regions.size(); ++region_index) {
+		const auto& old_region = first->regions[region_index];
+		const auto& new_region = second->regions[region_index];
 		const std::size_t size = (std::min)(old_region.data.size(), new_region.data.size());
 		bool region_changed = false;
 		for (std::size_t index = 0; index < size; ++index) {
@@ -624,14 +750,17 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 			result.changes.push_back(std::move(change));
 			++result.total_changed_bytes;
 			region_changed = true;
+			if (result.changes.size() >= detail::maximum_diff_ranges) {
+				result.truncated = true;
+				break;
+			}
 		}
 		if (region_changed) ++result.changed_page_count;
+		if (result.truncated) break;
 	}
 	{
 		std::lock_guard<std::mutex> lock(g_state.mutex);
-		g_state.diff = std::move(result);
-		g_state.selected_change = -1;
-		g_state.row_flash.assign(g_state.diff.changes.size(), 1.f);
+		g_state.published_diff = std::make_shared<const diff_result_t>(std::move(result));
 	}
 	g_state.progress.store(1.f);
 	g_state.comparing.store(false);
@@ -656,6 +785,8 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 	g_state.comparing.store(true);
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
+	const std::uint64_t operation_generation =
+		g_state.operation_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 	g_state.compare_cursor_active = true;
 	g_state.compare_cursor_t = 0.f;
 
@@ -666,48 +797,48 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 	sub.domain = aida::infra::executor::domain_t::long_running;
 	sub.priority = 2;
 	sub.target_pid = driver_bridge::attached_pid();
-	sub.body = [id_a, id_b]() {
+	sub.generation = operation_generation;
+	sub.body = [id_a, id_b, operation_generation]() {
 		try {
 		auto t_start = std::chrono::steady_clock::now();
 		diff_result_t result;
 
-		snapshot_t snap_a, snap_b;
+		std::shared_ptr<const snapshot_t> snap_a;
+		std::shared_ptr<const snapshot_t> snap_b;
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			const snapshot_t* p_a = nullptr;
-			const snapshot_t* p_b = nullptr;
-			for (auto& s : g_state.snapshots) {
-				if (s.id == id_a) p_a = &s;
-				if (s.id == id_b) p_b = &s;
+			for (const auto& s : g_state.snapshots) {
+				if (s->id == id_a) snap_a = s;
+				if (s->id == id_b) snap_b = s;
 			}
-			if (p_a == nullptr || p_b == nullptr) {
-				g_state.last_error = (p_a == nullptr && p_b == nullptr)
+			if (!snap_a || !snap_b) {
+				g_state.last_error = (!snap_a && !snap_b)
 					? "compare_snapshots: both snapshots evicted"
-					: (p_a == nullptr
+					: (!snap_a
 						? "compare_snapshots: snapshot A evicted"
 						: "compare_snapshots: snapshot B evicted");
 				g_state.comparing.store(false);
 				g_state.compare_cursor_active = false;
 				return;
 			}
-			snap_a = *p_a;
-			snap_b = *p_b;
 		}
 
-		result.snap_a_name = snap_a.name;
-		result.snap_b_name = snap_b.name;
+		result.snap_a_name = snap_a->name;
+		result.snap_b_name = snap_b->name;
 
 		std::unordered_map<uint64_t, std::size_t> b_map;
-		for (std::size_t i = 0; i < snap_b.regions.size(); ++i)
-			b_map[snap_b.regions[i].base] = i;
+		for (std::size_t i = 0; i < snap_b->regions.size(); ++i)
+			b_map[snap_b->regions[i].base] = i;
 
 		auto modules = driver_bridge::enumerate_modules();
+		std::sort(modules.begin(), modules.end(),
+			[](const auto& left, const auto& right) { return left.base < right.base; });
 
-		uint64_t total = snap_a.regions.size();
+		uint64_t total = snap_a->regions.size();
 		if (total == 0) total = 1;
 		uint64_t done = 0;
 
-		for (auto& ra : snap_a.regions) {
+		for (const auto& ra : snap_a->regions) {
 			if (g_state.cancel.load()) break;
 
 			auto it = b_map.find(ra.base);
@@ -717,7 +848,7 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 				continue;
 			}
 
-			auto& rb = snap_b.regions[it->second];
+			const auto& rb = snap_b->regions[it->second];
 			uint64_t cmp_size = (std::min)(ra.size, rb.size);
 			uint64_t min_data = (std::min)(ra.data.size(), rb.data.size());
 			if (min_data < cmp_size) cmp_size = min_data;
@@ -738,30 +869,42 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 				cr.new_data.assign(rb.data.begin() + start, rb.data.begin() + i);
 				cr.type = detail::classify_change(cr.old_data.data(), cr.new_data.data(), cr.size);
 
-				for (auto& m : modules) {
-					if (cr.address >= m.base && cr.address < m.base + m.size) {
-						cr.module_name = m.name;
-						break;
-					}
+				const auto module_after = std::upper_bound(modules.begin(), modules.end(), cr.address,
+					[](std::uint64_t address, const auto& module) { return address < module.base; });
+				if (module_after != modules.begin()) {
+					const auto& module = *std::prev(module_after);
+					if (cr.address >= module.base && cr.address - module.base < module.size)
+						cr.module_name = module.name;
 				}
 
+				const std::uint32_t changed_size = cr.size;
 				result.changes.push_back(std::move(cr));
-				result.total_changed_bytes += cr.size;
+				result.total_changed_bytes += changed_size;
+				if (result.changes.size() >= detail::maximum_diff_ranges) {
+					result.truncated = true;
+					break;
+				}
 			}
 
 			++result.changed_page_count;
 			++done;
 			g_state.progress.store(static_cast<float>(done) / static_cast<float>(total));
+			if (result.truncated) break;
 		}
 
 		std::size_t changes_count = result.changes.size();
 		uint64_t changed_bytes = result.total_changed_bytes;
 		std::size_t changed_pages = result.changed_page_count;
+		if (g_state.cancel.load(std::memory_order_acquire) ||
+			g_state.operation_generation.load(std::memory_order_acquire) != operation_generation) {
+			g_state.progress.store(1.f);
+			g_state.comparing.store(false);
+			g_state.compare_cursor_active = false;
+			return;
+		}
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.diff = std::move(result);
-			g_state.selected_change = -1;
-			g_state.row_flash.clear();
+			g_state.published_diff = std::make_shared<const diff_result_t>(std::move(result));
 		}
 
 		auto t_end = std::chrono::steady_clock::now();
@@ -779,13 +922,13 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 		g_state.compare_cursor_active = false;
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("snapshot_diff", "compare_snapshots worker_exception err='%s'", ex.what());
-			g_state.last_error = ex.what();
+			set_last_error(ex.what());
 			g_state.progress.store(1.f);
 			g_state.comparing.store(false);
 			g_state.compare_cursor_active = false;
 		} catch (...) {
 			diag::log_tagged("snapshot_diff", "compare_snapshots worker_exception err='<unknown>'");
-			g_state.last_error = "compare_snapshots: worker threw an unknown exception";
+			set_last_error("compare_snapshots: worker threw an unknown exception");
 			g_state.progress.store(1.f);
 			g_state.comparing.store(false);
 			g_state.compare_cursor_active = false;
@@ -794,7 +937,7 @@ inline void compare_snapshots(uint64_t id_a, uint64_t id_b)
 	const auto submitted = aida::infra::executor::submit(std::move(sub));
 	if (!submitted.submitted) {
 		diag::log_tagged("snapshot_diff", "compare_snapshots worker_queue_rejected");
-		g_state.last_error = "compare_snapshots: worker queue rejected the task";
+		set_last_error("compare_snapshots: worker queue rejected the task");
 		g_state.progress.store(1.f);
 		g_state.comparing.store(false);
 		g_state.compare_cursor_active = false;
@@ -813,15 +956,14 @@ inline void clear_snapshots()
 {
 	diag::log_tagged("snapshot_diff", "clear_snapshots signalled");
 	g_state.cancel.store(true);
+	g_state.operation_generation.fetch_add(1, std::memory_order_acq_rel);
 	std::lock_guard<std::mutex> lk(g_state.mutex);
 	std::size_t had = g_state.snapshots.size();
 	g_state.snapshots.clear();
-	g_state.diff = {};
+	g_state.published_diff = std::make_shared<const diff_result_t>();
 	g_state.snap_a_id = 0;
 	g_state.snap_b_id = 0;
 	g_state.snap_counter = 0;
-	g_state.prev_change_keys.clear();
-	g_state.row_flash.clear();
 	g_state.selected_change = -1;
 	diag::log_tagged_fmt("snapshot_diff", "clear_snapshots cleared=%zu", had);
 }
@@ -840,14 +982,22 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 	dl->AddRect(ImVec2(ox, oy), ImVec2(ox + w, oy + h),
 		aida::ui::with_alpha(t.border_subtle, a), 10.f, 0, 1.f);
 
-	std::size_t snap_count = 0;
-	std::vector<uint64_t> snap_ids;
+	struct marker_t {
+		std::uint64_t id = 0;
+		std::string name;
+	};
+	std::vector<marker_t> markers;
+	std::uint64_t selected_a = 0;
+	std::uint64_t selected_b = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
-		snap_count = g_state.snapshots.size();
-		snap_ids.reserve(snap_count);
-		for (auto& s : g_state.snapshots) snap_ids.push_back(s.id);
+		markers.reserve(g_state.snapshots.size());
+		for (const auto& snapshot : g_state.snapshots)
+			markers.push_back({snapshot->id, snapshot->name});
+		selected_a = g_state.snap_a_id;
+		selected_b = g_state.snap_b_id;
 	}
+	const std::size_t snap_count = markers.size();
 
 	float track_y = oy + h * 0.5f;
 	float pad_x = 28.f;
@@ -871,8 +1021,8 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 	std::size_t idx_a = snap_count;
 	std::size_t idx_b = snap_count;
 	for (std::size_t i = 0; i < snap_count; ++i) {
-		if (g_state.snap_a_id != 0 && snap_ids[i] == g_state.snap_a_id) idx_a = i;
-		if (g_state.snap_b_id != 0 && snap_ids[i] == g_state.snap_b_id) idx_b = i;
+		if (selected_a != 0 && markers[i].id == selected_a) idx_a = i;
+		if (selected_b != 0 && markers[i].id == selected_b) idx_b = i;
 	}
 
 	std::size_t hot_marker = snap_count;
@@ -889,8 +1039,9 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 		bool clk_r = ImGui::IsItemClicked(ImGuiMouseButton_Right);
 		ImGui::PopID();
 		if (hov) hot_marker = i;
-		uint64_t this_id = snap_ids[i];
+		uint64_t this_id = markers[i].id;
 		if (clk) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (g_state.snap_a_id == this_id) g_state.snap_a_id = 0;
 			else if (g_state.snap_b_id == this_id) g_state.snap_b_id = 0;
 			else if (g_state.snap_a_id == 0) g_state.snap_a_id = this_id;
@@ -898,6 +1049,7 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 			else g_state.snap_b_id = this_id;
 		}
 		if (clk_r) {
+			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (g_state.snap_a_id == this_id) g_state.snap_a_id = 0;
 			if (g_state.snap_b_id == this_id) g_state.snap_b_id = 0;
 		}
@@ -957,12 +1109,7 @@ inline void render_timeline(ImDrawList* dl, float ox, float oy, float w, float h
 		dl->AddCircleFilled(ImVec2(mx, my), r_outer, outer, 24);
 		dl->AddCircleFilled(ImVec2(mx, my), r_outer - 3.f, inner, 24);
 
-		std::string nm;
-		{
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			if (i < g_state.snapshots.size())
-				nm = g_state.snapshots[i].name;
-		}
+		const std::string& nm = markers[i].name;
 		ImVec2 ts = ImGui::CalcTextSize(nm.c_str());
 		dl->AddText(body_font, body_font_size,
 			ImVec2(mx - ts.x * 0.5f, my + 11.f),
@@ -991,9 +1138,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (!seeded) {
 		take_snapshot("Before Patch");
 		take_snapshot("After Patch");
-		compare_snapshots(g_state.snapshots[0].id, g_state.snapshots[1].id);
-		g_state.snap_a_id = g_state.snapshots[0].id;
-		g_state.snap_b_id = g_state.snapshots[1].id;
+		compare_snapshots(g_state.snapshots[0]->id, g_state.snapshots[1]->id);
+		g_state.snap_a_id = g_state.snapshots[0]->id;
+		g_state.snap_b_id = g_state.snapshots[1]->id;
 		seeded = true;
 	}
 #endif
@@ -1060,14 +1207,18 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	}
 
 	std::size_t snap_count = 0;
+	std::uint64_t selected_snapshot_a = 0;
+	std::uint64_t selected_snapshot_b = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		snap_count = g_state.snapshots.size();
+		selected_snapshot_a = g_state.snap_a_id;
+		selected_snapshot_b = g_state.snap_b_id;
 	}
 
 	bool can_compare = (!busy && snap_count >= 2U &&
-		g_state.snap_a_id != 0 && g_state.snap_b_id != 0 &&
-		g_state.snap_a_id != g_state.snap_b_id);
+		selected_snapshot_a != 0 && selected_snapshot_b != 0 &&
+		selected_snapshot_a != selected_snapshot_b);
 
 	{
 		ImGui::SetCursorScreenPos(ImVec2(cx, cy));
@@ -1076,7 +1227,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !can_compare, nullptr, comparing)) {
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] snapshot_diff compare");
-			compare_snapshots(g_state.snap_a_id, g_state.snap_b_id);
+			compare_snapshots(selected_snapshot_a, selected_snapshot_b);
 		}
 		cx = ImGui::GetItemRectMax().x + btn_gap;
 	}
@@ -1099,8 +1250,6 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			load_from_disk({});
 #else
 			auto initial_dir = detail::snapshot_dir();
-			std::error_code ec;
-			std::filesystem::create_directories(initial_dir, ec);
 			std::string initial_dir_str = initial_dir.string();
 			char path_buf[MAX_PATH] = {};
 			static const char k_snapshot_filter[] =
@@ -1181,46 +1330,24 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		hx += col_widths[c];
 	}
 
-	std::vector<changed_region_t> filtered;
+	std::shared_ptr<const diff_result_t> diff_snapshot;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
-		for (auto& c : g_state.diff.changes) {
-			if (g_state.filter_min_addr != 0 && c.address < g_state.filter_min_addr) continue;
-			if (g_state.filter_max_addr != 0 && c.address > g_state.filter_max_addr) continue;
-			filtered.push_back(c);
-		}
+		diff_snapshot = g_state.published_diff;
 	}
-
-	if (g_state.row_flash.size() < filtered.size())
-		g_state.row_flash.resize(filtered.size(), 0.f);
-
-	{
-		std::unordered_set<uint64_t> current;
-		current.reserve(filtered.size());
-		for (auto& c : filtered) current.insert(c.address);
-		bool changed = (current.size() != g_state.prev_change_keys.size());
-		if (!changed) {
-			for (auto k : current) {
-				if (g_state.prev_change_keys.find(k) == g_state.prev_change_keys.end()) {
-					changed = true; break;
-				}
-			}
-		}
-		if (changed) {
-			for (std::size_t i = 0; i < filtered.size(); ++i) {
-				if (g_state.prev_change_keys.find(filtered[i].address) == g_state.prev_change_keys.end()) {
-					if (i < g_state.row_flash.size()) g_state.row_flash[i] = 1.f;
-				}
-			}
-			g_state.prev_change_keys = std::move(current);
-		}
+	if (!diff_snapshot)
+		diff_snapshot = std::make_shared<const diff_result_t>();
+	if (diff_snapshot->truncated) {
+		const char* bounded_label = "Bounded to first 250,000 change ranges";
+		const ImVec2 bounded_size = ImGui::CalcTextSize(bounded_label);
+		dl->AddText(body_font, body_font_size,
+			ImVec2(x0 + width - bounded_size.x - 12.f,
+				content_y + (hdr_h - body_font_size) * 0.5f),
+			aida::ui::with_alpha(t.warning, a), bounded_label);
 	}
-
-	for (auto& f : g_state.row_flash) {
-		if (f > 0.f) {
-			f -= aida::ui::clock::dt() * 1.66f;
-			if (f < 0.f) f = 0.f;
-		}
+	if (g_state.visible_diff != diff_snapshot) {
+		g_state.visible_diff = diff_snapshot;
+		g_state.selected_change = -1;
 	}
 
 	float body_y = content_y + hdr_h;
@@ -1234,9 +1361,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	diff_row_anim_time += aida::ui::clock::dt();
 
 	float row_height = 22.f;
-	for (std::size_t index = 0; index < filtered.size(); ++index) {
-		const int row_index = static_cast<int>(index);
-		auto& c = filtered[index];
+	ImGuiListClipper clipper;
+	const int visible_count = static_cast<int>((std::min)(
+		diff_snapshot->changes.size(), static_cast<std::size_t>(2147483647)));
+	clipper.Begin(visible_count, row_height);
+	while (clipper.Step()) for (int row_index = clipper.DisplayStart;
+		row_index < clipper.DisplayEnd; ++row_index) {
+		const auto& c = diff_snapshot->changes[static_cast<std::size_t>(row_index)];
 		ImVec2 rp = ImGui::GetCursorScreenPos();
 
 		float entrance = ui_anim::render_row_entrance(row_index, diff_row_anim_time, 0.012f);
@@ -1251,15 +1382,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		} else if (hov) {
 			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
 				aida::ui::with_alpha(t.hover_wash, a * entrance));
-		} else if ((index & 1U) != 0U) {
+		} else if ((static_cast<std::size_t>(row_index) & 1U) != 0U) {
 			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
 				aida::ui::with_alpha(IM_COL32(255, 255, 255, 4), a * entrance));
-		}
-
-		float flash = index < g_state.row_flash.size() ? g_state.row_flash[index] : 0.f;
-		if (flash > 0.f) {
-			dl->AddRectFilled(rp, ImVec2(rp.x + width, rp.y + row_height),
-				aida::ui::with_alpha(t.accent_glow, a * flash * 0.85f));
 		}
 
 		if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1315,11 +1440,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::SetCursorScreenPos(ImVec2(rp.x, rp.y + row_height));
 	}
+	clipper.End();
 
-	if (filtered.empty()) {
+	if (diff_snapshot->changes.empty()) {
 		aida::ui::empty_state::config_t cfg;
 		cfg.glyph = aida::ui::empty_state::glyph_t::memory;
-		if (g_state.snapshots.empty()) {
+		if (snap_count == 0U) {
 			cfg.title = "No snapshots yet";
 			cfg.body = "Capture two snapshots of the target process, then compare them to see what changed.";
 		} else {
@@ -1332,8 +1458,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::EndChild();
 
 	if (g_state.selected_change >= 0 &&
-		static_cast<std::size_t>(g_state.selected_change) < filtered.size()) {
-		auto& c = filtered[static_cast<std::size_t>(g_state.selected_change)];
+		static_cast<std::size_t>(g_state.selected_change) < diff_snapshot->changes.size()) {
+		const auto& c = diff_snapshot->changes[static_cast<std::size_t>(g_state.selected_change)];
 		float dy = y0 + height - detail_h;
 		dl->AddLine(ImVec2(x0, dy), ImVec2(x0 + width, dy),
 			aida::ui::with_alpha(t.border_subtle, a), 1.f);

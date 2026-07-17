@@ -11,6 +11,7 @@
 #endif
 #include "../ui/task_center.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
 #include "../ai/standalone_chat.hpp"
 #include "standalone_driver.hpp"
 #ifndef AIDA_IMGUI_STUDIO_PREVIEW
@@ -18,6 +19,7 @@
 #endif
 #include "protocol_parser.hpp"
 #include "mitm_proxy.hpp"
+#include "flow_serializer.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../preview/network_preview_certificates.hpp"
 #else
@@ -120,9 +122,11 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <charconv>
 #include <climits>
 #include <cctype>
 #include <cstdio>
@@ -134,9 +138,16 @@
 #include <fstream>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
+#include <limits>
+#include <memory>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -197,33 +208,144 @@ struct capture_table_snapshot_t {
 struct capture_context_t {
     int packet_index = -1;
     uint64_t timestamp = 0;
+    bool open_requested = false;
+    aida::ui::context_menu_open_origin_t origin =
+        aida::ui::context_menu_open_origin_t::pointer;
 };
 
-struct proxy_context_t {
-    uint64_t exchange_id = 0;
-    uint64_t timestamp = 0;
+enum class network_exchange_action_t : std::uint8_t {
+    repeater,
+    intruder,
+    scanner,
+    comparer,
+    decoder,
+    sequencer,
+    camoufox,
+    copy_url,
+    copy_method,
+    copy_status,
+    copy_request,
+    copy_response,
+    copy_headers,
+    copy_body,
+    copy_artifact,
+    scope_include,
+    scope_exclude,
+    save_export,
+    create_issue,
+    chat,
+    agent,
+    replay_live,
+    remove
 };
 
-struct websocket_context_t {
-    uint64_t timestamp = 0;
-    uint64_t exchange_id = 0;
-    size_t payload_size = 0;
-    bool outbound = false;
-    uint8_t opcode = 0;
+struct network_exchange_action_descriptor_t {
+    network_exchange_action_t action;
+    const char* id;
+};
+
+struct exchange_context_runtime_t {
+    artifact_identity_t primary;
+    artifact_identity_t related;
+    bool primary_current = false;
+    std::string unavailable_reason;
 };
 
 static capture_context_t s_capture_context;
-static proxy_context_t s_proxy_context;
-static websocket_context_t s_websocket_context;
 static std::atomic<std::uint64_t> s_repeater_artifact_sequence{1};
+static std::atomic<std::uint64_t> s_network_operation_sequence{1};
+static std::atomic<bool> s_accept_ui_completions{false};
+static std::mutex s_ui_completion_mutex;
+static std::deque<std::function<void()>> s_ui_completions;
 
-static std::uint64_t artifact_hash(const std::vector<std::uint8_t>& bytes) {
+static std::uint64_t network_now_ms() {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return aida::preview::network::monotonic_ms();
+#else
+    return static_cast<std::uint64_t>(GetTickCount64());
+#endif
+}
+
+static bool enqueue_ui_completion(std::function<void()> completion) {
+    if (!completion || !s_accept_ui_completions.load(std::memory_order_acquire))
+        return false;
+    std::lock_guard<std::mutex> lock(s_ui_completion_mutex);
+    if (!s_accept_ui_completions.load(std::memory_order_relaxed) || s_ui_completions.size() >= 256)
+        return false;
+    s_ui_completions.push_back(std::move(completion));
+    return true;
+}
+
+static void drain_ui_completions() {
+    std::deque<std::function<void()>> pending;
+    {
+        std::lock_guard<std::mutex> lock(s_ui_completion_mutex);
+        const std::size_t count = (std::min)(s_ui_completions.size(), static_cast<std::size_t>(32));
+        for (std::size_t i = 0; i < count; ++i) {
+            pending.push_back(std::move(s_ui_completions.front()));
+            s_ui_completions.pop_front();
+        }
+    }
+    for (auto& completion : pending)
+        completion();
+}
+
+static std::string register_network_operation(const char* action, const char* label,
+                                              const char* owner_view, std::string target) {
+    const std::string id = "network.operation." +
+        std::to_string(s_network_operation_sequence.fetch_add(1, std::memory_order_acq_rel));
+    aida::ui::task_center::task_registration_t registration;
+    registration.id = id;
+    registration.source = "human";
+    registration.owner = "network";
+    registration.owner_view = owner_view ? owner_view : "view.network.connections";
+    registration.owner_action = action ? action : "network.operation";
+    registration.target = std::move(target);
+    registration.label = label ? label : "Network operation";
+    registration.stage = "Queued";
+    registration.progress = -1.0f;
+    registration.cancellation_is_safe = false;
+    registration.callbacks.focus = [view = registration.owner_view] {
+        (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(view));
+    };
+    if (!aida::ui::task_center::register_task(std::move(registration)))
+        return {};
+    return id;
+}
+
+static void finish_network_operation(const std::string& id, bool success,
+                                     std::string stage, std::string summary) {
+    if (id.empty())
+        return;
+    (void)aida::ui::task_center::update_task(
+        id,
+        success ? aida::ui::task_center::task_state_t::completed
+                : aida::ui::task_center::task_state_t::failed,
+        1.0f, std::move(stage), std::move(summary));
+}
+
+std::uint64_t artifact_content_hash(const std::vector<std::uint8_t>& bytes) {
     std::uint64_t hash = 14695981039346656037ULL;
     for (const std::uint8_t value : bytes) {
         hash ^= value;
         hash *= 1099511628211ULL;
     }
     hash ^= static_cast<std::uint64_t>(bytes.size());
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+static std::uint64_t artifact_hash(const std::vector<std::uint8_t>& bytes) {
+    return artifact_content_hash(bytes);
+}
+
+static std::uint64_t artifact_hash(std::string_view text) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char value : text) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    hash ^= static_cast<std::uint64_t>(text.size());
     hash *= 1099511628211ULL;
     return hash == 0 ? 1 : hash;
 }
@@ -248,13 +370,118 @@ static artifact_identity_t exchange_artifact_identity(const mitm_proxy::http_exc
     return identity;
 }
 
-static bool menu_item_disabled(const char* label, const char* reason) {
-    ImGui::BeginDisabled();
-    ImGui::MenuItem(label);
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", reason);
-    return false;
+static artifact_identity_t repeater_artifact_identity(const repeater_entry_t& entry,
+                                                       artifact_kind_t kind) {
+    artifact_identity_t identity;
+    const bool response = kind == artifact_kind_t::repeater_response;
+    identity.kind = kind;
+    identity.source_id = entry.id;
+    identity.timestamp = response ? entry.response_timestamp : 0;
+    identity.revision = entry.request_revision;
+    identity.target_host = entry.host;
+    identity.target_port = entry.port;
+    identity.use_tls = entry.use_tls;
+    identity.parent_id = entry.source_artifact_id;
+    identity.id = "network.repeater." + std::to_string(entry.id) +
+        (response ? ".response." + std::to_string(entry.response_timestamp)
+                  : ".request." + std::to_string(entry.request_revision));
+    identity.source_view_id = "view.network.repeater";
+    identity.label = std::string(response ? "Repeater response #" : "Repeater request #") +
+        std::to_string(entry.id);
+    const std::string& text = response ? entry.raw_response : entry.raw_request;
+    identity.content_size = text.size();
+    const std::uint64_t retained_hash = response
+        ? entry.response_hash : entry.request_hash;
+    identity.content_hash = text.empty() ? 0
+        : retained_hash != 0 ? retained_hash : artifact_hash(std::string_view(text));
+    return identity;
+}
+
+struct repeater_artifact_publication_t {
+    std::vector<std::shared_ptr<const artifact_snapshot_t>> requests;
+};
+
+static std::shared_ptr<const repeater_artifact_publication_t>
+    s_repeater_artifact_publication;
+static std::atomic<bool> s_repeater_artifact_publication_ready{false};
+
+static void publish_repeater_request_artifacts(const state_t& state) noexcept {
+    const auto previous = std::atomic_load_explicit(
+        &s_repeater_artifact_publication, std::memory_order_acquire);
+    s_repeater_artifact_publication_ready.store(false, std::memory_order_release);
+    std::atomic_store_explicit(&s_repeater_artifact_publication,
+        std::shared_ptr<const repeater_artifact_publication_t>{},
+        std::memory_order_release);
+    try {
+        auto next = std::make_shared<repeater_artifact_publication_t>();
+        next->requests.reserve(state.repeater_entries.size());
+        std::unordered_map<std::uint64_t,
+            std::shared_ptr<const artifact_snapshot_t>> previous_by_source;
+        if (previous) {
+            previous_by_source.reserve(previous->requests.size());
+            for (const auto& candidate : previous->requests) {
+                if (candidate)
+                    previous_by_source.emplace(
+                        candidate->identity.source_id, candidate);
+            }
+        }
+        for (const auto& entry : state.repeater_entries) {
+            if (!entry || entry->id == 0 || entry->raw_request.empty())
+                continue;
+            const artifact_identity_t identity = repeater_artifact_identity(
+                *entry, artifact_kind_t::repeater_request);
+            if (!identity.valid())
+                continue;
+            std::shared_ptr<const artifact_snapshot_t> retained;
+            const auto previous_found = previous_by_source.find(identity.source_id);
+            if (previous_found != previous_by_source.end()) {
+                const auto& candidate = previous_found->second;
+                if (candidate && candidate->identity.id == identity.id &&
+                    candidate->identity.revision == identity.revision &&
+                    candidate->identity.content_size == identity.content_size &&
+                    candidate->identity.content_hash == identity.content_hash &&
+                    candidate->identity.target_host == identity.target_host &&
+                    candidate->identity.target_port == identity.target_port &&
+                    candidate->identity.use_tls == identity.use_tls &&
+                    candidate->identity.parent_id == identity.parent_id)
+                    retained = candidate;
+            }
+            if (!retained) {
+                auto snapshot = std::make_shared<artifact_snapshot_t>();
+                snapshot->identity = identity;
+                snapshot->bytes.assign(entry->raw_request.begin(), entry->raw_request.end());
+                if (snapshot->identity.content_size != snapshot->bytes.size() ||
+                    snapshot->identity.content_hash != artifact_hash(snapshot->bytes))
+                    continue;
+                retained = std::move(snapshot);
+            }
+            next->requests.push_back(std::move(retained));
+        }
+        std::shared_ptr<const repeater_artifact_publication_t> immutable =
+            std::move(next);
+        std::atomic_store_explicit(&s_repeater_artifact_publication,
+            std::move(immutable), std::memory_order_release);
+        s_repeater_artifact_publication_ready.store(true, std::memory_order_release);
+    } catch (...) {
+    }
+}
+
+static artifact_identity_t websocket_artifact_identity(const state_t::ws_frame_entry_t& frame) {
+    artifact_identity_t identity;
+    identity.kind = artifact_kind_t::websocket_frame;
+    identity.id = "network.websocket." + std::to_string(frame.exchange_id) + "." +
+        std::to_string(frame.timestamp) + (frame.is_outbound ? ".out" : ".in");
+    identity.parent_id = "network.exchange." + std::to_string(frame.exchange_id);
+    identity.source_view_id = "view.network.websocket";
+    identity.source_id = frame.exchange_id;
+    identity.timestamp = frame.timestamp;
+    identity.content_size = frame.payload.size();
+    identity.content_hash = artifact_hash(frame.payload);
+    identity.label = std::string(frame.is_outbound ? "Outbound" : "Inbound") +
+        " WebSocket frame";
+    identity.target_host = frame.host;
+    identity.target_port = frame.port;
+    return identity;
 }
 
 static ImU32 status_code_color(int code) {
@@ -359,7 +586,8 @@ template <typename Fn>
 static bool post_network_task(const char* name,
                               aida::infra::executor::domain_t domain,
                               const char* thread_class,
-                              Fn&& fn) {
+                              Fn&& fn,
+                              bool register_with_task_center = true) {
     try {
         std::string task_name = name ? name : "?";
         std::function<void()> task(std::forward<Fn>(fn));
@@ -386,7 +614,7 @@ static bool post_network_task(const char* name,
         };
         auto submit_result = aida::infra::executor::submit(std::move(sub));
         bool ok = submit_result.submitted;
-        if (ok && submit_result.task_id != 0) {
+        if (ok && submit_result.task_id != 0 && register_with_task_center) {
             const std::string task_label = [&task_name] {
                 std::string label;
                 label.reserve(task_name.size());
@@ -503,6 +731,10 @@ struct cert_diagnostics_ui_t {
     std::string handoff_status;
 };
 static cert_diagnostics_ui_t s_cert_diag_ui;
+static std::atomic<bool> s_cert_diagnostics_pending{false};
+static std::atomic<bool> s_cert_handoff_pending{false};
+static std::atomic<std::uint64_t> s_cert_diagnostics_serial{0};
+static std::atomic<std::uint64_t> s_cert_handoff_serial{0};
 
 static std::string cert_diag_lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -631,23 +863,42 @@ static bool filter_text_match(const char* filter, const std::string& text) {
     return lower_text.find(lower_filter) != std::string::npos;
 }
 
-static void clamp_capture_selection_to_buffer_locked(state_t& state) {
-    int count = static_cast<int>(state.captured_packets.size());
-    if (count <= 0) {
-        state.cap_selected = -1;
-        return;
-    }
-    if (state.cap_selected < -1)
-        state.cap_selected = -1;
-    if (state.cap_selected >= count)
-        state.cap_selected = count - 1;
+static void publish_connection_snapshot(state_t& state, const std::vector<connection_entry_t>& entries) {
+    std::atomic_store_explicit(&state.connection_snapshot,
+        std::shared_ptr<const std::vector<connection_entry_t>>(
+            std::make_shared<std::vector<connection_entry_t>>(entries)),
+        std::memory_order_release);
+}
+
+static void publish_capture_snapshot_locked(state_t& state) {
+    auto snapshot = std::make_shared<std::vector<packet_entry_t>>();
+    snapshot->assign(state.captured_packets.begin(), state.captured_packets.end());
+    std::atomic_store_explicit(&state.capture_snapshot,
+        std::shared_ptr<const std::vector<packet_entry_t>>(std::move(snapshot)),
+        std::memory_order_release);
+}
+
+static void publish_dns_snapshot_locked(state_t& state) {
+    auto snapshot = std::make_shared<std::vector<dns_entry_t>>();
+    snapshot->assign(state.dns_entries.begin(), state.dns_entries.end());
+    std::atomic_store_explicit(&state.dns_snapshot,
+        std::shared_ptr<const std::vector<dns_entry_t>>(std::move(snapshot)),
+        std::memory_order_release);
+}
+
+static void publish_bandwidth_snapshot(state_t& state, const std::vector<bw_entry_t>& entries) {
+    std::atomic_store_explicit(&state.bandwidth_snapshot,
+        std::shared_ptr<const std::vector<bw_entry_t>>(
+            std::make_shared<std::vector<bw_entry_t>>(entries)),
+        std::memory_order_release);
 }
 
 static void shift_capture_selection_after_front_pop_locked(state_t& state) {
-    if (state.cap_selected > 0)
-        --state.cap_selected;
-    else if (state.cap_selected == 0)
-        state.cap_selected = -1;
+    int selected = state.cap_selected.load(std::memory_order_acquire);
+    if (selected > 0)
+        state.cap_selected.store(selected - 1, std::memory_order_release);
+    else if (selected == 0)
+        state.cap_selected.store(-1, std::memory_order_release);
 }
 
 static std::string capture_row_info_text(const std::string& summary) {
@@ -656,18 +907,31 @@ static std::string capture_row_info_text(const std::string& summary) {
     return summary.substr(0, 197) + "...";
 }
 
-static capture_table_snapshot_t snapshot_capture_table(state_t& state, const char* filter_text) {
-    capture_table_snapshot_t snapshot;
+static capture_table_snapshot_t& snapshot_capture_table(state_t& state, const char* filter_text) {
+    static capture_table_snapshot_t snapshot;
+    static std::shared_ptr<const std::vector<packet_entry_t>> cached_packets;
+    static std::string cached_filter;
+    const auto packets = std::atomic_load_explicit(&state.capture_snapshot, std::memory_order_acquire);
     std::string filter = filter_text ? filter_text : "";
-    std::lock_guard<std::mutex> lock(state.cap_mutex);
-    clamp_capture_selection_to_buffer_locked(state);
-    snapshot.total_count = state.captured_packets.size();
-    snapshot.selected_index = state.cap_selected;
-    snapshot.rows.reserve(state.captured_packets.size());
+    const int selected = state.cap_selected.load(std::memory_order_acquire);
+    if (packets == cached_packets && filter == cached_filter) {
+        snapshot.selected_index = selected;
+        return snapshot;
+    }
+    cached_packets = packets;
+    cached_filter = filter;
+    snapshot = {};
+    if (!packets) {
+        snapshot.selected_index = -1;
+        return snapshot;
+    }
+    snapshot.total_count = packets->size();
+    snapshot.selected_index = selected;
+    snapshot.rows.reserve(packets->size());
 
     bool selected_visible = snapshot.selected_index < 0;
-    for (size_t i = 0; i < state.captured_packets.size(); ++i) {
-        const packet_entry_t& p = state.captured_packets[i];
+    for (size_t i = 0; i < packets->size(); ++i) {
+        const packet_entry_t& p = (*packets)[i];
         std::string src = format_ip(p.src_addr, 2) + ":" + std::to_string(p.src_port);
         std::string dst = format_ip(p.dst_addr, 2) + ":" + std::to_string(p.dst_port);
 
@@ -703,7 +967,7 @@ static capture_table_snapshot_t snapshot_capture_table(state_t& state, const cha
             }
             state.cap_selected = it->packet_index;
         }
-        snapshot.selected_index = state.cap_selected;
+        snapshot.selected_index = state.cap_selected.load(std::memory_order_acquire);
     }
 
     return snapshot;
@@ -802,6 +1066,7 @@ static void connection_poll_thread(state_t& state) {
             }
 
             size_t count = entries.size();
+            publish_connection_snapshot(state, entries);
             {
                 std::lock_guard<std::mutex> lock(state.conn_mutex);
                 state.connections = std::move(entries);
@@ -880,6 +1145,7 @@ static void capture_poll_thread(state_t& state) {
                         diag::log_tagged_fmt("network", "capture_poll_batch packets=%zu total_buffered=%zu",
                             batch_n, state.captured_packets.size());
                     }
+                    publish_capture_snapshot_locked(state);
                 }
             }
 
@@ -947,6 +1213,7 @@ static void dns_poll_thread(state_t& state) {
                     }
                     while (state.dns_entries.size() > state.dns_max_entries)
                         state.dns_entries.pop_front();
+                    publish_dns_snapshot_locked(state);
                     if (added > 0) {
                         diag::log_tagged_fmt("network", "dns_poll_batch raw=%zu added=%zu total=%zu",
                             raw_dns.size(), added, state.dns_entries.size());
@@ -1023,6 +1290,7 @@ static void bandwidth_poll_thread(state_t& state) {
             {
                 std::lock_guard<std::mutex> lock(state.bw_mutex);
                 state.bw_entries = std::move(entries);
+                publish_bandwidth_snapshot(state, state.bw_entries);
             }
             }
 
@@ -1178,12 +1446,63 @@ static bool start_fuzzer_worker(state_t& state) {
 }
 #endif
 
+static void publish_initial_snapshots(state_t& state) {
+    {
+        std::lock_guard<std::mutex> lock(state.conn_mutex);
+        publish_connection_snapshot(state, state.connections);
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.cap_mutex);
+        publish_capture_snapshot_locked(state);
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.dns_mutex);
+        publish_dns_snapshot_locked(state);
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.bw_mutex);
+        publish_bandwidth_snapshot(state, state.bw_entries);
+    }
+    publish_repeater_request_artifacts(state);
+}
+
+static std::atomic<bool> s_driver_available_snapshot{false};
+static std::atomic<bool> s_driver_available_snapshot_pending{false};
+static std::atomic<std::uint64_t> s_driver_available_snapshot_requested_ms{0};
+
+static void request_driver_available_snapshot(bool force = false) {
+    const std::uint64_t now = network_now_ms();
+    const std::uint64_t last = s_driver_available_snapshot_requested_ms.load(std::memory_order_acquire);
+    if (!force && last != 0 && now >= last && now - last < 500)
+        return;
+    bool expected = false;
+    if (!s_driver_available_snapshot_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    s_driver_available_snapshot_requested_ms.store(now, std::memory_order_release);
+    const bool posted = post_network_task(
+        "driver_availability_snapshot", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        []() {
+            bool available = false;
+            try {
+                available = driver_bridge::using_kernel_driver();
+            } catch (...) {
+            }
+            s_driver_available_snapshot.store(available, std::memory_order_release);
+            s_driver_available_snapshot_pending.store(false, std::memory_order_release);
+        }, false);
+    if (!posted)
+        s_driver_available_snapshot_pending.store(false, std::memory_order_release);
+}
+
 void initialize() {
+    s_accept_ui_completions.store(true, std::memory_order_release);
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
     aida::preview::network::initialize(g_state);
+    publish_initial_snapshots(g_state);
     return;
 #else
     g_state.active = true;
+    publish_initial_snapshots(g_state);
     diag::log_tagged("network", "initialize_begin");
     anti_tamper::webhook::write_log("net_audit", "[net_audit] network_view initialize begin");
 
@@ -1261,6 +1580,11 @@ void initialize() {
 }
 
 void shutdown() {
+    s_accept_ui_completions.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(s_ui_completion_mutex);
+        s_ui_completions.clear();
+    }
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
     aida::preview::network::shutdown(g_state);
     return;
@@ -1839,14 +2163,90 @@ static float render_tab_bar(state_t& state, float x, float y, float w, float alp
 }
 
 
+template <typename RawConnections>
+static std::vector<connection_entry_t> convert_connection_entries(RawConnections&& raw_connections) {
+    std::vector<connection_entry_t> entries;
+    entries.reserve(raw_connections.size());
+    for (auto& connection : raw_connections) {
+        connection_entry_t entry;
+        entry.pid = connection.pid;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        entry.protocol = static_cast<std::uint8_t>((std::min)(connection.protocol, static_cast<std::uint32_t>(UINT8_MAX)));
+        entry.state = static_cast<std::uint8_t>((std::min)(connection.state, static_cast<std::uint32_t>(UINT8_MAX)));
+        entry.local_port = static_cast<std::uint16_t>((std::min)(connection.local_port, static_cast<std::uint32_t>(UINT16_MAX)));
+        entry.remote_port = static_cast<std::uint16_t>((std::min)(connection.remote_port, static_cast<std::uint32_t>(UINT16_MAX)));
+        entry.address_family = static_cast<std::uint8_t>((std::min)(connection.address_family, static_cast<std::uint32_t>(UINT8_MAX)));
+#else
+        entry.protocol = connection.protocol;
+        entry.state = connection.state;
+        entry.local_port = connection.local_port;
+        entry.remote_port = connection.remote_port;
+        entry.address_family = connection.address_family;
+#endif
+        std::memcpy(entry.local_addr, connection.local_addr, sizeof(entry.local_addr));
+        std::memcpy(entry.remote_addr, connection.remote_addr, sizeof(entry.remote_addr));
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+static void request_connection_refresh(state_t& state) {
+    bool expected = false;
+    if (!state.conn_refresh_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.conn_refresh_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::uint32_t filter_pid = state.conn_filter_pid;
+    const std::uint8_t filter_protocol = state.conn_filter_protocol;
+    const std::string task_id = register_network_operation(
+        "network.connections.refresh", "Refresh network connections",
+        "view.network.connections", "driver connection table");
+    const bool posted = post_network_task(
+        "connection_refresh", aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, filter_pid, filter_protocol, task_id]() {
+            bool success = false;
+            std::string error;
+            std::vector<connection_entry_t> entries;
+            try {
+                if (!driver_feature_ready("connection_refresh")) {
+                    error = "Driver connection enumeration is unavailable";
+                } else {
+                    auto raw = driver_bridge::enumerate_connections(filter_pid, filter_protocol);
+                    entries = convert_connection_entries(std::move(raw));
+                    success = true;
+                }
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Connection enumeration failed";
+            }
+            if (success && g_state.conn_refresh_serial.load(std::memory_order_acquire) == serial)
+                publish_connection_snapshot(g_state, entries);
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(entries.size()) + " connections published" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (g_state.conn_refresh_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                g_state.conn_refresh_pending.store(false, std::memory_order_release);
+                if (!success)
+                    toast_notification::push(error.empty() ? "Connection refresh failed" : error,
+                        toast_notification::toast_type_t::error);
+            });
+        }, false);
+    if (!posted) {
+        state.conn_refresh_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected connection refresh");
+    }
+}
+
 static void render_connections(state_t& state, float x, float y, float w, float h,
-                                float alpha, float ar, float ag, float ab) {
+                                 float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
     const auto& th = aida::ui::resolved();
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_conn", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = driver_bridge::using_kernel_driver();
+    request_driver_available_snapshot();
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire);
 
     float conn_toolbar_avail = ImGui::GetContentRegionAvail().x;
     bool conn_toolbar_narrow = (conn_toolbar_avail < 560.f);
@@ -1874,45 +2274,20 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         state.conn_cv.notify_all();
     }
     ImGui::SameLine();
-    if (aida::ui::button("Refresh##conn_refresh", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+    const bool refresh_pending = state.conn_refresh_pending.load(std::memory_order_acquire);
+    if (aida::ui::button(refresh_pending ? "Refreshing...##conn_refresh" : "Refresh##conn_refresh",
+                         aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                         ImVec2(0.f, 0.f), refresh_pending)) {
         diag::log_tagged_fmt("network", "connections_refresh_clicked drv_ok=%d filter_pid=%u filter_proto=%u",
             driver_ok ? 1 : 0, state.conn_filter_pid, state.conn_filter_protocol);
-        if (driver_ok) {
-            auto raw = driver_bridge::enumerate_connections(state.conn_filter_pid, state.conn_filter_protocol);
-            size_t n = raw.size();
-            std::lock_guard<std::mutex> lock(state.conn_mutex);
-            state.connections.clear();
-            for (auto& c : raw) {
-                connection_entry_t e;
-                e.pid = c.pid;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-                e.protocol = static_cast<uint8_t>((std::min)(c.protocol, static_cast<uint32_t>(UINT8_MAX)));
-                e.state = static_cast<uint8_t>((std::min)(c.state, static_cast<uint32_t>(UINT8_MAX)));
-                e.local_port = static_cast<uint16_t>((std::min)(c.local_port, static_cast<uint32_t>(UINT16_MAX)));
-                e.remote_port = static_cast<uint16_t>((std::min)(c.remote_port, static_cast<uint32_t>(UINT16_MAX)));
-                e.address_family = static_cast<uint8_t>((std::min)(c.address_family, static_cast<uint32_t>(UINT8_MAX)));
-#else
-                e.protocol = c.protocol;
-                e.state = c.state;
-                e.local_port = c.local_port;
-                e.remote_port = c.remote_port;
-                e.address_family = c.address_family;
-#endif
-                memcpy(e.local_addr, c.local_addr, 16);
-                memcpy(e.remote_addr, c.remote_addr, 16);
-                state.connections.push_back(std::move(e));
-            }
-            diag::log_tagged_fmt("network", "connections_refresh_done count=%zu", n);
-        }
+        if (driver_ok)
+            request_connection_refresh(state);
     }
     if (!driver_ok) ImGui::EndDisabled();
 
     ImGui::SameLine();
-    size_t conn_count = 0;
-    {
-        std::lock_guard<std::mutex> lock(state.conn_mutex);
-        conn_count = state.connections.size();
-    }
+    const auto connections = std::atomic_load_explicit(&state.connection_snapshot, std::memory_order_acquire);
+    const size_t conn_count = connections ? connections->size() : 0;
     char count_buf[32];
     snprintf(count_buf, sizeof(count_buf), "%zu connections", conn_count);
     ImGui::AlignTextToFramePadding();
@@ -1962,13 +2337,12 @@ static void render_connections(state_t& state, float x, float y, float w, float 
     ImGui::BeginChild("##conn_list", ImVec2(w - 4.f, list_h), false,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
-    std::lock_guard<std::mutex> lock(state.conn_mutex);
     ImVec2 list_org = ImGui::GetWindowPos();
     ImVec2 list_sz  = ImGui::GetWindowSize();
     dl->PushClipRect(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y), true);
     int conn_visible_row = 0;
 
-    if (state.connections.empty()) {
+    if (!connections || connections->empty()) {
         dl->PopClipRect();
         ImGui::EndChild();
         ImGui::SetCursorPos(ImVec2(x, ImGui::GetCursorPos().y - list_h));
@@ -1984,25 +2358,43 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         return;
     }
 
-    for (int i = 0; i < static_cast<int>(state.connections.size()); i++) {
-        auto& c = state.connections[static_cast<size_t>(i)];
-
-        if (c.pid == 0 && c.protocol == 0 && c.local_port == 0 && c.remote_port == 0)
-            continue;
+    static std::shared_ptr<const std::vector<connection_entry_t>> filtered_snapshot;
+    static std::string filtered_query;
+    static std::vector<int> filtered_indices;
+    const std::string current_query(state.conn_filter_text);
+    if (filtered_snapshot != connections || filtered_query != current_query) {
+        filtered_snapshot = connections;
+        filtered_query = current_query;
+        filtered_indices.clear();
+        filtered_indices.reserve(connections->size());
+        for (int i = 0; i < static_cast<int>(connections->size()); ++i) {
+            const auto& connection = (*connections)[static_cast<std::size_t>(i)];
+            if (connection.pid == 0 && connection.protocol == 0 && connection.local_port == 0 && connection.remote_port == 0)
+                continue;
+            if (!current_query.empty()) {
+                const std::string local = format_ip(connection.local_addr, connection.address_family) + ":" + std::to_string(connection.local_port);
+                const std::string remote = format_ip(connection.remote_addr, connection.address_family) + ":" + std::to_string(connection.remote_port);
+                const std::string searchable = std::to_string(connection.pid) + " " + protocol_name(connection.protocol) + " " +
+                    tcp_state_name(connection.state) + " " + local + " " + remote;
+                if (!filter_text_match(current_query.c_str(), searchable))
+                    continue;
+            }
+            filtered_indices.push_back(i);
+        }
+    }
+    ImGuiListClipper connection_clipper;
+    connection_clipper.Begin(static_cast<int>(filtered_indices.size()), row_h);
+    while (connection_clipper.Step()) {
+    for (int visible_index = connection_clipper.DisplayStart; visible_index < connection_clipper.DisplayEnd; ++visible_index) {
+        const int i = filtered_indices[static_cast<std::size_t>(visible_index)];
+        const auto& c = (*connections)[static_cast<size_t>(i)];
 
         std::string local_str = format_ip(c.local_addr, c.address_family) + ":" + std::to_string(c.local_port);
         std::string remote_str = format_ip(c.remote_addr, c.address_family) + ":" + std::to_string(c.remote_port);
 
-
-        if (state.conn_filter_text[0]) {
-            std::string all = std::to_string(c.pid) + " " + protocol_name(c.protocol) + " " +
-                tcp_state_name(c.state) + " " + local_str + " " + remote_str;
-            if (!filter_text_match(state.conn_filter_text, all)) continue;
-        }
-
         float row_alpha = 1.f;
         float row_xoff = 0.f;
-        compute_row_entrance(s_conn_rows, state.connections.size(), row_alpha, row_xoff, i);
+        compute_row_entrance(s_conn_rows, filtered_indices.size(), row_alpha, row_xoff, visible_index);
         float r_alpha = alpha * row_alpha;
 
         float ry = ImGui::GetCursorPosY();
@@ -2073,6 +2465,7 @@ static void render_connections(state_t& state, float x, float y, float w, float 
         conn_visible_row++;
         ImGui::SetCursorPosY(ry + row_h);
     }
+    }
 
     ImGui::Dummy(ImVec2(0.f, 0.f));
     dl->PopClipRect();
@@ -2091,7 +2484,8 @@ static void request_capture_start(state_t& state) {
     uint32_t filter_pid = state.cap_filter_pid;
     uint32_t filter_port = static_cast<uint32_t>(state.cap_filter_port);
     uint32_t filter_protocol = state.cap_filter_protocol;
-    bool driver_ok = driver_feature_ready("start_capture");
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire) &&
+        standalone_license::is_valid();
     if (!driver_ok) {
         set_capture_control_status("Capture unavailable until AiDA is authorized");
         state.cap_start_pending.store(false, std::memory_order_release);
@@ -2190,16 +2584,15 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_cap", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = driver_feature_ready("bandwidth");
+    request_driver_available_snapshot();
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire) &&
+        standalone_license::is_valid();
     bool cap_running = state.cap_running.load(std::memory_order_acquire);
     bool cap_start_pending = state.cap_start_pending.load(std::memory_order_acquire);
     bool cap_stop_pending = state.cap_stop_pending.load(std::memory_order_acquire);
 
-    size_t pkt_count = 0;
-    {
-        std::lock_guard<std::mutex> lock(state.cap_mutex);
-        pkt_count = state.captured_packets.size();
-    }
+    const auto packet_snapshot = std::atomic_load_explicit(&state.capture_snapshot, std::memory_order_acquire);
+    const size_t pkt_count = packet_snapshot ? packet_snapshot->size() : 0;
     float live_rate = capture_rate_tick(pkt_count);
 
 
@@ -2261,7 +2654,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         if (aida::ui::button("Start Capture", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
             diag::log_tagged_fmt("network", "start_capture_clicked filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d",
                 state.cap_filter_pid, state.cap_filter_port, state.cap_filter_protocol,
-                driver_bridge::using_kernel_driver() ? 1 : 0);
+                driver_ok ? 1 : 0);
             request_capture_start(state);
         }
     } else {
@@ -2333,6 +2726,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
         size_t prev = state.captured_packets.size();
         state.captured_packets.clear();
         state.cap_selected = -1;
+        publish_capture_snapshot_locked(state);
         diag::log_tagged_fmt("network", "capture_cleared prev_packet_count=%zu", prev);
     }
 
@@ -2374,7 +2768,7 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     float detail_h = h - split_y - 30.f;
 
 
-    capture_table_snapshot_t cap_snapshot = snapshot_capture_table(state, state.cap_filter_text);
+    capture_table_snapshot_t& cap_snapshot = snapshot_capture_table(state, state.cap_filter_text);
 
     ImGui::BeginChild("##cap_list", ImVec2(w - 4.f, list_h), false,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
@@ -2466,7 +2860,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, transparent);
                     ImGui::PushStyleColor(ImGuiCol_HeaderActive, transparent);
                     float row_h = ImGui::GetTextLineHeight() + ImGui::GetStyle().CellPadding.y * 2.f;
-                    bool open_context = false;
                     if (ImGui::Selectable("##row_select", selected, sel_flags, ImVec2(0.f, row_h))) {
                         pending_selection = row.packet_index;
                         cap_snapshot.selected_index = row.packet_index;
@@ -2477,8 +2870,10 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                         s_capture_context.packet_index = row.packet_index;
                         s_capture_context.timestamp = row.timestamp;
+                        s_capture_context.open_requested = true;
+                        s_capture_context.origin =
+                            aida::ui::context_menu_open_origin_t::pointer;
                         pending_selection = row.packet_index;
-                        open_context = true;
                     }
                     bool hovered = ImGui::IsItemHovered();
                     ImGui::PopStyleColor(3);
@@ -2529,8 +2924,6 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                     table_text(row.summary, info_col);
 
                     ImGui::PopID();
-                    if (open_context)
-                        ImGui::OpenPopupEx(ImHashStr("aida.network.capture.context"));
                 }
             }
 
@@ -2547,10 +2940,13 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             ImGui::EndTable();
         }
 
-        if (cap_snapshot.selected_index >= 0 &&
+        const bool capture_menu_key = cap_snapshot.selected_index >= 0 &&
             ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
-            (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-             (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool capture_shift_f10 = !capture_menu_key && cap_snapshot.selected_index >= 0 &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        if (capture_menu_key || capture_shift_f10) {
             const auto selected_row = std::find_if(cap_snapshot.rows.begin(), cap_snapshot.rows.end(),
                 [&](const capture_row_snapshot_t& row) {
                     return row.packet_index == cap_snapshot.selected_index;
@@ -2558,40 +2954,82 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             if (selected_row != cap_snapshot.rows.end()) {
                 s_capture_context.packet_index = selected_row->packet_index;
                 s_capture_context.timestamp = selected_row->timestamp;
-                ImGui::OpenPopupEx(ImHashStr("aida.network.capture.context"));
+                s_capture_context.open_requested = true;
+                s_capture_context.origin = capture_menu_key
+                    ? aida::ui::context_menu_open_origin_t::menu_key
+                    : aida::ui::context_menu_open_origin_t::shift_f10;
             }
         }
 
-        if (ImGui::BeginPopupEx(ImHashStr("aida.network.capture.context"), ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (s_capture_context.open_requested) {
+            s_capture_context.open_requested = false;
             packet_entry_t packet;
             bool current = false;
-            {
-                std::lock_guard<std::mutex> lock(state.cap_mutex);
-                if (s_capture_context.packet_index >= 0 &&
-                    s_capture_context.packet_index < static_cast<int>(state.captured_packets.size())) {
-                    const auto& candidate = state.captured_packets[static_cast<size_t>(s_capture_context.packet_index)];
-                    if (candidate.timestamp == s_capture_context.timestamp) {
-                        packet = candidate;
-                        current = true;
-                    }
+            const auto current_packets = std::atomic_load_explicit(&state.capture_snapshot, std::memory_order_acquire);
+            if (current_packets && s_capture_context.packet_index >= 0 &&
+                s_capture_context.packet_index < static_cast<int>(current_packets->size())) {
+                const auto& candidate = (*current_packets)[static_cast<size_t>(s_capture_context.packet_index)];
+                if (candidate.timestamp == s_capture_context.timestamp) {
+                    packet = candidate;
+                    current = true;
                 }
             }
-            if (!current) {
-                menu_item_disabled("Captured packet is stale", "The bounded capture buffer advanced; reopen the menu on a current packet");
-            } else {
+            if (current) {
                 const std::string src = format_ip(packet.src_addr, 2) + ":" + std::to_string(packet.src_port);
                 const std::string dst = format_ip(packet.dst_addr, 2) + ":" + std::to_string(packet.dst_port);
-                if (ImGui::MenuItem("Copy Summary"))
-                    ImGui::SetClipboardText(packet.summary.c_str());
-                if (ImGui::MenuItem("Copy Source Endpoint"))
+                aida::ui::application_ui::retained_entity_context_t context;
+                context.owner_id = "network.capture.packet";
+                context.entity_id = std::to_string(packet.timestamp) + ":" +
+                    std::to_string(s_capture_context.packet_index);
+                context.entity_generation = packet.timestamp;
+                context.active_view = aida::ui::stable_view_id_t("view.network.capture");
+                const auto retained_index = s_capture_context.packet_index;
+                const auto retained_timestamp = packet.timestamp;
+                const auto retained_size = packet.payload.size();
+                context.validate_identity = [&state, retained_index, retained_timestamp, retained_size] {
+                    const auto live = std::atomic_load_explicit(
+                        &state.capture_snapshot, std::memory_order_acquire);
+                    if (!live || retained_index < 0 ||
+                        retained_index >= static_cast<int>(live->size()))
+                        return aida::ui::capability_state_t::unavailable(
+                            "The bounded capture buffer advanced; select a current packet");
+                    const auto& candidate = (*live)[static_cast<std::size_t>(retained_index)];
+                    return candidate.timestamp == retained_timestamp &&
+                            candidate.payload.size() == retained_size
+                        ? aida::ui::capability_state_t::available()
+                        : aida::ui::capability_state_t::unavailable(
+                            "The captured packet was replaced; select it again");
+                };
+                const auto add = [&context](const char* id, bool enabled, const char* reason,
+                        std::function<aida::ui::action_handler_result_t()> invoke) {
+                    aida::ui::application_ui::retained_entity_action_t action;
+                    action.action_id = id;
+                    action.capability = enabled
+                        ? aida::ui::capability_state_t::available()
+                        : aida::ui::capability_state_t::unavailable(reason);
+                    action.invoke = std::move(invoke);
+                    context.actions.push_back(std::move(action));
+                };
+                const auto summary = packet.summary;
+                add("network.capture.copy_summary", !summary.empty(),
+                    "The captured packet has no summary", [summary] {
+                    ImGui::SetClipboardText(summary.c_str());
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                add("network.capture.copy_source", true, "", [src] {
                     ImGui::SetClipboardText(src.c_str());
-                if (ImGui::MenuItem("Copy Destination Endpoint"))
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                add("network.capture.copy_destination", true, "", [dst] {
                     ImGui::SetClipboardText(dst.c_str());
-                if (ImGui::MenuItem("Copy Payload")) {
-                    const std::string payload = payload_display_text(packet.payload, 262144);
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                const std::string payload = payload_display_text(packet.payload, 262144);
+                add("network.capture.copy_payload", !packet.payload.empty(),
+                    "The captured packet has no payload", [payload] {
                     ImGui::SetClipboardText(payload.c_str());
-                }
-                ImGui::Separator();
+                    return aida::ui::action_handler_result_t::completed();
+                });
                 artifact_identity_t packet_identity;
                 packet_identity.kind = artifact_kind_t::packet;
                 packet_identity.id = "network.packet." + std::to_string(packet.timestamp) + "." +
@@ -2602,33 +3040,60 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
                 packet_identity.content_size = packet.payload.size();
                 packet_identity.content_hash = artifact_hash(packet.payload);
                 packet_identity.label = packet.protocol_label + " packet";
-                std::string handoff_reason;
-                if (ImGui::MenuItem("Send Payload to Comparer"))
-                    (void)send_artifact_to_comparer(packet_identity, handoff_reason);
-                if (ImGui::MenuItem("Add Payload to AI Chat"))
-                    (void)add_artifact_to_chat(packet_identity, handoff_reason);
-                if (ImGui::MenuItem("Assign Payload to Agent"))
-                    (void)assign_artifact_to_agent(packet_identity, handoff_reason);
-                ImGui::Separator();
-                if (ImGui::MenuItem("Filter by PID"))
-                    state.cap_filter_pid = packet.pid;
-                if (ImGui::MenuItem("Filter by Protocol"))
-                    state.cap_filter_protocol = packet.protocol;
-                if (ImGui::MenuItem(state.cap_auto_scroll ? "Disable Follow Tail" : "Enable Follow Tail"))
+                add("network.capture.send_comparer", !packet.payload.empty(),
+                    "The captured packet has no payload", [packet_identity] {
+                    std::string reason;
+                    return send_artifact_to_comparer(packet_identity, reason)
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(reason);
+                });
+                add("network.capture.send_chat", !packet.payload.empty(),
+                    "The captured packet has no payload", [packet_identity] {
+                    std::string reason;
+                    return add_artifact_to_chat(packet_identity, reason)
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(reason);
+                });
+                add("network.capture.assign_agent", !packet.payload.empty(),
+                    "The captured packet has no payload", [packet_identity] {
+                    std::string reason;
+                    return assign_artifact_to_agent(packet_identity, reason)
+                        ? aida::ui::action_handler_result_t::completed()
+                        : aida::ui::action_handler_result_t::failed(reason);
+                });
+                add("network.capture.filter_pid", packet.pid != 0,
+                    "The captured packet has no process identity", [&state, pid = packet.pid] {
+                    state.cap_filter_pid = pid;
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                add("network.capture.filter_protocol", packet.protocol != 0,
+                    "The captured packet has no protocol discriminator",
+                    [&state, protocol = packet.protocol] {
+                    state.cap_filter_protocol = protocol;
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                add("network.capture.toggle_follow", true, "", [&state] {
                     state.cap_auto_scroll = !state.cap_auto_scroll;
-                ImGui::Separator();
-                menu_item_disabled("Send to Repeater", "A raw driver packet is not necessarily a complete HTTP request; use Proxy history for safe request reconstruction");
-                menu_item_disabled("Replay Packet", "Raw packet replay has no capability-backed human handler in this view");
+                    return aida::ui::action_handler_result_t::completed();
+                });
+                add("network.capture.send_repeater", false,
+                    "A raw driver packet is not necessarily a complete HTTP request; use Proxy history for safe request reconstruction", {});
+                add("network.capture.replay", false,
+                    "Raw packet replay has no capability-backed human handler in this view", {});
+                aida::ui::application_ui::open_retained_entity_context_menu(
+                    std::move(context), s_capture_context.origin);
             }
-            ImGui::EndPopup();
         }
+        aida::ui::application_ui::render_retained_entity_context_menu(
+            "network.capture.packet");
 
         if (pending_selection >= 0) {
-            std::lock_guard<std::mutex> lock(state.cap_mutex);
-            if (pending_selection < static_cast<int>(state.captured_packets.size()))
+            const auto current_packets = std::atomic_load_explicit(&state.capture_snapshot, std::memory_order_acquire);
+            if (current_packets && pending_selection < static_cast<int>(current_packets->size()))
                 state.cap_selected = pending_selection;
             else
-                clamp_capture_selection_to_buffer_locked(state);
+                state.cap_selected = current_packets && !current_packets->empty()
+                    ? static_cast<int>(current_packets->size()) - 1 : -1;
         }
 
         ImGui::PopStyleColor(3);
@@ -2651,13 +3116,17 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
     if (detail_h > 30.f) {
         ImGui::BeginChild("##cap_detail", ImVec2(w - 4.f, detail_h), false, ImGuiWindowFlags_NoBackground);
 
-        std::lock_guard<std::mutex> lock2(state.cap_mutex);
-        clamp_capture_selection_to_buffer_locked(state);
-        if (state.cap_selected >= 0 && state.cap_selected < static_cast<int>(state.captured_packets.size())) {
-            auto& p = state.captured_packets[static_cast<size_t>(state.cap_selected)];
+        const auto detail_packets = std::atomic_load_explicit(&state.capture_snapshot, std::memory_order_acquire);
+        int selected_packet = state.cap_selected.load(std::memory_order_acquire);
+        if (detail_packets && selected_packet >= static_cast<int>(detail_packets->size())) {
+            selected_packet = detail_packets->empty() ? -1 : static_cast<int>(detail_packets->size()) - 1;
+            state.cap_selected.store(selected_packet, std::memory_order_release);
+        }
+        if (detail_packets && selected_packet >= 0 && selected_packet < static_cast<int>(detail_packets->size())) {
+            const auto& p = (*detail_packets)[static_cast<size_t>(selected_packet)];
 
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
-                               "Packet #%d  -  %s", state.cap_selected + 1, p.protocol_label.c_str());
+                               "Packet #%d  -  %s", selected_packet + 1, p.protocol_label.c_str());
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
                 "%s:%u -> %s:%u  -  PID: %u  -  %u bytes  -  %s",
                 format_ip(p.src_addr, 2).c_str(), static_cast<unsigned>(p.src_port),
@@ -2729,6 +3198,90 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
 }
 
 
+template <typename RawDns>
+static std::size_t merge_dns_entries(state_t& state, RawDns&& raw_dns) {
+    std::size_t added = 0;
+    std::lock_guard<std::mutex> lock(state.dns_mutex);
+    for (auto& query : raw_dns) {
+        bool duplicate = false;
+        const auto recent_count = static_cast<std::ptrdiff_t>((std::min)(
+            static_cast<std::size_t>(256), state.dns_entries.size()));
+        for (auto it = state.dns_entries.rbegin();
+             it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + recent_count; ++it) {
+            if (it->timestamp == query.timestamp && it->domain == query.domain && it->pid == query.pid) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+        dns_entry_t entry;
+        entry.timestamp = query.timestamp;
+        entry.pid = query.pid;
+        entry.query_type = static_cast<std::uint16_t>(query.query_type);
+        entry.domain = query.domain;
+        entry.resolved_addr = format_ip(query.resolved_addr, 2);
+        entry.response_code = query.response_code;
+        entry.ttl = query.ttl;
+        state.dns_entries.push_back(std::move(entry));
+        ++added;
+    }
+    while (state.dns_entries.size() > state.dns_max_entries)
+        state.dns_entries.pop_front();
+    publish_dns_snapshot_locked(state);
+    return added;
+}
+
+static void request_dns_refresh(state_t& state) {
+    bool expected = false;
+    if (!state.dns_refresh_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.dns_refresh_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::uint32_t filter_pid = state.dns_filter_pid;
+    const std::string task_id = register_network_operation(
+        "network.dns.refresh", "Refresh DNS observations", "view.network.dns",
+        filter_pid == 0 ? "all processes" : "PID " + std::to_string(filter_pid));
+    const bool posted = post_network_task(
+        "dns_refresh", aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, filter_pid, task_id]() {
+            bool success = false;
+            std::size_t raw_count = 0;
+            std::size_t added = 0;
+            std::string error;
+            try {
+                if (!driver_feature_ready("dns_refresh")) {
+                    error = "Driver DNS observations are unavailable";
+                } else {
+                    auto raw = driver_bridge::get_dns_queries(filter_pid);
+                    raw_count = raw.size();
+                    if (g_state.dns_refresh_serial.load(std::memory_order_acquire) == serial)
+                        added = merge_dns_entries(g_state, std::move(raw));
+                    success = g_state.dns_refresh_serial.load(std::memory_order_acquire) == serial;
+                    if (!success)
+                        error = "DNS refresh was superseded";
+                }
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "DNS refresh failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(added) + " new of " + std::to_string(raw_count) + " observations" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (g_state.dns_refresh_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                g_state.dns_refresh_pending.store(false, std::memory_order_release);
+                if (!success)
+                    toast_notification::push(error.empty() ? "DNS refresh failed" : error,
+                        toast_notification::toast_type_t::error);
+            });
+        }, false);
+    if (!posted) {
+        state.dns_refresh_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected DNS refresh");
+    }
+}
+
 static void render_dns(state_t& state, float x, float y, float w, float h,
                         float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
@@ -2736,7 +3289,8 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_dns", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = driver_bridge::using_kernel_driver();
+    request_driver_available_snapshot();
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire);
 
     if (!driver_ok) ImGui::BeginDisabled();
 
@@ -2754,43 +3308,14 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         }
     }
     ImGui::SameLine();
-    if (aida::ui::button("Refresh", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+    const bool refresh_pending = state.dns_refresh_pending.load(std::memory_order_acquire);
+    if (aida::ui::button(refresh_pending ? "Refreshing...##dns_refresh" : "Refresh##dns_refresh",
+                         aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                         ImVec2(0.f, 0.f), refresh_pending)) {
         diag::log_tagged_fmt("network", "dns_refresh_clicked drv_ok=%d filter_pid=%u",
             driver_ok ? 1 : 0, state.dns_filter_pid);
-        if (driver_ok) {
-            auto raw = driver_bridge::get_dns_queries(state.dns_filter_pid);
-            size_t added = 0;
-            std::lock_guard<std::mutex> lock(state.dns_mutex);
-            for (auto& d : raw) {
-                bool duplicate = false;
-                const auto recent_count = static_cast<std::ptrdiff_t>((std::min)(
-                    static_cast<std::size_t>(256), state.dns_entries.size()));
-                for (auto it = state.dns_entries.rbegin();
-                     it != state.dns_entries.rend() && it != state.dns_entries.rbegin() + recent_count;
-                     ++it) {
-                    if (it->timestamp == d.timestamp && it->domain == d.domain && it->pid == d.pid) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (!duplicate) {
-                    dns_entry_t e;
-                    e.timestamp = d.timestamp;
-                    e.pid = d.pid;
-                    e.query_type = static_cast<uint16_t>(d.query_type);
-                    e.domain = d.domain;
-                    e.resolved_addr = format_ip(d.resolved_addr, 2);
-                    e.response_code = d.response_code;
-                    e.ttl = d.ttl;
-                    state.dns_entries.push_back(std::move(e));
-                    ++added;
-                }
-            }
-            while (state.dns_entries.size() > state.dns_max_entries)
-                state.dns_entries.pop_front();
-            diag::log_tagged_fmt("network", "dns_refresh_done raw=%zu added=%zu total=%zu",
-                raw.size(), added, state.dns_entries.size());
-        }
+        if (driver_ok)
+            request_dns_refresh(state);
     }
 
     if (!driver_ok) ImGui::EndDisabled();
@@ -2834,12 +3359,12 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
     float list_h = h - (cursor.y + row_h + 12.f);
     ImGui::BeginChild("##dns_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
 
-    std::lock_guard<std::mutex> lock(state.dns_mutex);
+    const auto dns_entries = std::atomic_load_explicit(&state.dns_snapshot, std::memory_order_acquire);
     ImVec2 list_org = ImGui::GetWindowPos();
     ImVec2 dns_list_sz = ImGui::GetWindowSize();
     dl->PushClipRect(list_org, ImVec2(list_org.x + dns_list_sz.x, list_org.y + dns_list_sz.y), true);
 
-    if (state.dns_entries.empty()) {
+    if (!dns_entries || dns_entries->empty()) {
         dl->PopClipRect();
         ImGui::EndChild();
         aida::ui::empty_state::config_t cfg;
@@ -2853,39 +3378,42 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         return;
     }
 
-    int total_visible_rows = 0;
-    for (int i = 0; i < static_cast<int>(state.dns_entries.size()); i++) {
-        auto& d = state.dns_entries[static_cast<size_t>(i)];
-        if (state.dns_filter_text[0]) {
-            std::string all = d.domain + " " + d.resolved_addr + " " + std::to_string(d.pid);
-            if (!filter_text_match(state.dns_filter_text, all)) continue;
+    static std::shared_ptr<const std::vector<dns_entry_t>> filtered_snapshot;
+    static std::string filtered_query;
+    static std::vector<int> filtered_indices;
+    const std::string current_query(state.dns_filter_text);
+    if (filtered_snapshot != dns_entries || filtered_query != current_query) {
+        filtered_snapshot = dns_entries;
+        filtered_query = current_query;
+        filtered_indices.clear();
+        filtered_indices.reserve(dns_entries->size());
+        for (int i = 0; i < static_cast<int>(dns_entries->size()); ++i) {
+            const auto& entry = (*dns_entries)[static_cast<std::size_t>(i)];
+            if (!current_query.empty()) {
+                const std::string searchable = entry.domain + " " + entry.resolved_addr + " " + std::to_string(entry.pid);
+                if (!filter_text_match(current_query.c_str(), searchable))
+                    continue;
+            }
+            filtered_indices.push_back(i);
         }
-        total_visible_rows++;
     }
+    const int total_visible_rows = static_cast<int>(filtered_indices.size());
 
     float scroll_y = ImGui::GetScrollY();
     float viewport_top = scroll_y;
     float viewport_bot = scroll_y + dns_list_sz.y;
 
-    int dns_visible_row = 0;
-    for (int i = 0; i < static_cast<int>(state.dns_entries.size()); i++) {
-        auto& d = state.dns_entries[static_cast<size_t>(i)];
-
-        if (state.dns_filter_text[0]) {
-            std::string all = d.domain + " " + d.resolved_addr + " " + std::to_string(d.pid);
-            if (!filter_text_match(state.dns_filter_text, all)) continue;
-        }
-
+    const int first_visible = (std::max)(0, static_cast<int>(viewport_top / row_h) - 1);
+    const int last_visible = (std::min)(total_visible_rows,
+        static_cast<int>(viewport_bot / row_h) + 2);
+    for (int dns_visible_row = first_visible; dns_visible_row < last_visible; ++dns_visible_row) {
+        const int i = filtered_indices[static_cast<std::size_t>(dns_visible_row)];
+        const auto& d = (*dns_entries)[static_cast<size_t>(i)];
         float ry = static_cast<float>(dns_visible_row) * row_h;
-
-        if (ry + row_h < viewport_top || ry > viewport_bot) {
-            dns_visible_row++;
-            continue;
-        }
 
         float row_alpha = 1.f;
         float row_yoff = 0.f;
-        compute_row_entrance(s_dns_rows, state.dns_entries.size(), row_alpha, row_yoff, i);
+        compute_row_entrance(s_dns_rows, filtered_indices.size(), row_alpha, row_yoff, dns_visible_row);
         float r_alpha = alpha * row_alpha;
 
         float abs_ry = list_org.y + ry - scroll_y;
@@ -2939,7 +3467,6 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
         snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(d.ttl));
         dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_dim, r_alpha), buf);
 
-        dns_visible_row++;
     }
 
     dl->PopClipRect();
@@ -2949,6 +3476,373 @@ static void render_dns(state_t& state, float x, float y, float w, float h,
 }
 
 
+struct proxy_runtime_snapshot_t {
+    mitm_proxy::proxy_stats stats;
+    std::vector<mitm_proxy::http_exchange> history;
+    bool ca_ready = false;
+    bool ca_installed = false;
+    std::string spki_prefix;
+    bool controlled_browser_running = false;
+    bool bypass_active = false;
+    std::size_t bypass_count = 0;
+};
+
+static std::shared_ptr<const proxy_runtime_snapshot_t> s_proxy_runtime_snapshot;
+static std::atomic<bool> s_proxy_snapshot_pending{false};
+static std::atomic<std::uint64_t> s_proxy_snapshot_requested_ms{0};
+static std::atomic<bool> s_proxy_operation_pending{false};
+static std::atomic<std::uint64_t> s_proxy_operation_serial{0};
+static std::size_t s_bypass_review_count = 0;
+
+static void request_proxy_runtime_snapshot(bool force = false) {
+    const std::uint64_t now = network_now_ms();
+    const std::uint64_t last = s_proxy_snapshot_requested_ms.load(std::memory_order_acquire);
+    if (!force && last != 0 && now >= last && now - last < 350)
+        return;
+    bool expected = false;
+    if (!s_proxy_snapshot_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    s_proxy_snapshot_requested_ms.store(now, std::memory_order_release);
+    const bool posted = post_network_task(
+        "proxy_snapshot", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        []() {
+            try {
+                auto snapshot = std::make_shared<proxy_runtime_snapshot_t>();
+                snapshot->stats = mitm_proxy::get_stats();
+                snapshot->history = mitm_proxy::get_history(4096);
+                snapshot->ca_ready = cert_generator::is_ready();
+                if (snapshot->ca_ready) {
+                    const auto& root = cert_generator::get_root_ca();
+                    snapshot->ca_installed = cert_generator::is_root_ca_installed(root);
+                    snapshot->spki_prefix = aida::burp::browser::spki_hash_prefix(
+                        cert_generator::spki_sha256_base64(root));
+                }
+                const auto browsers = aida::burp::browser::list_running();
+                snapshot->controlled_browser_running = std::any_of(browsers.begin(), browsers.end(),
+                    [](const auto& browser) { return browser.running; });
+                snapshot->bypass_active = cert_pin_bypass::is_bypass_active();
+                if (snapshot->bypass_active)
+                    snapshot->bypass_count = cert_pin_bypass::get_active_bypasses().size();
+                std::atomic_store_explicit(&s_proxy_runtime_snapshot,
+                    std::shared_ptr<const proxy_runtime_snapshot_t>(std::move(snapshot)),
+                    std::memory_order_release);
+            } catch (...) {
+            }
+            s_proxy_snapshot_pending.store(false, std::memory_order_release);
+        }, false);
+    if (!posted)
+        s_proxy_snapshot_pending.store(false, std::memory_order_release);
+}
+
+static void request_proxy_control(state_t& state, bool start) {
+    bool expected = false;
+    if (!s_proxy_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = s_proxy_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    mitm_proxy::proxy_config config;
+    config.bind_addr = state.proxy_bind_addr;
+    config.bind_port = static_cast<std::uint16_t>((std::max)(1, (std::min)(state.proxy_port, 65535)));
+    config.decode_tls = state.proxy_decode_tls;
+    const std::string target = config.bind_addr + ":" + std::to_string(config.bind_port) +
+        (config.decode_tls ? " TLS interception" : " plaintext only");
+    const std::string task_id = register_network_operation(
+        start ? "network.proxy.start" : "network.proxy.stop",
+        start ? "Start interception proxy" : "Stop interception proxy",
+        "view.network.proxy", target);
+    const bool posted = post_network_task(
+        start ? "proxy_start" : "proxy_stop",
+        start ? aida::infra::executor::domain_t::long_running
+              : aida::infra::executor::domain_t::feature_worker,
+        start ? "long_running" : "bounded_task",
+        [serial, start, config = std::move(config), task_id]() {
+            bool success = true;
+            std::string error;
+            try {
+                if (start)
+                    success = mitm_proxy::start(config);
+                else
+                    mitm_proxy::stop();
+                if (success != mitm_proxy::is_running()) {
+                    if (!start && !mitm_proxy::is_running())
+                        success = true;
+                    else if (start)
+                        success = false;
+                }
+                if (!success)
+                    error = start ? "Proxy did not enter the running state" : "Proxy did not stop";
+            } catch (const std::exception& exception) {
+                success = false;
+                error = exception.what();
+            } catch (...) {
+                success = false;
+                error = start ? "Proxy start failed" : "Proxy stop failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? (start ? "Proxy is running" : "Proxy is stopped") : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (s_proxy_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (!success)
+                    toast_notification::push(error.empty() ? "Proxy control failed" : error,
+                        toast_notification::toast_type_t::error);
+                s_proxy_operation_pending.store(false, std::memory_order_release);
+                request_proxy_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        s_proxy_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected proxy control");
+    }
+}
+
+static void request_proxy_history_clear(std::size_t reviewed_count) {
+    bool expected = false;
+    if (!s_proxy_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = s_proxy_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.proxy.history.clear", "Clear proxy history", "view.network.proxy",
+        std::to_string(reviewed_count) + " reviewed exchanges");
+    const bool posted = post_network_task(
+        "proxy_history_clear", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, reviewed_count, task_id]() {
+            bool success = true;
+            std::string error;
+            try {
+                mitm_proxy::clear_history();
+                success = mitm_proxy::history_count() == 0;
+                if (!success)
+                    error = "Proxy history remained non-empty after clear";
+            } catch (const std::exception& exception) {
+                success = false;
+                error = exception.what();
+            } catch (...) {
+                success = false;
+                error = "Proxy history clear failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(reviewed_count) + " exchanges cleared" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (s_proxy_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (!success)
+                    toast_notification::push(error.empty() ? "Proxy history clear failed" : error,
+                        toast_notification::toast_type_t::error);
+                s_proxy_operation_pending.store(false, std::memory_order_release);
+                request_proxy_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        s_proxy_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected proxy history clear");
+    }
+}
+
+static void request_ca_trust_repair() {
+    bool expected = false;
+    if (!s_proxy_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = s_proxy_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.proxy.ca.repair", "Repair AiDA interception CA trust", "view.network.proxy",
+        "current user trust store");
+    const bool posted = post_network_task(
+        "proxy_ca_repair", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+                success = cert_generator::initialize();
+                if (success && cert_generator::is_ready())
+                    success = cert_generator::install_root_ca(cert_generator::get_root_ca());
+                if (!success)
+                    error = "AiDA CA trust repair failed";
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "AiDA CA trust repair failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? "AiDA CA is installed in the current user trust store" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (s_proxy_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                toast_notification::push(success ? "AiDA CA trust repaired."
+                    : (error.empty() ? "AiDA CA trust repair failed." : error),
+                    success ? toast_notification::toast_type_t::success : toast_notification::toast_type_t::error);
+                s_proxy_operation_pending.store(false, std::memory_order_release);
+                request_proxy_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        s_proxy_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected CA trust repair");
+    }
+}
+
+static void request_legacy_bypass_revert(std::size_t reviewed_count) {
+    bool expected = false;
+    if (!s_proxy_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = s_proxy_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.proxy.legacy_bypass.revert", "Revert legacy certificate bypass patches",
+        "view.network.proxy", std::to_string(reviewed_count) + " live patches");
+    const bool posted = post_network_task(
+        "proxy_legacy_bypass_revert", aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, reviewed_count, task_id]() {
+            bool success = false;
+            int reverted = 0;
+            std::string error;
+            try {
+                reverted = cert_pin_bypass::revert_all_bypasses();
+                success = reverted >= 0 && !cert_pin_bypass::is_bypass_active();
+                if (!success)
+                    error = "One or more legacy certificate patches remain active";
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Legacy certificate patch reversion failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(reverted) + " of " + std::to_string(reviewed_count) + " patches reverted" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (s_proxy_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (!success)
+                    toast_notification::push(error.empty() ? "Legacy certificate patch reversion failed" : error,
+                        toast_notification::toast_type_t::error);
+                s_proxy_operation_pending.store(false, std::memory_order_release);
+                request_proxy_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        s_proxy_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected legacy bypass reversion");
+    }
+}
+
+static void request_certificate_diagnostics(std::uint32_t target_pid,
+                                            cert_intercept::diagnostic_context_t context) {
+    bool expected = false;
+    if (!s_cert_diagnostics_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = s_cert_diagnostics_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.proxy.certificate_diagnostics", "Diagnose target TLS interception",
+        "view.network.proxy", "PID " + std::to_string(target_pid));
+    const bool posted = post_network_task(
+        "proxy_certificate_diagnostics", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, target_pid, context = std::move(context), task_id]() mutable {
+            bool success = false;
+            cert_intercept::process_diagnostics_t report;
+            std::vector<cert_intercept::provider_status_t> providers;
+            std::string error;
+            try {
+                cert_diag_apply_proxy_observations(context);
+                report = cert_intercept::diagnose_process(target_pid, context);
+                providers = cert_intercept::provider_registry_t::instance().evaluate(target_pid, report);
+                success = true;
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Target TLS diagnostics failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? cert_intercept::to_string(report.primary) + " - " + report.summary : error);
+            enqueue_ui_completion([serial, success, report = std::move(report),
+                                   providers = std::move(providers), error = std::move(error)]() mutable {
+                if (s_cert_diagnostics_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (success) {
+                    s_cert_diag_ui.report = std::move(report);
+                    s_cert_diag_ui.providers = std::move(providers);
+                    s_cert_diag_ui.has_report = true;
+                    s_cert_diag_ui.status = cert_intercept::to_string(s_cert_diag_ui.report.primary) +
+                        " - " + s_cert_diag_ui.report.summary;
+                    s_cert_diag_ui.handoff_status.clear();
+                } else {
+                    s_cert_diag_ui.has_report = false;
+                    s_cert_diag_ui.providers.clear();
+                    s_cert_diag_ui.status = error.empty() ? "Target TLS diagnostics failed" : error;
+                }
+                s_cert_diagnostics_pending.store(false, std::memory_order_release);
+            });
+        }, false);
+    if (!posted) {
+        s_cert_diagnostics_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected target TLS diagnostics");
+        s_cert_diag_ui.status = "Executor rejected target TLS diagnostics";
+    }
+}
+
+static void request_certificate_handoff(cert_intercept::process_diagnostics_t report,
+                                        std::vector<cert_intercept::provider_status_t> providers,
+                                        std::string proxy_endpoint) {
+    bool expected = false;
+    if (!s_cert_handoff_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = s_cert_handoff_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string target_label = report.process_name.empty() ? "target" : report.process_name;
+    const std::string task_id = register_network_operation(
+        "network.proxy.certificate_handoff", "Generate TLS interception handoff",
+        "view.network.proxy", target_label);
+    const bool posted = post_network_task(
+        "proxy_certificate_handoff", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, report = std::move(report), providers = std::move(providers),
+         proxy_endpoint = std::move(proxy_endpoint), target_label, task_id]() mutable {
+            bool success = false;
+            std::string status;
+            try {
+                cert_intercept::profiles::public_ca_export_t exported;
+                if (cert_generator::initialize() && cert_generator::is_ready())
+                    exported = cert_intercept::profiles::export_public_ca_files(cert_generator::get_root_ca());
+                if (!exported.ok) {
+                    status = exported.error.empty() ? "ca_export_failed" : exported.error;
+                } else {
+                    cert_intercept::handoff_request_t request;
+                    request.diagnostics = std::move(report);
+                    request.provider_statuses = std::move(providers);
+                    request.target_label = target_label;
+                    request.proxy_endpoint = proxy_endpoint;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    request.ca_cert_pem_path = aida::preview::network::filesystem_path_utf8(exported.pem_path);
+                    request.ca_cert_der_path = aida::preview::network::filesystem_path_utf8(exported.der_path);
+#else
+                    request.ca_cert_pem_path = exported.pem_path.u8string();
+                    request.ca_cert_der_path = exported.der_path.u8string();
+#endif
+                    auto handoff = cert_intercept::generate_handoff(request);
+                    success = handoff.ok;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                    status = success ? aida::preview::network::filesystem_path_utf8(handoff.metadata_path)
+                                     : handoff.error;
+#else
+                    status = success ? handoff.metadata_path.u8string() : handoff.error;
+#endif
+                }
+            } catch (const std::exception& exception) {
+                status = exception.what();
+            } catch (...) {
+                status = "TLS interception handoff generation failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed", status);
+            enqueue_ui_completion([serial, success, status = std::move(status)]() mutable {
+                if (s_cert_handoff_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                s_cert_diag_ui.handoff_status = status.empty()
+                    ? (success ? "Handoff generated" : "TLS interception handoff generation failed")
+                    : std::move(status);
+                s_cert_handoff_pending.store(false, std::memory_order_release);
+            });
+        }, false);
+    if (!posted) {
+        s_cert_handoff_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected TLS interception handoff generation");
+        s_cert_diag_ui.handoff_status = "Executor rejected TLS interception handoff generation";
+    }
+}
+
 static void render_proxy(state_t& state, float x, float y, float w, float h,
                           float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
@@ -2956,7 +3850,10 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_proxy", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool running = mitm_proxy::is_running();
+    request_proxy_runtime_snapshot();
+    const auto proxy_snapshot = std::atomic_load_explicit(&s_proxy_runtime_snapshot, std::memory_order_acquire);
+    const bool running = proxy_snapshot && proxy_snapshot->stats.running;
+    const bool proxy_pending = s_proxy_operation_pending.load(std::memory_order_acquire);
 
     ImGui::PushID("proxy_toolbar");
     if (!running) {
@@ -2979,29 +3876,15 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                            "TLS MITM");
         same_line_if_fits(110.f);
 
-        if (aida::ui::button("Start Proxy", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-            mitm_proxy::proxy_config cfg;
-            cfg.bind_addr = state.proxy_bind_addr;
-            cfg.bind_port = static_cast<uint16_t>(state.proxy_port);
-            cfg.decode_tls = state.proxy_decode_tls;
+        if (aida::ui::button(proxy_pending ? "Starting...##proxy_start" : "Start Proxy##proxy_start",
+                             aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), proxy_pending)) {
             diag::log_tagged_fmt("network", "proxy_start_clicked bind=%s:%u decode_tls=%d",
                 state.proxy_bind_addr, state.proxy_port, state.proxy_decode_tls ? 1 : 0);
-            bool ok = mitm_proxy::start(cfg);
-            diag::log_tagged_fmt("network", "proxy_start_result ok=%d running=%d",
-                ok ? 1 : 0, mitm_proxy::is_running() ? 1 : 0);
-            char buf[160];
-            snprintf(buf, sizeof(buf),
-                "[net_audit] proxy start clicked bind=%s:%u tls=%d ok=%d running=%d",
-                state.proxy_bind_addr, static_cast<unsigned>(state.proxy_port), state.proxy_decode_tls ? 1 : 0,
-                ok ? 1 : 0, mitm_proxy::is_running() ? 1 : 0);
-            anti_tamper::webhook::write_log("net_audit", buf);
-            if (!ok) {
-                toast_notification::push("Failed to start proxy. See aida_debug.log.",
-                    toast_notification::toast_type_t::error);
-            }
+            request_proxy_control(state, true);
         }
     } else {
-        auto stats = mitm_proxy::get_stats();
+        const auto& stats = proxy_snapshot->stats;
         proxy_chart_tick(stats.total_requests);
 
         char run_buf[64];
@@ -3033,15 +3916,16 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         clipped_text(stats_buf, aida::ui::with_alpha(th.text_dim, alpha), ImGui::GetContentRegionAvail().x);
 
         same_line_if_fits(64.f);
-        if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        if (aida::ui::button(proxy_pending ? "Stopping...##proxy_stop" : "Stop##proxy_stop",
+                             aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), proxy_pending)) {
             diag::log_tagged("network", "proxy_stop_clicked");
-            mitm_proxy::stop();
+            request_proxy_control(state, false);
         }
         same_line_if_fits(112.f);
-        if (aida::ui::button("Clear History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            size_t prev = mitm_proxy::history_count();
-            mitm_proxy::clear_history();
-            diag::log_tagged_fmt("network", "proxy_history_cleared prev_count=%zu", prev);
+        if (aida::ui::button("Clear History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), proxy_pending || proxy_snapshot->history.empty())) {
+            ImGui::OpenPopup("Review Proxy History Clear");
         }
     }
 
@@ -3050,24 +3934,27 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                           "Filter requests...", false, ImVec2(220.f, 28.f));
     ImGui::PopID();
 
+    if (ImGui::BeginPopupModal("Review Proxy History Clear", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const std::size_t reviewed_count = proxy_snapshot ? proxy_snapshot->history.size() : 0;
+        ImGui::Text("Permanently clear %zu captured proxy exchanges?", reviewed_count);
+        ImGui::TextUnformatted("Requests, responses, annotations, and evidence in this bounded history will be removed.");
+        ImGui::Spacing();
+        if (aida::ui::button("Confirm Clear", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            request_proxy_history_clear(reviewed_count);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
 
     ImGui::Spacing();
-    bool ca_ready = cert_generator::is_ready();
-    bool ca_installed = false;
-    std::string spki_prefix;
-    if (ca_ready) {
-        const auto& ca = cert_generator::get_root_ca();
-        ca_installed = cert_generator::is_root_ca_installed(ca);
-        spki_prefix = aida::burp::browser::spki_hash_prefix(cert_generator::spki_sha256_base64(ca));
-    }
-    auto controlled_browsers = aida::burp::browser::list_running();
-    bool controlled_browser_running = false;
-    for (const auto& browser : controlled_browsers) {
-        if (browser.running) {
-            controlled_browser_running = true;
-            break;
-        }
-    }
+    const bool ca_installed = proxy_snapshot && proxy_snapshot->ca_installed;
+    const std::string spki_prefix = proxy_snapshot ? proxy_snapshot->spki_prefix : std::string();
+    const bool controlled_browser_running = proxy_snapshot && proxy_snapshot->controlled_browser_running;
 
     bool first_pill = true;
     auto readiness_pill = [&](const char* label, aida::ui::pill_kind_t kind) {
@@ -3077,8 +3964,8 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         first_pill = false;
     };
     readiness_pill("Interception readiness", aida::ui::pill_kind_t::info);
-    aida::ui::pill_kind(mitm_proxy::is_running() ? "Proxy running" : "Proxy stopped",
-        mitm_proxy::is_running() ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::warning,
+    aida::ui::pill_kind(running ? "Proxy running" : "Proxy stopped",
+        running ? aida::ui::pill_kind_t::success : aida::ui::pill_kind_t::warning,
         aida::ui::size_t_::sm, false);
     same_line_if_fits(estimate_chip_w(ca_installed ? "AiDA CA trusted" : "AiDA CA not trusted", 24.f));
     aida::ui::pill_kind(ca_installed ? "AiDA CA trusted" : "AiDA CA not trusted",
@@ -3106,32 +3993,45 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         state.active_tab = sub_tab_t::browser;
     }
     same_line_if_fits(92.f);
-    if (aida::ui::button("Repair trust", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-        bool ok = cert_generator::initialize();
-        if (ok && cert_generator::is_ready()) {
-            ok = cert_generator::install_root_ca(cert_generator::get_root_ca());
-        }
-        toast_notification::push(ok ? "AiDA CA trust repaired." : "AiDA CA trust repair failed.",
-            ok ? toast_notification::toast_type_t::success : toast_notification::toast_type_t::error);
-    }
+    if (aida::ui::button(proxy_pending ? "Repairing...##ca_repair" : "Repair trust##ca_repair",
+                         aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                         ImVec2(0.f, 0.f), proxy_pending))
+        request_ca_trust_repair();
     same_line_if_fits(154.f);
     if (aida::ui::button("Open Camoufox controls", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         state.prev_tab = state.active_tab;
         state.active_tab = sub_tab_t::browser;
         toast_notification::push("Camoufox is the only supported browser.", toast_notification::toast_type_t::info);
     }
-    if (cert_pin_bypass::is_bypass_active()) {
-        auto active_bypasses = cert_pin_bypass::get_active_bypasses();
+    if (proxy_snapshot && proxy_snapshot->bypass_active) {
         char legacy_buf[96];
-        snprintf(legacy_buf, sizeof(legacy_buf), "Legacy cleanup  -  %zu patches", active_bypasses.size());
+        snprintf(legacy_buf, sizeof(legacy_buf), "Legacy cleanup  -  %zu patches", proxy_snapshot->bypass_count);
         same_line_if_fits(estimate_chip_w(legacy_buf, 24.f));
         aida::ui::pill_kind(legacy_buf, aida::ui::pill_kind_t::warning, aida::ui::size_t_::sm, false);
         same_line_if_fits(142.f);
         if (aida::ui::button("Revert legacy patches", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             diag::log_tagged_fmt("network", "cert_pin_revert_clicked patches=%zu",
-                active_bypasses.size());
-            cert_pin_bypass::revert_all_bypasses();
+                proxy_snapshot->bypass_count);
+            s_bypass_review_count = proxy_snapshot->bypass_count;
+            ImGui::OpenPopup("Review Legacy Patch Reversion");
         }
+    }
+
+    if (ImGui::BeginPopupModal("Review Legacy Patch Reversion", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Revert %zu live certificate bypass patches?", s_bypass_review_count);
+        ImGui::TextUnformatted("The worker will restore reviewed process memory and verify that no bypass remains active.");
+        ImGui::Spacing();
+        if (aida::ui::button("Confirm Revert", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            request_legacy_bypass_revert(s_bypass_review_count);
+            s_bypass_review_count = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            s_bypass_review_count = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::Spacing();
@@ -3143,20 +4043,17 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     ImGui::InputInt("##cert_diag_pid", &s_cert_diag_ui.target_pid, 1, 100, ImGuiInputTextFlags_CharsDecimal);
     if (s_cert_diag_ui.target_pid < 0) s_cert_diag_ui.target_pid = 0;
     same_line_if_fits(118.f);
-    if (aida::ui::button("Diagnose target", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+    const bool certificate_diagnostics_pending = s_cert_diagnostics_pending.load(std::memory_order_acquire);
+    if (aida::ui::button(certificate_diagnostics_pending ? "Diagnosing...##cert_diag" : "Diagnose target##cert_diag",
+                         aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                         ImVec2(0.f, 0.f), certificate_diagnostics_pending)) {
         cert_intercept::diagnostic_context_t context;
-        context.proxy_running = mitm_proxy::is_running();
+        context.proxy_running = running;
         context.ca_trusted = ca_installed;
         context.controlled_browser = controlled_browser_running;
         context.proxy_endpoint = std::string(state.proxy_bind_addr) + ":" + std::to_string(state.proxy_port);
-        cert_diag_apply_proxy_observations(context);
         if (s_cert_diag_ui.target_pid > 0) {
-            s_cert_diag_ui.report = cert_intercept::diagnose_process(static_cast<uint32_t>(s_cert_diag_ui.target_pid), context);
-            s_cert_diag_ui.providers = cert_intercept::provider_registry_t::instance().evaluate(
-                static_cast<uint32_t>(s_cert_diag_ui.target_pid), s_cert_diag_ui.report);
-            s_cert_diag_ui.has_report = true;
-            s_cert_diag_ui.status = cert_intercept::to_string(s_cert_diag_ui.report.primary) + " - " + s_cert_diag_ui.report.summary;
-            s_cert_diag_ui.handoff_status.clear();
+            request_certificate_diagnostics(static_cast<std::uint32_t>(s_cert_diag_ui.target_pid), std::move(context));
         } else {
             s_cert_diag_ui.has_report = false;
             s_cert_diag_ui.status = "Select a live PID before diagnostics";
@@ -3196,39 +4093,12 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         bool can_handoff = s_cert_diag_ui.report.primary == cert_intercept::classification_t::true_pinning ||
             s_cert_diag_ui.report.primary == cert_intercept::classification_t::app_specific_tls_stack;
         if (can_handoff) {
-            if (aida::ui::button("Generate handoff", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-                bool ok = cert_generator::initialize();
-                cert_intercept::profiles::public_ca_export_t exported;
-                if (ok && cert_generator::is_ready()) {
-                    exported = cert_intercept::profiles::export_public_ca_files(cert_generator::get_root_ca());
-                    ok = exported.ok;
-                }
-                if (ok) {
-                    cert_intercept::handoff_request_t request;
-                    request.diagnostics = s_cert_diag_ui.report;
-                    request.provider_statuses = s_cert_diag_ui.providers;
-                    request.target_label = s_cert_diag_ui.report.process_name.empty() ? "target" : s_cert_diag_ui.report.process_name;
-                    request.proxy_endpoint = std::string(state.proxy_bind_addr) + ":" + std::to_string(state.proxy_port);
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-                    request.ca_cert_pem_path = aida::preview::network::filesystem_path_utf8(exported.pem_path);
-                    request.ca_cert_der_path = aida::preview::network::filesystem_path_utf8(exported.der_path);
-#else
-                    request.ca_cert_pem_path = exported.pem_path.u8string();
-                    request.ca_cert_der_path = exported.der_path.u8string();
-#endif
-                    auto handoff = cert_intercept::generate_handoff(request);
-                    ok = handoff.ok;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-                    s_cert_diag_ui.handoff_status = ok
-                        ? aida::preview::network::filesystem_path_utf8(handoff.metadata_path)
-                        : handoff.error;
-#else
-                    s_cert_diag_ui.handoff_status = ok ? handoff.metadata_path.u8string() : handoff.error;
-#endif
-                } else {
-                    s_cert_diag_ui.handoff_status = exported.error.empty() ? "ca_export_failed" : exported.error;
-                }
-            }
+            const bool handoff_pending = s_cert_handoff_pending.load(std::memory_order_acquire);
+            if (aida::ui::button(handoff_pending ? "Generating...##cert_handoff" : "Generate handoff##cert_handoff",
+                                 aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                                 ImVec2(0.f, 0.f), handoff_pending))
+                request_certificate_handoff(s_cert_diag_ui.report, s_cert_diag_ui.providers,
+                    std::string(state.proxy_bind_addr) + ":" + std::to_string(state.proxy_port));
             if (!s_cert_diag_ui.handoff_status.empty()) {
                 same_line_if_fits(std::min(360.f, ImGui::CalcTextSize(s_cert_diag_ui.handoff_status.c_str()).x + 8.f));
                 clipped_text(s_cert_diag_ui.handoff_status.c_str(), aida::ui::with_alpha(th.text_dim, alpha), ImGui::GetContentRegionAvail().x);
@@ -3242,7 +4112,8 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     ImVec2 org = ImGui::GetWindowPos();
     float cursor_y = ImGui::GetCursorPosY();
     float list_h = std::max(120.f, (h - cursor_y - 16.f) * 0.58f);
-    auto history = mitm_proxy::get_history();
+    static const std::vector<mitm_proxy::http_exchange> empty_history;
+    const auto& history = proxy_snapshot ? proxy_snapshot->history : empty_history;
 
     if (history.empty()) {
         ImVec2 list_org = ImGui::GetCursorScreenPos();
@@ -3268,16 +4139,23 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImGuiTableFlags_SizingStretchProp;
 
     static std::vector<int> filtered_history_indices;
-    filtered_history_indices.clear();
-    filtered_history_indices.reserve(history.size());
-    for (int index = 0; index < static_cast<int>(history.size()); ++index) {
-        const auto& exchange = history[static_cast<size_t>(index)];
-        if (state.proxy_filter_text[0]) {
-            const std::string searchable = exchange.target_host + " " + exchange.request.method + " " + exchange.request.uri;
-            if (!filter_text_match(state.proxy_filter_text, searchable))
-                continue;
+    static std::shared_ptr<const proxy_runtime_snapshot_t> filtered_proxy_snapshot;
+    static std::string filtered_proxy_query;
+    const std::string current_proxy_query(state.proxy_filter_text);
+    if (filtered_proxy_snapshot != proxy_snapshot || filtered_proxy_query != current_proxy_query) {
+        filtered_proxy_snapshot = proxy_snapshot;
+        filtered_proxy_query = current_proxy_query;
+        filtered_history_indices.clear();
+        filtered_history_indices.reserve(history.size());
+        for (int index = 0; index < static_cast<int>(history.size()); ++index) {
+            const auto& exchange = history[static_cast<size_t>(index)];
+            if (!current_proxy_query.empty()) {
+                const std::string searchable = exchange.target_host + " " + exchange.request.method + " " + exchange.request.uri;
+                if (!filter_text_match(current_proxy_query.c_str(), searchable))
+                    continue;
+            }
+            filtered_history_indices.push_back(index);
         }
-        filtered_history_indices.push_back(index);
     }
 
     int visible_rows = static_cast<int>(filtered_history_indices.size());
@@ -3321,9 +4199,10 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
             }
             if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                 state.proxy_selected = i;
-                s_proxy_context.exchange_id = ex.id;
-                s_proxy_context.timestamp = ex.timestamp;
-                ImGui::OpenPopupEx(ImHashStr("aida.network.proxy.context"));
+                open_exchange_context(
+                    exchange_artifact_identity(ex, artifact_kind_t::request),
+                    exchange_artifact_identity(ex, artifact_kind_t::response),
+                    exchange_context_origin_t::pointer);
             }
             ImGui::PopID();
 
@@ -3368,73 +4247,22 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         ImGui::EndTable();
     }
 
-    if (state.proxy_selected >= 0 && state.proxy_selected < static_cast<int>(history.size()) &&
+    const bool proxy_menu_key = state.proxy_selected >= 0 &&
+        state.proxy_selected < static_cast<int>(history.size()) &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
-        (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+        ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+    const bool proxy_shift_f10 = !proxy_menu_key && state.proxy_selected >= 0 &&
+        state.proxy_selected < static_cast<int>(history.size()) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+        ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+    if (proxy_menu_key || proxy_shift_f10) {
         const auto& selected = history[static_cast<size_t>(state.proxy_selected)];
-        s_proxy_context.exchange_id = selected.id;
-        s_proxy_context.timestamp = selected.timestamp;
-        ImGui::OpenPopupEx(ImHashStr("aida.network.proxy.context"));
-    }
-
-    if (ImGui::BeginPopupEx(ImHashStr("aida.network.proxy.context"), ImGuiWindowFlags_AlwaysAutoResize)) {
-        const auto found = std::find_if(history.begin(), history.end(), [](const mitm_proxy::http_exchange& exchange) {
-            return exchange.id == s_proxy_context.exchange_id && exchange.timestamp == s_proxy_context.timestamp;
-        });
-        if (found == history.end()) {
-            menu_item_disabled("Request is stale", "Proxy history changed; reopen the menu on a current request");
-        } else {
-            const auto& exchange = *found;
-            const std::string url = std::string(exchange.is_tls ? "https://" : "http://") +
-                exchange.target_host + exchange.request.uri;
-            if (ImGui::MenuItem("Copy URL"))
-                ImGui::SetClipboardText(url.c_str());
-            if (ImGui::MenuItem("Copy Request")) {
-                const std::string request = payload_display_text(exchange.raw_request);
-                ImGui::SetClipboardText(request.c_str());
-            }
-            if (ImGui::MenuItem("Copy Response", nullptr, false, !exchange.raw_response.empty())) {
-                const std::string response = payload_display_text(exchange.raw_response);
-                ImGui::SetClipboardText(response.c_str());
-            }
-            if (exchange.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("No response has been captured for this request");
-            ImGui::Separator();
-            const artifact_identity_t request_identity = exchange_artifact_identity(exchange, artifact_kind_t::request);
-            const artifact_identity_t response_identity = exchange_artifact_identity(exchange, artifact_kind_t::response);
-            std::string handoff_reason;
-            if (ImGui::MenuItem("Send to Repeater"))
-                (void)send_artifact_to_repeater(request_identity, handoff_reason);
-            if (ImGui::MenuItem("Send Request to Comparer"))
-                (void)send_artifact_to_comparer(request_identity, handoff_reason);
-            if (ImGui::MenuItem("Send Response to Comparer", nullptr, false, !exchange.raw_response.empty()))
-                (void)send_artifact_to_comparer(response_identity, handoff_reason);
-            if (exchange.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("No response has been captured for this request");
-            if (ImGui::BeginMenu("AI and Automation")) {
-                if (ImGui::MenuItem("Add Request to Chat"))
-                    (void)add_artifact_to_chat(request_identity, handoff_reason);
-                if (ImGui::MenuItem("Assign Request to Agent"))
-                    (void)assign_artifact_to_agent(request_identity, handoff_reason);
-                if (ImGui::MenuItem("Add Response to Chat", nullptr, false, !exchange.raw_response.empty()))
-                    (void)add_artifact_to_chat(response_identity, handoff_reason);
-                if (ImGui::MenuItem("Assign Response to Agent", nullptr, false, !exchange.raw_response.empty()))
-                    (void)assign_artifact_to_agent(response_identity, handoff_reason);
-                ImGui::EndMenu();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Filter by Host"))
-                std::snprintf(state.proxy_filter_text, sizeof(state.proxy_filter_text), "%s", exchange.target_host.c_str());
-            if (ImGui::MenuItem("Filter by Method"))
-                std::snprintf(state.proxy_filter_text, sizeof(state.proxy_filter_text), "%s", exchange.request.method.c_str());
-            if (ImGui::MenuItem("Clear Filter", nullptr, false, state.proxy_filter_text[0] != '\0'))
-                state.proxy_filter_text[0] = '\0';
-            ImGui::Separator();
-            menu_item_disabled("Replay Request Now", "Replay is a live network mutation; review and send it from Repeater so the target, TLS mode, and bytes remain visible");
-            menu_item_disabled("Delete Request", "The proxy backend exposes bounded history clearing, not safe single-request deletion");
-        }
-        ImGui::EndPopup();
+        open_exchange_context(
+            exchange_artifact_identity(selected, artifact_kind_t::request),
+            exchange_artifact_identity(selected, artifact_kind_t::response),
+            proxy_menu_key
+                ? exchange_context_origin_t::menu_key
+                : exchange_context_origin_t::shift_f10);
     }
 
     if (visible_rows == 0) {
@@ -3486,6 +4314,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                 static_cast<unsigned long long>(ex.id), ex.target_host.c_str(), ex.target_port,
                 ex.is_tls ? 1 : 0, rep->raw_request.size());
             state.repeater_entries.push_back(std::move(rep));
+            publish_repeater_request_artifacts(state);
             state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
         }
         same_line_if_fits(96.f);
@@ -3533,6 +4362,197 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 }
 
 
+enum class filter_review_action_t : std::uint8_t { none, clear_all, remove_one };
+
+struct filter_review_state_t {
+    filter_review_action_t action = filter_review_action_t::none;
+    std::uint32_t rule_id = 0;
+    std::size_t rule_count = 0;
+};
+
+static filter_review_state_t s_filter_review;
+
+static std::string driver_failure_text(const char* fallback) {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    return fallback ? fallback : "Driver operation failed";
+#else
+    const std::string detail = driver_bridge::last_error();
+    return detail.empty() ? (fallback ? fallback : "Driver operation failed") : detail;
+#endif
+}
+
+static void request_filter_add(state_t& state) {
+    bool expected = false;
+    if (!state.filter_mutation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed_pid = state.nf_pid[0] ? std::strtoul(state.nf_pid, &end, 10) : 0;
+    if (errno != 0 || (state.nf_pid[0] && (!end || *end != '\0')) || parsed_pid > UINT32_MAX) {
+        state.filter_mutation_pending.store(false, std::memory_order_release);
+        toast_notification::push("PID must be an unsigned 32-bit integer", toast_notification::toast_type_t::error);
+        return;
+    }
+    end = nullptr;
+    errno = 0;
+    const unsigned long parsed_port = state.nf_port[0] ? std::strtoul(state.nf_port, &end, 10) : 0;
+    if (errno != 0 || (state.nf_port[0] && (!end || *end != '\0')) || parsed_port > UINT16_MAX) {
+        state.filter_mutation_pending.store(false, std::memory_order_release);
+        toast_notification::push("Port must be between 0 and 65535", toast_notification::toast_type_t::error);
+        return;
+    }
+    std::array<std::uint8_t, 16> ip_bytes{};
+    const std::string ip_text(state.nf_ip);
+    if (!ip_text.empty() && inet_pton(AF_INET, ip_text.c_str(), ip_bytes.data()) != 1) {
+        state.filter_mutation_pending.store(false, std::memory_order_release);
+        toast_notification::push("Filter IP address is not valid IPv4", toast_notification::toast_type_t::error);
+        return;
+    }
+    const std::uint32_t action = static_cast<std::uint32_t>(state.nf_action);
+    const std::uint32_t direction = static_cast<std::uint32_t>(state.nf_direction);
+    const std::uint32_t protocol = static_cast<std::uint32_t>(state.nf_protocol);
+    const std::uint32_t pid = static_cast<std::uint32_t>(parsed_pid);
+    const std::uint16_t port = static_cast<std::uint16_t>(parsed_port);
+    const std::uint64_t serial = state.filter_mutation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string target = "action=" + std::to_string(action) + " direction=" +
+        std::to_string(direction) + " protocol=" + std::to_string(protocol) +
+        " pid=" + std::to_string(pid) + " port=" + std::to_string(port) +
+        (ip_text.empty() ? std::string() : " ip=" + ip_text);
+    const std::string task_id = register_network_operation(
+        "network.filters.add", "Add network filter rule", "view.network.filters", target);
+    const bool posted = post_network_task(
+        "filter_add", aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, action, direction, protocol, pid, port, ip_bytes, ip_text, task_id]() {
+            std::uint32_t rule_id = 0;
+            bool success = false;
+            std::string error;
+            try {
+                success = driver_feature_ready("filter_add") && driver_bridge::add_filter_rule(
+                    action, direction, protocol, pid, port, ip_bytes.data(), nullptr, &rule_id);
+                if (!success)
+                    error = driver_failure_text("Failed to add filter rule");
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Failed to add filter rule";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? "Rule #" + std::to_string(rule_id) + " applied" : error);
+            enqueue_ui_completion([serial, success, rule_id, action, direction, protocol, pid, port,
+                                   ip_text, error = std::move(error)]() {
+                if (g_state.filter_mutation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (success) {
+                    filter_entry_t entry;
+                    entry.rule_id = rule_id;
+                    entry.action = static_cast<std::uint8_t>(action);
+                    entry.direction = static_cast<std::uint8_t>(direction);
+                    entry.protocol = static_cast<std::uint8_t>(protocol);
+                    entry.pid = pid;
+                    entry.port = port;
+                    entry.ip_addr = ip_text;
+                    entry.active = true;
+                    g_state.filters.push_back(std::move(entry));
+                    toast_notification::push("Filter rule added", toast_notification::toast_type_t::info);
+                } else {
+                    toast_notification::push(error.empty() ? "Failed to add filter rule" : error,
+                        toast_notification::toast_type_t::error);
+                }
+                g_state.filter_mutation_pending.store(false, std::memory_order_release);
+            });
+        }, false);
+    if (!posted) {
+        state.filter_mutation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected filter mutation");
+    }
+}
+
+static void request_filter_clear(state_t& state) {
+    bool expected = false;
+    if (!state.filter_mutation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.filter_mutation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::size_t reviewed_count = state.filters.size();
+    const std::string task_id = register_network_operation(
+        "network.filters.clear", "Clear all network filter rules", "view.network.filters",
+        std::to_string(reviewed_count) + " reviewed rules");
+    const bool posted = post_network_task(
+        "filter_clear", aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, reviewed_count, task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+                success = driver_feature_ready("filter_clear") && driver_bridge::clear_filter_rules();
+                if (!success)
+                    error = driver_failure_text("Failed to clear filter rules");
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Failed to clear filter rules";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(reviewed_count) + " rules cleared" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (g_state.filter_mutation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (success)
+                    g_state.filters.clear();
+                else
+                    toast_notification::push(error.empty() ? "Failed to clear filter rules" : error,
+                        toast_notification::toast_type_t::error);
+                g_state.filter_mutation_pending.store(false, std::memory_order_release);
+            });
+        }, false);
+    if (!posted) {
+        state.filter_mutation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected filter mutation");
+    }
+}
+
+static void request_filter_remove(state_t& state, std::uint32_t rule_id) {
+    bool expected = false;
+    if (!state.filter_mutation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.filter_mutation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.filters.remove", "Remove network filter rule", "view.network.filters",
+        "rule #" + std::to_string(rule_id));
+    const bool posted = post_network_task(
+        "filter_remove", aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, rule_id, task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+                success = driver_feature_ready("filter_remove") && driver_bridge::remove_filter_rule(rule_id);
+                if (!success)
+                    error = driver_failure_text("Failed to remove filter rule");
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Failed to remove filter rule";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? "Rule #" + std::to_string(rule_id) + " removed" : error);
+            enqueue_ui_completion([serial, rule_id, success, error = std::move(error)]() {
+                if (g_state.filter_mutation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (success) {
+                    g_state.filters.erase(std::remove_if(g_state.filters.begin(), g_state.filters.end(),
+                        [rule_id](const filter_entry_t& entry) { return entry.rule_id == rule_id; }),
+                        g_state.filters.end());
+                } else {
+                    toast_notification::push(error.empty() ? "Failed to remove filter rule" : error,
+                        toast_notification::toast_type_t::error);
+                }
+                g_state.filter_mutation_pending.store(false, std::memory_order_release);
+            });
+        }, false);
+    if (!posted) {
+        state.filter_mutation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected filter mutation");
+    }
+}
+
 static void render_filters(state_t& state, float x, float y, float w, float h,
                             float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab; (void)w; (void)h;
@@ -3540,7 +4560,8 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_filters", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = driver_bridge::using_kernel_driver();
+    request_driver_available_snapshot();
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire);
 
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
@@ -3577,52 +4598,19 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
                           false, ImVec2(180.f, 28.f));
     ImGui::SameLine();
 
-    if (!driver_ok) ImGui::BeginDisabled();
-    if (aida::ui::button("Add Rule", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-        uint32_t pid = state.nf_pid[0] ? static_cast<uint32_t>(atoi(state.nf_pid)) : 0;
-        uint16_t port = state.nf_port[0] ? static_cast<uint16_t>(atoi(state.nf_port)) : 0;
-
-        uint8_t ip_bytes[16] = {};
-        if (state.nf_ip[0]) {
-            inet_pton(AF_INET, state.nf_ip, ip_bytes);
-        }
-
-        uint32_t out_rule_id = 0;
-        bool added = driver_bridge::add_filter_rule(
-            static_cast<uint32_t>(state.nf_action),
-            static_cast<uint32_t>(state.nf_direction),
-            static_cast<uint32_t>(state.nf_protocol),
-            pid, port, ip_bytes, nullptr, &out_rule_id);
-        diag::log_tagged_fmt("network", "filter_add_rule action=%d dir=%d proto=%d pid=%u port=%u ip='%s' added=%d rule_id=%u",
-            state.nf_action, state.nf_direction, state.nf_protocol, pid, port,
-            state.nf_ip, added ? 1 : 0, out_rule_id);
-        if (added) {
-            filter_entry_t fe;
-            fe.rule_id = out_rule_id;
-            fe.action = static_cast<uint8_t>(state.nf_action);
-            fe.direction = static_cast<uint8_t>(state.nf_direction);
-            fe.protocol = static_cast<uint8_t>(state.nf_protocol);
-            fe.pid = pid;
-            fe.port = port;
-            fe.ip_addr = state.nf_ip;
-            fe.active = true;
-            state.filters.push_back(std::move(fe));
-            toast_notification::push("Filter rule added", toast_notification::toast_type_t::info);
-        } else {
-            toast_notification::push("Failed to add filter rule",
-                toast_notification::toast_type_t::error);
-        }
-    }
+    const bool mutation_pending = state.filter_mutation_pending.load(std::memory_order_acquire);
+    if (!driver_ok || mutation_pending) ImGui::BeginDisabled();
+    if (aida::ui::button(mutation_pending ? "Applying...##filter_add" : "Add Rule##filter_add",
+                         aida::ui::button_kind_t::primary, aida::ui::size_t_::sm))
+        request_filter_add(state);
 
     ImGui::SameLine();
     if (aida::ui::button("Clear All", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-        size_t prev_n = state.filters.size();
-        bool cleared = driver_bridge::clear_filter_rules();
-        state.filters.clear();
-        diag::log_tagged_fmt("network", "filter_clear_all prev_count=%zu driver_cleared=%d",
-            prev_n, cleared ? 1 : 0);
+        s_filter_review.action = filter_review_action_t::clear_all;
+        s_filter_review.rule_count = state.filters.size();
+        ImGui::OpenPopup("Review Filter Mutation");
     }
-    if (!driver_ok) ImGui::EndDisabled();
+    if (!driver_ok || mutation_pending) ImGui::EndDisabled();
 
     ImGui::Spacing();
 
@@ -3636,8 +4624,11 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
                            "No active filter rules.");
     }
 
-    int remove_idx = -1;
-    for (int i = 0; i < static_cast<int>(state.filters.size()); i++) {
+    std::uint32_t remove_rule_id = 0;
+    ImGuiListClipper filter_clipper;
+    filter_clipper.Begin(static_cast<int>(state.filters.size()));
+    while (filter_clipper.Step()) {
+    for (int i = filter_clipper.DisplayStart; i < filter_clipper.DisplayEnd; i++) {
         auto& f = state.filters[static_cast<size_t>(i)];
         char rule_buf[192];
         snprintf(rule_buf, sizeof(rule_buf), "#%u  %s  %s %s  PID:%u  Port:%u  %s",
@@ -3652,21 +4643,100 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
         aida::ui::pill_kind(rule_buf, kind, aida::ui::size_t_::sm, true);
         ImGui::SameLine();
         ImGui::PushID(i);
+        ImGui::BeginDisabled(mutation_pending);
         if (aida::ui::button("Remove", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm))
-            remove_idx = i;
+            remove_rule_id = f.rule_id;
+        ImGui::EndDisabled();
         ImGui::PopID();
     }
-    if (remove_idx >= 0 && remove_idx < static_cast<int>(state.filters.size())) {
-        auto& f = state.filters[static_cast<size_t>(remove_idx)];
-        bool drv_removed = driver_bridge::remove_filter_rule(f.rule_id);
-        diag::log_tagged_fmt("network", "filter_remove_rule rule_id=%u drv_removed=%d", f.rule_id,
-            drv_removed ? 1 : 0);
-        state.filters.erase(state.filters.begin() + static_cast<ptrdiff_t>(remove_idx));
+    }
+    if (remove_rule_id != 0) {
+        s_filter_review.action = filter_review_action_t::remove_one;
+        s_filter_review.rule_id = remove_rule_id;
+        s_filter_review.rule_count = 1;
+        ImGui::OpenPopup("Review Filter Mutation");
+    }
+
+    if (ImGui::BeginPopupModal("Review Filter Mutation", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (s_filter_review.action == filter_review_action_t::clear_all) {
+            ImGui::Text("Clear all %zu active network filter rules?", s_filter_review.rule_count);
+            ImGui::TextUnformatted("This immediately changes live kernel traffic policy and cannot be undone automatically.");
+        } else {
+            ImGui::Text("Remove active network filter rule #%u?", s_filter_review.rule_id);
+            ImGui::TextUnformatted("Traffic matching this rule will immediately stop receiving its current policy.");
+        }
+        ImGui::Spacing();
+        if (aida::ui::button(s_filter_review.action == filter_review_action_t::clear_all
+                                 ? "Confirm Clear" : "Confirm Remove",
+                             aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            if (s_filter_review.action == filter_review_action_t::clear_all)
+                request_filter_clear(state);
+            else if (s_filter_review.action == filter_review_action_t::remove_one)
+                request_filter_remove(state, s_filter_review.rule_id);
+            s_filter_review = {};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            s_filter_review = {};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::EndChild();
 }
 
+
+static void request_bandwidth_control(state_t& state, bool start) {
+    bool expected = false;
+    if (!state.bw_control_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.bw_control_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        start ? "network.bandwidth.start" : "network.bandwidth.stop",
+        start ? "Start bandwidth monitor" : "Stop bandwidth monitor",
+        "view.network.bandwidth", "kernel bandwidth telemetry");
+    const bool posted = post_network_task(
+        start ? "bandwidth_start" : "bandwidth_stop",
+        aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, start, task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+                success = driver_feature_ready(start ? "bandwidth_start" : "bandwidth_stop") &&
+                    driver_bridge::bw_monitor_op(start ? 0U : 1U);
+                if (!success)
+                    error = driver_failure_text(start ? "Failed to start bandwidth monitor"
+                                                      : "Failed to stop bandwidth monitor");
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = start ? "Failed to start bandwidth monitor" : "Failed to stop bandwidth monitor";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? (start ? "Bandwidth telemetry started" : "Bandwidth telemetry stopped") : error);
+            enqueue_ui_completion([serial, start, success, error = std::move(error)]() {
+                if (g_state.bw_control_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (success) {
+                    g_state.bw_monitoring = start;
+                    g_state.bw_polling.store(start, std::memory_order_release);
+                    if (start)
+                        g_state.bw_cv.notify_one();
+                } else {
+                    toast_notification::push(error.empty()
+                        ? (start ? "Failed to start bandwidth monitor" : "Failed to stop bandwidth monitor")
+                        : error, toast_notification::toast_type_t::error);
+                }
+                g_state.bw_control_pending.store(false, std::memory_order_release);
+            });
+        }, false);
+    if (!posted) {
+        state.bw_control_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected bandwidth control");
+    }
+}
 
 static void render_bandwidth(state_t& state, float x, float y, float w, float h,
                               float alpha, float ar, float ag, float ab) {
@@ -3675,30 +4745,27 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_bw", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool driver_ok = driver_bridge::using_kernel_driver();
+    request_driver_available_snapshot();
+    const bool driver_ok = s_driver_available_snapshot.load(std::memory_order_acquire);
 
-    if (!driver_ok) ImGui::BeginDisabled();
+    const bool control_pending = state.bw_control_pending.load(std::memory_order_acquire);
+    if (!driver_ok || control_pending) ImGui::BeginDisabled();
 
     if (!state.bw_polling.load()) {
         if (aida::ui::button("Start Monitoring", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
-            bool drv_started = driver_bridge::bw_monitor_op(0);
-            diag::log_tagged_fmt("network", "bandwidth_monitor_start_clicked drv_ok=%d drv_started=%d",
-                driver_ok ? 1 : 0, drv_started ? 1 : 0);
-            state.bw_monitoring = true;
-            state.bw_polling.store(true);
-            state.bw_cv.notify_one();
+            request_bandwidth_control(state, true);
         }
     } else {
         if (aida::ui::button("Stop Monitoring", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            bool drv_stopped = driver_bridge::bw_monitor_op(1);
-            diag::log_tagged_fmt("network", "bandwidth_monitor_stop_clicked drv_stopped=%d",
-                drv_stopped ? 1 : 0);
-            state.bw_monitoring = false;
-            state.bw_polling.store(false);
+            request_bandwidth_control(state, false);
         }
     }
 
-    if (!driver_ok) ImGui::EndDisabled();
+    if (!driver_ok || control_pending) ImGui::EndDisabled();
+    if (control_pending) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Applying driver state...");
+    }
     ImGui::Spacing();
 
 
@@ -3734,12 +4801,12 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
     float list_h = h - (cursor.y + row_h + 12.f);
     ImGui::BeginChild("##bw_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
 
-    std::lock_guard<std::mutex> lock(state.bw_mutex);
+    const auto bandwidth_entries = std::atomic_load_explicit(&state.bandwidth_snapshot, std::memory_order_acquire);
     ImVec2 list_org = ImGui::GetWindowPos();
     ImVec2 bw_list_sz = ImGui::GetWindowSize();
     dl->PushClipRect(list_org, ImVec2(list_org.x + bw_list_sz.x, list_org.y + bw_list_sz.y), true);
 
-    if (state.bw_entries.empty()) {
+    if (!bandwidth_entries || bandwidth_entries->empty()) {
         dl->PopClipRect();
         ImGui::EndChild();
         aida::ui::empty_state::config_t cfg;
@@ -3753,8 +4820,11 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
         return;
     }
 
-    for (int i = 0; i < static_cast<int>(state.bw_entries.size()); i++) {
-        auto& b = state.bw_entries[static_cast<size_t>(i)];
+    ImGuiListClipper bandwidth_clipper;
+    bandwidth_clipper.Begin(static_cast<int>(bandwidth_entries->size()), row_h);
+    while (bandwidth_clipper.Step()) {
+    for (int i = bandwidth_clipper.DisplayStart; i < bandwidth_clipper.DisplayEnd; i++) {
+        const auto& b = (*bandwidth_entries)[static_cast<size_t>(i)];
         float ry = ImGui::GetCursorPosY();
         float abs_ry = ImGui::GetCursorScreenPos().y;
 
@@ -3849,6 +4919,7 @@ static void render_bandwidth(state_t& state, float x, float y, float w, float h,
 
         ImGui::SetCursorPosY(ry + row_h);
     }
+    }
 
     dl->PopClipRect();
     ImGui::EndChild();
@@ -3890,10 +4961,11 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         rep->port = static_cast<uint16_t>(state.rep_port);
         rep->use_tls = state.rep_use_tls;
         rep->raw_request = "GET / HTTP/1.1\r\nHost: " + std::string(state.rep_host) + "\r\n\r\n";
-        rep->request_hash = artifact_hash(std::vector<std::uint8_t>(rep->raw_request.begin(), rep->raw_request.end()));
+        rep->request_hash = artifact_hash(std::string_view(rep->raw_request));
         diag::log_tagged_fmt("network", "repeater_new_entry host=%s:%d tls=%d",
             state.rep_host, state.rep_port, state.rep_use_tls ? 1 : 0);
         state.repeater_entries.push_back(std::move(rep));
+        publish_repeater_request_artifacts(state);
         state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
     }
 
@@ -3925,6 +4997,7 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 diag::log_tagged_fmt("network", "repeater_entry_closed idx=%d", idx);
                 state.repeater_entries.erase(
                     state.repeater_entries.begin() + static_cast<ptrdiff_t>(idx));
+                publish_repeater_request_artifacts(state);
                 if (state.repeater_selected >= static_cast<int>(state.repeater_entries.size()))
                     state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
             }
@@ -3935,8 +5008,19 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
         if (state.repeater_selected >= 0 && state.repeater_selected < static_cast<int>(state.repeater_entries.size())) {
             auto rep_ptr = state.repeater_entries[static_cast<size_t>(state.repeater_selected)];
             auto& rep = *rep_ptr;
-            if (rep.id == 0)
+            if (rep.id == 0) {
                 rep.id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
+                publish_repeater_request_artifacts(state);
+            }
+
+            if (rep.reviewed_draft) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("AI REVIEWED DRAFT");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Source hash: 0x%016llX\nProvenance: %s",
+                        static_cast<unsigned long long>(rep.reviewed_source_hash),
+                        rep.review_provenance.c_str());
+            }
 
             const bool stack_editors = w < 760.f;
             float half_w = (w - 8.f) * 0.5f;
@@ -3972,55 +5056,28 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 ImVec2(req_w - 4.f, std::max(72.f, req_h - 78.f)))) {
                 rep.raw_request = req_buf;
                 ++rep.request_revision;
-                rep.request_hash = artifact_hash(std::vector<std::uint8_t>(rep.raw_request.begin(), rep.raw_request.end()));
+                rep.request_hash = artifact_hash(std::string_view(rep.raw_request));
+                rep.reviewed_draft = false;
+                rep.reviewed_source_hash = 0;
+                rep.review_provenance.clear();
                 req_buf_dirty = true;
+                publish_repeater_request_artifacts(state);
             }
-            const bool request_context = ImGui::IsItemClicked(ImGuiMouseButton_Right) ||
-                (ImGui::IsItemFocused() && (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false))));
-            if (request_context)
-                ImGui::OpenPopup("##repeater_request_context");
-            if (ImGui::BeginPopup("##repeater_request_context")) {
-                if (ImGui::MenuItem("Copy Request"))
-                    ImGui::SetClipboardText(req_buf);
-                if (ImGui::MenuItem("Duplicate Repeater Tab")) {
-                    auto duplicate = std::make_shared<repeater_entry_t>();
-                    duplicate->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
-                    duplicate->source_artifact_id = "network.repeater." + std::to_string(rep.id) + ".request";
-                    duplicate->host = rep.host;
-                    duplicate->port = rep.port;
-                    duplicate->use_tls = rep.use_tls;
-                    duplicate->raw_request = req_buf;
-                    duplicate->request_hash = artifact_hash(std::vector<std::uint8_t>(
-                        duplicate->raw_request.begin(), duplicate->raw_request.end()));
-                    state.repeater_entries.push_back(std::move(duplicate));
-                    state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
-                }
-                artifact_identity_t request_identity;
-                request_identity.kind = artifact_kind_t::repeater_request;
-                request_identity.id = "network.repeater." + std::to_string(rep.id) + ".request." +
-                    std::to_string(rep.request_revision);
-                request_identity.parent_id = rep.source_artifact_id;
-                request_identity.source_view_id = "view.network.repeater";
-                request_identity.source_id = rep.id;
-                request_identity.revision = rep.request_revision;
-                request_identity.content_size = rep.raw_request.size();
-                request_identity.content_hash = artifact_hash(std::vector<std::uint8_t>(
-                    rep.raw_request.begin(), rep.raw_request.end()));
-                request_identity.label = "Repeater request #" + std::to_string(rep.id);
-                request_identity.target_host = rep.host;
-                request_identity.target_port = rep.port;
-                request_identity.use_tls = rep.use_tls;
-                std::string handoff_reason;
-                if (ImGui::MenuItem("Send Request to Comparer"))
-                    (void)send_artifact_to_comparer(request_identity, handoff_reason);
-                if (ImGui::MenuItem("Add Request to AI Chat"))
-                    (void)add_artifact_to_chat(request_identity, handoff_reason);
-                if (ImGui::MenuItem("Assign Request to Agent"))
-                    (void)assign_artifact_to_agent(request_identity, handoff_reason);
-                ImGui::Separator();
-                menu_item_disabled("Send Request Now", "Sending performs live network activity; use the visible Send button after reviewing host, port, TLS mode, and request bytes");
-                ImGui::EndPopup();
+            const bool request_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            const bool request_menu_key = ImGui::IsItemFocused() &&
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+            const bool request_shift_f10 = !request_menu_key && ImGui::IsItemFocused() &&
+                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+            const bool request_context = request_pointer_context || request_menu_key || request_shift_f10;
+            if (request_context) {
+                const auto origin = request_pointer_context
+                    ? exchange_context_origin_t::pointer
+                    : request_menu_key
+                    ? exchange_context_origin_t::menu_key
+                    : exchange_context_origin_t::shift_f10;
+                open_exchange_context(
+                    repeater_artifact_identity(rep, artifact_kind_t::repeater_request),
+                    repeater_artifact_identity(rep, artifact_kind_t::repeater_response), origin);
             }
 
             if (!rep.in_progress.load()) {
@@ -4106,51 +5163,21 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
                 rep.raw_response.size() + 1,
                 ImVec2(resp_w - 4.f, std::max(72.f, resp_h - 78.f)),
                 ImGuiInputTextFlags_ReadOnly);
-            const bool response_context = ImGui::IsItemClicked(ImGuiMouseButton_Right) ||
-                (ImGui::IsItemFocused() && (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-                 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false))));
-            if (response_context)
-                ImGui::OpenPopup("##repeater_response_context");
-            if (ImGui::BeginPopup("##repeater_response_context")) {
-                artifact_identity_t response_identity;
-                response_identity.kind = artifact_kind_t::repeater_response;
-                response_identity.id = "network.repeater." + std::to_string(rep.id) + ".response." +
-                    std::to_string(rep.response_timestamp);
-                response_identity.parent_id = "network.repeater." + std::to_string(rep.id) + ".request." +
-                    std::to_string(rep.request_revision);
-                response_identity.source_view_id = "view.network.repeater";
-                response_identity.source_id = rep.id;
-                response_identity.timestamp = rep.response_timestamp;
-                response_identity.revision = rep.request_revision;
-                response_identity.content_size = rep.raw_response.size();
-                response_identity.content_hash = rep.raw_response.empty() ? 0 : artifact_hash(
-                    std::vector<std::uint8_t>(rep.raw_response.begin(), rep.raw_response.end()));
-                response_identity.label = "Repeater response #" + std::to_string(rep.id);
-                response_identity.target_host = rep.host;
-                response_identity.target_port = rep.port;
-                response_identity.use_tls = rep.use_tls;
-                std::string handoff_reason;
-                if (ImGui::MenuItem("Copy Response", nullptr, false, !rep.raw_response.empty()))
-                    ImGui::SetClipboardText(rep.raw_response.c_str());
-                if (rep.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Send the request and receive a response first");
-                if (ImGui::MenuItem("Send Response to Comparer", nullptr, false, !rep.raw_response.empty()))
-                    (void)send_artifact_to_comparer(response_identity, handoff_reason);
-                if (ImGui::MenuItem("Add Response to AI Chat", nullptr, false, !rep.raw_response.empty()))
-                    (void)add_artifact_to_chat(response_identity, handoff_reason);
-                if (ImGui::MenuItem("Assign Response to Agent", nullptr, false, !rep.raw_response.empty()))
-                    (void)assign_artifact_to_agent(response_identity, handoff_reason);
-                if (rep.raw_response.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Send the request and receive a response first");
-                ImGui::Separator();
-                if (ImGui::MenuItem("Clear Response Display", nullptr, false, !rep.raw_response.empty())) {
-                    rep.raw_response.clear();
-                    rep.status_code = 0;
-                    rep.latency_ms = 0;
-                    rep.response_hash = 0;
-                    rep.response_timestamp = 0;
-                }
-                ImGui::EndPopup();
+            const bool response_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            const bool response_menu_key = ImGui::IsItemFocused() &&
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+            const bool response_shift_f10 = !response_menu_key && ImGui::IsItemFocused() &&
+                ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+            const bool response_context = response_pointer_context || response_menu_key || response_shift_f10;
+            if (response_context) {
+                const auto origin = response_pointer_context
+                    ? exchange_context_origin_t::pointer
+                    : response_menu_key
+                    ? exchange_context_origin_t::menu_key
+                    : exchange_context_origin_t::shift_f10;
+                open_exchange_context(
+                    repeater_artifact_identity(rep, artifact_kind_t::repeater_response),
+                    repeater_artifact_identity(rep, artifact_kind_t::repeater_request), origin);
             }
 
             ImGui::EndChild();
@@ -4169,6 +5196,291 @@ static void render_repeater(state_t& state, float x, float y, float w, float h,
 }
 
 
+struct intercept_runtime_snapshot_t {
+    bool running = false;
+    bool enabled = false;
+    std::vector<mitm_proxy::http_exchange> held;
+};
+
+enum class intercept_operation_t {
+    set_enabled,
+    forward_all,
+    drop_all,
+    forward_one,
+    drop_one,
+    forward_modified
+};
+
+struct intercept_drop_review_t {
+    bool open = false;
+    bool all = false;
+    std::uint64_t exchange_id = 0;
+    std::size_t reviewed_count = 0;
+    std::shared_ptr<const intercept_runtime_snapshot_t> reviewed_publication;
+};
+
+static std::shared_ptr<const intercept_runtime_snapshot_t> s_intercept_runtime_snapshot;
+static std::atomic<bool> s_intercept_snapshot_pending{false};
+static std::atomic<std::uint64_t> s_intercept_snapshot_requested_ms{0};
+static std::atomic<bool> s_intercept_operation_pending{false};
+static std::atomic<std::uint64_t> s_intercept_operation_serial{0};
+static intercept_drop_review_t s_intercept_drop_review;
+static std::uint64_t s_intercept_selected_exchange_id = 0;
+
+static void publish_intercept_runtime_snapshot() {
+    auto snapshot = std::make_shared<intercept_runtime_snapshot_t>();
+    snapshot->running = mitm_proxy::is_running();
+    snapshot->enabled = mitm_proxy::is_intercept_enabled();
+    snapshot->held = mitm_proxy::get_held_exchanges();
+    std::atomic_store_explicit(&s_intercept_runtime_snapshot,
+        std::shared_ptr<const intercept_runtime_snapshot_t>(std::move(snapshot)),
+        std::memory_order_release);
+}
+
+static void request_intercept_runtime_snapshot(bool force = false) {
+    const std::uint64_t now = network_now_ms();
+    const std::uint64_t last = s_intercept_snapshot_requested_ms.load(std::memory_order_acquire);
+    if (!force && last != 0 && now >= last && now - last < 200)
+        return;
+    bool expected = false;
+    if (!s_intercept_snapshot_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    s_intercept_snapshot_requested_ms.store(now, std::memory_order_release);
+    const bool posted = post_network_task(
+        "intercept_snapshot", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        []() {
+            try {
+                publish_intercept_runtime_snapshot();
+            } catch (...) {
+            }
+            s_intercept_snapshot_pending.store(false, std::memory_order_release);
+        }, false);
+    if (!posted)
+        s_intercept_snapshot_pending.store(false, std::memory_order_release);
+}
+
+static bool request_intercept_operation(intercept_operation_t operation, bool enabled,
+                                        std::uint64_t exchange_id,
+                                        std::vector<std::uint8_t> modified_request,
+                                        std::size_t reviewed_count,
+                                        std::shared_ptr<const intercept_runtime_snapshot_t>
+                                            reviewed_publication = {}) {
+    bool expected = false;
+    if (!s_intercept_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return false;
+    const std::uint64_t serial = s_intercept_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const char* action = "network.intercept.forward";
+    const char* label = "Forward held exchange";
+    std::string target = exchange_id == 0 ? std::to_string(reviewed_count) + " held exchanges"
+                                          : "exchange " + std::to_string(exchange_id);
+    switch (operation) {
+    case intercept_operation_t::set_enabled:
+        action = enabled ? "network.intercept.enable" : "network.intercept.disable";
+        label = enabled ? "Enable request interception" : "Disable request interception";
+        target = enabled ? "interception enabled" : "interception disabled";
+        break;
+    case intercept_operation_t::forward_all:
+        action = "network.intercept.forward_all";
+        label = "Forward all held exchanges";
+        break;
+    case intercept_operation_t::drop_all:
+        action = "network.intercept.drop_all";
+        label = "Drop all held exchanges";
+        break;
+    case intercept_operation_t::drop_one:
+        action = "network.intercept.drop";
+        label = "Drop held exchange";
+        break;
+    case intercept_operation_t::forward_modified:
+        action = "network.intercept.forward_modified";
+        label = "Forward modified exchange";
+        break;
+    default:
+        break;
+    }
+    const std::string task_id = register_network_operation(action, label, "view.network.intercept", target);
+    const bool posted = post_network_task(
+        "intercept_mutation", aida::infra::executor::domain_t::feature_worker, "bounded_task",
+        [serial, operation, enabled, exchange_id, modified_request = std::move(modified_request),
+         reviewed_count, reviewed_publication = std::move(reviewed_publication), task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+                switch (operation) {
+                case intercept_operation_t::set_enabled:
+                    mitm_proxy::set_intercept_enabled(enabled);
+                    success = mitm_proxy::is_intercept_enabled() == enabled;
+                    break;
+                case intercept_operation_t::forward_all:
+                    if (!reviewed_publication) {
+                        error = "The reviewed Intercept publication is unavailable";
+                        break;
+                    }
+                    for (const auto& exchange : reviewed_publication->held)
+                        mitm_proxy::forward_exchange(exchange.id);
+                    success = true;
+                    break;
+                case intercept_operation_t::drop_all:
+                    if (!reviewed_publication) {
+                        error = "The reviewed Intercept publication is unavailable";
+                        break;
+                    }
+                    for (const auto& exchange : reviewed_publication->held)
+                        mitm_proxy::drop_exchange(exchange.id);
+                    success = true;
+                    break;
+                case intercept_operation_t::forward_one:
+                    mitm_proxy::forward_exchange(exchange_id);
+                    success = true;
+                    break;
+                case intercept_operation_t::drop_one:
+                    mitm_proxy::drop_exchange(exchange_id);
+                    success = true;
+                    break;
+                case intercept_operation_t::forward_modified:
+                    if (modified_request.empty())
+                        mitm_proxy::forward_exchange(exchange_id);
+                    else
+                        mitm_proxy::forward_modified(exchange_id, modified_request);
+                    success = true;
+                    break;
+                }
+                publish_intercept_runtime_snapshot();
+                const auto snapshot = std::atomic_load_explicit(&s_intercept_runtime_snapshot, std::memory_order_acquire);
+                if (success && exchange_id != 0 && snapshot) {
+                    success = std::none_of(snapshot->held.begin(), snapshot->held.end(),
+                        [exchange_id](const auto& exchange) { return exchange.id == exchange_id; });
+                } else if (success && reviewed_publication && snapshot &&
+                    (operation == intercept_operation_t::forward_all ||
+                     operation == intercept_operation_t::drop_all)) {
+                    std::vector<std::uint64_t> remaining_ids;
+                    remaining_ids.reserve(snapshot->held.size());
+                    for (const auto& exchange : snapshot->held)
+                        remaining_ids.push_back(exchange.id);
+                    std::sort(remaining_ids.begin(), remaining_ids.end());
+                    success = std::none_of(reviewed_publication->held.begin(),
+                        reviewed_publication->held.end(), [&remaining_ids](const auto& exchange) {
+                            return std::binary_search(remaining_ids.begin(), remaining_ids.end(),
+                                exchange.id);
+                        });
+                }
+                if (!success)
+                    error = "The requested intercept state could not be verified";
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Intercept operation failed";
+            }
+            const std::string detail = success
+                ? (reviewed_count > 0 ? std::to_string(reviewed_count) + " exchanges processed" : "Completed")
+                : error;
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed", detail);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (s_intercept_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (!success)
+                    toast_notification::push(error.empty() ? "Intercept operation failed" : error,
+                        toast_notification::toast_type_t::error);
+                s_intercept_operation_pending.store(false, std::memory_order_release);
+                request_intercept_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        s_intercept_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected intercept operation");
+        return false;
+    }
+    return true;
+}
+
+intercept_command_capability_t intercept_command_capability(intercept_command_t command) {
+    const auto snapshot = std::atomic_load_explicit(
+        &s_intercept_runtime_snapshot, std::memory_order_acquire);
+    if (!snapshot)
+        return {false, "The immutable Intercept publication is still loading"};
+    if (!snapshot->running)
+        return {false, "Start the MITM proxy before using Intercept commands"};
+    if (s_intercept_operation_pending.load(std::memory_order_acquire))
+        return {false, "Wait for the current Intercept operation to finish"};
+    if (snapshot->held.empty())
+        return {false, "No held exchanges are available"};
+    if (command == intercept_command_t::forward_selected ||
+        command == intercept_command_t::drop_selected) {
+        if (s_intercept_selected_exchange_id == 0)
+            return {false, "Select a held exchange first"};
+        const bool selected_exists = std::any_of(snapshot->held.begin(), snapshot->held.end(),
+            [](const auto& exchange) {
+                return exchange.id == s_intercept_selected_exchange_id;
+            });
+        if (!selected_exists)
+            return {false, "The selected held exchange changed; select it again"};
+    }
+    return {true, nullptr};
+}
+
+bool execute_intercept_command(intercept_command_t command, std::string* error) {
+    const auto capability = intercept_command_capability(command);
+    if (!capability.enabled) {
+        if (error) *error = capability.disabled_reason ? capability.disabled_reason :
+            "The Intercept command is unavailable";
+        return false;
+    }
+    const auto snapshot = std::atomic_load_explicit(
+        &s_intercept_runtime_snapshot, std::memory_order_acquire);
+    if (!snapshot) {
+        if (error) *error = "The immutable Intercept publication changed before execution";
+        return false;
+    }
+    std::uint64_t selected_id = 0;
+    if (command == intercept_command_t::forward_selected ||
+        command == intercept_command_t::drop_selected) {
+        selected_id = s_intercept_selected_exchange_id;
+        const bool selected_exists = selected_id != 0 &&
+            std::any_of(snapshot->held.begin(), snapshot->held.end(),
+                [selected_id](const auto& exchange) { return exchange.id == selected_id; });
+        if (!selected_exists) {
+            if (error) *error = "The selected held exchange changed before execution";
+            return false;
+        }
+    }
+    switch (command) {
+    case intercept_command_t::forward_selected:
+        if (!request_intercept_operation(intercept_operation_t::forward_one, false,
+                selected_id, {}, 1)) {
+            if (error) *error = "The Intercept executor rejected the selected forward operation";
+            return false;
+        }
+        break;
+    case intercept_command_t::drop_selected:
+        if (const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.network.intercept")); !opened.ok()) {
+            if (error) *error = opened.detail.empty()
+                ? "The Intercept review surface could not be opened" : opened.detail;
+            return false;
+        }
+        s_intercept_drop_review = {true, false, selected_id, 1, {}};
+        break;
+    case intercept_command_t::forward_all:
+        if (!request_intercept_operation(intercept_operation_t::forward_all, false,
+                0, {}, snapshot->held.size(), snapshot)) {
+            if (error) *error = "The Intercept executor rejected the forward-all operation";
+            return false;
+        }
+        break;
+    case intercept_command_t::drop_all:
+        if (const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.network.intercept")); !opened.ok()) {
+            if (error) *error = opened.detail.empty()
+                ? "The Intercept review surface could not be opened" : opened.detail;
+            return false;
+        }
+        s_intercept_drop_review = {true, true, 0, snapshot->held.size(), snapshot};
+        break;
+    }
+    if (error) error->clear();
+    return true;
+}
+
 static void render_intercept(state_t& state, float x, float y, float w, float h,
                               float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
@@ -4176,7 +5488,11 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_intercept", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
-    bool running = mitm_proxy::is_running();
+    request_intercept_runtime_snapshot();
+    const auto intercept_snapshot = std::atomic_load_explicit(
+        &s_intercept_runtime_snapshot, std::memory_order_acquire);
+    const bool running = intercept_snapshot && intercept_snapshot->running;
+    const bool intercept_pending = s_intercept_operation_pending.load(std::memory_order_acquire);
     if (!running) {
         ImVec2 region = ImVec2(w, h);
         ImVec2 region_pos = ImGui::GetCursorScreenPos();
@@ -4189,41 +5505,75 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         return;
     }
 
-    bool intercept_changed = aida::ui::toggle_switch("##intercept_en", &state.intercept_enabled);
+    state.intercept_enabled = intercept_snapshot->enabled;
+    bool requested_intercept_enabled = state.intercept_enabled;
+    if (intercept_pending) ImGui::BeginDisabled();
+    bool intercept_changed = aida::ui::toggle_switch("##intercept_en", &requested_intercept_enabled);
+    if (intercept_pending) ImGui::EndDisabled();
     if (intercept_changed) {
         diag::log_tagged_fmt("network", "intercept_enabled_toggled new=%d",
-            state.intercept_enabled ? 1 : 0);
-        mitm_proxy::set_intercept_enabled(state.intercept_enabled);
+            requested_intercept_enabled ? 1 : 0);
+        request_intercept_operation(intercept_operation_t::set_enabled, requested_intercept_enabled,
+                                    0, {}, 0);
     }
     ImGui::SameLine();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
                        "Intercept Enabled");
     ImGui::SameLine();
 
-    if (aida::ui::button("Forward All", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+    const auto& held = intercept_snapshot->held;
+    const auto forward_all_action = aida::ui::application_ui::present_action(
+        "network.intercept.forward_all");
+    const auto drop_all_action = aida::ui::application_ui::present_action(
+        "network.intercept.drop_all");
+    if (aida::ui::button(intercept_pending ? "Working...##intercept_forward_all" : "Forward All##intercept_forward_all",
+                         aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+                         ImVec2(0.f, 0.f), !forward_all_action.enabled)) {
         diag::log_tagged("network", "intercept_forward_all_clicked");
-        mitm_proxy::forward_all();
+        static_cast<void>(aida::ui::application_ui::execute_action(
+            "network.intercept.forward_all",
+            aida::ui::action_invocation_source_t::toolbar));
+    }
+    if (!forward_all_action.shortcut.empty()) {
+        ImGui::SameLine();
+        aida::ui::kbd_chip(forward_all_action.shortcut.c_str());
     }
     ImGui::SameLine();
-    aida::ui::kbd_chip("Shift+F");
-    ImGui::SameLine();
-    if (aida::ui::button("Drop All", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+    if (aida::ui::button("Drop All##intercept_drop_all", aida::ui::button_kind_t::destructive,
+                         aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !drop_all_action.enabled)) {
         diag::log_tagged("network", "intercept_drop_all_clicked");
-        mitm_proxy::drop_all();
+        static_cast<void>(aida::ui::application_ui::execute_action(
+            "network.intercept.drop_all",
+            aida::ui::action_invocation_source_t::toolbar));
     }
-    ImGui::SameLine();
-    aida::ui::kbd_chip("Shift+D");
+    if (!drop_all_action.shortcut.empty()) {
+        ImGui::SameLine();
+        aida::ui::kbd_chip(drop_all_action.shortcut.c_str());
+    }
 
-    if (state.intercept_enabled) {
+    if (intercept_snapshot->enabled) {
         ImGui::SameLine();
         aida::ui::pill_kind("INTERCEPTING", aida::ui::pill_kind_t::accent, aida::ui::size_t_::sm, true);
     }
 
     ImGui::Spacing();
-
-
-    auto held = mitm_proxy::get_held_exchanges();
     int held_count = static_cast<int>(held.size());
+    if (s_intercept_selected_exchange_id != 0) {
+        const auto selected = std::find_if(held.begin(), held.end(), [](const auto& exchange) {
+            return exchange.id == s_intercept_selected_exchange_id;
+        });
+        if (selected == held.end()) {
+            state.intercept_selected = -1;
+            s_intercept_selected_exchange_id = 0;
+        } else {
+            state.intercept_selected = static_cast<int>(std::distance(held.begin(), selected));
+        }
+    } else if (state.intercept_selected >= 0 && state.intercept_selected < held_count) {
+        s_intercept_selected_exchange_id =
+            held[static_cast<std::size_t>(state.intercept_selected)].id;
+    } else {
+        state.intercept_selected = -1;
+    }
     if (held_count > s_intercept_ui.prev_held_count) {
         s_intercept_ui.border_flash.trigger();
         s_intercept_ui.label_flash.trigger();
@@ -4237,35 +5587,37 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(lbl_col),
                        "Held: %d", held_count);
 
-    bool can_use_shortcuts = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
-                              !ImGui::IsAnyItemActive() && !ImGui::GetIO().WantTextInput;
-    if (can_use_shortcuts) {
-        bool shift = ImGui::GetIO().KeyShift;
-        if (shift && ImGui::IsKeyPressed(ImGuiKey_F)) {
-            diag::log_tagged("network", "intercept_forward_all_shortcut");
-            anti_tamper::webhook::write_log("net_audit", "[net_audit] intercept Shift+F forward_all shortcut fired");
-            mitm_proxy::forward_all();
-        }
-        if (shift && ImGui::IsKeyPressed(ImGuiKey_D)) {
-            diag::log_tagged("network", "intercept_drop_all_shortcut");
-            anti_tamper::webhook::write_log("net_audit", "[net_audit] intercept Shift+D drop_all shortcut fired");
-            mitm_proxy::drop_all();
-        }
-
-
-        if (state.intercept_selected >= 0 && state.intercept_selected < static_cast<int>(held.size())) {
-            auto& sel = held[static_cast<size_t>(state.intercept_selected)];
-            if (!shift && ImGui::IsKeyPressed(ImGuiKey_F)) {
-                diag::log_tagged_fmt("network", "intercept_forward_shortcut id=%llu",
-                    static_cast<unsigned long long>(sel.id));
-                mitm_proxy::forward_exchange(sel.id);
-            }
-            if (!shift && ImGui::IsKeyPressed(ImGuiKey_D)) {
-                diag::log_tagged_fmt("network", "intercept_drop_shortcut id=%llu",
-                    static_cast<unsigned long long>(sel.id));
-                mitm_proxy::drop_exchange(sel.id);
+    if (s_intercept_drop_review.open) {
+        s_intercept_drop_review.open = false;
+        ImGui::OpenPopup("Review Intercept Drop");
+    }
+    if (ImGui::BeginPopupModal("Review Intercept Drop", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (s_intercept_drop_review.all)
+            ImGui::Text("Drop all %zu currently held exchanges?", s_intercept_drop_review.reviewed_count);
+        else
+            ImGui::Text("Drop held exchange %llu?",
+                static_cast<unsigned long long>(s_intercept_drop_review.exchange_id));
+        ImGui::TextUnformatted("Dropped exchanges are not forwarded to their upstream destination.");
+        ImGui::Spacing();
+        if (aida::ui::button("Confirm Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            const bool accepted = request_intercept_operation(
+                s_intercept_drop_review.all ? intercept_operation_t::drop_all : intercept_operation_t::drop_one,
+                false, s_intercept_drop_review.exchange_id, {}, s_intercept_drop_review.reviewed_count,
+                s_intercept_drop_review.reviewed_publication);
+            if (accepted) {
+                s_intercept_drop_review = {};
+                ImGui::CloseCurrentPopup();
+            } else {
+                toast_notification::push("The Intercept executor rejected the reviewed drop operation",
+                    toast_notification::toast_type_t::error);
             }
         }
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            s_intercept_drop_review = {};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::Spacing();
@@ -4323,7 +5675,10 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
                            list_org.y + split_y * 0.5f), dim, msg);
     }
 
-    for (int i = 0; i < static_cast<int>(held.size()); i++) {
+    ImGuiListClipper held_clipper;
+    held_clipper.Begin(static_cast<int>(held.size()), row_h);
+    while (held_clipper.Step()) {
+    for (int i = held_clipper.DisplayStart; i < held_clipper.DisplayEnd; i++) {
         auto& ex = held[static_cast<size_t>(i)];
         float ry = ImGui::GetCursorPosY();
         float abs_ry = ImGui::GetCursorScreenPos().y;
@@ -4338,8 +5693,10 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
 
         ImVec2 mouse = ImGui::GetMousePos();
         if (mouse.x >= list_org.x && mouse.x < list_org.x + list_sz.x - 4.f &&
-            mouse.y >= abs_ry && mouse.y < abs_ry + row_h && ImGui::IsMouseClicked(0))
+            mouse.y >= abs_ry && mouse.y < abs_ry + row_h && ImGui::IsMouseClicked(0)) {
             state.intercept_selected = i;
+            s_intercept_selected_exchange_id = ex.id;
+        }
 
         ImU32 txt_col = aida::ui::with_alpha(is_sel ? th.text_primary : th.text_secondary, alpha);
         cx = list_org.x + 8.f;
@@ -4362,6 +5719,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
 
         ImGui::SetCursorPosY(ry + row_h);
     }
+    }
     ImGui::EndChild();
     (void)dl_outer; (void)outer_pos;
 
@@ -4380,33 +5738,49 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         }
 
         ImGui::Spacing();
-        if (aida::ui::button("Forward", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+        const auto forward_selected_action = aida::ui::application_ui::present_action(
+            "network.intercept.forward_selected");
+        const auto drop_selected_action = aida::ui::application_ui::present_action(
+            "network.intercept.drop_selected");
+        if (aida::ui::button("Forward", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), !forward_selected_action.enabled)) {
             diag::log_tagged_fmt("network", "intercept_forward_clicked id=%llu",
                 static_cast<unsigned long long>(sel.id));
-            mitm_proxy::forward_exchange(sel.id);
+            static_cast<void>(aida::ui::application_ui::execute_action(
+                "network.intercept.forward_selected",
+                aida::ui::action_invocation_source_t::toolbar));
+        }
+        if (!forward_selected_action.shortcut.empty()) {
+            ImGui::SameLine();
+            aida::ui::kbd_chip(forward_selected_action.shortcut.c_str());
         }
         ImGui::SameLine();
-        aida::ui::kbd_chip("F");
-        ImGui::SameLine();
-        if (aida::ui::button("Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        if (aida::ui::button("Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), !drop_selected_action.enabled)) {
             diag::log_tagged_fmt("network", "intercept_drop_clicked id=%llu",
                 static_cast<unsigned long long>(sel.id));
-            mitm_proxy::drop_exchange(sel.id);
+            static_cast<void>(aida::ui::application_ui::execute_action(
+                "network.intercept.drop_selected",
+                aida::ui::action_invocation_source_t::toolbar));
+        }
+        if (!drop_selected_action.shortcut.empty()) {
+            ImGui::SameLine();
+            aida::ui::kbd_chip(drop_selected_action.shortcut.c_str());
         }
         ImGui::SameLine();
-        aida::ui::kbd_chip("D");
-        ImGui::SameLine();
-        if (aida::ui::button("Forward Modified", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        if (aida::ui::button("Forward Modified", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), intercept_pending)) {
             size_t len = strlen(mod_buf);
             if (len > 0) {
                 std::vector<uint8_t> mod_data(mod_buf, mod_buf + len);
                 diag::log_tagged_fmt("network", "intercept_forward_modified id=%llu new_size=%zu",
                     static_cast<unsigned long long>(sel.id), len);
-                mitm_proxy::forward_modified(sel.id, mod_data);
+                request_intercept_operation(intercept_operation_t::forward_modified, false, sel.id,
+                                            std::move(mod_data), 1);
             } else {
                 diag::log_tagged_fmt("network", "intercept_forward_modified id=%llu empty_buf_fallback_forward",
                     static_cast<unsigned long long>(sel.id));
-                mitm_proxy::forward_exchange(sel.id);
+                request_intercept_operation(intercept_operation_t::forward_modified, false, sel.id, {}, 1);
             }
         }
         ImGui::SameLine();
@@ -4425,6 +5799,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
                 static_cast<unsigned long long>(sel.id), sel.target_host.c_str(), sel.target_port,
                 rep->raw_request.size());
             state.repeater_entries.push_back(std::move(rep));
+            publish_repeater_request_artifacts(state);
             state.repeater_selected = static_cast<int>(state.repeater_entries.size()) - 1;
         }
         ImGui::SameLine();
@@ -4489,12 +5864,188 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
 }
 
 
+struct keylog_runtime_snapshot_t {
+    bool watching = false;
+    std::string path;
+    std::size_t entry_count = 0;
+    std::vector<ssl_keylog::keylog_entry> entries;
+};
+
+enum class keylog_operation_t {
+    launch_and_watch,
+    watch_file,
+    stop_watching,
+    clear_entries
+};
+
+static std::shared_ptr<const keylog_runtime_snapshot_t> s_keylog_runtime_snapshot;
+static std::atomic<bool> s_keylog_snapshot_pending{false};
+static std::atomic<std::uint64_t> s_keylog_snapshot_requested_ms{0};
+static std::atomic<bool> s_keylog_operation_pending{false};
+static std::atomic<std::uint64_t> s_keylog_operation_serial{0};
+static std::size_t s_keylog_clear_review_count = 0;
+
+static void publish_keylog_runtime_snapshot(const std::string& known_path = {}) {
+    auto snapshot = std::make_shared<keylog_runtime_snapshot_t>();
+    snapshot->watching = ssl_keylog::is_watching();
+    snapshot->entries = ssl_keylog::get_entries(500);
+    snapshot->entry_count = ssl_keylog::entry_count();
+    if (!known_path.empty()) {
+        snapshot->path = known_path;
+    } else {
+        const auto previous = std::atomic_load_explicit(&s_keylog_runtime_snapshot, std::memory_order_acquire);
+        if (previous)
+            snapshot->path = previous->path;
+    }
+    if (!snapshot->watching)
+        snapshot->path.clear();
+    std::atomic_store_explicit(&s_keylog_runtime_snapshot,
+        std::shared_ptr<const keylog_runtime_snapshot_t>(std::move(snapshot)),
+        std::memory_order_release);
+}
+
+static void request_keylog_runtime_snapshot(bool force = false) {
+    const std::uint64_t now = network_now_ms();
+    const std::uint64_t last = s_keylog_snapshot_requested_ms.load(std::memory_order_acquire);
+    if (!force && last != 0 && now >= last && now - last < 250)
+        return;
+    bool expected = false;
+    if (!s_keylog_snapshot_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    s_keylog_snapshot_requested_ms.store(now, std::memory_order_release);
+    const bool posted = post_network_task(
+        "keylog_snapshot", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        []() {
+            try {
+                publish_keylog_runtime_snapshot();
+            } catch (...) {
+            }
+            s_keylog_snapshot_pending.store(false, std::memory_order_release);
+        }, false);
+    if (!posted)
+        s_keylog_snapshot_pending.store(false, std::memory_order_release);
+}
+
+static void request_keylog_operation(keylog_operation_t operation, std::string path,
+                                     std::string arguments, std::size_t reviewed_count) {
+    bool expected = false;
+    if (!s_keylog_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = s_keylog_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const char* action = "network.keylog.watch";
+    const char* label = "Watch TLS keylog file";
+    std::string target = path;
+    switch (operation) {
+    case keylog_operation_t::launch_and_watch:
+        action = "network.keylog.launch";
+        label = "Launch target with TLS key logging";
+        break;
+    case keylog_operation_t::stop_watching:
+        action = "network.keylog.stop";
+        label = "Stop TLS keylog watcher";
+        break;
+    case keylog_operation_t::clear_entries:
+        action = "network.keylog.clear";
+        label = "Clear captured TLS keys";
+        target = std::to_string(reviewed_count) + " captured keys";
+        break;
+    default:
+        break;
+    }
+    const std::string task_id = register_network_operation(action, label, "view.network.keylog", target);
+    const bool posted = post_network_task(
+        "keylog_mutation",
+        operation == keylog_operation_t::launch_and_watch
+            ? aida::infra::executor::domain_t::external_tool
+            : aida::infra::executor::domain_t::feature_worker,
+        "bounded_task",
+        [serial, operation, path = std::move(path), arguments = std::move(arguments),
+         reviewed_count, task_id]() mutable {
+            bool success = false;
+            std::string effective_path = path;
+            std::string error;
+            std::uint32_t launched_pid = 0;
+            try {
+                switch (operation) {
+                case keylog_operation_t::launch_and_watch: {
+                    auto result = ssl_keylog::launch_with_keylog(path, arguments);
+                    success = result.success;
+                    launched_pid = result.pid;
+                    effective_path = result.keylog_path;
+                    if (success) {
+                        ssl_keylog::start_watching(effective_path);
+                        success = ssl_keylog::is_watching();
+                    }
+                    if (!success)
+                        error = result.error.empty() ? "TLS keylog watcher did not start" : result.error;
+                    break;
+                }
+                case keylog_operation_t::watch_file:
+                    ssl_keylog::start_watching(path);
+                    success = ssl_keylog::is_watching();
+                    if (!success) error = "TLS keylog watcher did not start";
+                    break;
+                case keylog_operation_t::stop_watching:
+                    ssl_keylog::stop_watching();
+                    success = !ssl_keylog::is_watching();
+                    if (!success) error = "TLS keylog watcher did not stop";
+                    break;
+                case keylog_operation_t::clear_entries:
+                    ssl_keylog::clear_entries();
+                    success = ssl_keylog::entry_count() == 0;
+                    if (!success) error = "Captured TLS keys remained after clear";
+                    break;
+                }
+                publish_keylog_runtime_snapshot(success ? effective_path : std::string());
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "TLS keylog operation failed";
+            }
+            std::string detail;
+            if (success && operation == keylog_operation_t::launch_and_watch)
+                detail = "PID " + std::to_string(launched_pid) + "; watching " + effective_path;
+            else if (success && operation == keylog_operation_t::clear_entries)
+                detail = std::to_string(reviewed_count) + " captured keys cleared";
+            else
+                detail = success ? "Completed" : error;
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed", detail);
+            enqueue_ui_completion([serial, operation, success, effective_path = std::move(effective_path),
+                                   error = std::move(error)]() mutable {
+                if (s_keylog_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (success && operation == keylog_operation_t::launch_and_watch)
+                    toast_notification::push("Process launched; TLS keylog watcher is active",
+                        toast_notification::toast_type_t::info);
+                else if (!success)
+                    toast_notification::push(error.empty() ? "TLS keylog operation failed" : error,
+                        toast_notification::toast_type_t::error);
+                s_keylog_operation_pending.store(false, std::memory_order_release);
+                request_keylog_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        s_keylog_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected TLS keylog operation");
+    }
+}
+
 static void render_keylog(state_t& state, float x, float y, float w, float h,
                            float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
     const auto& th = aida::ui::resolved();
     ImGui::SetCursorPos(ImVec2(x, y));
     ImGui::BeginChild("##net_keylog", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
+
+    request_keylog_runtime_snapshot();
+    const auto keylog_snapshot = std::atomic_load_explicit(&s_keylog_runtime_snapshot, std::memory_order_acquire);
+    const bool keylog_watching = keylog_snapshot && keylog_snapshot->watching;
+    const bool keylog_pending = s_keylog_operation_pending.load(std::memory_order_acquire);
+    static const std::vector<ssl_keylog::keylog_entry> empty_keylog_entries;
+    const auto& entries = keylog_snapshot ? keylog_snapshot->entries : empty_keylog_entries;
+    const std::size_t keylog_entry_count = keylog_snapshot ? keylog_snapshot->entry_count : 0;
+    if (state.kl_selected >= static_cast<int>(entries.size()))
+        state.kl_selected = entries.empty() ? -1 : static_cast<int>(entries.size()) - 1;
 
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
@@ -4532,25 +6083,19 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
 
     ImGui::Spacing();
 
-    if (!ssl_keylog::g_state.watching.load()) {
-        if (aida::ui::button("Launch & Watch", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
+    if (!keylog_watching) {
+        const bool can_launch = state.kl_exe_path[0] != '\0';
+        if (aida::ui::button(keylog_pending ? "Launching...##keylog_launch" : "Launch & Watch##keylog_launch",
+                             aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), keylog_pending || !can_launch)) {
             diag::log_tagged_fmt("network", "keylog_launch_clicked exe='%s' args='%s'",
                 state.kl_exe_path, state.kl_args);
-            auto result = ssl_keylog::launch_with_keylog(state.kl_exe_path, state.kl_args);
-            if (result.success) {
-                diag::log_tagged_fmt("network", "keylog_launch_ok pid=%u keylog='%s'",
-                    result.pid, result.keylog_path.c_str());
-                ssl_keylog::start_watching(result.keylog_path);
-                toast_notification::push("SSL keylog: process launched, watching key file",
-                    toast_notification::toast_type_t::info);
-            } else {
-                diag::log_tagged_fmt("network", "keylog_launch_failed err='%s'", result.error.c_str());
-                toast_notification::push(std::string("Failed to launch: ") + result.error,
-                    toast_notification::toast_type_t::error);
-            }
+            request_keylog_operation(keylog_operation_t::launch_and_watch,
+                state.kl_exe_path, state.kl_args, 0);
         }
         ImGui::SameLine();
-        if (aida::ui::button("Watch File...", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        if (aida::ui::button("Watch File...", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), keylog_pending)) {
             char path_buf[MAX_PATH] = {};
             static const char k_keylog_open_filter[] =
                 "SSL Keylog (*.log;*.keylog;*.txt)\0*.log;*.keylog;*.txt\0"
@@ -4564,7 +6109,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
                 diag::log_tagged_fmt("network", "keylog_watch_dialog_pick path='%s'", path_buf);
                 anti_tamper::webhook::write_log("net_audit",
                     (std::string("[net_audit] keylog watch dialog path='") + path_buf + "'").c_str());
-                ssl_keylog::start_watching(path_buf);
+                request_keylog_operation(keylog_operation_t::watch_file, path_buf, {}, 0);
             } else {
                 diag::log_tagged("network", "keylog_watch_dialog_cancelled");
             }
@@ -4575,33 +6120,54 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
         ImGui::SameLine();
         bool can_use_typed = state.kl_watch_path[0] != '\0';
         if (aida::ui::button("Watch", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm,
-                              ImVec2(0.f, 0.f), !can_use_typed) && can_use_typed) {
+                              ImVec2(0.f, 0.f), keylog_pending || !can_use_typed) && can_use_typed) {
             diag::log_tagged_fmt("network", "keylog_watch_typed path='%s'", state.kl_watch_path);
             anti_tamper::webhook::write_log("net_audit",
                 (std::string("[net_audit] keylog watch typed path='") + state.kl_watch_path + "'").c_str());
-            ssl_keylog::start_watching(state.kl_watch_path);
+            request_keylog_operation(keylog_operation_t::watch_file, state.kl_watch_path, {}, 0);
         }
     } else {
         char watch_buf[640];
-        snprintf(watch_buf, sizeof(watch_buf), "Watching: %s", ssl_keylog::g_state.keylog_path.c_str());
+        snprintf(watch_buf, sizeof(watch_buf), "Watching: %s",
+            keylog_snapshot->path.empty() ? "active TLS keylog source" : keylog_snapshot->path.c_str());
         aida::ui::pill_kind(watch_buf, aida::ui::pill_kind_t::accent, aida::ui::size_t_::sm, true);
         ImGui::SameLine();
-        if (aida::ui::button("Stop Watching", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        if (aida::ui::button(keylog_pending ? "Stopping...##keylog_stop" : "Stop Watching##keylog_stop",
+                             aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), keylog_pending)) {
             diag::log_tagged_fmt("network", "keylog_stop_watching path='%s' entries=%zu",
-                ssl_keylog::g_state.keylog_path.c_str(), ssl_keylog::entry_count());
-            ssl_keylog::stop_watching();
+                keylog_snapshot->path.c_str(), keylog_entry_count);
+            request_keylog_operation(keylog_operation_t::stop_watching,
+                keylog_snapshot->path, {}, keylog_entry_count);
         }
         ImGui::SameLine();
-        if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            size_t prev = ssl_keylog::entry_count();
-            ssl_keylog::clear_entries();
-            diag::log_tagged_fmt("network", "keylog_cleared prev_entry_count=%zu", prev);
+        if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                             ImVec2(0.f, 0.f), keylog_pending || keylog_entry_count == 0)) {
+            s_keylog_clear_review_count = keylog_entry_count;
+            ImGui::OpenPopup("Review TLS Key Clear");
         }
+    }
+
+    if (ImGui::BeginPopupModal("Review TLS Key Clear", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Permanently clear %zu captured TLS secrets?", s_keylog_clear_review_count);
+        ImGui::TextUnformatted("Cleared key material cannot be used for later traffic decryption.");
+        ImGui::Spacing();
+        if (aida::ui::button("Confirm Clear", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            request_keylog_operation(keylog_operation_t::clear_entries, {}, {}, s_keylog_clear_review_count);
+            s_keylog_clear_review_count = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+            s_keylog_clear_review_count = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::Spacing();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                       "Captured Keys: %zu", ssl_keylog::entry_count());
+                       "Captured Keys: %zu", keylog_entry_count);
 
     ImGui::Spacing();
 
@@ -4636,7 +6202,6 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
     float list_h = h - (cursor.y + hdr_h + 12.f);
     ImGui::BeginChild("##kl_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
 
-    auto entries = ssl_keylog::get_entries(500);
     ImVec2 list_org = ImGui::GetWindowPos();
     ImVec2 list_sz  = ImGui::GetWindowSize();
     dl->PushClipRect(list_org, ImVec2(list_org.x + list_sz.x, list_org.y + list_sz.y), true);
@@ -4654,7 +6219,12 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
         return;
     }
 
-    for (int i = static_cast<int>(entries.size()) - 1; i >= 0; i--) {
+    ImGuiListClipper keylog_clipper;
+    keylog_clipper.Begin(static_cast<int>(entries.size()), row_h);
+    while (keylog_clipper.Step()) {
+    for (int visible_index = keylog_clipper.DisplayStart;
+         visible_index < keylog_clipper.DisplayEnd; ++visible_index) {
+        const int i = static_cast<int>(entries.size()) - 1 - visible_index;
         auto& e = entries[static_cast<size_t>(i)];
 
         float row_alpha = 1.f;
@@ -4718,6 +6288,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
 
         ImGui::SetCursorPosY(ry + row_h);
     }
+    }
     dl->PopClipRect();
 
     if (state.kl_auto_scroll && !entries.empty())
@@ -4748,92 +6319,191 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
 }
 
 
-#ifndef AIDA_IMGUI_STUDIO_PREVIEW
-static void write_pcap_header(std::ofstream& f) {
+static constexpr std::size_t k_network_export_limit = 256ULL * 1024ULL * 1024ULL;
 
-    uint32_t magic = 0xa1b2c3d4;
-    uint16_t ver_major = 2, ver_minor = 4;
-    int32_t  thiszone = 0;
-    uint32_t sigfigs = 0, snaplen = 65535, network = 1;
-    f.write(reinterpret_cast<const char*>(&magic), 4);
-    f.write(reinterpret_cast<const char*>(&ver_major), 2);
-    f.write(reinterpret_cast<const char*>(&ver_minor), 2);
-    f.write(reinterpret_cast<const char*>(&thiszone), 4);
-    f.write(reinterpret_cast<const char*>(&sigfigs), 4);
-    f.write(reinterpret_cast<const char*>(&snaplen), 4);
-    f.write(reinterpret_cast<const char*>(&network), 4);
+template <typename Value>
+static bool append_export_value(std::vector<std::uint8_t>& output, const Value& value) {
+    if (output.size() > k_network_export_limit - sizeof(Value))
+        return false;
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&value);
+    output.insert(output.end(), bytes, bytes + sizeof(Value));
+    return true;
 }
 
-static void write_pcap_packet(std::ofstream& f, const packet_entry_t& pkt) {
+static bool append_export_bytes(std::vector<std::uint8_t>& output, const std::uint8_t* data,
+                                std::size_t size) {
+    if ((size != 0 && !data) || size > k_network_export_limit ||
+        output.size() > k_network_export_limit - size)
+        return false;
+    if (size == 0)
+        return true;
+    output.insert(output.end(), data, data + size);
+    return true;
+}
 
-    uint32_t ts_sec = static_cast<uint32_t>(pkt.timestamp / 1000);
-    uint32_t ts_usec = static_cast<uint32_t>((pkt.timestamp % 1000) * 1000);
-
-
-    uint32_t transport_hdr_len = (pkt.protocol == 6) ? 20 : 8;
-    uint32_t ip_total_len = 20 + transport_hdr_len + pkt.payload_size;
-    uint32_t frame_len = 14 + ip_total_len;
-
-    std::vector<uint8_t> frame(frame_len, 0);
-
-
-    frame[12] = 0x08; frame[13] = 0x00;
-
-
-    uint8_t* ip = frame.data() + 14;
-    ip[0] = 0x45;
-    ip[2] = static_cast<uint8_t>((ip_total_len >> 8) & 0xff);
-    ip[3] = static_cast<uint8_t>(ip_total_len & 0xff);
-    ip[8] = 64;
-    ip[9] = pkt.protocol;
-
-
-    if (pkt.direction == 1) {
-        memcpy(ip + 12, pkt.src_addr, 4);
-        memcpy(ip + 16, pkt.dst_addr, 4);
-    } else {
-        memcpy(ip + 12, pkt.dst_addr, 4);
-        memcpy(ip + 16, pkt.src_addr, 4);
+static bool serialize_pcap(const std::vector<packet_entry_t>& packets, std::uint32_t filter_pid,
+                           std::uint8_t filter_protocol, std::vector<std::uint8_t>& output,
+                           std::uint32_t& written, std::string& error) {
+    output.clear();
+    output.reserve((std::min)(k_network_export_limit, static_cast<std::size_t>(24 + packets.size() * 128)));
+    const std::uint32_t magic = 0xa1b2c3d4;
+    const std::uint16_t major = 2;
+    const std::uint16_t minor = 4;
+    const std::int32_t timezone = 0;
+    const std::uint32_t sigfigs = 0;
+    const std::uint32_t snaplen = 65535;
+    const std::uint32_t linktype = 1;
+    if (!append_export_value(output, magic) || !append_export_value(output, major) ||
+        !append_export_value(output, minor) || !append_export_value(output, timezone) ||
+        !append_export_value(output, sigfigs) || !append_export_value(output, snaplen) ||
+        !append_export_value(output, linktype)) {
+        error = "PCAP header exceeds export limit";
+        return false;
     }
-
-
-    uint32_t cksum = 0;
-    for (int i = 0; i < 20; i += 2)
-        cksum += (static_cast<uint32_t>(ip[i]) << 8) | ip[i + 1];
-    while (cksum >> 16) cksum = (cksum & 0xffff) + (cksum >> 16);
-    uint16_t ip_cksum = static_cast<uint16_t>(~cksum);
-    ip[10] = static_cast<uint8_t>(ip_cksum >> 8);
-    ip[11] = static_cast<uint8_t>(ip_cksum & 0xff);
-
-
-    uint8_t* th = ip + 20;
-    uint16_t sp = pkt.direction == 1 ? pkt.src_port : pkt.dst_port;
-    uint16_t dp = pkt.direction == 1 ? pkt.dst_port : pkt.src_port;
-    th[0] = static_cast<uint8_t>(sp >> 8); th[1] = static_cast<uint8_t>(sp & 0xff);
-    th[2] = static_cast<uint8_t>(dp >> 8); th[3] = static_cast<uint8_t>(dp & 0xff);
-    if (pkt.protocol == 6) {
-        th[12] = 0x50;
-        th[13] = 0x18;
-    } else {
-        uint16_t udp_len = static_cast<uint16_t>(8 + pkt.payload_size);
-        th[4] = static_cast<uint8_t>(udp_len >> 8);
-        th[5] = static_cast<uint8_t>(udp_len & 0xff);
+    written = 0;
+    for (const auto& packet : packets) {
+        if (filter_pid != 0 && packet.pid != filter_pid)
+            continue;
+        if (filter_protocol != 0 && packet.protocol != filter_protocol)
+            continue;
+        const std::uint32_t transport_size = packet.protocol == 6 ? 20U : 8U;
+        const std::size_t protocol_payload_limit = 65535U - 20U - transport_size;
+        const std::size_t payload_size = (std::min)({packet.payload.size(),
+            static_cast<std::size_t>(packet.payload_size), protocol_payload_limit});
+        const std::uint32_t ip_size = static_cast<std::uint32_t>(20U + transport_size + payload_size);
+        const std::uint32_t frame_size = 14U + ip_size;
+        if (output.size() > k_network_export_limit - 16U - frame_size) {
+            error = "PCAP export exceeds the 256 MiB safety limit";
+            return false;
+        }
+        std::vector<std::uint8_t> frame(frame_size, 0);
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        std::uint8_t* ip = frame.data() + 14;
+        ip[0] = 0x45;
+        ip[2] = static_cast<std::uint8_t>((ip_size >> 8) & 0xff);
+        ip[3] = static_cast<std::uint8_t>(ip_size & 0xff);
+        ip[8] = 64;
+        ip[9] = packet.protocol;
+        if (packet.direction == 1) {
+            std::memcpy(ip + 12, packet.src_addr, 4);
+            std::memcpy(ip + 16, packet.dst_addr, 4);
+        } else {
+            std::memcpy(ip + 12, packet.dst_addr, 4);
+            std::memcpy(ip + 16, packet.src_addr, 4);
+        }
+        std::uint32_t checksum = 0;
+        for (int index = 0; index < 20; index += 2)
+            checksum += (static_cast<std::uint32_t>(ip[index]) << 8) | ip[index + 1];
+        while (checksum >> 16)
+            checksum = (checksum & 0xffff) + (checksum >> 16);
+        const std::uint16_t ip_checksum = static_cast<std::uint16_t>(~checksum);
+        ip[10] = static_cast<std::uint8_t>(ip_checksum >> 8);
+        ip[11] = static_cast<std::uint8_t>(ip_checksum & 0xff);
+        std::uint8_t* transport = ip + 20;
+        const std::uint16_t source_port = packet.direction == 1 ? packet.src_port : packet.dst_port;
+        const std::uint16_t destination_port = packet.direction == 1 ? packet.dst_port : packet.src_port;
+        transport[0] = static_cast<std::uint8_t>(source_port >> 8);
+        transport[1] = static_cast<std::uint8_t>(source_port & 0xff);
+        transport[2] = static_cast<std::uint8_t>(destination_port >> 8);
+        transport[3] = static_cast<std::uint8_t>(destination_port & 0xff);
+        if (packet.protocol == 6) {
+            transport[12] = 0x50;
+            transport[13] = 0x18;
+        } else {
+            const std::uint16_t udp_size = static_cast<std::uint16_t>(8U + payload_size);
+            transport[4] = static_cast<std::uint8_t>(udp_size >> 8);
+            transport[5] = static_cast<std::uint8_t>(udp_size & 0xff);
+        }
+        if (payload_size != 0)
+            std::memcpy(transport + transport_size, packet.payload.data(), payload_size);
+        const std::uint32_t seconds = static_cast<std::uint32_t>(packet.timestamp / 1000);
+        const std::uint32_t microseconds = static_cast<std::uint32_t>((packet.timestamp % 1000) * 1000);
+        if (!append_export_value(output, seconds) || !append_export_value(output, microseconds) ||
+            !append_export_value(output, frame_size) || !append_export_value(output, frame_size) ||
+            !append_export_bytes(output, frame.data(), frame.size())) {
+            error = "PCAP export exceeds the 256 MiB safety limit";
+            return false;
+        }
+        ++written;
     }
+    return true;
+}
 
-
-    if (pkt.payload_size > 0 && !pkt.payload.empty()) {
-        memcpy(th + transport_hdr_len, pkt.payload.data(),
-            std::min<size_t>(pkt.payload_size, pkt.payload.size()));
+#ifndef AIDA_IMGUI_STUDIO_PREVIEW
+static bool atomic_write_export(const std::string& destination, const std::uint8_t* data,
+                                std::size_t size, std::string& error) {
+    if (destination.empty() || (size != 0 && !data) || size > k_network_export_limit) {
+        error = "Export destination or payload is invalid";
+        return false;
     }
-
-
-    f.write(reinterpret_cast<const char*>(&ts_sec), 4);
-    f.write(reinterpret_cast<const char*>(&ts_usec), 4);
-    f.write(reinterpret_cast<const char*>(&frame_len), 4);
-    f.write(reinterpret_cast<const char*>(&frame_len), 4);
-    f.write(reinterpret_cast<const char*>(frame.data()), static_cast<std::streamsize>(frame_len));
+    const std::string temporary = destination + ".aida-tmp-" +
+        std::to_string(GetCurrentProcessId()) + "-" +
+        std::to_string(s_network_operation_sequence.fetch_add(1, std::memory_order_acq_rel));
+    HANDLE file = CreateFileA(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                              FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = "Cannot create temporary export file (Win32 " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    bool success = true;
+    std::size_t offset = 0;
+    while (offset < size) {
+        const DWORD chunk = static_cast<DWORD>((std::min)(size - offset, static_cast<std::size_t>(1024 * 1024)));
+        DWORD wrote = 0;
+        if (!WriteFile(file, data + offset, chunk, &wrote, nullptr) || wrote != chunk) {
+            error = "Export write failed or was partial (Win32 " + std::to_string(GetLastError()) + ")";
+            success = false;
+            break;
+        }
+        offset += wrote;
+    }
+    LARGE_INTEGER exact_size{};
+    if (success && (!FlushFileBuffers(file) || !GetFileSizeEx(file, &exact_size) ||
+                    exact_size.QuadPart != static_cast<LONGLONG>(size))) {
+        error = "Export flush or size verification failed (Win32 " + std::to_string(GetLastError()) + ")";
+        success = false;
+    }
+    CloseHandle(file);
+    if (success && !MoveFileExA(temporary.c_str(), destination.c_str(),
+                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        error = "Atomic export replacement failed (Win32 " + std::to_string(GetLastError()) + ")";
+        success = false;
+    }
+    if (!success)
+        DeleteFileA(temporary.c_str());
+    return success;
 }
 #endif
+
+static bool serialize_har_bounded(const std::vector<mitm_proxy::http_exchange>& history,
+                                  std::string& serialized, std::string& error) {
+    if (history.size() > 4096) {
+        error = "HAR history exceeds the 4096-exchange safety limit";
+        return false;
+    }
+    std::size_t source_bytes = 0;
+    for (const auto& exchange : history) {
+        const std::size_t exchange_bytes = exchange.raw_request.size() + exchange.raw_response.size();
+        if (exchange_bytes > k_network_export_limit || source_bytes > k_network_export_limit - exchange_bytes) {
+            error = "HAR source history exceeds the 256 MiB safety limit";
+            return false;
+        }
+        source_bytes += exchange_bytes;
+    }
+    try {
+        serialized = flow_serializer::export_har_1_2(history).dump(2);
+    } catch (const std::exception& exception) {
+        error = exception.what();
+        return false;
+    }
+    if (serialized.size() > k_network_export_limit) {
+        serialized.clear();
+        error = "Serialized HAR exceeds the 256 MiB safety limit";
+        return false;
+    }
+    return true;
+}
 
 static void render_pcap_export(state_t& state, float x, float y, float w, float h,
                                 float alpha, float ar, float ag, float ab) {
@@ -4908,11 +6578,8 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 
     ImGui::Spacing();
 
-    size_t cap_count = 0;
-    {
-        std::lock_guard<std::mutex> lock(state.cap_mutex);
-        cap_count = state.captured_packets.size();
-    }
+    const auto export_packets = std::atomic_load_explicit(&state.capture_snapshot, std::memory_order_acquire);
+    const size_t cap_count = export_packets ? export_packets->size() : 0;
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                        "Captured packets available: %zu", cap_count);
@@ -4926,73 +6593,59 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             state.pcap_writing.store(true);
             state.pcap_written_count.store(0);
             {
-                std::lock_guard<std::mutex> elock(state.pcap_error_mutex);
+                std::lock_guard<std::mutex> status_lock(state.pcap_error_mutex);
                 state.pcap_last_error.clear();
+                state.pcap_last_path.clear();
             }
 
-
-            std::deque<packet_entry_t> packets_copy;
-            {
-                std::lock_guard<std::mutex> lock(state.cap_mutex);
-                packets_copy = state.captured_packets;
-            }
-
-            auto path = std::string(state.pcap_path);
-            auto filter_pid = state.pcap_filter_pid;
-            auto filter_proto = state.pcap_filter_protocol;
+            const auto path = std::string(state.pcap_path);
+            const auto filter_pid = state.pcap_filter_pid;
+            const auto filter_proto = state.pcap_filter_protocol;
+            const std::string task_id = register_network_operation(
+                "network.pcap.export", "Export packet capture", "view.network.pcap",
+                path + " pid=" + std::to_string(filter_pid) + " protocol=" + std::to_string(filter_proto));
 
             diag::log_tagged_fmt("network", "pcap_export_clicked path='%s' filter_pid=%u filter_proto=%u source_packets=%zu",
-                path.c_str(), filter_pid, filter_proto, packets_copy.size());
+                path.c_str(), filter_pid, filter_proto, export_packets ? export_packets->size() : 0);
             anti_tamper::webhook::write_log("net_audit",
                 ("[net_audit] pcap export start path='" + path + "'").c_str());
 
-            const bool posted = post_network_task("pcap_export", aida::infra::executor::domain_t::diagnostics, "bounded_task", [packets_copy = std::move(packets_copy), path, filter_pid, filter_proto,
-                         st = &state]() {
+            const bool posted = post_network_task("pcap_export", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+                [packets = export_packets, path, filter_pid, filter_proto, task_id]() {
+                bool success = false;
+                std::uint32_t count = 0;
+                std::string error;
+                std::vector<std::uint8_t> bytes;
+                if (!packets) {
+                    error = "The capture snapshot is no longer available";
+                } else {
+                    success = serialize_pcap(*packets, filter_pid, filter_proto, bytes, count, error);
+                }
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
-                uint32_t count = 0;
-                for (const auto& packet : packets_copy) {
-                    if (filter_pid != 0 && packet.pid != filter_pid) continue;
-                    if (filter_proto != 0 && packet.protocol != filter_proto) continue;
-                    ++count;
-                }
-                st->pcap_written_count.store(count, std::memory_order_release);
-                st->pcap_writing.store(false, std::memory_order_release);
-                aida::preview::network::record_receipt("PCAP export", path + " " + std::to_string(count) + " packets");
+                if (success)
+                    aida::preview::network::record_receipt("PCAP export",
+                        path + " " + std::to_string(count) + " packets " + std::to_string(bytes.size()) + " bytes");
 #else
-                std::ofstream f(path, std::ios::binary);
-                if (!f.is_open()) {
-                    diag::log_tagged_fmt("network", "pcap_export_failed_open path='%s'", path.c_str());
-                    anti_tamper::webhook::write_log("net_audit",
-                        ("[net_audit] pcap export FAILED open path='" + path + "'").c_str());
-                    {
-                        std::lock_guard<std::mutex> elock(st->pcap_error_mutex);
-                        st->pcap_last_error = "Cannot open '" + path + "' for writing";
-                    }
-                    st->pcap_writing.store(false);
-                    return;
-                }
-                write_pcap_header(f);
-
-                uint32_t count = 0;
-                for (auto& pkt : packets_copy) {
-                    if (filter_pid != 0 && pkt.pid != filter_pid) continue;
-                    if (filter_proto != 0 && pkt.protocol != filter_proto) continue;
-                    write_pcap_packet(f, pkt);
-                    count++;
-                }
-                st->pcap_written_count.store(count);
-                f.close();
-                st->pcap_writing.store(false);
-                diag::log_tagged_fmt("network", "pcap_export_done path='%s' written=%u",
-                    path.c_str(), count);
-                anti_tamper::webhook::write_log("net_audit",
-                    ("[net_audit] pcap export ok path='" + path + "' written=" + std::to_string(count)).c_str());
+                if (success)
+                    success = atomic_write_export(path, bytes.data(), bytes.size(), error);
 #endif
-            });
+                finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                    success ? std::to_string(count) + " packets written atomically to " + path : error);
+                enqueue_ui_completion([success, count, path, error = std::move(error)]() {
+                    {
+                        std::lock_guard<std::mutex> status_lock(g_state.pcap_error_mutex);
+                        g_state.pcap_last_error = success ? std::string() : error;
+                        g_state.pcap_last_path = success ? path : std::string();
+                    }
+                    g_state.pcap_written_count.store(success ? count : 0, std::memory_order_release);
+                    g_state.pcap_writing.store(false, std::memory_order_release);
+                });
+            }, false);
             if (!posted) {
                 std::lock_guard<std::mutex> elock(state.pcap_error_mutex);
                 state.pcap_last_error = "Executor rejected PCAP export";
                 state.pcap_writing.store(false);
+                finish_network_operation(task_id, false, "Rejected", state.pcap_last_error);
             }
         }
         if (!can_export) {
@@ -5020,10 +6673,15 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
 
     uint32_t exported_count = state.pcap_written_count.load();
     if (exported_count > 0 && !state.pcap_writing.load()) {
+        std::string exported_path;
+        {
+            std::lock_guard<std::mutex> status_lock(state.pcap_error_mutex);
+            exported_path = state.pcap_last_path;
+        }
         ImGui::Spacing();
         char done_buf[640];
         snprintf(done_buf, sizeof(done_buf), "Exported %u packets to %s",
-                 exported_count, state.pcap_path);
+                 exported_count, exported_path.c_str());
         aida::ui::pill_kind(done_buf, aida::ui::pill_kind_t::success, aida::ui::size_t_::sm, false);
     }
 
@@ -5035,11 +6693,17 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
                        "Export Proxy History");
     ImGui::Spacing();
 
-    size_t proxy_count = mitm_proxy::history_count();
+    request_proxy_runtime_snapshot();
+    const auto proxy_export_snapshot = std::atomic_load_explicit(
+        &s_proxy_runtime_snapshot, std::memory_order_acquire);
+    const std::size_t proxy_count = proxy_export_snapshot ? proxy_export_snapshot->history.size() : 0;
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                        "Proxy exchanges available: %zu", proxy_count);
 
-    if (aida::ui::button("Export Proxy as HAR", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+    const bool har_writing = state.har_writing.load(std::memory_order_acquire);
+    if (aida::ui::button(har_writing ? "Exporting HAR...##har_export" : "Export Proxy as HAR##har_export",
+                         aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
+                         ImVec2(0.f, 0.f), har_writing || proxy_count == 0)) {
         char har_buf[MAX_PATH] = {};
         char temp[MAX_PATH] = {};
         GetTempPathA(MAX_PATH, temp);
@@ -5058,53 +6722,94 @@ static void render_pcap_export(state_t& state, float x, float y, float w, float 
             anti_tamper::webhook::write_log("net_audit",
                 "[net_audit] HAR export dialog cancelled");
         } else {
-        std::string har_path(har_buf);
+        const std::string har_path(har_buf);
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
         aida::preview::network::record_receipt("Export HAR", har_path);
 #endif
-
-        auto history = mitm_proxy::get_history(0);
+        state.har_writing.store(true, std::memory_order_release);
+        state.har_written_count.store(0, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> status_lock(state.har_status_mutex);
+            state.har_last_error.clear();
+            state.har_last_path.clear();
+        }
+        const std::string task_id = register_network_operation(
+            "network.har.export", "Export proxy history as HAR", "view.network.proxy", har_path);
         diag::log_tagged_fmt("network", "har_export_clicked path='%s' history_count=%zu",
-            har_path.c_str(), history.size());
+            har_path.c_str(), proxy_count);
         anti_tamper::webhook::write_log("net_audit",
             (std::string("[net_audit] HAR export path='") + har_path + "' count=" +
-             std::to_string(history.size())).c_str());
-        (void)post_network_task("har_export", aida::infra::executor::domain_t::diagnostics, "bounded_task", [history = std::move(history), har_path]() {
+             std::to_string(proxy_count)).c_str());
+        const bool posted = post_network_task(
+            "har_export", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+            [har_path, task_id]() {
+            bool success = false;
+            std::size_t count = 0;
+            std::string serialized;
+            std::string error;
+            try {
+                auto history = mitm_proxy::get_history(4096);
+                count = history.size();
+                success = serialize_har_bounded(history, serialized, error);
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
-            aida::preview::network::record_receipt("HAR export", har_path + " " + std::to_string(history.size()) + " exchanges");
+                if (success)
+                    aida::preview::network::record_receipt("HAR export", har_path + " " +
+                        std::to_string(count) + " exchanges " + std::to_string(serialized.size()) + " bytes");
 #else
-            std::ofstream f(har_path);
-            if (!f.is_open()) {
-                diag::log_tagged_fmt("network", "har_export_failed_open path='%s'", har_path.c_str());
-                return;
-            }
-
-            f << "{\n  \"log\": {\n    \"version\": \"1.2\",\n    \"entries\": [\n";
-            for (size_t i = 0; i < history.size(); i++) {
-                auto& ex = history[i];
-                if (i > 0) f << ",\n";
-                f << "      {\n";
-                f << "        \"request\": {\n";
-                f << "          \"method\": \"" << ex.request.method << "\",\n";
-                f << "          \"url\": \"" << (ex.is_tls ? "https://" : "http://")
-                  << ex.target_host << ex.request.uri << "\",\n";
-                f << "          \"httpVersion\": \"" << ex.request.version << "\",\n";
-                f << "          \"bodySize\": " << ex.request_size << "\n";
-                f << "        },\n";
-                f << "        \"response\": {\n";
-                f << "          \"status\": " << ex.response.status_code << ",\n";
-                f << "          \"statusText\": \"" << ex.response.reason << "\",\n";
-                f << "          \"bodySize\": " << ex.response_size << "\n";
-                f << "        },\n";
-                f << "        \"time\": " << ex.latency_ms << "\n";
-                f << "      }";
-            }
-            f << "\n    ]\n  }\n}\n";
-            f.close();
-            diag::log_tagged_fmt("network", "har_export_done path='%s' entries=%zu",
-                har_path.c_str(), history.size());
+                if (success)
+                    success = atomic_write_export(har_path,
+                        reinterpret_cast<const std::uint8_t*>(serialized.data()), serialized.size(), error);
 #endif
-        });
+            } catch (const std::exception& exception) {
+                success = false;
+                error = exception.what();
+            } catch (...) {
+                success = false;
+                error = "HAR export failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(count) + " exchanges written atomically to " + har_path : error);
+            enqueue_ui_completion([success, count, har_path, error = std::move(error)]() {
+                {
+                    std::lock_guard<std::mutex> status_lock(g_state.har_status_mutex);
+                    g_state.har_last_error = success ? std::string() : error;
+                    g_state.har_last_path = success ? har_path : std::string();
+                }
+                g_state.har_written_count.store(success ? static_cast<std::uint32_t>(count) : 0,
+                                                std::memory_order_release);
+                g_state.har_writing.store(false, std::memory_order_release);
+            });
+        }, false);
+        if (!posted) {
+            state.har_writing.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> status_lock(state.har_status_mutex);
+                state.har_last_error = "Executor rejected HAR export";
+            }
+            finish_network_operation(task_id, false, "Rejected", "Executor rejected HAR export");
+        }
+        }
+    }
+
+    {
+        std::string har_error;
+        std::string har_path;
+        {
+            std::lock_guard<std::mutex> status_lock(state.har_status_mutex);
+            har_error = state.har_last_error;
+            har_path = state.har_last_path;
+        }
+        if (!har_error.empty()) {
+            ImGui::Spacing();
+            aida::ui::pill_kind(har_error.c_str(), aida::ui::pill_kind_t::error,
+                                aida::ui::size_t_::sm, true);
+        } else if (!har_path.empty() && state.har_written_count.load(std::memory_order_acquire) > 0) {
+            ImGui::Spacing();
+            const std::string receipt = "Exported " +
+                std::to_string(state.har_written_count.load(std::memory_order_acquire)) +
+                " exchanges to " + har_path;
+            aida::ui::pill_kind(receipt.c_str(), aida::ui::pill_kind_t::success,
+                                aida::ui::size_t_::sm, false);
         }
     }
 
@@ -6549,9 +8254,8 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
             state.ws_selected = static_cast<int>(i);
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             state.ws_selected = static_cast<int>(i);
-            s_websocket_context = {fr.timestamp, fr.exchange_id, fr.payload.size(),
-                fr.is_outbound, fr.opcode};
-            ImGui::OpenPopupEx(ImHashStr("aida.network.websocket.context"));
+            open_exchange_context(websocket_artifact_identity(fr), {},
+                                  exchange_context_origin_t::pointer);
         }
 
         cx = 8.f;
@@ -6578,63 +8282,20 @@ static void render_websocket(state_t& state, float x, float y, float w, float h,
     }
     }
 
-    if (state.ws_selected >= 0 && state.ws_selected < static_cast<int>(state.ws_frames.size()) &&
+    const bool websocket_menu_key = state.ws_selected >= 0 &&
+        state.ws_selected < static_cast<int>(state.ws_frames.size()) &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
+        ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+    const bool websocket_shift_f10 = !websocket_menu_key && state.ws_selected >= 0 &&
+        state.ws_selected < static_cast<int>(state.ws_frames.size()) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+    if (websocket_menu_key || websocket_shift_f10) {
         const auto& frame = state.ws_frames[static_cast<size_t>(state.ws_selected)];
-        s_websocket_context = {frame.timestamp, frame.exchange_id, frame.payload.size(),
-            frame.is_outbound, frame.opcode};
-        ImGui::OpenPopupEx(ImHashStr("aida.network.websocket.context"));
-    }
-
-    if (ImGui::BeginPopupEx(ImHashStr("aida.network.websocket.context"), ImGuiWindowFlags_AlwaysAutoResize)) {
-        const auto frame = std::find_if(state.ws_frames.begin(), state.ws_frames.end(), [](const state_t::ws_frame_entry_t& candidate) {
-            return candidate.timestamp == s_websocket_context.timestamp &&
-                candidate.exchange_id == s_websocket_context.exchange_id &&
-                candidate.payload.size() == s_websocket_context.payload_size &&
-                candidate.is_outbound == s_websocket_context.outbound &&
-                candidate.opcode == s_websocket_context.opcode;
-        });
-        if (frame == state.ws_frames.end()) {
-            menu_item_disabled("WebSocket frame is stale", "The bounded frame buffer advanced; reopen the menu on a current frame");
-        } else {
-            artifact_identity_t frame_identity;
-            frame_identity.kind = artifact_kind_t::websocket_frame;
-            frame_identity.id = "network.websocket." + std::to_string(frame->exchange_id) + "." +
-                std::to_string(frame->timestamp) + (frame->is_outbound ? ".out" : ".in");
-            frame_identity.parent_id = "network.exchange." + std::to_string(frame->exchange_id);
-            frame_identity.source_view_id = "view.network.websocket";
-            frame_identity.source_id = frame->exchange_id;
-            frame_identity.timestamp = frame->timestamp;
-            frame_identity.content_size = frame->payload.size();
-            frame_identity.content_hash = artifact_hash(frame->payload);
-            frame_identity.label = std::string(frame->is_outbound ? "Outbound" : "Inbound") + " WebSocket frame";
-            frame_identity.target_host = frame->host;
-            frame_identity.target_port = frame->port;
-            std::string handoff_reason;
-            if (ImGui::MenuItem("Copy Payload")) {
-                const std::string payload = payload_display_text(frame->payload);
-                ImGui::SetClipboardText(payload.c_str());
-            }
-            if (ImGui::MenuItem("Copy Host"))
-                ImGui::SetClipboardText(frame->host.c_str());
-            if (ImGui::MenuItem("Send Payload to Comparer"))
-                (void)send_artifact_to_comparer(frame_identity, handoff_reason);
-            if (ImGui::MenuItem("Add Frame to AI Chat"))
-                (void)add_artifact_to_chat(frame_identity, handoff_reason);
-            if (ImGui::MenuItem("Assign Frame to Agent"))
-                (void)assign_artifact_to_agent(frame_identity, handoff_reason);
-            ImGui::Separator();
-            if (ImGui::MenuItem("Filter by Host"))
-                std::snprintf(state.ws_filter_text, sizeof(state.ws_filter_text), "%s", frame->host.c_str());
-            if (ImGui::MenuItem(state.ws_auto_scroll ? "Disable Follow Tail" : "Enable Follow Tail"))
-                state.ws_auto_scroll = !state.ws_auto_scroll;
-            ImGui::Separator();
-            menu_item_disabled("Replay Frame Now", "Frame replay is a live network mutation; review connection, direction, opcode, and payload in WebSocket Editor first");
-            menu_item_disabled("Send to WebSocket Editor", "The WebSocket Editor backend does not expose a capability-backed import operation for captured frames");
-        }
-        ImGui::EndPopup();
+        open_exchange_context(websocket_artifact_identity(frame), {},
+            websocket_menu_key
+                ? exchange_context_origin_t::menu_key
+                : exchange_context_origin_t::shift_f10);
     }
 
     if (state.ws_auto_scroll && !state.ws_frames.empty())
@@ -6808,6 +8469,389 @@ namespace scripting_detail {
 
 }
 
+struct script_runtime_snapshot_t {
+    bool initialized = false;
+    std::size_t hook_count = 0;
+    std::vector<script_engine::log_entry> log;
+};
+
+static std::shared_ptr<const script_runtime_snapshot_t> s_script_runtime_snapshot;
+static std::atomic<bool> s_script_snapshot_pending{false};
+static std::atomic<std::uint64_t> s_script_snapshot_requested_ms{0};
+
+static void request_script_runtime_snapshot(bool force = false) {
+    const std::uint64_t now = network_now_ms();
+    const std::uint64_t last = s_script_snapshot_requested_ms.load(std::memory_order_acquire);
+    if (!force && last != 0 && now >= last && now - last < 250)
+        return;
+    bool expected = false;
+    if (!s_script_snapshot_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    s_script_snapshot_requested_ms.store(now, std::memory_order_release);
+    const bool posted = post_network_task(
+        "script_snapshot", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        []() {
+            auto snapshot = std::make_shared<script_runtime_snapshot_t>();
+            try {
+                snapshot->initialized = script_engine::is_initialized();
+                snapshot->hook_count = script_engine::registered_hook_count();
+                snapshot->log = script_engine::get_log(2048);
+                std::atomic_store_explicit(&s_script_runtime_snapshot,
+                    std::shared_ptr<const script_runtime_snapshot_t>(std::move(snapshot)),
+                    std::memory_order_release);
+            } catch (...) {
+            }
+            s_script_snapshot_pending.store(false, std::memory_order_release);
+        }, false);
+    if (!posted)
+        s_script_snapshot_pending.store(false, std::memory_order_release);
+}
+
+static void request_script_load(state_t& state, std::string path) {
+    bool expected = false;
+    if (!state.script_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.script_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.scripts.load", "Load network automation script", "view.network.scripting", path);
+    const bool posted = post_network_task(
+        "script_load", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, path = std::move(path), task_id]() {
+            bool success = false;
+            std::string error;
+            std::string name;
+            try {
+                success = script_engine::load_script(path);
+                name = std::filesystem::path(path).stem().string();
+                if (!success)
+                    error = "Script engine rejected the selected file";
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Script load failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? "Loaded " + name : error);
+            enqueue_ui_completion([serial, success, path, name, error = std::move(error)]() {
+                if (g_state.script_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (success) {
+                    const auto found = std::find_if(g_state.scripts.begin(), g_state.scripts.end(),
+                        [&name](const state_t::script_entry_t& entry) { return entry.name == name; });
+                    if (found != g_state.scripts.end()) {
+                        found->path = path;
+                        found->loaded = true;
+                        found->enabled = true;
+                        g_state.script_selected = static_cast<int>(std::distance(g_state.scripts.begin(), found));
+                    } else {
+                        state_t::script_entry_t entry;
+                        entry.name = name;
+                        entry.path = path;
+                        entry.enabled = true;
+                        entry.loaded = true;
+                        g_state.scripts.push_back(std::move(entry));
+                        g_state.script_selected = static_cast<int>(g_state.scripts.size()) - 1;
+                    }
+                    toast_notification::push("Loaded script: " + name, toast_notification::toast_type_t::info);
+                } else {
+                    toast_notification::push(error.empty() ? "Script load failed" : error,
+                        toast_notification::toast_type_t::error);
+                }
+                g_state.script_operation_pending.store(false, std::memory_order_release);
+                request_script_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        state.script_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected script load");
+    }
+}
+
+static void request_script_unload(state_t& state, std::string name) {
+    bool expected = false;
+    if (!state.script_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.script_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.scripts.unload", "Unload network automation script", "view.network.scripting", name);
+    const bool posted = post_network_task(
+        "script_unload", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, name = std::move(name), task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+                success = script_engine::unload_script(name);
+                if (!success)
+                    error = "Script engine did not unload " + name;
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Script unload failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? "Unloaded " + name : error);
+            enqueue_ui_completion([serial, name, success, error = std::move(error)]() {
+                if (g_state.script_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                const auto found = std::find_if(g_state.scripts.begin(), g_state.scripts.end(),
+                    [&name](const state_t::script_entry_t& entry) { return entry.name == name; });
+                if (success && found != g_state.scripts.end()) {
+                    found->loaded = false;
+                    found->enabled = false;
+                } else if (!success) {
+                    toast_notification::push(error.empty() ? "Script unload failed" : error,
+                        toast_notification::toast_type_t::error);
+                }
+                g_state.script_operation_pending.store(false, std::memory_order_release);
+                request_script_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        state.script_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected script unload");
+    }
+}
+
+static void request_script_toggle(state_t& state, std::string name, bool enable) {
+    bool expected = false;
+    if (!state.script_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.script_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        enable ? "network.scripts.enable" : "network.scripts.pause",
+        enable ? "Enable network automation script" : "Pause network automation script",
+        "view.network.scripting", name);
+    const bool posted = post_network_task(
+        enable ? "script_enable" : "script_pause",
+        aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, name = std::move(name), enable, task_id]() {
+            bool success = true;
+            std::string error;
+            try {
+                script_engine::set_script_enabled(name, enable);
+            } catch (const std::exception& exception) {
+                success = false;
+                error = exception.what();
+            } catch (...) {
+                success = false;
+                error = "Script state change failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? name + (enable ? " enabled" : " paused") : error);
+            enqueue_ui_completion([serial, name, enable, success, error = std::move(error)]() {
+                if (g_state.script_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                const auto found = std::find_if(g_state.scripts.begin(), g_state.scripts.end(),
+                    [&name](const state_t::script_entry_t& entry) { return entry.name == name; });
+                if (success && found != g_state.scripts.end())
+                    found->enabled = enable;
+                else if (!success)
+                    toast_notification::push(error.empty() ? "Script state change failed" : error,
+                        toast_notification::toast_type_t::error);
+                g_state.script_operation_pending.store(false, std::memory_order_release);
+                request_script_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        state.script_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected script state change");
+    }
+}
+
+static void request_script_evaluate(state_t& state, std::string source) {
+    bool expected = false;
+    if (!state.script_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.script_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::size_t source_size = source.size();
+    const std::string task_id = register_network_operation(
+        "network.scripts.evaluate", "Evaluate network automation script", "view.network.scripting",
+        std::to_string(source_size) + " bytes");
+    const bool posted = post_network_task(
+        "script_editor_run", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, source = std::move(source), source_size, task_id]() {
+            bool success = false;
+            std::string error;
+            try {
+                success = script_engine::load_script_source("_editor_", source);
+                if (!success)
+                    error = "Script engine rejected the editor source";
+            } catch (const std::exception& exception) {
+                error = exception.what();
+            } catch (...) {
+                error = "Script evaluation failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(source_size) + " bytes evaluated" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (g_state.script_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (!success)
+                    toast_notification::push(error.empty() ? "Script evaluation failed" : error,
+                        toast_notification::toast_type_t::error);
+                g_state.script_operation_pending.store(false, std::memory_order_release);
+                request_script_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        state.script_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected script evaluation");
+    }
+}
+
+static void request_script_console(state_t& state, std::string command) {
+    bool expected = false;
+    if (!state.script_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.script_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.scripts.console", "Execute network script console command", "view.network.scripting",
+        std::to_string(command.size()) + " bytes");
+    const bool posted = post_network_task(
+        "script_console_exec", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, command = std::move(command), task_id]() {
+            bool success = true;
+            std::string output;
+            std::string error;
+            try {
+                output = script_engine::execute(command);
+            } catch (const std::exception& exception) {
+                success = false;
+                error = exception.what();
+            } catch (...) {
+                success = false;
+                error = "Script console execution failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(output.size()) + " output bytes" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (g_state.script_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (!success)
+                    toast_notification::push(error.empty() ? "Script console execution failed" : error,
+                        toast_notification::toast_type_t::error);
+                g_state.script_operation_pending.store(false, std::memory_order_release);
+                request_script_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        state.script_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected script console command");
+    }
+}
+
+static bool read_script_file_exact(const std::string& path, std::string& contents, std::string& error) {
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+    static_cast<void>(error);
+    contents = "function onRequest(request) {\n  request.headers.remove('Authorization');\n  return request;\n}\n\nfunction onResponse(response) {\n  if (response.status >= 500) response.tags.add('server-error');\n  return response;\n}";
+    aida::preview::network::record_receipt("Script opened in editor", path);
+    return true;
+#else
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = "Cannot open script file (Win32 " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    LARGE_INTEGER size{};
+    bool success = GetFileSizeEx(file, &size) && size.QuadPart >= 0 && size.QuadPart < 32768;
+    if (!success)
+        error = size.QuadPart >= 32768 ? "Script is larger than the 32 KiB inline editor limit"
+                                      : "Cannot determine script size";
+    if (success) {
+        contents.resize(static_cast<std::size_t>(size.QuadPart));
+        std::size_t offset = 0;
+        while (offset < contents.size()) {
+            const DWORD chunk = static_cast<DWORD>((std::min)(contents.size() - offset, static_cast<std::size_t>(32768)));
+            DWORD read = 0;
+            if (!ReadFile(file, contents.data() + offset, chunk, &read, nullptr) || read != chunk) {
+                error = "Script read failed or was partial (Win32 " + std::to_string(GetLastError()) + ")";
+                success = false;
+                break;
+            }
+            offset += read;
+        }
+    }
+    CloseHandle(file);
+    if (success && contents.find('\0') != std::string::npos) {
+        contents.clear();
+        error = "Script contains embedded NUL bytes and cannot be opened in the text editor";
+        success = false;
+    }
+    return success;
+#endif
+}
+
+static void request_script_open(state_t& state, std::string path) {
+    bool expected = false;
+    if (!state.script_open_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::string task_id = register_network_operation(
+        "network.scripts.open", "Open network script in editor", "view.network.scripting", path);
+    const bool posted = post_network_task(
+        "script_open", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [path = std::move(path), task_id]() {
+            std::string contents;
+            std::string error;
+            const bool success = read_script_file_exact(path, contents, error);
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? std::to_string(contents.size()) + " bytes loaded" : error);
+            enqueue_ui_completion([success, contents = std::move(contents), error = std::move(error)]() {
+                if (success) {
+                    std::memcpy(g_state.script_editor_buf, contents.data(), contents.size());
+                    g_state.script_editor_buf[contents.size()] = '\0';
+                } else {
+                    toast_notification::push(error.empty() ? "Script open failed" : error,
+                        toast_notification::toast_type_t::error);
+                }
+                g_state.script_open_pending.store(false, std::memory_order_release);
+            });
+        }, false);
+    if (!posted) {
+        state.script_open_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected script open");
+    }
+}
+
+static void request_script_log_clear(state_t& state) {
+    bool expected = false;
+    if (!state.script_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    const std::uint64_t serial = state.script_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::string task_id = register_network_operation(
+        "network.scripts.log.clear", "Clear network script log", "view.network.scripting", "engine log");
+    const bool posted = post_network_task(
+        "script_log_clear", aida::infra::executor::domain_t::diagnostics, "bounded_task",
+        [serial, task_id]() {
+            bool success = true;
+            std::string error;
+            try {
+                script_engine::clear_log();
+            } catch (const std::exception& exception) {
+                success = false;
+                error = exception.what();
+            } catch (...) {
+                success = false;
+                error = "Script log clear failed";
+            }
+            finish_network_operation(task_id, success, success ? "Completed" : "Failed",
+                success ? "Script log cleared" : error);
+            enqueue_ui_completion([serial, success, error = std::move(error)]() {
+                if (g_state.script_operation_serial.load(std::memory_order_acquire) != serial)
+                    return;
+                if (!success)
+                    toast_notification::push(error.empty() ? "Script log clear failed" : error,
+                        toast_notification::toast_type_t::error);
+                g_state.script_operation_pending.store(false, std::memory_order_release);
+                request_script_runtime_snapshot(true);
+            });
+        }, false);
+    if (!posted) {
+        state.script_operation_pending.store(false, std::memory_order_release);
+        finish_network_operation(task_id, false, "Rejected", "Executor rejected script log clear");
+    }
+}
+
 static void render_scripting(state_t& state, float x, float y, float w, float h,
                               float alpha, float ar, float ag, float ab) {
     (void)ar; (void)ag; (void)ab;
@@ -6834,43 +8878,13 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
 
         std::string path_str(path_buf);
         diag::log_tagged_fmt("network", "script_load_dialog_pick path='%s'", path_str.c_str());
-        if (script_engine::load_script(path_str)) {
-            std::filesystem::path fp(path_str);
-            std::string stem = fp.stem().string();
-
-            bool updated = false;
-            for (auto& entry : state.scripts) {
-                if (entry.name == stem) {
-                    entry.path = path_str;
-                    entry.loaded = true;
-                    entry.enabled = true;
-                    updated = true;
-                    break;
-                }
-            }
-            if (!updated) {
-                state_t::script_entry_t ne;
-                ne.name = stem;
-                ne.path = path_str;
-                ne.enabled = true;
-                ne.loaded = true;
-                state.scripts.push_back(std::move(ne));
-                state.script_selected = static_cast<int>(state.scripts.size()) - 1;
-            }
-            diag::log_tagged_fmt("network", "script_load_ok name='%s' path='%s' total_loaded=%zu",
-                stem.c_str(), path_str.c_str(), state.scripts.size());
-            toast_notification::push(std::string("Loaded script: ") + stem,
-                                     toast_notification::toast_type_t::info);
-        }
-        else {
-            diag::log_tagged_fmt("network", "script_load_failed path='%s'", path_str.c_str());
-            toast_notification::push(std::string("Failed to load script: ") + path_str,
-                                     toast_notification::toast_type_t::error);
-        }
+        request_script_load(state, std::move(path_str));
     };
 
-    bool engine_up = script_engine::is_initialized();
-    size_t hook_count = script_engine::registered_hook_count();
+    request_script_runtime_snapshot();
+    const auto runtime_snapshot = std::atomic_load_explicit(&s_script_runtime_snapshot, std::memory_order_acquire);
+    const bool engine_up = runtime_snapshot && runtime_snapshot->initialized;
+    const size_t hook_count = runtime_snapshot ? runtime_snapshot->hook_count : 0;
 
     float pad = 2.f;
     float content_y = 0.f;
@@ -6927,7 +8941,12 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
             float gap = 6.f;
             ldl->PushClipRect(lwin, ImVec2(lwin.x + lsz.x, lwin.y + lsz.y), true);
 
-            for (size_t i = 0; i < state.scripts.size(); i++) {
+            const float script_stride = row_h + gap;
+            const std::size_t first_script = static_cast<std::size_t>((std::max)(0,
+                static_cast<int>(ImGui::GetScrollY() / script_stride) - 1));
+            const std::size_t last_script = (std::min)(state.scripts.size(),
+                static_cast<std::size_t>(ImGui::GetScrollY() / script_stride + lsz.y / script_stride + 3));
+            for (size_t i = first_script; i < last_script; i++) {
                 auto& s = state.scripts[i];
                 float ry = static_cast<float>(i) * (row_h + gap);
                 float abs_ry = lwin.y + ry - ImGui::GetScrollY();
@@ -7015,7 +9034,7 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
 
             ldl->PopClipRect();
             ImGui::Dummy(ImVec2(rail_w - 12.f,
-                static_cast<float>(state.scripts.size()) * (row_h + gap)));
+                static_cast<float>(state.scripts.size()) * script_stride));
         }
         ImGui::EndChild();
 
@@ -7029,8 +9048,9 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                     aida::ui::with_alpha(th.border_subtle, alpha), 1.f);
 
         ImGui::SetCursorPos(ImVec2(8.f, footer_y));
+        const bool script_pending = state.script_operation_pending.load(std::memory_order_acquire);
         if (aida::ui::button("Load Script", aida::ui::button_kind_t::primary,
-                             aida::ui::size_t_::sm, ImVec2(rail_w - 16.f, 30.f)))
+                             aida::ui::size_t_::sm, ImVec2(rail_w - 16.f, 30.f), script_pending))
             load_script_from_dialog();
 
         float fbtn_w = (rail_w - 16.f - 8.f) * 0.5f;
@@ -7038,47 +9058,31 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         bool can_unload = has_sel && state.scripts[static_cast<size_t>(state.script_selected)].loaded;
         if (aida::ui::button(can_unload ? "Unload" : "Unloaded",
                              aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
-                             ImVec2(fbtn_w, 30.f), !can_unload) && can_unload) {
-            auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
+                             ImVec2(fbtn_w, 30.f), !can_unload || script_pending) && can_unload) {
+            const auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
             diag::log_tagged_fmt("network", "script_unload_clicked name='%s'", s.name.c_str());
-            script_engine::unload_script(s.name);
-            s.loaded = false;
+            request_script_unload(state, s.name);
         }
         ImGui::SameLine(0.f, 8.f);
         bool sel_enabled = has_sel && state.scripts[static_cast<size_t>(state.script_selected)].enabled;
         if (aida::ui::button(sel_enabled ? "Pause" : "Enable",
                              aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
-                             ImVec2(fbtn_w, 30.f), !has_sel) && has_sel) {
-            auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
-            s.enabled = !s.enabled;
+                             ImVec2(fbtn_w, 30.f), !has_sel || script_pending) && has_sel) {
+            const auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
+            const bool enable = !s.enabled;
             diag::log_tagged_fmt("network", "script_toggle_enabled name='%s' enabled=%d",
-                s.name.c_str(), s.enabled ? 1 : 0);
-            script_engine::set_script_enabled(s.name, s.enabled);
+                s.name.c_str(), enable ? 1 : 0);
+            request_script_toggle(state, s.name, enable);
         }
 
         ImGui::SetCursorPos(ImVec2(8.f, footer_y + 72.f));
         bool can_edit = has_sel && !state.scripts[static_cast<size_t>(state.script_selected)].path.empty();
+        const bool open_pending = state.script_open_pending.load(std::memory_order_acquire);
         if (aida::ui::button("Open in Editor", aida::ui::button_kind_t::ghost,
                              aida::ui::size_t_::sm, ImVec2(rail_w - 16.f, 30.f),
-                             !can_edit) && can_edit) {
+                             !can_edit || open_pending) && can_edit) {
             const auto& s = state.scripts[static_cast<size_t>(state.script_selected)];
-#ifdef AIDA_IMGUI_STUDIO_PREVIEW
-            std::string contents = "function onRequest(request) {\n  request.headers.remove('Authorization');\n  return request;\n}\n\nfunction onResponse(response) {\n  if (response.status >= 500) response.tags.add('server-error');\n  return response;\n}";
-            size_t copy_n = std::min(contents.size(), sizeof(state.script_editor_buf) - 1);
-            memcpy(state.script_editor_buf, contents.data(), copy_n);
-            state.script_editor_buf[copy_n] = '\0';
-            aida::preview::network::record_receipt("Script opened in editor", s.path);
-#else
-            std::ifstream ifs(s.path, std::ios::binary);
-            if (ifs) {
-                std::stringstream ss;
-                ss << ifs.rdbuf();
-                std::string contents = ss.str();
-                size_t copy_n = std::min(contents.size(), sizeof(state.script_editor_buf) - 1);
-                memcpy(state.script_editor_buf, contents.data(), copy_n);
-                state.script_editor_buf[copy_n] = '\0';
-            }
-#endif
+            request_script_open(state, s.path);
         }
     }
 
@@ -7151,14 +9155,11 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
             field_top + field_h + inner_pad - 4.f));
         bool has_src = char_count > 0;
         if (aida::ui::button("Run Script", aida::ui::button_kind_t::primary,
-                             aida::ui::size_t_::sm, ImVec2(112.f, 30.f), !has_src) && has_src) {
+                             aida::ui::size_t_::sm, ImVec2(112.f, 30.f),
+                             !has_src || state.script_operation_pending.load(std::memory_order_acquire)) && has_src) {
             std::string src(state.script_editor_buf);
             diag::log_tagged_fmt("network", "script_editor_run size=%zu", src.size());
-            (void)post_network_task("script_editor_run", aida::infra::executor::domain_t::diagnostics, "bounded_task", [src]() {
-                bool ok = script_engine::load_script_source("_editor_", src);
-                diag::log_tagged_fmt("network", "script_editor_run_result ok=%d size=%zu",
-                    ok ? 1 : 0, src.size());
-            });
+            request_script_evaluate(state, std::move(src));
         }
         ImGui::SameLine(0.f, 8.f);
         if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary,
@@ -7217,16 +9218,13 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
 
         ImGui::SetCursorScreenPos(ImVec2(fb.x + 8.f, fa.y + (field_h - 30.f) * 0.5f));
         bool exec = aida::ui::button("Exec", aida::ui::button_kind_t::primary,
-                                     aida::ui::size_t_::sm, ImVec2(btn_w, 30.f));
+                                     aida::ui::size_t_::sm, ImVec2(btn_w, 30.f),
+                                     state.script_operation_pending.load(std::memory_order_acquire));
         if (exec || enter) {
             std::string cmd(state.script_console_buf);
             if (!cmd.empty()) {
                 diag::log_tagged_fmt("network", "script_console_exec size=%zu", cmd.size());
-                (void)post_network_task("script_console_exec", aida::infra::executor::domain_t::diagnostics, "bounded_task", [cmd]() {
-                    std::string out = script_engine::execute(cmd);
-                    diag::log_tagged_fmt("network", "script_console_exec_done out_size=%zu",
-                        out.size());
-                });
+                request_script_console(state, std::move(cmd));
                 memset(state.script_console_buf, 0, sizeof(state.script_console_buf));
             }
         }
@@ -7238,8 +9236,9 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
             ImVec2(right_x, log_y), ImVec2(right_w, log_h), alpha,
             "Engine Log", aida::ui::empty_state::glyph_t::memory, true);
 
-        std::vector<script_engine::log_entry> entries = script_engine::get_log();
-        size_t log_size = entries.size();
+        static const std::vector<script_engine::log_entry> empty_log;
+        const auto& entries = runtime_snapshot ? runtime_snapshot->log : empty_log;
+        const size_t log_size = entries.size();
 
         float ctrl_w = 200.f;
         ImGui::SetCursorScreenPos(ImVec2(lg.body_max.x - ctrl_w - 12.f,
@@ -7251,9 +9250,9 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
         ImGui::SameLine(0.f, 10.f);
         if (aida::ui::button("Clear", aida::ui::button_kind_t::ghost,
                              aida::ui::size_t_::sm, ImVec2(64.f, 24.f),
-                             log_size == 0) && log_size > 0) {
-            script_engine::clear_log();
-        }
+                             log_size == 0 || state.script_operation_pending.load(std::memory_order_acquire)) &&
+            log_size > 0)
+            request_script_log_clear(state);
 
         float inner_pad = 8.f;
         float scroll_top = log_y + lg.header_h + inner_pad;
@@ -7288,13 +9287,18 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
             float fs = ImGui::GetFontSize();
             float line_h = ImGui::GetTextLineHeightWithSpacing();
             float avail_w = right_w - inner_pad * 2.f - 16.f;
-            float ty = 0.f;
-
             float ts_w = ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0.f, "00:00:00").x + 8.f;
             float tag_w = ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0.f, "WARN").x + 8.f;
 
-            for (const auto& e : entries) {
-                float row_y = swin.y + ty - ImGui::GetScrollY();
+            const float scroll_y = ImGui::GetScrollY();
+            const float viewport_height = ImGui::GetWindowSize().y;
+            const std::size_t first_log = static_cast<std::size_t>((std::max)(0,
+                static_cast<int>(scroll_y / line_h) - 1));
+            const std::size_t last_log = (std::min)(log_size,
+                static_cast<std::size_t>(scroll_y / line_h + viewport_height / line_h + 3));
+            for (std::size_t log_index = first_log; log_index < last_log; ++log_index) {
+                const auto& e = entries[log_index];
+                float row_y = swin.y + static_cast<float>(log_index) * line_h - scroll_y;
                 ImU32 lvl_col = log_level_color(e.level, alpha);
 
                 char ts_buf[16];
@@ -7336,10 +9340,8 @@ static void render_scripting(state_t& state, float x, float y, float w, float h,
                                  aida::ui::with_alpha(th.text_dim, alpha),
                                  repeat_badge.c_str());
                 }
-
-                ty += line_h;
             }
-            ImGui::Dummy(ImVec2(avail_w, ty));
+            ImGui::Dummy(ImVec2(avail_w, static_cast<float>(log_size) * line_h));
 
             if (code_pushed) ImGui::PopFont();
 
@@ -7633,6 +9635,7 @@ static void render_tab_content(sub_tab_t tab, state_t& state, float x, float y, 
         case sub_tab_t::headless: aida::burp::headless_view::render(x, y, w, h, alpha, ar, ag, ab); break;
         case sub_tab_t::COUNT: break;
     }
+    render_exchange_context();
 }
 
 static aida::ui::components::status_kind_t network_header_status(const state_t& state,
@@ -7673,11 +9676,9 @@ static void render_network_status_bar(state_t& state, ImVec2 pos, float width, b
                 : capture_running ? aida::ui::components::status_kind_t::success
                                   : aida::ui::components::status_kind_t::neutral;
 
-            size_t packet_count = 0;
-            {
-                std::lock_guard<std::mutex> lock(state.cap_mutex);
-                packet_count = state.captured_packets.size();
-            }
+            const auto capture_snapshot = std::atomic_load_explicit(
+                &state.capture_snapshot, std::memory_order_acquire);
+            const std::size_t packet_count = capture_snapshot ? capture_snapshot->size() : 0;
             char packet_text[32] = {};
             std::snprintf(packet_text, sizeof(packet_text), "%zu", packet_count);
 
@@ -7705,6 +9706,7 @@ static void render_network_status_bar(state_t& state, ImVec2 pos, float width, b
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b) {
+    drain_ui_completions();
     float dt = ImGui::GetIO().DeltaTime;
     const auto& th = aida::ui::resolved();
     const bool has_target = analysis_session::has_active_target();
@@ -7970,6 +9972,7 @@ const char* tab_name(sub_tab_t tab) noexcept {
 
 void render_pane(sub_tab_t tab, float pos_x, float pos_y, float width, float height,
                  float alpha, float accent_r, float accent_g, float accent_b) {
+    drain_ui_completions();
     const int index = static_cast<int>(tab);
     if (index < 0 || index >= static_cast<int>(sub_tab_t::COUNT))
         return;
@@ -8016,6 +10019,77 @@ void render_pane(sub_tab_t tab, float pos_x, float pos_y, float width, float hei
     ImGui::PopID();
 }
 
+static std::vector<std::uint8_t> sitemap_request_bytes(
+    const aida::burp::exchange_observed_t& exchange) {
+    std::string raw = exchange.method.empty() ? "GET" : exchange.method;
+    raw.push_back(' ');
+    raw.append(exchange.path.empty() ? "/" : exchange.path);
+    if (!exchange.query.empty()) raw.append("?").append(exchange.query);
+    raw.append(" HTTP/1.1\r\n");
+    bool has_host = false;
+    for (const auto& header : exchange.req_headers) {
+        std::string name = header.first;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        has_host = has_host || name == "host";
+        raw.append(header.first).append(": ").append(header.second).append("\r\n");
+    }
+    if (!has_host) raw.append("Host: ").append(exchange.host).append("\r\n");
+    raw.append("\r\n");
+    raw.append(reinterpret_cast<const char*>(exchange.req_body.data()), exchange.req_body.size());
+    return {raw.begin(), raw.end()};
+}
+
+static std::vector<std::uint8_t> sitemap_response_bytes(
+    const aida::burp::exchange_observed_t& exchange) {
+    std::string raw = "HTTP/1.1 " + std::to_string(exchange.status_code) + " " +
+        exchange.reason_phrase + "\r\n";
+    for (const auto& header : exchange.resp_headers)
+        raw.append(header.first).append(": ").append(header.second).append("\r\n");
+    raw.append("\r\n");
+    raw.append(reinterpret_cast<const char*>(exchange.resp_body.data()), exchange.resp_body.size());
+    return {raw.begin(), raw.end()};
+}
+
+bool make_sitemap_artifact(std::uint64_t exchange_id, artifact_kind_t kind,
+                           artifact_identity_t& identity, std::string& unavailable_reason) {
+    if (kind != artifact_kind_t::sitemap_request &&
+        kind != artifact_kind_t::sitemap_response) {
+        unavailable_reason = "Site Map artifacts must identify a request or response.";
+        return false;
+    }
+    aida::burp::exchange_observed_t exchange;
+    if (!aida::burp::sitemap::find_exchange(exchange_id, exchange)) {
+        unavailable_reason = "The Site Map exchange is no longer retained.";
+        return false;
+    }
+    const bool response = kind == artifact_kind_t::sitemap_response;
+    if (response && exchange.status_code <= 0 && exchange.resp_headers.empty() &&
+        exchange.resp_body.empty()) {
+        identity = {};
+        unavailable_reason = "No response has been retained for this Site Map exchange.";
+        return false;
+    }
+    const auto bytes = response ? sitemap_response_bytes(exchange) : sitemap_request_bytes(exchange);
+    identity = {};
+    identity.kind = kind;
+    identity.source_id = exchange.id;
+    identity.timestamp = exchange.timestamp_ms;
+    identity.target_host = exchange.host;
+    identity.target_port = exchange.port;
+    identity.use_tls = exchange.scheme == "https";
+    identity.parent_id = "network.sitemap.exchange." + std::to_string(exchange.id);
+    identity.id = identity.parent_id + (response ? ".response" : ".request");
+    identity.source_view_id = "view.network.sitemap";
+    identity.label = std::string(response ? "Site Map response #" : "Site Map request #") +
+        std::to_string(exchange.id);
+    identity.content_size = bytes.size();
+    identity.content_hash = artifact_hash(bytes);
+    unavailable_reason.clear();
+    return true;
+}
+
 bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& snapshot,
                       std::string& unavailable_reason) {
     snapshot = artifact_snapshot_t{};
@@ -8028,24 +10102,38 @@ bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& 
     case artifact_kind_t::request:
     case artifact_kind_t::response:
     case artifact_kind_t::exchange: {
-        const auto history = mitm_proxy::get_history();
-        const auto found = std::find_if(history.begin(), history.end(), [&](const mitm_proxy::http_exchange& exchange) {
+        const auto proxy_snapshot = std::atomic_load_explicit(
+            &s_proxy_runtime_snapshot, std::memory_order_acquire);
+        if (!proxy_snapshot) {
+            unavailable_reason = "The proxy history snapshot is still loading; retry after the view refreshes.";
+            return false;
+        }
+        const auto found = std::find_if(proxy_snapshot->history.begin(), proxy_snapshot->history.end(),
+            [&](const mitm_proxy::http_exchange& exchange) {
             return exchange.id == identity.source_id && exchange.timestamp == identity.timestamp;
         });
-        if (found == history.end()) {
+        if (found == proxy_snapshot->history.end()) {
             unavailable_reason = "The captured exchange is no longer retained; select a current history item.";
             return false;
         }
+        snapshot.identity.target_host = found->target_host;
+        snapshot.identity.target_port = found->target_port;
+        snapshot.identity.use_tls = found->is_tls;
         snapshot.bytes = identity.kind == artifact_kind_t::response ? found->raw_response : found->raw_request;
         break;
     }
     case artifact_kind_t::packet: {
-        std::lock_guard<std::mutex> lock(g_state.cap_mutex);
-        const auto found = std::find_if(g_state.captured_packets.begin(), g_state.captured_packets.end(),
+        const auto capture_snapshot = std::atomic_load_explicit(
+            &g_state.capture_snapshot, std::memory_order_acquire);
+        if (!capture_snapshot) {
+            unavailable_reason = "The capture snapshot is still loading; retry after the view refreshes.";
+            return false;
+        }
+        const auto found = std::find_if(capture_snapshot->begin(), capture_snapshot->end(),
             [&](const packet_entry_t& packet) {
                 return packet.timestamp == identity.timestamp && packet.payload.size() == identity.content_size;
             });
-        if (found == g_state.captured_packets.end()) {
+        if (found == capture_snapshot->end()) {
             unavailable_reason = "The captured packet rolled out of the bounded capture history; select a current packet.";
             return false;
         }
@@ -8066,7 +10154,35 @@ bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& 
         snapshot.bytes = found->payload;
         break;
     }
-    case artifact_kind_t::repeater_request:
+    case artifact_kind_t::repeater_request: {
+        if (!s_repeater_artifact_publication_ready.load(std::memory_order_acquire)) {
+            unavailable_reason = "The Repeater request publication is unavailable; select the request again after the view refreshes.";
+            return false;
+        }
+        const auto publication = std::atomic_load_explicit(
+            &s_repeater_artifact_publication, std::memory_order_acquire);
+        if (!publication) {
+            unavailable_reason = "The Repeater request snapshot is still loading; select the request again.";
+            return false;
+        }
+        const auto found = std::find_if(publication->requests.begin(), publication->requests.end(),
+            [&](const std::shared_ptr<const artifact_snapshot_t>& retained) {
+                return retained && retained->identity.source_id == identity.source_id;
+            });
+        if (found == publication->requests.end()) {
+            unavailable_reason = "The Repeater request is no longer retained; select a current request.";
+            return false;
+        }
+        if ((*found)->identity.revision != identity.revision ||
+            (*found)->identity.content_size != identity.content_size ||
+            (*found)->identity.content_hash != identity.content_hash ||
+            (*found)->identity.id != identity.id) {
+            unavailable_reason = "The Repeater request generation changed; reopen actions on the current request.";
+            return false;
+        }
+        snapshot = **found;
+        break;
+    }
     case artifact_kind_t::repeater_response: {
         const auto found = std::find_if(g_state.repeater_entries.begin(), g_state.repeater_entries.end(),
             [&](const std::shared_ptr<repeater_entry_t>& entry) {
@@ -8076,12 +10192,73 @@ bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& 
             unavailable_reason = "The Repeater tab was closed; reopen or select another request.";
             return false;
         }
-        snapshot.bytes.assign(identity.kind == artifact_kind_t::repeater_response
-            ? (*found)->raw_response.begin() : (*found)->raw_request.begin(),
-            identity.kind == artifact_kind_t::repeater_response
-            ? (*found)->raw_response.end() : (*found)->raw_request.end());
+        if ((*found)->request_revision != identity.revision ||
+            (*found)->response_timestamp != identity.timestamp) {
+            unavailable_reason = "The Repeater request or response generation changed; reopen actions on the current artifact.";
+            return false;
+        }
+        snapshot.identity.target_host = (*found)->host;
+        snapshot.identity.target_port = (*found)->port;
+        snapshot.identity.use_tls = (*found)->use_tls;
+        snapshot.bytes.assign((*found)->raw_response.begin(), (*found)->raw_response.end());
         break;
     }
+    case artifact_kind_t::sitemap_request:
+    case artifact_kind_t::sitemap_response: {
+        aida::burp::exchange_observed_t exchange;
+        if (!aida::burp::sitemap::find_exchange(identity.source_id, exchange)) {
+            unavailable_reason = "The Site Map exchange is no longer retained.";
+            return false;
+        }
+        if (exchange.timestamp_ms != identity.timestamp) {
+            unavailable_reason = "The Site Map exchange generation changed; select the current exchange.";
+            return false;
+        }
+        snapshot.identity.target_host = exchange.host;
+        snapshot.identity.target_port = exchange.port;
+        snapshot.identity.use_tls = exchange.scheme == "https";
+        snapshot.bytes = identity.kind == artifact_kind_t::sitemap_response
+            ? sitemap_response_bytes(exchange) : sitemap_request_bytes(exchange);
+        break;
+    }
+    case artifact_kind_t::api_request:
+    case artifact_kind_t::api_response: {
+        if (!aida::burp::api_view::resolve_retained_artifact(identity.source_id, identity.timestamp,
+                identity.kind == artifact_kind_t::api_response, snapshot.bytes, unavailable_reason))
+            return false;
+        if (!aida::burp::api_view::resolve_retained_endpoint(identity.source_id,
+                identity.timestamp, snapshot.identity.target_host,
+                snapshot.identity.target_port, snapshot.identity.use_tls,
+                unavailable_reason)) return false;
+        break;
+    }
+    case artifact_kind_t::websocket_editor_frame:
+        if (!aida::burp::ws_editor_view::resolve_retained_artifact(identity.source_id, identity.revision,
+                snapshot.bytes, unavailable_reason)) return false;
+        break;
+    case artifact_kind_t::http2_request:
+    case artifact_kind_t::http2_response:
+        if (!aida::burp::h2_editor_view::resolve_retained_artifact(identity.source_id, identity.timestamp,
+                identity.kind == artifact_kind_t::http2_response, snapshot.bytes, unavailable_reason))
+            return false;
+        break;
+    case artifact_kind_t::intruder_response:
+        if (!aida::burp::intruder_view::resolve_retained_artifact(identity.source_id,
+                identity.revision, identity.timestamp, snapshot.bytes, unavailable_reason))
+            return false;
+        break;
+    case artifact_kind_t::scanner_request:
+    case artifact_kind_t::scanner_response:
+        if (!aida::burp::scanner_view::resolve_retained_artifact(identity.source_id,
+                identity.timestamp, identity.revision,
+                identity.kind == artifact_kind_t::scanner_response,
+                snapshot.bytes, unavailable_reason))
+            return false;
+        if (!aida::burp::scanner_view::resolve_retained_endpoint(identity.source_id,
+                identity.timestamp, snapshot.identity.target_host,
+                snapshot.identity.target_port, snapshot.identity.use_tls,
+                unavailable_reason)) return false;
+        break;
     }
     if (snapshot.bytes.size() != identity.content_size || artifact_hash(snapshot.bytes) != identity.content_hash) {
         unavailable_reason = "The network artifact changed after the action menu opened; review the current bytes and try again.";
@@ -8093,8 +10270,26 @@ bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& 
 }
 
 bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string& unavailable_reason) {
-    if (identity.kind == artifact_kind_t::response || identity.kind == artifact_kind_t::repeater_response) {
+    if (identity.kind == artifact_kind_t::response ||
+        identity.kind == artifact_kind_t::repeater_response ||
+        identity.kind == artifact_kind_t::sitemap_response ||
+        identity.kind == artifact_kind_t::api_response ||
+        identity.kind == artifact_kind_t::http2_response ||
+        identity.kind == artifact_kind_t::intruder_response ||
+        identity.kind == artifact_kind_t::scanner_response) {
         unavailable_reason = "Responses cannot be replayed as requests; choose the corresponding request artifact.";
+        return false;
+    }
+    if (identity.kind == artifact_kind_t::http2_request) {
+        unavailable_reason = "HTTP/2 requests must remain in the HTTP/2 editor so frame and pseudo-header semantics are preserved.";
+        return false;
+    }
+    if (identity.kind != artifact_kind_t::request && identity.kind != artifact_kind_t::exchange &&
+        identity.kind != artifact_kind_t::repeater_request &&
+        identity.kind != artifact_kind_t::sitemap_request &&
+        identity.kind != artifact_kind_t::api_request &&
+        identity.kind != artifact_kind_t::scanner_request) {
+        unavailable_reason = "Repeater accepts retained HTTP/1 request artifacts only.";
         return false;
     }
     artifact_snapshot_t snapshot;
@@ -8108,9 +10303,360 @@ bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string&
     entry->raw_request.assign(snapshot.bytes.begin(), snapshot.bytes.end());
     entry->request_hash = artifact_hash(snapshot.bytes);
     g_state.repeater_entries.push_back(std::move(entry));
+    publish_repeater_request_artifacts(g_state);
     g_state.repeater_selected = static_cast<int>(g_state.repeater_entries.size()) - 1;
     unavailable_reason.clear();
     (void)aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("view.network.repeater"));
+    return true;
+}
+
+namespace {
+
+static constexpr char k_line_separator[] = "\r\n";
+
+bool http_token_character(std::uint8_t value) {
+    if ((value >= '0' && value <= '9') ||
+        (value >= 'A' && value <= 'Z') ||
+        (value >= 'a' && value <= 'z')) return true;
+    switch (value) {
+    case '!': case '#': case '$': case '%': case '&': case '\'': case '*':
+    case '+': case '-': case '.': case '^': case '_': case '`': case '|': case '~':
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool parse_decimal_size(std::string_view value, std::size_t& result) {
+    if (value.empty() || value.size() > 20U) return false;
+    result = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result, 10);
+    return parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
+}
+
+bool validate_chunked_body(const std::vector<std::uint8_t>& request,
+                           std::size_t offset, std::string& reason) {
+    while (offset < request.size()) {
+        const auto line_end = std::search(request.begin() + static_cast<std::ptrdiff_t>(offset),
+            request.end(), std::begin(k_line_separator), std::end(k_line_separator) - 1);
+        if (line_end == request.end()) {
+            reason = "The chunked request body has an unterminated chunk-size line.";
+            return false;
+        }
+        const std::size_t line_end_offset = static_cast<std::size_t>(line_end - request.begin());
+        std::string_view size_line(reinterpret_cast<const char*>(request.data() + offset),
+            line_end_offset - offset);
+        const auto extension = size_line.find(';');
+        if (extension != std::string_view::npos) {
+            const auto extension_text = size_line.substr(extension + 1U);
+            if (extension_text.empty() ||
+                !std::all_of(extension_text.begin(), extension_text.end(), [](unsigned char value) {
+                    return value >= 0x20U && value != 0x7fU;
+                })) {
+                reason = "The chunked request contains an invalid chunk extension.";
+                return false;
+            }
+            size_line = size_line.substr(0, extension);
+        }
+        if (size_line.empty() || size_line.size() > 16U) {
+            reason = "The chunked request body has an invalid chunk size.";
+            return false;
+        }
+        std::uint64_t chunk_size = 0;
+        const auto parsed = std::from_chars(size_line.data(),
+            size_line.data() + size_line.size(), chunk_size, 16);
+        if (parsed.ec != std::errc{} || parsed.ptr != size_line.data() + size_line.size() ||
+            chunk_size > 65535U) {
+            reason = "The chunked request body has an invalid or oversized chunk.";
+            return false;
+        }
+        offset = line_end_offset + 2U;
+        if (chunk_size == 0) {
+            if (offset + 2U == request.size() && request[offset] == '\r' &&
+                request[offset + 1U] == '\n') return true;
+            while (offset < request.size()) {
+                const auto trailer_end = std::search(
+                    request.begin() + static_cast<std::ptrdiff_t>(offset), request.end(),
+                    std::begin(k_line_separator), std::end(k_line_separator) - 1);
+                if (trailer_end == request.end()) break;
+                const std::size_t trailer_end_offset =
+                    static_cast<std::size_t>(trailer_end - request.begin());
+                if (trailer_end_offset == offset)
+                    return trailer_end_offset + 2U == request.size();
+                const auto colon = std::find(request.begin() + static_cast<std::ptrdiff_t>(offset),
+                    trailer_end, static_cast<std::uint8_t>(':'));
+                if (colon == trailer_end) break;
+                for (auto it = request.begin() + static_cast<std::ptrdiff_t>(offset);
+                     it != colon; ++it) {
+                    if (!http_token_character(*it)) {
+                        reason = "The chunked request contains an invalid trailer name.";
+                        return false;
+                    }
+                }
+                if (!std::all_of(colon + 1, trailer_end, [](std::uint8_t value) {
+                        return value == '\t' || (value >= 0x20U && value != 0x7fU);
+                    })) {
+                    reason = "The chunked request contains an invalid trailer value.";
+                    return false;
+                }
+                offset = trailer_end_offset + 2U;
+            }
+            reason = "The chunked request has invalid or trailing data after its final chunk.";
+            return false;
+        }
+        if (chunk_size > request.size() - offset ||
+            offset + static_cast<std::size_t>(chunk_size) + 2U > request.size()) {
+            reason = "The chunked request body is shorter than its declared chunk size.";
+            return false;
+        }
+        offset += static_cast<std::size_t>(chunk_size);
+        if (request[offset] != '\r' || request[offset + 1U] != '\n') {
+            reason = "The chunked request body has an invalid chunk terminator.";
+            return false;
+        }
+        offset += 2U;
+    }
+    reason = "The chunked request body has no final zero-sized chunk.";
+    return false;
+}
+
+bool validate_http1_request(const std::vector<std::uint8_t>& request,
+                            std::string& reason) {
+    if (request.empty() || request.size() > 65535U) {
+        reason = "A reviewed HTTP/1 request must contain from 1 to 65,535 bytes.";
+        return false;
+    }
+    static constexpr char separator_bytes[] = "\r\n\r\n";
+    const auto separator = std::search(request.begin(), request.end(),
+        std::begin(separator_bytes), std::end(separator_bytes) - 1);
+    if (separator == request.end()) {
+        reason = "The reviewed HTTP/1 request has no exact CRLF header/body separator.";
+        return false;
+    }
+    const std::size_t header_end = static_cast<std::size_t>(separator - request.begin());
+    for (std::size_t index = 0; index < header_end + 2U; ++index) {
+        const std::uint8_t value = request[index];
+        if (value == '\n' && (index == 0 || request[index - 1U] != '\r')) {
+            reason = "The reviewed HTTP/1 headers contain a bare line-feed.";
+            return false;
+        }
+        if (value == '\r' && (index + 1U >= request.size() || request[index + 1U] != '\n')) {
+            reason = "The reviewed HTTP/1 headers contain a bare carriage-return.";
+            return false;
+        }
+        if (value == 0 || (value < 0x20U && value != '\r' && value != '\n' && value != '\t') ||
+            value == 0x7fU) {
+            reason = "The reviewed HTTP/1 headers contain a prohibited control character.";
+            return false;
+        }
+    }
+    const auto first_line_end = std::search(request.begin(), separator,
+        std::begin(k_line_separator), std::end(k_line_separator) - 1);
+    const auto first_space = std::find(request.begin(), first_line_end,
+        static_cast<std::uint8_t>(' '));
+    const auto second_space = first_space == first_line_end ? first_line_end :
+        std::find(first_space + 1, first_line_end, static_cast<std::uint8_t>(' '));
+    if (first_space == request.begin() || first_space == first_line_end ||
+        second_space == first_space + 1 || second_space == first_line_end ||
+        std::find(second_space + 1, first_line_end, static_cast<std::uint8_t>(' ')) != first_line_end) {
+        reason = "The reviewed request line must be METHOD SP target SP HTTP/1.x.";
+        return false;
+    }
+    if (static_cast<std::size_t>(first_space - request.begin()) > 32U ||
+        !std::all_of(request.begin(), first_space, http_token_character)) {
+        reason = "The reviewed request method is not a bounded HTTP token.";
+        return false;
+    }
+    if (static_cast<std::size_t>(second_space - first_space - 1) > 8192U ||
+        !std::all_of(first_space + 1, second_space, [](std::uint8_t value) {
+            return value > 0x20U && value != 0x7fU;
+        })) {
+        reason = "The reviewed request target is empty, oversized, or contains controls.";
+        return false;
+    }
+    const std::string_view version(reinterpret_cast<const char*>(&*(second_space + 1)),
+        static_cast<std::size_t>(first_line_end - second_space - 1));
+    if (version != "HTTP/1.0" && version != "HTTP/1.1") {
+        reason = "The reviewed request must use HTTP/1.0 or HTTP/1.1.";
+        return false;
+    }
+
+    bool host_present = false;
+    bool content_length_present = false;
+    std::size_t content_length = 0;
+    bool transfer_encoding_present = false;
+    bool transfer_chunked = false;
+    std::size_t line_begin = static_cast<std::size_t>(first_line_end - request.begin()) + 2U;
+    while (line_begin < header_end) {
+        const auto line_end = std::search(
+            request.begin() + static_cast<std::ptrdiff_t>(line_begin), request.end(),
+            std::begin(k_line_separator), std::end(k_line_separator) - 1);
+        if (line_end == request.end() || line_end > separator) {
+            reason = "The reviewed HTTP/1 header block is malformed.";
+            return false;
+        }
+        const std::size_t line_end_offset = static_cast<std::size_t>(line_end - request.begin());
+        if (line_end_offset - line_begin > 8192U || request[line_begin] == ' ' ||
+            request[line_begin] == '\t') {
+            reason = "Folded, empty, or oversized HTTP headers are not accepted.";
+            return false;
+        }
+        const auto colon = std::find(request.begin() + static_cast<std::ptrdiff_t>(line_begin),
+            line_end, static_cast<std::uint8_t>(':'));
+        if (colon == line_end || colon == request.begin() + static_cast<std::ptrdiff_t>(line_begin) ||
+            static_cast<std::size_t>(colon -
+                (request.begin() + static_cast<std::ptrdiff_t>(line_begin))) > 256U ||
+            !std::all_of(request.begin() + static_cast<std::ptrdiff_t>(line_begin), colon,
+                http_token_character)) {
+            reason = "The reviewed request contains an invalid HTTP header name.";
+            return false;
+        }
+        std::string name(reinterpret_cast<const char*>(request.data() + line_begin),
+            static_cast<std::size_t>(colon - (request.begin() + static_cast<std::ptrdiff_t>(line_begin))));
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        std::size_t value_begin = static_cast<std::size_t>(colon - request.begin()) + 1U;
+        while (value_begin < line_end_offset &&
+            (request[value_begin] == ' ' || request[value_begin] == '\t')) ++value_begin;
+        std::size_t value_end = line_end_offset;
+        while (value_end > value_begin &&
+            (request[value_end - 1U] == ' ' || request[value_end - 1U] == '\t')) --value_end;
+        const std::string_view value(reinterpret_cast<const char*>(request.data() + value_begin),
+            value_end - value_begin);
+        if (name == "host") {
+            if (host_present || value.empty()) {
+                reason = "The reviewed request must contain exactly one non-empty Host header.";
+                return false;
+            }
+            host_present = true;
+        }
+        if (name == "content-length") {
+            std::size_t parsed_length = 0;
+            if (content_length_present || !parse_decimal_size(value, parsed_length)) {
+                reason = "Content-Length must be one unambiguous bounded decimal value.";
+                return false;
+            }
+            content_length_present = true;
+            content_length = parsed_length;
+        }
+        if (name == "transfer-encoding") {
+            std::string lower(value);
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char item) {
+                return static_cast<char>(std::tolower(item));
+            });
+            if (transfer_encoding_present || lower != "chunked") {
+                reason = "Reviewed requests support only one exact Transfer-Encoding: chunked header.";
+                return false;
+            }
+            transfer_encoding_present = true;
+            transfer_chunked = true;
+        }
+        line_begin = line_end_offset + 2U;
+    }
+    if (version == "HTTP/1.1" && !host_present) {
+        reason = "HTTP/1.1 reviewed requests require a non-empty Host header.";
+        return false;
+    }
+    if (content_length_present && transfer_encoding_present) {
+        reason = "A reviewed request cannot combine Content-Length and Transfer-Encoding.";
+        return false;
+    }
+    const std::size_t body_begin = header_end + 4U;
+    const std::size_t body_size = request.size() - body_begin;
+    if (content_length_present && content_length != body_size) {
+        reason = "The request body length does not match Content-Length.";
+        return false;
+    }
+    if (transfer_chunked && !validate_chunked_body(request, body_begin, reason)) return false;
+    if (!content_length_present && !transfer_encoding_present && body_size != 0U) {
+        reason = "A reviewed request body requires explicit Content-Length or chunked framing.";
+        return false;
+    }
+    reason.clear();
+    return true;
+}
+
+}
+
+bool validate_reviewed_request(const artifact_identity_t& source,
+                               const std::vector<std::uint8_t>& reviewed_request,
+                               artifact_identity_t& canonical_source,
+                               std::string& unavailable_reason) {
+    canonical_source = {};
+    artifact_snapshot_t current;
+    if (!resolve_artifact(source, current, unavailable_reason)) return false;
+    if (current.identity.target_host.empty() || current.identity.target_port == 0 ||
+        source.target_host != current.identity.target_host ||
+        source.target_port != current.identity.target_port ||
+        source.use_tls != current.identity.use_tls) {
+        unavailable_reason = "The proposal endpoint does not exactly match the canonical retained artifact endpoint.";
+        return false;
+    }
+    if (!validate_http1_request(reviewed_request, unavailable_reason)) return false;
+    canonical_source = current.identity;
+    unavailable_reason.clear();
+    return true;
+}
+
+bool stage_validated_reviewed_request(const artifact_identity_t& source,
+                                      const std::vector<std::uint8_t>& reviewed_request,
+                                      const std::string& provenance,
+                                      artifact_identity_t& staged_identity,
+                                      std::string& unavailable_reason) {
+    staged_identity = {};
+    if (reviewed_request.empty() || reviewed_request.size() > 65535U) {
+        unavailable_reason = "The prevalidated request payload is outside its bounded staging range.";
+        return false;
+    }
+    if (!source.valid() || source.target_host.empty() || source.target_port == 0) {
+        unavailable_reason = "The validated request has no canonical retained endpoint.";
+        return false;
+    }
+    if (source.kind != artifact_kind_t::request &&
+        source.kind != artifact_kind_t::exchange &&
+        source.kind != artifact_kind_t::repeater_request &&
+        source.kind != artifact_kind_t::sitemap_request &&
+        source.kind != artifact_kind_t::api_request &&
+        source.kind != artifact_kind_t::scanner_request) {
+        unavailable_reason = "Only canonical retained HTTP/1 request artifacts can be staged.";
+        return false;
+    }
+    if (provenance.empty() || provenance.size() > 512U) {
+        unavailable_reason = "The reviewed request has no bounded AI proposal provenance.";
+        return false;
+    }
+    artifact_identity_t canonical_source;
+    if (!validate_reviewed_request(source, reviewed_request,
+            canonical_source, unavailable_reason))
+        return false;
+    auto entry = std::make_shared<repeater_entry_t>();
+    entry->id = s_repeater_artifact_sequence.fetch_add(1, std::memory_order_relaxed);
+    entry->source_artifact_id = canonical_source.id;
+    entry->host = canonical_source.target_host;
+    entry->port = canonical_source.target_port;
+    entry->use_tls = canonical_source.use_tls;
+    entry->raw_request.assign(reviewed_request.begin(), reviewed_request.end());
+    entry->request_hash = artifact_hash(reviewed_request);
+    entry->reviewed_source_hash = canonical_source.content_hash;
+    entry->review_provenance = provenance;
+    entry->reviewed_draft = true;
+    staged_identity = repeater_artifact_identity(*entry, artifact_kind_t::repeater_request);
+    g_state.repeater_entries.push_back(std::move(entry));
+    publish_repeater_request_artifacts(g_state);
+    g_state.repeater_selected = static_cast<int>(g_state.repeater_entries.size()) - 1;
+    const auto opened = aida::ui::application_views::open_or_focus(
+        aida::ui::stable_view_id_t("view.network.repeater"));
+    if (!opened.ok()) {
+        g_state.repeater_entries.pop_back();
+        publish_repeater_request_artifacts(g_state);
+        g_state.repeater_selected = static_cast<int>(g_state.repeater_entries.size()) - 1;
+        staged_identity = {};
+        unavailable_reason = opened.detail.empty()
+            ? "The reviewed request could not open Repeater." : opened.detail;
+        return false;
+    }
+    unavailable_reason.clear();
     return true;
 }
 
@@ -8165,6 +10711,550 @@ bool add_artifact_to_chat(const artifact_identity_t& identity, std::string& unav
 
 bool assign_artifact_to_agent(const artifact_identity_t& identity, std::string& unavailable_reason) {
     return handoff_artifact(identity, true, unavailable_reason);
+}
+
+namespace {
+
+const network_exchange_action_descriptor_t k_exchange_actions[] = {
+    {network_exchange_action_t::repeater, "network.exchange.repeater"},
+    {network_exchange_action_t::intruder, "network.exchange.intruder"},
+    {network_exchange_action_t::scanner, "network.exchange.scanner"},
+    {network_exchange_action_t::comparer, "network.exchange.comparer"},
+    {network_exchange_action_t::decoder, "network.exchange.decoder"},
+    {network_exchange_action_t::sequencer, "network.exchange.sequencer"},
+    {network_exchange_action_t::camoufox, "network.exchange.camoufox"},
+    {network_exchange_action_t::copy_url, "network.exchange.copy_url"},
+    {network_exchange_action_t::copy_method, "network.exchange.copy_method"},
+    {network_exchange_action_t::copy_status, "network.exchange.copy_status"},
+    {network_exchange_action_t::copy_request, "network.exchange.copy_request"},
+    {network_exchange_action_t::copy_response, "network.exchange.copy_response"},
+    {network_exchange_action_t::copy_headers, "network.exchange.copy_headers"},
+    {network_exchange_action_t::copy_body, "network.exchange.copy_body"},
+    {network_exchange_action_t::copy_artifact, "network.exchange.copy_artifact"},
+    {network_exchange_action_t::scope_include, "network.exchange.scope_include"},
+    {network_exchange_action_t::scope_exclude, "network.exchange.scope_exclude"},
+    {network_exchange_action_t::save_export, "network.exchange.save_export"},
+    {network_exchange_action_t::create_issue, "network.exchange.create_issue"},
+    {network_exchange_action_t::chat, "network.exchange.chat"},
+    {network_exchange_action_t::agent, "network.exchange.agent"},
+    {network_exchange_action_t::replay_live, "network.exchange.replay"},
+    {network_exchange_action_t::remove, "network.exchange.remove"}
+};
+
+bool response_kind(artifact_kind_t kind) {
+    return kind == artifact_kind_t::response ||
+        kind == artifact_kind_t::repeater_response ||
+        kind == artifact_kind_t::sitemap_response ||
+        kind == artifact_kind_t::api_response ||
+        kind == artifact_kind_t::http2_response ||
+        kind == artifact_kind_t::intruder_response ||
+        kind == artifact_kind_t::scanner_response;
+}
+
+bool request_kind(artifact_kind_t kind) {
+    return kind == artifact_kind_t::request || kind == artifact_kind_t::exchange ||
+        kind == artifact_kind_t::repeater_request ||
+        kind == artifact_kind_t::sitemap_request ||
+        kind == artifact_kind_t::api_request ||
+        kind == artifact_kind_t::http2_request ||
+        kind == artifact_kind_t::scanner_request;
+}
+
+std::string artifact_text(const artifact_snapshot_t& snapshot) {
+    return std::string(reinterpret_cast<const char*>(snapshot.bytes.data()), snapshot.bytes.size());
+}
+
+std::string clipboard_text(const std::string& value) {
+    const bool textual = std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return c == '\r' || c == '\n' || c == '\t' || (c >= 0x20 && c != 0x7F);
+    });
+    if (textual) return value;
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string encoded = "hex:";
+    encoded.reserve(4U + value.size() * 2U);
+    for (const char byte : value) {
+        const auto c = static_cast<unsigned char>(byte);
+        encoded.push_back(hex[c >> 4U]);
+        encoded.push_back(hex[c & 0x0FU]);
+    }
+    return encoded;
+}
+
+std::string request_method(const std::string& raw) {
+    const auto end = raw.find(' ');
+    return end == std::string::npos ? std::string() : raw.substr(0, end);
+}
+
+std::string request_target(const std::string& raw) {
+    const auto first = raw.find(' ');
+    if (first == std::string::npos) return {};
+    const auto second = raw.find(' ', first + 1U);
+    return second == std::string::npos ? std::string() : raw.substr(first + 1U, second - first - 1U);
+}
+
+std::string artifact_url(const artifact_identity_t& identity, const std::string& request) {
+    if (identity.target_host.empty()) return {};
+    const std::string target = request_target(request);
+    if (target.rfind("http://", 0) == 0 || target.rfind("https://", 0) == 0) return target;
+    std::string url = identity.use_tls ? "https://" : "http://";
+    url.append(identity.target_host);
+    const std::uint16_t default_port = identity.use_tls ? 443 : 80;
+    if (identity.target_port != 0 && identity.target_port != default_port)
+        url.append(":").append(std::to_string(identity.target_port));
+    url.append(target.empty() ? "/" : target);
+    return url;
+}
+
+std::pair<std::string, std::string> http_headers_body(const std::string& raw) {
+    auto split = raw.find("\r\n\r\n");
+    std::size_t delimiter = 4;
+    if (split == std::string::npos) {
+        split = raw.find("\n\n");
+        delimiter = 2;
+    }
+    if (split == std::string::npos) return {raw, {}};
+    const auto first_line = raw.find('\n');
+    const std::size_t header_begin = first_line == std::string::npos ? 0 : first_line + 1U;
+    return {raw.substr(header_begin, split - header_begin), raw.substr(split + delimiter)};
+}
+
+std::string curl_quote(const std::string& value) {
+    std::string result;
+    result.reserve(value.size() + 2U);
+    result.push_back('"');
+    for (const char c : value) {
+        if (c == '"' || c == '\\') result.push_back('\\');
+        result.push_back(c);
+    }
+    result.push_back('"');
+    return result;
+}
+
+std::string curl_command(const artifact_identity_t& identity, const std::string& request) {
+    const std::string method = request_method(request);
+    const std::string url = artifact_url(identity, request);
+    if (method.empty() || url.empty()) return {};
+    std::string result = "curl -i -k -X " + method + " " + curl_quote(url);
+    const auto parts = http_headers_body(request);
+    std::size_t offset = 0;
+    while (offset < parts.first.size()) {
+        const auto end = parts.first.find('\n', offset);
+        std::string line = parts.first.substr(offset,
+            end == std::string::npos ? std::string::npos : end - offset);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const auto colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string name = line.substr(0, colon);
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (name != "host" && name != "content-length")
+                result.append(" -H ").append(curl_quote(line));
+        }
+        if (end == std::string::npos) break;
+        offset = end + 1U;
+    }
+    if (!parts.second.empty())
+        result.append(" --data-binary ").append(curl_quote(parts.second));
+    return result;
+}
+
+std::string response_status(const std::string& raw) {
+    const auto first = raw.find(' ');
+    if (first == std::string::npos) return {};
+    const auto end = raw.find_first_of("\r\n", first + 1U);
+    return raw.substr(first + 1U, end == std::string::npos ? std::string::npos : end - first - 1U);
+}
+
+bool snapshot_for(const artifact_identity_t& identity, artifact_snapshot_t& snapshot,
+                  std::string& reason) {
+    return identity.valid() && resolve_artifact(identity, snapshot, reason);
+}
+
+const artifact_identity_t* request_identity(const exchange_context_runtime_t& context) {
+    if (request_kind(context.primary.kind)) return &context.primary;
+    return request_kind(context.related.kind) ? &context.related : nullptr;
+}
+
+const artifact_identity_t* response_identity(const exchange_context_runtime_t& context) {
+    if (response_kind(context.primary.kind) && context.primary.valid() &&
+        context.primary.content_size != 0) return &context.primary;
+    return response_kind(context.related.kind) && context.related.valid() &&
+        context.related.content_size != 0 ? &context.related : nullptr;
+}
+
+std::string capability_reason(network_exchange_action_t action,
+                              const exchange_context_runtime_t& context) {
+    if (!context.primary_current) return context.unavailable_reason.empty()
+        ? "The selected artifact is stale; reopen the menu on a current row."
+        : context.unavailable_reason;
+    const auto* request = request_identity(context);
+    const auto* response = response_identity(context);
+    switch (action) {
+    case network_exchange_action_t::repeater:
+    case network_exchange_action_t::intruder:
+    case network_exchange_action_t::scanner:
+    case network_exchange_action_t::sequencer:
+        if (!request) return "This action requires a retained HTTP request artifact.";
+        if (request->kind == artifact_kind_t::http2_request)
+            return "HTTP/2 requests must be reviewed and replayed in the HTTP/2 editor; HTTP/1 tools cannot preserve frame semantics.";
+        if (request->target_host.empty() || request->target_port == 0)
+            return "The request has no verified target host and port.";
+        return {};
+    case network_exchange_action_t::camoufox:
+    case network_exchange_action_t::copy_url:
+    case network_exchange_action_t::copy_method:
+    case network_exchange_action_t::scope_include:
+    case network_exchange_action_t::scope_exclude:
+        if (!request) return "The selected context has no retained HTTP request.";
+        if (request->raw_protocol)
+            return "Raw protocol frames have no verified HTTP URL or method; inspect or decode the artifact first.";
+        return {};
+    case network_exchange_action_t::copy_status:
+    case network_exchange_action_t::copy_response:
+        return response ? std::string() : "The selected context has no retained HTTP response.";
+    case network_exchange_action_t::copy_request:
+        return request ? std::string() : "The selected context has no retained HTTP request.";
+    case network_exchange_action_t::copy_headers:
+    case network_exchange_action_t::copy_body:
+        if (context.primary.kind == artifact_kind_t::websocket_frame ||
+            context.primary.kind == artifact_kind_t::websocket_editor_frame ||
+            context.primary.kind == artifact_kind_t::packet || context.primary.raw_protocol)
+            return "This artifact is a raw payload and has no HTTP header/body boundary.";
+        return {};
+    case network_exchange_action_t::save_export:
+        return "No common reviewed file-export chooser owns network artifact paths yet; copy the artifact or use the source view's existing export.";
+    case network_exchange_action_t::create_issue:
+        return "The issue store has no reviewed human issue-editor adapter for arbitrary artifacts.";
+    case network_exchange_action_t::replay_live:
+        return "Live sending requires review in Repeater, Intruder, Scanner, Sequencer, or the protocol editor.";
+    case network_exchange_action_t::remove:
+        return "History removal has no common confirmation and undo provider.";
+    default:
+        return {};
+    }
+}
+
+bool execute_exchange_action(network_exchange_action_t action,
+                             const exchange_context_runtime_t& context,
+                             std::string& reason) {
+    const auto* request = request_identity(context);
+    const auto* response = response_identity(context);
+    artifact_snapshot_t primary_snapshot;
+    if (!snapshot_for(context.primary, primary_snapshot, reason)) return false;
+    artifact_snapshot_t request_snapshot;
+    artifact_snapshot_t response_snapshot;
+    const bool needs_request = action == network_exchange_action_t::repeater ||
+        action == network_exchange_action_t::intruder ||
+        action == network_exchange_action_t::scanner ||
+        action == network_exchange_action_t::sequencer ||
+        action == network_exchange_action_t::camoufox ||
+        action == network_exchange_action_t::copy_url ||
+        action == network_exchange_action_t::copy_method ||
+        action == network_exchange_action_t::copy_request ||
+        action == network_exchange_action_t::scope_include ||
+        action == network_exchange_action_t::scope_exclude;
+    const bool needs_response = action == network_exchange_action_t::copy_status ||
+        action == network_exchange_action_t::copy_response;
+    if (needs_request && request && !snapshot_for(*request, request_snapshot, reason)) return false;
+    if (needs_response && response && !snapshot_for(*response, response_snapshot, reason)) return false;
+    const std::string request_raw = request ? artifact_text(request_snapshot) : std::string();
+    const std::string response_raw = response ? artifact_text(response_snapshot) : std::string();
+    const std::string url = request ? artifact_url(*request, request_raw) : std::string();
+    const auto copy = [](const std::string& value) {
+        const std::string safe = clipboard_text(value);
+        ImGui::SetClipboardText(safe.c_str());
+        return true;
+    };
+    switch (action) {
+    case network_exchange_action_t::repeater:
+        return request && send_artifact_to_repeater(*request, reason);
+    case network_exchange_action_t::comparer:
+        return send_artifact_to_comparer(context.primary, reason);
+    case network_exchange_action_t::intruder:
+        if (!request || request_raw.size() >= 65536U) {
+            reason = "Intruder's reviewed request editor accepts at most 65535 bytes.";
+            return false;
+        }
+        if (!aida::burp::intruder_view::open_new_attack_with(request->target_host,
+                request->target_port, request->use_tls, request_raw, reason)) return false;
+        return aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.intruder")).ok();
+    case network_exchange_action_t::scanner:
+        if (!request || request_raw.size() >= 65536U) {
+            reason = "Scanner's reviewed audit editor accepts at most 65535 bytes.";
+            return false;
+        }
+        if (!aida::burp::scanner_view::open_new_audit_with(url, request_raw)) {
+            reason = "Scanner rejected the reviewed audit draft.";
+            return false;
+        }
+        return aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.scanner")).ok();
+    case network_exchange_action_t::decoder:
+        if (primary_snapshot.bytes.size() >= sizeof(g_state.decoder_input)) {
+            reason = "Decoder's reviewed input accepts at most 16383 bytes.";
+            return false;
+        }
+        std::memcpy(g_state.decoder_input, primary_snapshot.bytes.data(), primary_snapshot.bytes.size());
+        g_state.decoder_input[primary_snapshot.bytes.size()] = '\0';
+        return aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.decoder")).ok();
+    case network_exchange_action_t::sequencer:
+        if (!request || request_raw.size() >= 8192U) {
+            reason = "Sequencer's reviewed request editor accepts at most 8191 bytes.";
+            return false;
+        }
+        if (!aida::burp::sequencer_view::open_new_collection_with(url, request->target_host,
+                request->target_port, request->use_tls, request_raw, reason)) return false;
+        return aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.sequencer")).ok();
+    case network_exchange_action_t::camoufox:
+        if (!aida::burp::browser::stage_camoufox_url(url, reason)) return false;
+        return aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.browser")).ok();
+    case network_exchange_action_t::scope_include:
+    case network_exchange_action_t::scope_exclude:
+        if (!aida::burp::scope::stage_rule(url,
+                action == network_exchange_action_t::scope_exclude
+                    ? aida::burp::scope::rule_kind_t::exclude
+                    : aida::burp::scope::rule_kind_t::include, reason)) return false;
+        return aida::ui::application_views::open_or_focus(
+            aida::ui::stable_view_id_t("view.network.scope")).ok();
+    case network_exchange_action_t::copy_url: return copy(url);
+    case network_exchange_action_t::copy_method: return copy(request_method(request_raw));
+    case network_exchange_action_t::copy_status: return copy(response_status(response_raw));
+    case network_exchange_action_t::copy_request: return copy(request_raw);
+    case network_exchange_action_t::copy_response: return copy(response_raw);
+    case network_exchange_action_t::copy_headers:
+        return copy(http_headers_body(artifact_text(primary_snapshot)).first);
+    case network_exchange_action_t::copy_body:
+        return copy(http_headers_body(artifact_text(primary_snapshot)).second);
+    case network_exchange_action_t::copy_artifact:
+        return copy(artifact_text(primary_snapshot));
+    case network_exchange_action_t::chat:
+        return add_artifact_to_chat(context.primary, reason);
+    case network_exchange_action_t::agent:
+        return assign_artifact_to_agent(context.primary, reason);
+    default:
+        reason = capability_reason(action, context);
+        return false;
+    }
+}
+
+}
+
+void open_exchange_context(artifact_identity_t primary, artifact_identity_t related,
+                           exchange_context_origin_t origin) {
+    exchange_context_runtime_t retained;
+    retained.primary = std::move(primary);
+    retained.related = std::move(related);
+    artifact_snapshot_t snapshot;
+    retained.primary_current = resolve_artifact(
+        retained.primary, snapshot, retained.unavailable_reason);
+    if (!retained.primary_current) return;
+
+    aida::ui::application_ui::retained_entity_context_t context;
+    context.owner_id = "network.exchange.artifact";
+    context.entity_id = retained.primary.id;
+    context.entity_generation = retained.primary.timestamp ^ retained.primary.revision ^
+        retained.primary.content_hash;
+    context.active_view = aida::ui::stable_view_id_t(
+        retained.primary.source_view_id.empty()
+            ? "view.network" : retained.primary.source_view_id);
+    const auto retained_identity = retained.primary;
+    const auto retained_related_identity = retained.related;
+    context.validate_identity = [retained_identity, retained_related_identity] {
+        artifact_snapshot_t live;
+        std::string reason;
+        if (!resolve_artifact(retained_identity, live, reason))
+            return aida::ui::capability_state_t::unavailable(reason.empty()
+                ? "The network artifact was replaced; select it again" : reason);
+        if (retained_related_identity.valid() &&
+            !resolve_artifact(retained_related_identity, live, reason))
+            return aida::ui::capability_state_t::unavailable(reason.empty()
+                ? "The related network artifact was replaced; select it again" : reason);
+        return aida::ui::capability_state_t::available();
+    };
+    const auto append = [&context](const char* id, bool enabled, const char* reason,
+            std::function<aida::ui::action_handler_result_t()> invoke) {
+        aida::ui::application_ui::retained_entity_action_t action;
+        action.action_id = id;
+        action.capability = enabled
+            ? aida::ui::capability_state_t::available()
+            : aida::ui::capability_state_t::unavailable(reason);
+        action.invoke = std::move(invoke);
+        context.actions.push_back(std::move(action));
+    };
+    for (const auto& descriptor : k_exchange_actions) {
+        aida::ui::application_ui::retained_entity_action_t action;
+        action.action_id = descriptor.id;
+        const std::string unavailable = capability_reason(descriptor.action, retained);
+        action.capability = unavailable.empty()
+            ? aida::ui::capability_state_t::available()
+            : aida::ui::capability_state_t::unavailable(unavailable);
+        const auto operation = descriptor.action;
+        action.invoke = [retained, operation] {
+            std::string reason;
+            return execute_exchange_action(operation, retained, reason)
+                ? aida::ui::action_handler_result_t::completed()
+                : aida::ui::action_handler_result_t::failed(reason.empty()
+                    ? "The network operation was rejected" : reason);
+        };
+        context.actions.push_back(std::move(action));
+    }
+    const auto* request = request_identity(retained);
+    artifact_snapshot_t request_snapshot;
+    std::string request_reason;
+    const bool request_current = request &&
+        snapshot_for(*request, request_snapshot, request_reason);
+    const std::string request_raw = request_current
+        ? artifact_text(request_snapshot) : std::string();
+    const std::string curl = request_current
+        ? curl_command(*request, request_raw) : std::string();
+    append("network.exchange.copy_curl", !curl.empty(),
+        request_reason.empty() ? "The retained context has no complete HTTP request"
+                               : request_reason.c_str(), [curl] {
+            ImGui::SetClipboardText(curl.c_str());
+            return aida::ui::action_handler_result_t::completed();
+        });
+
+    if (retained.related.valid()) {
+        const auto related = retained.related;
+        append("network.exchange.related_comparer", true, "", [related] {
+            std::string reason;
+            return send_artifact_to_comparer(related, reason)
+                ? aida::ui::action_handler_result_t::completed()
+                : aida::ui::action_handler_result_t::failed(reason);
+        });
+        append("network.exchange.related_chat", true, "", [related] {
+            std::string reason;
+            return add_artifact_to_chat(related, reason)
+                ? aida::ui::action_handler_result_t::completed()
+                : aida::ui::action_handler_result_t::failed(reason);
+        });
+        append("network.exchange.related_agent", true, "", [related] {
+            std::string reason;
+            return assign_artifact_to_agent(related, reason)
+                ? aida::ui::action_handler_result_t::completed()
+                : aida::ui::action_handler_result_t::failed(reason);
+        });
+    }
+
+    if (request && request->source_view_id == "view.network.proxy") {
+        const std::string host = request->target_host;
+        const std::string method = request_method(request_raw);
+        append("network.proxy.filter_host", !host.empty(),
+            "The retained request has no target host", [host] {
+                std::snprintf(g_state.proxy_filter_text,
+                    sizeof(g_state.proxy_filter_text), "%s", host.c_str());
+                return aida::ui::action_handler_result_t::completed();
+            });
+        append("network.proxy.filter_method", !method.empty(),
+            "The retained request has no HTTP method", [method] {
+                std::snprintf(g_state.proxy_filter_text,
+                    sizeof(g_state.proxy_filter_text), "%s", method.c_str());
+                return aida::ui::action_handler_result_t::completed();
+            });
+        append("network.proxy.clear_filter", g_state.proxy_filter_text[0] != '\0',
+            "The Proxy history filter is already clear", [] {
+                g_state.proxy_filter_text[0] = '\0';
+                return aida::ui::action_handler_result_t::completed();
+            });
+    }
+
+    if (request && request->kind == artifact_kind_t::repeater_request) {
+        const auto retained_request = *request;
+        append("network.repeater.duplicate", true, "", [retained_request] {
+            const auto found = std::find_if(g_state.repeater_entries.begin(),
+                g_state.repeater_entries.end(), [&](const auto& item) {
+                    return item && item->id == retained_request.source_id;
+                });
+            if (found == g_state.repeater_entries.end())
+                return aida::ui::action_handler_result_t::failed(
+                    "The Repeater request was removed; select it again");
+            const auto& source = **found;
+            if (source.request_revision != retained_request.revision ||
+                source.request_hash != retained_request.content_hash)
+                return aida::ui::action_handler_result_t::failed(
+                    "The Repeater request changed; review it again before duplicating");
+            auto duplicate = std::make_shared<repeater_entry_t>();
+            duplicate->id = s_repeater_artifact_sequence.fetch_add(
+                1, std::memory_order_relaxed);
+            duplicate->source_artifact_id = retained_request.id;
+            duplicate->host = source.host;
+            duplicate->port = source.port;
+            duplicate->use_tls = source.use_tls;
+            duplicate->raw_request = source.raw_request;
+            duplicate->request_hash = source.request_hash;
+            duplicate->reviewed_source_hash = source.reviewed_source_hash;
+            duplicate->review_provenance = source.review_provenance;
+            duplicate->reviewed_draft = source.reviewed_draft;
+            g_state.repeater_entries.push_back(std::move(duplicate));
+            publish_repeater_request_artifacts(g_state);
+            g_state.repeater_selected = static_cast<int>(
+                g_state.repeater_entries.size()) - 1;
+            return aida::ui::action_handler_result_t::completed();
+        });
+    }
+
+    if (retained.primary.kind == artifact_kind_t::repeater_response) {
+        const auto response = retained.primary;
+        append("network.repeater.clear_response", response.content_size != 0,
+            "Send the request and receive a response first", [response] {
+                const auto found = std::find_if(g_state.repeater_entries.begin(),
+                    g_state.repeater_entries.end(), [&](const auto& item) {
+                        return item && item->id == response.source_id;
+                    });
+                if (found == g_state.repeater_entries.end())
+                    return aida::ui::action_handler_result_t::failed(
+                        "The Repeater response was removed; select it again");
+                auto& entry = **found;
+                if (entry.response_timestamp != response.timestamp ||
+                    entry.response_hash != response.content_hash)
+                    return aida::ui::action_handler_result_t::failed(
+                        "The Repeater response changed; select it again");
+                entry.raw_response.clear();
+                entry.status_code = 0;
+                entry.latency_ms = 0;
+                entry.response_hash = 0;
+                entry.response_timestamp = 0;
+                return aida::ui::action_handler_result_t::completed();
+            });
+    }
+
+    if (retained.primary.kind == artifact_kind_t::websocket_frame) {
+        const std::string host = retained.primary.target_host;
+        append("network.websocket.copy_host", !host.empty(),
+            "The retained frame has no host", [host] {
+                ImGui::SetClipboardText(host.c_str());
+                return aida::ui::action_handler_result_t::completed();
+            });
+        append("network.websocket.filter_host", !host.empty(),
+            "The retained frame has no host", [host] {
+                std::snprintf(g_state.ws_filter_text,
+                    sizeof(g_state.ws_filter_text), "%s", host.c_str());
+                return aida::ui::action_handler_result_t::completed();
+            });
+        append("network.websocket.toggle_follow", true, "", [] {
+            g_state.ws_auto_scroll = !g_state.ws_auto_scroll;
+            return aida::ui::action_handler_result_t::completed();
+        });
+        append("network.websocket.open_editor", false,
+            "The WebSocket Editor backend does not expose a capability-backed import operation for captured frames", {});
+    }
+    const auto retained_origin = origin == exchange_context_origin_t::pointer
+        ? aida::ui::context_menu_open_origin_t::pointer
+        : origin == exchange_context_origin_t::shift_f10
+        ? aida::ui::context_menu_open_origin_t::shift_f10
+        : aida::ui::context_menu_open_origin_t::menu_key;
+    aida::ui::application_ui::open_retained_entity_context_menu(
+        std::move(context), retained_origin);
+}
+
+void render_exchange_context() {
+    aida::ui::application_ui::render_retained_entity_context_menu(
+        "network.exchange.artifact");
 }
 
 }

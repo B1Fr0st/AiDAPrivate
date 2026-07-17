@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
-#include <iostream>
+#include <limits>
 #include <string>
 #include <cstring>
 #include <cstdint>
@@ -108,50 +108,22 @@
 #include "../core/ui/workspace_layout.hpp"
 #include "../core/ui/application_ui_runtime.hpp"
 #include "../core/ui/application_view_registry.hpp"
+#include "../core/settings/settings_persistence_service.hpp"
+#include "../core/settings/theme_transfer_service.hpp"
+#include "../core/ai/conversation_evidence_store.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../preview/shell_preview.hpp"
 #endif
 #include <atomic>
-#include <condition_variable>
+#include <cmath>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 
 render_section_state_t            g_render_section;
 
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-namespace test_all_features {
-	void format_ui_phase_snapshot(char* out, std::size_t cap);
-}
-#endif
-
 namespace {
-	bool shell_full_test_running()
-	{
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		return false;
-#else
-		return test_all_features::is_running();
-#endif
-	}
-
-	void format_shell_ui_phase_snapshot(char* out, std::size_t cap)
-	{
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		if (out && cap > 0)
-			out[0] = '\0';
-#else
-		test_all_features::format_ui_phase_snapshot(out, cap);
-#endif
-	}
-
-
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::atomic<bool>          g_settings_dirty{false};
-	std::condition_variable    g_settings_cv;
-	std::mutex                 g_settings_cv_mtx;
-	std::atomic<bool>          g_settings_saver_running{false};
-	std::atomic<bool>          g_settings_saver_started{false};
 	std::atomic<bool>          g_chrome_shutdown_requested{false};
 
 	aida::infra::executor::submit_result_t submit_helpers_executor_task(
@@ -172,47 +144,612 @@ namespace {
 		return aida::infra::executor::submit(std::move(sub));
 	}
 
-	void settings_saver_loop()
-	{
-		while (g_settings_saver_running.load()) {
-			std::unique_lock<std::mutex> lk(g_settings_cv_mtx);
-			g_settings_cv.wait_for(lk, std::chrono::milliseconds(500), [] {
-				return g_settings_dirty.load() || !g_settings_saver_running.load();
-			});
-			lk.unlock();
-			if (!g_settings_saver_running.load()) break;
-			if (g_settings_dirty.exchange(false)) {
-				try {
-					g_sa_settings.save();
-				} catch (...) {
-				}
-			}
-		}
-	}
 #endif
 
 	void g_sa_settings_request_save()
 	{
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		aida::preview::record(aida::preview::shell_action_t::save_file, "settings");
+		static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 #else
-		g_settings_dirty.store(true);
-		bool expected = false;
-		if (g_settings_saver_started.compare_exchange_strong(expected, true)) {
-			g_settings_saver_running.store(true);
-			const auto submit_result = submit_helpers_executor_task(
-				"settings",
-				"settings.saver_loop",
-				aida::infra::executor::domain_t::service,
-				"long_lived_service",
-				[]() { settings_saver_loop(); });
-			if (!submit_result.submitted) {
-				g_settings_saver_running.store(false);
-				g_settings_saver_started.store(false);
+		static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
+#endif
+	}
+
+	enum class workspace_review_t : std::uint8_t {
+		none,
+		overwrite,
+		delete_saved,
+		reset_all
+	};
+
+	struct workspace_dialog_state_t {
+		bool save_as_open = false;
+		bool manager_open = false;
+		bool focus_save_name = false;
+		bool focus_rename_name = false;
+		char save_name[65]{};
+		char rename_name[65]{};
+		std::string selected_name;
+		std::string status;
+		workspace_review_t review = workspace_review_t::none;
+	};
+
+	workspace_dialog_state_t& workspace_dialog_state()
+	{
+		static workspace_dialog_state_t value;
+		return value;
+	}
+
+	void copy_workspace_name(char (&target)[65], std::string_view value)
+	{
+		std::fill(std::begin(target), std::end(target), '\0');
+		const std::size_t bytes = (std::min)(value.size(), sizeof(target) - 1U);
+		if (bytes != 0)
+			std::memcpy(target, value.data(), bytes);
+	}
+
+	const char* workspace_preset_display_name(aida::ui::workspace_layout::workspace_preset_t preset)
+	{
+		std::size_t count = 0;
+		const auto* descriptors = aida::ui::workspace_layout::presets(count);
+		for (std::size_t index = 0; index < count; ++index)
+			if (descriptors[index].id == preset)
+				return descriptors[index].display_name.data();
+		return "Analysis";
+	}
+
+	bool workspace_request_succeeded(
+		aida::ui::workspace_layout::workspace_request_result_t result) noexcept
+	{
+		using result_t = aida::ui::workspace_layout::workspace_request_result_t;
+		return result == result_t::completed || result == result_t::queued ||
+			result == result_t::unchanged;
+	}
+
+	std::string workspace_request_message(
+		aida::ui::workspace_layout::workspace_request_result_t result,
+		std::string_view operation)
+	{
+		using result_t = aida::ui::workspace_layout::workspace_request_result_t;
+		if (result == result_t::completed) return std::string(operation) + " completed.";
+		if (result == result_t::queued) return std::string(operation) + " queued in Background Tasks.";
+		if (result == result_t::unchanged) return std::string(operation) + " made no changes.";
+		if (result == result_t::busy) {
+			const std::string status = aida::ui::workspace_layout::operation_status();
+			return status.empty() ? "Another workspace transaction is already running." : status;
+		}
+		if (result == result_t::invalid_name)
+			return "Use 1-64 ASCII letters, numbers, spaces, hyphens or underscores; spaces cannot lead, trail or repeat.";
+		if (result == result_t::already_exists)
+			return "A saved workspace with this exact name already exists.";
+		if (result == result_t::not_found)
+			return "The selected saved workspace no longer exists. The catalog will refresh automatically.";
+		if (result == result_t::unavailable)
+			return "This operation is unavailable until the DockSpace and persistence service are ready.";
+		return std::string(operation) + " failed. Open Background Tasks or Diagnostics for the retained failure evidence.";
+	}
+
+	void register_workspace_semantic(std::string_view id, std::string_view type,
+		bool disabled = false)
+	{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::preview::semantics::register_last_item(id, type,
+			false, disabled));
+#else
+		static_cast<void>(id);
+		static_cast<void>(type);
+		static_cast<void>(disabled);
+#endif
+	}
+
+	void open_workspace_save_as_dialog()
+	{
+		auto& dialog = workspace_dialog_state();
+		dialog.save_as_open = true;
+		dialog.manager_open = false;
+		dialog.review = workspace_review_t::none;
+		dialog.status.clear();
+		const auto identity = aida::ui::workspace_layout::active_identity();
+		copy_workspace_name(dialog.save_name, identity.kind ==
+			aida::ui::workspace_layout::workspace_identity_kind_t::user
+			? identity.user_name : std::string_view{});
+		dialog.focus_save_name = true;
+	}
+
+	void open_workspace_manager_dialog(std::string_view selected = {})
+	{
+		auto& dialog = workspace_dialog_state();
+		dialog.manager_open = true;
+		dialog.save_as_open = false;
+		dialog.review = workspace_review_t::none;
+		dialog.status.clear();
+		if (!selected.empty()) {
+			dialog.selected_name.assign(selected);
+			copy_workspace_name(dialog.rename_name, selected);
+		}
+	}
+
+	void load_workspace_from_menu(std::string_view name)
+	{
+		const auto result = aida::ui::workspace_layout::load_user_layout(name);
+		if (workspace_request_succeeded(result))
+			return;
+		open_workspace_manager_dialog(name);
+		workspace_dialog_state().status = workspace_request_message(result,
+			"Load workspace");
+	}
+
+	void open_workspace_reset_all_review()
+	{
+		open_workspace_manager_dialog();
+		workspace_dialog_state().review = workspace_review_t::reset_all;
+	}
+
+	void render_workspace_dialogs()
+	{
+		auto& dialog = workspace_dialog_state();
+		const ImVec2 display = ImGui::GetIO().DisplaySize;
+		const auto place_window = [display](float desired_width, float desired_height) {
+			const float width = (std::min)(desired_width, (std::max)(120.0f, display.x - 24.0f));
+			const float height = (std::min)(desired_height, (std::max)(100.0f, display.y - 24.0f));
+			ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+			ImGui::SetNextWindowPos(ImVec2((std::max)(12.0f, (display.x - width) * 0.5f),
+				(std::max)(12.0f, (display.y - height) * 0.5f)), ImGuiCond_Always);
+		};
+		ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+			ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+#if defined(IMGUI_HAS_DOCK)
+		flags |= ImGuiWindowFlags_NoDocking;
+#endif
+
+		if (dialog.save_as_open) {
+			place_window(500.0f, dialog.review == workspace_review_t::overwrite ? 260.0f : 220.0f);
+			if (ImGui::Begin("Save Workspace As##workspace.save-as.dialog",
+					&dialog.save_as_open, flags)) {
+				const auto identity = aida::ui::workspace_layout::active_identity();
+				ImGui::TextUnformatted("Create a named derivative of the current workspace");
+				ImGui::TextDisabled("Base preset: %s", workspace_preset_display_name(identity.preset));
+				ImGui::Spacing();
+				ImGui::SetNextItemWidth(-1.0f);
+				if (dialog.focus_save_name) {
+					ImGui::SetKeyboardFocusHere();
+					dialog.focus_save_name = false;
+				}
+				const bool submitted = ImGui::InputText("##workspace.save-as.name",
+					dialog.save_name, sizeof(dialog.save_name),
+					ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+				register_workspace_semantic("aida.workspace.save-as.name",
+					"workspace-name-input");
+				ImGui::TextDisabled("1-64 letters, numbers, spaces, hyphens or underscores");
+				if (!dialog.status.empty())
+					ImGui::TextWrapped("%s", dialog.status.c_str());
+				const bool pending = aida::ui::workspace_layout::operation_pending();
+				const bool catalog_ready = aida::ui::workspace_layout::user_layout_catalog_ready();
+				if (!catalog_ready)
+					ImGui::TextDisabled("Loading saved workspace catalog...");
+				const bool empty = dialog.save_name[0] == '\0';
+				ImGui::BeginDisabled(pending || !catalog_ready || empty ||
+					dialog.review == workspace_review_t::overwrite);
+				const bool save_clicked = ImGui::Button("Save##workspace.save-as.confirm",
+					ImVec2(104.0f, 0.0f));
+				register_workspace_semantic("aida.workspace.save-as.confirm",
+					"workspace-save-as", pending || !catalog_ready || empty ||
+					dialog.review == workspace_review_t::overwrite);
+				ImGui::EndDisabled();
+				if ((save_clicked || (submitted && !pending && catalog_ready && !empty)) &&
+					dialog.review != workspace_review_t::overwrite) {
+					const auto result = aida::ui::workspace_layout::save_user_layout(
+						dialog.save_name, false);
+					if (result == aida::ui::workspace_layout::workspace_request_result_t::already_exists) {
+						dialog.review = workspace_review_t::overwrite;
+						dialog.status = "This exact name already exists. Overwrite replaces its saved layout and visibility snapshot.";
+					} else {
+						dialog.status = workspace_request_message(result, "Save Workspace As");
+						if (workspace_request_succeeded(result))
+							dialog.save_as_open = false;
+					}
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Cancel##workspace.save-as.cancel", ImVec2(96.0f, 0.0f))) {
+					dialog.review = workspace_review_t::none;
+					dialog.save_as_open = false;
+				}
+				register_workspace_semantic("aida.workspace.save-as.cancel",
+					"workspace-dialog-cancel");
+				if (dialog.review == workspace_review_t::overwrite) {
+					ImGui::Separator();
+					ImGui::TextWrapped("Overwrite saved workspace \"%s\"? This cannot be undone.",
+						dialog.save_name);
+					ImGui::BeginDisabled(pending);
+					if (ImGui::Button("Overwrite##workspace.save-as.overwrite", ImVec2(104.0f, 0.0f))) {
+						const auto result = aida::ui::workspace_layout::save_user_layout(
+							dialog.save_name, true);
+						dialog.status = workspace_request_message(result, "Workspace overwrite");
+						if (workspace_request_succeeded(result))
+							dialog.save_as_open = false;
+					}
+					register_workspace_semantic("aida.workspace.save-as.overwrite",
+						"workspace-overwrite-confirm", pending);
+					ImGui::EndDisabled();
+					ImGui::SameLine();
+					if (ImGui::Button("Keep Existing##workspace.save-as.keep")) {
+						dialog.review = workspace_review_t::none;
+						dialog.status.clear();
+						dialog.focus_save_name = true;
+					}
+					register_workspace_semantic("aida.workspace.save-as.keep",
+						"workspace-overwrite-cancel");
+				}
+			}
+			ImGui::End();
+		}
+
+		if (dialog.manager_open) {
+			place_window(760.0f, 500.0f);
+			if (ImGui::Begin("Saved Workspaces##workspace.manager.dialog",
+					&dialog.manager_open, flags)) {
+				const bool catalog_ready = aida::ui::workspace_layout::user_layout_catalog_ready();
+				const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
+				const auto active = aida::ui::workspace_layout::active_identity();
+				if (!dialog.selected_name.empty() && (!catalog ||
+					std::none_of(catalog->begin(), catalog->end(), [&dialog](const auto& item) {
+						return item.name == dialog.selected_name;
+					}))) {
+					dialog.selected_name.clear();
+					dialog.review = dialog.review == workspace_review_t::reset_all
+						? dialog.review : workspace_review_t::none;
+				}
+				if (dialog.selected_name.empty() && catalog && !catalog->empty()) {
+					const auto selected = std::find_if(catalog->begin(), catalog->end(),
+						[](const auto& item) { return item.active; });
+					dialog.selected_name = selected == catalog->end()
+						? catalog->front().name : selected->name;
+				}
+				ImGui::TextUnformatted("Saved Workspaces");
+				if (active.kind == aida::ui::workspace_layout::workspace_identity_kind_t::user)
+					ImGui::TextDisabled("Active: %s / %s",
+						workspace_preset_display_name(active.preset), active.user_name.c_str());
+				else
+					ImGui::TextDisabled("Active: %s / Built-in",
+						workspace_preset_display_name(active.preset));
+				ImGui::Separator();
+				const float list_width = (std::min)(260.0f,
+					(std::max)(160.0f, ImGui::GetContentRegionAvail().x * 0.38f));
+				ImGui::BeginChild("##workspace.manager.catalog", ImVec2(list_width, -44.0f),
+					true);
+				if (!catalog_ready) {
+					ImGui::TextWrapped("Loading saved workspace catalog...");
+				} else if (!catalog || catalog->empty()) {
+					ImGui::TextWrapped("No named workspaces yet. Use Save Workspace As to create one.");
+				} else {
+					for (const auto& item : *catalog) {
+						ImGui::PushID(item.name.c_str());
+						std::string label = item.name;
+						if (item.active) label.append("  [Active]");
+						const bool selected = dialog.selected_name == item.name;
+						if (ImGui::Selectable((label + "##workspace.saved-row").c_str(), selected,
+							ImGuiSelectableFlags_AllowDoubleClick)) {
+							dialog.selected_name = item.name;
+							copy_workspace_name(dialog.rename_name, item.name);
+							dialog.review = workspace_review_t::none;
+							dialog.status.clear();
+							if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !item.active &&
+								!aida::ui::workspace_layout::operation_pending()) {
+								const auto result = aida::ui::workspace_layout::load_user_layout(item.name);
+								dialog.status = workspace_request_message(result, "Load workspace");
+								if (workspace_request_succeeded(result)) dialog.manager_open = false;
+							}
+						}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						register_workspace_semantic(aida::preview::semantics::stable_id(
+							"aida.workspace.saved", item.name), "workspace-saved-row");
+#endif
+						ImGui::TextDisabled("%s  /  generation %llu",
+							workspace_preset_display_name(item.base_preset),
+							static_cast<unsigned long long>(item.generation));
+						ImGui::PopID();
+					}
+				}
+				ImGui::EndChild();
+				ImGui::SameLine();
+				ImGui::BeginChild("##workspace.manager.details", ImVec2(0.0f, -44.0f), true);
+				const auto selected = catalog ? std::find_if(catalog->begin(), catalog->end(),
+					[&dialog](const auto& item) { return item.name == dialog.selected_name; }) :
+					std::vector<aida::ui::workspace_layout::user_workspace_descriptor_t>::const_iterator{};
+				if (!catalog || selected == catalog->end()) {
+					ImGui::TextWrapped("Select a saved workspace to load, rename or delete it.");
+				} else {
+					ImGui::Text("%s", selected->name.c_str());
+					ImGui::TextDisabled("Base preset: %s", workspace_preset_display_name(selected->base_preset));
+					ImGui::TextDisabled("Saved generation: %llu",
+						static_cast<unsigned long long>(selected->generation));
+					ImGui::Spacing();
+					const bool pending = aida::ui::workspace_layout::operation_pending();
+					ImGui::BeginDisabled(pending || selected->active);
+					if (ImGui::Button("Load##workspace.manager.load", ImVec2(96.0f, 0.0f))) {
+						const auto result = aida::ui::workspace_layout::load_user_layout(selected->name);
+						dialog.status = workspace_request_message(result, "Load workspace");
+						if (workspace_request_succeeded(result)) dialog.manager_open = false;
+					}
+					register_workspace_semantic("aida.workspace.manager.load", "workspace-load",
+						pending || selected->active);
+					ImGui::EndDisabled();
+					ImGui::SameLine();
+					if (ImGui::Button("Save As Copy##workspace.manager.save-copy")) {
+						copy_workspace_name(dialog.save_name, selected->name);
+						dialog.manager_open = false;
+						dialog.save_as_open = true;
+						dialog.focus_save_name = true;
+						dialog.review = workspace_review_t::none;
+						dialog.status.clear();
+					}
+					register_workspace_semantic("aida.workspace.manager.save-copy",
+						"workspace-save-copy");
+					ImGui::Spacing();
+					if (dialog.rename_name[0] == '\0' ||
+						dialog.selected_name != selected->name)
+						copy_workspace_name(dialog.rename_name, selected->name);
+					if (dialog.focus_rename_name) {
+						ImGui::SetKeyboardFocusHere();
+						dialog.focus_rename_name = false;
+					}
+					ImGui::SetNextItemWidth(-1.0f);
+					ImGui::InputText("##workspace.manager.rename-name", dialog.rename_name,
+						sizeof(dialog.rename_name), ImGuiInputTextFlags_AutoSelectAll);
+					register_workspace_semantic("aida.workspace.manager.rename-name",
+						"workspace-rename-input");
+					ImGui::BeginDisabled(pending || dialog.rename_name[0] == '\0' ||
+						selected->name == dialog.rename_name);
+					if (ImGui::Button("Rename##workspace.manager.rename", ImVec2(96.0f, 0.0f))) {
+						const std::string old_name = selected->name;
+						const auto result = aida::ui::workspace_layout::rename_user_layout(
+							old_name, dialog.rename_name);
+						dialog.status = workspace_request_message(result, "Rename workspace");
+						if (workspace_request_succeeded(result))
+							dialog.selected_name.assign(dialog.rename_name);
+					}
+					register_workspace_semantic("aida.workspace.manager.rename",
+						"workspace-rename", pending || dialog.rename_name[0] == '\0' ||
+						selected->name == dialog.rename_name);
+					ImGui::EndDisabled();
+					ImGui::SameLine();
+					ImGui::BeginDisabled(pending);
+					if (ImGui::Button("Delete...##workspace.manager.delete", ImVec2(96.0f, 0.0f))) {
+						dialog.review = workspace_review_t::delete_saved;
+						dialog.status.clear();
+					}
+					register_workspace_semantic("aida.workspace.manager.delete",
+						"workspace-delete-review", pending);
+					ImGui::EndDisabled();
+					if (dialog.review == workspace_review_t::delete_saved) {
+						ImGui::Separator();
+						ImGui::TextWrapped("Delete \"%s\"? The saved layout and its visibility snapshot will be removed. Open documents and jobs are not deleted.",
+							selected->name.c_str());
+						ImGui::BeginDisabled(pending);
+						if (ImGui::Button("Delete Permanently##workspace.manager.delete-confirm")) {
+							const auto result = aida::ui::workspace_layout::delete_user_layout(
+								selected->name);
+							dialog.status = workspace_request_message(result, "Delete workspace");
+							if (workspace_request_succeeded(result)) {
+								dialog.selected_name.clear();
+								dialog.review = workspace_review_t::none;
+							}
+						}
+						register_workspace_semantic("aida.workspace.manager.delete-confirm",
+							"workspace-delete-confirm", pending);
+						ImGui::EndDisabled();
+						ImGui::SameLine();
+						if (ImGui::Button("Cancel Delete##workspace.manager.delete-cancel"))
+							dialog.review = workspace_review_t::none;
+						register_workspace_semantic("aida.workspace.manager.delete-cancel",
+							"workspace-delete-cancel");
+					}
+				}
+				if (!dialog.status.empty()) {
+					ImGui::Separator();
+					ImGui::TextWrapped("%s", dialog.status.c_str());
+				}
+				ImGui::EndChild();
+				if (dialog.review == workspace_review_t::reset_all) {
+					ImGui::Separator();
+					ImGui::TextWrapped("Reset all layouts? Every built-in customization and every named workspace will be removed, then the factory Analysis workspace will open. Documents, analysis sessions and background jobs remain intact.");
+					const bool pending = aida::ui::workspace_layout::operation_pending();
+					ImGui::BeginDisabled(pending);
+					if (ImGui::Button("Reset All Layouts##workspace.manager.reset-all-confirm")) {
+						const auto result = aida::ui::workspace_layout::reset_all();
+						dialog.status = workspace_request_message(result, "Reset all layouts");
+						if (workspace_request_succeeded(result)) dialog.manager_open = false;
+					}
+					register_workspace_semantic("aida.workspace.manager.reset-all-confirm",
+						"workspace-reset-all-confirm", pending);
+					ImGui::EndDisabled();
+					ImGui::SameLine();
+					if (ImGui::Button("Cancel Reset##workspace.manager.reset-all-cancel"))
+						dialog.review = workspace_review_t::none;
+					register_workspace_semantic("aida.workspace.manager.reset-all-cancel",
+						"workspace-reset-all-cancel");
+				} else {
+					if (ImGui::Button("Save Workspace As...##workspace.manager.save-as"))
+						open_workspace_save_as_dialog();
+					register_workspace_semantic("aida.workspace.manager.save-as",
+						"workspace-save-as-open");
+					ImGui::SameLine();
+					if (ImGui::Button("Close##workspace.manager.close"))
+						dialog.manager_open = false;
+					register_workspace_semantic("aida.workspace.manager.close",
+						"workspace-dialog-close");
+				}
+			}
+			ImGui::End();
+		}
+
+		if ((dialog.save_as_open || dialog.manager_open) &&
+			ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+			dialog.save_as_open = false;
+			dialog.manager_open = false;
+			dialog.review = workspace_review_t::none;
+		}
+	}
+
+	std::string& custom_theme_ui_error()
+	{
+		static std::string value;
+		return value;
+	}
+
+	aida::theme_transfer::theme_t capture_theme_transfer(const CustomThemeData& theme)
+	{
+		aida::theme_transfer::theme_t captured;
+		captured.name = theme.name;
+		captured.accent = {theme.accent[0], theme.accent[1], theme.accent[2]};
+		captured.bg_base = static_cast<std::uint32_t>(theme.bg_base);
+		captured.panel_bg = static_cast<std::uint32_t>(theme.panel_bg);
+		captured.panel_header = static_cast<std::uint32_t>(theme.panel_header);
+		captured.title_bar = static_cast<std::uint32_t>(theme.title_bar);
+		captured.text_primary = static_cast<std::uint32_t>(theme.text_primary);
+		captured.text_secondary = static_cast<std::uint32_t>(theme.text_secondary);
+		captured.text_dim = static_cast<std::uint32_t>(theme.text_dim);
+		captured.acrylic_color = static_cast<std::uint32_t>(theme.acrylic_color);
+		captured.icon_index = theme.icon_index;
+		captured.icon_file_path = theme.icon_file_path;
+		return captured;
+	}
+
+	CustomThemeData materialize_theme(const aida::theme_transfer::theme_t& theme)
+	{
+		CustomThemeData materialized;
+		materialized.name = theme.name;
+		materialized.accent[0] = theme.accent[0];
+		materialized.accent[1] = theme.accent[1];
+		materialized.accent[2] = theme.accent[2];
+		materialized.bg_base = static_cast<ImU32>(theme.bg_base);
+		materialized.panel_bg = static_cast<ImU32>(theme.panel_bg);
+		materialized.panel_header = static_cast<ImU32>(theme.panel_header);
+		materialized.title_bar = static_cast<ImU32>(theme.title_bar);
+		materialized.text_primary = static_cast<ImU32>(theme.text_primary);
+		materialized.text_secondary = static_cast<ImU32>(theme.text_secondary);
+		materialized.text_dim = static_cast<ImU32>(theme.text_dim);
+		materialized.acrylic_color = static_cast<DWORD>(theme.acrylic_color);
+		materialized.icon_index = theme.icon_index;
+		materialized.icon_file_path = theme.icon_file_path;
+		return materialized;
+	}
+
+	bool validate_custom_theme(const CustomThemeData& theme, std::string& error)
+	{
+		if (theme.name.empty() ||
+			theme.name.size() > aida::theme_transfer::maximum_theme_name_bytes ||
+			theme.name.find('\0') != std::string::npos) {
+			error = "Theme names must contain between 1 and 96 bytes.";
+			return false;
+		}
+		for (const float channel : theme.accent) {
+			if (!std::isfinite(channel) || channel < 0.0f || channel > 1.0f) {
+				error = "Theme accent channels must be finite values between 0 and 1.";
+				return false;
 			}
 		}
-		g_settings_cv.notify_one();
-#endif
+		if (theme.icon_index < -1 || theme.icon_index > 4095) {
+			error = "The theme icon index is outside the supported range.";
+			return false;
+		}
+		if (theme.icon_file_path.size() >
+				aida::theme_transfer::maximum_icon_path_bytes ||
+			theme.icon_file_path.find('\0') != std::string::npos) {
+			error = "The theme icon path exceeds its exact bound or contains an embedded null.";
+			return false;
+		}
+		error.clear();
+		return true;
+	}
+
+	bool persist_custom_theme_catalog(std::string& error)
+	{
+		if (custom_themes::list.size() > aida::theme_transfer::maximum_theme_count) {
+			error = "The custom theme catalog is limited to 128 themes.";
+			return false;
+		}
+		nlohmann::json catalog = nlohmann::json::array();
+		for (const auto& theme : custom_themes::list) {
+			if (!validate_custom_theme(theme, error))
+				return false;
+			const auto captured = capture_theme_transfer(theme);
+			catalog.push_back({
+				{"schema_version", 1},
+				{"name", captured.name},
+				{"accent", {captured.accent[0], captured.accent[1], captured.accent[2]}},
+				{"bg_base", captured.bg_base},
+				{"panel_bg", captured.panel_bg},
+				{"panel_header", captured.panel_header},
+				{"title_bar", captured.title_bar},
+				{"text_primary", captured.text_primary},
+				{"text_secondary", captured.text_secondary},
+				{"text_dim", captured.text_dim},
+				{"acrylic_color", captured.acrylic_color},
+				{"icon_index", captured.icon_index},
+				{"icon_file_path", captured.icon_file_path}
+			});
+		}
+		std::string payload;
+		try {
+			payload = catalog.dump();
+		} catch (...) {
+			error = "The custom theme catalog could not be serialized.";
+			return false;
+		}
+		if (payload.size() > 1024U * 1024U) {
+			error = "The custom theme catalog exceeds its 1 MiB bound.";
+			return false;
+		}
+		const std::string previous_payload = g_sa_settings.custom_themes_json;
+		const int previous_active = g_sa_settings.active_custom_theme_idx;
+		g_sa_settings.custom_themes_json = std::move(payload);
+		g_sa_settings.active_custom_theme_idx = custom_themes::active_custom;
+		const auto requested = aida::settings_persistence::request_save(g_sa_settings);
+		if (!aida::settings_persistence::accepted(requested)) {
+			g_sa_settings.custom_themes_json = previous_payload;
+			g_sa_settings.active_custom_theme_idx = previous_active;
+			error = "The immutable settings snapshot for the custom theme catalog was rejected.";
+			return false;
+		}
+		error.clear();
+		return true;
+	}
+
+	void process_theme_transfer_completion()
+	{
+		auto completion = aida::theme_transfer::take_completion();
+		if (!completion || completion->operation !=
+				aida::theme_transfer::operation_t::import_theme ||
+			!completion->success)
+			return;
+		if (!completion->imported_theme) {
+			custom_theme_ui_error() = "The validated theme import did not contain a theme.";
+			aida::theme_transfer::acknowledge_import(completion->serial, false,
+				custom_theme_ui_error());
+			return;
+		}
+		if (custom_themes::list.size() >= aida::theme_transfer::maximum_theme_count) {
+			custom_theme_ui_error() = "Delete a custom theme before importing another; the catalog limit is 128.";
+			aida::theme_transfer::acknowledge_import(completion->serial, false,
+				custom_theme_ui_error());
+			return;
+		}
+		const int previous_active = custom_themes::active_custom;
+		custom_themes::list.push_back(materialize_theme(*completion->imported_theme));
+		custom_themes::active_custom = static_cast<int>(custom_themes::list.size()) - 1;
+		std::string persistence_error;
+		if (!persist_custom_theme_catalog(persistence_error)) {
+			custom_themes::list.pop_back();
+			custom_themes::active_custom = previous_active;
+			custom_theme_ui_error() = std::move(persistence_error);
+			aida::theme_transfer::acknowledge_import(completion->serial, false,
+				custom_theme_ui_error());
+			return;
+		}
+		themes::changed = true;
+		custom_theme_ui_error().clear();
+		aida::theme_transfer::acknowledge_import(completion->serial, true);
 	}
 
 	void log_license_screen_breadcrumb(const char* event, float window_w, float window_h, bool runtime_ready, bool runtime_locked)
@@ -340,7 +877,6 @@ namespace {
 			return;
 		}
 
-		file_tabs::write_hot_exit_snapshot_all();
 		try {
 			test_all_features::cancel_tests();
 			aida::burp::camoufox::force_cleanup(cleanup_reason ? cleanup_reason : "chrome.shutdown");
@@ -415,64 +951,6 @@ namespace {
 	}
 #endif
 
-	const char* center_view_name(center_view_t view)
-	{
-		switch (view) {
-			case center_view_t::code_editor: return "code_editor";
-			case center_view_t::disassembly: return "disassembly";
-			case center_view_t::hex_view: return "hex_view";
-			case center_view_t::welcome: return "welcome";
-			case center_view_t::settings_view: return "settings_view";
-			case center_view_t::network_view: return "network_view";
-			case center_view_t::memory_scanner: return "memory_scanner";
-			case center_view_t::debugger_view: return "debugger_view";
-			case center_view_t::pseudocode: return "pseudocode";
-			case center_view_t::struct_recon: return "struct_recon";
-			case center_view_t::crypto_scanner: return "crypto_scanner";
-			case center_view_t::aob_generator: return "aob_generator";
-			case center_view_t::fuzzer_view: return "fuzzer_view";
-			case center_view_t::xref_browser: return "xref_browser";
-			case center_view_t::snapshot_diff: return "snapshot_diff";
-			case center_view_t::pointer_scanner: return "pointer_scanner";
-			case center_view_t::decrypt_oracle: return "decrypt_oracle";
-			case center_view_t::integrity_hunter: return "integrity_hunter";
-			case center_view_t::symbolic_view: return "symbolic_view";
-			case center_view_t::taint_view: return "taint_view";
-			case center_view_t::deobfuscation_view: return "deobfuscation_view";
-			case center_view_t::stealth_view: return "stealth_view";
-			case center_view_t::scan_hub: return "scan_hub";
-			case center_view_t::types_hub: return "types_hub";
-			case center_view_t::analysis_hub: return "analysis_hub";
-			case center_view_t::binary_map: return "binary_map";
-			case center_view_t::graph_view: return "graph_view";
-			case center_view_t::image_view: return "image_view";
-			case center_view_t::test_lab: return "test_lab";
-			case center_view_t::workbench: return "workbench";
-			case center_view_t::functions_panel: return "functions_panel";
-			case center_view_t::xref_database: return "xref_database";
-		}
-		return "unknown";
-	}
-
-	std::optional<aida::workbench::document_kind_t> workbench_document_kind(
-		center_view_t view)
-	{
-		switch (view) {
-			case center_view_t::disassembly:
-				return aida::workbench::document_kind_t::disassembly;
-			case center_view_t::hex_view:
-				return aida::workbench::document_kind_t::hex;
-			case center_view_t::pseudocode:
-				return aida::workbench::document_kind_t::pseudocode;
-			case center_view_t::graph_view:
-				return aida::workbench::document_kind_t::graph;
-			case center_view_t::snapshot_diff:
-				return aida::workbench::document_kind_t::diff;
-			default:
-				return std::nullopt;
-		}
-	}
-
 	void restore_workbench_center_view(
 		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace)
 	{
@@ -505,76 +983,8 @@ namespace {
 		restored_workspace = workspace;
 		if (workspace->identity().target_kind() ==
 			aida::analysis::target_kind_t::static_file)
-			globals::ui::active_center_view = center_view_t::workbench;
-	}
-
-	class workbench_frame_cancellation_t final
-		: public aida::workbench::disasm_document::disasm_cancellation_t,
-		  public aida::workbench::hex_document::hex_cancellation_t,
-		  public aida::workbench::graph_document::graph_layout_cancellation_t,
-		  public aida::workbench::diff_document::diff_cancellation_t,
-		  public aida::workbench::navigator::navigator_cancellation_t
-	{
-	public:
-		explicit workbench_frame_cancellation_t(std::uint32_t budget_ms)
-			: deadline_(std::chrono::steady_clock::now() +
-				std::chrono::milliseconds(budget_ms)) {}
-
-		bool cancelled() const noexcept override
-		{
-			return std::chrono::steady_clock::now() >= deadline_;
-		}
-
-	private:
-		std::chrono::steady_clock::time_point deadline_;
-	};
-
-	struct workbench_ui_state_t final {
-		aida::workbench::navigator::navigator_domain_t navigator_domain =
-			aida::workbench::navigator::navigator_domain_t::functions;
-		std::uint64_t disassembly_offset = 0;
-		std::uint64_t hex_offset = 0;
-		std::uint64_t diff_offset = 0;
-		std::uint64_t diff_total = 0;
-		std::uint64_t last_address = 0;
-		std::string last_entity_locator;
-		std::string pseudocode_identity;
-		std::optional<aida::workbench::pseudocode_document::
-			pseudocode_request_t> pseudocode_request;
-		aida::workbench::graph_document::graph_kind_t graph_kind =
-			aida::workbench::graph_document::graph_kind_t::cfg;
-		aida::workbench::graph_document::graph_layout_t graph_layout;
-		std::uint64_t graph_layout_function_address = 0;
-		aida::workbench::diff_document::diff_kind_t diff_kind =
-			aida::workbench::diff_document::diff_kind_t::generation;
-		aida::analysis::decompiler_profile_id_t pseudocode_profile =
-			aida::analysis::decompiler_profile_id_t::balanced;
-		std::uint64_t observed_generation = 0;
-		std::uint64_t last_touch = 0;
-		std::string status;
-	};
-
-	workbench_ui_state_t& workbench_ui_state(
-		aida::workbench::workspace_id_t workspace)
-	{
-		static std::map<std::uint64_t, workbench_ui_state_t> states;
-		static std::uint64_t touch = 0;
-		if (++touch == 0)
-			touch = 1;
-		auto found = states.find(workspace.value);
-		if (found == states.end()) {
-			if (states.size() >= 64) {
-				const auto oldest = std::min_element(
-					states.begin(), states.end(), [](const auto& lhs, const auto& rhs) {
-						return lhs.second.last_touch < rhs.second.last_touch;
-					});
-				if (oldest != states.end())
-					states.erase(oldest);
-			}
-			found = states.try_emplace(workspace.value).first;
-		}
-		found->second.last_touch = touch;
-		return found->second;
+			static_cast<void>(aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.disassembly")));
 	}
 
 	const aida::workbench::document_persistence_dto_t*
@@ -584,815 +994,6 @@ namespace {
 		const auto found = std::find_if(state.documents.begin(), state.documents.end(),
 			[document](const auto& candidate) { return candidate.id == document; });
 		return found == state.documents.end() ? nullptr : &*found;
-	}
-
-	void render_workbench_disassembly(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		aida::workbench::workbench_shell_workspace_context_t& context,
-		workbench_ui_state_t& state)
-	{
-		if (!context.disassembly_document) {
-			ImGui::TextDisabled("Disassembly provider unavailable");
-			return;
-		}
-		const auto total_rows = context.disassembly_document->total_rows();
-		if (ImGui::SmallButton("Previous##wb_disasm"))
-			state.disassembly_offset = state.disassembly_offset > 256
-				? state.disassembly_offset - 256 : 0;
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Next##wb_disasm"))
-			state.disassembly_offset = total_rows > 256U
-				? (std::min)(state.disassembly_offset + 256U,
-					total_rows - 256U) : 0;
-		ImGui::SameLine();
-		ImGui::TextDisabled("generation %llu", static_cast<unsigned long long>(
-			context.analysis_generation));
-		aida::workbench::disasm_document::disasm_page_t page;
-		workbench_frame_cancellation_t cancellation(20);
-		const auto error = context.disassembly_document->page(
-			{state.disassembly_offset, 256}, &cancellation, page);
-		if (!error) {
-			ImGui::TextDisabled("Disassembly unavailable (%u)",
-				static_cast<unsigned>(error.code));
-			return;
-		}
-		if (page.offset != state.disassembly_offset)
-			state.disassembly_offset = page.offset;
-		for (const auto& row : page.rows) {
-			char label[1024];
-			_snprintf_s(label, sizeof(label), _TRUNCATE,
-				"%016llX  %-10s %s%s%s##wb_disasm_%llu",
-				static_cast<unsigned long long>(row.address), row.mnemonic.c_str(),
-				row.operands.c_str(), row.overlay ? "  ; " : "",
-				row.overlay ? row.overlay->text.c_str() : "",
-				static_cast<unsigned long long>(row.id.value));
-			const bool selected = state.last_address == row.address;
-			if (!ImGui::Selectable(label, selected))
-				continue;
-			state.last_address = row.address;
-			state.last_entity_locator.clear();
-			aida::workbench::selection_context_t selection;
-			selection.kind = aida::workbench::selection_kind_t::address;
-			selection.has_address = true;
-			selection.address = row.address;
-			selection.extent = row.byte_size;
-			aida::workbench::document_local_cursor_t cursor;
-			cursor.has_position = true;
-			cursor.position = row.address;
-			static_cast<void>(
-				aida::workbench::workbench_shell_runtime_t::instance()
-					.navigate_document(workspace,
-						aida::workbench::document_kind_t::disassembly,
-						std::nullopt, selection, cursor, context));
-		}
-	}
-
-	void render_workbench_hex(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		aida::workbench::workbench_shell_workspace_context_t& context,
-		workbench_ui_state_t& state)
-	{
-		if (!context.hex_document) {
-			ImGui::TextDisabled("Hex provider unavailable");
-			return;
-		}
-		const auto total_rows = context.hex_document->total_rows();
-		if (ImGui::SmallButton("Previous##wb_hex"))
-			state.hex_offset = state.hex_offset > 256 ? state.hex_offset - 256 : 0;
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Next##wb_hex"))
-			state.hex_offset = total_rows > 256U
-				? (std::min)(state.hex_offset + 256U, total_rows - 256U) : 0;
-		aida::workbench::hex_document::hex_page_t page;
-		workbench_frame_cancellation_t cancellation(20);
-		const auto error = context.hex_document->page(
-			{state.hex_offset, 256}, &cancellation, page);
-		if (!error) {
-			ImGui::TextDisabled("Hex unavailable (%u)",
-				static_cast<unsigned>(error.code));
-			return;
-		}
-		if (page.offset != state.hex_offset)
-			state.hex_offset = page.offset;
-		for (const auto& row : page.rows) {
-			char label[2048];
-			_snprintf_s(label, sizeof(label), _TRUNCATE,
-				"%016llX  %-48s  %s##wb_hex_%llu",
-				static_cast<unsigned long long>(row.address), row.hex_text.c_str(),
-				row.ascii_text.c_str(),
-				static_cast<unsigned long long>(row.id.value));
-			if (!ImGui::Selectable(label, state.last_address == row.address))
-				continue;
-			state.last_address = row.address;
-			state.last_entity_locator.clear();
-			aida::workbench::selection_context_t selection;
-			selection.kind = aida::workbench::selection_kind_t::range;
-			selection.has_address = true;
-			selection.address = row.address;
-			selection.extent = row.byte_count;
-			aida::workbench::document_local_cursor_t cursor;
-			cursor.has_position = true;
-			cursor.position = row.address;
-			static_cast<void>(
-				aida::workbench::workbench_shell_runtime_t::instance()
-					.navigate_document(workspace,
-						aida::workbench::document_kind_t::hex,
-						std::nullopt, selection, cursor, context));
-		}
-	}
-
-	void render_workbench_pseudocode(
-		aida::workbench::workbench_shell_workspace_context_t& context,
-		workbench_ui_state_t& state)
-	{
-		auto* model = context.pseudocode_document;
-		if (!model) {
-			ImGui::TextDisabled("Typed pseudocode provider unavailable");
-			return;
-		}
-		if (ImGui::SmallButton("Fast##wb_psv"))
-			state.pseudocode_profile = aida::analysis::decompiler_profile_id_t::fast;
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Balanced##wb_psv"))
-			state.pseudocode_profile = aida::analysis::decompiler_profile_id_t::balanced;
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Thorough##wb_psv"))
-			state.pseudocode_profile = aida::analysis::decompiler_profile_id_t::thorough;
-		ImGui::SameLine();
-		const bool can_request =
-			(state.last_address != 0 || !state.last_entity_locator.empty()) &&
-			!model->has_pending_requests();
-		ImGui::BeginDisabled(!can_request);
-		if (ImGui::SmallButton("Decompile (F5)##wb_psv")) {
-			aida::workbench::pseudocode_document::pseudocode_request_t request;
-			aida::workbench::pseudocode_document::pseudocode_error_t resolved;
-			if (!state.last_entity_locator.empty()) {
-				const auto locator =
-					aida::workbench::pseudocode_document::
-						parse_pseudocode_entity_locator(
-							state.last_entity_locator);
-				resolved = locator
-					? model->resolve_request(*locator, state.pseudocode_profile,
-						aida::workbench::pseudocode_document::
-							k_pseudocode_document_default_timeout_ms, request)
-					: aida::workbench::pseudocode_document::pseudocode_error_t{
-						aida::workbench::pseudocode_document::
-							pseudocode_error_code_t::invalid_argument, 0};
-			} else {
-				resolved = model->resolve_request(
-					state.last_address, state.pseudocode_profile,
-					aida::workbench::pseudocode_document::
-						k_pseudocode_document_default_timeout_ms, request);
-			}
-			const auto requested = resolved ? model->request(request) : resolved;
-			if (requested || requested.code ==
-				aida::workbench::pseudocode_document::
-					pseudocode_error_code_t::request_in_progress)
-				state.pseudocode_request = request;
-			else
-				state.status = "Decompiler request rejected (" +
-					std::to_string(static_cast<unsigned>(requested.code)) + ")";
-		}
-		ImGui::EndDisabled();
-		const auto* cached = state.pseudocode_request
-			? model->cached_document(*state.pseudocode_request)
-			: model->cached_document();
-		if (cached && cached->state ==
-			aida::workbench::pseudocode_document::pseudocode_cache_state_t::requesting) {
-			static_cast<void>(model->poll(cached->job_id));
-			cached = state.pseudocode_request
-				? model->cached_document(*state.pseudocode_request)
-				: model->cached_document();
-		}
-		if (model->has_pending_requests() && cached) {
-			ImGui::SameLine();
-			if (ImGui::SmallButton("Cancel##wb_psv"))
-				static_cast<void>(model->cancel(cached->job_id));
-		}
-		if (!state.status.empty())
-			ImGui::TextDisabled("%s", state.status.c_str());
-		aida::workbench::pseudocode_document::pseudocode_page_t page;
-		const auto error = model->page({0, 1024}, page);
-		if (!error) {
-			const auto diagnostics = model->diagnostics();
-			for (const auto& diagnostic : diagnostics)
-				ImGui::TextWrapped("%s", diagnostic.message.c_str());
-			if (diagnostics.empty())
-				ImGui::TextDisabled("Select an address and request decompilation explicitly.");
-			return;
-		}
-		for (const auto& line : page.lines) {
-			char id[64];
-			_snprintf_s(id, sizeof(id), _TRUNCATE, "##wb_psv_%u", line.line_number);
-			ImGui::Selectable((line.text + id).c_str(), false);
-		}
-	}
-
-	void render_workbench_graph(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		aida::workbench::workbench_shell_workspace_context_t& context,
-		workbench_ui_state_t& state, float width, float height)
-	{
-		auto* model = context.graph_document;
-		if (!model) {
-			ImGui::TextDisabled("Graph provider unavailable");
-			return;
-		}
-		if (ImGui::SmallButton("CFG##wb_graph")) {
-			state.graph_kind = aida::workbench::graph_document::graph_kind_t::cfg;
-			state.graph_layout = {};
-		}
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Call graph##wb_graph")) {
-			state.graph_kind = aida::workbench::graph_document::graph_kind_t::call_graph;
-			state.graph_layout = {};
-		}
-		ImGui::SameLine();
-		const bool reusable_layout_scope = state.graph_layout.complete &&
-			state.graph_layout.snapshot_generation == context.analysis_generation &&
-			state.graph_layout.graph_kind == state.graph_kind;
-		const auto graph_function_address = state.graph_kind ==
-			aida::workbench::graph_document::graph_kind_t::cfg
-			? (reusable_layout_scope
-				? state.graph_layout_function_address : state.last_address)
-			: 0;
-		if (ImGui::SmallButton("Layout##wb_graph")) {
-			aida::workbench::graph_document::graph_layout_request_t request;
-			request.expected_generation = context.analysis_generation;
-			request.graph_kind = state.graph_kind;
-			request.function_address = graph_function_address;
-			request.max_nodes =
-				aida::workbench::graph_document::k_graph_document_max_page_size;
-			request.max_edges = 8192;
-			request.max_iterations = 256;
-			request.canvas_width = (std::max)(width, 320.0f);
-			request.canvas_height = (std::max)(height - 48.0f, 200.0f);
-			workbench_frame_cancellation_t cancellation(40);
-			aida::workbench::graph_document::graph_layout_t layout;
-			const auto error = model->compute_layout(
-				request, &cancellation, layout);
-			if (!error) {
-				state.graph_layout = {};
-				state.status = "Graph layout deferred (" +
-					std::to_string(static_cast<unsigned>(error.code)) + ")";
-			} else {
-				state.graph_layout = std::move(layout);
-				state.graph_layout_function_address = graph_function_address;
-				state.status.clear();
-			}
-		}
-		const bool layout_current = state.graph_layout.complete &&
-			state.graph_layout.snapshot_generation == context.analysis_generation &&
-			state.graph_layout.graph_kind == state.graph_kind &&
-			state.graph_layout_function_address == graph_function_address;
-		aida::workbench::graph_document::graph_page_request_t request;
-		request.limit = layout_current
-			? aida::workbench::graph_document::k_graph_document_max_page_size
-			: 256;
-		request.graph_kind = state.graph_kind;
-		request.function_address = graph_function_address;
-		workbench_frame_cancellation_t cancellation(25);
-		aida::workbench::graph_document::graph_page_t page;
-		const auto error = model->page(request, &cancellation, page);
-		if (!error) {
-			ImGui::TextDisabled("Graph materialization deferred (%u)",
-				static_cast<unsigned>(error.code));
-			return;
-		}
-		auto navigate = [&](const aida::workbench::graph_document::graph_node_view_t& node) {
-			state.last_address = node.address;
-			state.last_entity_locator.clear();
-			aida::workbench::selection_context_t selection;
-			selection.kind = aida::workbench::selection_kind_t::address;
-			selection.has_address = true;
-			selection.address = node.address;
-			selection.entity_key = std::to_string(node.id.value);
-			aida::workbench::document_local_cursor_t cursor;
-			cursor.has_position = true;
-			cursor.position = node.address;
-			static_cast<void>(
-				aida::workbench::workbench_shell_runtime_t::instance()
-					.navigate_document(workspace,
-						aida::workbench::document_kind_t::graph,
-						std::nullopt, selection, cursor, context));
-		};
-		if (layout_current && page.total_items <=
-			aida::workbench::graph_document::k_graph_document_max_page_size) {
-			std::unordered_map<std::uint64_t,
-				const aida::workbench::graph_document::graph_node_view_t*> nodes;
-			nodes.reserve(page.nodes.size());
-			for (const auto& node : page.nodes)
-				nodes.emplace(node.id.value, &node);
-			std::unordered_map<std::uint64_t,
-				const aida::workbench::graph_document::graph_layout_node_t*> positions;
-			positions.reserve(state.graph_layout.nodes.size());
-			for (const auto& node : state.graph_layout.nodes)
-				positions.emplace(node.id.value, &node);
-			const auto available = ImGui::GetContentRegionAvail();
-			const ImVec2 canvas_size(
-				(std::max)(available.x, 1.0f),
-				(std::max)(available.y, 1.0f));
-			const auto origin = ImGui::GetCursorScreenPos();
-			ImGui::InvisibleButton("##wb_graph_canvas", canvas_size);
-			auto* draw = ImGui::GetWindowDrawList();
-			const auto edge_color = ImGui::GetColorU32(ImGuiCol_Separator);
-			for (const auto& edge : state.graph_layout.edges) {
-				const auto source = positions.find(edge.source.value);
-				const auto target = positions.find(edge.target.value);
-				if (source == positions.end() || target == positions.end())
-					continue;
-				ImVec2 previous(
-					origin.x + source->second->x + source->second->width * 0.5f,
-					origin.y + source->second->y + source->second->height * 0.5f);
-				const auto bends = (std::min)(edge.bend_x.size(), edge.bend_y.size());
-				for (std::size_t index = 0; index < bends; ++index) {
-					const ImVec2 bend(origin.x + edge.bend_x[index],
-						origin.y + edge.bend_y[index]);
-					draw->AddLine(previous, bend, edge_color, 1.5f);
-					previous = bend;
-				}
-				const ImVec2 endpoint(
-					origin.x + target->second->x + target->second->width * 0.5f,
-					origin.y + target->second->y + target->second->height * 0.5f);
-				draw->AddLine(previous, endpoint, edge_color, 1.5f);
-			}
-			const auto mouse = ImGui::GetMousePos();
-			const bool clicked = ImGui::IsItemHovered() &&
-				ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-			const auto normal_color = ImGui::GetColorU32(ImGuiCol_FrameBg);
-			const auto selected_color = ImGui::GetColorU32(ImGuiCol_HeaderActive);
-			const auto border_color = ImGui::GetColorU32(ImGuiCol_Border);
-			const auto text_color = ImGui::GetColorU32(ImGuiCol_Text);
-			const aida::workbench::graph_document::graph_node_view_t* clicked_node = nullptr;
-			for (const auto& layout_node : state.graph_layout.nodes) {
-				const auto view = nodes.find(layout_node.id.value);
-				if (view == nodes.end())
-					continue;
-				const ImVec2 minimum(origin.x + layout_node.x,
-					origin.y + layout_node.y);
-				const ImVec2 maximum(minimum.x + layout_node.width,
-					minimum.y + layout_node.height);
-				draw->AddRectFilled(minimum, maximum,
-					state.last_address == view->second->address
-						? selected_color : normal_color, 4.0f);
-				draw->AddRect(minimum, maximum, border_color, 4.0f);
-				auto label = view->second->label;
-				if (label.size() > 24)
-					label.resize(24);
-				draw->AddText(ImVec2(minimum.x + 6.0f, minimum.y + 6.0f),
-					text_color, label.c_str());
-				if (clicked && mouse.x >= minimum.x && mouse.x < maximum.x &&
-					mouse.y >= minimum.y && mouse.y < maximum.y)
-					clicked_node = view->second;
-			}
-			if (clicked_node)
-				navigate(*clicked_node);
-			return;
-		}
-		for (const auto& node : page.nodes) {
-			char label[1024];
-			_snprintf_s(label, sizeof(label), _TRUNCATE,
-				"%016llX  %s  in:%u out:%u##wb_graph_%llu",
-				static_cast<unsigned long long>(node.address), node.label.c_str(),
-				node.in_degree, node.out_degree,
-				static_cast<unsigned long long>(node.id.value));
-			if (!ImGui::Selectable(label, state.last_address == node.address))
-				continue;
-			navigate(node);
-		}
-	}
-
-	bool workbench_diff_scope(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		const aida::workbench::workbench_shell_workspace_context_t& context,
-		aida::workbench::diff_document::diff_kind_t kind,
-		aida::workbench::diff_document::diff_scope_t& scope)
-	{
-		scope = {};
-		scope.kind = kind;
-		scope.before.workspace_id = context.workspace.value;
-		scope.after.workspace_id = context.workspace.value;
-		scope.before.generation = context.analysis_generation;
-		scope.after.generation = context.analysis_generation;
-		if (kind == aida::workbench::diff_document::diff_kind_t::generation) {
-			if (context.analysis_generation < 2)
-				return false;
-			scope.before.generation = context.analysis_generation - 1U;
-			return true;
-		}
-		if (kind == aida::workbench::diff_document::diff_kind_t::overlay) {
-			if (context.overlay_revision == 0)
-				return false;
-			scope.before.overlay_revision = context.overlay_revision - 1U;
-			scope.after.overlay_revision = context.overlay_revision;
-			return true;
-		}
-		const auto workspaces =
-			aida::workbench::workbench_shell_runtime_t::instance()
-				.analysis_workspaces();
-		for (const auto& other : workspaces) {
-			if (!other || other == workspace)
-				continue;
-			aida::workbench::workbench_shell_workspace_context_t other_context;
-			const auto loaded =
-				aida::workbench::workbench_shell_runtime_t::instance()
-					.workspace_context(other, other_context);
-			if (!loaded)
-				continue;
-			scope.after.workspace_id = other_context.workspace.value;
-			scope.after.generation = other_context.analysis_generation;
-			return true;
-		}
-		return false;
-	}
-
-	void render_workbench_diff(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		aida::workbench::workbench_shell_workspace_context_t& context,
-		workbench_ui_state_t& state)
-	{
-		auto* model = context.diff_document;
-		if (!model) {
-			ImGui::TextDisabled("Diff provider unavailable");
-			return;
-		}
-		if (ImGui::SmallButton("Generation##wb_diff"))
-			state.diff_kind = aida::workbench::diff_document::diff_kind_t::generation;
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Overlay##wb_diff"))
-			state.diff_kind = aida::workbench::diff_document::diff_kind_t::overlay;
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Workspace##wb_diff"))
-			state.diff_kind = aida::workbench::diff_document::diff_kind_t::workspace;
-		aida::workbench::diff_document::diff_scope_t scope;
-		if (!workbench_diff_scope(workspace, context, state.diff_kind, scope)) {
-			ImGui::TextDisabled("The selected diff requires another retained generation, overlay revision, or workspace.");
-			return;
-		}
-		if (ImGui::SmallButton("Previous##wb_diff"))
-			state.diff_offset = state.diff_offset > 256 ? state.diff_offset - 256 : 0;
-		ImGui::SameLine();
-		if (ImGui::SmallButton("Next##wb_diff"))
-			state.diff_offset = state.diff_total > 256U
-				? (std::min)(state.diff_offset + 256U,
-					state.diff_total - 256U) : 0;
-		aida::workbench::diff_document::diff_page_t page;
-		workbench_frame_cancellation_t cancellation(30);
-		const auto error = model->page({state.diff_offset, 256,
-			static_cast<aida::workbench::diff_document::diff_domain_t>(0xFF)},
-			context.analysis_generation, scope, &cancellation, page);
-		if (!error) {
-			ImGui::TextDisabled("Diff materialization deferred (%u)",
-				static_cast<unsigned>(error.code));
-			return;
-		}
-		state.diff_total = page.total_entries;
-		for (std::size_t index = 0; index < page.entries.size(); ++index) {
-			const auto& entry = page.entries[index];
-			char label[2048];
-			_snprintf_s(label, sizeof(label), _TRUNCATE,
-				"%016llX  %s  %s -> %s##wb_diff_%llu",
-				static_cast<unsigned long long>(entry.address),
-				entry.entity_key.c_str(), entry.old_value.c_str(),
-				entry.new_value.c_str(),
-				static_cast<unsigned long long>(page.offset + index));
-			if (!ImGui::Selectable(label, state.last_address == entry.address))
-				continue;
-			state.last_address = entry.address;
-			state.last_entity_locator.clear();
-			if (entry.address == 0)
-				continue;
-			aida::workbench::selection_context_t selection;
-			selection.kind = aida::workbench::selection_kind_t::address;
-			selection.has_address = true;
-			selection.address = entry.address;
-			selection.entity_key = entry.entity_key;
-			aida::workbench::document_local_cursor_t cursor;
-			cursor.has_position = true;
-			cursor.position = page.offset + index;
-			static_cast<void>(
-				aida::workbench::workbench_shell_runtime_t::instance()
-					.navigate_document(workspace,
-						aida::workbench::document_kind_t::diff,
-						std::nullopt, selection, cursor, context));
-		}
-	}
-
-	void render_workbench_document(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		aida::workbench::workbench_shell_workspace_context_t& context,
-		const aida::workbench::document_persistence_dto_t& document,
-		workbench_ui_state_t& state, float width, float height)
-	{
-		if (document.local_state.selection.has_address) {
-			state.last_address = document.local_state.selection.address;
-			state.last_entity_locator.clear();
-		} else if (document.identity.kind ==
-				aida::workbench::document_kind_t::pseudocode &&
-			document.identity.has_address) {
-			state.last_address = document.identity.address;
-			state.last_entity_locator.clear();
-		} else if (document.identity.kind ==
-				aida::workbench::document_kind_t::pseudocode) {
-			const auto& encoded = document.identity.provider_key != "analysis"
-				? document.identity.provider_key
-				: document.local_state.selection.entity_key;
-			const auto locator =
-				aida::workbench::pseudocode_document::
-					parse_pseudocode_entity_locator(encoded);
-			const auto canonical = locator
-				? aida::workbench::pseudocode_document::
-					canonical_pseudocode_entity_locator(*locator)
-				: std::nullopt;
-			if (canonical && *canonical == encoded) {
-				state.last_address = 0;
-				state.last_entity_locator = *canonical;
-			}
-		}
-		if (document.identity.kind ==
-				aida::workbench::document_kind_t::pseudocode) {
-			const std::string identity = !state.last_entity_locator.empty()
-				? state.last_entity_locator
-				: "native:" + std::to_string(state.last_address);
-			if (state.pseudocode_identity != identity) {
-				state.pseudocode_identity = identity;
-				state.pseudocode_request.reset();
-			}
-		}
-		switch (document.identity.kind) {
-		case aida::workbench::document_kind_t::disassembly:
-			render_workbench_disassembly(workspace, context, state);
-			break;
-		case aida::workbench::document_kind_t::hex:
-			render_workbench_hex(workspace, context, state);
-			break;
-		case aida::workbench::document_kind_t::pseudocode:
-			render_workbench_pseudocode(context, state);
-			break;
-		case aida::workbench::document_kind_t::graph:
-			render_workbench_graph(workspace, context, state, width, height);
-			break;
-		case aida::workbench::document_kind_t::diff:
-			render_workbench_diff(workspace, context, state);
-			break;
-		default:
-			ImGui::TextDisabled("Document provider is not available for this kind.");
-			break;
-		}
-	}
-
-	void render_workbench_navigator(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		aida::workbench::workbench_shell_workspace_context_t& context,
-		workbench_ui_state_t& state)
-	{
-		using domain_t = aida::workbench::navigator::navigator_domain_t;
-		const std::array<std::pair<const char*, domain_t>, 6> domains{{
-			{"Functions", domain_t::functions}, {"Imports", domain_t::imports},
-			{"Exports", domain_t::exports}, {"Strings", domain_t::strings},
-			{"Symbols", domain_t::symbols}, {"Types", domain_t::types}}};
-		for (std::size_t index = 0; index < domains.size(); ++index) {
-			if (index != 0)
-				ImGui::SameLine();
-			if (ImGui::SmallButton((std::string(domains[index].first) +
-				"##wb_nav_domain").c_str()))
-				state.navigator_domain = domains[index].second;
-		}
-		if (!context.navigator_tree) {
-			ImGui::TextDisabled("Navigator provider unavailable");
-			return;
-		}
-		aida::workbench::navigator::navigator_tree_request_t request;
-		request.domain = state.navigator_domain;
-		request.page.limit = 256;
-		workbench_frame_cancellation_t cancellation(20);
-		aida::workbench::navigator::navigator_tree_page_t page;
-		const auto error = context.navigator_tree->page(request, &cancellation, page);
-		if (!error) {
-			ImGui::TextDisabled("Navigator deferred (%u)",
-				static_cast<unsigned>(error.code));
-			return;
-		}
-		for (const auto& row : page.rows) {
-			const auto label = std::string(row.label) + "##wb_nav_" +
-				std::to_string(row.id.value);
-			if (!ImGui::Selectable(label.c_str(),
-				row.has_address && state.last_address == row.address))
-				continue;
-			if (!row.has_address)
-				continue;
-			state.last_address = row.address;
-			state.last_entity_locator.clear();
-			aida::workbench::selection_context_t selection;
-			selection.kind = aida::workbench::selection_kind_t::address;
-			selection.has_address = true;
-			selection.address = row.address;
-			selection.entity_key = std::to_string(row.id.value);
-			aida::workbench::document_local_cursor_t cursor;
-			cursor.has_position = true;
-			cursor.position = row.address;
-			static_cast<void>(
-				aida::workbench::workbench_shell_runtime_t::instance()
-					.navigate_document(workspace,
-						aida::workbench::document_kind_t::disassembly,
-						std::nullopt, selection, cursor, context));
-		}
-	}
-
-	void render_workbench_inspector(
-		const aida::workbench::workbench_shell_workspace_context_t& context)
-	{
-		ImGui::TextUnformatted("Inspector");
-		ImGui::Separator();
-		ImGui::Text("Generation: %llu", static_cast<unsigned long long>(
-			context.analysis_generation));
-		ImGui::Text("Analysis revision: %llu", static_cast<unsigned long long>(
-			context.analysis_revision));
-		ImGui::Text("Overlay revision: %llu", static_cast<unsigned long long>(
-			context.overlay_revision));
-		const auto* active = context.inspector_session
-			? context.inspector_session->active_context() : nullptr;
-		if (!active) {
-			ImGui::TextDisabled("No synchronized selection");
-			return;
-		}
-		ImGui::Separator();
-		ImGui::Text("Document kind: %u", static_cast<unsigned>(
-			active->document.kind));
-		if (active->selection.has_address)
-			ImGui::Text("Address: 0x%llX", static_cast<unsigned long long>(
-				active->selection.address));
-		if (!active->selection.entity_key.empty())
-			ImGui::TextWrapped("Entity: %s", active->selection.entity_key.c_str());
-		static const char* panels[] = {"Identity", "Bytes", "Operands", "Xrefs",
-			"Calls", "Stack/locals", "Types", "Overlays", "Diagnostics",
-			"Source provenance"};
-		ImGui::Separator();
-		for (const auto* panel : panels)
-			ImGui::BulletText("%s", panel);
-	}
-
-	void render_analysis_workbench(
-		const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
-		float width, float height)
-	{
-		if (!workspace) {
-			ImGui::TextDisabled("No analysis workspace is active");
-			return;
-		}
-		aida::workbench::workbench_shell_workspace_context_t context;
-		const auto loaded =
-			aida::workbench::workbench_shell_runtime_t::instance()
-				.workspace_context(workspace, context);
-		if (!loaded || !context.document_host) {
-			ImGui::TextDisabled("Workbench unavailable (%u)",
-				static_cast<unsigned>(loaded.code));
-			return;
-		}
-		auto& state = workbench_ui_state(context.workspace);
-		if (state.observed_generation != context.analysis_generation) {
-			state.disassembly_offset = 0;
-			state.hex_offset = 0;
-			state.diff_offset = 0;
-			state.diff_total = 0;
-			state.graph_layout = {};
-			state.graph_layout_function_address = 0;
-			state.status.clear();
-			state.observed_generation = context.analysis_generation;
-		}
-		aida::workbench::document_host::document_host_layout_request_t request;
-		request.client_extent.width_pixels = static_cast<std::uint32_t>(
-			(std::max)(1.0f, width));
-		request.client_extent.height_pixels = static_cast<std::uint32_t>(
-			(std::max)(1.0f, height));
-		request.dpi = static_cast<std::uint32_t>((std::clamp)(
-			96.0f * ImGui::GetIO().DisplayFramebufferScale.x, 48.0f, 768.0f));
-		request.average_character_width_pixels = static_cast<std::uint32_t>(
-			(std::clamp)(ImGui::CalcTextSize("M").x, 4.0f, 64.0f));
-		aida::workbench::document_host::document_host_chrome_t chrome;
-		const auto composed = context.document_host->compose(
-			context.workspace, request, chrome);
-		if (!composed) {
-			ImGui::TextDisabled("Workbench layout rejected (%u)",
-				static_cast<unsigned>(composed.code));
-			return;
-		}
-		ImGui::PushID(static_cast<int>(context.workspace.value & 0x7FFFFFFFU));
-		auto begin_region = [](const char* id,
-			const aida::workbench::document_host::document_host_rect_t& bounds) {
-			ImGui::SetCursorPos(ImVec2(static_cast<float>(bounds.x),
-				static_cast<float>(bounds.y)));
-			return ImGui::BeginChild(id,
-				ImVec2(static_cast<float>(bounds.width),
-					static_cast<float>(bounds.height)), false,
-				ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
-		};
-		if (chrome.navigator_visible && chrome.navigator_bounds.width != 0 &&
-			chrome.navigator_bounds.height != 0) {
-			if (begin_region("##wb_navigator", chrome.navigator_bounds))
-				render_workbench_navigator(workspace, context, state);
-			ImGui::EndChild();
-		}
-		for (const auto& tab : chrome.tabs) {
-			if (!tab.visible)
-				continue;
-			ImGui::SetCursorPos(ImVec2(static_cast<float>(tab.bounds.x),
-				static_cast<float>(tab.bounds.y)));
-			if (ImGui::Selectable((tab.label + "##wb_tab_" +
-				std::to_string(tab.document.value)).c_str(), tab.selected, 0,
-				ImVec2(static_cast<float>(tab.bounds.width),
-					static_cast<float>(tab.bounds.height)))) {
-				aida::workbench::document_host::document_host_dispatch_t dispatch;
-				dispatch.kind = aida::workbench::document_host::
-					document_host_dispatch_kind_t::select_document;
-				dispatch.document = tab.document;
-				aida::workbench::workbench_command_result_t result;
-				static_cast<void>(
-					aida::workbench::workbench_shell_runtime_t::instance()
-						.dispatch_host_command(workspace, dispatch, result, context));
-			}
-		}
-		for (const auto& item : chrome.toolbar) {
-			if (!item.visible)
-				continue;
-			ImGui::SetCursorPos(ImVec2(static_cast<float>(item.bounds.x),
-				static_cast<float>(item.bounds.y)));
-			ImGui::BeginDisabled(!item.enabled);
-			const char* label = ">";
-			switch (item.action) {
-			case aida::workbench::document_host::document_host_toolbar_action_t::previous_view: label = "<"; break;
-			case aida::workbench::document_host::document_host_toolbar_action_t::next_view: label = ">"; break;
-			case aida::workbench::document_host::document_host_toolbar_action_t::split_horizontal: label = "H"; break;
-			case aida::workbench::document_host::document_host_toolbar_action_t::split_vertical: label = "V"; break;
-			case aida::workbench::document_host::document_host_toolbar_action_t::history_back: label = "B"; break;
-			case aida::workbench::document_host::document_host_toolbar_action_t::history_forward: label = "F"; break;
-			case aida::workbench::document_host::document_host_toolbar_action_t::close_document: label = "X"; break;
-			}
-			if (ImGui::Button((std::string(label) + "##wb_toolbar_" +
-				std::to_string(static_cast<unsigned>(item.action))).c_str(),
-				ImVec2(static_cast<float>(item.bounds.width),
-					static_cast<float>(item.bounds.height)))) {
-				aida::workbench::document_host::document_host_dispatch_t dispatch;
-				dispatch.kind = aida::workbench::document_host::
-					document_host_dispatch_kind_t::toolbar;
-				dispatch.toolbar_action = item.action;
-				aida::workbench::workbench_command_result_t result;
-				static_cast<void>(
-					aida::workbench::workbench_shell_runtime_t::instance()
-						.dispatch_host_command(workspace, dispatch, result, context));
-			}
-			ImGui::EndDisabled();
-			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("%s", item.tooltip.c_str());
-		}
-		for (const auto& leaf : chrome.leaves) {
-			const auto* document = workbench_document(
-				context.persistence, leaf.document);
-			if (!document || leaf.bounds.width == 0 || leaf.bounds.height == 0)
-				continue;
-			const auto id = "##wb_leaf_" + std::to_string(leaf.view.value);
-			if (begin_region(id.c_str(), leaf.bounds))
-				render_workbench_document(workspace, context, *document, state,
-					static_cast<float>(leaf.bounds.width),
-					static_cast<float>(leaf.bounds.height));
-			ImGui::EndChild();
-		}
-		if (chrome.inspector_visible && chrome.inspector_bounds.width != 0 &&
-			chrome.inspector_bounds.height != 0) {
-			if (begin_region("##wb_inspector", chrome.inspector_bounds))
-				render_workbench_inspector(context);
-			ImGui::EndChild();
-		}
-		ImGui::PopID();
-	}
-
-	void mark_center_render_section(const char* section, center_view_t view, bool overlay_blocking, float vw, float vh)
-	{
-		g_render_section = section;
-		static std::atomic<unsigned long long> s_last_log_ms{0};
-		static std::atomic<int> s_last_view{-1000000};
-		static std::atomic<int> s_last_full_test{-1};
-		const unsigned long long now = aida::shell_platform::tick_ms();
-		const int view_raw = static_cast<int>(view);
-		const bool full_test = shell_full_test_running();
-		const bool view_changed = s_last_view.exchange(view_raw, std::memory_order_acq_rel) != view_raw;
-		const bool full_changed = s_last_full_test.exchange(full_test ? 1 : 0, std::memory_order_acq_rel) != (full_test ? 1 : 0);
-		unsigned long long last = s_last_log_ms.load(std::memory_order_acquire);
-		const unsigned long long interval_ms = full_test ? 1000ULL : 15000ULL;
-		const bool due = view_changed || full_changed || now - last >= interval_ms;
-		if (due && s_last_log_ms.compare_exchange_strong(last, now, std::memory_order_acq_rel)) {
-			diag::log_tagged_critical_fmt("render_center",
-				"section=%s view=%s view_id=%d overlay=%d full_test=%d frame=%d vw=%.1f vh=%.1f tid=%lu",
-				section ? section : "<null>",
-				center_view_name(view),
-				view_raw,
-				overlay_blocking ? 1 : 0,
-				full_test ? 1 : 0,
-				ImGui::GetFrameCount(),
-				vw,
-				vh,
-				static_cast<unsigned long>(aida::shell_platform::thread_id()));
-		}
 	}
 
 	bool text_has_token(const std::string& text, const char* token)
@@ -1578,6 +1179,8 @@ namespace ui_input_gate
 			|| globals::ui::command_palette_open
 			|| globals::ui::driver_status_open
 			|| globals::ui::shortcuts_dialog_open
+			|| workspace_dialog_state().save_as_open
+			|| workspace_dialog_state().manager_open
 			|| aida::mcp_marketplace_view::is_open()
 			|| aida::agent_picker::is_open()
 			|| menu_bar::any_open;
@@ -1773,9 +1376,10 @@ namespace file_menu_deferred
 						static_cast<unsigned long long>(token),
 						source_copy.c_str(),
 						path_copy.c_str());
-					file_browser::refresh(path_copy);
-					g_sa_settings.workspace.root_path = path_copy;
-					g_sa_settings_request_save();
+					std::string root_error;
+					if (!file_browser::set_workspace_root(path_copy, &root_error))
+						diag::log_tagged_fmt("file_dialog", "open_folder_root_transaction_failed path=%.260s error=%s",
+							path_copy.c_str(), root_error.c_str());
 					diag::log_tagged_fmt("file_dialog", "deferred_open_folder picked path=%.260s", path_copy.c_str());
 				} else {
 					diag::log_tagged_critical_fmt("FILEDIALOG-UI-DISPATCH",
@@ -1918,17 +1522,6 @@ namespace file_menu_deferred
 		}
 #endif
 	}
-}
-
-static bool has_any_target()
-{
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	return aida::preview::attached_pid() != 0 || analysis_session::session_count() > 0;
-#else
-	return analysis_session::session_count() > 0
-	    || driver_bridge::attached_pid() != 0
-	    || analysis_session::active_workspace() != nullptr;
-#endif
 }
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -2354,33 +1947,150 @@ void helpers::add_key(const char* label, CKeybind* keybind)
 		menu_open[keybind] = false;
 }
 
+namespace {
 
-#include <filesystem>
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include <shlobj.h>
-#endif
-
-std::string conversations::get_storage_dir()
+bool valid_conversation_id(std::string_view id)
 {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	return "C:/Preview/AiDA/Standalone/conversations";
-#else
-	wchar_t* appdata = nullptr;
-	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
-		auto p = std::filesystem::path(appdata) / L"AiDA" / L"Standalone" / L"conversations";
-		CoTaskMemFree(appdata);
-		std::filesystem::create_directories(p);
-		return p.string();
+	if (id.empty() || id.size() > 128U)
+		return false;
+	return std::all_of(id.begin(), id.end(), [](unsigned char value) {
+		return std::isalnum(value) != 0 || value == '-' || value == '_';
+	});
+}
+
+struct conversation_ui_transaction_t {
+	std::uint64_t source_fingerprint = 0;
+	std::uint64_t source_revision = 0;
+	aida::conversation_store::operation_t operation =
+		aida::conversation_store::operation_t::save;
+	std::optional<aida::conversation_store::request_t> deferred_save;
+};
+
+conversation_ui_transaction_t& conversation_ui_transaction()
+{
+	static conversation_ui_transaction_t value;
+	return value;
+}
+
+std::uint64_t conversation_fingerprint()
+{
+	std::uint64_t hash = 14695981039346656037ULL;
+	auto append = [&](std::string_view value) {
+		for (const char character : value) {
+			hash ^= static_cast<unsigned char>(character);
+			hash *= 1099511628211ULL;
+		}
+	};
+	append(conversations::current_id);
+	for (const auto& message : g_chat_messages) {
+		append(message.text);
+		append(message.thinking_text);
+		append(message.model_id);
+		hash ^= static_cast<std::uint64_t>(message.timestamp);
+		hash *= 1099511628211ULL;
+		hash ^= message.is_user ? 1ULL : 0ULL;
+		hash *= 1099511628211ULL;
 	}
-	return {};
+	return hash;
+}
+
+aida::conversation_store::snapshot_t capture_conversation_snapshot(bool advance_revision)
+{
+	aida::conversation_store::snapshot_t snapshot;
+	snapshot.id = conversations::current_id;
+	const bool assigning_identity = snapshot.id.empty() && !g_chat_messages.empty();
+	if (assigning_identity) {
+		static std::uint64_t identity_sequence = 0;
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::system_clock::now().time_since_epoch()).count();
+		snapshot.id = std::to_string(now);
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		snapshot.id += "-" + std::to_string(::GetCurrentProcessId());
 #endif
+		snapshot.id += "-" + std::to_string(++identity_sequence);
+		conversations::current_id = snapshot.id;
+		conversations::current_identity_uncommitted = true;
+	}
+	snapshot.require_absent = conversations::current_identity_uncommitted;
+	if (advance_revision && !snapshot.id.empty())
+		++conversations::current_revision;
+	snapshot.revision = conversations::current_revision;
+	for (const auto& summary : conversations::history) {
+		if (summary.id == snapshot.id) {
+			snapshot.pinned = summary.pinned;
+			snapshot.created = summary.created;
+			snapshot.title = summary.title;
+			break;
+		}
+	}
+	if (snapshot.created == 0 && !g_chat_messages.empty())
+		snapshot.created = g_chat_messages.front().timestamp;
+	for (const auto& message : g_chat_messages) {
+		if (snapshot.title.empty() && message.is_user && !message.text.empty())
+			snapshot.title = message.text.substr(0, 80);
+		aida::conversation_store::message_t persisted;
+		persisted.text = message.text;
+		persisted.thinking_text = message.thinking_text;
+		persisted.is_user = message.is_user;
+		persisted.has_thinking = message.has_thinking;
+		persisted.timestamp = message.timestamp;
+		persisted.input_tokens = message.input_tokens;
+		persisted.output_tokens = message.output_tokens;
+		persisted.cache_read_tokens = message.cache_read_tokens;
+		persisted.cache_write_tokens = message.cache_write_tokens;
+		persisted.model_id = message.model_id;
+		snapshot.messages.push_back(std::move(persisted));
+	}
+	if (!snapshot.id.empty())
+		snapshot.evidence = aida::automation_ui::persisted_evidence_snapshot(snapshot.id);
+	snapshot.evidence_authoritative = snapshot.id.empty() ||
+		aida::automation_ui::persisted_evidence_session_loaded(snapshot.id);
+	return snapshot;
+}
+
+void publish_conversation_catalog()
+{
+	conversations::published_history =
+		std::make_shared<const std::vector<ConversationSummary>>(conversations::history);
+}
+
+std::uint64_t summary_revision(std::string_view id)
+{
+	const auto found = std::find_if(conversations::history.begin(),
+		conversations::history.end(), [&](const ConversationSummary& summary) {
+			return summary.id == id;
+		});
+	return found == conversations::history.end() ? 0 : found->revision;
+}
+
+bool submit_conversation_request(aida::conversation_store::request_t request)
+{
+	conversation_ui_transaction_t& transaction = conversation_ui_transaction();
+	const std::uint64_t fingerprint = conversation_fingerprint();
+	const auto submitted = aida::conversation_store::submit(request);
+	if (submitted == aida::conversation_store::request_result_t::busy &&
+		request.operation == aida::conversation_store::operation_t::save) {
+		transaction.deferred_save = std::move(request);
+		return true;
+	}
+	const bool accepted = submitted == aida::conversation_store::request_result_t::queued ||
+		submitted == aida::conversation_store::request_result_t::preview_recorded;
+	if (accepted) {
+		transaction.source_fingerprint = fingerprint;
+		transaction.source_revision = request.current.revision;
+		transaction.operation = request.operation;
+	}
+	return accepted;
+}
+
 }
 
 void conversations::save_current()
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	if (g_chat_messages.empty()) return;
+	if (g_chat_messages.empty() && current_id.empty()) return;
 	if (current_id.empty()) current_id = "preview-conversation";
+	++current_revision;
 	std::string title = "Untitled";
 	for (const auto& message : g_chat_messages) {
 		if (message.is_user && !message.text.empty()) {
@@ -2391,57 +2101,34 @@ void conversations::save_current()
 	auto found = std::find_if(history.begin(), history.end(), [](const ConversationSummary& item) {
 		return item.id == current_id;
 	});
-	ConversationSummary summary{ current_id, title, g_chat_messages.front().timestamp, static_cast<int>(g_chat_messages.size()) };
+	if (g_chat_messages.empty() && found != history.end() && !found->title.empty())
+		title = found->title;
+	const bool pinned = found != history.end() && found->pinned;
+	const std::int64_t created = !g_chat_messages.empty() ? g_chat_messages.front().timestamp :
+		found != history.end() ? found->created : 0;
+	ConversationSummary summary{ current_id, title, created,
+		static_cast<int>(g_chat_messages.size()), pinned, current_revision };
 	if (found == history.end()) history.insert(history.begin(), std::move(summary));
 	else *found = std::move(summary);
+	publish_conversation_catalog();
 #else
-	if (g_chat_messages.empty()) return;
-	std::string dir = get_storage_dir();
-	if (dir.empty()) return;
-
-	if (current_id.empty()) {
-		auto now = std::chrono::system_clock::now().time_since_epoch();
-		current_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
-	}
-
-	nlohmann::json j;
-	j["id"] = current_id;
-	std::string title;
-	for (auto& m : g_chat_messages) {
-		if (m.is_user && !m.text.empty()) {
-			title = m.text.substr(0, 80);
-			break;
-		}
-	}
-	j["title"] = title;
-	j["created"] = g_chat_messages.front().timestamp;
-	nlohmann::json msgs = nlohmann::json::array();
-	for (auto& m : g_chat_messages) {
-		nlohmann::json mj;
-		mj["text"] = m.text;
-		mj["thinking_text"] = m.thinking_text;
-		mj["is_user"] = m.is_user;
-		mj["has_thinking"] = m.has_thinking;
-		mj["timestamp"] = m.timestamp;
-		mj["input_tokens"] = m.input_tokens;
-		mj["output_tokens"] = m.output_tokens;
-		mj["cache_read_tokens"] = m.cache_read_tokens;
-		mj["cache_write_tokens"] = m.cache_write_tokens;
-		mj["model_id"] = m.model_id;
-		msgs.push_back(mj);
-	}
-	j["messages"] = msgs;
-
-	std::string path = dir + "\\" + current_id + ".json";
-	std::ofstream ofs(path, std::ios::trunc);
-	if (ofs.is_open()) ofs << j.dump(2);
+	if (g_chat_messages.empty() && current_id.empty()) return;
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::save;
+	request.current = capture_conversation_snapshot(true);
+	request.catalog_generation = catalog_generation;
+	static_cast<void>(submit_conversation_request(std::move(request)));
 #endif
 }
 
 void conversations::load_conversation(const std::string& id)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	if (!current_id.empty() && current_id != id)
+		save_current();
 	current_id = id;
+	++current_revision;
+	current_identity_uncommitted = false;
 	g_chat_messages.clear();
 	ChatMessage user_message;
 	user_message.text = "Show the saved reverse-engineering findings.";
@@ -2454,43 +2141,37 @@ void conversations::load_conversation(const std::string& id)
 	g_chat_messages.push_back(std::move(assistant_message));
 	g_chat_scroll_to_bottom = true;
 #else
-	std::string dir = get_storage_dir();
-	if (dir.empty()) return;
-	std::string path = dir + "\\" + id + ".json";
-	std::ifstream ifs(path);
-	if (!ifs.is_open()) return;
-	auto j = nlohmann::json::parse(ifs, nullptr, false);
-	if (j.is_discarded() || !j.is_object()) return;
-
-	g_chat_messages.clear();
-	current_id = j.value("id", id);
-	for (auto& mj : j.value("messages", nlohmann::json::array())) {
-		ChatMessage m;
-		m.text = mj.value("text", "");
-		m.thinking_text = mj.value("thinking_text", "");
-		m.is_user = mj.value("is_user", false);
-		m.has_thinking = mj.value("has_thinking", false);
-		m.streaming = false;
-		m.timestamp = mj.value("timestamp", (int64_t)0);
-		m.input_tokens = mj.value("input_tokens", 0);
-		m.output_tokens = mj.value("output_tokens", 0);
-		m.cache_read_tokens = mj.value("cache_read_tokens", 0);
-		m.cache_write_tokens = mj.value("cache_write_tokens", 0);
-		m.model_id = mj.value("model_id", std::string());
-		g_chat_messages.push_back(m);
-	}
-	g_chat_scroll_to_bottom = true;
+	if (!valid_conversation_id(id)) return;
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::switch_conversation;
+	request.current = capture_conversation_snapshot(true);
+	request.target_id = id;
+	request.target_revision = summary_revision(id);
+	request.catalog_generation = catalog_generation;
+	static_cast<void>(submit_conversation_request(std::move(request)));
 #endif
 }
 
 void conversations::new_chat()
 {
+	const auto persistence = aida::conversation_store::status();
+	if (persistence.pending || persistence.failed || is_ai_busy()) return;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	save_current();
 	g_chat_messages.clear();
 	g_chat_buf[0] = '\0';
 	current_id.clear();
+	current_revision = 0;
+	current_identity_uncommitted = false;
 	g_chat_scroll_to_bottom = true;
 	refresh_history();
+#else
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::new_conversation;
+	request.current = capture_conversation_snapshot(true);
+	request.catalog_generation = catalog_generation;
+	static_cast<void>(submit_conversation_request(std::move(request)));
+#endif
 }
 
 void conversations::refresh_history()
@@ -2503,439 +2184,310 @@ void conversations::refresh_history()
 			{ "fixture-unpack", "Packed sample notes", 1, 6 }
 		};
 	}
+	publish_conversation_catalog();
 #else
-	history.clear();
-	std::string dir = get_storage_dir();
-	if (dir.empty()) return;
-	for (auto& entry : std::filesystem::directory_iterator(dir)) {
-		if (!entry.is_regular_file()) continue;
-		if (entry.path().extension() != ".json") continue;
-		std::ifstream ifs(entry.path());
-		auto j = nlohmann::json::parse(ifs, nullptr, false);
-		if (j.is_discarded() || !j.is_object()) continue;
-		ConversationSummary s;
-		s.id = j.value("id", entry.path().stem().string());
-		s.title = j.value("title", "Untitled");
-		s.created = j.value("created", (int64_t)0);
-		auto msgs = j.value("messages", nlohmann::json::array());
-		s.msg_count = (int)msgs.size();
-		history.push_back(s);
-	}
-	std::sort(history.begin(), history.end(), [](auto& a, auto& b) { return a.created > b.created; });
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::refresh_catalog;
+	request.catalog_generation = catalog_generation;
+	static_cast<void>(submit_conversation_request(std::move(request)));
 #endif
 }
 
-void conversations::delete_conversation(const std::string& id)
+void conversations::delete_conversation(const std::string& id,
+	std::uint64_t reviewed_revision)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(reviewed_revision);
 	history.erase(std::remove_if(history.begin(), history.end(), [&id](const ConversationSummary& item) {
 		return item.id == id;
 	}), history.end());
-	if (current_id == id) new_chat();
+	if (current_id == id) {
+		g_chat_messages.clear();
+		g_chat_buf[0] = '\0';
+		current_id.clear();
+		current_revision = 0;
+		current_identity_uncommitted = false;
+		g_chat_scroll_to_bottom = true;
+		aida::automation_ui::apply_persisted_evidence({}, {});
+	}
+	publish_conversation_catalog();
 #else
-	std::string dir = get_storage_dir();
-	if (dir.empty()) return;
-	std::string path = dir + "\\" + id + ".json";
-	std::filesystem::remove(path);
-	refresh_history();
+	if (!valid_conversation_id(id)) return;
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::delete_conversation;
+	request.target_id = id;
+	request.target_revision = reviewed_revision;
+	request.catalog_generation = catalog_generation;
+	static_cast<void>(submit_conversation_request(std::move(request)));
 #endif
 }
 
-static std::string truncate_session_tab_label(const std::string& s, size_t max_chars)
+bool conversations::set_pinned(const std::string& id, bool pinned)
 {
-	if (s.size() <= max_chars) return s;
-	if (max_chars <= 3) return std::string(max_chars, '.');
-	return s.substr(0, max_chars - 3) + std::string("...");
+	if (!valid_conversation_id(id)) return false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const auto found = std::find_if(history.begin(), history.end(), [&](const ConversationSummary& item) {
+		return item.id == id;
+	});
+	if (found == history.end()) return false;
+	found->pinned = pinned;
+	std::stable_sort(history.begin(), history.end(), [](const auto& a, const auto& b) {
+		if (a.pinned != b.pinned) return a.pinned > b.pinned;
+		return a.created > b.created;
+	});
+	publish_conversation_catalog();
+	return true;
+#else
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::set_pinned;
+	request.target_id = id;
+	request.target_revision = summary_revision(id);
+	request.catalog_generation = catalog_generation;
+	request.pinned = pinned;
+	return submit_conversation_request(std::move(request));
+#endif
 }
 
-static void render_session_tabs(float x, float y, float width, float height, float alpha)
+bool conversations::fork_conversation(const std::string& id, std::string& forked_id)
 {
-	const auto& th = aida::ui::resolved();
-	ImDrawList* dl = ImGui::GetWindowDrawList();
-	size_t count = analysis_session::session_count();
-	if (!has_any_target()) {
-		float pad = 12.f;
-		float card_w = width - pad * 2.f;
-		if (card_w < 120.f) card_w = 120.f;
-		float card_h = height - 4.f;
-		ImVec2 a(x + pad, y + 2.f);
-		ImVec2 b(a.x + card_w, a.y + card_h);
-		dl->AddRectFilled(a, b, aida::ui::with_alpha(th.bg_elevated, 0.5f * alpha), 6.f);
-		dl->AddRect(a, b, aida::ui::with_alpha(th.border_subtle, 0.6f * alpha), 6.f, 0, 1.f);
-		const char* msg = "No binary open. Click a file in the Explorer, attach to a process, or press Run.";
-		ImVec2 ts = ImGui::CalcTextSize(msg);
-		dl->AddText(ImVec2(a.x + (card_w - ts.x) * 0.5f, a.y + (card_h - ts.y) * 0.5f),
-			aida::ui::with_alpha(th.text_dim, 0.85f * alpha), msg);
-
-		float plus_sz = 18.f;
-		float plus_x0 = b.x + 6.f;
-		float plus_y0 = a.y + (card_h - plus_sz) * 0.5f;
-		float plus_x1 = plus_x0 + plus_sz;
-		float plus_y1 = plus_y0 + plus_sz;
-		if (plus_x1 < x + width - 2.f) {
-			bool plus_hov = ImGui::IsMouseHoveringRect(ImVec2(plus_x0, plus_y0), ImVec2(plus_x1, plus_y1), false);
-			ImU32 plus_bg = aida::ui::with_alpha(plus_hov ? th.accent_u32 : th.bg_elevated, (plus_hov ? 0.65f : 0.45f) * alpha);
-			dl->AddRectFilled(ImVec2(plus_x0, plus_y0), ImVec2(plus_x1, plus_y1), plus_bg, 4.f);
-			float cx = plus_x0 + plus_sz * 0.5f;
-			float cy = plus_y0 + plus_sz * 0.5f;
-			ImU32 plus_col = aida::ui::with_alpha(th.text_primary, alpha);
-			dl->AddLine(ImVec2(cx - 5.f, cy), ImVec2(cx + 5.f, cy), plus_col, 1.6f);
-			dl->AddLine(ImVec2(cx, cy - 5.f), ImVec2(cx, cy + 5.f), plus_col, 1.6f);
-			if (plus_hov && !ui_input_gate::popup_blocks_background_input()) {
-				ImGui::SetTooltip("New session\nLeft-click: Open File...\nRight-click: Attach to Process...\nMiddle-click: Run...");
-				if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+	forked_id.clear();
+	if (!valid_conversation_id(id)) return false;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-					aida::preview::apply_open_file();
+	const auto found = std::find_if(history.begin(), history.end(), [&](const ConversationSummary& item) {
+		return item.id == id;
+	});
+	if (found == history.end()) return false;
+	static std::uint64_t sequence = 1;
+	forked_id = "preview-fork-" + std::to_string(sequence++);
+	ConversationSummary forked = *found;
+	forked.id = forked_id;
+	forked.title = forked.title.empty() ? "Forked conversation" : forked.title + " (fork)";
+	forked.created = static_cast<std::int64_t>(sequence);
+	forked.pinned = false;
+	history.insert(history.begin(), std::move(forked));
+	publish_conversation_catalog();
+	return true;
 #else
-					anti_tamper::webhook::write_log("file_dialog", "session_tab_plus left_click open_file_dialog");
-					std::string fpath = disasm::open_file_dialog(g_hwnd);
-					if (!fpath.empty()) {
-						anti_tamper::webhook::write_log("file_dialog", (std::string("session_tab_plus open_file_dialog ok path=") + fpath).c_str());
-						analysis_session::open_session(fpath);
-					} else {
-						anti_tamper::webhook::write_log("file_dialog", "session_tab_plus open_file_dialog cancelled_or_empty");
-					}
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::fork_conversation;
+	request.current = capture_conversation_snapshot(true);
+	request.target_id = id;
+	request.target_revision = id == request.current.id
+		? request.current.revision : summary_revision(id);
+	request.catalog_generation = catalog_generation;
+	return submit_conversation_request(std::move(request));
 #endif
-				} else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-					globals::ui::process_attach_open = true;
-				} else if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+}
+
+bool conversations::export_markdown(const std::string& id, const std::string& output_path,
+	std::string& error)
+{
+	error.clear();
+	if (!valid_conversation_id(id) || output_path.empty()) {
+		error = "The conversation identity or export path is invalid.";
+		return false;
+	}
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::export_markdown;
+	request.current = capture_conversation_snapshot(true);
+	request.target_id = id;
+	request.target_revision = id == request.current.id
+		? request.current.revision : summary_revision(id);
+	request.catalog_generation = catalog_generation;
+	request.output_path = output_path;
+	const bool queued = submit_conversation_request(std::move(request));
+	if (!queued) error = "The conversation export could not be queued.";
+	return queued;
+}
+
+void conversations::process_store_completion(bool allow_deferred)
+{
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-					aida::preview::record(aida::preview::shell_action_t::run_target, "session_tab_plus");
-#endif
-					spawn_target_dialog::request_open();
-				}
-			}
-		}
+	static_cast<void>(allow_deferred);
+	return;
+#else
+	auto submit_deferred_save = [] {
+		auto& transaction = conversation_ui_transaction();
+		if (!transaction.deferred_save || aida::conversation_store::status().pending)
+			return;
+		auto request = std::move(*transaction.deferred_save);
+		transaction.deferred_save.reset();
+		request.catalog_generation = conversations::catalog_generation;
+		if (!submit_conversation_request(std::move(request)))
+			conversations::persistence_error = "The deferred conversation snapshot could not be queued.";
+	};
+	auto completion = aida::conversation_store::take_completion();
+	if (!completion) {
+		if (allow_deferred) submit_deferred_save();
 		return;
 	}
-	if (count == 0) {
+	if (!completion->success) {
+		persistence_error = completion->error.empty()
+			? "The conversation transaction failed." : completion->error;
 		return;
 	}
-
-	float tab_h = height - 6.f;
-	if (tab_h < 22.f) tab_h = 22.f;
-	float ty0 = y + (height - tab_h) * 0.5f;
-	float ty1 = ty0 + tab_h;
-
-	float pad_outer = 8.f;
-	float gap = 4.f;
-	float close_btn_sz = 14.f;
-	float inner_pad = 10.f;
-	float badge_sz = 14.f;
-	float badge_gap = 6.f;
-
-	float cursor_x = x + pad_outer;
-	size_t active_idx = analysis_session::active_session_idx();
-	int    close_intent = -1;
-	int    switch_intent = -1;
-	int    detach_intent = -1;
-	int    reattach_intent = -1;
-	int    open_ctx_for = -1;
-
-	for (size_t i = 0; i < count; ++i) {
-		const auto sess = analysis_session::session_handle_at(i);
-		if (!sess) continue;
-		bool is_live = (sess->attached_pid != 0);
-		bool is_dead = is_live && !session_health::is_alive(sess->attached_pid);
-		std::string label = truncate_session_tab_label(sess->filename.empty() ? sess->path : sess->filename, 20);
-		ImVec2 ls = ImGui::CalcTextSize(label.c_str());
-		float tab_w = inner_pad + badge_sz + badge_gap + ls.x + 8.f + close_btn_sz + inner_pad;
-		if (tab_w < 100.f) tab_w = 100.f;
-
-		float tx0 = cursor_x;
-		float tx1 = tx0 + tab_w;
-		if (tx1 > x + width - pad_outer - 28.f) break;
-
-		bool is_active = (i == active_idx);
-		bool hov = ImGui::IsMouseHoveringRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1), false);
-
-		ImU32 fill_top, fill_bot;
-		if (is_dead) {
-			ImU32 dead_fill = IM_COL32(58, 24, 24, static_cast<int>(180.f * alpha));
-			fill_top = dead_fill;
-			fill_bot = dead_fill;
-		} else if (is_active) {
-			fill_top = aida::ui::with_alpha(th.accent_grad_top, 0.30f * alpha);
-			fill_bot = aida::ui::with_alpha(th.accent_grad_bot, 0.45f * alpha);
-		} else if (hov) {
-			fill_top = aida::ui::with_alpha(th.panel_header, 0.85f * alpha);
-			fill_bot = aida::ui::with_alpha(th.panel_header, 0.85f * alpha);
-		} else {
-			fill_top = aida::ui::with_alpha(th.panel_bg, 0.6f * alpha);
-			fill_bot = aida::ui::with_alpha(th.panel_bg, 0.6f * alpha);
-		}
-		ImU32 flat = aida::ui::mix(fill_top, fill_bot, 0.5f);
-		dl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1), flat, 6.f);
-		if (is_dead) {
-			dl->AddRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-				IM_COL32(200, 80, 80, static_cast<int>(220.f * alpha)), 6.f, 0, 1.2f);
-		} else if (is_active) {
-			ui_anim::render_tab_underline_glow(dl, tx0 + 4.f, (tx1 - tx0) - 8.f,
-				ty1 - 2.5f, alpha);
-		} else {
-			dl->AddRect(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-				aida::ui::with_alpha(th.border_subtle, 0.6f * alpha), 6.f, 0, 1.f);
-		}
-
-		float badge_x = tx0 + inner_pad;
-		float badge_y = ty0 + (tab_h - badge_sz) * 0.5f;
-		if (is_live) {
-			ImU32 live_dot;
-			ImU32 live_glow;
-			if (is_dead) {
-				live_dot = IM_COL32(120, 120, 120, static_cast<int>(255.f * alpha));
-				live_glow = IM_COL32(80, 80, 80, static_cast<int>(60.f * alpha));
-			} else {
-				live_dot = IM_COL32(232, 80, 80, static_cast<int>(255.f * alpha));
-				live_glow = IM_COL32(232, 80, 80, static_cast<int>(80.f * alpha));
-			}
-			float r = badge_sz * 0.36f;
-			float cxr = badge_x + badge_sz * 0.5f;
-			float cyr = badge_y + badge_sz * 0.5f;
-			dl->AddCircleFilled(ImVec2(cxr, cyr), r + 2.f, live_glow);
-			dl->AddCircleFilled(ImVec2(cxr, cyr), r, live_dot);
-			if (is_dead) {
-				dl->AddLine(ImVec2(cxr - r, cyr - r), ImVec2(cxr + r, cyr + r),
-					IM_COL32(255, 110, 110, static_cast<int>(255.f * alpha)), 1.5f);
-				dl->AddLine(ImVec2(cxr + r, cyr - r), ImVec2(cxr - r, cyr + r),
-					IM_COL32(255, 110, 110, static_cast<int>(255.f * alpha)), 1.5f);
-			}
-		} else {
-			ImU32 page_col = aida::ui::with_alpha(is_active ? th.accent_u32 : th.text_secondary, 0.9f * alpha);
-			float px0 = badge_x + 2.f;
-			float py0 = badge_y + 1.f;
-			float px1 = badge_x + badge_sz - 3.f;
-			float py1 = badge_y + badge_sz - 1.f;
-			dl->AddRect(ImVec2(px0, py0), ImVec2(px1, py1), page_col, 2.f, 0, 1.4f);
-			dl->AddLine(ImVec2(px0 + 2.f, py0 + 3.f), ImVec2(px1 - 2.f, py0 + 3.f), page_col, 1.f);
-			dl->AddLine(ImVec2(px0 + 2.f, py0 + 6.f), ImVec2(px1 - 2.f, py0 + 6.f), page_col, 1.f);
-			dl->AddLine(ImVec2(px0 + 2.f, py0 + 9.f), ImVec2(px1 - 3.f, py0 + 9.f), page_col, 1.f);
-		}
-
-		ImU32 text_col;
-		if (is_dead) {
-			text_col = IM_COL32(220, 160, 160, static_cast<int>(220.f * alpha));
-		} else {
-			text_col = is_active
-				? aida::ui::with_alpha(th.text_primary, alpha)
-				: aida::ui::with_alpha(th.text_secondary, (hov ? 1.f : 0.9f) * alpha);
-		}
-		float text_x = tx0 + inner_pad + badge_sz + badge_gap;
-		float text_y = ty0 + (tab_h - ls.y) * 0.5f;
-		dl->AddText(ImVec2(text_x, text_y), text_col, label.c_str());
-		if (is_dead) {
-			dl->AddLine(ImVec2(text_x, text_y + ls.y * 0.55f),
-				ImVec2(text_x + ls.x, text_y + ls.y * 0.55f),
-				text_col, 1.2f);
-		}
-
-		float cx0 = tx1 - inner_pad - close_btn_sz;
-		float cy0 = ty0 + (tab_h - close_btn_sz) * 0.5f;
-		float cx1 = cx0 + close_btn_sz;
-		float cy1 = cy0 + close_btn_sz;
-		bool close_hov = ImGui::IsMouseHoveringRect(ImVec2(cx0, cy0), ImVec2(cx1, cy1), false);
-		if (close_hov) {
-			dl->AddRectFilled(ImVec2(cx0, cy0), ImVec2(cx1, cy1),
-				aida::ui::with_alpha(th.error, 0.5f * alpha), 3.f);
-		}
-		float pad_x = 3.f;
-		dl->AddLine(ImVec2(cx0 + pad_x, cy0 + pad_x), ImVec2(cx1 - pad_x, cy1 - pad_x),
-			aida::ui::with_alpha(th.text_secondary, alpha), 1.4f);
-		dl->AddLine(ImVec2(cx1 - pad_x, cy0 + pad_x), ImVec2(cx0 + pad_x, cy1 - pad_x),
-			aida::ui::with_alpha(th.text_secondary, alpha), 1.4f);
-
-		if (!ui_input_gate::popup_blocks_background_input()) {
-			if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-				if (close_hov) close_intent = static_cast<int>(i);
-				else if (hov)  switch_intent = static_cast<int>(i);
-			}
-			if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && hov && !close_hov) {
-				open_ctx_for = static_cast<int>(i);
-			}
-			if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle) && hov) {
-				close_intent = static_cast<int>(i);
-			}
-		}
-
-		if (hov && !close_hov) {
-			if (is_live) {
-				if (is_dead) {
-					ImGui::SetTooltip("Live session (process exited)\nPID %u\n%s\nRight-click to reattach to a new PID or close.",
-						sess->attached_pid,
-						sess->filename.empty() ? "(unknown process)" : sess->filename.c_str());
-				} else {
-					ImGui::SetTooltip("Live session\nPID %u\n%s",
-						sess->attached_pid,
-						sess->filename.empty() ? "(unknown process)" : sess->filename.c_str());
-				}
-			} else {
-				ImGui::SetTooltip("%s", sess->path.c_str());
-			}
-		}
-
-		cursor_x = tx1 + gap;
+	const bool replaces_conversation =
+		completion->operation == aida::conversation_store::operation_t::switch_conversation ||
+		completion->operation == aida::conversation_store::operation_t::new_conversation ||
+		completion->operation == aida::conversation_store::operation_t::fork_conversation;
+	if (replaces_conversation &&
+		(conversation_fingerprint() != conversation_ui_transaction().source_fingerprint ||
+		 completion->source_revision != conversation_ui_transaction().source_revision)) {
+		persistence_error = "The active conversation changed before the loaded transaction could be published.";
+		return;
 	}
-
-	{
-		float plus_sz = 20.f;
-		float plus_x0 = cursor_x + 2.f;
-		float plus_y0 = ty0 + (tab_h - plus_sz) * 0.5f;
-		float plus_x1 = plus_x0 + plus_sz;
-		float plus_y1 = plus_y0 + plus_sz;
-		if (plus_x1 < x + width - pad_outer) {
-			bool plus_hov = ImGui::IsMouseHoveringRect(ImVec2(plus_x0, plus_y0), ImVec2(plus_x1, plus_y1), false);
-			ImU32 plus_bg = aida::ui::with_alpha(plus_hov ? th.accent_u32 : th.bg_elevated, (plus_hov ? 0.65f : 0.4f) * alpha);
-			dl->AddRectFilled(ImVec2(plus_x0, plus_y0), ImVec2(plus_x1, plus_y1), plus_bg, 4.f);
-			float cxp = plus_x0 + plus_sz * 0.5f;
-			float cyp = plus_y0 + plus_sz * 0.5f;
-			ImU32 plus_col = aida::ui::with_alpha(th.text_primary, alpha);
-			dl->AddLine(ImVec2(cxp - 6.f, cyp), ImVec2(cxp + 6.f, cyp), plus_col, 1.6f);
-			dl->AddLine(ImVec2(cxp, cyp - 6.f), ImVec2(cxp, cyp + 6.f), plus_col, 1.6f);
-			if (plus_hov && !ui_input_gate::popup_blocks_background_input()) {
-				ImGui::SetTooltip("New session\nLeft-click: Open File...\nRight-click: Attach to Process...\nMiddle-click: Run...");
-				if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-					aida::preview::apply_open_file();
-#else
-					anti_tamper::webhook::write_log("file_dialog", "session_tab_plus(open) left_click");
-					std::string fpath = disasm::open_file_dialog(g_hwnd);
-					if (!fpath.empty()) {
-						anti_tamper::webhook::write_log("file_dialog", (std::string("session_tab_plus(open) ok path=") + fpath).c_str());
-						analysis_session::open_session(fpath);
-					} else {
-						anti_tamper::webhook::write_log("file_dialog", "session_tab_plus(open) cancelled");
-					}
+	std::string publication_error;
+	const bool publishes_catalog =
+		completion->operation == aida::conversation_store::operation_t::save ||
+		completion->operation == aida::conversation_store::operation_t::switch_conversation ||
+		completion->operation == aida::conversation_store::operation_t::new_conversation ||
+		completion->operation == aida::conversation_store::operation_t::refresh_catalog ||
+		completion->operation == aida::conversation_store::operation_t::delete_conversation ||
+		completion->operation == aida::conversation_store::operation_t::set_pinned ||
+		completion->operation == aida::conversation_store::operation_t::fork_conversation ||
+		completion->operation == aida::conversation_store::operation_t::export_markdown;
+	bool catalog_published = false;
+	bool local_catalog_changed = false;
+	auto upsert_local_summary = [&](const aida::conversation_store::summary_t& summary) {
+		auto found = std::find_if(history.begin(), history.end(),
+			[&](const ConversationSummary& current) { return current.id == summary.id; });
+		ConversationSummary replacement{summary.id, summary.title, summary.created,
+			summary.message_count, summary.pinned, summary.revision};
+		if (found == history.end()) history.push_back(std::move(replacement));
+		else *found = std::move(replacement);
+		local_catalog_changed = true;
+	};
+	if (publishes_catalog && completion->catalog_authoritative) {
+		if (completion->source_catalog_generation != catalog_generation) {
+			publication_error = "Conversation history changed before the catalog result could be published.";
+		} else {
+			std::vector<ConversationSummary> replacement;
+			replacement.reserve(completion->catalog.size());
+			for (const auto& summary : completion->catalog) {
+				replacement.push_back({summary.id, summary.title, summary.created,
+					summary.message_count, summary.pinned, summary.revision});
+			}
+			history = std::move(replacement);
+			publish_conversation_catalog();
+			++catalog_generation;
+			catalog_published = true;
+		}
+	}
+	if (completion->committed_summary) {
+		const auto& committed = *completion->committed_summary;
+		if (committed.id == current_id) current_revision = committed.revision;
+		if (committed.id == current_id) current_identity_uncommitted = false;
+		if (!catalog_published) upsert_local_summary(committed);
+	}
+	if (completion->loaded) {
+		const auto& loaded = *completion->loaded;
+		if (completion->operation == aida::conversation_store::operation_t::load_evidence) {
+			if (loaded.id == current_id)
+				aida::automation_ui::apply_persisted_evidence(loaded.id, loaded.evidence);
+		} else {
+			if (!catalog_published && !loaded.id.empty()) {
+				upsert_local_summary({loaded.id, loaded.title, loaded.created,
+					static_cast<int>(loaded.messages.size()), loaded.pinned,
+					loaded.revision});
+			}
+			std::vector<ChatMessage> messages;
+			messages.reserve(loaded.messages.size());
+			for (const auto& persisted : loaded.messages) {
+				ChatMessage message;
+				message.text = persisted.text;
+				message.thinking_text = persisted.thinking_text;
+				message.is_user = persisted.is_user;
+				message.has_thinking = persisted.has_thinking;
+				message.timestamp = persisted.timestamp;
+				message.input_tokens = persisted.input_tokens;
+				message.output_tokens = persisted.output_tokens;
+				message.cache_read_tokens = persisted.cache_read_tokens;
+				message.cache_write_tokens = persisted.cache_write_tokens;
+				message.model_id = persisted.model_id;
+				messages.push_back(std::move(message));
+			}
+			g_chat_messages = std::move(messages);
+			current_id = loaded.id;
+			current_revision = loaded.revision;
+			current_identity_uncommitted = false;
+			g_chat_buf[0] = '\0';
+			g_chat_scroll_to_bottom = true;
+			aida::automation_ui::apply_persisted_evidence(loaded.id, loaded.evidence);
+			chat_bind_session(loaded.id);
+		}
+	}
+	if (completion->operation == aida::conversation_store::operation_t::delete_conversation &&
+		completion->target_id == current_id) {
+		g_chat_messages.clear();
+		current_id.clear();
+		current_revision = 0;
+		current_identity_uncommitted = false;
+		g_chat_buf[0] = '\0';
+		g_chat_scroll_to_bottom = true;
+		aida::automation_ui::apply_persisted_evidence({}, {});
+		chat_bind_session({});
+	}
+	if (!catalog_published &&
+		completion->operation == aida::conversation_store::operation_t::delete_conversation) {
+		const auto previous_size = history.size();
+		history.erase(std::remove_if(history.begin(), history.end(),
+			[&](const ConversationSummary& summary) {
+				return summary.id == completion->target_id;
+			}), history.end());
+		local_catalog_changed = local_catalog_changed || history.size() != previous_size;
+	}
+	if (!catalog_published && local_catalog_changed) {
+		std::stable_sort(history.begin(), history.end(), [](const auto& left,
+			const auto& right) {
+			if (left.pinned != right.pinned) return left.pinned > right.pinned;
+			if (left.created != right.created) return left.created > right.created;
+			return left.id < right.id;
+		});
+		publish_conversation_catalog();
+		++catalog_generation;
+	}
+	persistence_error = !publication_error.empty() ? std::move(publication_error) :
+		completion->partial ? completion->error : std::string{};
+	if (allow_deferred) submit_deferred_save();
 #endif
-				} else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-					globals::ui::process_attach_open = true;
-				} else if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-					aida::preview::record(aida::preview::shell_action_t::run_target, "session_tab_plus");
-#else
-					spawn_target_dialog::request_open();
-#endif
-				}
-			}
-		}
-	}
+}
 
-	if (open_ctx_for >= 0) {
-		ImGui::OpenPopup("##session_tab_ctx");
-		ImGui::GetStateStorage()->SetInt(ImGui::GetID("##session_tab_ctx_idx"), open_ctx_for);
+bool conversations::commit_shutdown(std::string& error)
+{
+	if (g_chat_messages.empty() && current_id.empty()) {
+		error.clear();
+		return true;
 	}
+	aida::conversation_store::request_t request;
+	request.operation = aida::conversation_store::operation_t::save;
+	request.current = capture_conversation_snapshot(true);
+	request.catalog_generation = catalog_generation;
+	return aida::conversation_store::commit_lifecycle(std::move(request), error);
+}
 
-	if (ImGui::BeginPopup("##session_tab_ctx")) {
-		int ctx_idx = ImGui::GetStateStorage()->GetInt(ImGui::GetID("##session_tab_ctx_idx"), -1);
-		if (ctx_idx >= 0 && ctx_idx < static_cast<int>(analysis_session::session_count())) {
-			const auto sess = analysis_session::session_handle_at(static_cast<size_t>(ctx_idx));
-			if (sess) {
-				bool live = (sess->attached_pid != 0);
-				bool dead = live && !session_health::is_alive(sess->attached_pid);
-				if (ImGui::MenuItem("Switch to")) {
-					switch_intent = ctx_idx;
-				}
-				if (live) {
-					if (dead) {
-						if (ImGui::MenuItem("Reattach to running process...")) {
-							reattach_intent = ctx_idx;
-						}
-					}
-					if (ImGui::MenuItem("Detach process")) {
-						detach_intent = ctx_idx;
-					}
-				}
-				ImGui::Separator();
-				if (ImGui::MenuItem("Close session")) {
-					close_intent = ctx_idx;
-				}
-			}
-		}
-		ImGui::EndPopup();
-	}
-
-	if (detach_intent >= 0) {
-		analysis_session::close_session(static_cast<size_t>(detach_intent));
-	} else if (close_intent >= 0) {
-		analysis_session::close_session(static_cast<size_t>(close_intent));
-	} else if (switch_intent >= 0) {
-		size_t sw_idx = static_cast<size_t>(switch_intent);
-		bool ok = analysis_session::switch_session(sw_idx);
-		const char* sw_name = "(unknown)";
-		const auto sw_sess = analysis_session::session_handle_at(sw_idx);
-		if (sw_sess) {
-			sw_name = sw_sess->filename.empty()
-				? (sw_sess->path.empty() ? "(unnamed)" : sw_sess->path.c_str())
-				: sw_sess->filename.c_str();
-		}
-		char sw_buf[700];
-		_snprintf_s(sw_buf, sizeof(sw_buf), _TRUNCATE,
-			"session_switch idx=%zu name=%s ok=%d", sw_idx, sw_name, ok ? 1 : 0);
-		anti_tamper::webhook::write_log("chrome", sw_buf);
-		if (ok) {
-			if (const auto workspace = analysis_session::active_workspace()) {
-				globals::ui::active_center_view =
-					workspace->identity().target_kind() ==
-						aida::analysis::target_kind_t::static_file
-					? center_view_t::workbench
-					: center_view_t::disassembly;
-			}
-		}
-	} else if (reattach_intent >= 0) {
-		analysis_session::close_session(static_cast<size_t>(reattach_intent));
-		globals::ui::process_attach_open = true;
-	}
+std::shared_ptr<const std::vector<ConversationSummary>> conversations::catalog_snapshot()
+{
+	return published_history;
 }
 
 void helpers::render_title()
 {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=entry_before_section\n";
-#endif
 	g_render_section = "entry";
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=entry_after_section\n";
-#endif
-	ImVec2 compatibility_position(0.0f, 0.0f);
-	ImVec2 compatibility_size(0.0f, 0.0f);
-	const bool compatibility_active = aida::ui::ide_shell::compatibility_content_rect(
-		compatibility_position, compatibility_size);
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=compatibility_rect active="
-		<< (compatibility_active ? 1 : 0) << " size=" << compatibility_size.x << "x"
-		<< compatibility_size.y << "\n";
-#endif
-	struct compatibility_geometry_scope_t {
-		bool active;
-		float width;
-		float height;
-		~compatibility_geometry_scope_t()
-		{
-			if (active) {
-				globals::ui::window_w = width;
-				globals::ui::window_h = height;
-			}
-		}
-	} compatibility_geometry_scope{
-		compatibility_active,
-		globals::ui::window_w,
-		globals::ui::window_h};
 	float dt = ImGui::GetIO().DeltaTime;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=before_controls_access dt=" << dt << "\n";
 	{
 		auto& preview_controls = aida::preview::controls();
-		std::cerr << "[AIDA_PREVIEW] render_title stage=controls_access revision="
-			<< preview_controls.revision << "\n";
-		static std::uint64_t applied_preview_revision = preview_controls.revision;
-		std::cerr << "[AIDA_PREVIEW] render_title stage=controls_revision previous="
-			<< applied_preview_revision << "\n";
+		static std::uint64_t applied_preview_revision = 0;
 		if (applied_preview_revision != preview_controls.revision) {
-			std::cerr << "[AIDA_PREVIEW] render_title stage=controls_apply\n";
 			applied_preview_revision = preview_controls.revision;
 			menu_bar::open_menu = preview_controls.open_menu;
 			menu_bar::any_open = preview_controls.open_menu >= 0;
-			if (preview_controls.center_view >= 0 && preview_controls.center_view <= static_cast<int>(center_view_t::workbench))
-				globals::ui::active_center_view = static_cast<center_view_t>(preview_controls.center_view);
+			menu_bar::open_request = preview_controls.open_menu >= 0;
+			static std::uint64_t preview_view_request_revision = 0;
+			if (preview_view_request_revision != preview_controls.revision) {
+				preview_view_request_revision = preview_controls.revision;
+				static_cast<void>(aida::preview::apply_requested_view(preview_controls));
+			}
 			if (preview_controls.bottom_tab >= 0 && preview_controls.bottom_tab < static_cast<int>(bottom_tab_t::COUNT)) {
 				const char* view_id = preview_controls.bottom_tab == static_cast<int>(bottom_tab_t::mcp_log)
 					? "view.mcp_log" : preview_controls.bottom_tab == static_cast<int>(bottom_tab_t::driver_log)
@@ -2950,25 +2502,28 @@ void helpers::render_title()
 			globals::ui::shortcuts_dialog_open = preview_controls.shortcuts_dialog_open;
 		}
 	}
-	std::cerr << "[AIDA_PREVIEW] render_title stage=controls_scope_complete\n";
-#endif
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=preview_controls_ready\n";
+
 #endif
 	const auto active_workspace_handle = analysis_session::active_workspace();
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=workspace_handle_ready\n";
-	#endif
 	restore_workbench_center_view(active_workspace_handle);
 	const auto active_workspace_context = disasm_view::capture_workspace(active_workspace_handle);
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=workspace_context_ready\n";
-	#endif
 	globals::ui::load_timer += dt;
 	file_menu_deferred::run_pending();
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=deferred_actions_ready\n";
-	#endif
+	process_theme_transfer_completion();
+	conversations::process_store_completion();
+	const auto save_document_as = [](int index) -> file_tabs::save_result_t {
+		if (!file_tabs::is_valid_tab_index(index))
+			return {false, "The document is no longer open."};
+		char buf[MAX_PATH] = {};
+		const auto& tab = file_tabs::tabs[file_tabs::tab_index(index)];
+		if (!tab.filename.empty())
+			strncpy_s(buf, tab.filename.c_str(), _TRUNCATE);
+		static const char k_save_as_filter[] = "All files (*.*)\0*.*\0\0";
+		if (!trusted_show_save_file(g_hwnd, "Save As", k_save_as_filter, nullptr,
+			buf, sizeof(buf), "file_menu_save_as"))
+			return {false, "Save As was canceled."};
+		return file_tabs::save_tab_as(index, buf);
+	};
 	aida::ui::application_ui::shell_callbacks_t application_callbacks;
 	application_callbacks.open_file = [] {
 		file_menu_deferred::request(file_menu_deferred::action_t::open_file);
@@ -2976,27 +2531,10 @@ void helpers::render_title()
 	application_callbacks.open_folder = [] {
 		file_menu_deferred::request(file_menu_deferred::action_t::open_folder);
 	};
-	application_callbacks.save_as = [] {
-		char buf[MAX_PATH] = {};
-		if (!code_editor::filename.empty())
-			strncpy_s(buf, code_editor::filename.c_str(), _TRUNCATE);
-		static const char k_save_as_filter[] = "All files (*.*)\0*.*\0\0";
-		if (!trusted_show_save_file(g_hwnd, "Save As", k_save_as_filter, nullptr,
-			buf, sizeof(buf), "file_menu_save_as"))
-			return;
-		code_editor::filepath = buf;
-		std::string filename = buf;
-		const auto separator = filename.find_last_of("\\/");
-		if (separator != std::string::npos)
-			filename = filename.substr(separator + 1);
-		code_editor::filename = filename;
-		if (file_tabs::active_tab >= 0 &&
-			static_cast<std::size_t>(file_tabs::active_tab) < file_tabs::tabs.size()) {
-			auto& tab = file_tabs::tabs[static_cast<std::size_t>(file_tabs::active_tab)];
-			tab.filepath = code_editor::filepath;
-			tab.filename = code_editor::filename;
-		}
-		code_editor::save();
+	application_callbacks.save_as = [save_document_as] {
+		const auto result = save_document_as(file_tabs::active_tab);
+		if (!result.succeeded)
+			file_tabs::close_confirm_error = result.detail;
 	};
 	application_callbacks.exit_application = [] {
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -3051,8 +2589,7 @@ void helpers::render_title()
 		[active_workspace_handle, active_workspace_context] {
 			if (active_workspace_handle &&
 				active_workspace_handle->identity().target_kind() ==
-					aida::analysis::target_kind_t::static_file &&
-				globals::ui::active_center_view == center_view_t::workbench) {
+					aida::analysis::target_kind_t::static_file) {
 				aida::workbench::workbench_shell_workspace_context_t context;
 				if (!aida::workbench::workbench_shell_runtime_t::instance()
 						.workspace_context(active_workspace_handle, context) ||
@@ -3089,8 +2626,7 @@ void helpers::render_title()
 		[active_workspace_handle, active_workspace_context] {
 			if (active_workspace_handle &&
 				active_workspace_handle->identity().target_kind() ==
-					aida::analysis::target_kind_t::static_file &&
-				globals::ui::active_center_view == center_view_t::workbench) {
+					aida::analysis::target_kind_t::static_file) {
 				aida::workbench::workbench_shell_workspace_context_t context;
 				const auto loaded = aida::workbench::workbench_shell_runtime_t::instance()
 					.workspace_context(active_workspace_handle, context);
@@ -3164,7 +2700,8 @@ void helpers::render_title()
 					"The decompiler rejected the active selection");
 			}
 			if (pseudocode_view::has_active_tab(active_workspace_context)) {
-				globals::ui::active_center_view = center_view_t::pseudocode;
+				static_cast<void>(aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("document.pseudocode")));
 				diag::log_tagged("ui", "view_switch to=pseudocode hotkey=F5");
 				return aida::ui::action_handler_result_t::completed();
 			}
@@ -3177,6 +2714,15 @@ void helpers::render_title()
 		globals::ui::shortcuts_dialog_open = true;
 		anti_tamper::webhook::write_log("chrome", "shortcuts_popup open=true source=action");
 	};
+	application_callbacks.open_workspace_save_as = [] {
+		open_workspace_save_as_dialog();
+	};
+	application_callbacks.open_workspace_manager = [] {
+		open_workspace_manager_dialog();
+	};
+	application_callbacks.open_workspace_reset_all = [] {
+		open_workspace_reset_all_review();
+	};
 	application_callbacks.persist_workspace = [] {
 		g_sa_settings_request_save();
 	};
@@ -3184,13 +2730,7 @@ void helpers::render_title()
 		diag::log_tagged_fmt("ui", "action_executed id=%s", action_id ? action_id : "<null>");
 	};
 	aida::ui::application_ui::configure_shell_callbacks(std::move(application_callbacks));
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=shell_callbacks_ready\n";
-	#endif
 	aida::ui::application_ui::begin_frame();
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=application_frame_ready\n";
-	#endif
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	static bool bg_completed = false;
@@ -3308,17 +2848,8 @@ void helpers::render_title()
 #else
 	const bool runtime_ready = aida::preview::runtime_ready();
 #endif
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=runtime_ready value=" << (runtime_ready ? 1 : 0) << "\n";
-	#endif
 
 	g_render_section = "theme_resolve";
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=theme_resolve_begin active="
-		<< themes::active << " count=" << themes::count
-		<< " custom_active=" << custom_themes::active_custom
-		<< " custom_count=" << custom_themes::list.size() << "\n";
-	#endif
 	if (custom_themes::active_custom >= 0 &&
 		static_cast<std::size_t>(custom_themes::active_custom) < custom_themes::list.size()) {
 		auto& ct = custom_themes::list[static_cast<std::size_t>(custom_themes::active_custom)];
@@ -3336,26 +2867,13 @@ void helpers::render_title()
 	} else {
 		themes::resolved = themes::presets[themes::active];
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=theme_preset_resolved name="
-		<< (themes::resolved.name ? themes::resolved.name : "<null>") << "\n";
-	#endif
 	globals::ui::accent = aida::ui::resolved().accent;
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=theme_preapply_accent_ready\n";
-	#endif
 
 	{
 		static int s_last_applied_theme_idx = -1;
 		static int s_last_applied_custom_idx = -2;
 		int target_custom = custom_themes::active_custom;
 		int target_idx = themes::active;
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=theme_apply_check target="
-			<< target_idx << " custom=" << target_custom
-			<< " last=" << s_last_applied_theme_idx
-			<< " last_custom=" << s_last_applied_custom_idx << "\n";
-		#endif
 		if (target_custom != s_last_applied_custom_idx || target_idx != s_last_applied_theme_idx) {
 			bool first_apply = (s_last_applied_theme_idx == -1 && s_last_applied_custom_idx == -2);
 			s_last_applied_custom_idx = target_custom;
@@ -3398,55 +2916,22 @@ void helpers::render_title()
 				if (first_apply) aida::ui::apply_immediate(base);
 				else             aida::ui::apply(base);
 			} else {
-				#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				std::cerr << "[AIDA_PREVIEW] render_title stage=theme_apply_builtin_begin first="
-					<< (first_apply ? 1 : 0) << "\n";
-				#endif
 				aida::ui::apply_for_index(target_idx, !first_apply);
-				#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				std::cerr << "[AIDA_PREVIEW] render_title stage=theme_apply_builtin_complete\n";
-				#endif
 			}
 		}
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=theme_apply_scope_complete\n";
-	#endif
 	globals::ui::accent = aida::ui::resolved().accent;
 
 	const auto& shell_theme = aida::ui::resolved();
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=shell_theme_resolved\n";
-	#endif
 	const int th_pb_r = (shell_theme.panel_bg >>  0) & 0xFF;
 	const int th_pb_g = (shell_theme.panel_bg >>  8) & 0xFF;
 	const int th_pb_b = (shell_theme.panel_bg >> 16) & 0xFF;
 	const int th_bb_r = (shell_theme.bg_base >>  0) & 0xFF;
 	const int th_bb_g = (shell_theme.bg_base >>  8) & 0xFF;
 	const int th_bb_b = (shell_theme.bg_base >> 16) & 0xFF;
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=shell_theme_channels_ready panel="
-		<< th_pb_r << ',' << th_pb_g << ',' << th_pb_b
-		<< " base=" << th_bb_r << ',' << th_bb_g << ',' << th_bb_b << "\n";
-	#endif
 
 
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=agent_shortcuts_begin\n";
-	#endif
-	chat_handle_agent_shortcuts();
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=agent_shortcuts_complete\n";
-	#endif
-
-
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=global_shortcuts_check want_text="
-		<< (ImGui::GetIO().WantTextInput ? 1 : 0) << "\n";
-	#endif
 	if (!ImGui::GetIO().WantTextInput) {
-		aida::ui::application_ui::process_global_shortcuts();
-
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		const bool ctrl = ImGui::GetIO().KeyCtrl;
 		const bool shift = ImGui::GetIO().KeyShift;
@@ -3458,14 +2943,7 @@ void helpers::render_title()
 
 
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=global_shortcuts_complete\n";
-	#endif
 
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=legacy_theme_handles_begin loaded="
-		<< (helpers::themes_loaded ? 1 : 0) << "\n";
-	#endif
 	if (!helpers::themes_loaded) {
 		helpers::theme_kaneki = nullptr;
 		helpers::theme_rias = nullptr;
@@ -3473,9 +2951,6 @@ void helpers::render_title()
 		helpers::theme_mio = nullptr;
 		helpers::themes_loaded = true;
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=legacy_theme_handles_complete\n";
-	#endif
 
 
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -3553,18 +3028,12 @@ void helpers::render_title()
 #endif
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=loading_query_begin\n";
 	bool loading = aida::preview::loading();
-	std::cerr << "[AIDA_PREVIEW] render_title stage=loading_query_complete value="
-		<< (loading ? 1 : 0) << "\n";
 #else
 	bool loading = !bg_completed || globals::ui::load_timer < 3.0f;
 #endif
 
 	g_render_section = loading ? "loading_screen" : "post_loading";
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=post_loading_section_assigned\n";
-	#endif
 	{
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		static bool s_loading_wait_logged = false;
@@ -3600,19 +3069,12 @@ void helpers::render_title()
 		}
 #endif
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=loading_diagnostics_complete\n";
-	#endif
 
 	if (!loading)
 	{
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=preview_geometry_begin display="
-			<< ImGui::GetIO().DisplaySize.x << 'x' << ImGui::GetIO().DisplaySize.y << "\n";
 		globals::ui::window_w = ImGui::GetIO().DisplaySize.x > 0.f ? ImGui::GetIO().DisplaySize.x : globals::ui::window_w;
 		globals::ui::window_h = ImGui::GetIO().DisplaySize.y > 0.f ? ImGui::GetIO().DisplaySize.y : globals::ui::window_h;
-		std::cerr << "[AIDA_PREVIEW] render_title stage=preview_geometry_complete window="
-			<< globals::ui::window_w << 'x' << globals::ui::window_h << "\n";
 #else
 		float tw, th;
 		if (!globals::ui::welcome_done) {
@@ -3699,18 +3161,10 @@ void helpers::render_title()
 		}
 #endif
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=post_loading_geometry_complete\n";
-	#endif
 
 
 	bool welcome_ready = !loading && globals::ui::window_w >= 470.f && globals::ui::window_h >= 270.f;
 	bool ui_ready      = globals::ui::window_w >= 1000.f && globals::ui::window_h >= 600.f;
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=readiness_computed welcome="
-		<< (welcome_ready ? 1 : 0) << " ui=" << (ui_ready ? 1 : 0)
-		<< " welcome_done=" << (globals::ui::welcome_done ? 1 : 0) << "\n";
-	#endif
 
 	if (ui_ready && globals::ui::welcome_done && runtime_ready)
 	{
@@ -3721,46 +3175,33 @@ void helpers::render_title()
 	}
 
 
-	if (compatibility_active) {
-		globals::ui::window_w = compatibility_size.x;
-		globals::ui::window_h = compatibility_size.y;
+	const bool ide_surface = globals::ui::welcome_done && runtime_ready;
+	if (ide_surface)
+		aida::ui::ide_shell::render_primary_surfaces();
+	if (!ide_surface) {
+		ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+		ImGui::SetNextWindowSize(ImVec2(globals::ui::window_w, globals::ui::window_h));
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=legacy_root_geometry_ready pos="
-		<< compatibility_position.x << ',' << compatibility_position.y << " size="
-		<< globals::ui::window_w << 'x' << globals::ui::window_h << "\n";
-	#endif
-	ImGui::SetNextWindowPos(compatibility_active ? compatibility_position : ImVec2(0, 0), ImGuiCond_Always);
-	ImGui::SetNextWindowSize(ImVec2(globals::ui::window_w, globals::ui::window_h));
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=legacy_root_next_window_ready\n";
-	#endif
 	ImGuiWindowFlags legacy_root_flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar |
-		ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
+		ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
 #if defined(IMGUI_HAS_DOCK)
 	legacy_root_flags |= ImGuiWindowFlags_NoDocking;
 #endif
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=legacy_root_begin_enter\n";
-	#endif
-	ImGui::Begin("##main", nullptr, legacy_root_flags);
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=legacy_root_begin_complete\n";
-	#endif
+	if (ide_surface)
+		aida::ui::ide_shell::begin_global_chrome_surface();
+	else
+		ImGui::Begin("##main", nullptr, legacy_root_flags);
 
 	{
 		ImVec2 bgwp = ImGui::GetWindowPos();
+		const ImVec2 surface_size = ImGui::GetWindowSize();
 		const auto& th = aida::ui::resolved();
 		ImGui::GetWindowDrawList()->AddRectFilled(
 			bgwp,
-			ImVec2(bgwp.x + globals::ui::window_w, bgwp.y + globals::ui::window_h),
+			ImVec2(bgwp.x + surface_size.x, bgwp.y + surface_size.y),
 			th.bg_base, 8.f);
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=legacy_root_background_complete\n";
-	std::cerr << "[AIDA_PREVIEW] render_title stage=welcome_branch_check value="
-		<< (globals::ui::welcome_done ? 1 : 0) << "\n";
-	#endif
 
 	if (!globals::ui::welcome_done && (loading || !welcome_ready || fadeout > 0.f))
 	{
@@ -4007,9 +3448,6 @@ void helpers::render_title()
 		ImGui::End();
 		return;
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=loading_welcome_branch_complete\n";
-	#endif
 
 
 	if (!globals::ui::welcome_done)
@@ -4091,11 +3529,6 @@ void helpers::render_title()
 		ImGui::End();
 		return;
 	}
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=welcome_intro_branch_complete\n";
-	std::cerr << "[AIDA_PREVIEW] render_title stage=runtime_gate_check value="
-		<< (runtime_ready ? 1 : 0) << "\n";
-	#endif
 
 
 	if (!runtime_ready)
@@ -4867,12 +4300,6 @@ void helpers::render_title()
 
 
 	g_render_section = "ide_layout";
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=runtime_gate_complete\n";
-	std::cerr << "[AIDA_PREVIEW] render_title stage=ide_layout_begin alpha="
-		<< globals::ui::ui_alpha << " dpi=" << globals::ui::dpi_scale << "\n";
-	std::cerr << "[AIDA_PREVIEW] render_title stage=shell_metrics_begin\n";
-	#endif
 	float a = globals::ui::ui_alpha;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	if (aida::preview::controls().settle_animations) {
@@ -4882,83 +4309,27 @@ void helpers::render_title()
 #endif
 
 
-	const auto metrics = aida::ui::shell_metrics(globals::ui::dpi_scale);
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=shell_metrics_complete pad="
-		<< metrics.pad << " gap=" << metrics.gap << " title=" << metrics.title_h
-		<< " menu=" << metrics.menu_h << "\n";
-	#endif
+	const ImGuiViewport* shell_viewport = ImGui::GetMainViewport();
+	const float shell_dpi_scale = shell_viewport && shell_viewport->DpiScale > 0.0f
+		? shell_viewport->DpiScale : 1.0f;
+	const auto metrics = aida::ui::shell_metrics(shell_dpi_scale);
 	const float pad      = metrics.pad;
 	const float gap      = metrics.gap;
 	const float title_h  = metrics.title_h;
 	const float menu_h   = metrics.menu_h;
-	float ww = globals::ui::window_w;
-	float wh = globals::ui::window_h;
-
-
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=layout_sync_complete right_visible="
-		<< 0 << " right_width=" << 0 << "\n";
-	#endif
-
-	float usable = ww - pad * 2.f - gap * 2.f;
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	const float max_right = usable * 0.5f;
-	std::cerr << "[AIDA_PREVIEW] render_title stage=settings_geometry_complete usable="
-		<< usable << " max_right=" << max_right << "\n";
-	#endif
-
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=right_animation_complete animated="
-		<< 0 << "\n";
-	#endif
-	float center_w = usable;
-	if (center_w < 100.f) center_w = 100.f;
-
-	float chrome_h = title_h + menu_h;
-	float total_h  = wh - pad * 2.f - chrome_h;
-	float content_top = pad + title_h + menu_h;
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	const float right_w = 0.f;
-	const float right_total_h = total_h;
-	std::cerr << "[AIDA_PREVIEW] render_title stage=ide_geometry_complete center="
-		<< center_w << " right=" << right_w << " total_h=" << total_h
-		<< " right_total_h=" << right_total_h << " content_top=" << content_top << "\n";
-	#endif
+	float ww = ide_surface ? ImGui::GetWindowSize().x : globals::ui::window_w;
 
 	g_render_section = "title_bar";
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=title_bar_push_alpha value=" << a << "\n";
-	#endif
 	ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
-	#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	std::cerr << "[AIDA_PREVIEW] render_title stage=title_bar_alpha_ready\n";
-	#endif
 
 
 	{
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_block_entry\n";
-		#endif
 		ImVec2 wp   = ImGui::GetWindowPos();
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_window_pos_ready x=" << wp.x << " y=" << wp.y << "\n";
-		#endif
 		ImDrawList* dl = ImGui::GetWindowDrawList();
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_draw_list_ready valid=" << (dl ? 1 : 0) << "\n";
-		#endif
 		const auto& th_tb = aida::ui::resolved();
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_theme_ready\n";
-		#endif
 
 		ImVec2 tb_a(wp.x, wp.y);
 		ImVec2 tb_b(wp.x + ww, wp.y + title_h);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_rect_ready ax=" << tb_a.x << " ay=" << tb_a.y
-			<< " bx=" << tb_b.x << " by=" << tb_b.y << "\n";
-		#endif
 
 		aida::ui::blur::layer_request_t tb_req;
 		tb_req.pos = tb_a;
@@ -4966,33 +4337,14 @@ void helpers::render_title()
 		tb_req.radius = 0.f;
 		tb_req.strength = 0.55f;
 		tb_req.alpha = a;
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_blur_schedule_begin alpha=" << tb_req.alpha << "\n";
-		#endif
 		aida::ui::blur::schedule(tb_req);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_blur_schedule_complete\n";
-		#endif
 		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.title_bar, a), metrics.corner_radius, ImDrawFlags_RoundCornersTop);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_fill_primary_complete\n";
-		#endif
 		dl->AddRectFilled(tb_a, tb_b, aida::ui::with_alpha(th_tb.glass_tint, a * 0.5f), metrics.corner_radius, ImDrawFlags_RoundCornersTop);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_fill_tint_complete\n";
-		#endif
 		dl->AddLine(ImVec2(wp.x, wp.y + title_h), ImVec2(wp.x + ww, wp.y + title_h),
 			aida::ui::with_alpha(th_tb.border_subtle, a));
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_border_complete\n";
-		#endif
 
 		float pulse = aida::ui::clock::pulse(0.6f, 0.0f, 1.0f);
 		ImVec2 logo_c(wp.x + pad + metrics.title_logo * 0.5f + gap, wp.y + title_h * 0.5f);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_logo_begin pulse=" << pulse
-			<< " texture=" << (g_aida_logo_srv ? 1 : 0) << " width=" << g_aida_logo_w << " height=" << g_aida_logo_h << "\n";
-		#endif
 		if (g_aida_logo_srv && g_aida_logo_w > 0 && g_aida_logo_h > 0) {
 			float ls = metrics.title_logo * (0.95f + 0.05f * pulse);
 			float aspect = (float)g_aida_logo_w / (float)g_aida_logo_h;
@@ -5006,33 +4358,18 @@ void helpers::render_title()
 		} else {
 			aida::ui::brand::render_logomark(dl, logo_c, metrics.title_logo, 1.0f, pulse, a);
 		}
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_logo_complete\n";
-		#endif
 
 		ImFont* h2f = aida::ui::fonts::h2();
 		if (!h2f) h2f = ImGui::GetFont();
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_font_ready valid=" << (h2f ? 1 : 0) << "\n";
-		#endif
 		const char* app_name = "AiDA";
 		const float title_font_sz = aida::ui::fonts::size_or(h2f, metrics.title_font);
 		const float title_x = logo_c.x + metrics.title_logo * 0.5f + gap * 2.f;
 		ImVec2 name_ts = h2f->CalcTextSizeA(title_font_sz, FLT_MAX, 0.f, app_name);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_name_measure_complete width=" << name_ts.x << " height=" << name_ts.y << "\n";
-		#endif
 		dl->AddText(h2f, title_font_sz,
 			ImVec2(title_x, wp.y + (title_h - title_font_sz) * 0.5f),
 			aida::ui::with_alpha(th_tb.text_primary, a), app_name);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_name_draw_complete\n";
-		#endif
 
 		{
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_breadcrumb_begin\n";
-			#endif
 			ImFont* body = aida::ui::fonts::caption();
 			if (!body) body = ImGui::GetFont();
 			const float bc_font_sz = aida::ui::fonts::size_or(body, metrics.caption_font);
@@ -5043,34 +4380,22 @@ void helpers::render_title()
 				metrics.title_control * 4.f - status_reserved_w;
 			dl->PushClipRect(ImVec2(bc_x, wp.y),
 				ImVec2((std::max)(bc_x, breadcrumb_clip_right), wp.y + title_h), true);
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_breadcrumb_clip_ready left=" << bc_x
-				<< " right=" << breadcrumb_clip_right << "\n";
-			#endif
 			std::vector<std::string> segs;
+			const auto editor_document = code_editor_widget::document_state();
 			if (active_workspace_context)
 				segs.push_back(active_workspace_context.workspace->identity().bin_name());
-			if (code_editor::active && !code_editor::filename.empty())
-				segs.push_back(code_editor::filename);
-			switch (globals::ui::active_center_view) {
-				case center_view_t::disassembly: segs.push_back("Disassembly"); break;
-				case center_view_t::pseudocode:  segs.push_back("Pseudocode"); break;
-				case center_view_t::hex_view:    segs.push_back("Hex"); break;
-				case center_view_t::network_view:segs.push_back("Network"); break;
-				case center_view_t::scan_hub:    segs.push_back("Scan"); break;
-				case center_view_t::types_hub:   segs.push_back("Types"); break;
-				case center_view_t::analysis_hub:segs.push_back("Analysis"); break;
-				case center_view_t::binary_map:  segs.push_back("Binary Map"); break;
-				case center_view_t::debugger_view:segs.push_back("Debugger"); break;
-				case center_view_t::graph_view:  segs.push_back("Graph"); break;
-				case center_view_t::workbench:   segs.push_back("Workbench"); break;
-				case center_view_t::welcome:
-				default: break;
+			if (editor_document.active && !editor_document.filename.empty())
+				segs.push_back(editor_document.filename);
+			const auto focused_view = aida::ui::application_views::registry().focused_instance();
+			if (focused_view) {
+				const auto* descriptor = aida::ui::application_views::registry()
+					.find_descriptor(focused_view->view);
+				if (descriptor &&
+					(focused_view->view.value() != "document.code" ||
+					 editor_document.filename.empty()))
+					segs.push_back(descriptor->display_name);
 			}
 			float sep_w = body->CalcTextSizeA(bc_font_sz, FLT_MAX, 0.f, ">").x;
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_breadcrumb_segments_ready count=" << segs.size() << "\n";
-			#endif
 			for (size_t si = 0; si < segs.size(); ++si) {
 				dl->AddText(body, bc_font_sz, ImVec2(bc_x, bc_y),
 					aida::ui::with_alpha(th_tb.text_dim, a), ">");
@@ -5086,9 +4411,6 @@ void helpers::render_title()
 				bc_x += ss.x + gap * 2.f;
 			}
 			dl->PopClipRect();
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_breadcrumb_complete\n";
-			#endif
 		}
 
 		auto draw_ctl = [&](float right_offset, const char* tag) -> std::pair<ImVec2, ImVec2> {
@@ -5101,56 +4423,22 @@ void helpers::render_title()
 
 		float ctl_off = pad + gap;
 
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_controls_begin\n";
-		#endif
 		auto [close_a, close_b] = draw_ctl(ctl_off, "x");
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_rect_ready ax=" << close_a.x << " ay=" << close_a.y
-			<< " bx=" << close_b.x << " by=" << close_b.y << "\n";
-		#endif
 		bool close_hov = ImGui::IsMouseHoveringRect(close_a, close_b);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_hover_ready value=" << (close_hov ? 1 : 0) << "\n";
-		#endif
 		static aida::ui::hover_state_t close_h;
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_state_ready\n";
-		#endif
 		float chv = close_h.tick(close_hov, dt, aida::motion::spring::balanced);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_tick_ready value=" << chv << "\n";
-		#endif
 		if (chv > 0.01f) {
 			dl->AddRectFilled(close_a, close_b,
 				aida::ui::with_alpha(th_tb.error, 0.20f * chv * a), metrics.control_radius);
 		}
 		ImVec2 xc((close_a.x + close_b.x) * 0.5f, (close_a.y + close_b.y) * 0.5f);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_center_ready x=" << xc.x << " y=" << xc.y << "\n";
-		#endif
 		float xr = 5.f;
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_color_begin\n";
-		#endif
 		ImU32 xcol = aida::ui::mix(th_tb.text_primary, aida::ui::lighten(th_tb.error, 30), chv);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_color_ready value=" << xcol << "\n";
-		#endif
 		float xth = 1.7f + chv * 0.6f;
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_line_one_begin thickness=" << xth << "\n";
-		#endif
 		dl->AddLine(ImVec2(xc.x - xr, xc.y - xr), ImVec2(xc.x + xr, xc.y + xr),
 			aida::ui::with_alpha(xcol, a), xth);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_line_one_complete\n";
-		#endif
 		dl->AddLine(ImVec2(xc.x + xr, xc.y - xr), ImVec2(xc.x - xr, xc.y + xr),
 			aida::ui::with_alpha(xcol, a), xth);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_line_two_complete\n";
-		#endif
 		if (close_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			POINT cursor{};
@@ -5171,24 +4459,12 @@ void helpers::render_title()
 #endif
 			request_chrome_shutdown_from_render("close_button", "chrome.close_button");
 		}
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_close_complete\n";
-		#endif
 		ctl_off += metrics.title_control + gap * 1.5f;
 
 		auto [max_a, max_b] = draw_ctl(ctl_off, "m");
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_max_rect_ready\n";
-		#endif
 		bool max_hov = ImGui::IsMouseHoveringRect(max_a, max_b);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_max_hover_ready value=" << (max_hov ? 1 : 0) << "\n";
-		#endif
 		static aida::ui::hover_state_t max_h;
 		float mhv = max_h.tick(max_hov, dt, aida::motion::spring::balanced);
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_max_tick_ready value=" << mhv << "\n";
-		#endif
 		if (mhv > 0.01f) {
 			dl->AddRectFilled(max_a, max_b,
 				aida::ui::with_alpha(th_tb.hover_wash, mhv * a), metrics.control_radius);
@@ -5208,14 +4484,8 @@ void helpers::render_title()
 		if (max_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			shell_toggle_maximize();
 		}
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_max_complete\n";
-		#endif
 		ctl_off += metrics.title_control + gap * 1.5f;
 
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_min_begin\n";
-		#endif
 		auto [min_a, min_b] = draw_ctl(ctl_off, "n");
 		bool min_hov = ImGui::IsMouseHoveringRect(min_a, min_b);
 		static aida::ui::hover_state_t min_hh;
@@ -5231,16 +4501,10 @@ void helpers::render_title()
 			aida::ui::with_alpha(mncol, a), 1.7f);
 		if (min_hov && !ui_input_gate::chrome_input_blocked() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 			shell_minimize();
-		#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		std::cerr << "[AIDA_PREVIEW] render_title stage=title_min_complete\n";
-		#endif
 		ctl_off += metrics.title_control + gap * 3.f;
 
 
 		{
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_theme_toggle_begin\n";
-			#endif
 			float toggle_sz = metrics.title_control;
 			ImVec2 tgl_a(wp.x + ww - ctl_off - toggle_sz, wp.y + (title_h - toggle_sz) * 0.5f);
 			ImVec2 tgl_b(tgl_a.x + toggle_sz, tgl_a.y + toggle_sz);
@@ -5287,15 +4551,9 @@ void helpers::render_title()
 			}
 			if (tgl_hov) ImGui::SetTooltip("Toggle dark/light mode");
 			ctl_off += toggle_sz + gap * 2.f;
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_theme_toggle_complete\n";
-			#endif
 		}
 
 		{
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_workspace_status_begin\n";
-			#endif
 			const std::string_view status_text = aida::ui::workspace_layout::active_preset_name();
 			const float status_w = aida::ui::scale_px(164.f, metrics.scale);
 			const float status_h = aida::ui::scale_px(24.f, metrics.scale);
@@ -5318,15 +4576,9 @@ void helpers::render_title()
 				aida::ui::with_alpha(th_tb.text_secondary, a), status_text.data(),
 				status_text.data() + status_text.size());
 			ctl_off += status_w + gap * 2.f;
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_workspace_status_complete\n";
-			#endif
 		}
 
 		{
-			#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			std::cerr << "[AIDA_PREVIEW] render_title stage=title_theme_popup_begin\n";
-			#endif
 			static int theme_popup_open_frame = 0;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			static std::uint64_t preview_theme_revision = 0;
@@ -5501,32 +4753,36 @@ void helpers::render_title()
 									k_theme_import_filter,
 									buf, sizeof(buf),
 									"theme_import")) {
-								std::ifstream ifs(buf);
-								if (ifs.is_open()) {
-									try {
-										nlohmann::json j;
-										ifs >> j;
-										CustomThemeData ct;
-										ct.name = j.value("name", "Imported Theme");
-										if (j.contains("accent") && j["accent"].is_array() && j["accent"].size() >= 3) {
-											ct.accent[0] = j["accent"][0].get<float>();
-											ct.accent[1] = j["accent"][1].get<float>();
-											ct.accent[2] = j["accent"][2].get<float>();
-										}
-										ct.bg_base       = j.value("bg_base", (uint32_t)ct.bg_base);
-										ct.panel_bg      = j.value("panel_bg", (uint32_t)ct.panel_bg);
-										ct.panel_header  = j.value("panel_header", (uint32_t)ct.panel_header);
-										ct.title_bar     = j.value("title_bar", (uint32_t)ct.title_bar);
-										ct.text_primary  = j.value("text_primary", (uint32_t)ct.text_primary);
-										ct.text_secondary= j.value("text_secondary", (uint32_t)ct.text_secondary);
-										ct.text_dim      = j.value("text_dim", (uint32_t)ct.text_dim);
-										ct.acrylic_color = j.value("acrylic_color", (DWORD)ct.acrylic_color);
-										ct.icon_index    = j.value("icon_index", ct.icon_index);
-										ct.icon_file_path= j.value("icon_file_path", std::string{});
-										custom_themes::list.push_back(std::move(ct));
-									} catch (...) {}
-								}
+								const auto requested = aida::theme_transfer::request_import(buf);
+								if (requested == aida::theme_transfer::request_result_t::queued ||
+									requested == aida::theme_transfer::request_result_t::preview_recorded)
+									custom_theme_ui_error().clear();
+								else if (requested == aida::theme_transfer::request_result_t::busy)
+									custom_theme_ui_error() = "A theme file operation is already running.";
+								else if (requested == aida::theme_transfer::request_result_t::rejected)
+									custom_theme_ui_error() = "The theme import request was rejected.";
 							}
+						}
+					}
+					const auto theme_transfer_status = aida::theme_transfer::status();
+					if (theme_transfer_status.pending || theme_transfer_status.failed ||
+						!custom_theme_ui_error().empty()) {
+						ImGui::Dummy(ImVec2(0.f, 3.f));
+						ImGui::Separator();
+						const std::string& displayed_error = !custom_theme_ui_error().empty()
+							? custom_theme_ui_error() : theme_transfer_status.error;
+						if (!displayed_error.empty()) {
+							ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + item_w);
+							ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th_tp.error),
+								"%s", displayed_error.c_str());
+							ImGui::PopTextWrapPos();
+						} else
+							ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th_tp.warning),
+								"%s", theme_transfer_status.stage.c_str());
+						if (theme_transfer_status.retryable &&
+							ImGui::SmallButton("Retry theme operation##theme_retry_popup")) {
+							if (aida::theme_transfer::request_retry())
+								custom_theme_ui_error().clear();
 						}
 					}
 					ImGui::EndPopup();
@@ -5628,6 +4884,23 @@ void helpers::render_title()
 							ed.icon_index = -1;
 						}
 					}
+					const auto editor_transfer_status = aida::theme_transfer::status();
+					const std::string& editor_error = !custom_theme_ui_error().empty()
+						? custom_theme_ui_error() : editor_transfer_status.error;
+					if (!editor_error.empty()) {
+						ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + iw2);
+						ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th_te.error),
+							"%s", editor_error.c_str());
+						ImGui::PopTextWrapPos();
+					} else if (editor_transfer_status.pending) {
+						ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th_te.warning),
+							"%s", editor_transfer_status.stage.c_str());
+					}
+					if (editor_transfer_status.retryable &&
+						ImGui::SmallButton("Retry theme operation##theme_retry_editor")) {
+						if (aida::theme_transfer::request_retry())
+							custom_theme_ui_error().clear();
+					}
 
 					ImGui::Dummy(ImVec2(0, 8));
 
@@ -5638,40 +4911,47 @@ void helpers::render_title()
 						aida::ui::components::size_t_::md,
 						ImVec2(btn_w2, 26.f))) {
 						ed.name = name_buf;
-						if (custom_themes::editing_idx >= 0 &&
-							static_cast<std::size_t>(custom_themes::editing_idx) < custom_themes::list.size()) {
-							custom_themes::list[
-								static_cast<std::size_t>(custom_themes::editing_idx)] = ed;
+						std::string validation_error;
+						const bool replacing = custom_themes::editing_idx >= 0 &&
+							static_cast<std::size_t>(custom_themes::editing_idx) < custom_themes::list.size();
+						if (!validate_custom_theme(ed, validation_error)) {
+							custom_theme_ui_error() = std::move(validation_error);
+						} else if (!replacing && custom_themes::editing_idx >= 0) {
+							custom_theme_ui_error() = "The custom theme being edited no longer exists.";
+						} else if (!replacing && custom_themes::list.size() >=
+								aida::theme_transfer::maximum_theme_count) {
+							custom_theme_ui_error() = "Delete a custom theme before creating another; the catalog limit is 128.";
 						} else {
-							custom_themes::list.push_back(ed);
-							custom_themes::editing_idx = (int)custom_themes::list.size() - 1;
+							const int previous_active = custom_themes::active_custom;
+							const int previous_editing = custom_themes::editing_idx;
+							CustomThemeData previous_theme;
+							if (replacing) {
+								previous_theme = custom_themes::list[
+									static_cast<std::size_t>(custom_themes::editing_idx)];
+								custom_themes::list[
+									static_cast<std::size_t>(custom_themes::editing_idx)] = ed;
+							} else {
+								custom_themes::list.push_back(ed);
+								custom_themes::editing_idx = static_cast<int>(custom_themes::list.size()) - 1;
+							}
+							custom_themes::active_custom = custom_themes::editing_idx;
+							std::string persistence_error;
+							if (!persist_custom_theme_catalog(persistence_error)) {
+								if (replacing)
+									custom_themes::list[static_cast<std::size_t>(previous_editing)] =
+										std::move(previous_theme);
+								else
+									custom_themes::list.pop_back();
+								custom_themes::editing_idx = previous_editing;
+								custom_themes::active_custom = previous_active;
+								custom_theme_ui_error() = std::move(persistence_error);
+							} else {
+								themes::changed = true;
+								custom_themes::editor_open = false;
+								custom_theme_ui_error().clear();
+								name_init = false;
+							}
 						}
-						custom_themes::active_custom = custom_themes::editing_idx;
-						themes::changed = true;
-						custom_themes::editor_open = false;
-						name_init = false;
-
-
-						nlohmann::json arr = nlohmann::json::array();
-						for (auto& ct2 : custom_themes::list) {
-							nlohmann::json jt;
-							jt["name"] = ct2.name;
-							jt["accent"] = { ct2.accent[0], ct2.accent[1], ct2.accent[2] };
-							jt["bg_base"] = (uint32_t)ct2.bg_base;
-							jt["panel_bg"] = (uint32_t)ct2.panel_bg;
-							jt["panel_header"] = (uint32_t)ct2.panel_header;
-							jt["title_bar"] = (uint32_t)ct2.title_bar;
-							jt["text_primary"] = (uint32_t)ct2.text_primary;
-							jt["text_secondary"] = (uint32_t)ct2.text_secondary;
-							jt["text_dim"] = (uint32_t)ct2.text_dim;
-							jt["acrylic_color"] = (uint32_t)ct2.acrylic_color;
-							jt["icon_index"] = ct2.icon_index;
-							jt["icon_file_path"] = ct2.icon_file_path;
-							arr.push_back(jt);
-						}
-						g_sa_settings.custom_themes_json = arr.dump();
-						g_sa_settings.active_custom_theme_idx = custom_themes::active_custom;
-						g_sa_settings_request_save();
 					}
 					ImGui::SameLine();
 
@@ -5690,37 +4970,47 @@ void helpers::render_title()
 							"json",
 							export_buf, sizeof(export_buf),
 							"theme_export")) {
-							nlohmann::json jt;
-							jt["name"] = std::string(name_buf);
-							jt["accent"] = { ed.accent[0], ed.accent[1], ed.accent[2] };
-							jt["bg_base"] = (uint32_t)ed.bg_base;
-							jt["panel_bg"] = (uint32_t)ed.panel_bg;
-							jt["panel_header"] = (uint32_t)ed.panel_header;
-							jt["title_bar"] = (uint32_t)ed.title_bar;
-							jt["text_primary"] = (uint32_t)ed.text_primary;
-							jt["text_secondary"] = (uint32_t)ed.text_secondary;
-							jt["text_dim"] = (uint32_t)ed.text_dim;
-							jt["acrylic_color"] = (uint32_t)ed.acrylic_color;
-							jt["icon_index"] = ed.icon_index;
-							std::ofstream ofs(export_buf, std::ios::trunc);
-							if (ofs.is_open()) ofs << jt.dump(2);
+							CustomThemeData exported = ed;
+							exported.name = name_buf;
+							const auto requested = aida::theme_transfer::request_export(
+								export_buf, capture_theme_transfer(exported));
+							if (requested == aida::theme_transfer::request_result_t::queued ||
+								requested == aida::theme_transfer::request_result_t::preview_recorded)
+								custom_theme_ui_error().clear();
+							else if (requested == aida::theme_transfer::request_result_t::busy)
+								custom_theme_ui_error() = "A theme file operation is already running.";
+							else if (requested == aida::theme_transfer::request_result_t::rejected)
+								custom_theme_ui_error() = "The theme export request failed validation or scheduling.";
 						}
 					}
 					ImGui::SameLine();
 
 
-					if (custom_themes::editing_idx >= 0) {
+					if (custom_themes::editing_idx >= 0 &&
+						static_cast<std::size_t>(custom_themes::editing_idx) <
+							custom_themes::list.size()) {
 						if (aida::ui::components::button("Delete",
 							aida::ui::components::button_kind_t::destructive,
 							aida::ui::components::size_t_::md,
 							ImVec2(btn_w2, 26.f))) {
 							int idx = custom_themes::editing_idx;
+							const int previous_active = custom_themes::active_custom;
+							CustomThemeData removed = custom_themes::list[static_cast<std::size_t>(idx)];
 							custom_themes::list.erase(custom_themes::list.begin() + idx);
 							if (custom_themes::active_custom == idx) custom_themes::active_custom = -1;
 							else if (custom_themes::active_custom > idx) custom_themes::active_custom--;
-							themes::changed = true;
-							custom_themes::editor_open = false;
-							name_init = false;
+							std::string persistence_error;
+							if (!persist_custom_theme_catalog(persistence_error)) {
+								custom_themes::list.insert(custom_themes::list.begin() + idx,
+									std::move(removed));
+								custom_themes::active_custom = previous_active;
+								custom_theme_ui_error() = std::move(persistence_error);
+							} else {
+								themes::changed = true;
+								custom_themes::editor_open = false;
+								custom_theme_ui_error().clear();
+								name_init = false;
+							}
 						}
 						ImGui::SameLine();
 					}
@@ -5807,12 +5097,43 @@ void helpers::render_title()
 			{"Network", 8}, {"Workspace", 9}, {"Tools", 10}, {"AI", 11},
 			{"Help", 12}, {"More", 13}
 		};
-		const bool compact_menu = ww < aida::ui::scale_px(1320.f, metrics.scale);
-
 		ImFont* mb_label_font = aida::ui::fonts::lg();
 		if (!mb_label_font) mb_label_font = aida::ui::fonts::body();
 		if (!mb_label_font) mb_label_font = ImGui::GetFont();
 		const float mb_label_size = aida::ui::fonts::size_or(mb_label_font, metrics.menu_font);
+		float complete_menu_width = metrics.menu_pad_x * 2.f;
+		for (int menu_index = 0; menu_index <= 12; ++menu_index) {
+			complete_menu_width += mb_label_font->CalcTextSizeA(
+				mb_label_size, FLT_MAX, 0.f, menus[menu_index].label).x +
+				metrics.menu_item_pad_x * 2.f;
+		}
+		const float available_menu_width = (std::max)(0.f,
+			ww - metrics.menu_pad_x * 2.f);
+		const bool compact_menu = complete_menu_width > available_menu_width;
+		int keyboard_menu_request = -1;
+		int compact_section_request = -1;
+		const ImGuiIO& menu_io = ImGui::GetIO();
+		if (menu_io.KeyAlt) {
+			if (ImGui::IsKeyPressed(ImGuiKey_F, false)) keyboard_menu_request = 0;
+			else if (ImGui::IsKeyPressed(ImGuiKey_E, false)) keyboard_menu_request = 1;
+			else if (ImGui::IsKeyPressed(ImGuiKey_V, false)) keyboard_menu_request = 2;
+			else if (ImGui::IsKeyPressed(ImGuiKey_N, false)) keyboard_menu_request = 3;
+			else if (ImGui::IsKeyPressed(ImGuiKey_A, false)) keyboard_menu_request = 4;
+			else if (ImGui::IsKeyPressed(ImGuiKey_D, false)) keyboard_menu_request = 5;
+			else if (ImGui::IsKeyPressed(ImGuiKey_M, false)) keyboard_menu_request = 6;
+			else if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) keyboard_menu_request = 7;
+			else if (ImGui::IsKeyPressed(ImGuiKey_K, false)) keyboard_menu_request = 8;
+			else if (ImGui::IsKeyPressed(ImGuiKey_W, false)) keyboard_menu_request = 9;
+			else if (ImGui::IsKeyPressed(ImGuiKey_T, false)) keyboard_menu_request = 10;
+			else if (ImGui::IsKeyPressed(ImGuiKey_I, false)) keyboard_menu_request = 11;
+			else if (ImGui::IsKeyPressed(ImGuiKey_H, false)) keyboard_menu_request = 12;
+		}
+		if (!menu_io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Menu, false))
+			keyboard_menu_request = menu_bar::open_menu >= 0 ? menu_bar::open_menu : 0;
+		if (compact_menu && keyboard_menu_request >= 4 && keyboard_menu_request <= 12) {
+			compact_section_request = keyboard_menu_request;
+			keyboard_menu_request = 13;
+		}
 		float mx_cursor = wp.x + metrics.menu_pad_x;
 		ImGuiStorage* mb_storage = ImGui::GetStateStorage();
 		for (int i = 0; i < static_cast<int>(sizeof(menus) / sizeof(menus[0])); i++) {
@@ -5826,9 +5147,14 @@ void helpers::render_title()
 
 			ImGui::PushID(menus[i].label);
 			ImGui::SetCursorScreenPos(bmin);
-			ImGui::InvisibleButton("##mb_top", ImVec2(btn_w, bmax.y - bmin.y));
+			if (keyboard_menu_request == i)
+				ImGui::SetKeyboardFocusHere();
+			const bool activated = ImGui::InvisibleButton(
+				"##mb_top", ImVec2(btn_w, bmax.y - bmin.y),
+				static_cast<ImGuiButtonFlags>(ImGuiButtonFlags_MouseButtonLeft) |
+				static_cast<ImGuiButtonFlags>(ImGuiButtonFlags_PressedOnClick));
 			bool hov = ImGui::IsItemHovered();
-			bool clicked_btn = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+			bool clicked_btn = activated;
 			bool focused = ImGui::IsItemFocused();
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			const std::string menu_semantic_id = aida::preview::semantics::stable_id(
@@ -5866,11 +5192,22 @@ void helpers::render_title()
 				aida::ui::with_alpha(tcol, a), menus[i].label);
 
 			bool need_open = false;
-			if (clicked_btn) {
+			const bool keyboard_open = keyboard_menu_request == i;
+			if (keyboard_open) {
+				menu_bar::open_menu = i;
+				menu_bar::any_open = true;
+				need_open = true;
+			}
+			if (clicked_btn && !keyboard_open) {
 				bool was_open = is_open;
 				menu_bar::open_menu = was_open ? -1 : i;
 				menu_bar::any_open = (menu_bar::open_menu >= 0);
-				if (!was_open) need_open = true;
+				if (!was_open) {
+					need_open = true;
+				} else {
+					ImGuiContext& popup_context = *GImGui;
+					ImGui::ClosePopupToLevel(popup_context.BeginPopupStack.Size, true);
+				}
 			}
 			if (hov && menu_bar::any_open && !is_open) {
 				menu_bar::open_menu = i;
@@ -5880,7 +5217,7 @@ void helpers::render_title()
 
 
 			if (is_open) {
-				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + 4.f));
+				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + gap));
 				ImGui::SetNextWindowBgAlpha(1.0f);
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, metrics.corner_radius);
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(gap * 1.5f, gap * 2.f));
@@ -5890,13 +5227,20 @@ void helpers::render_title()
 
 				char popup_id[32];
 				snprintf(popup_id, sizeof(popup_id), "##menu_%d", i);
-				if (need_open) ImGui::OpenPopup(popup_id);
+				if (need_open || menu_bar::open_request)
+					ImGui::OpenPopup(popup_id);
+				menu_bar::open_request = false;
 
-				if (i == 2 || i == 13)
-					ImGui::SetNextWindowSizeConstraints(ImVec2(320.f, 240.f),
-						ImVec2(420.f, ImGui::GetMainViewport()->WorkSize.y * 0.82f));
+				const float popup_max_height = (std::max)(aida::ui::scale_px(220.f, metrics.scale),
+					ImGui::GetMainViewport()->WorkSize.y * 0.82f);
+				ImGui::SetNextWindowSizeConstraints(
+					ImVec2(aida::ui::scale_px(300.f, metrics.scale),
+						i == 2 || i == 13 ? aida::ui::scale_px(240.f, metrics.scale) : 0.f),
+					ImVec2(aida::ui::scale_px(440.f, metrics.scale), popup_max_height));
 				if (ImGui::BeginPopup(popup_id)) {
-					float mw = 280.f;
+					if (keyboard_open)
+						ImGui::SetKeyboardFocusHere();
+					float mw = aida::ui::scale_px(280.f, metrics.scale);
 
 					ImVec2 pwp = ImGui::GetWindowPos();
 					ImVec2 pws = ImGui::GetWindowSize();
@@ -5914,7 +5258,8 @@ void helpers::render_title()
 					}
 					aida::ui::blur::render_glass_border(pdl, pa, pb, metrics.corner_radius, 1.f, 1.f);
 
-					auto menu_item = [&](const char* label, const char* shortcut, bool enabled = true) -> bool {
+					auto menu_item = [&](const char* label, const char* shortcut,
+						bool enabled = true, const char* semantic_action_id = nullptr) -> bool {
 						const auto& th_p = aida::ui::resolved();
 						ImVec2 cp = ImGui::GetCursorScreenPos();
 						ImU32 tc = enabled ? th_p.text_primary : th_p.text_dim;
@@ -5935,16 +5280,34 @@ void helpers::render_title()
 							label_clip_right = (std::max)(cp.x + label_pad, cp.x + mw - sts.x - shortcut_pad - aida::ui::scale_px(10.f, metrics.scale));
 						}
 						ImGui::PushID(label);
-						ImGui::InvisibleButton("##mi", ImVec2(mw, item_h));
+						if (!enabled)
+							ImGui::BeginDisabled();
+						const bool activated = ImGui::InvisibleButton(
+							"##mi", ImVec2(mw, item_h));
+						if (!enabled)
+							ImGui::EndDisabled();
 						bool mhov = enabled && ImGui::IsItemHovered();
-						bool clicked = enabled && ImGui::IsItemClicked(ImGuiMouseButton_Left);
+						bool mfocused = enabled && ImGui::IsItemFocused();
+						bool clicked = enabled && activated;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						if (semantic_action_id && *semantic_action_id) {
+							const std::string semantic_id = aida::preview::semantics::stable_id(
+								"aida.menu.action", semantic_action_id);
+							aida::preview::semantics::register_last_item(
+								semantic_id, "application-menu-action", false, !enabled);
+						}
+#endif
 						ImGui::PopID();
 						ImVec2 rmin = cp;
 						ImVec2 rmax(cp.x + mw, cp.y + item_h);
 						ImDrawList* idl = ImGui::GetWindowDrawList();
-						if (mhov) idl->AddRectFilled(rmin, rmax,
+						if (mhov || mfocused) idl->AddRectFilled(rmin, rmax,
 							aida::ui::with_alpha(th_p.hover_wash, 1.f),
 							aida::ui::scale_px(aida::ui::metrics::radius::md, metrics.scale));
+						if (mfocused) idl->AddRect(rmin, rmax,
+							aida::ui::with_alpha(th_p.border_focus, 0.9f),
+							aida::ui::scale_px(aida::ui::metrics::radius::md, metrics.scale),
+							0, aida::ui::scale_px(1.5f, metrics.scale));
 						ImVec4 label_clip(cp.x + label_pad, cp.y, label_clip_right, cp.y + item_h);
 						idl->AddText(f_label, label_sz,
 							ImVec2(cp.x + label_pad, cp.y + (item_h - label_sz) * 0.5f), tc, label, nullptr, 0.f, &label_clip);
@@ -5978,21 +5341,15 @@ void helpers::render_title()
 							? label_override : presentation.label.c_str();
 						const char* shortcut = !presentation.shortcut.empty()
 							? presentation.shortcut.c_str() : shortcut_fallback;
-						const bool selected = menu_item(label, shortcut, presentation.enabled);
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-						const std::string action_semantic_id = aida::preview::semantics::stable_id(
-							"aida.menu.action", action_id);
-						aida::preview::semantics::register_last_item(
-							action_semantic_id, "application-menu-action", false,
-							!presentation.enabled);
-#endif
+						const bool selected = menu_item(label, shortcut,
+							presentation.enabled, action_id);
 						if (!presentation.enabled &&
 							ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
 							!presentation.disabled_reason.empty())
 							ImGui::SetTooltip("%s", presentation.disabled_reason.c_str());
 						if (selected)
-							aida::ui::application_ui::execute_action(
-								action_id, aida::ui::action_invocation_source_t::application_menu);
+							static_cast<void>(aida::ui::application_ui::execute_action(
+								action_id, aida::ui::action_invocation_source_t::application_menu));
 						return selected;
 					};
 
@@ -6007,17 +5364,131 @@ void helpers::render_title()
 							});
 					};
 
+					auto render_native_view_entry = [&](
+						const aida::ui::application_views::menu_entry_t& entry) {
+						const std::string action_id =
+							aida::ui::application_ui::view_action_id(entry.id);
+						auto presentation =
+							aida::ui::application_ui::present_action(action_id.c_str());
+						const bool enabled = entry.enabled && presentation.enabled;
+						ImGui::PushID(action_id.c_str());
+						const bool selected = ImGui::MenuItem(entry.label.c_str(),
+							presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str(),
+							entry.open, enabled);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						const std::string semantic_id = aida::preview::semantics::stable_id(
+							"aida.menu.action", action_id);
+						aida::preview::semantics::register_last_item(
+							semantic_id, "application-menu-action", false, !enabled);
+#endif
+						if (!enabled && ImGui::IsItemHovered(
+							ImGuiHoveredFlags_AllowWhenDisabled)) {
+							const std::string& reason = !entry.disabled_reason.empty()
+								? entry.disabled_reason : presentation.disabled_reason;
+							if (!reason.empty()) ImGui::SetTooltip("%s", reason.c_str());
+						}
+						ImGui::PopID();
+						if (selected) {
+							static_cast<void>(aida::ui::application_ui::execute_action(
+								action_id.c_str(),
+								aida::ui::action_invocation_source_t::application_menu));
+							menu_bar::open_menu = -1;
+							menu_bar::any_open = false;
+							menu_bar::suppress_frames = 2;
+						}
+					};
+
+					auto render_network_category = [&]() {
+						std::vector<aida::ui::application_views::menu_entry_t> entries;
+						aida::ui::application_views::for_each_menu_entry(
+							[&](const aida::ui::application_views::menu_entry_t& entry) {
+								if (entry.category == aida::ui::view_category_t::network)
+									entries.push_back(entry);
+							});
+						static const char* monitor_capture[] = {
+							"view.network.connections", "view.network.capture", "view.network.dns",
+							"view.network.bandwidth", "view.network.keylog", "view.network.pcap",
+							"view.network.logger"
+						};
+						static const char* traffic_proxy[] = {
+							"view.network.intercept", "view.network.proxy", "view.network.filters",
+							"view.network.match_replace", "view.network.upstream", "view.network.browser",
+							"view.network.headless"
+						};
+						static const char* request_tools[] = {
+							"view.network.repeater", "view.network.decoder", "view.network.comparer",
+							"view.network.sequencer", "view.network.session", "view.network.api"
+						};
+						static const char* testing_automation[] = {
+							"view.network.fuzzer", "view.network.offensive", "view.network.scanner",
+							"view.network.recon", "view.network.intruder", "view.network.collaborator",
+							"view.network.scripting"
+						};
+						static const char* protocols_security[] = {
+							"view.network.websocket", "view.network.ws_editor", "view.network.h2_editor",
+							"view.network.jwt_lab", "view.network.csp", "view.network.cookies",
+							"view.network.scope", "view.network.site_map", "view.network.reports"
+						};
+						struct network_group_t {
+							const char* label;
+							const char* const* ids;
+							std::size_t count;
+						};
+						static const network_group_t groups[] = {
+							{"Monitor and Capture", monitor_capture, sizeof(monitor_capture) / sizeof(monitor_capture[0])},
+							{"Traffic and Proxy", traffic_proxy, sizeof(traffic_proxy) / sizeof(traffic_proxy[0])},
+							{"Request Tools", request_tools, sizeof(request_tools) / sizeof(request_tools[0])},
+							{"Testing and Automation", testing_automation, sizeof(testing_automation) / sizeof(testing_automation[0])},
+							{"Protocols and Security", protocols_security, sizeof(protocols_security) / sizeof(protocols_security[0])}
+						};
+						auto find_entry = [&](const char* id) {
+							return std::find_if(entries.begin(), entries.end(),
+								[&](const auto& entry) { return entry.id.value() == id; });
+						};
+						auto grouped = [&](const std::string& id) {
+							for (const auto& group : groups)
+								for (std::size_t index = 0; index < group.count; ++index)
+									if (id == group.ids[index]) return true;
+							return false;
+						};
+						for (const auto& group : groups) {
+							if (ImGui::BeginMenu(group.label)) {
+								for (std::size_t index = 0; index < group.count; ++index) {
+									const auto found = find_entry(group.ids[index]);
+									if (found != entries.end()) render_native_view_entry(*found);
+								}
+								ImGui::EndMenu();
+							}
+						}
+						const bool has_other = std::any_of(entries.begin(), entries.end(),
+							[&](const auto& entry) { return !grouped(entry.id.value()); });
+						if (has_other && ImGui::BeginMenu("Other Network Views")) {
+							for (const auto& entry : entries)
+								if (!grouped(entry.id.value())) render_native_view_entry(entry);
+							ImGui::EndMenu();
+						}
+					};
+
 					switch (i) {
 					case 0:
 					{
 						action_menu_item("file.new", "Ctrl+N");
 						action_menu_item("file.open", "Ctrl+O");
 						action_menu_item("file.open_folder", "Ctrl+K");
+						action_menu_item("file.quick_open", "Ctrl+P");
+						action_menu_item("view.focus.view.recent", "", "Recent Files and Sessions...");
+						menu_sep();
+						action_menu_item("tools.load_binary", "", "Open Binary...");
+						action_menu_item("tools.attach_process", "", "Attach to Process...");
+						action_menu_item("debugger.launch", "", "Launch Target...");
+						action_menu_item("file.restore_previous_session");
+						action_menu_item("file.reopen_closed_document");
 						menu_sep();
 						action_menu_item("file.save", "Ctrl+S");
 						action_menu_item("file.save_as", "Ctrl+Shift+S");
 						action_menu_item("file.save_all");
 						action_menu_item("file.close", "Ctrl+W");
+						action_menu_item("file.close_all");
 						menu_sep();
 						action_menu_item("file.exit", "Alt+F4");
 						break;
@@ -6026,6 +5497,8 @@ void helpers::render_title()
 					{
 						action_menu_item("edit.undo", "Ctrl+Z");
 						action_menu_item("edit.redo", "Ctrl+Y");
+						action_menu_item("analysis.overlay.undo");
+						action_menu_item("analysis.overlay.redo");
 						menu_sep();
 						action_menu_item("edit.cut", "Ctrl+X");
 						action_menu_item("edit.copy", "Ctrl+C");
@@ -6047,46 +5520,153 @@ void helpers::render_title()
 						action_menu_item("view.reopen_last_closed");
 						action_menu_item("view.open_default_missing");
 						action_menu_item("shell.toggle_maximize", "F11");
+						action_menu_item("workspace.reset_current", "", "Reset Current Layout");
+						action_menu_item("workspace.safe", "", "Activate Safe Layout");
 						menu_sep();
-						aida::ui::view_category_t last_category = aida::ui::view_category_t::settings;
-						bool first_category = true;
+						std::vector<aida::ui::application_views::menu_entry_t> view_entries;
 						aida::ui::application_views::for_each_menu_entry(
 							[&](const aida::ui::application_views::menu_entry_t& entry) {
-								if (first_category || entry.category != last_category) {
-									if (!first_category)
-										menu_sep();
-									menu_item(aida::ui::application_views::category_label(entry.category), "", false);
-									last_category = entry.category;
-									first_category = false;
-								}
-								std::string label = entry.open ? "Close " : "Open ";
-								label += entry.label;
-								const std::string action_id = aida::ui::application_ui::view_action_id(entry.id);
-								action_menu_item(action_id.c_str(), "", label.c_str());
+								view_entries.push_back(entry);
 							});
+						std::size_t category_begin = 0;
+						while (category_begin < view_entries.size()) {
+							const auto category = view_entries[category_begin].category;
+							std::size_t category_end = category_begin;
+							std::size_t open_count = 0;
+							while (category_end < view_entries.size() &&
+								view_entries[category_end].category == category) {
+								if (view_entries[category_end].open)
+									++open_count;
+								++category_end;
+							}
+							const std::size_t category_count = category_end - category_begin;
+							std::string category_name =
+								aida::ui::application_views::category_label(category);
+							category_name.append("  (").append(std::to_string(open_count))
+								.append("/").append(std::to_string(category_count)).append(")");
+							if (ImGui::BeginMenu(category_name.c_str())) {
+								auto render_view_entry = [&](std::size_t entry_index) {
+									const auto& entry = view_entries[entry_index];
+									const std::string action_id =
+										aida::ui::application_ui::view_action_id(entry.id);
+									auto presentation =
+										aida::ui::application_ui::present_action(action_id.c_str());
+									const bool enabled = entry.enabled && presentation.enabled;
+									ImGui::PushID(action_id.c_str());
+									const bool selected = ImGui::MenuItem(entry.label.c_str(),
+										presentation.shortcut.empty() ? nullptr : presentation.shortcut.c_str(),
+										entry.open, enabled);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+									const std::string view_semantic_id =
+										aida::preview::semantics::stable_id(
+											"aida.menu.action", action_id);
+									aida::preview::semantics::register_last_item(
+										view_semantic_id, "application-menu-action", false, !enabled);
+#endif
+									if (!enabled && ImGui::IsItemHovered(
+										ImGuiHoveredFlags_AllowWhenDisabled)) {
+										const std::string& reason = !entry.disabled_reason.empty()
+											? entry.disabled_reason : presentation.disabled_reason;
+										if (!reason.empty())
+											ImGui::SetTooltip("%s", reason.c_str());
+									}
+									ImGui::PopID();
+									if (selected) {
+										static_cast<void>(aida::ui::application_ui::execute_action(
+											action_id.c_str(),
+											aida::ui::action_invocation_source_t::application_menu));
+										menu_bar::open_menu = -1;
+										menu_bar::any_open = false;
+									}
+								};
+								constexpr std::size_t maximum_entries_per_menu = 12;
+								if (category_count <= maximum_entries_per_menu) {
+									for (std::size_t entry_index = category_begin;
+										entry_index < category_end; ++entry_index)
+										render_view_entry(entry_index);
+								} else {
+									std::size_t page_begin = category_begin;
+									while (page_begin < category_end) {
+										const std::size_t page_end = (std::min)(
+											page_begin + maximum_entries_per_menu, category_end);
+										const std::size_t first = page_begin - category_begin + 1;
+										const std::size_t last = page_end - category_begin;
+										std::string page_label = "Views ";
+										page_label.append(std::to_string(first)).append("-")
+											.append(std::to_string(last));
+										if (ImGui::BeginMenu(page_label.c_str())) {
+											for (std::size_t entry_index = page_begin;
+												entry_index < page_end; ++entry_index)
+												render_view_entry(entry_index);
+											ImGui::EndMenu();
+										}
+										page_begin = page_end;
+									}
+								}
+								ImGui::EndMenu();
+							}
+							category_begin = category_end;
+						}
 						break;
 					}
 					case 3:
 					{
-						action_menu_item("view.focus.document.disassembly", "G", "Disassembly");
-						action_menu_item("analysis.decompile_or_focus_pseudocode", "F5", "Pseudocode");
-						action_menu_item("view.focus.document.graph", "Space", "Graph");
+						action_menu_item("analysis.navigate.back");
+						action_menu_item("analysis.navigate.forward");
+						action_menu_item("file.quick_open", "Ctrl+P");
+						action_menu_item("navigate.previous_document_or_session");
+						action_menu_item("navigate.next_document_or_session");
+						menu_sep();
+						action_menu_item("analysis.navigate.goto", "", "Go to Address...");
+						action_menu_item("analysis.decompile_or_focus_pseudocode", nullptr, "Pseudocode");
+						action_menu_item("analysis.toggle_graph_text", nullptr, "Graph / Text");
 						action_menu_item("view.focus.document.hex", "", "Hex");
-						action_menu_item("view.focus.view.analysis.references", "X", "Cross References");
+						action_menu_item("analysis.navigate.xrefs", nullptr, "Cross References");
 						action_menu_item("view.focus.view.workspace_search", "Ctrl+Shift+F", "Workspace Search");
+						menu_sep();
+						action_menu_item("programming.language.definition", "F12");
+						action_menu_item("programming.language.references", "Shift+F12");
+						action_menu_item("programming.language.workspace_symbols");
 						break;
 					}
 					case 4:
 					{
 						action_menu_item("tools.load_binary");
-						action_menu_item("analysis.decompile_or_focus_pseudocode", "F5");
+						action_menu_item("analysis.decompile_or_focus_pseudocode");
+						action_menu_item("analysis.toggle_graph_text");
+						action_menu_item("analysis.navigate.follow");
+						action_menu_item("analysis.navigate.xrefs");
+						action_menu_item("analysis.modify.rename");
+						action_menu_item("analysis.modify.retype");
+						action_menu_item("analysis.modify.comment");
+						action_menu_item("analysis.modify.bookmark");
+						action_menu_item("analysis.modify.rebase");
+						action_menu_item("analysis.debug.run_to_cursor");
+						action_menu_item("analysis.debug.breakpoint");
+						menu_sep();
+						action_menu_item("analysis.overlay.undo");
+						action_menu_item("analysis.overlay.redo");
+						menu_sep();
+						action_menu_item("analysis.modify.patch");
+						action_menu_item("analysis.modify.nop");
+						action_menu_item("analysis.modify.assemble");
+						action_menu_item("analysis.export.listing");
 						menu_sep();
 						render_view_category(aida::ui::view_category_t::analysis);
 						break;
 					}
 					case 5:
 					{
+						action_menu_item("debugger.launch");
 						action_menu_item("tools.attach_process");
+						action_menu_item("debugger.run_continue", "F5");
+						action_menu_item("debugger.pause", "F6");
+						action_menu_item("debugger.step_over", "F10");
+						action_menu_item("debugger.step_into", "F11");
+						action_menu_item("debugger.step_out", "Shift+F11");
+						action_menu_item("debugger.restart", "Ctrl+Shift+F5");
+						action_menu_item("debugger.detach", "Ctrl+F2");
+						action_menu_item("debugger.stop", "Shift+F5");
 						menu_sep();
 						render_view_category(aida::ui::view_category_t::debugger);
 						break;
@@ -6103,11 +5683,20 @@ void helpers::render_title()
 					}
 					case 8:
 					{
-						render_view_category(aida::ui::view_category_t::network);
+						render_network_category();
 						break;
 					}
 					case 9:
 					{
+						const auto active = aida::ui::workspace_layout::active_identity();
+						std::string active_label = "Active: ";
+						active_label.append(workspace_preset_display_name(active.preset));
+						active_label.append(" / ");
+						active_label.append(active.kind ==
+							aida::ui::workspace_layout::workspace_identity_kind_t::user
+							? active.user_name : "Built-in");
+						ImGui::MenuItem(active_label.c_str(), nullptr, false, false);
+						menu_sep();
 						std::size_t preset_count = 0;
 						const auto* presets = aida::ui::workspace_layout::presets(preset_count);
 						for (std::size_t preset_index = 0; preset_index < preset_count; ++preset_index) {
@@ -6117,14 +5706,50 @@ void helpers::render_title()
 							std::string action_id = "workspace.switch.";
 							action_id.append(preset.stable_id);
 							action_menu_item(action_id.c_str(),
-								aida::ui::workspace_layout::active_preset() == preset.id ? "Active" : "",
+								active.kind == aida::ui::workspace_layout::workspace_identity_kind_t::built_in &&
+								active.preset == preset.id ? "Active" : "",
 								preset.display_name.data());
 						}
 						menu_sep();
 						action_menu_item("workspace.lock", "", aida::ui::workspace_layout::layout_locked() ? "Unlock Layout" : "Lock Layout");
-						action_menu_item("workspace.save");
+						action_menu_item("workspace.save_active");
+						action_menu_item("workspace.save_as");
+						const bool saved_workspaces_open = ImGui::BeginMenu("Saved Workspaces");
+						register_workspace_semantic("aida.workspace.menu.saved-workspaces",
+							"workspace-saved-menu");
+						if (saved_workspaces_open) {
+							const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
+							const bool pending = aida::ui::workspace_layout::operation_pending();
+							if (!catalog || catalog->empty())
+								ImGui::MenuItem("No saved workspaces", nullptr, false, false);
+							else {
+								for (const auto& item : *catalog) {
+									const char* detail = item.active ? "Active" :
+										workspace_preset_display_name(item.base_preset);
+									const bool enabled = !pending && !item.active;
+									if (ImGui::MenuItem(item.name.c_str(), detail, false, enabled))
+										load_workspace_from_menu(item.name);
+									if (!enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+										const std::string status = aida::ui::workspace_layout::operation_status();
+										ImGui::SetTooltip("%s", item.active
+											? "This saved workspace is already active."
+											: status.empty() ? "Another workspace transaction is already running."
+												: status.c_str());
+									}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+									register_workspace_semantic(aida::preview::semantics::stable_id(
+										"aida.workspace.menu.saved", item.name),
+										"workspace-saved-menu-item", !enabled);
+#endif
+								}
+							}
+							menu_sep();
+							action_menu_item("workspace.load_saved");
+							ImGui::EndMenu();
+						}
 						action_menu_item("workspace.restore_builtin");
 						action_menu_item("workspace.reset_current");
+						action_menu_item("workspace.reset_all");
 						action_menu_item("workspace.open_missing");
 						action_menu_item("workspace.safe");
 						break;
@@ -6136,19 +5761,46 @@ void helpers::render_title()
 						menu_sep();
 						action_menu_item("tools.settings", "", "MCP Servers");
 						action_menu_item("tools.driver_status");
+						menu_sep();
+						action_menu_item("programming.index.rebuild");
+						action_menu_item("programming.index.cancel");
+						action_menu_item("programming.task.run");
+						action_menu_item("programming.task.cancel");
+						action_menu_item("programming.task.retry");
+						action_menu_item("programming.task.configure");
+						action_menu_item("programming.task.reload");
+						action_menu_item("programming.show_problems");
+						if (ImGui::BeginMenu("Language Services")) {
+							action_menu_item("programming.language.completion", "Ctrl+Space");
+							action_menu_item("programming.language.hover");
+							action_menu_item("programming.language.signature_help");
+							action_menu_item("programming.language.document_symbols", "Ctrl+Shift+O");
+							action_menu_item("programming.language.workspace_symbols");
+							action_menu_item("programming.language.diagnostics");
+							action_menu_item("programming.language.definition", "F12");
+							action_menu_item("programming.language.references", "Shift+F12");
+							action_menu_item("programming.language.rename");
+							action_menu_item("programming.language.format");
+							action_menu_item("programming.language.code_actions");
+							action_menu_item("programming.language.cancel_query");
+							ImGui::EndMenu();
+						}
+						render_view_category(aida::ui::view_category_t::programming);
 						break;
 					}
 					case 11:
 					{
 						action_menu_item("ai.new_chat", "Ctrl+L");
 						action_menu_item("ai.model_settings");
+						action_menu_item("ai.agent_picker.toggle");
+						action_menu_item("ai.agent_mode.toggle_plan_build");
 						menu_sep();
 						render_view_category(aida::ui::view_category_t::automation);
 						break;
 					}
 					case 12:
 					{
-						action_menu_item("help.shortcuts");
+						action_menu_item("help.shortcuts", "Ctrl+K, Ctrl+S");
 						const std::string diagnostics_id =
 							aida::ui::application_ui::view_action_id(
 								aida::ui::stable_view_id_t("view.diagnostics"));
@@ -6157,58 +5809,183 @@ void helpers::render_title()
 					}
 					case 13:
 					{
-						menu_item("Analysis", "", false);
-						action_menu_item("tools.load_binary");
-						render_view_category(aida::ui::view_category_t::analysis);
-						menu_sep();
-						menu_item("Debugger", "", false);
-						action_menu_item("tools.attach_process");
-						render_view_category(aida::ui::view_category_t::debugger);
-						menu_sep();
-						menu_item("Memory", "", false);
-						render_view_category(aida::ui::view_category_t::memory);
-						menu_sep();
-						menu_item("Types and Structures", "", false);
-						render_view_category(aida::ui::view_category_t::types);
-						menu_sep();
-						menu_item("Network", "", false);
-						render_view_category(aida::ui::view_category_t::network);
-						menu_sep();
-						menu_item("Workspace", "", false);
-						std::size_t preset_count = 0;
-						const auto* presets = aida::ui::workspace_layout::presets(preset_count);
-						for (std::size_t preset_index = 0; preset_index < preset_count; ++preset_index) {
-							const auto& preset = presets[preset_index];
-							if (preset.id == aida::ui::workspace_layout::workspace_preset_t::safe)
-								continue;
-							std::string action_id = "workspace.switch.";
-							action_id.append(preset.stable_id);
-							action_menu_item(action_id.c_str(), "", preset.display_name.data());
+						auto begin_compact_section = [&](const char* label, int section) {
+							const bool requested = compact_section_request == section;
+							if (requested)
+								ImGui::OpenPopup(label);
+							const bool opened = ImGui::BeginMenu(label);
+							if (opened && requested)
+								ImGui::SetKeyboardFocusHere();
+							return opened;
+						};
+						if (begin_compact_section("Analysis", 4)) {
+							action_menu_item("tools.load_binary");
+							action_menu_item("analysis.decompile_or_focus_pseudocode");
+							action_menu_item("analysis.toggle_graph_text");
+							action_menu_item("analysis.navigate.follow");
+							action_menu_item("analysis.navigate.xrefs");
+							action_menu_item("analysis.modify.rename");
+							action_menu_item("analysis.modify.retype");
+							action_menu_item("analysis.modify.comment");
+							action_menu_item("analysis.modify.bookmark");
+							action_menu_item("analysis.modify.rebase");
+							action_menu_item("analysis.debug.run_to_cursor");
+							action_menu_item("analysis.debug.breakpoint");
+							action_menu_item("analysis.overlay.undo");
+							action_menu_item("analysis.overlay.redo");
+							action_menu_item("analysis.modify.patch");
+							action_menu_item("analysis.modify.nop");
+							action_menu_item("analysis.modify.assemble");
+							action_menu_item("analysis.export.listing");
+							render_view_category(aida::ui::view_category_t::analysis);
+							ImGui::EndMenu();
 						}
-						action_menu_item("workspace.lock", "",
-							aida::ui::workspace_layout::layout_locked() ? "Unlock Layout" : "Lock Layout");
-						action_menu_item("workspace.save");
-						action_menu_item("workspace.restore_builtin");
-						action_menu_item("workspace.reset_current");
-						action_menu_item("workspace.open_missing");
-						action_menu_item("workspace.safe");
-						menu_sep();
-						menu_item("Tools", "", false);
-						action_menu_item("tools.settings");
-						action_menu_item("tools.driver_status");
-						menu_sep();
-						menu_item("AI", "", false);
-						action_menu_item("ai.new_chat", "Ctrl+L");
-						action_menu_item("ai.model_settings");
-						render_view_category(aida::ui::view_category_t::automation);
-						menu_sep();
-						menu_item("Help", "", false);
-						action_menu_item("help.shortcuts");
+						if (begin_compact_section("Debugger", 5)) {
+							action_menu_item("debugger.launch");
+							action_menu_item("tools.attach_process");
+							action_menu_item("debugger.run_continue", "F5");
+							action_menu_item("debugger.pause", "F6");
+							action_menu_item("debugger.step_over", "F10");
+							action_menu_item("debugger.step_into", "F11");
+							action_menu_item("debugger.step_out", "Shift+F11");
+							action_menu_item("debugger.restart", "Ctrl+Shift+F5");
+							action_menu_item("debugger.detach", "Ctrl+F2");
+							action_menu_item("debugger.stop", "Shift+F5");
+							render_view_category(aida::ui::view_category_t::debugger);
+							ImGui::EndMenu();
+						}
+						if (begin_compact_section("Memory", 6)) {
+							render_view_category(aida::ui::view_category_t::memory);
+							ImGui::EndMenu();
+						}
+						if (begin_compact_section("Types and Structures", 7)) {
+							render_view_category(aida::ui::view_category_t::types);
+							ImGui::EndMenu();
+						}
+						if (begin_compact_section("Network", 8)) {
+							render_network_category();
+							ImGui::EndMenu();
+						}
+						if (begin_compact_section("Workspace", 9)) {
+							const auto active = aida::ui::workspace_layout::active_identity();
+							std::string active_label = "Active: ";
+							active_label.append(workspace_preset_display_name(active.preset));
+							active_label.append(" / ");
+							active_label.append(active.kind ==
+								aida::ui::workspace_layout::workspace_identity_kind_t::user
+								? active.user_name : "Built-in");
+							ImGui::MenuItem(active_label.c_str(), nullptr, false, false);
+							menu_sep();
+							std::size_t preset_count = 0;
+							const auto* presets = aida::ui::workspace_layout::presets(preset_count);
+							for (std::size_t preset_index = 0; preset_index < preset_count; ++preset_index) {
+								const auto& preset = presets[preset_index];
+								if (preset.id == aida::ui::workspace_layout::workspace_preset_t::safe)
+									continue;
+								std::string action_id = "workspace.switch.";
+								action_id.append(preset.stable_id);
+								action_menu_item(action_id.c_str(),
+									active.kind == aida::ui::workspace_layout::workspace_identity_kind_t::built_in &&
+									active.preset == preset.id ? "Active" : "",
+									preset.display_name.data());
+							}
+							menu_sep();
+							action_menu_item("workspace.lock", "",
+								aida::ui::workspace_layout::layout_locked() ? "Unlock Layout" : "Lock Layout");
+							action_menu_item("workspace.save_active");
+							action_menu_item("workspace.save_as");
+							const bool saved_workspaces_open = ImGui::BeginMenu("Saved Workspaces");
+							register_workspace_semantic("aida.workspace.compact.saved-workspaces",
+								"workspace-saved-menu");
+							if (saved_workspaces_open) {
+								const auto catalog = aida::ui::workspace_layout::user_layout_catalog();
+								const bool pending = aida::ui::workspace_layout::operation_pending();
+								if (!catalog || catalog->empty())
+									ImGui::MenuItem("No saved workspaces", nullptr, false, false);
+								else {
+									for (const auto& item : *catalog) {
+										const char* detail = item.active ? "Active" :
+											workspace_preset_display_name(item.base_preset);
+										const bool enabled = !pending && !item.active;
+										if (ImGui::MenuItem(item.name.c_str(), detail, false, enabled))
+											load_workspace_from_menu(item.name);
+										if (!enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+											const std::string status = aida::ui::workspace_layout::operation_status();
+											ImGui::SetTooltip("%s", item.active
+												? "This saved workspace is already active."
+												: status.empty() ? "Another workspace transaction is already running."
+													: status.c_str());
+										}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+										register_workspace_semantic(aida::preview::semantics::stable_id(
+											"aida.workspace.compact.saved", item.name),
+											"workspace-saved-menu-item", !enabled);
+#endif
+									}
+								}
+								menu_sep();
+								action_menu_item("workspace.load_saved");
+								ImGui::EndMenu();
+							}
+							action_menu_item("workspace.restore_builtin");
+							action_menu_item("workspace.reset_current");
+							action_menu_item("workspace.reset_all");
+							action_menu_item("workspace.open_missing");
+							action_menu_item("workspace.safe");
+							ImGui::EndMenu();
+						}
+						if (begin_compact_section("Tools", 10)) {
+							action_menu_item("tools.load_binary");
+							action_menu_item("tools.attach_process");
+							action_menu_item("tools.settings", "", "MCP Servers");
+							action_menu_item("tools.driver_status");
+							action_menu_item("programming.index.rebuild");
+							action_menu_item("programming.index.cancel");
+							action_menu_item("programming.task.run");
+							action_menu_item("programming.task.cancel");
+							action_menu_item("programming.task.retry");
+							action_menu_item("programming.task.configure");
+							action_menu_item("programming.task.reload");
+							action_menu_item("programming.show_problems");
+							if (ImGui::BeginMenu("Language Services")) {
+								action_menu_item("programming.language.completion", "Ctrl+Space");
+								action_menu_item("programming.language.hover");
+								action_menu_item("programming.language.signature_help");
+								action_menu_item("programming.language.document_symbols", "Ctrl+Shift+O");
+								action_menu_item("programming.language.workspace_symbols");
+								action_menu_item("programming.language.diagnostics");
+								action_menu_item("programming.language.definition", "F12");
+								action_menu_item("programming.language.references", "Shift+F12");
+								action_menu_item("programming.language.rename");
+								action_menu_item("programming.language.format");
+								action_menu_item("programming.language.code_actions");
+								action_menu_item("programming.language.cancel_query");
+								ImGui::EndMenu();
+							}
+							render_view_category(aida::ui::view_category_t::programming);
+							ImGui::EndMenu();
+						}
+						if (begin_compact_section("AI", 11)) {
+							action_menu_item("ai.new_chat", "Ctrl+L");
+							action_menu_item("ai.model_settings");
+							action_menu_item("ai.agent_picker.toggle");
+							action_menu_item("ai.agent_mode.toggle_plan_build");
+							render_view_category(aida::ui::view_category_t::automation);
+							ImGui::EndMenu();
+						}
+						if (begin_compact_section("Help", 12)) {
+							action_menu_item("help.shortcuts", "Ctrl+K, Ctrl+S");
+							const std::string diagnostics_id =
+								aida::ui::application_ui::view_action_id(
+									aida::ui::stable_view_id_t("view.diagnostics"));
+							action_menu_item(diagnostics_id.c_str(), "", "Diagnostics");
+							ImGui::EndMenu();
+						}
 						break;
 					}
 					}
 					ImGui::EndPopup();
-				} else {
+				} else if (!ImGui::IsPopupOpen(popup_id)) {
 					menu_bar::open_menu = -1;
 					menu_bar::any_open = false;
 				}
@@ -6220,2070 +5997,28 @@ void helpers::render_title()
 		}
 
 
-		if (menu_bar::any_open && !ui_input_gate::popup_blocks_background_input() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-			!ImGui::IsMouseHoveringRect(ImVec2(wp.x, my0), ImVec2(wp.x + ww, my1)) &&
-			!ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
-			menu_bar::open_menu = -1;
-			menu_bar::any_open = false;
-		}
-
-
 	}
 
-
-	const auto& th_lp = aida::ui::resolved();
-	float ax3 = globals::ui::accent.x, ay3 = globals::ui::accent.y, az3 = globals::ui::accent.z;
-	ImU32 ac_full = aida::ui::with_alpha(th_lp.accent_u32, a);
-
-	const float hdr_pad = aida::ui::scale_px(aida::ui::metrics::spacing::md, metrics.scale);
-	const float row_h = aida::ui::scale_px(aida::ui::metrics::row::compact, metrics.scale);
-	const float row_gap = aida::ui::scale_px(aida::ui::metrics::spacing::xxs, metrics.scale);
-	const float tb_vpad = aida::ui::scale_px(aida::ui::metrics::spacing::sm, metrics.scale);
-	const float hdr_h    = tb_vpad * 2.f + row_h * 2.f + row_gap;
-
-	ImDrawList* wdl  = ImGui::GetWindowDrawList();
-	ImVec2      wp_m = ImGui::GetWindowPos();
-
-
-	g_render_section = "title_strip_layout";
-	float hx0 = wp_m.x + pad, hy0 = wp_m.y + content_top;
-	float hx1  = hx0 + center_w;
-	float hy1  = hy0 + hdr_h;
-	float dc_y1 = wp_m.y + content_top + total_h;
-
-	const auto& th_cp = aida::ui::resolved();
-
-	wdl->AddRectFilled(ImVec2(hx0, hy0), ImVec2(hx1, dc_y1),
-		th_cp.panel_bg, metrics.corner_radius);
-	wdl->AddRect(ImVec2(hx0, hy0), ImVec2(hx1, dc_y1),
-		aida::ui::with_alpha(th_cp.border_subtle, a), metrics.corner_radius, 0, 1.f);
-
-
-	wdl->AddRectFilled(ImVec2(hx0, hy0), ImVec2(hx1, hy1),
-		th_cp.panel_header, metrics.corner_radius, ImDrawFlags_RoundCornersTop);
-
-
-	const float sep_y = hy0 + hdr_h * 0.5f;
-	const float r1_cy = hy0 + hdr_h * 0.25f;
-	const float r2_cy = hy0 + hdr_h * 0.75f;
-
-
-	wdl->AddLine(ImVec2(hx0, sep_y), ImVec2(hx1, sep_y),
-		aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 1.f);
-
-	wdl->AddLine(ImVec2(hx0, hy1), ImVec2(hx1, hy1),
-		aida::ui::with_alpha(th_lp.hover_wash, 0.55f*a), 1.f);
-
-
-	auto ghost_btn = [&](const char* label, ImGuiID id_hv, ImGuiID id_fl,
-		float bx0, float cy, float bw2) -> bool
-	{
-		ImGuiStorage* st = ImGui::GetStateStorage();
-		ImVec2 ts  = ImGui::CalcTextSize(label);
-		float  bh2 = row_h - 2.f;
-		float  by0 = cy - bh2 * 0.5f;
-		float  bx1 = bx0 + bw2, by1 = by0 + bh2;
-		bool   bhv = !ui_input_gate::popup_blocks_background_input() && ImGui::IsMouseHoveringRect(ImVec2(bx0,by0), ImVec2(bx1,by1), false);
-		bool   bck = bhv && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-		float  bht = st->GetFloat(id_hv, 0.f);
-		float  bft = st->GetFloat(id_fl, 0.f);
-		bht += ((bhv ? 1.f : 0.f) - bht) * std::min(12.f * dt, 1.f);
-		bft += ((bck ? 1.f : 0.f) - bft) * std::min(22.f * dt, 1.f);
-		st->SetFloat(id_hv, bht);
-		st->SetFloat(id_fl, bft);
-		float bg_a  = (bht * 0.72f + bft * 0.20f) * a;
-		float brd_a = (0.48f + bht * 0.34f) * a;
-		float txt_a = (0.72f + bht * 0.28f) * a;
-		wdl->AddRectFilled(ImVec2(bx0,by0), ImVec2(bx1,by1),
-			aida::ui::with_alpha(th_lp.hover_wash, bg_a),
-			aida::ui::scale_px(aida::ui::metrics::radius::sm, metrics.scale));
-		wdl->AddRect(ImVec2(bx0,by0), ImVec2(bx1,by1),
-			aida::ui::with_alpha(th_lp.border_subtle, brd_a),
-			aida::ui::scale_px(aida::ui::metrics::radius::sm, metrics.scale), 0, 1.f);
-		wdl->AddText(ImVec2(bx0 + (bw2 - ts.x) * 0.5f, by0 + (bh2 - ts.y) * 0.5f),
-			aida::ui::with_alpha(th_lp.text_secondary, txt_a), label);
-		return bck;
-	};
-
-
-	const float rbtn_w  = std::max(
-		ImGui::CalcTextSize("Choose File").x,
-		ImGui::CalcTextSize("Run").x) + 32.f;
-	const float rbtn_x0 = hx1 - hdr_pad - rbtn_w;
-
-
-	{
-
-
-		bool row2_has_vt_btn = static_cast<bool>(active_workspace_context);
-		float row2_vt_btn_w = 0.f;
-		if (row2_has_vt_btn) {
-			bool is_hex_view_pre = (globals::ui::active_center_view == center_view_t::hex_view);
-			const char* vt_label_pre = is_hex_view_pre ? "View Disassembly" : "View Hex";
-			row2_vt_btn_w = ImGui::CalcTextSize(vt_label_pre).x + 32.f;
-		}
-		const float row2_right_anchor = rbtn_x0 - (row2_has_vt_btn ? (row2_vt_btn_w + 8.f) : 0.f);
-
-		const float strip_chev_w = 18.f;
-		const float strip_drop_w = 22.f;
-		const float strip_div_w  = 1.f;
-		const float strip_lchev_x0 = hx0 + hdr_pad;
-		const float strip_lchev_x1 = strip_lchev_x0 + strip_chev_w;
-		const float strip_div1_x   = strip_lchev_x1;
-		const float strip_tabs_x0  = strip_div1_x + strip_div_w + 4.f;
-
-		const float strip_right_edge = row2_right_anchor - 10.f;
-		const float strip_drop_x1  = strip_right_edge;
-		const float strip_drop_x0  = strip_drop_x1 - strip_drop_w;
-		const float strip_div3_x   = strip_drop_x0 - 2.f;
-		const float strip_rchev_x1 = strip_div3_x - strip_div_w;
-		const float strip_rchev_x0 = strip_rchev_x1 - strip_chev_w;
-		const float strip_div2_x   = strip_rchev_x0 - 2.f;
-		const float strip_tabs_x1  = strip_div2_x - strip_div_w - 4.f;
-
-		ImGuiStorage* strip_st = ImGui::GetStateStorage();
-		const ImGuiID strip_id_scroll        = ImGui::GetID("##strip_scroll");
-		const ImGuiID strip_id_scroll_target = ImGui::GetID("##strip_scroll_target");
-		const ImGuiID strip_id_active_sig    = ImGui::GetID("##strip_active_sig");
-		float strip_scroll = strip_st->GetFloat(strip_id_scroll, 0.f);
-		float strip_scroll_target = strip_st->GetFloat(strip_id_scroll_target, 0.f);
-
-		const float tab_h_strip   = row_h - 2.f;
-		const float strip_tab_y0  = r2_cy - tab_h_strip * 0.5f;
-		const float strip_tab_y1  = strip_tab_y0 + tab_h_strip;
-
-		struct strip_entry_t {
-			std::string label;
-			int  kind = 0;
-			int  idx  = -1;
-			uint64_t addr = 0;
-			bool is_active = false;
-			bool dirty = false;
-			bool error = false;
-			float width = 0.f;
-		};
-		g_render_section = "title_strip_entries_build";
-		std::vector<strip_entry_t> strip_entries;
-		strip_entries.reserve(file_tabs::tabs.size() + 8);
-
-		const float tab_pad_x_strip = 10.f;
-		const float close_sz_strip  = 10.f;
-
-		auto strip_calc_w = [&](const std::string& label) -> float {
-			ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-			return tab_pad_x_strip * 2.f + ts.x + close_sz_strip + 12.f;
-		};
-
-		for (std::size_t ti = 0; ti < file_tabs::tabs.size(); ++ti) {
-			auto& tab = file_tabs::tabs[ti];
-			const int tab_index = static_cast<int>(ti);
-			strip_entry_t e;
-			e.label = tab.filename + (tab.dirty ? " *" : "");
-			e.kind = 0;
-			e.idx = tab_index;
-			e.is_active = ((tab_index == file_tabs::active_tab) && code_editor::active &&
-			              globals::ui::active_center_view == center_view_t::code_editor);
-			e.dirty = tab.dirty;
-			e.width = strip_calc_w(e.label);
-			strip_entries.push_back(std::move(e));
-		}
-
-		{
-			g_render_section = "title_strip_psv_snapshot";
-			const unsigned long long psv_snap1_t0 = aida::shell_platform::tick_ms();
-			auto psv_tabs_for_strip = pseudocode_view::snapshot_tabs(active_workspace_context);
-			const unsigned long long psv_snap1_elapsed = aida::shell_platform::tick_ms() - psv_snap1_t0;
-			if (psv_snap1_elapsed >= 50ULL) {
-				diag::log_tagged_critical_fmt("helpers",
-					"helpers_psv_snapshot1_slow elapsed_ms=%llu tabs=%zu tid=%lu tick_ms=%llu",
-					psv_snap1_elapsed,
-					psv_tabs_for_strip.size(),
-					static_cast<unsigned long>(aida::shell_platform::thread_id()),
-					static_cast<unsigned long long>(aida::shell_platform::tick_ms()));
-			}
-			bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
-			uint64_t active_psv_addr = pseudocode_view::active_tab_address(active_workspace_context);
-			for (auto& pt : psv_tabs_for_strip) {
-				strip_entry_t e;
-				if (!pt.function_name.empty()) e.label = pt.function_name;
-				else if (!pt.label.empty()) e.label = pt.label;
-				else {
-					char nm[64];
-					std::snprintf(nm, sizeof(nm), "sub_%llX",
-						static_cast<unsigned long long>(pt.addr));
-					e.label = nm;
-				}
-				if (pt.decompiling) e.label += " ...";
-				e.kind = 2;
-				e.addr = pt.addr;
-				e.error = pt.is_error;
-				e.is_active = (psv_view_active && pt.addr == active_psv_addr);
-				e.width = strip_calc_w(e.label);
-				strip_entries.push_back(std::move(e));
-			}
-		}
-
-		if (hex_view::active(active_workspace_context)) {
-			strip_entry_t e;
-			const std::string hex_source = hex_view::source_name(active_workspace_context);
-			e.label = hex_source.empty()
-				? std::string("Hex View")
-				: hex_source + " (Hex)";
-			e.kind = 3;
-			e.is_active = (globals::ui::active_center_view == center_view_t::hex_view);
-			e.width = strip_calc_w(e.label);
-			strip_entries.push_back(std::move(e));
-		}
-
-		float strip_total_w = 0.f;
-		for (auto& e : strip_entries) strip_total_w += e.width + 2.f;
-		if (strip_total_w > 0.f) strip_total_w -= 2.f;
-
-		const float strip_visible_w = std::max(20.f, strip_tabs_x1 - strip_tabs_x0);
-		const bool  strip_has_overflow = (strip_total_w > strip_visible_w + 0.5f);
-		const float strip_max_scroll = strip_has_overflow ? (strip_total_w - strip_visible_w) : 0.f;
-
-		{
-			float ax_running = 0.f;
-			int active_idx = -1;
-			for (std::size_t i = 0; i < strip_entries.size(); ++i) {
-				auto& e = strip_entries[i];
-				if (e.is_active) { active_idx = static_cast<int>(i); break; }
-				ax_running += e.width + 2.f;
-			}
-			if (active_idx >= 0 && strip_has_overflow) {
-				const std::size_t active_entry_index = static_cast<std::size_t>(active_idx);
-				char sig_buf[64];
-				std::snprintf(sig_buf, sizeof(sig_buf), "%d|%s",
-					active_idx, strip_entries[active_entry_index].label.c_str());
-				ImGuiID sig_id = ImGui::GetID(sig_buf);
-				ImGuiID prev_sig_id = (ImGuiID)strip_st->GetInt(strip_id_active_sig, 0);
-				if (sig_id != prev_sig_id) {
-					float aw = strip_entries[active_entry_index].width;
-					float min_off = ax_running + aw - strip_visible_w + 12.f;
-					float max_off = ax_running - 12.f;
-					if (strip_scroll_target < min_off) strip_scroll_target = min_off;
-					if (strip_scroll_target > max_off) strip_scroll_target = max_off;
-					strip_st->SetInt(strip_id_active_sig, (int)sig_id);
-				}
-			}
-		}
-
-		if (strip_scroll_target < 0.f) strip_scroll_target = 0.f;
-		if (strip_scroll_target > strip_max_scroll) strip_scroll_target = strip_max_scroll;
-		strip_scroll = aida::motion::smooth_lerp(strip_scroll, strip_scroll_target, 18.f, dt);
-		if (strip_scroll < 0.f) strip_scroll = 0.f;
-		if (strip_scroll > strip_max_scroll) strip_scroll = strip_max_scroll;
-
-		wdl->PushClipRect(ImVec2(strip_tabs_x0 - 2.f, strip_tab_y0 - 8.f),
-			ImVec2(strip_tabs_x1 + 2.f, strip_tab_y1 + 8.f), true);
-
-		g_render_section = "title_strip_file_tabs_render";
-		if (!file_tabs::tabs.empty()) {
-			const float tab_pad_x = 10.f;
-			const float tab_gap   = 2.f;
-			const float close_sz  = 10.f;
-			const float tab_h     = row_h - 2.f;
-			float tab_x = strip_tabs_x0 - strip_scroll;
-			float tab_y = r2_cy - tab_h * 0.5f;
-
-			int close_idx = -1;
-			int click_idx = -1;
-			int context_idx = -1;
-			aida::ui::context_menu_open_origin_t tab_context_origin =
-				aida::ui::context_menu_open_origin_t::pointer;
-			float active_tx0 = -1.f, active_tx1 = -1.f, active_ty0 = 0.f;
-			const ImVec2 tab_cursor_restore = ImGui::GetCursorScreenPos();
-
-			for (std::size_t ti = 0; ti < file_tabs::tabs.size(); ++ti) {
-				auto& tab = file_tabs::tabs[ti];
-				const int tab_index = static_cast<int>(ti);
-				bool is_active = (tab_index == file_tabs::active_tab);
-
-
-				std::string label = tab.filename;
-				if (tab.dirty) label += " *";
-
-				ImVec2 lts = ImGui::CalcTextSize(label.c_str());
-				float tw = tab_pad_x * 2.f + lts.x + close_sz + 6.f;
-
-				float tx0 = tab_x, ty0 = tab_y;
-				float tx1 = tab_x + tw, ty1 = tab_y + tab_h;
-
-				bool tx_in_view = (tx1 >= strip_tabs_x0 - 2.f) && (tx0 <= strip_tabs_x1 + 2.f);
-				bool mouse_in_strip = !ui_input_gate::popup_blocks_background_input() &&
-					ImGui::IsMouseHoveringRect(
-						ImVec2(strip_tabs_x0, strip_tab_y0 - 4.f),
-						ImVec2(strip_tabs_x1, strip_tab_y1 + 4.f), false);
-				(void)tx_in_view;
-
-				ImGui::SetCursorScreenPos(ImVec2(tx0, ty0));
-				ImGui::PushID(tab_index);
-				ImGui::InvisibleButton("##editor_tab", ImVec2(tw, tab_h));
-				const bool tab_item_hovered = ImGui::IsItemHovered();
-				const bool tab_item_focused = ImGui::IsItemFocused();
-				const bool tab_left_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-				const bool tab_right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-				ImGui::PopID();
-				bool tab_hov = mouse_in_strip && tab_item_hovered;
-
-
-				if (is_active) {
-					wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-						aida::ui::with_alpha(th_lp.selection, 0.86f * a),
-						4.f, ImDrawFlags_RoundCornersTop);
-					active_tx0 = tx0 + 2.f;
-					active_tx1 = tx1 - 2.f;
-					active_ty0 = ty0;
-				} else if (tab_hov) {
-					wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-						aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 4.f, ImDrawFlags_RoundCornersTop);
-				}
-				if (tab_item_focused)
-					wdl->AddRect(ImVec2(tx0 + 1.f, ty0 + 1.f), ImVec2(tx1 - 1.f, ty1 - 1.f),
-						aida::ui::with_alpha(th_lp.border_focus, a), 4.f, 0, 1.5f);
-
-
-				ImU32 tab_col = is_active ? ac_full
-				              : aida::ui::with_alpha(th_lp.text_secondary, (tab_hov ? 1.f : 0.78f)*a);
-				wdl->AddText(ImVec2(tx0 + tab_pad_x, ty0 + (tab_h - lts.y) * 0.5f),
-					tab_col, label.c_str());
-
-
-				float cx0 = tx1 - tab_pad_x - close_sz;
-				float cy0 = ty0 + (tab_h - close_sz) * 0.5f;
-				float cx1 = cx0 + close_sz, cy1 = cy0 + close_sz;
-				bool close_hov = mouse_in_strip &&
-					ImGui::IsMouseHoveringRect(ImVec2(cx0, cy0), ImVec2(cx1, cy1), false);
-				if (close_hov) {
-					wdl->AddRectFilled(ImVec2(cx0 - 1, cy0 - 1), ImVec2(cx1 + 1, cy1 + 1),
-						aida::ui::with_alpha(th_lp.error, 0.16f*a), 3.f);
-				}
-				ImU32 close_col = close_hov
-					? aida::ui::with_alpha(th_lp.error, 0.86f*a)
-					: aida::ui::with_alpha(th_lp.text_dim, (is_active ? 0.78f : 0.45f)*a);
-				float cmx = (cx0 + cx1) * 0.5f, cmy = (cy0 + cy1) * 0.5f;
-				float cr = 3.f;
-				wdl->AddLine(ImVec2(cmx - cr, cmy - cr), ImVec2(cmx + cr, cmy + cr), close_col, 1.2f);
-				wdl->AddLine(ImVec2(cmx + cr, cmy - cr), ImVec2(cmx - cr, cmy + cr), close_col, 1.2f);
-
-
-				if (close_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-					close_idx = tab_index;
-				else if (tab_hov && !close_hov && tab_left_clicked)
-					click_idx = tab_index;
-				if (tab_hov && tab_right_clicked) {
-					context_idx = tab_index;
-					tab_context_origin = aida::ui::context_menu_open_origin_t::pointer;
-				}
-				if (tab_item_focused &&
-					(ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-					 ImGui::IsKeyPressed(ImGuiKey_Space, false)))
-					click_idx = tab_index;
-				if (tab_item_focused &&
-					(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-					 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)))) {
-					context_idx = tab_index;
-					tab_context_origin = ImGui::IsKeyPressed(ImGuiKey_Menu, false)
-						? aida::ui::context_menu_open_origin_t::menu_key
-						: aida::ui::context_menu_open_origin_t::shift_f10;
-				}
-				if (tab_item_focused && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) && tab_index > 0)
-					click_idx = tab_index - 1;
-				if (tab_item_focused && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) &&
-					static_cast<std::size_t>(tab_index + 1) < file_tabs::tabs.size())
-					click_idx = tab_index + 1;
-
-
-				if (ti + 1 < file_tabs::tabs.size()) {
-					wdl->AddLine(ImVec2(tx1, ty0 + 3.f), ImVec2(tx1, ty1 - 3.f),
-						aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 1.f);
-				}
-
-				tab_x = tx1 + tab_gap;
-			}
-			ImGui::SetCursorScreenPos(tab_cursor_restore);
-
-
-			if (close_idx >= 0) {
-				if (static_cast<std::size_t>(close_idx) < file_tabs::tabs.size() &&
-					file_tabs::tabs[static_cast<std::size_t>(close_idx)].dirty) {
-					file_tabs::pending_close_idx = close_idx;
-					file_tabs::show_close_confirm = true;
-				} else {
-					file_tabs::close_tab(close_idx);
-				}
-			}
-			else if (click_idx >= 0 && click_idx != file_tabs::active_tab) {
-				file_tabs::switch_to(click_idx);
-				globals::ui::active_center_view = center_view_t::code_editor;
-			}
-			if (context_idx >= 0)
-				aida::ui::application_ui::open_editor_tab_context_menu(
-					context_idx, tab_context_origin);
-			aida::ui::application_ui::render_editor_tab_context_menu();
-
-			if (active_tx0 >= 0.f) {
-				ImGuiID ct_ulx = ImGui::GetID("##ct_ul_x");
-				ImGuiID ct_ulw = ImGui::GetID("##ct_ul_w");
-				ImGuiID ct_ulvx = ImGui::GetID("##ct_ul_vx");
-				float ct_x = ImGui::GetStateStorage()->GetFloat(ct_ulx, active_tx0);
-				float ct_w = ImGui::GetStateStorage()->GetFloat(ct_ulw, active_tx1 - active_tx0);
-				float ct_vx = ImGui::GetStateStorage()->GetFloat(ct_ulvx, 0.f);
-				float tgt_w = active_tx1 - active_tx0;
-				ct_x = aida::motion::spring_step(ct_x, active_tx0, ct_vx,
-					aida::motion::spring::balanced, dt);
-				ct_w = aida::motion::smooth_lerp(ct_w, tgt_w, 16.f, dt);
-				ImGui::GetStateStorage()->SetFloat(ct_ulx, ct_x);
-				ImGui::GetStateStorage()->SetFloat(ct_ulw, ct_w);
-				ImGui::GetStateStorage()->SetFloat(ct_ulvx, ct_vx);
-				ui_anim::render_tab_underline_glow(wdl, ct_x, ct_w, active_ty0 + 1.f, a);
-			}
-
-		}
-
-
-		float next_tab_x_after_disasm = strip_tabs_x0 - strip_scroll;
-		if (!file_tabs::tabs.empty()) {
-			float last_tab_end = strip_tabs_x0 - strip_scroll;
-			for (std::size_t ti = 0; ti < file_tabs::tabs.size(); ++ti) {
-				auto& tab = file_tabs::tabs[ti];
-				std::string label = tab.filename;
-				if (tab.dirty) label += " *";
-				ImVec2 lts = ImGui::CalcTextSize(label.c_str());
-				float tw = 10.f * 2.f + lts.x + 10.f + 6.f;
-				last_tab_end += tw + 2.f;
-			}
-			next_tab_x_after_disasm = last_tab_end + 4.f;
-		}
-
-		{
-			g_render_section = "title_strip_psv_render";
-			const unsigned long long psv_snap2_t0 = aida::shell_platform::tick_ms();
-			auto psv_tabs = pseudocode_view::snapshot_tabs(active_workspace_context);
-			const unsigned long long psv_snap2_elapsed = aida::shell_platform::tick_ms() - psv_snap2_t0;
-			if (psv_snap2_elapsed >= 50ULL) {
-				diag::log_tagged_critical_fmt("helpers",
-					"helpers_psv_snapshot2_slow elapsed_ms=%llu tabs=%zu tid=%lu tick_ms=%llu",
-					psv_snap2_elapsed,
-					psv_tabs.size(),
-					static_cast<unsigned long>(aida::shell_platform::thread_id()),
-					static_cast<unsigned long long>(aida::shell_platform::tick_ms()));
-			}
-			if (!psv_tabs.empty()) {
-				bool psv_view_active = (globals::ui::active_center_view == center_view_t::pseudocode);
-				uint64_t active_psv_addr = pseudocode_view::active_tab_address(active_workspace_context);
-
-				const float p_close_sz = 10.f;
-				float tab_h_p = row_h - 2.f;
-				uint64_t to_activate_addr = 0;
-				uint64_t to_close_addr = 0;
-
-				bool psv_mouse_in_strip = !ui_input_gate::popup_blocks_background_input() &&
-					ImGui::IsMouseHoveringRect(
-						ImVec2(strip_tabs_x0, strip_tab_y0 - 4.f),
-						ImVec2(strip_tabs_x1, strip_tab_y1 + 4.f), false);
-
-				for (auto& pt : psv_tabs) {
-					std::string lbl;
-					if (!pt.function_name.empty()) {
-						lbl = pt.function_name;
-					} else if (!pt.label.empty()) {
-						lbl = pt.label;
-					} else {
-						char nm[64];
-						std::snprintf(nm, sizeof(nm), "sub_%llX",
-							static_cast<unsigned long long>(pt.addr));
-						lbl = nm;
-					}
-					if (pt.decompiling) lbl += " ...";
-
-					ImVec2 plts = ImGui::CalcTextSize(lbl.c_str());
-					float ptw = 10.f * 2.f + plts.x + p_close_sz + 12.f;
-					float ptx0 = next_tab_x_after_disasm;
-					float ptx1 = ptx0 + ptw;
-					float pty0 = r2_cy - tab_h_p * 0.5f;
-					float pty1 = pty0 + tab_h_p;
-
-					bool ptab_active = (psv_view_active && pt.addr == active_psv_addr);
-					bool ptab_hov = psv_mouse_in_strip &&
-						ImGui::IsMouseHoveringRect(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1), false);
-
-					if (ptab_active) {
-						wdl->AddRectFilled(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1),
-							aida::ui::with_alpha(th_lp.selection, 0.86f * a),
-							4.f, ImDrawFlags_RoundCornersTop);
-						ui_anim::render_tab_underline_glow(wdl, ptx0 + 4.f,
-							(ptx1 - ptx0) - 8.f, pty0 + 1.f, a);
-					} else if (ptab_hov) {
-						wdl->AddRectFilled(ImVec2(ptx0, pty0), ImVec2(ptx1, pty1),
-							aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 4.f, ImDrawFlags_RoundCornersTop);
-					}
-
-					ImU32 ptab_col = ptab_active ? ac_full
-					               : (pt.is_error
-					                  ? aida::ui::with_alpha(th_lp.warning, (ptab_hov ? 0.86f : 0.7f)*a)
-					                  : aida::ui::with_alpha(th_lp.text_secondary, (ptab_hov ? 1.f : 0.78f)*a));
-					wdl->AddText(ImVec2(ptx0 + 10.f, pty0 + (tab_h_p - plts.y) * 0.5f),
-						ptab_col, lbl.c_str());
-					(void)pty1;
-
-					float pcx0 = ptx1 - p_close_sz - 6.f;
-					float pcy0 = pty0 + (tab_h_p - p_close_sz) * 0.5f;
-					float pcx1 = pcx0 + p_close_sz;
-					float pcy1 = pcy0 + p_close_sz;
-					bool pclose_hov = psv_mouse_in_strip &&
-						ImGui::IsMouseHoveringRect(ImVec2(pcx0 - 2, pcy0 - 2),
-							ImVec2(pcx1 + 2, pcy1 + 2), false);
-					if (pclose_hov) {
-						wdl->AddRectFilled(ImVec2(pcx0 - 1, pcy0 - 1), ImVec2(pcx1 + 1, pcy1 + 1),
-							aida::ui::with_alpha(th_lp.error, 0.16f*a), 3.f);
-					}
-					ImU32 pclose_col = pclose_hov
-						? aida::ui::with_alpha(th_lp.error, 0.86f*a)
-						: aida::ui::with_alpha(th_lp.text_dim, (ptab_active ? 0.78f : 0.45f)*a);
-					float pcmx = (pcx0 + pcx1) * 0.5f, pcmy = (pcy0 + pcy1) * 0.5f;
-					float pcr = 3.f;
-					wdl->AddLine(ImVec2(pcmx - pcr, pcmy - pcr), ImVec2(pcmx + pcr, pcmy + pcr), pclose_col, 1.2f);
-					wdl->AddLine(ImVec2(pcmx + pcr, pcmy - pcr), ImVec2(pcmx - pcr, pcmy + pcr), pclose_col, 1.2f);
-
-					if (pclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-						to_close_addr = pt.addr;
-					} else if (ptab_hov && !pclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-						to_activate_addr = pt.addr;
-					} else if (ptab_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
-						to_close_addr = pt.addr;
-					}
-
-					next_tab_x_after_disasm = ptx1 + 4.f;
-				}
-
-				if (to_close_addr != 0) {
-					pseudocode_view::close_tab_by_addr(active_workspace_context, to_close_addr);
-					if (psv_view_active && pseudocode_view::tab_count(active_workspace_context) == 0) {
-						globals::ui::active_center_view = center_view_t::disassembly;
-					}
-				} else if (to_activate_addr != 0) {
-					pseudocode_view::activate_tab_by_addr(active_workspace_context, to_activate_addr);
-					globals::ui::active_center_view = center_view_t::pseudocode;
-				}
-			}
-		}
-
-		if (hex_view::active(active_workspace_context)) {
-			bool hex_is_active = (globals::ui::active_center_view == center_view_t::hex_view);
-			const std::string hex_source = hex_view::source_name(active_workspace_context);
-			std::string hex_label_str = hex_source.empty()
-				? std::string("Hex View")
-				: hex_source + " (Hex)";
-			const char* hex_label = hex_label_str.c_str();
-			ImVec2 hts = ImGui::CalcTextSize(hex_label);
-			const float hex_close_sz = 10.f;
-			float htw = 10.f * 2.f + hts.x + hex_close_sz + 12.f;
-			float tab_h3 = row_h - 2.f;
-
-			float htx0 = next_tab_x_after_disasm;
-			float htx1 = htx0 + htw;
-			{
-				float hty0 = r2_cy - tab_h3 * 0.5f;
-				float hty1 = hty0 + tab_h3;
-
-				bool hex_mouse_in_strip = !ui_input_gate::popup_blocks_background_input() &&
-					ImGui::IsMouseHoveringRect(
-						ImVec2(strip_tabs_x0, strip_tab_y0 - 4.f),
-						ImVec2(strip_tabs_x1, strip_tab_y1 + 4.f), false);
-				bool htab_hov = hex_mouse_in_strip &&
-					ImGui::IsMouseHoveringRect(ImVec2(htx0, hty0), ImVec2(htx1, hty1), false);
-
-				if (hex_is_active) {
-					wdl->AddRectFilled(ImVec2(htx0, hty0), ImVec2(htx1, hty1),
-						aida::ui::with_alpha(th_lp.selection, 0.86f * a),
-						4.f, ImDrawFlags_RoundCornersTop);
-					ui_anim::render_tab_underline_glow(wdl, htx0 + 4.f,
-						(htx1 - htx0) - 8.f, hty0 + 1.f, a);
-				} else if (htab_hov) {
-					wdl->AddRectFilled(ImVec2(htx0, hty0), ImVec2(htx1, hty1),
-						aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 4.f, ImDrawFlags_RoundCornersTop);
-				}
-
-				ImU32 htab_col = hex_is_active ? ac_full
-				               : aida::ui::with_alpha(th_lp.text_secondary, (htab_hov ? 1.f : 0.78f)*a);
-				wdl->AddText(ImVec2(htx0 + 10.f, hty0 + (tab_h3 - hts.y) * 0.5f),
-					htab_col, hex_label);
-				(void)hty1;
-
-
-				float hcx0 = htx1 - hex_close_sz - 6.f;
-				float hcy0 = hty0 + (tab_h3 - hex_close_sz) * 0.5f;
-				float hcx1 = hcx0 + hex_close_sz;
-				float hcy1 = hcy0 + hex_close_sz;
-				bool hclose_hov = hex_mouse_in_strip &&
-					ImGui::IsMouseHoveringRect(ImVec2(hcx0 - 2, hcy0 - 2), ImVec2(hcx1 + 2, hcy1 + 2), false);
-				if (hclose_hov) {
-					wdl->AddRectFilled(ImVec2(hcx0 - 1, hcy0 - 1), ImVec2(hcx1 + 1, hcy1 + 1),
-						aida::ui::with_alpha(th_lp.error, 0.16f*a), 3.f);
-				}
-				ImU32 hclose_col = hclose_hov
-					? aida::ui::with_alpha(th_lp.error, 0.86f*a)
-					: aida::ui::with_alpha(th_lp.text_dim, (hex_is_active ? 0.78f : 0.45f)*a);
-				float hcmx = (hcx0 + hcx1) * 0.5f, hcmy = (hcy0 + hcy1) * 0.5f;
-				float hcr = 3.f;
-				wdl->AddLine(ImVec2(hcmx - hcr, hcmy - hcr), ImVec2(hcmx + hcr, hcmy + hcr), hclose_col, 1.2f);
-				wdl->AddLine(ImVec2(hcmx + hcr, hcmy - hcr), ImVec2(hcmx - hcr, hcmy + hcr), hclose_col, 1.2f);
-
-				if (hclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-					hex_view::close(active_workspace_context);
-					if (globals::ui::active_center_view == center_view_t::hex_view)
-						globals::ui::active_center_view = center_view_t::code_editor;
-				} else if (htab_hov && !hclose_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-					globals::ui::active_center_view = center_view_t::hex_view;
-				}
-			}
-		}
-
-		wdl->PopClipRect();
-
-		const bool strip_has_any_entry = !strip_entries.empty();
-
-		if (!strip_has_any_entry) {
-			const char* fn_disp = "No file open";
-			ImVec2 fn_ts = ImGui::CalcTextSize(fn_disp);
-			float  fn_y  = r2_cy - fn_ts.y * 0.5f;
-			wdl->AddText(ImVec2(strip_tabs_x0, fn_y),
-				aida::ui::with_alpha(th_lp.text_secondary, a), fn_disp);
-		}
-
-		bool strip_show_nav = strip_has_overflow || strip_has_any_entry;
-
-		auto strip_draw_chevron = [&](float cx, float cy, bool point_right, ImU32 col) {
-			float w = 4.f, h = 6.f;
-			if (point_right) {
-				wdl->AddLine(ImVec2(cx - w * 0.5f, cy - h * 0.5f),
-					ImVec2(cx + w * 0.5f, cy), col, 1.4f);
-				wdl->AddLine(ImVec2(cx + w * 0.5f, cy),
-					ImVec2(cx - w * 0.5f, cy + h * 0.5f), col, 1.4f);
-			} else {
-				wdl->AddLine(ImVec2(cx + w * 0.5f, cy - h * 0.5f),
-					ImVec2(cx - w * 0.5f, cy), col, 1.4f);
-				wdl->AddLine(ImVec2(cx - w * 0.5f, cy),
-					ImVec2(cx + w * 0.5f, cy + h * 0.5f), col, 1.4f);
-			}
-		};
-
-		g_render_section = "title_strip_nav";
-		if (strip_show_nav) {
-			float chev_y0 = strip_tab_y0 + 2.f;
-			float chev_y1 = strip_tab_y1 - 2.f;
-			float chev_cy = (chev_y0 + chev_y1) * 0.5f;
-
-			bool strip_mouse_in_chrome = !ui_input_gate::popup_blocks_background_input() &&
-				ImGui::IsMouseHoveringRect(
-					ImVec2(strip_lchev_x0, strip_tab_y0 - 6.f),
-					ImVec2(strip_drop_x1, strip_tab_y1 + 6.f), false);
-
-			bool lchev_enabled = (strip_scroll_target > 0.5f);
-			bool lchev_hov = strip_mouse_in_chrome && lchev_enabled &&
-				ImGui::IsMouseHoveringRect(
-					ImVec2(strip_lchev_x0, chev_y0),
-					ImVec2(strip_lchev_x1, chev_y1), false);
-			ImU32 lchev_col = lchev_enabled
-				? aida::ui::with_alpha(th_lp.text_secondary, (lchev_hov ? 1.f : 0.78f) * a)
-				: aida::ui::with_alpha(th_lp.text_dim, 0.45f * a);
-			if (lchev_hov) {
-				wdl->AddRectFilled(
-					ImVec2(strip_lchev_x0, chev_y0),
-					ImVec2(strip_lchev_x1, chev_y1),
-					aida::ui::with_alpha(th_lp.hover_wash, 0.55f*a), 3.f);
-			}
-			strip_draw_chevron(
-				(strip_lchev_x0 + strip_lchev_x1) * 0.5f, chev_cy, false, lchev_col);
-			if (lchev_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-				float step = std::max(80.f, strip_visible_w * 0.5f);
-				strip_scroll_target -= step;
-				if (strip_scroll_target < 0.f) strip_scroll_target = 0.f;
-			}
-
-			wdl->AddLine(
-				ImVec2(strip_div1_x + 0.5f, strip_tab_y0 + 4.f),
-				ImVec2(strip_div1_x + 0.5f, strip_tab_y1 - 4.f),
-				aida::ui::with_alpha(th_lp.border_subtle, a), 1.f);
-
-			wdl->AddLine(
-				ImVec2(strip_div2_x + strip_div_w * 0.5f, strip_tab_y0 + 4.f),
-				ImVec2(strip_div2_x + strip_div_w * 0.5f, strip_tab_y1 - 4.f),
-				aida::ui::with_alpha(th_lp.border_subtle, a), 1.f);
-
-			bool rchev_enabled = (strip_scroll_target < strip_max_scroll - 0.5f);
-			bool rchev_hov = strip_mouse_in_chrome && rchev_enabled &&
-				ImGui::IsMouseHoveringRect(
-					ImVec2(strip_rchev_x0, chev_y0),
-					ImVec2(strip_rchev_x1, chev_y1), false);
-			ImU32 rchev_col = rchev_enabled
-				? aida::ui::with_alpha(th_lp.text_secondary, (rchev_hov ? 1.f : 0.78f) * a)
-				: aida::ui::with_alpha(th_lp.text_dim, 0.45f * a);
-			if (rchev_hov) {
-				wdl->AddRectFilled(
-					ImVec2(strip_rchev_x0, chev_y0),
-					ImVec2(strip_rchev_x1, chev_y1),
-					aida::ui::with_alpha(th_lp.hover_wash, 0.55f*a), 3.f);
-			}
-			strip_draw_chevron(
-				(strip_rchev_x0 + strip_rchev_x1) * 0.5f, chev_cy, true, rchev_col);
-			if (rchev_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-				float step = std::max(80.f, strip_visible_w * 0.5f);
-				strip_scroll_target += step;
-				if (strip_scroll_target > strip_max_scroll)
-					strip_scroll_target = strip_max_scroll;
-			}
-
-			wdl->AddLine(
-				ImVec2(strip_div3_x + strip_div_w * 0.5f, strip_tab_y0 + 4.f),
-				ImVec2(strip_div3_x + strip_div_w * 0.5f, strip_tab_y1 - 4.f),
-				aida::ui::with_alpha(th_lp.border_subtle, a), 1.f);
-
-			bool drop_hov = strip_mouse_in_chrome &&
-				ImGui::IsMouseHoveringRect(
-					ImVec2(strip_drop_x0, chev_y0),
-					ImVec2(strip_drop_x1, chev_y1), false);
-			ImU32 drop_col = aida::ui::with_alpha(th_lp.text_secondary, (drop_hov ? 1.f : 0.78f) * a);
-			if (drop_hov) {
-				wdl->AddRectFilled(
-					ImVec2(strip_drop_x0, chev_y0),
-					ImVec2(strip_drop_x1, chev_y1),
-					aida::ui::with_alpha(th_lp.hover_wash, 0.55f*a), 3.f);
-			}
-			float drop_cx = (strip_drop_x0 + strip_drop_x1) * 0.5f;
-			float drop_cy = chev_cy;
-			float drop_w_icon = 10.f;
-			for (int li = 0; li < 3; ++li) {
-				float ly = drop_cy - 3.f + static_cast<float>(li) * 3.f;
-				wdl->AddLine(
-					ImVec2(drop_cx - drop_w_icon * 0.5f, ly),
-					ImVec2(drop_cx + drop_w_icon * 0.5f, ly),
-					drop_col, 1.2f);
-			}
-			if (drop_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-				ImGui::OpenPopup("##tab_strip_dropdown");
-			}
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			static std::uint64_t preview_tab_dropdown_revision = 0;
-			if (aida::preview::controls().tab_dropdown_open && preview_tab_dropdown_revision != aida::preview::controls().revision) {
-				preview_tab_dropdown_revision = aida::preview::controls().revision;
-				ImGui::OpenPopup("##tab_strip_dropdown");
-			}
-#endif
-
-			g_render_section = "title_strip_dropdown_popup";
-			ImGui::SetNextWindowPos(ImVec2(strip_drop_x1 - 280.f, strip_tab_y1 + 4.f),
-				ImGuiCond_Always);
-			if (ImGui::BeginPopup("##tab_strip_dropdown",
-				ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-				ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
-
-				float pop_w = 280.f;
-				float row_h_pop = 26.f;
-				ImVec2 pwp = ImGui::GetWindowPos();
-				ImDrawList* pdl = ImGui::GetWindowDrawList();
-				const auto& th_pp = aida::ui::resolved();
-
-				ImGui::TextUnformatted("Open Tabs");
-				ImGui::Dummy(ImVec2(pop_w, 1.f));
-				pdl->AddLine(
-					ImVec2(pwp.x + 6.f, ImGui::GetCursorScreenPos().y),
-					ImVec2(pwp.x + pop_w - 6.f, ImGui::GetCursorScreenPos().y),
-					th_pp.border_strong, 1.f);
-				ImGui::Dummy(ImVec2(pop_w, 2.f));
-
-				int chosen_kind = -1;
-				int chosen_idx = -1;
-				uint64_t chosen_addr = 0;
-
-				for (std::size_t ei = 0; ei < strip_entries.size(); ++ei) {
-					auto& e = strip_entries[ei];
-					ImVec2 cp = ImGui::GetCursorScreenPos();
-					ImVec2 rmin(cp.x, cp.y);
-					ImVec2 rmax(cp.x + pop_w, cp.y + row_h_pop);
-					bool rhov = ImGui::IsMouseHoveringRect(rmin, rmax, false);
-					if (e.is_active) {
-						pdl->AddRectFilled(rmin, rmax,
-							aida::ui::with_alpha(th_pp.selection, 0.86f), 6.f);
-					} else if (rhov) {
-						pdl->AddRectFilled(rmin, rmax,
-							aida::ui::with_alpha(th_pp.hover_wash, 1.f), 6.f);
-					}
-					const char* kind_tag = "";
-					ImU32 kind_col = th_lp.text_dim;
-					switch (e.kind) {
-						case 0: kind_tag = "TXT"; kind_col = th_lp.text_secondary; break;
-						case 1: kind_tag = "ASM"; kind_col = th_lp.syn_number; break;
-						case 2: kind_tag = "C  "; kind_col = th_lp.syn_function; break;
-						case 3: kind_tag = "HEX"; kind_col = th_lp.syn_keyword; break;
-					}
-					pdl->AddText(ImVec2(cp.x + 10.f, cp.y + (row_h_pop - ImGui::GetFontSize()) * 0.5f),
-						kind_col, kind_tag);
-					ImU32 label_col = e.is_active
-						? th_pp.accent_u32
-						: th_lp.text_primary;
-					if (e.error) label_col = th_lp.error;
-					pdl->AddText(ImVec2(cp.x + 50.f, cp.y + (row_h_pop - ImGui::GetFontSize()) * 0.5f),
-						label_col, e.label.c_str());
-					if (e.dirty) {
-						pdl->AddCircleFilled(
-							ImVec2(cp.x + pop_w - 14.f, cp.y + row_h_pop * 0.5f), 3.f,
-							th_lp.warning);
-					}
-					ImGui::Dummy(ImVec2(pop_w, row_h_pop));
-					if (rhov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-						chosen_kind = e.kind;
-						chosen_idx = e.idx;
-						chosen_addr = e.addr;
-					}
-				}
-
-				if (chosen_kind >= 0) {
-					if (chosen_kind == 0 && chosen_idx >= 0 && chosen_idx < (int)file_tabs::tabs.size()) {
-						file_tabs::switch_to(chosen_idx);
-						globals::ui::active_center_view = center_view_t::code_editor;
-					} else if (chosen_kind == 1) {
-						globals::ui::active_center_view = center_view_t::disassembly;
-					} else if (chosen_kind == 2 && chosen_addr != 0) {
-						pseudocode_view::activate_tab_by_addr(active_workspace_context, chosen_addr);
-						globals::ui::active_center_view = center_view_t::pseudocode;
-					} else if (chosen_kind == 3) {
-						globals::ui::active_center_view = center_view_t::hex_view;
-					}
-					ImGui::CloseCurrentPopup();
-				}
-
-				ImGui::EndPopup();
-			}
-		}
-
-		strip_st->SetFloat(strip_id_scroll, strip_scroll);
-		strip_st->SetFloat(strip_id_scroll_target, strip_scroll_target);
-
-
-		g_render_section = "title_hub_nav";
-		float hub_active_x0 = 0.f;
-		float hub_active_x1 = 0.f;
-		float hub_active_y1 = 0.f;
-		bool  hub_has_active = false;
-		float hub_hover_x0 = 0.f;
-		float hub_hover_x1 = 0.f;
-		float hub_hover_y1 = 0.f;
-		bool  hub_has_hover = false;
-		struct shell_hub_overflow_t {
-			const char* label;
-			center_view_t view;
-			bool active;
-		};
-		std::vector<shell_hub_overflow_t> hub_overflow;
-		auto shell_hub_log_click = [&](const char* source, const char* label, center_view_t view, bool blocked, ImVec2 rmin, ImVec2 rmax) {
-			diag::log_tagged_fmt("ui",
-				"shell_nav_click source=%s label='%s' target=%s blocked=%d rect=%.1f,%.1f,%.1f,%.1f before=%s",
-				source,
-				label,
-				center_view_name(view),
-				blocked ? 1 : 0,
-				rmin.x,
-				rmin.y,
-				rmax.x,
-				rmax.y,
-				center_view_name(globals::ui::active_center_view));
-		};
-		auto shell_hub_switch = [&](const char* source, const char* label, center_view_t view, bool blocked, ImVec2 rmin, ImVec2 rmax) {
-			shell_hub_log_click(source, label, view, blocked, rmin, rmax);
-			if (!blocked)
-				globals::ui::active_center_view = view;
-		};
-		const float hub_left_limit = hx0 + hdr_pad + aida::ui::scale_px(72.f, metrics.scale);
-
-		{
-			g_render_section = "title_hub_network";
-			bool net_is_active = (globals::ui::active_center_view == center_view_t::network_view);
-			const char* net_label = "Network";
-			ImVec2 nts = ImGui::CalcTextSize(net_label);
-			float ntw = 10.f * 2.f + nts.x;
-			float ntx0 = rbtn_x0 - ntw - 8.f;
-			float ntx1 = ntx0 + ntw;
-			float tab_h4 = row_h - 2.f;
-			float nty0 = r1_cy - tab_h4 * 0.5f;
-			float nty1 = nty0 + tab_h4;
-
-			if (ntx0 > hub_left_limit) {
-				ImVec2 saved_cursor = ImGui::GetCursorScreenPos();
-				ImVec2 nmin(ntx0, nty0);
-				ImVec2 nmax(ntx1, nty1);
-				ImGui::SetCursorScreenPos(nmin);
-				ImGui::InvisibleButton("##hub_network", ImVec2(ntx1 - ntx0, nty1 - nty0));
-				bool ntab_item_hov = ImGui::IsItemHovered();
-				bool ntab_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-				ImGui::SetCursorScreenPos(saved_cursor);
-				bool ntab_blocked = ui_input_gate::popup_blocks_background_input();
-				bool ntab_hov = ntab_item_hov && !ntab_blocked;
-
-				if (net_is_active) {
-					wdl->AddRectFilled(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1),
-						aida::ui::with_alpha(th_lp.selection_strong, 0.88f * a),
-						4.f, ImDrawFlags_RoundCornersAll);
-					wdl->AddLine(ImVec2(ntx0 + 1.f, nty0 + 0.5f), ImVec2(ntx1 - 1.f, nty0 + 0.5f),
-						aida::ui::with_alpha(th_lp.accent_u32, 0.5f * a), 1.f);
-					hub_active_x0 = ntx0; hub_active_x1 = ntx1; hub_active_y1 = nty1;
-					hub_has_active = true;
-				} else if (ntab_hov) {
-					wdl->AddRectFilled(ImVec2(ntx0, nty0), ImVec2(ntx1, nty1),
-						aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 4.f, ImDrawFlags_RoundCornersTop);
-					hub_hover_x0 = ntx0; hub_hover_x1 = ntx1; hub_hover_y1 = nty1;
-					hub_has_hover = true;
-				}
-
-				ImU32 ntab_col = net_is_active ? ac_full
-				               : aida::ui::with_alpha(th_lp.text_secondary, (ntab_hov ? 1.f : 0.78f)*a);
-				wdl->AddText(ImVec2(ntx0 + 10.f, nty0 + (tab_h4 - nts.y) * 0.5f),
-					ntab_col, net_label);
-
-				if (ntab_clicked)
-					shell_hub_switch("hub_tab", net_label, center_view_t::network_view, ntab_blocked, nmin, nmax);
-			} else {
-				hub_overflow.push_back({ net_label, center_view_t::network_view, net_is_active });
-			}
-		}
-
-
-		{
-			g_render_section = "title_hub_scan";
-			auto scv = globals::ui::active_center_view;
-			bool scan_is_active = (scv == center_view_t::scan_hub
-				|| scv == center_view_t::memory_scanner
-				|| scv == center_view_t::crypto_scanner
-				|| scv == center_view_t::aob_generator
-				|| scv == center_view_t::xref_browser
-				|| scv == center_view_t::snapshot_diff
-				|| scv == center_view_t::pointer_scanner
-				|| scv == center_view_t::decrypt_oracle
-				|| scv == center_view_t::integrity_hunter);
-			const char* scan_label = "Scan";
-			ImVec2 sts = ImGui::CalcTextSize(scan_label);
-			float stw = 10.f * 2.f + sts.x;
-
-			float net_tab_w = 10.f * 2.f + ImGui::CalcTextSize("Network").x;
-			float net_tab_x0 = rbtn_x0 - net_tab_w - 8.f;
-			float tab_h_s = row_h - 2.f;
-			float stx0 = net_tab_x0 - stw - 6.f;
-			float stx1 = stx0 + stw;
-			float sty0 = r1_cy - tab_h_s * 0.5f;
-			float sty1 = sty0 + tab_h_s;
-
-			if (stx0 > hub_left_limit) {
-				ImVec2 saved_cursor = ImGui::GetCursorScreenPos();
-				ImVec2 smin(stx0, sty0);
-				ImVec2 smax(stx1, sty1);
-				ImGui::SetCursorScreenPos(smin);
-				ImGui::InvisibleButton("##hub_scan", ImVec2(stx1 - stx0, sty1 - sty0));
-				bool stab_item_hov = ImGui::IsItemHovered();
-				bool stab_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-				ImGui::SetCursorScreenPos(saved_cursor);
-				bool stab_blocked = ui_input_gate::popup_blocks_background_input();
-				bool stab_hov = stab_item_hov && !stab_blocked;
-
-				if (scan_is_active) {
-					wdl->AddRectFilled(ImVec2(stx0, sty0), ImVec2(stx1, sty1),
-						aida::ui::with_alpha(th_lp.selection_strong, 0.88f * a),
-						4.f, ImDrawFlags_RoundCornersAll);
-					wdl->AddLine(ImVec2(stx0 + 1.f, sty0 + 0.5f), ImVec2(stx1 - 1.f, sty0 + 0.5f),
-						aida::ui::with_alpha(th_lp.accent_u32, 0.5f * a), 1.f);
-					hub_active_x0 = stx0; hub_active_x1 = stx1; hub_active_y1 = sty1;
-					hub_has_active = true;
-				} else if (stab_hov) {
-					wdl->AddRectFilled(ImVec2(stx0, sty0), ImVec2(stx1, sty1),
-						aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 4.f, ImDrawFlags_RoundCornersTop);
-					hub_hover_x0 = stx0; hub_hover_x1 = stx1; hub_hover_y1 = sty1;
-					hub_has_hover = true;
-				}
-
-				ImU32 stab_col = scan_is_active ? ac_full
-				               : aida::ui::with_alpha(th_lp.text_secondary, (stab_hov ? 1.f : 0.78f)*a);
-				wdl->AddText(ImVec2(stx0 + 10.f, sty0 + (tab_h_s - sts.y) * 0.5f),
-					stab_col, scan_label);
-
-				if (stab_clicked)
-					shell_hub_switch("hub_tab", scan_label, center_view_t::scan_hub, stab_blocked, smin, smax);
-			} else {
-				hub_overflow.push_back({ scan_label, center_view_t::scan_hub, scan_is_active });
-			}
-		}
-
-
-		float dtx0 = 0.f;
-		{
-			bool dbg_is_active = (globals::ui::active_center_view == center_view_t::debugger_view);
-			const char* dbg_label = "Debugger";
-			ImVec2 dts = ImGui::CalcTextSize(dbg_label);
-			float dtw = 10.f * 2.f + dts.x;
-
-			float net_tw = 10.f * 2.f + ImGui::CalcTextSize("Network").x;
-			float net_x0 = rbtn_x0 - net_tw - 8.f;
-			float scan_tw = 10.f * 2.f + ImGui::CalcTextSize("Scan").x;
-			float scan_x0 = net_x0 - scan_tw - 6.f;
-			float tab_h_d = row_h - 2.f;
-			dtx0 = scan_x0 - dtw - 6.f;
-			float dtx1 = dtx0 + dtw;
-			float dty0 = r1_cy - tab_h_d * 0.5f;
-			float dty1 = dty0 + tab_h_d;
-
-			if (dtx0 > hub_left_limit) {
-				ImVec2 saved_cursor = ImGui::GetCursorScreenPos();
-				ImVec2 dmin(dtx0, dty0);
-				ImVec2 dmax(dtx1, dty1);
-				ImGui::SetCursorScreenPos(dmin);
-				ImGui::InvisibleButton("##hub_debugger", ImVec2(dtx1 - dtx0, dty1 - dty0));
-				bool dtab_item_hov = ImGui::IsItemHovered();
-				bool dtab_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-				ImGui::SetCursorScreenPos(saved_cursor);
-				bool dtab_blocked = ui_input_gate::popup_blocks_background_input();
-				bool dtab_hov = dtab_item_hov && !dtab_blocked;
-
-				if (dbg_is_active) {
-					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
-						aida::ui::with_alpha(th_lp.selection_strong, 0.88f * a),
-						4.f, ImDrawFlags_RoundCornersAll);
-					wdl->AddLine(ImVec2(dtx0 + 1.f, dty0 + 0.5f), ImVec2(dtx1 - 1.f, dty0 + 0.5f),
-						aida::ui::with_alpha(th_lp.accent_u32, 0.5f * a), 1.f);
-					hub_active_x0 = dtx0; hub_active_x1 = dtx1; hub_active_y1 = dty1;
-					hub_has_active = true;
-				} else if (dtab_hov) {
-					wdl->AddRectFilled(ImVec2(dtx0, dty0), ImVec2(dtx1, dty1),
-						aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 4.f, ImDrawFlags_RoundCornersTop);
-					hub_hover_x0 = dtx0; hub_hover_x1 = dtx1; hub_hover_y1 = dty1;
-					hub_has_hover = true;
-				}
-
-				ImU32 dtab_col = dbg_is_active ? ac_full
-				               : aida::ui::with_alpha(th_lp.text_secondary, (dtab_hov ? 1.f : 0.78f)*a);
-				wdl->AddText(ImVec2(dtx0 + 10.f, dty0 + (tab_h_d - dts.y) * 0.5f),
-					dtab_col, dbg_label);
-
-				if (dtab_clicked)
-					shell_hub_switch("hub_tab", dbg_label, center_view_t::debugger_view, dtab_blocked, dmin, dmax);
-			} else {
-				hub_overflow.push_back({ dbg_label, center_view_t::debugger_view, dbg_is_active });
-			}
-		}
-
-
-		{
-			auto acv = globals::ui::active_center_view;
-
-			auto is_hub_active = [&](center_view_t hub) -> bool {
-				if (acv == hub) return true;
-				if (hub == center_view_t::types_hub)
-					return acv == center_view_t::struct_recon;
-				if (hub == center_view_t::analysis_hub)
-					return acv == center_view_t::symbolic_view
-						|| acv == center_view_t::taint_view
-						|| acv == center_view_t::deobfuscation_view
-						|| acv == center_view_t::stealth_view
-						|| acv == center_view_t::fuzzer_view;
-				return false;
-			};
-
-			auto add_right_tab = [&](const char* label, center_view_t view_id, float anchor_x0) {
-				bool is_active = (acv == view_id) || is_hub_active(view_id);
-				ImVec2 lsz = ImGui::CalcTextSize(label);
-				float tw = 10.f * 2.f + lsz.x;
-				float tx0 = anchor_x0 - tw - 4.f;
-				float tx1 = tx0 + tw;
-				float th = row_h - 2.f;
-				float ty0 = r1_cy - th * 0.5f;
-				float ty1 = ty0 + th;
-				if (tx0 > hub_left_limit) {
-					ImVec2 saved_cursor = ImGui::GetCursorScreenPos();
-					ImVec2 tmin(tx0, ty0);
-					ImVec2 tmax(tx1, ty1);
-					ImGui::SetCursorScreenPos(tmin);
-					ImGui::PushID(label);
-					ImGui::InvisibleButton("##hub_extra", ImVec2(tx1 - tx0, ty1 - ty0));
-					bool item_hov = ImGui::IsItemHovered();
-					bool item_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-					ImGui::PopID();
-					ImGui::SetCursorScreenPos(saved_cursor);
-					bool blocked = ui_input_gate::popup_blocks_background_input();
-					bool hov = item_hov && !blocked;
-					if (is_active) {
-						wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-							aida::ui::with_alpha(th_lp.selection_strong, 0.88f * a),
-							4.f, ImDrawFlags_RoundCornersAll);
-						wdl->AddLine(ImVec2(tx0 + 1.f, ty0 + 0.5f), ImVec2(tx1 - 1.f, ty0 + 0.5f),
-							aida::ui::with_alpha(th_lp.accent_u32, 0.5f * a), 1.f);
-						hub_active_x0 = tx0; hub_active_x1 = tx1; hub_active_y1 = ty1;
-						hub_has_active = true;
-					} else if (hov) {
-						wdl->AddRectFilled(ImVec2(tx0, ty0), ImVec2(tx1, ty1),
-							aida::ui::with_alpha(th_lp.hover_wash, 0.45f*a), 4.f, ImDrawFlags_RoundCornersTop);
-						hub_hover_x0 = tx0; hub_hover_x1 = tx1; hub_hover_y1 = ty1;
-						hub_has_hover = true;
-					}
-					ImU32 tc = is_active ? ac_full : aida::ui::with_alpha(th_lp.text_secondary, (hov ? 1.f : 0.78f)*a);
-					wdl->AddText(ImVec2(tx0 + 10.f, ty0 + (th - lsz.y) * 0.5f), tc, label);
-					if (item_clicked)
-						shell_hub_switch("hub_tab", label, view_id, blocked, tmin, tmax);
-				} else {
-					hub_overflow.push_back({ label, view_id, is_active });
-				}
-				return tx0;
-			};
-
-			float anchor = dtx0;
-			anchor = add_right_tab("Types",      center_view_t::types_hub, anchor);
-			anchor = add_right_tab("Analysis",   center_view_t::analysis_hub, anchor);
-			anchor = add_right_tab("Binary Map", center_view_t::binary_map, anchor);
-		}
-
-		if (!hub_overflow.empty()) {
-			const char* more_label = "More";
-			ImVec2 mts = ImGui::CalcTextSize(more_label);
-			float mtw = aida::ui::scale_px(20.f, metrics.scale) + mts.x;
-			float mth = row_h - 2.f;
-			float mtx0 = hx0 + hdr_pad + aida::ui::scale_px(4.f, metrics.scale);
-			float mty0 = r1_cy - mth * 0.5f;
-			float mtx1 = mtx0 + mtw;
-			float mty1 = mty0 + mth;
-			ImVec2 saved_cursor = ImGui::GetCursorScreenPos();
-			ImGui::SetCursorScreenPos(ImVec2(mtx0, mty0));
-			ImGui::InvisibleButton("##hub_more", ImVec2(mtw, mth));
-			bool more_hov = ImGui::IsItemHovered();
-			bool more_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-			ImGui::SetCursorScreenPos(saved_cursor);
-			if (more_hov) {
-				wdl->AddRectFilled(ImVec2(mtx0, mty0), ImVec2(mtx1, mty1),
-					aida::ui::with_alpha(th_lp.hover_wash, 0.55f*a), 4.f, ImDrawFlags_RoundCornersAll);
-			}
-			wdl->AddText(ImVec2(mtx0 + aida::ui::scale_px(10.f, metrics.scale), mty0 + (mth - mts.y) * 0.5f),
-				aida::ui::with_alpha(th_lp.text_secondary, (more_hov ? 1.f : 0.78f)*a), more_label);
-			if (more_clicked) {
-				shell_hub_log_click("hub_overflow_button", more_label, globals::ui::active_center_view, false,
-					ImVec2(mtx0, mty0), ImVec2(mtx1, mty1));
-				ImGui::OpenPopup("##hub_overflow_popup");
-			}
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			static std::uint64_t preview_hub_overflow_revision = 0;
-			if (aida::preview::controls().hub_overflow_open && preview_hub_overflow_revision != aida::preview::controls().revision) {
-				preview_hub_overflow_revision = aida::preview::controls().revision;
-				ImGui::OpenPopup("##hub_overflow_popup");
-			}
-#endif
-			ImGui::SetNextWindowPos(ImVec2(mtx0, mty1 + aida::ui::scale_px(4.f, metrics.scale)), ImGuiCond_Always);
-			if (ImGui::BeginPopup("##hub_overflow_popup",
-				ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-				ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
-				const float pop_w = aida::ui::scale_px(190.f, metrics.scale);
-				const float pop_row_h = (std::max)(aida::ui::scale_px(30.f, metrics.scale), ImGui::GetTextLineHeight() + aida::ui::scale_px(10.f, metrics.scale));
-				ImDrawList* pdl = ImGui::GetWindowDrawList();
-				const auto& th_pp = aida::ui::resolved();
-				for (size_t oi = 0; oi < hub_overflow.size(); ++oi) {
-					const auto& entry = hub_overflow[oi];
-					ImVec2 cp = ImGui::GetCursorScreenPos();
-					ImVec2 rmin(cp.x, cp.y);
-					ImVec2 rmax(cp.x + pop_w, cp.y + pop_row_h);
-					ImGui::PushID(static_cast<int>(oi));
-					ImGui::InvisibleButton("##hub_overflow_item", ImVec2(pop_w, pop_row_h));
-					bool rhov = ImGui::IsItemHovered();
-					bool rclicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-					ImGui::PopID();
-					if (entry.active) {
-						pdl->AddRectFilled(rmin, rmax,
-							aida::ui::with_alpha(th_pp.selection, 0.86f), 6.f);
-					} else if (rhov) {
-						pdl->AddRectFilled(rmin, rmax,
-							aida::ui::with_alpha(th_pp.hover_wash, 1.f), 6.f);
-					}
-					ImU32 row_col = entry.active ? ac_full : th_pp.text_primary;
-					pdl->PushClipRect(rmin, rmax, true);
-					pdl->AddText(ImVec2(rmin.x + aida::ui::scale_px(10.f, metrics.scale),
-						rmin.y + (pop_row_h - ImGui::GetTextLineHeight()) * 0.5f),
-						row_col, entry.label);
-					pdl->PopClipRect();
-					if (rclicked) {
-						shell_hub_switch("hub_overflow", entry.label, entry.view, false, rmin, rmax);
-						ImGui::CloseCurrentPopup();
-					}
-				}
-				ImGui::EndPopup();
-			}
-		}
-
-		{
-			ImGuiStorage* hub_st = ImGui::GetStateStorage();
-			ImGuiID hub_id_x   = ImGui::GetID("##hub_ul_x");
-			ImGuiID hub_id_w   = ImGui::GetID("##hub_ul_w");
-			ImGuiID hub_id_v   = ImGui::GetID("##hub_ul_v");
-			ImGuiID hub_id_y   = ImGui::GetID("##hub_ul_y");
-			ImGuiID hub_id_a   = ImGui::GetID("##hub_ul_a");
-			ImGuiID hub_id_init= ImGui::GetID("##hub_ul_init");
-
-			float hub_ul_x = hub_st->GetFloat(hub_id_x, 0.f);
-			float hub_ul_w = hub_st->GetFloat(hub_id_w, 0.f);
-			float hub_ul_v = hub_st->GetFloat(hub_id_v, 0.f);
-			float hub_ul_y = hub_st->GetFloat(hub_id_y, 0.f);
-			float hub_ul_a = hub_st->GetFloat(hub_id_a, 0.f);
-			bool  hub_init = hub_st->GetInt(hub_id_init, 0) != 0;
-
-			float target_x = hub_ul_x;
-			float target_w = hub_ul_w;
-			float target_y = hub_ul_y;
-			float target_a = 0.f;
-			if (hub_has_active) {
-				target_x = hub_active_x0 + 4.f;
-				target_w = (hub_active_x1 - hub_active_x0) - 8.f;
-				target_y = hub_active_y1;
-				target_a = 1.f;
-			}
-
-			if (!hub_init && hub_has_active) {
-				hub_ul_x = target_x;
-				hub_ul_w = target_w;
-				hub_ul_y = target_y;
-				hub_ul_a = target_a;
-				hub_init = true;
-			}
-
-			if (hub_has_active) {
-				hub_ul_x = aida::motion::spring_step(hub_ul_x, target_x, hub_ul_v,
-					aida::motion::spring::balanced, dt);
-				hub_ul_w = aida::motion::smooth_lerp(hub_ul_w, target_w, 16.f, dt);
-				hub_ul_y = aida::motion::smooth_lerp(hub_ul_y, target_y, 18.f, dt);
-				hub_ul_a = aida::motion::smooth_lerp(hub_ul_a, target_a, 12.f, dt);
-			} else {
-				hub_ul_a = aida::motion::smooth_lerp(hub_ul_a, 0.f, 10.f, dt);
-			}
-
-			hub_st->SetFloat(hub_id_x, hub_ul_x);
-			hub_st->SetFloat(hub_id_w, hub_ul_w);
-			hub_st->SetFloat(hub_id_v, hub_ul_v);
-			hub_st->SetFloat(hub_id_y, hub_ul_y);
-			hub_st->SetFloat(hub_id_a, hub_ul_a);
-			hub_st->SetInt(hub_id_init, hub_init ? 1 : 0);
-
-			if (hub_ul_w > 0.5f && hub_ul_a > 0.005f) {
-				ui_anim::render_tab_underline_glow(wdl, hub_ul_x, hub_ul_w,
-					hub_ul_y - 1.f, a * hub_ul_a);
-			}
-
-			ImGuiID hub_id_hx = ImGui::GetID("##hub_uh_x");
-			ImGuiID hub_id_hw = ImGui::GetID("##hub_uh_w");
-			ImGuiID hub_id_hy = ImGui::GetID("##hub_uh_y");
-			ImGuiID hub_id_ha = ImGui::GetID("##hub_uh_a");
-
-			bool show_hover_preview = hub_has_hover
-				&& (!hub_has_active
-					|| std::abs(hub_hover_x0 - hub_active_x0) > 0.5f);
-
-			if (show_hover_preview) {
-				const auto& th_hub2 = aida::ui::resolved();
-				float hub_uh_x = hub_st->GetFloat(hub_id_hx, hub_hover_x0 + 4.f);
-				float hub_uh_w = hub_st->GetFloat(hub_id_hw, (hub_hover_x1 - hub_hover_x0) - 8.f);
-				float hub_uh_y = hub_st->GetFloat(hub_id_hy, hub_hover_y1);
-				float hub_uh_a = hub_st->GetFloat(hub_id_ha, 0.f);
-
-				float th_x = hub_hover_x0 + 4.f;
-				float th_w = (hub_hover_x1 - hub_hover_x0) - 8.f;
-				float th_y = hub_hover_y1;
-
-				hub_uh_x = aida::motion::smooth_lerp(hub_uh_x, th_x, 22.f, dt);
-				hub_uh_w = aida::motion::smooth_lerp(hub_uh_w, th_w, 22.f, dt);
-				hub_uh_y = aida::motion::smooth_lerp(hub_uh_y, th_y, 22.f, dt);
-				hub_uh_a = aida::motion::smooth_lerp(hub_uh_a, 1.f, 14.f, dt);
-
-				hub_st->SetFloat(hub_id_hx, hub_uh_x);
-				hub_st->SetFloat(hub_id_hw, hub_uh_w);
-				hub_st->SetFloat(hub_id_hy, hub_uh_y);
-				hub_st->SetFloat(hub_id_ha, hub_uh_a);
-
-				if (hub_uh_w > 0.5f && hub_uh_a > 0.01f) {
-					ImU32 hov_col = aida::ui::with_alpha(th_hub2.accent_u32, a * hub_uh_a * 0.45f);
-					wdl->AddLine(
-						ImVec2(hub_uh_x, hub_uh_y),
-						ImVec2(hub_uh_x + hub_uh_w, hub_uh_y),
-						hov_col, 1.5f);
-				}
-			} else {
-				float hub_uh_a = hub_st->GetFloat(hub_id_ha, 0.f);
-				hub_uh_a = aida::motion::smooth_lerp(hub_uh_a, 0.f, 14.f, dt);
-				hub_st->SetFloat(hub_id_ha, hub_uh_a);
-			}
-		}
-
-		bool cf_clicked = ghost_btn("Choose File",
-			ImGui::GetID("##cfhv"), ImGui::GetID("##cffl"),
-			rbtn_x0, r1_cy, rbtn_w);
-
-		if (cf_clicked) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			aida::preview::apply_open_file();
-#else
-			anti_tamper::webhook::write_log("file_dialog", "chrome.choose_file_clicked invoking_open_file_dialog");
-			std::string fpath = disasm::open_file_dialog(g_hwnd);
-			if (fpath.empty()) {
-				anti_tamper::webhook::write_log("file_dialog", "chrome.choose_file cancelled_or_empty");
-				anti_tamper::webhook::write_log("chrome", "choose_file cancelled");
-			} else {
-				anti_tamper::webhook::write_log("file_dialog",
-					(std::string("chrome.choose_file path=") + fpath).c_str());
-				std::string fpath_copy = fpath;
-				const bool posted = aida::ui_thread::post([fpath_copy]() {
-					if (!aida::ui_thread::require_owner("analysis_session", "open_session", "choose_file"))
-						return;
-					bool ok = analysis_session::open_session(fpath_copy);
-					if (ok) {
-						char buf[600];
-						_snprintf_s(buf, sizeof(buf), _TRUNCATE,
-							"choose_file ok path=%s", fpath_copy.c_str());
-						anti_tamper::webhook::write_log("chrome", buf);
-					} else {
-						const char* err = analysis_session::last_error();
-						char buf[700];
-						_snprintf_s(buf, sizeof(buf), _TRUNCATE,
-							"choose_file failed path=%s err=%s",
-							fpath_copy.c_str(), err ? err : "(none)");
-						anti_tamper::webhook::write_log("chrome", buf);
-					}
-				}, "analysis_session", "open_session", "choose_file");
-				if (!posted) {
-					diag::log_tagged_critical_fmt("analysis_session",
-						"choose_file_dispatch_failed tid=%lu ui_tid=%lu path=%.260s",
-						static_cast<unsigned long>(aida::shell_platform::thread_id()),
-						static_cast<unsigned long>(aida::ui_thread::owner_tid()),
-						fpath_copy.c_str());
-				}
-			}
-#endif
-		}
-
-
-		if (file_tabs::active_tab >= 0 &&
-			static_cast<std::size_t>(file_tabs::active_tab) < file_tabs::tabs.size()) {
-			auto& sync_tab = file_tabs::tabs[static_cast<std::size_t>(file_tabs::active_tab)];
-			if (code_editor::active && sync_tab.filepath == code_editor::filepath)
-				sync_tab.dirty = code_editor::dirty;
-		}
+	if (!ide_surface) {
+		ImGui::PopStyleVar();
+		ImGui::End();
+		aida::ui::application_ui::process_global_shortcuts();
+		g_render_section = "done";
+		return;
 	}
-
-
-	{
-
-		if (active_workspace_context) {
-			bool is_hex_view = (globals::ui::active_center_view == center_view_t::hex_view);
-			const char* vt_label = is_hex_view ? "View Disassembly" : "View Hex";
-			float vtbtn_w = ImGui::CalcTextSize(vt_label).x + 22.f;
-			float vtbtn_x = rbtn_x0 - vtbtn_w - 8.f;
-
-			bool vt_clicked = ghost_btn(vt_label,
-				ImGui::GetID("##vthv2"), ImGui::GetID("##vtfl2"),
-				vtbtn_x, r2_cy, vtbtn_w);
-
-			if (vt_clicked) {
-				if (is_hex_view) {
-					globals::ui::active_center_view = center_view_t::disassembly;
-				} else {
-					globals::ui::active_center_view = center_view_t::hex_view;
-				}
-			}
-		}
-
-		bool run_clicked = ghost_btn("Run",
-			ImGui::GetID("##drhv"), ImGui::GetID("##drfl"),
-			rbtn_x0, r2_cy, rbtn_w);
-
-		static bool s_run_pick_open = false;
-		static bool s_run_confirm_open = false;
-		static int  s_run_pick_selected = -1;
-		static std::string s_run_confirm_path;
-		static std::string s_run_confirm_label;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		static std::uint64_t preview_run_revision = 0;
-		if (preview_run_revision != aida::preview::controls().revision) {
-			preview_run_revision = aida::preview::controls().revision;
-			s_run_pick_open = aida::preview::controls().run_picker_open;
-			s_run_confirm_open = aida::preview::controls().run_confirmation_open;
-			s_run_pick_selected = 0;
-			s_run_confirm_path = "C:/Preview/ReverseEngineering/samples/sample.exe";
-			s_run_confirm_label = "sample.exe";
-		}
-#endif
-
-		auto launch_session_path = [](const std::string& path) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			aida::preview::record(aida::preview::shell_action_t::run_target, path);
-			std::string cwd_v;
-			if (!path.empty()) {
-				size_t slash = path.find_last_of("\\/");
-				if (slash != std::string::npos) cwd_v = path.substr(0, slash);
-			}
-			spawn_target_dialog::request_open();
-			strncpy_s(spawn_target_dialog::detail::exe_buf(), 1024, path.c_str(), _TRUNCATE);
-			if (!cwd_v.empty())
-				strncpy_s(spawn_target_dialog::detail::cwd_buf(), 1024, cwd_v.c_str(), _TRUNCATE);
-			output_log::push(bottom_tab_t::sandbox_log,
-				std::string("[Preview] Opening launch choice dialog for: ") + path);
-#else
-			std::string cwd_v;
-			if (!path.empty()) {
-				size_t slash = path.find_last_of("\\/");
-				if (slash != std::string::npos) cwd_v = path.substr(0, slash);
-			}
-			spawn_target_dialog::request_open();
-			strncpy_s(spawn_target_dialog::detail::exe_buf(), 1024, path.c_str(), _TRUNCATE);
-			if (!cwd_v.empty()) {
-				strncpy_s(spawn_target_dialog::detail::cwd_buf(), 1024, cwd_v.c_str(), _TRUNCATE);
-			}
-			output_log::push(bottom_tab_t::sandbox_log,
-				std::string("[Run] Opening launch choice dialog for: ") + path);
-#endif
-		};
-
-		if (run_clicked) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			aida::preview::record(aida::preview::shell_action_t::run_target, "run_button");
-			const size_t sess_count = analysis_session::session_count();
-			if (sess_count > 1) {
-				s_run_pick_selected = static_cast<int>(analysis_session::active_session_idx());
-				if (s_run_pick_selected < 0 || s_run_pick_selected >= static_cast<int>(sess_count))
-					s_run_pick_selected = 0;
-				s_run_pick_open = true;
-			} else if (sess_count == 1) {
-				const auto sess = analysis_session::session_handle_at(0);
-				if (sess && !sess->path.empty())
-					launch_session_path(sess->path);
-				else
-					spawn_target_dialog::request_open();
-			} else {
-				spawn_target_dialog::request_open();
-			}
-#else
-			size_t sess_count = analysis_session::session_count();
-			uint32_t attached = driver_bridge::attached_pid();
-			char log_buf[256];
-
-			if (attached != 0) {
-				_snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
-					"run skipped reason=already_running attached_pid=%u sessions=%zu",
-					static_cast<unsigned>(attached), sess_count);
-				anti_tamper::webhook::write_log("chrome", log_buf);
-				output_log::push(bottom_tab_t::sandbox_log,
-					std::string("[Run] Skipped: a process is already attached (PID ")
-						+ std::to_string(attached) + ").");
-			} else if (sess_count > 1) {
-				s_run_pick_selected = static_cast<int>(analysis_session::active_session_idx());
-				if (s_run_pick_selected < 0 || s_run_pick_selected >= static_cast<int>(sess_count))
-					s_run_pick_selected = 0;
-				s_run_pick_open = true;
-				_snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
-					"run sessions=%zu choice=picker status=opened",
-					sess_count);
-				anti_tamper::webhook::write_log("chrome", log_buf);
-			} else if (sess_count == 1) {
-				const auto sess = analysis_session::session_handle_at(0);
-				if (sess && !sess->path.empty()) {
-					launch_session_path(sess->path);
-					_snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
-						"run sessions=1 choice=direct status=spawn_dialog path=%s",
-						sess->path.c_str());
-					anti_tamper::webhook::write_log("chrome", log_buf);
-				} else {
-					std::string prefill_exe;
-					if (active_workspace_context)
-						prefill_exe = active_workspace_context.workspace->identity().normalized_source_path();
-					if (!prefill_exe.empty()) {
-						launch_session_path(prefill_exe);
-					} else {
-						spawn_target_dialog::request_open();
-					}
-					_snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
-						"run sessions=1 choice=fallback status=dialog");
-					anti_tamper::webhook::write_log("chrome", log_buf);
-				}
-			} else {
-				std::string prefill_exe;
-			if (active_workspace_context) {
-					prefill_exe = active_workspace_context.workspace->identity().normalized_source_path();
-				} else if (code_editor::active && file_tabs::active_tab >= 0 &&
-					static_cast<std::size_t>(file_tabs::active_tab) < file_tabs::tabs.size()) {
-					auto& tab = file_tabs::tabs[
-						static_cast<std::size_t>(file_tabs::active_tab)];
-					prefill_exe = tab.filepath;
-				}
-				spawn_target_dialog::request_open();
-				if (!prefill_exe.empty()) {
-					strncpy_s(spawn_target_dialog::detail::exe_buf(), 1024,
-						prefill_exe.c_str(), _TRUNCATE);
-					size_t slash = prefill_exe.find_last_of("\\/");
-					if (slash != std::string::npos) {
-						std::string cwd_v = prefill_exe.substr(0, slash);
-						strncpy_s(spawn_target_dialog::detail::cwd_buf(), 1024,
-							cwd_v.c_str(), _TRUNCATE);
-					}
-				}
-				output_log::push(bottom_tab_t::sandbox_log,
-					prefill_exe.empty()
-						? std::string("[Run] Opening launch choice dialog (no file pre-fill).")
-						: std::string("[Run] Opening launch choice dialog for: ") + prefill_exe);
-				_snprintf_s(log_buf, sizeof(log_buf), _TRUNCATE,
-					"run sessions=0 choice=fallback status=dialog");
-				anti_tamper::webhook::write_log("chrome", log_buf);
-			}
-#endif
-		}
-
-		if (s_run_pick_open) {
-			ImGui::OpenPopup("##chrome_run_pick");
-			s_run_pick_open = false;
-		}
-		if (s_run_confirm_open) {
-			ImGui::OpenPopup("##chrome_run_confirm");
-			s_run_confirm_open = false;
-		}
-
-		{
-			g_render_section = "title_run_confirm_popup";
-			ImVec2 vp = ImGui::GetIO().DisplaySize;
-			ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, vp.y * 0.5f),
-				ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-			ImGui::SetNextWindowSize(ImVec2(440.f, 0.f), ImGuiCond_Appearing);
-			if (ImGui::BeginPopupModal("##chrome_run_confirm", nullptr,
-				ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-				ImGui::TextUnformatted("Open launch choice?");
-				ImGui::Separator();
-				ImGui::TextWrapped("Sample: %s", s_run_confirm_label.c_str());
-				ImGui::Spacing();
-				bool yes = aida::ui::components::button("Yes",
-					aida::ui::components::button_kind_t::primary,
-					aida::ui::components::size_t_::md, ImVec2(96.f, 26.f));
-				ImGui::SameLine();
-				bool no = aida::ui::components::button("Cancel",
-					aida::ui::components::button_kind_t::secondary,
-					aida::ui::components::size_t_::md, ImVec2(96.f, 26.f));
-				if (yes) {
-					std::string path = s_run_confirm_path;
-					launch_session_path(path);
-					char buf[600];
-					_snprintf_s(buf, sizeof(buf), _TRUNCATE,
-						"run sessions=1 choice=%s status=accepted",
-						s_run_confirm_label.c_str());
-					anti_tamper::webhook::write_log("chrome", buf);
-					s_run_confirm_path.clear();
-					s_run_confirm_label.clear();
-					ImGui::CloseCurrentPopup();
-				} else if (no || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-					anti_tamper::webhook::write_log("chrome", "run sessions=1 choice=cancel status=closed");
-					s_run_confirm_path.clear();
-					s_run_confirm_label.clear();
-					ImGui::CloseCurrentPopup();
-				}
-				ImGui::EndPopup();
-			}
-		}
-
-		{
-			g_render_section = "title_run_pick_popup";
-			ImVec2 vp = ImGui::GetIO().DisplaySize;
-			ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, vp.y * 0.5f),
-				ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-			ImGui::SetNextWindowSize(ImVec2(540.f, 0.f), ImGuiCond_Appearing);
-			if (ImGui::BeginPopupModal("##chrome_run_pick", nullptr,
-				ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-				ImGui::TextUnformatted("Which binary do you want to run?");
-				ImGui::Separator();
-				const unsigned long long run_pick_iter_t0 = aida::shell_platform::tick_ms();
-				size_t sess_count = analysis_session::session_count();
-				if (s_run_pick_selected >= static_cast<int>(sess_count))
-					s_run_pick_selected = static_cast<int>(sess_count) - 1;
-				if (s_run_pick_selected < 0 && sess_count > 0) s_run_pick_selected = 0;
-
-				ImGui::BeginChild("##chrome_run_pick_list",
-					ImVec2(520.f, std::min(360.f, std::max(80.f, static_cast<float>(sess_count) * 28.f + 16.f))),
-					true, ImGuiWindowFlags_None);
-				for (size_t i = 0; i < sess_count; ++i) {
-					const auto sess = analysis_session::session_handle_at(i);
-					if (!sess) continue;
-					std::string label = sess->filename.empty()
-						? (sess->path.empty() ? std::string("(unnamed)") : sess->path)
-						: sess->filename;
-					char tag[16];
-					if (sess->attached_pid != 0)
-						_snprintf_s(tag, sizeof(tag), _TRUNCATE, "[LIVE] ");
-					else
-						tag[0] = '\0';
-					std::string row = std::string(tag) + label;
-					ImGui::PushID(static_cast<int>(i));
-					if (ImGui::RadioButton(row.c_str(),
-						s_run_pick_selected == static_cast<int>(i))) {
-						s_run_pick_selected = static_cast<int>(i);
-					}
-					if (!sess->path.empty()) {
-						ImGui::SameLine();
-						ImGui::TextDisabled("  %s", sess->path.c_str());
-					}
-					ImGui::PopID();
-				}
-				ImGui::EndChild();
-				const unsigned long long run_pick_iter_elapsed = aida::shell_platform::tick_ms() - run_pick_iter_t0;
-				if (run_pick_iter_elapsed >= 50ULL) {
-					diag::log_tagged_critical_fmt("helpers",
-						"helpers_run_pick_session_iter_slow elapsed_ms=%llu count=%zu tid=%lu tick_ms=%llu",
-						run_pick_iter_elapsed,
-						sess_count,
-						static_cast<unsigned long>(aida::shell_platform::thread_id()),
-						static_cast<unsigned long long>(aida::shell_platform::tick_ms()));
-				}
-				ImGui::Spacing();
-				bool launch_btn = aida::ui::components::button("Continue",
-					aida::ui::components::button_kind_t::primary,
-					aida::ui::components::size_t_::md, ImVec2(110.f, 26.f));
-				ImGui::SameLine();
-				bool cancel_btn = aida::ui::components::button("Cancel",
-					aida::ui::components::button_kind_t::secondary,
-					aida::ui::components::size_t_::md, ImVec2(96.f, 26.f));
-
-				if (launch_btn && s_run_pick_selected >= 0 &&
-					s_run_pick_selected < static_cast<int>(sess_count)) {
-					const auto sess = analysis_session::session_handle_at(
-						static_cast<size_t>(s_run_pick_selected));
-					if (sess && !sess->path.empty()) {
-						std::string chosen_label = sess->filename.empty() ? sess->path : sess->filename;
-						launch_session_path(sess->path);
-						char buf[700];
-						_snprintf_s(buf, sizeof(buf), _TRUNCATE,
-							"run sessions=%zu choice=%s status=accepted",
-							sess_count, chosen_label.c_str());
-						anti_tamper::webhook::write_log("chrome", buf);
-					} else {
-						anti_tamper::webhook::write_log("chrome", "run sessions=N choice=invalid status=closed");
-					}
-					ImGui::CloseCurrentPopup();
-				} else if (cancel_btn || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-					char buf[256];
-					_snprintf_s(buf, sizeof(buf), _TRUNCATE,
-						"run sessions=%zu choice=cancel status=closed", sess_count);
-					anti_tamper::webhook::write_log("chrome", buf);
-					ImGui::CloseCurrentPopup();
-				}
-				ImGui::EndPopup();
-			}
-		}
-
-		g_render_section = "title_spawn_target_dialog";
-		const unsigned long long spawn_target_t0 = aida::shell_platform::tick_ms();
-		spawn_target_dialog::render();
-		const unsigned long long spawn_target_elapsed = aida::shell_platform::tick_ms() - spawn_target_t0;
-		if (spawn_target_elapsed >= 50ULL) {
-			diag::log_tagged_critical_fmt("helpers",
-				"helpers_spawn_target_render_slow elapsed_ms=%llu tid=%lu tick_ms=%llu",
-				spawn_target_elapsed,
-				static_cast<unsigned long>(aida::shell_platform::thread_id()),
-				static_cast<unsigned long long>(aida::shell_platform::tick_ms()));
-		}
-		g_render_section = "title_spawn_target_consume";
-		spawn_target_dialog::result_t spawn_res;
-		if (spawn_target_dialog::consume_result(spawn_res) && spawn_res.accepted) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-			const std::string exe = spawn_target_dialog::detail::narrow_utf8(spawn_res.exe_path.c_str());
-			aida::preview::record(aida::preview::shell_action_t::run_target,
-				exe.empty() ? "spawn_target_dialog" : exe);
-			output_log::push(bottom_tab_t::sandbox_log,
-				std::string("[Preview] Launch receipt accepted for ")
-					+ (exe.empty() ? std::string("target") : exe));
-			toast_notification::push(
-				std::string("Launch preview staged for ")
-					+ (exe.empty() ? std::string("target") : exe),
-				toast_notification::toast_type_t::success, 4.0f);
-#else
-			run_target::launch_options_t opts = spawn_res.launch_options;
-			opts.exe_path    = std::move(spawn_res.exe_path);
-			opts.args        = std::move(spawn_res.args);
-			opts.working_dir = std::move(spawn_res.working_dir);
-
-			std::string exe_log = [&]() {
-				if (opts.exe_path.empty()) return std::string("(empty)");
-				int n = WideCharToMultiByte(CP_UTF8, 0, opts.exe_path.c_str(), -1, nullptr, 0, nullptr, nullptr);
-				if (n <= 1) return std::string();
-				std::string out(static_cast<size_t>(n - 1), '\0');
-				WideCharToMultiByte(CP_UTF8, 0, opts.exe_path.c_str(), -1, out.data(), n, nullptr, nullptr);
-				return out;
-			}();
-			anti_tamper::webhook::write_log("run",
-				(std::string("launch_dispatch exe='") + exe_log
-				 + "' iso=" + std::to_string(static_cast<int>(opts.isolation))
-				 + " block_net=" + (opts.block_network ? "1" : "0")
-				 + " kill_on_exit=" + (opts.kill_on_host_exit ? "1" : "0")
-				 + " attach=" + (opts.attach_after_resume ? "1" : "0")).c_str());
-			const bool dispatch_vm = opts.isolation == run_target::isolation_t::windows_sandbox;
-			output_log::push(bottom_tab_t::sandbox_log,
-				std::string("[Run] Starting ") + (dispatch_vm ? "interactive VM" : "host launch")
-					+ " for " + exe_log
-					+ " iso=" + std::to_string(static_cast<int>(opts.isolation))
-					+ " block_net=" + (opts.block_network ? "1" : "0"));
-			toast_notification::push(
-				std::string(dispatch_vm ? "Starting malware lab VM for " : "Starting host run for ")
-					+ (exe_log.empty() ? std::string("target") : exe_log),
-				toast_notification::toast_type_t::info, 3.0f);
-
-			g_render_section = "title_spawn_target_post";
-			const auto submit_result = submit_helpers_executor_task(
-				"run_target",
-				"run_target.spawn_and_attach",
-				aida::infra::executor::domain_t::long_running,
-				"blocking_process_launch",
-				[opts, exe_log]() {
-				uint32_t new_pid = 0;
-				run_target::launch_result_t lr{};
-				bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, &lr);
-				std::wstring sandbox_dir_snapshot = lr.sandbox_dir;
-				if (opts.isolation == run_target::isolation_t::windows_sandbox) {
-					run_target::cleanup(lr);
-				} else if (lr.thread_handle != 0) {
-					CloseHandle(reinterpret_cast<HANDLE>(lr.thread_handle));
-					lr.thread_handle = 0;
-				}
-				if (!sandbox_dir_snapshot.empty()) {
-					spawn_target_dialog::detail::last_sandbox_dir() = sandbox_dir_snapshot;
-				}
-				if (!ok) {
-					const std::string& err = debugger_engine::last_error();
-					anti_tamper::webhook::write_log("run",
-						(std::string("launch_FAILED err='") + (err.empty() ? "no_detail" : err) + "'").c_str());
-					output_log::push(bottom_tab_t::sandbox_log,
-						std::string("[Run] Launch failed: ")
-							+ (err.empty() ? "(no detail)" : err));
-					toast_notification::push(
-						std::string("Run failed: ") + (err.empty() ? std::string("no detail") : err),
-						toast_notification::toast_type_t::error, 5.0f);
-				} else if (opts.isolation == run_target::isolation_t::windows_sandbox) {
-					anti_tamper::webhook::write_log("run",
-						"launch_ok windows_sandbox_session_started");
-					output_log::push(bottom_tab_t::sandbox_log,
-						"[Run] Interactive Windows Sandbox VM launched.");
-					toast_notification::push("Malware lab VM started",
-						toast_notification::toast_type_t::success, 4.0f);
-				} else {
-					char line[160];
-					std::snprintf(line, sizeof(line),
-						"[Run] Host launch started pid=%u iso=%d.",
-						static_cast<unsigned>(new_pid),
-						static_cast<int>(opts.isolation));
-					output_log::push(bottom_tab_t::sandbox_log, line);
-					anti_tamper::webhook::write_log("run",
-						(std::string("launch_ok_host pid=") + std::to_string(static_cast<unsigned>(new_pid))
-						 + " iso=" + std::to_string(static_cast<int>(opts.isolation))
-						 + " exe='" + exe_log + "'").c_str());
-					toast_notification::push("Host launch started",
-						toast_notification::toast_type_t::success, 4.0f);
-				}
-			});
-			if (!submit_result.submitted) {
-				anti_tamper::webhook::write_log("run", "launch_dispatch_rejected executor_submit_failed");
-				output_log::push(bottom_tab_t::sandbox_log, "[Run] Launch failed: executor rejected run target task.");
-				toast_notification::push("Run failed: launch task rejected", toast_notification::toast_type_t::error, 5.0f);
-			}
-#endif
-		}
-	}
-
-
-	float disasm_child_y = content_top + hdr_h + 1.f;
-	float disasm_child_h = total_h - hdr_h - 1.f;
-	const float di_pad   = 6.f;
-	const float session_tabs_h = 32.f;
-	float center_content_w = (std::max)(center_w - di_pad * 2.f, 1.f);
-	float center_content_h = (std::max)(disasm_child_h - di_pad * 2.f - session_tabs_h, 1.f);
-	g_render_section = "title_session_tabs";
-	{
-		ImVec2 wpos = ImGui::GetWindowPos();
-		float tabs_screen_x = wpos.x + pad + di_pad;
-		float tabs_screen_y = wpos.y + disasm_child_y + di_pad;
-		float tabs_w = center_content_w;
-		render_session_tabs(tabs_screen_x, tabs_screen_y, tabs_w, session_tabs_h, a);
-	}
-	g_render_section = "title_pre_center_pump";
-	ImGui::SetCursorPos(ImVec2(pad + di_pad, disasm_child_y + di_pad + session_tabs_h));
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f,0.f));
-	ImGui::BeginChild("##center_content_scroll",
-		ImVec2(center_content_w, center_content_h),
-		false, ImGuiWindowFlags_NoBackground);
-	{
-
-
-	mark_center_render_section("center_ui_dispatcher_drain", globals::ui::active_center_view, false, center_content_w, center_content_h);
-	static std::atomic<unsigned long long> s_last_pump_jobs_log_ms{0};
-	const unsigned long long ui_jobs_start_ms = aida::shell_platform::tick_ms();
-	unsigned long long last_pump_jobs_log_ms = s_last_pump_jobs_log_ms.load(std::memory_order_acquire);
-	const bool full_test_active_for_pump_log = shell_full_test_running();
-	const unsigned long long pump_log_interval_ms = full_test_active_for_pump_log ? 1000ULL : 30000ULL;
-	const bool log_pump_jobs = ui_jobs_start_ms - last_pump_jobs_log_ms >= pump_log_interval_ms &&
-		s_last_pump_jobs_log_ms.compare_exchange_strong(last_pump_jobs_log_ms, ui_jobs_start_ms, std::memory_order_acq_rel);
-	char ui_phase_before[900] = {};
-	if (log_pump_jobs)
-		format_shell_ui_phase_snapshot(ui_phase_before, sizeof(ui_phase_before));
-	if (log_pump_jobs) {
-		diag::log_tagged_critical_fmt("render_center",
-			"ui_dispatcher_drain_enter view=%s view_id=%d frame=%d tid=%lu stats={%.760s}",
-			center_view_name(globals::ui::active_center_view),
-			static_cast<int>(globals::ui::active_center_view),
-			ImGui::GetFrameCount(),
-			static_cast<unsigned long>(aida::shell_platform::thread_id()),
-			ui_phase_before[0] ? ui_phase_before : "<not-sampled>");
-	}
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	const std::uint32_t ui_dispatch_drained = 0;
-#else
-	const std::uint32_t ui_dispatch_drained = aida::ui_thread::drain(8, 1, "center_content");
-#endif
-	const unsigned long long ui_jobs_wall_ms = aida::shell_platform::tick_ms() - ui_jobs_start_ms;
-	const bool slow_pump_jobs = ui_jobs_wall_ms >= (full_test_active_for_pump_log ? 8ULL : 32ULL);
-	if (log_pump_jobs || slow_pump_jobs) {
-		char ui_phase_after[900] = {};
-		format_shell_ui_phase_snapshot(ui_phase_after, sizeof(ui_phase_after));
-		diag::log_tagged_critical_fmt("render_center",
-			"ui_dispatcher_drain_exit view=%s view_id=%d drained=%u wall_ms=%llu slow=%d frame=%d tid=%lu before={%.760s} after={%.760s}",
-			center_view_name(globals::ui::active_center_view),
-			static_cast<int>(globals::ui::active_center_view),
-			static_cast<unsigned>(ui_dispatch_drained),
-			static_cast<unsigned long long>(ui_jobs_wall_ms),
-			slow_pump_jobs ? 1 : 0,
-			ImGui::GetFrameCount(),
-			static_cast<unsigned long>(aida::shell_platform::thread_id()),
-			ui_phase_before[0] ? ui_phase_before : "<not-sampled>",
-			ui_phase_after[0] ? ui_phase_after : "<empty>");
-	}
-	g_render_section = "center_resolve_view";
-	auto cv = globals::ui::active_center_view;
-
-	bool overlay_blocking = loading_binary_overlay::is_blocking_views();
-	if (overlay_blocking) {
-		cv = center_view_t::welcome;
-	}
-	if (cv == center_view_t::workbench &&
-		(!active_workspace_handle ||
-		 active_workspace_handle->identity().target_kind() !=
-			aida::analysis::target_kind_t::static_file)) {
-		cv = active_workspace_context
-			? center_view_t::disassembly : center_view_t::welcome;
-		globals::ui::active_center_view = cv;
-	}
-
-	if (cv == center_view_t::welcome && !overlay_blocking) {
-		if (code_editor::active && !code_editor::buffer.empty())
-			cv = center_view_t::code_editor;
-		else if (active_workspace_handle &&
-			active_workspace_handle->identity().target_kind() ==
-				aida::analysis::target_kind_t::static_file)
-			cv = center_view_t::workbench;
-		else if (active_workspace_context)
-			cv = center_view_t::disassembly;
-		else if (hex_view::active(active_workspace_context))
-			cv = center_view_t::hex_view;
-	}
-	if (!overlay_blocking && active_workspace_handle) {
-		const auto kind = workbench_document_kind(cv);
-		if (kind) {
-			aida::workbench::workbench_shell_workspace_context_t workbench_context;
-			const auto activated =
-				aida::workbench::workbench_shell_runtime_t::instance()
-					.activate_document(active_workspace_handle, *kind,
-						std::nullopt, workbench_context);
-			if (!activated) {
-				static unsigned long long last_failure_ms = 0;
-				const auto now_ms = aida::shell_platform::tick_ms();
-				if (now_ms - last_failure_ms >= 5000ULL) {
-					last_failure_ms = now_ms;
-					diag::log_tagged_fmt(
-						"workbench_shell",
-						"ui_activate_deferred view=%s code=%u subject=%llu",
-						center_view_name(cv),
-						static_cast<unsigned>(activated.code),
-						static_cast<unsigned long long>(activated.subject));
-				}
-			}
-		}
-	}
-
-	float vw = center_content_w;
-	float vh = center_content_h;
-	const unsigned long long center_dispatch_start_ms = aida::shell_platform::tick_ms();
-	auto log_center_dispatch_exit = [&](const char* section) {
-		const unsigned long long now_ms = aida::shell_platform::tick_ms();
-		const unsigned long long elapsed_ms = now_ms >= center_dispatch_start_ms ? now_ms - center_dispatch_start_ms : 0ULL;
-		if (elapsed_ms >= 250ULL) {
-			diag::log_tagged_critical_fmt("render_center",
-				"slow_exit section=%s view=%s view_id=%d elapsed_ms=%llu overlay=%d full_test=%d frame=%d",
-				section ? section : "<null>",
-				center_view_name(cv),
-				static_cast<int>(cv),
-				elapsed_ms,
-				overlay_blocking ? 1 : 0,
-				shell_full_test_running() ? 1 : 0,
-				ImGui::GetFrameCount());
-		}
-	};
-
-	if (cv == center_view_t::workbench && active_workspace_handle &&
-		active_workspace_handle->identity().target_kind() ==
-			aida::analysis::target_kind_t::static_file)
-	{
-		mark_center_render_section("center_view_workbench", cv, overlay_blocking, vw, vh);
-		render_analysis_workbench(active_workspace_handle, vw, vh);
-		log_center_dispatch_exit("center_view_workbench");
-	}
-
-	else if (cv == center_view_t::code_editor && code_editor::active && !code_editor::buffer.empty())
-	{
-		mark_center_render_section("center_view_code_editor", cv, overlay_blocking, vw, vh);
-		ImGui::SetCursorPos(ImVec2(0.f, 0.f));
-		code_editor_widget::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-		log_center_dispatch_exit("center_view_code_editor");
-	}
-
-
-	else if (cv == center_view_t::hex_view && active_workspace_context)
-	{
-		mark_center_render_section("center_view_hex_view", cv, overlay_blocking, vw, vh);
-		hex_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, active_workspace_context);
-		log_center_dispatch_exit("center_view_hex_view");
-	}
-
-	else if (cv == center_view_t::image_view && image_view::g_state().active.load(std::memory_order_acquire))
-	{
-		mark_center_render_section("center_view_image_view", cv, overlay_blocking, vw, vh);
-		image_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-		log_center_dispatch_exit("center_view_image_view");
-	}
-
-	else if (cv == center_view_t::disassembly && active_workspace_context)
-	{
-		mark_center_render_section("center_view_disassembly", cv, overlay_blocking, vw, vh);
-		disasm_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, active_workspace_context, dt);
-		log_center_dispatch_exit("center_view_disassembly");
-	}
-
-	else if (cv == center_view_t::graph_view)
-	{
-		mark_center_render_section("center_view_graph_view", cv, overlay_blocking, vw, vh);
-		ImVec2 wp = ImGui::GetWindowPos();
-		cfg_view::render(wp.x, wp.y, vw, vh, a, ax3, ay3, az3, active_workspace_context);
-		log_center_dispatch_exit("center_view_graph_view");
-	}
-
-	else if (cv == center_view_t::network_view)
-	{
-		mark_center_render_section("center_view_network_view", cv, overlay_blocking, vw, vh);
-		network_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-		log_center_dispatch_exit("center_view_network_view");
-	}
-
-	else if (cv == center_view_t::debugger_view)
-	{
-		mark_center_render_section("center_view_debugger_view", cv, overlay_blocking, vw, vh);
-		debugger_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-		log_center_dispatch_exit("center_view_debugger_view");
-	}
-
-	else if (cv == center_view_t::pseudocode)
-	{
-		mark_center_render_section("center_view_pseudocode", cv, overlay_blocking, vw, vh);
-		pseudocode_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3, active_workspace_context);
-		log_center_dispatch_exit("center_view_pseudocode");
-	}
-
-	else if (cv == center_view_t::scan_hub || cv == center_view_t::memory_scanner
-		|| cv == center_view_t::crypto_scanner || cv == center_view_t::aob_generator
-		|| cv == center_view_t::xref_browser || cv == center_view_t::snapshot_diff
-		|| cv == center_view_t::pointer_scanner || cv == center_view_t::decrypt_oracle
-		|| cv == center_view_t::integrity_hunter)
-	{
-		mark_center_render_section("center_view_scan_hub", cv, overlay_blocking, vw, vh);
-		scan_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-		log_center_dispatch_exit("center_view_scan_hub");
-	}
-
-	else if (cv == center_view_t::types_hub || cv == center_view_t::struct_recon)
-	{
-		mark_center_render_section("center_view_types_hub", cv, overlay_blocking, vw, vh);
-		types_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3);
-		log_center_dispatch_exit("center_view_types_hub");
-	}
-
-	else if (cv == center_view_t::analysis_hub || cv == center_view_t::symbolic_view
-		|| cv == center_view_t::taint_view || cv == center_view_t::deobfuscation_view
-		|| cv == center_view_t::stealth_view || cv == center_view_t::fuzzer_view)
-	{
-		mark_center_render_section("center_view_analysis_hub", cv, overlay_blocking, vw, vh);
-		analysis_hub_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3,
-			active_workspace_context);
-		log_center_dispatch_exit("center_view_analysis_hub");
-	}
-
-	else if (cv == center_view_t::binary_map)
-	{
-		mark_center_render_section("center_view_binary_map", cv, overlay_blocking, vw, vh);
-		aida::binary_map_view::render(0, 0, vw, vh, a, ax3, ay3, az3,
-			active_workspace_context);
-		log_center_dispatch_exit("center_view_binary_map");
-	}
-
-	else if (cv == center_view_t::functions_panel)
-	{
-		mark_center_render_section("center_view_functions_panel", cv, overlay_blocking, vw, vh);
-		functions_panel::render(0.f, 0.f, vw, vh);
-		log_center_dispatch_exit("center_view_functions_panel");
-	}
-
-	else if (cv == center_view_t::xref_database)
-	{
-		mark_center_render_section("center_view_xref_database", cv, overlay_blocking, vw, vh);
-		xref_db_view::render(0.f, 0.f, vw, vh, a, ax3, ay3, az3,
-			active_workspace_context);
-		log_center_dispatch_exit("center_view_xref_database");
-	}
-
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	else if (cv == center_view_t::test_lab)
-	{
-		mark_center_render_section("center_view_test_lab", cv, overlay_blocking, vw, vh);
-		static float s_test_lab_anim_time = 0.f;
-		s_test_lab_anim_time += ImGui::GetIO().DeltaTime;
-		test_lab_view::render(vw, vh, s_test_lab_anim_time);
-		log_center_dispatch_exit("center_view_test_lab");
-	}
-#endif
-
-	else
-	{
-		mark_center_render_section("center_view_empty_state", cv, overlay_blocking, vw, vh);
-
-		ImDrawList* cdl  = ImGui::GetWindowDrawList();
-		ImVec2      orig = ImGui::GetWindowPos();
-
-		if (!overlay_blocking) {
-			std::string hint_text = "Choose a file to begin";
-			if (active_workspace_context.progress.error)
-				hint_text = active_workspace_context.progress.error->stable_code() + ": " +
-					active_workspace_context.progress.error->message;
-			else if (active_workspace_context)
-				hint_text = "Click 'Run' to choose VM or host launch";
-			const char* hint = hint_text.c_str();
-			ImVec2 ht2 = ImGui::CalcTextSize(hint);
-			float  window_h = ImGui::GetWindowHeight();
-			cdl->AddText(ImVec2(orig.x + vw*0.5f - ht2.x*0.5f, orig.y + window_h * 0.5f - ht2.y*0.5f),
-				aida::ui::with_alpha(th_lp.text_dim, 0.7f*a), hint);
-		}
-		log_center_dispatch_exit("center_view_empty_state");
-	}
-
-	}
-	ImGui::EndChild();
 	ImGui::PopStyleVar();
+	aida::ui::ide_shell::end_global_chrome_surface();
+	aida::ui::ide_shell::render_primary_surfaces();
+	debugger_view::render_global_target_dialog();
+	g_render_section = "popups_workspace_management";
+	render_workspace_dialogs();
 
 	g_render_section = "file_tabs_popup";
 	{
+		if (file_tabs::pending_close_after_save_document_id != 0)
+			file_tabs::resolve_pending_close_after_save();
+		else if (!file_tabs::pending_close_all_document_ids.empty())
+			file_tabs::advance_close_all();
 		bool popup_active = (file_tabs::pending_close_idx >= 0);
 
 
@@ -8305,7 +6040,7 @@ void helpers::render_title()
 					IM_COL32(0, 0, 0, static_cast<int>(120.f * anim)));
 
 
-			float pw = 380.f, ph = 150.f;
+			float pw = 420.f, ph = file_tabs::close_confirm_error.empty() ? 150.f : 174.f;
 			float scale = 0.92f + 0.08f * anim;
 			float sw = pw * scale, sh = ph * scale;
 			float px = display.x * 0.5f - sw * 0.5f;
@@ -8326,9 +6061,9 @@ void helpers::render_title()
 			float ay3 = globals::ui::accent.y;
 			float az3 = globals::ui::accent.z;
 			fdl->AddRectFilled(ImVec2(px, py), ImVec2(px + sw, py + sh),
-				aida::ui::with_alpha(th_lp.bg_elevated, 0.96f * popup_alpha), 12.f);
+				aida::ui::with_alpha(shell_theme.bg_elevated, 0.96f * popup_alpha), 12.f);
 			fdl->AddRect(ImVec2(px, py), ImVec2(px + sw, py + sh),
-				aida::ui::with_alpha(th_lp.border_strong, popup_alpha), 12.f);
+				aida::ui::with_alpha(shell_theme.border_strong, popup_alpha), 12.f);
 
 
 			fdl->AddRectFilled(ImVec2(px + 1.f, py + 1.f), ImVec2(px + sw - 1.f, py + 3.f),
@@ -8343,16 +6078,23 @@ void helpers::render_title()
 			std::string title = "Unsaved Changes";
 			ImVec2 tts = ImGui::CalcTextSize(title.c_str());
 			fdl->AddText(ImVec2(px + sw * 0.5f - tts.x * 0.5f, py + 18.f),
-				aida::ui::with_alpha(th_lp.text_primary, popup_alpha), title.c_str());
+				aida::ui::with_alpha(shell_theme.text_primary, popup_alpha), title.c_str());
 
 			std::string msg = "Do you want to save '" + fname + "'?";
 			ImVec2 mts = ImGui::CalcTextSize(msg.c_str());
 			fdl->AddText(ImVec2(px + sw * 0.5f - mts.x * 0.5f, py + 46.f),
-				aida::ui::with_alpha(th_lp.text_secondary, popup_alpha), msg.c_str());
+				aida::ui::with_alpha(shell_theme.text_secondary, popup_alpha), msg.c_str());
+			if (!file_tabs::close_confirm_error.empty()) {
+				const std::string detail = file_tabs::close_confirm_error;
+				const ImVec2 detail_size = ImGui::CalcTextSize(detail.c_str());
+				fdl->AddText(ImVec2(px + sw * 0.5f - detail_size.x * 0.5f, py + 67.f),
+					aida::ui::with_alpha(shell_theme.error, popup_alpha), detail.c_str());
+			}
 
 
-			fdl->AddLine(ImVec2(px + 20.f, py + 76.f), ImVec2(px + sw - 20.f, py + 76.f),
-				aida::ui::with_alpha(th_lp.border_subtle, popup_alpha));
+			const float content_offset = file_tabs::close_confirm_error.empty() ? 0.f : 24.f;
+			fdl->AddLine(ImVec2(px + 20.f, py + 76.f + content_offset), ImVec2(px + sw - 20.f, py + 76.f + content_offset),
+				aida::ui::with_alpha(shell_theme.border_subtle, popup_alpha));
 
 
 			ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
@@ -8363,17 +6105,17 @@ void helpers::render_title()
 				 IM_COL32((int)(ax3*180), (int)(ay3*180), (int)(az3*180), (int)(60 * popup_alpha)),
 				 IM_COL32((int)(ax3*220), (int)(ay3*220), (int)(az3*220), (int)(100 * popup_alpha))},
 				{"Don't Save",  100.f,
-				 aida::ui::with_alpha(th_lp.error, 0.16f * popup_alpha),
-				 aida::ui::with_alpha(th_lp.error, 0.32f * popup_alpha)},
+				 aida::ui::with_alpha(shell_theme.error, 0.16f * popup_alpha),
+				 aida::ui::with_alpha(shell_theme.error, 0.32f * popup_alpha)},
 				{"Cancel",      90.f,
-				 aida::ui::with_alpha(th_lp.panel_header, 0.85f * popup_alpha),
-				 aida::ui::with_alpha(th_lp.border_strong, popup_alpha)},
+				 aida::ui::with_alpha(shell_theme.panel_header, 0.85f * popup_alpha),
+				 aida::ui::with_alpha(shell_theme.border_strong, popup_alpha)},
 			};
 
 			float btn_h = 34.f;
 			float total_btn_w = buttons[0].w + buttons[1].w + buttons[2].w + 16.f;
 			float bx = px + sw * 0.5f - total_btn_w * 0.5f;
-			float by = py + 90.f;
+			float by = py + 90.f + content_offset;
 
 			ImVec2 mpos = ImGui::GetIO().MousePos;
 			bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
@@ -8391,14 +6133,14 @@ void helpers::render_title()
 
 				if (hov) {
 					fdl->AddRect(ImVec2(bx0, by0), ImVec2(bx1, by1),
-						aida::ui::with_alpha(th_lp.border_strong, popup_alpha), 8.f);
+						aida::ui::with_alpha(shell_theme.border_strong, popup_alpha), 8.f);
 				}
 
 				ImVec2 bts = ImGui::CalcTextSize(buttons[bi].label);
 				float tx = bx0 + (buttons[bi].w - bts.x) * 0.5f;
 				float ty = by0 + (btn_h - bts.y) * 0.5f;
 				fdl->AddText(ImVec2(tx, ty),
-					aida::ui::with_alpha(th_lp.text_primary, (hov ? 1.f : 0.8f) * popup_alpha),
+					aida::ui::with_alpha(shell_theme.text_primary, (hov ? 1.f : 0.8f) * popup_alpha),
 					buttons[bi].label);
 
 				if (hov && clicked) action = bi;
@@ -8406,15 +6148,39 @@ void helpers::render_title()
 			}
 
 			if (action == 0) {
-				if (ci >= 0 && ci < (int)file_tabs::tabs.size())
-					file_tabs::save_tab_to_disk(ci);
-				file_tabs::close_tab(ci);
-				file_tabs::pending_close_idx = -1;
+				const std::uint64_t closing_document = file_tabs::is_valid_tab_index(ci)
+					? file_tabs::tabs[file_tabs::tab_index(ci)].document_id : 0;
+				file_tabs::save_result_t saved{false, "The document is no longer open."};
+				if (file_tabs::is_valid_tab_index(ci))
+					saved = file_tabs::tabs[file_tabs::tab_index(ci)].filepath.empty()
+						? save_document_as(ci)
+						: file_tabs::save_tab_to_disk_result(ci);
+				if (saved.succeeded) {
+					file_tabs::pending_close_idx = -1;
+					file_tabs::close_confirm_error.clear();
+					if (file_tabs::is_valid_tab_index(ci) &&
+						file_tabs::tabs[file_tabs::tab_index(ci)].save_in_progress) {
+						file_tabs::pending_close_after_save_document_id = closing_document;
+					} else {
+						file_tabs::close_tab(ci);
+						file_tabs::finish_close_all_document(closing_document);
+						file_tabs::advance_close_all();
+					}
+				} else {
+					file_tabs::close_confirm_error = saved.detail;
+				}
 			} else if (action == 1) {
-				file_tabs::close_tab(ci);
+				const std::uint64_t closing_document = file_tabs::is_valid_tab_index(ci)
+					? file_tabs::tabs[file_tabs::tab_index(ci)].document_id : 0;
+				file_tabs::close_tab(ci, true);
 				file_tabs::pending_close_idx = -1;
+				file_tabs::close_confirm_error.clear();
+				file_tabs::finish_close_all_document(closing_document);
+				file_tabs::advance_close_all();
 			} else if (action == 2) {
 				file_tabs::pending_close_idx = -1;
+				file_tabs::close_confirm_error.clear();
+				file_tabs::cancel_close_all();
 			}
 
 
@@ -8831,8 +6597,9 @@ void helpers::render_title()
 								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
 							diag::log_tagged_critical_fmt("attach", "phase=workspace_snapshot_ready pid=%u base=0x%llX size=0x%llX mod=%s",
 								p.pid, (unsigned long long)target_mod->base, (unsigned long long)mod_size, target_mod->name.c_str());
-							globals::ui::active_center_view = center_view_t::disassembly;
-							diag::log_tagged_critical("attach", "phase=post_set_center_view");
+							static_cast<void>(aida::ui::application_views::open_or_focus(
+								aida::ui::stable_view_id_t("document.disassembly")));
+							diag::log_tagged_critical("attach", "phase=post_focus_disassembly");
 						} else {
 							output_log::push(bottom_tab_t::output,
 								"[Driver] Attached to PID " + std::to_string(p.pid) + " but could not enumerate modules.\n");
@@ -9137,6 +6904,12 @@ void helpers::render_title()
 	static bool kb_closing = false;
 	static char kb_filter_buf[128] = {0};
 	static bool kb_was_open = false;
+	static std::string kb_edit_binding;
+	static std::string kb_edit_label;
+	static std::vector<ImGuiKeyChord> kb_edit_strokes;
+	static std::vector<std::string> kb_edit_conflicts;
+	static std::string kb_edit_status;
+	static bool kb_reset_all_armed = false;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	static std::uint64_t preview_shortcuts_revision = 0;
 	if (preview_shortcuts_revision != aida::preview::controls().revision) {
@@ -9159,6 +6932,12 @@ void helpers::render_title()
 		bool now_open = globals::ui::shortcuts_dialog_open;
 		if (now_open && !kb_was_open) {
 			kb_filter_buf[0] = '\0';
+			kb_edit_binding.clear();
+			kb_edit_label.clear();
+			kb_edit_strokes.clear();
+			kb_edit_conflicts.clear();
+			kb_edit_status.clear();
+			kb_reset_all_armed = false;
 			anti_tamper::webhook::write_log("chrome", "shortcuts_popup open=true");
 		} else if (!now_open && kb_was_open) {
 			anti_tamper::webhook::write_log("chrome", "shortcuts_popup open=false");
@@ -9172,6 +6951,9 @@ void helpers::render_title()
 			kb_anim = 0.f;
 		}
 	}
+	aida::ui::application_ui::set_shortcut_capture_active(
+		(globals::ui::shortcuts_dialog_open && !kb_edit_binding.empty()) ||
+		workspace_dialog_state().save_as_open || workspace_dialog_state().manager_open);
 
 	g_render_section = "popups_shortcuts";
 	if (globals::ui::shortcuts_dialog_open || kb_anim > 0.005f) {
@@ -9179,13 +6961,23 @@ void helpers::render_title()
 
 		ImVec2 vp = ImGui::GetIO().DisplaySize;
 
-		float pw = 640.f, ph = 540.f;
+		float pw = (std::min)(760.f, (std::max)(480.f, vp.x - 40.f));
+		float ph = (std::min)(620.f, (std::max)(420.f, vp.y - 40.f));
 		float kb_scale = 0.96f + 0.04f * kb_anim;
 		float sw = pw * kb_scale, sh = ph * kb_scale;
 		float px = (vp.x - sw) * 0.5f, py = (vp.y - sh) * 0.5f;
 
-		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !kb_closing)
-			kb_closing = true;
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !kb_closing) {
+			if (!kb_edit_binding.empty()) {
+				kb_edit_binding.clear();
+				kb_edit_label.clear();
+				kb_edit_strokes.clear();
+				kb_edit_conflicts.clear();
+				kb_edit_status = "Edit cancelled";
+			} else {
+				kb_closing = true;
+			}
+		}
 
 		if (ImGui::GetFrameCount() > kb_open_frame + 1 && !kb_closing &&
 			ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -9257,6 +7049,135 @@ void helpers::render_title()
 				"##kb_filter", kb_filter_buf, sizeof(kb_filter_buf),
 				"Search shortcuts...", wsize.x - 56.f,
 				ax_f, ay_f, az_f, kb_anim);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			aida::preview::semantics::register_last_item(
+				"aida.shortcuts.search", "shortcut-search");
+#endif
+
+			if (kb_reset_all_armed) {
+				if (ImGui::SmallButton("Confirm reset all")) {
+					const auto result = aida::ui::application_ui::reset_all_shortcut_overrides();
+					kb_edit_status = result.detail;
+					kb_reset_all_armed = false;
+					kb_edit_binding.clear();
+					kb_edit_strokes.clear();
+					kb_edit_conflicts.clear();
+				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.shortcuts.reset-all.confirm", "shortcut-reset-all-confirm");
+#endif
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Cancel reset")) {
+					kb_reset_all_armed = false;
+					kb_edit_status = "Reset cancelled";
+				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.shortcuts.reset-all.cancel", "shortcut-reset-all-cancel");
+#endif
+			} else {
+				if (ImGui::SmallButton("Reset all shortcuts")) {
+					kb_reset_all_armed = true;
+					kb_edit_status = "Confirm to restore every canonical default binding";
+				}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::semantics::register_last_item(
+					"aida.shortcuts.reset-all", "shortcut-reset-all");
+#endif
+			}
+
+			if (!kb_edit_binding.empty()) {
+				if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false) && !kb_edit_strokes.empty()) {
+					kb_edit_strokes.pop_back();
+					kb_edit_conflicts.clear();
+				}
+				if (kb_edit_conflicts.empty()) {
+					const ImGuiIO& capture_io = ImGui::GetIO();
+					for (int value = ImGuiKey_Tab; value < ImGuiKey_GamepadStart; ++value) {
+						const ImGuiKey key = static_cast<ImGuiKey>(value);
+						if (key == ImGuiKey_Escape || key == ImGuiKey_Enter ||
+							key == ImGuiKey_KeypadEnter || key == ImGuiKey_Backspace ||
+							!ImGui::IsKeyPressed(key, false))
+							continue;
+						if (kb_edit_strokes.size() >= 4) {
+							kb_edit_status = "A chord may contain at most four strokes";
+							break;
+						}
+						ImGuiKeyChord stroke = key;
+						if (capture_io.KeyCtrl) stroke |= ImGuiMod_Ctrl;
+						if (capture_io.KeyShift) stroke |= ImGuiMod_Shift;
+						if (capture_io.KeyAlt) stroke |= ImGuiMod_Alt;
+						if (capture_io.KeySuper) stroke |= ImGuiMod_Super;
+						kb_edit_strokes.push_back(stroke);
+						kb_edit_status = "Stroke captured; add another or apply";
+						break;
+					}
+				}
+				ImGui::Separator();
+				ImGui::Text("Editing %s", kb_edit_label.c_str());
+				const std::string draft = kb_edit_strokes.empty()
+					? "Press a key combination"
+					: aida::ui::application_ui::format_shortcut_sequence(kb_edit_strokes);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th_kb.accent_u32),
+					"%s", draft.c_str());
+				if (kb_edit_conflicts.empty()) {
+					ImGui::BeginDisabled(kb_edit_strokes.empty());
+					if (ImGui::SmallButton("Apply binding")) {
+						const auto result = aida::ui::application_ui::update_shortcut_override(
+							kb_edit_binding.c_str(), kb_edit_strokes, false);
+						kb_edit_status = result.detail;
+						kb_edit_conflicts = result.conflicts;
+						if (result.completed()) {
+							kb_edit_binding.clear();
+							kb_edit_label.clear();
+							kb_edit_strokes.clear();
+						}
+					}
+					ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::semantics::register_last_item(
+						"aida.shortcuts.apply", "shortcut-apply", false,
+						kb_edit_strokes.empty());
+#endif
+				} else {
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th_kb.warning),
+						"Conflict with %zu binding%s in this focus scope",
+						kb_edit_conflicts.size(), kb_edit_conflicts.size() == 1 ? "" : "s");
+					for (std::size_t index = 0;
+						 index < (std::min)(kb_edit_conflicts.size(), static_cast<std::size_t>(4));
+						 ++index)
+						ImGui::TextDisabled("%s", kb_edit_conflicts[index].c_str());
+					if (kb_edit_conflicts.size() > 4)
+						ImGui::TextDisabled("+%zu more", kb_edit_conflicts.size() - 4);
+					if (ImGui::SmallButton("Replace conflicting bindings")) {
+						const auto result = aida::ui::application_ui::update_shortcut_override(
+							kb_edit_binding.c_str(), kb_edit_strokes, true);
+						kb_edit_status = result.detail;
+						if (result.completed()) {
+							kb_edit_binding.clear();
+							kb_edit_label.clear();
+							kb_edit_strokes.clear();
+							kb_edit_conflicts.clear();
+						}
+					}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::semantics::register_last_item(
+						"aida.shortcuts.replace-conflicts", "shortcut-conflict-resolution");
+#endif
+				}
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Cancel edit")) {
+					kb_edit_binding.clear();
+					kb_edit_label.clear();
+					kb_edit_strokes.clear();
+					kb_edit_conflicts.clear();
+					kb_edit_status = "Edit cancelled";
+				}
+				ImGui::Separator();
+			}
+			if (!kb_edit_status.empty())
+				ImGui::TextDisabled("%s", kb_edit_status.c_str());
 
 			ImGui::Spacing();
 
@@ -9277,7 +7198,8 @@ void helpers::render_title()
 			const auto shortcuts = aida::ui::application_ui::list_shortcuts();
 
 			ImGui::BeginChild("##kb_scroll",
-				ImVec2(-1, sh - 130.f), false, ImGuiWindowFlags_HorizontalScrollbar);
+				ImVec2(-1, (std::max)(120.f, ImGui::GetContentRegionAvail().y - 42.f)),
+				false, ImGuiWindowFlags_HorizontalScrollbar);
 
 			int total_visible = 0;
 			std::string active_category;
@@ -9327,6 +7249,10 @@ void helpers::render_title()
 				idl->AddText(ImVec2(rcp.x + 6.f, rcp.y + 3.f),
 					aida::ui::with_alpha(label_color, 0.92f * kb_anim), shortcut.label.c_str());
 				std::string metadata = shortcut.scope;
+				if (!shortcut.binding_enabled)
+					metadata += " / Disabled";
+				if (shortcut.customized)
+					metadata += " / Customized";
 				if (shortcut.conflict)
 					metadata += " / Conflict";
 				idl->AddText(ImVec2(rcp.x + 6.f, rcp.y + 16.f),
@@ -9334,12 +7260,71 @@ void helpers::render_title()
 					metadata.c_str());
 				ImVec2 chip_ts = ImGui::CalcTextSize(shortcut.shortcut.c_str());
 				float chip_w_est = chip_ts.x + 12.f;
-				float chip_x = rcp.x + row_w - chip_w_est - 6.f;
+				float chip_x = rcp.x + row_w - chip_w_est - (shortcut.editable ? 202.f : 6.f);
 				float chip_y = rcp.y + (row_h_k - (chip_ts.y + 4.f)) * 0.5f;
 				ui_anim::render_kbd_chip(idl, chip_x, chip_y, shortcut.shortcut.c_str(), kb_anim);
 				ImGui::Dummy(ImVec2(row_w, row_h_k));
-				if (row_hov && !shortcut.enabled && !shortcut.disabled_reason.empty())
-					ImGui::SetTooltip("%s", shortcut.disabled_reason.c_str());
+				const ImVec2 next_row = ImGui::GetCursorScreenPos();
+				if (shortcut.editable) {
+					ImGui::PushID(shortcut.binding_id.c_str());
+					ImGui::SetCursorScreenPos(ImVec2(rcp.x + row_w - 192.f, rcp.y + 5.f));
+					if (ImGui::SmallButton("Edit")) {
+						kb_edit_binding = shortcut.binding_id;
+						kb_edit_label = shortcut.label;
+						kb_edit_strokes.clear();
+						kb_edit_conflicts.clear();
+						kb_edit_status = "Press one or more key combinations";
+						kb_reset_all_armed = false;
+					}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					aida::preview::semantics::register_last_item(
+						aida::preview::semantics::stable_id(
+							"aida.shortcuts.edit", shortcut.binding_id),
+						"shortcut-edit");
+#endif
+					if (shortcut.binding_enabled) {
+						ImGui::SameLine();
+						if (ImGui::SmallButton("Disable")) {
+							const auto result = aida::ui::application_ui::disable_shortcut_override(
+								shortcut.binding_id.c_str());
+							kb_edit_status = result.detail;
+							kb_edit_binding.clear();
+							kb_edit_strokes.clear();
+							kb_edit_conflicts.clear();
+						}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						aida::preview::semantics::register_last_item(
+							aida::preview::semantics::stable_id(
+								"aida.shortcuts.disable", shortcut.binding_id),
+							"shortcut-disable");
+#endif
+					}
+					if (shortcut.customized) {
+						ImGui::SameLine();
+						if (ImGui::SmallButton("Reset")) {
+							const auto result = aida::ui::application_ui::reset_shortcut_override(
+								shortcut.binding_id.c_str());
+							kb_edit_status = result.detail;
+							kb_edit_binding.clear();
+							kb_edit_strokes.clear();
+							kb_edit_conflicts.clear();
+						}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						aida::preview::semantics::register_last_item(
+							aida::preview::semantics::stable_id(
+								"aida.shortcuts.reset", shortcut.binding_id),
+							"shortcut-reset");
+#endif
+					}
+					ImGui::PopID();
+					ImGui::SetCursorScreenPos(next_row);
+				}
+				if (row_hov) {
+					if (shortcut.customized)
+						ImGui::SetTooltip("Default: %s", shortcut.default_shortcut.c_str());
+					else if (!shortcut.enabled && !shortcut.disabled_reason.empty())
+						ImGui::SetTooltip("%s", shortcut.disabled_reason.c_str());
+				}
 			}
 
 			if (has_filter && total_visible == 0) {
@@ -9442,7 +7427,6 @@ void helpers::render_title()
 		}
 	}
 
-	ImGui::PopStyleVar();
-	ImGui::End();
+	aida::ui::application_ui::process_global_shortcuts();
 	g_render_section = "done";
 }

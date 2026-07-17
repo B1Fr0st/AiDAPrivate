@@ -144,6 +144,18 @@ void status_pill(const char* label, bool ok, bool neutral_when_false = false)
 
 }
 
+bool stage_camoufox_url(const std::string& url, std::string& reason)
+{
+    if (url.empty() || (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0)) {
+        reason = "Camoufox requires an absolute HTTP or HTTPS URL.";
+        return false;
+    }
+    auto& st = vs();
+    std::snprintf(st.initial_url, sizeof(st.initial_url), "%s", url.c_str());
+    reason.clear();
+    return true;
+}
+
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {

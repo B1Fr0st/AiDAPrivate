@@ -129,6 +129,18 @@ struct overlay_snapshot_t {
     std::vector<std::pair<std::string, overlay_operation_t>> items;
 };
 
+struct overlay_history_snapshot_t {
+    std::uint64_t revision = 0;
+    std::uint64_t history_cursor = 0;
+    std::uint64_t next_transaction_id = 1;
+    std::uint64_t history_epoch = 0;
+
+    bool can_undo() const noexcept { return history_cursor != 0; }
+    bool can_redo() const noexcept {
+        return next_transaction_id > 1 && history_cursor < next_transaction_id - 1;
+    }
+};
+
 class overlay_journal_t final : public workspace_lifecycle_participant_t,
                                 public std::enable_shared_from_this<overlay_journal_t> {
 public:
@@ -161,6 +173,7 @@ public:
         const cancellation_token_t& cancel = {});
 
     overlay_snapshot_t snapshot() const;
+    overlay_history_snapshot_t history_snapshot() const noexcept;
     overlay_target_identity_v9_t fixed_target() const;
     std::optional<overlay_operation_t> find(const std::string& entity_key) const;
     std::vector<overlay_operation_t> patch_operations() const;
@@ -194,6 +207,7 @@ private:
     std::unordered_map<std::string, overlay_operation_t> items_;
     std::uint64_t revision_ = 0;
     std::uint64_t history_cursor_ = 0;
+    std::uint64_t next_transaction_id_ = 1;
     std::uint64_t history_epoch_ = 1;
     cancellation_source_t cancellation_;
 };

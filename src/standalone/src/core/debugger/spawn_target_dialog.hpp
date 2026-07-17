@@ -20,6 +20,11 @@
 
 #include <cstring>
 #include <cstdio>
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <exception>
+#include <memory>
 #include <string>
 #include <utility>
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -39,8 +44,11 @@
 #include "../runtime/vm_guest_bridge.hpp"
 #endif
 #include "../ui/toast_notification.hpp"
+#include "../ui/task_center.hpp"
+#include "../infra/executor.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../auth/auth_browser_launch.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #else
 #include "../../preview/debugger_preview_runtime.hpp"
 #endif
@@ -194,6 +202,104 @@ inline std::wstring& last_custom_bridge_dir() {
 	return v;
 }
 
+enum class custom_bridge_status_t : std::uint8_t {
+	idle,
+	queued,
+	running,
+	succeeded,
+	failed,
+	cancelled
+};
+
+struct custom_bridge_operation_t {
+	std::atomic<bool> cancel_requested{false};
+	std::atomic<unsigned> phase{0};
+	std::atomic<unsigned> irreversible_gate{0};
+	std::uint64_t serial = 0;
+};
+
+inline custom_bridge_status_t& custom_bridge_status() {
+	static custom_bridge_status_t value = custom_bridge_status_t::idle;
+	return value;
+}
+
+inline std::string& custom_bridge_status_text() {
+	static std::string value;
+	return value;
+}
+
+inline std::shared_ptr<custom_bridge_operation_t>& custom_bridge_operation() {
+	static std::shared_ptr<custom_bridge_operation_t> value;
+	return value;
+}
+
+inline std::atomic<std::uint64_t>& custom_bridge_sequence() {
+	static std::atomic<std::uint64_t> value{1};
+	return value;
+}
+
+inline std::atomic<std::uint64_t>& custom_bridge_dispatch_failure() {
+	static std::atomic<std::uint64_t> value{0};
+	return value;
+}
+
+inline std::atomic<std::uint64_t>& custom_bridge_dispatch_applied() {
+	static std::atomic<std::uint64_t> value{0};
+	return value;
+}
+
+inline bool custom_bridge_pending() {
+	return custom_bridge_status() == custom_bridge_status_t::queued ||
+		custom_bridge_status() == custom_bridge_status_t::running;
+}
+
+inline bool request_custom_bridge_cancel() {
+	const auto operation = custom_bridge_operation();
+	if (!operation || !custom_bridge_pending())
+		return false;
+	unsigned expected_gate = 0;
+	if (!operation->irreversible_gate.compare_exchange_strong(expected_gate, 1,
+			std::memory_order_acq_rel))
+		return false;
+	operation->cancel_requested.store(true, std::memory_order_release);
+	const std::string task_id = "debugger.custom_vm_bridge." +
+		std::to_string(operation->serial);
+	static_cast<void>(aida::ui::task_center::update_task(task_id,
+		aida::ui::task_center::task_state_t::cancellation_requested, -1.0f,
+		"Cancellation requested before activation"));
+	custom_bridge_status_text() = "Cancellation requested; waiting for the current reversible step.";
+	return true;
+}
+
+inline void poll_custom_bridge_dispatch_failure() {
+	const auto operation = custom_bridge_operation();
+	if (!operation)
+		return;
+	const unsigned phase = operation->phase.load(std::memory_order_acquire);
+	if (custom_bridge_pending() && phase > 0 && phase < 6) {
+		custom_bridge_status() = custom_bridge_status_t::running;
+		switch (phase) {
+		case 1: custom_bridge_status_text() = "Validating bridge directories."; break;
+		case 2: custom_bridge_status_text() = "Staging the reviewed sample."; break;
+		case 3: custom_bridge_status_text() = "Staging AiDAGuestAgent.exe."; break;
+		case 4: custom_bridge_status_text() = "Preparing bridge metadata."; break;
+		case 5: custom_bridge_status_text() = "Activating the custom VM bridge."; break;
+		default: break;
+		}
+	}
+	const std::uint64_t failed = custom_bridge_dispatch_failure().exchange(0,
+		std::memory_order_acq_rel);
+	if (failed == 0 || failed != operation->serial)
+		return;
+	if (custom_bridge_dispatch_applied().exchange(0, std::memory_order_acq_rel) == failed) {
+		custom_bridge_status() = custom_bridge_status_t::succeeded;
+		custom_bridge_status_text() = "The bridge was activated, but its detailed UI receipt could not be published.";
+	} else {
+		custom_bridge_status() = custom_bridge_status_t::failed;
+		custom_bridge_status_text() = "The bridge operation finished, but its result could not be published. Retry after reviewing Task Center.";
+	}
+}
+
 inline void reset_inputs() {
 	std::memset(exe_buf(), 0, 1024);
 	std::memset(args_buf(), 0, 2048);
@@ -318,118 +424,389 @@ inline void open_custom_vm_guide() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	aida::preview::debugger::record("open_guide", "custom-vm-bridge-guide.md");
 #else
-	std::filesystem::path rel = L"docs\\custom-vm-bridge-guide.md";
-	std::error_code ec;
-	std::filesystem::path candidates[4];
-	candidates[0] = std::filesystem::current_path(ec) / rel;
-	wchar_t module_path[MAX_PATH] = {};
-	DWORD n = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
-	if (n > 0 && n < MAX_PATH) {
-		std::filesystem::path module_dir = std::filesystem::path(module_path).parent_path();
-		candidates[1] = module_dir / rel;
-		candidates[2] = module_dir.parent_path() / rel;
-		candidates[3] = module_dir.parent_path().parent_path() / rel;
+	static std::atomic<std::uint64_t> sequence{1};
+	const std::uint64_t serial = sequence.fetch_add(1, std::memory_order_relaxed);
+	const std::string task_id = "debugger.custom_vm_guide." + std::to_string(serial);
+	aida::ui::task_center::task_registration_t registration;
+	registration.id = task_id;
+	registration.source = "debugger.spawn_target";
+	registration.owner = "Run Target";
+	registration.owner_view = "view.debug.cpu";
+	registration.owner_action = "Open custom VM guide";
+	registration.target = "custom-vm-bridge-guide.md";
+	registration.label = "Locate and open custom VM guide";
+	registration.stage = "Queued";
+	registration.affected_entity = "custom-vm-bridge-guide.md";
+	if (!aida::ui::task_center::register_task(std::move(registration))) {
+		toast_notification::push("Task Center rejected the guide lookup.",
+			toast_notification::toast_type_t::error, 4.0f);
+		return;
 	}
-	for (const auto& candidate : candidates) {
-		ec.clear();
-		if (!candidate.empty() && std::filesystem::exists(candidate, ec) && !ec) {
-			ShellExecuteW(g_hwnd, L"open", candidate.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-			return;
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "debugger";
+	submission.label = "debugger.custom_vm_guide.open";
+	submission.thread_class = "bounded_file_io";
+	submission.domain = aida::infra::executor::domain_t::external_tool;
+	submission.priority = 1;
+	submission.generation = serial;
+	submission.diagnostic_id = task_id.c_str();
+	submission.ui_access_policy = "ui_dispatch_only";
+	submission.failure_policy = "typed_diagnostic";
+	submission.shutdown_policy = "drain";
+	submission.body = [task_id]() {
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::running, -1.0f,
+			"Resolving bounded guide candidates"));
+		bool opened = false;
+		std::string error;
+		try {
+			const std::filesystem::path relative = L"docs\\custom-vm-bridge-guide.md";
+			std::error_code filesystem_error;
+			std::array<std::filesystem::path, 4> candidates{};
+			candidates[0] = std::filesystem::current_path(filesystem_error) / relative;
+			wchar_t module_path[MAX_PATH] = {};
+			const DWORD length = GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+			if (length > 0 && length < MAX_PATH) {
+				const std::filesystem::path module_directory =
+					std::filesystem::path(module_path).parent_path();
+				candidates[1] = module_directory / relative;
+				candidates[2] = module_directory.parent_path() / relative;
+				candidates[3] = module_directory.parent_path().parent_path() / relative;
+			}
+			for (const auto& candidate : candidates) {
+				filesystem_error.clear();
+				if (candidate.empty() || !std::filesystem::is_regular_file(candidate,
+						filesystem_error) || filesystem_error)
+					continue;
+				const auto result = reinterpret_cast<std::intptr_t>(ShellExecuteW(g_hwnd,
+					L"open", candidate.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+				opened = result > 32;
+				if (!opened)
+					error = "Windows rejected the guide open request.";
+				break;
+			}
+			if (!opened && error.empty())
+				error = "The guide was not found in any approved installation or repository location.";
+		} catch (const std::exception& exception) {
+			error = exception.what();
+		} catch (...) {
+			error = "Unknown guide lookup failure.";
 		}
+		auto publish = [task_id, opened, error] {
+			static_cast<void>(aida::ui::task_center::update_task(task_id,
+				opened ? aida::ui::task_center::task_state_t::completed :
+					aida::ui::task_center::task_state_t::failed,
+				1.0f, opened ? "Guide opened" : "Guide unavailable",
+				opened ? "Opened custom VM bridge guide" : error,
+				opened ? std::string() : "diagnostic." + task_id));
+			if (!opened)
+				toast_notification::push(error, toast_notification::toast_type_t::error, 6.0f);
+		};
+		if (!aida::ui_thread::post(std::move(publish), "spawn_target_dialog",
+				"publish_custom_vm_guide", "worker_completion")) {
+			static_cast<void>(aida::ui::task_center::update_task(task_id,
+				aida::ui::task_center::task_state_t::failed, 1.0f,
+				"UI publication rejected", opened ?
+					"The guide opened, but its UI receipt could not be published" :
+					"The guide result could not be published",
+				"diagnostic." + task_id));
+		}
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::failed, 1.0f,
+			"Executor rejected guide lookup", submitted.reject_reason,
+			"diagnostic." + task_id));
+		toast_notification::push("The guide lookup could not be queued; see Task Center.",
+			toast_notification::toast_type_t::error, 5.0f);
 	}
-	toast_notification::push("Custom VM guide is in docs\\custom-vm-bridge-guide.md.", toast_notification::toast_type_t::info, 5.0f);
 #endif
 }
 
 inline bool activate_custom_bridge() {
+	if (custom_bridge_pending())
+		return false;
+	const std::string host_bridge_text = trim(custom_bridge_buf());
+	const std::string guest_bridge_text = trim(custom_guest_bridge_buf());
+	const std::string executable_text = trim(exe_buf());
+	const std::string arguments_text = trim(args_buf());
+	const std::string guest_sample_text = trim(custom_guest_sample_buf());
+	if (host_bridge_text.empty()) {
+		custom_bridge_status() = custom_bridge_status_t::failed;
+		custom_bridge_status_text() = "Choose a host bridge folder first.";
+		return false;
+	}
+	if (guest_bridge_text.empty()) {
+		custom_bridge_status() = custom_bridge_status_t::failed;
+		custom_bridge_status_text() = "Enter the guest path for the shared bridge folder.";
+		return false;
+	}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	aida::preview::debugger::record("activate_vm_bridge", trim(custom_guest_bridge_buf()));
-	last_custom_bridge_dir() = widen_utf8(trim(custom_bridge_buf()).c_str());
+	aida::preview::debugger::record("activate_vm_bridge", guest_bridge_text);
+	last_custom_bridge_dir() = widen_utf8(host_bridge_text.c_str());
+	custom_bridge_status() = custom_bridge_status_t::succeeded;
+	custom_bridge_status_text() = "Deterministic custom VM bridge preview activated.";
 	toast_notification::push("Custom VM bridge preview activated.", toast_notification::toast_type_t::success, 5.0f);
 	return true;
 #else
-	std::string host_bridge_trim = trim(custom_bridge_buf());
-	std::string guest_bridge_trim = trim(custom_guest_bridge_buf());
-	std::string exe_trim = trim(exe_buf());
-	std::string args_trim = trim(args_buf());
-	std::string guest_sample_trim = trim(custom_guest_sample_buf());
-	if (host_bridge_trim.empty()) {
-		toast_notification::push("Choose a host bridge folder first.", toast_notification::toast_type_t::error, 4.0f);
-		return false;
-	}
-	if (guest_bridge_trim.empty()) {
-		toast_notification::push("Enter the guest path for the shared bridge folder.", toast_notification::toast_type_t::error, 4.0f);
-		return false;
-	}
-	std::wstring host_bridge = widen_utf8(host_bridge_trim.c_str());
-	std::wstring guest_sample = widen_utf8(guest_sample_trim.c_str());
-	std::wstring args = widen_utf8(args_trim.c_str());
-	std::filesystem::path host_bridge_path(host_bridge);
-	std::error_code ec;
-	std::filesystem::create_directories(host_bridge_path / L"samples", ec);
-	if (ec) {
-		toast_notification::push("Could not create bridge samples folder: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
-		return false;
-	}
-	ec.clear();
-	std::filesystem::create_directories(host_bridge_path / L"agent", ec);
-	if (ec) {
-		toast_notification::push("Could not create bridge agent folder: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
-		return false;
-	}
-	if (!exe_trim.empty()) {
-		std::filesystem::path host_sample(widen_utf8(exe_trim.c_str()));
-		ec.clear();
-		if (!std::filesystem::exists(host_sample, ec) || ec || std::filesystem::is_directory(host_sample, ec)) {
-			toast_notification::push("Host sample path is not a readable file.", toast_notification::toast_type_t::error, 5.0f);
+	const std::uint64_t serial = custom_bridge_sequence().fetch_add(1,
+		std::memory_order_relaxed);
+	auto operation = std::make_shared<custom_bridge_operation_t>();
+	operation->serial = serial;
+	custom_bridge_operation() = operation;
+	custom_bridge_status() = custom_bridge_status_t::queued;
+	custom_bridge_status_text() = "Queued bridge staging and activation.";
+	const std::string task_id = "debugger.custom_vm_bridge." + std::to_string(serial);
+	aida::ui::task_center::task_registration_t registration;
+	registration.id = task_id;
+	registration.source = "debugger.spawn_target";
+	registration.owner = "Run Target";
+	registration.owner_view = "view.debug.cpu";
+	registration.owner_action = "Activate custom VM bridge";
+	registration.target = "Custom VM bridge";
+	registration.label = "Stage and activate custom VM bridge";
+	registration.stage = "Queued";
+	registration.affected_entity = "Custom VM bridge";
+	registration.cancellation_is_safe = true;
+	registration.callbacks.cancel = [operation] {
+		unsigned expected_gate = 0;
+		if (!operation->irreversible_gate.compare_exchange_strong(expected_gate, 1,
+				std::memory_order_acq_rel))
 			return false;
+		operation->cancel_requested.store(true, std::memory_order_release);
+		return true;
+	};
+	if (!aida::ui::task_center::register_task(std::move(registration))) {
+		custom_bridge_status() = custom_bridge_status_t::failed;
+		custom_bridge_status_text() = "Task Center rejected ownership of the bridge operation.";
+		custom_bridge_operation().reset();
+		return false;
+	}
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "debugger";
+	submission.label = "debugger.custom_vm_bridge.activate";
+	submission.thread_class = "bounded_file_io";
+	submission.domain = aida::infra::executor::domain_t::external_tool;
+	submission.priority = 2;
+	submission.generation = serial;
+	submission.diagnostic_id = task_id.c_str();
+	submission.ui_access_policy = "ui_dispatch_only";
+	submission.failure_policy = "retain_review_and_report";
+	submission.shutdown_policy = "drain";
+	submission.cancel_hook = [operation] {
+		unsigned expected_gate = 0;
+		if (operation->irreversible_gate.compare_exchange_strong(expected_gate, 1,
+				std::memory_order_acq_rel))
+			operation->cancel_requested.store(true, std::memory_order_release);
+	};
+	submission.body = [operation, task_id, host_bridge_text, guest_bridge_text,
+		executable_text, arguments_text, guest_sample_text]() {
+		operation->phase.store(1, std::memory_order_release);
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::running, 0.05f,
+			"Validating reviewed bridge paths"));
+		bool activated = false;
+		bool cancelled = false;
+		std::string error;
+		std::wstring host_bridge = widen_utf8(host_bridge_text.c_str());
+		std::wstring guest_sample = widen_utf8(guest_sample_text.c_str());
+		const std::wstring arguments = widen_utf8(arguments_text.c_str());
+		try {
+			const auto cancellation_requested = [&] {
+				cancelled = operation->cancel_requested.load(std::memory_order_acquire);
+				if (cancelled && error.empty())
+					error = "Bridge activation was cancelled before its irreversible phase.";
+				return cancelled;
+			};
+			std::filesystem::path host_bridge_path(host_bridge);
+			std::error_code filesystem_error;
+			if (host_bridge.empty() || guest_bridge_text.empty())
+				error = "The reviewed host or guest bridge path is invalid.";
+			else if (cancellation_requested()) {
+			} else {
+				std::filesystem::create_directories(host_bridge_path / L"samples", filesystem_error);
+				if (!filesystem_error)
+					std::filesystem::create_directories(host_bridge_path / L"agent", filesystem_error);
+				if (filesystem_error)
+					error = "Could not create the bridge directories: " + filesystem_error.message();
+			}
+			operation->phase.store(2, std::memory_order_release);
+			if (error.empty() && !cancellation_requested() && !executable_text.empty()) {
+				const std::filesystem::path host_sample(widen_utf8(executable_text.c_str()));
+				filesystem_error.clear();
+				const auto size = std::filesystem::file_size(host_sample, filesystem_error);
+				const auto modified = filesystem_error ? std::filesystem::file_time_type{} :
+					std::filesystem::last_write_time(host_sample, filesystem_error);
+				if (filesystem_error || size == 0 || size > 2ULL * 1024ULL * 1024ULL * 1024ULL)
+					error = "The reviewed host sample is unavailable, empty, or exceeds 2 GiB.";
+				else if (std::filesystem::is_directory(host_sample, filesystem_error) || filesystem_error)
+					error = "The reviewed host sample is not a regular file.";
+				else {
+					const std::filesystem::path staged_sample =
+						host_bridge_path / L"samples" / host_sample.filename();
+					std::filesystem::copy_file(host_sample, staged_sample,
+						std::filesystem::copy_options::overwrite_existing, filesystem_error);
+					if (filesystem_error)
+						error = "Could not stage the reviewed sample: " + filesystem_error.message();
+					else {
+						filesystem_error.clear();
+						const auto source_size_after = std::filesystem::file_size(host_sample,
+							filesystem_error);
+						const auto source_modified_after = filesystem_error ?
+							std::filesystem::file_time_type{} :
+							std::filesystem::last_write_time(host_sample, filesystem_error);
+						const auto staged_size = filesystem_error ? std::uintmax_t{0} :
+							std::filesystem::file_size(staged_sample, filesystem_error);
+						if (filesystem_error || source_size_after != size || staged_size != size ||
+							source_modified_after != modified)
+							error = "The reviewed host sample changed during staging or the copy was not exact.";
+					}
+					if (error.empty() && guest_sample.empty()) {
+						const std::string filename = narrow_utf8(host_sample.filename().wstring().c_str());
+						const std::string generated = join_guest_path(
+							join_guest_path(guest_bridge_text, "samples"), filename);
+						guest_sample = widen_utf8(generated.c_str());
+					}
+				}
+			}
+			operation->phase.store(3, std::memory_order_release);
+			if (error.empty() && !cancellation_requested()) {
+				const std::wstring agent_source = resolve_guest_agent_exe();
+				if (agent_source.empty())
+					error = "AiDAGuestAgent.exe is missing beside AiDAStandalone.exe.";
+				else {
+					filesystem_error.clear();
+					const std::filesystem::path agent_source_path(agent_source);
+					const auto agent_size = std::filesystem::file_size(agent_source_path, filesystem_error);
+					const auto agent_modified = filesystem_error ? std::filesystem::file_time_type{} :
+						std::filesystem::last_write_time(agent_source_path, filesystem_error);
+					if (filesystem_error || agent_size == 0 || agent_size > 512ULL * 1024ULL * 1024ULL)
+						error = "AiDAGuestAgent.exe is invalid or exceeds 512 MiB.";
+					else {
+						const std::filesystem::path staged_agent =
+							host_bridge_path / L"agent" / L"AiDAGuestAgent.exe";
+						std::filesystem::copy_file(agent_source_path, staged_agent,
+							std::filesystem::copy_options::overwrite_existing, filesystem_error);
+						if (filesystem_error)
+							error = "Could not stage AiDAGuestAgent.exe: " + filesystem_error.message();
+						else {
+							filesystem_error.clear();
+							const auto source_size_after = std::filesystem::file_size(agent_source_path,
+								filesystem_error);
+							const auto source_modified_after = filesystem_error ?
+								std::filesystem::file_time_type{} :
+								std::filesystem::last_write_time(agent_source_path, filesystem_error);
+							const auto staged_size = filesystem_error ? std::uintmax_t{0} :
+								std::filesystem::file_size(staged_agent, filesystem_error);
+							if (filesystem_error || source_size_after != agent_size ||
+								staged_size != agent_size || source_modified_after != agent_modified)
+								error = "AiDAGuestAgent.exe changed during staging or the copy was not exact.";
+						}
+					}
+				}
+			}
+			operation->phase.store(4, std::memory_order_release);
+			if (error.empty() && !cancellation_requested()) {
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::running, 0.65f,
+					"Preparing bridge metadata and launch contract"));
+				if (!vm_guest_bridge::prepare_bridge_directory(host_bridge, guest_sample,
+						arguments, &error) && error.empty())
+					error = "Bridge preparation failed.";
+			}
+			if (error.empty()) {
+				unsigned expected_gate = 0;
+				if (!operation->irreversible_gate.compare_exchange_strong(expected_gate, 2,
+						std::memory_order_acq_rel)) {
+					cancelled = expected_gate == 1;
+					error = cancelled ? "Bridge activation was cancelled before its irreversible phase." :
+						"Bridge activation could not acquire its irreversible-phase gate.";
+				}
+			}
+			if (error.empty()) {
+				operation->phase.store(5, std::memory_order_release);
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::running, 0.9f,
+					"Activating reviewed custom VM bridge"));
+				if (!vm_guest_bridge::activate_bridge(host_bridge, host_bridge, guest_sample,
+						"custom_vm", &error) && error.empty())
+					error = "Bridge activation failed.";
+				else if (error.empty())
+					activated = true;
+			}
+		} catch (const std::exception& exception) {
+			error = exception.what();
+		} catch (...) {
+			error = "Unknown bridge activation failure.";
 		}
-		ec.clear();
-		std::filesystem::copy_file(host_sample, host_bridge_path / L"samples" / host_sample.filename(),
-			std::filesystem::copy_options::overwrite_existing, ec);
-		if (ec) {
-			toast_notification::push("Could not stage sample into bridge: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
-			return false;
+		operation->phase.store(6, std::memory_order_release);
+		const std::string guest_sample_result = narrow_utf8(guest_sample.c_str());
+		auto publish = [operation, task_id, host_bridge, guest_sample_result,
+			host_bridge_text, guest_bridge_text, arguments_text, activated, cancelled,
+			error]() {
+			if (!custom_bridge_operation() ||
+				custom_bridge_operation()->serial != operation->serial)
+				return;
+			if (activated) {
+				last_custom_bridge_dir() = host_bridge;
+				if (!guest_sample_result.empty()) {
+					std::snprintf(custom_guest_sample_buf(), 1024, "%s",
+						guest_sample_result.c_str());
+				}
+				custom_bridge_status() = custom_bridge_status_t::succeeded;
+				custom_bridge_status_text() = "Bridge activated. Start the displayed guest command inside the VM.";
+				diag::log_tagged_critical_fmt("spawn",
+					"custom_vm_bridge_activated host_bridge='%s' guest_bridge='%s' guest_sample='%s' args_len=%zu",
+					host_bridge_text.c_str(), guest_bridge_text.c_str(),
+					guest_sample_result.c_str(), arguments_text.size());
+				toast_notification::push("Custom VM bridge activated. Start the guest command inside the VM.",
+					toast_notification::toast_type_t::success, 5.0f);
+			} else if (cancelled) {
+				custom_bridge_status() = custom_bridge_status_t::cancelled;
+				custom_bridge_status_text() = error.empty() ? "Bridge activation was cancelled." : error;
+			} else {
+				custom_bridge_status() = custom_bridge_status_t::failed;
+				custom_bridge_status_text() = error.empty() ? "Bridge activation failed." : error;
+				toast_notification::push(custom_bridge_status_text(),
+					toast_notification::toast_type_t::error, 6.0f);
+			}
+			static_cast<void>(aida::ui::task_center::update_task(task_id,
+				activated ? aida::ui::task_center::task_state_t::completed :
+					cancelled ? aida::ui::task_center::task_state_t::cancelled :
+						aida::ui::task_center::task_state_t::failed,
+				1.0f, activated ? "Bridge activated" : cancelled ? "Cancelled" : "Activation failed",
+				activated ? "Custom VM bridge activation verified" : custom_bridge_status_text(),
+				activated ? std::string() : "diagnostic." + task_id));
+		};
+		if (!aida::ui_thread::post(std::move(publish), "spawn_target_dialog",
+				"publish_custom_vm_bridge", "worker_completion")) {
+			custom_bridge_dispatch_failure().store(operation->serial,
+				std::memory_order_release);
+			if (activated)
+				custom_bridge_dispatch_applied().store(operation->serial,
+					std::memory_order_release);
+			static_cast<void>(aida::ui::task_center::update_task(task_id,
+				activated ? aida::ui::task_center::task_state_t::partial :
+					aida::ui::task_center::task_state_t::failed,
+				1.0f, "UI publication rejected",
+				activated ? "Bridge activation succeeded but UI publication was rejected" :
+					"Bridge activation result could not be published",
+				"diagnostic." + task_id));
 		}
-		if (guest_sample.empty()) {
-			std::wstring host_sample_filename_w = host_sample.filename().wstring();
-			std::string host_sample_filename = narrow_utf8(host_sample_filename_w.c_str());
-			std::string guest_sample_auto = join_guest_path(join_guest_path(guest_bridge_trim, "samples"), host_sample_filename);
-			std::strncpy(custom_guest_sample_buf(), guest_sample_auto.c_str(), 1023);
-			custom_guest_sample_buf()[1023] = '\0';
-			guest_sample = widen_utf8(guest_sample_auto.c_str());
-		}
-	}
-	std::wstring agent_src = resolve_guest_agent_exe();
-	if (agent_src.empty()) {
-		toast_notification::push("AiDAGuestAgent.exe is missing beside AiDAStandalone.exe.", toast_notification::toast_type_t::error, 6.0f);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		custom_bridge_status() = custom_bridge_status_t::failed;
+		custom_bridge_status_text() = "The executor rejected bridge activation: " +
+			submitted.reject_reason;
+		custom_bridge_operation().reset();
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::failed, 1.0f,
+			"Executor rejected activation", submitted.reject_reason,
+			"diagnostic." + task_id));
 		return false;
 	}
-	ec.clear();
-	std::filesystem::copy_file(std::filesystem::path(agent_src), host_bridge_path / L"agent" / L"AiDAGuestAgent.exe",
-		std::filesystem::copy_options::overwrite_existing, ec);
-	if (ec) {
-		toast_notification::push("Could not stage AiDAGuestAgent.exe: " + ec.message(), toast_notification::toast_type_t::error, 5.0f);
-		return false;
-	}
-	std::string error;
-	if (!vm_guest_bridge::prepare_bridge_directory(host_bridge, guest_sample, args, &error)) {
-		toast_notification::push("Bridge setup failed: " + error, toast_notification::toast_type_t::error, 5.0f);
-		return false;
-	}
-	if (!vm_guest_bridge::activate_bridge(host_bridge, host_bridge, guest_sample, "custom_vm", &error)) {
-		toast_notification::push("Bridge activation failed: " + error, toast_notification::toast_type_t::error, 5.0f);
-		return false;
-	}
-	last_custom_bridge_dir() = host_bridge;
-	std::string guest_sample_utf8 = narrow_utf8(guest_sample.c_str());
-	diag::log_tagged_critical_fmt("spawn",
-		"custom_vm_bridge_activated host_bridge='%s' guest_bridge='%s' guest_sample='%s' args_len=%zu",
-		host_bridge_trim.c_str(),
-		guest_bridge_trim.c_str(),
-		guest_sample_utf8.c_str(),
-		args_trim.size());
-	toast_notification::push("Custom VM bridge activated. Start the guest command inside the VM.", toast_notification::toast_type_t::success, 5.0f);
 	return true;
 #endif
 }
@@ -642,6 +1019,14 @@ inline void request_open() {
 	diag::log_tagged_critical("spawn", "spawn_dialog_open_requested");
 }
 
+inline void request_open(const std::string& executable_path) {
+	request_open();
+	if (executable_path.empty())
+		return;
+	std::strncpy(detail::exe_buf(), executable_path.c_str(), 1023);
+	detail::exe_buf()[1023] = '\0';
+}
+
 inline bool consume_result(result_t& out) {
 	if (!detail::pending_result_ready()) return false;
 	out = std::move(detail::pending_result());
@@ -651,6 +1036,7 @@ inline bool consume_result(result_t& out) {
 }
 
 inline void render() {
+	detail::poll_custom_bridge_dispatch_failure();
 	static int s_last_render_frame = -1;
 	int cur_frame = ImGui::GetFrameCount();
 	if (s_last_render_frame == cur_frame) return;
@@ -680,12 +1066,13 @@ inline void render() {
 	ImGui::SetNextWindowSize(ImVec2(620.f, 0.f), ImGuiCond_Appearing);
 
 	bool open_flag_local = true;
+	const bool bridge_modal_pending = detail::custom_bridge_pending();
 	bool launch_now = false;
 	bool cancel_now = false;
 	bool close_parent_after_host_confirm = false;
 
 	if (ImGui::BeginPopupModal("Malware Lab Run###aida_spawn_target_dialog",
-	                           &open_flag_local,
+	                           bridge_modal_pending ? nullptr : &open_flag_local,
 	                           ImGuiWindowFlags_NoSavedSettings |
 	                           ImGuiWindowFlags_NoResize)) {
 
@@ -962,9 +1349,25 @@ inline void render() {
 		std::string exe_trim = detail::trim(detail::exe_buf());
 		std::string custom_bridge_trim = detail::trim(detail::custom_bridge_buf());
 		std::string custom_guest_bridge_trim = detail::trim(detail::custom_guest_bridge_buf());
+		const bool bridge_pending = detail::custom_bridge_pending();
+		if (detail::run_mode_choice() == 1 &&
+			detail::custom_bridge_status() != detail::custom_bridge_status_t::idle &&
+			!detail::custom_bridge_status_text().empty()) {
+			const ImVec4 status_color = detail::custom_bridge_status() == detail::custom_bridge_status_t::failed
+				? ImGui::ColorConvertU32ToFloat4(tk.error)
+				: detail::custom_bridge_status() == detail::custom_bridge_status_t::succeeded
+					? ImGui::ColorConvertU32ToFloat4(tk.success)
+					: detail::custom_bridge_status() == detail::custom_bridge_status_t::cancelled
+						? ImGui::ColorConvertU32ToFloat4(tk.warning)
+						: ImGui::ColorConvertU32ToFloat4(tk.info);
+			ImGui::TextColored(status_color, "%s", detail::custom_bridge_status_text().c_str());
+			if (bridge_pending)
+				ImGui::TextDisabled("The reviewed configuration remains editable after this operation reaches a terminal state.");
+			ImGui::Dummy(ImVec2(0.f, 4.f));
+		}
 		bool launch_disabled =
 			(detail::run_mode_choice() == 0 && (exe_trim.empty() || !detail::cached_capabilities().has_windows_sandbox))
-			|| (detail::run_mode_choice() == 1 && (custom_bridge_trim.empty() || custom_guest_bridge_trim.empty()))
+			|| (detail::run_mode_choice() == 1 && (custom_bridge_trim.empty() || custom_guest_bridge_trim.empty() || bridge_pending))
 			|| (detail::run_mode_choice() == 2 && exe_trim.empty());
 
 		float total_w = ImGui::GetContentRegionAvail().x;
@@ -976,10 +1379,14 @@ inline void render() {
 		ImGui::Dummy(ImVec2(row_x_offset, 0.f));
 		ImGui::SameLine();
 
-		if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
+		const char* cancel_label = bridge_pending ? "Cancel activation" : "Cancel";
+		if (aida::ui::button(cancel_label, aida::ui::button_kind_t::secondary,
 		                     aida::ui::size_t_::md,
 		                     ImVec2(btn_w, 40.f), false, nullptr, false)) {
-			cancel_now = true;
+			if (bridge_pending)
+				static_cast<void>(detail::request_custom_bridge_cancel());
+			else
+				cancel_now = true;
 		}
 		ImGui::SameLine(0.f, gap);
 		const char* launch_label = detail::run_mode_choice() == 0 ? "Open VM" : (detail::run_mode_choice() == 1 ? "Activate" : "Run Host");
@@ -988,10 +1395,24 @@ inline void render() {
 		                     ImVec2(btn_w, 40.f), launch_disabled, nullptr, false)) {
 			launch_now = true;
 		}
+		if (launch_disabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+			const char* reason = bridge_pending ?
+				"A custom VM bridge operation is already active; cancel it or wait for its terminal state." :
+				detail::run_mode_choice() == 1 ?
+					"Choose both the host bridge folder and guest shared-folder path." :
+					detail::run_mode_choice() == 0 ?
+						"Choose an executable and ensure Windows Sandbox is available." :
+						"Choose an executable before reviewing a Host run.";
+			ImGui::SetTooltip("%s", reason);
+		}
 
 		ImGuiIO& io = ImGui::GetIO();
-		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
-			cancel_now = true;
+		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+			if (bridge_pending)
+				static_cast<void>(detail::request_custom_bridge_cancel());
+			else
+				cancel_now = true;
+		}
 		if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !launch_disabled)
 			launch_now = true;
 
@@ -1005,7 +1426,7 @@ inline void render() {
 				ImGui::CloseCurrentPopup();
 				detail::open_flag() = false;
 			}
-		} else if (cancel_now || !open_flag_local) {
+		} else if ((cancel_now || !open_flag_local) && !bridge_pending) {
 			detail::pending_result_ready() = false;
 			detail::pending_result() = result_t{};
 			diag::log_tagged_critical("spawn", "spawn_dialog_cancelled");

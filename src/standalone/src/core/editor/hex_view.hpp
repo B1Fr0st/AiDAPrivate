@@ -9,8 +9,11 @@
 namespace hex_view {
 
 void activate(const disasm_view::workspace_context_t& context);
-bool read_live_memory(const disasm_view::workspace_context_t& context,
-                      std::uint64_t address, std::size_t size);
+bool focus_address(const disasm_view::workspace_context_t& context,
+                   const aida::analysis::address_t& address,
+                   std::string* error = nullptr);
+bool request_live_memory(const disasm_view::workspace_context_t& context,
+                         std::uint64_t address, std::size_t size);
 void close(const disasm_view::workspace_context_t& context);
 bool active(const disasm_view::workspace_context_t& context);
 std::string source_name(const disasm_view::workspace_context_t& context);

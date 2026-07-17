@@ -174,7 +174,7 @@ namespace {
     bool (*g_mcp_cancelled_fn)() = nullptr;
     std::atomic<bool> g_mcp_coverage_audit_started{false};
     std::atomic<bool> g_mcp_coverage_audit_completed{false};
-    constexpr int k_mcp_planned_tool_tests = 556;
+    constexpr int k_mcp_planned_tool_tests = 579;
     constexpr int k_expected_destructive_schema_only_exemptions = 6;
     constexpr DWORD k_camoufox_testlab_launch_timeout_ms = 75000;
     constexpr DWORD k_camoufox_dependency_probe_timeout_ms = 9000;
@@ -1174,6 +1174,7 @@ namespace {
     bool is_destructive_mcp_tool(const std::string& name) {
         static const std::set<std::string> exact = {
             "driver_call_function",
+            "driver_write_kernel_memory",
             "dx_hook_manage",
             "dx_dump_render_targets",
             "vmt_hook_manage",
@@ -1220,6 +1221,7 @@ namespace {
 
     bool mcp_tool_has_safe_external_guard_exemption(const std::string& name) {
         static const std::set<std::string> exact = {
+            "driver_write_kernel_memory",
             "drv_hook_manage",
             "network_decrypt_capture",
             "sandbox_execute",
@@ -8440,7 +8442,8 @@ namespace {
     mcp_tool_call_status_t classify_expected_false_pass(const std::string& tool_name,
                                                         const char* case_name,
                                                         const mcp_standalone::json& args) {
-        if (lower_copy(tool_name) == "drv_hook_manage")
+        if (lower_copy(tool_name) == "drv_hook_manage" ||
+            lower_copy(tool_name) == "driver_write_kernel_memory")
             return mcp_tool_call_status_t::security_guard_pass;
         const std::string label = lower_copy(tool_name + " " + (case_name ? std::string(case_name) : std::string()));
         if (label.find("confirm") != std::string::npos ||
@@ -24065,6 +24068,322 @@ void test_tool_scanner_undo(HANDLE hf, std::atomic<int>& passed, std::atomic<int
         driver_bridge::free_memory(addr);
     }
 
+    struct memory_tool_param_contract_t {
+        const char* name;
+        const char* type;
+        bool required;
+    };
+
+    bool test_memory_tool_schema_contract(HANDLE hf,
+                                          const char* tool_name,
+                                          bool expected_read_only,
+                                          std::initializer_list<memory_tool_param_contract_t> params,
+                                          std::atomic<int>& passed,
+                                          std::atomic<int>& failed) {
+        const char* tag = "mcp.memory_surface.schema";
+        const std::string tool = tool_name ? tool_name : "";
+        g_invoked_tools.insert(tool);
+        const auto* def = find_registered_tool(get_server(), tool_name);
+        if (!def) {
+            log_msg(hf, tag, "FAIL -- tool=\"%s\" not registered", tool.c_str());
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        if (def->read_only != expected_read_only) {
+            log_msg(hf, tag, "FAIL -- tool=\"%s\" read_only=%d expected=%d",
+                tool.c_str(), def->read_only ? 1 : 0, expected_read_only ? 1 : 0);
+            record_tool_status(tool, mcp_tool_call_status_t::failed);
+            failed.fetch_add(1);
+            return false;
+        }
+        for (const auto& expected : params) {
+            const auto it = std::find_if(def->params.begin(), def->params.end(), [&](const auto& actual) {
+                return actual.name == expected.name;
+            });
+            bool present = it != def->params.end();
+            std::string actual_type = present ? it->type : std::string();
+            bool actual_required = present && it->required;
+            if (!present && def->input_schema.is_object() &&
+                def->input_schema.contains("properties") && def->input_schema["properties"].is_object()) {
+                const auto property = def->input_schema["properties"].find(expected.name);
+                if (property != def->input_schema["properties"].end() && property->is_object()) {
+                    present = true;
+                    actual_type = property->value("type", std::string());
+                    if (def->input_schema.contains("required") && def->input_schema["required"].is_array()) {
+                        actual_required = std::any_of(def->input_schema["required"].begin(),
+                            def->input_schema["required"].end(), [&](const auto& name) {
+                                return name.is_string() && name.get<std::string>() == expected.name;
+                            });
+                    }
+                }
+            }
+            if (!present || actual_type != expected.type || actual_required != expected.required) {
+                log_msg(hf, tag,
+                    "FAIL -- tool=\"%s\" param=%s expected_type=%s expected_required=%d present=%d actual_type=%s actual_required=%d",
+                    tool.c_str(), expected.name, expected.type, expected.required ? 1 : 0,
+                    present ? 1 : 0,
+                    present ? actual_type.c_str() : "<missing>",
+                    actual_required ? 1 : 0);
+                record_tool_status(tool, mcp_tool_call_status_t::failed);
+                failed.fetch_add(1);
+                return false;
+            }
+        }
+        log_msg(hf, tag, "SCHEMA-PASS -- tool=\"%s\" read_only=%d checked_params=%zu",
+            tool.c_str(), def->read_only ? 1 : 0, params.size());
+        record_tool_status(tool, mcp_tool_call_status_t::schema_pass);
+        passed.fetch_add(1);
+        return true;
+    }
+
+    bool memory_typed_value_equals(const mcp_standalone::json& data,
+                                   std::uint64_t expected,
+                                   std::string& reason) {
+        if (!data.is_object() || !data.contains("typed") || !data["typed"].is_object()) {
+            reason = "typed decode object missing data=" + compact_json(data, 600);
+            return false;
+        }
+        std::uint64_t value = 0;
+        if (!payload_u64_field(data["typed"], "value", value) || value != expected) {
+            reason = "typed value mismatch expected=" + std::to_string(expected) +
+                " data=" + compact_json(data, 600);
+            return false;
+        }
+        return true;
+    }
+
+    void test_memory_tool_surface_contracts(HANDLE hf,
+                                            std::atomic<int>& passed,
+                                            std::atomic<int>& failed,
+                                            std::atomic<int>& skipped) {
+        (void)skipped;
+        const char* tag = "mcp.memory_surface";
+
+        test_memory_tool_schema_contract(hf, "read_memory", true,
+            {{"address", "string", false}, {"addresses", "array", false},
+             {"size", "number", false}, {"sizes", "array", false},
+             {"value_type", "string", false}, {"value_types", "array", false},
+             {"fields", "array", false}}, passed, failed);
+        test_memory_tool_schema_contract(hf, "read_struct", true,
+            {{"address", "string", true}, {"struct_name", "string", false},
+             {"fields", "array", false}}, passed, failed);
+        for (const char* tool : {"read_u8", "read_u16", "read_u32", "read_u64"}) {
+            test_memory_tool_schema_contract(hf, tool, true,
+                {{"address", "string", false}, {"addresses", "array", false}}, passed, failed);
+        }
+        test_memory_tool_schema_contract(hf, "read_bytes", true,
+            {{"address", "string", false}, {"addresses", "array", false},
+             {"size", "number", false}, {"sizes", "array", false}}, passed, failed);
+        test_memory_tool_schema_contract(hf, "driver_read_kernel_memory", true,
+            {{"address", "string", true}, {"size", "number", true}}, passed, failed);
+        test_memory_tool_schema_contract(hf, "driver_write_kernel_memory", false,
+            {{"address", "string", true}, {"bytes", "string", true},
+             {"expected_bytes", "string", false}, {"confirm_unsafe", "boolean", false},
+             {"dry_run", "boolean", false}}, passed, failed);
+        test_memory_tool_schema_contract(hf, "search_kernel_memory", true,
+            {{"pattern", "string", true}, {"address", "string", false},
+             {"start_address", "string", false}, {"size", "number", false},
+             {"module", "string", false}, {"offset", "number", false},
+             {"chunk_size", "number", false}, {"max_results", "number", false}}, passed, failed);
+
+        const std::vector<std::uint8_t> fixture_bytes = {
+            0x7A, 0x56, 0x34, 0x12,
+            0x78, 0x56, 0x34, 0x12,
+            0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
+            0x41, 0x49, 0x44, 0x41,
+            0xBE, 0xBA, 0xFE, 0xCA
+        };
+        scoped_coverage_domains_1_8_remote_region_t fixture(hf, tag);
+        if (!fixture.allocate(fixture_bytes, 4096)) {
+            const std::string fixture_reason = "private memory fixture allocation or write failed status=" +
+                driver_bridge::status() + " error=" + driver_bridge::last_error();
+            for (const char* tool : {"read_memory", "read_memory", "read_memory", "read_memory",
+                                     "read_struct", "read_u8", "read_u16", "read_u32", "read_u64", "read_bytes"})
+                test_coverage_domains_1_8_fixture_fail(hf, tag, tool, fixture_reason, failed);
+        } else {
+            const std::string base = hex_u64(fixture.addr);
+
+            test_coverage_domains_1_8_case(hf, tag, "read_memory", "arithmetic_address_expression",
+                mcp_standalone::json{{"address", base + "+0x4"}, {"size", 4}, {"value_type", "uint32"}}, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    return ir.success && memory_typed_value_equals(ir.data, 0x12345678ULL, reason);
+                }, passed, failed);
+
+            test_coverage_domains_1_8_case(hf, tag, "read_memory", "typed_multi_value_decode",
+                mcp_standalone::json{{"address", base + "+0x4"}, {"size", 8}, {"value_type", "uint32"}}, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success || !ir.data.contains("typed_values") || !ir.data["typed_values"].is_array() ||
+                        ir.data["typed_values"].size() != 2) {
+                        reason = "typed_values array missing or wrong size data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    std::uint64_t first = 0;
+                    std::uint64_t second = 0;
+                    if (!payload_u64_field(ir.data["typed_values"][0], "value", first) || first != 0x12345678ULL ||
+                        !payload_u64_field(ir.data["typed_values"][1], "value", second) || second != 0x89ABCDEFULL) {
+                        reason = "typed_values contents mismatch data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+
+            const mcp_standalone::json fields = mcp_standalone::json::array({
+                {{"name", "tag"}, {"offset", 0}, {"type", "uint8"}},
+                {{"name", "counter"}, {"offset", 4}, {"type", "uint32"}},
+                {{"name", "pointer"}, {"offset", 8}, {"type", "uint64"}}
+            });
+            test_coverage_domains_1_8_case(hf, tag, "read_memory", "typed_multi_field_struct_view",
+                mcp_standalone::json{{"address", base}, {"size", 16}, {"fields", fields}}, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success || !ir.data.contains("fields") || !ir.data["fields"].is_array() ||
+                        ir.data["fields"].size() != 3 || !ir.data.contains("struct") || !ir.data["struct"].is_object()) {
+                        reason = "fields/struct view missing data=" + compact_json(ir.data, 900);
+                        return false;
+                    }
+                    const auto& view = ir.data["struct"];
+                    std::uint64_t tag_value = 0;
+                    std::uint64_t counter = 0;
+                    std::uint64_t pointer = 0;
+                    if (!view.contains("tag") || !payload_u64_field(view["tag"], "value", tag_value) || tag_value != 0x7AULL ||
+                        !view.contains("counter") || !payload_u64_field(view["counter"], "value", counter) || counter != 0x12345678ULL ||
+                        !view.contains("pointer") || !payload_u64_field(view["pointer"], "value", pointer) || pointer != 0x0123456789ABCDEFULL) {
+                        reason = "struct field decode mismatch data=" + compact_json(ir.data, 900);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+
+            test_coverage_domains_1_8_case(hf, tag, "read_memory", "batch_addresses_sizes_types",
+                mcp_standalone::json{
+                    {"addresses", mcp_standalone::json::array({base, base + "+0x1", base + "+0x4"})},
+                    {"sizes", mcp_standalone::json::array({1, 2, 4})},
+                    {"value_types", mcp_standalone::json::array({"uint8", "uint16", "uint32"})}}, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    std::uint64_t count = 0;
+                    std::uint64_t succeeded = 0;
+                    std::uint64_t failed_count = 0;
+                    if (!ir.success || !payload_u64_field(ir.data, "count", count) || count != 3 ||
+                        !payload_u64_field(ir.data, "succeeded", succeeded) || succeeded != 3 ||
+                        !payload_u64_field(ir.data, "failed", failed_count) || failed_count != 0 ||
+                        !ir.data.contains("results") || !ir.data["results"].is_array() || ir.data["results"].size() != 3) {
+                        reason = "batch summary mismatch data=" + compact_json(ir.data, 900);
+                        return false;
+                    }
+                    const std::uint64_t expected[] = {0x7AULL, 0x3456ULL, 0x12345678ULL};
+                    for (std::size_t index = 0; index < 3; ++index) {
+                        bool success = false;
+                        std::uint64_t value = 0;
+                        const auto& item = ir.data["results"][index];
+                        if (!payload_bool_field(item, "success", success) || !success ||
+                            !item.contains("typed") || !payload_u64_field(item["typed"], "value", value) ||
+                            value != expected[index]) {
+                            reason = "batch item mismatch index=" + std::to_string(index) +
+                                " data=" + compact_json(ir.data, 900);
+                            return false;
+                        }
+                    }
+                    return true;
+                }, passed, failed);
+
+            test_coverage_domains_1_8_case(hf, tag, "read_struct", "named_struct_decode",
+                mcp_standalone::json{{"address", base}, {"size", 16}, {"fields", fields}}, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success || !ir.data.contains("struct") || !ir.data["struct"].is_object()) {
+                        reason = "read_struct view missing data=" + compact_json(ir.data, 800);
+                        return false;
+                    }
+                    std::uint64_t pointer = 0;
+                    if (!ir.data["struct"].contains("pointer") ||
+                        !payload_u64_field(ir.data["struct"]["pointer"], "value", pointer) ||
+                        pointer != 0x0123456789ABCDEFULL) {
+                        reason = "read_struct pointer mismatch data=" + compact_json(ir.data, 800);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+
+            const struct {
+                const char* tool;
+                const char* expression;
+                std::uint64_t expected;
+            } typed_cases[] = {
+                {"read_u8", "", 0x7AULL},
+                {"read_u16", "+0x1", 0x3456ULL},
+                {"read_u32", "+0x4", 0x12345678ULL},
+                {"read_u64", "+0x8", 0x0123456789ABCDEFULL}
+            };
+            for (const auto& typed_case : typed_cases) {
+                const std::uint64_t expected = typed_case.expected;
+                test_coverage_domains_1_8_case(hf, tag, typed_case.tool, "typed_shortcut_value",
+                    mcp_standalone::json{{"address", base + typed_case.expression}}, 5000,
+                    [expected](const invoke_result_t& ir, std::string& reason) {
+                        return ir.success && memory_typed_value_equals(ir.data, expected, reason);
+                    }, passed, failed);
+            }
+
+            test_coverage_domains_1_8_case(hf, tag, "read_bytes", "exact_byte_shortcut",
+                mcp_standalone::json{{"address", base + "+0x10"}, {"size", 4}}, 5000,
+                [](const invoke_result_t& ir, std::string& reason) {
+                    if (!ir.success || ir.data.value("hex", std::string()) != "41494441" || ir.data.contains("typed")) {
+                        reason = "read_bytes exact raw result mismatch data=" + compact_json(ir.data, 700);
+                        return false;
+                    }
+                    return true;
+                }, passed, failed);
+        }
+
+        invoke_result_t kernel_search;
+        const bool kernel_search_ok = test_coverage_domains_1_8_case(hf, tag, "search_kernel_memory",
+            "ntoskrnl_header_pattern", mcp_standalone::json{
+                {"module", "ntoskrnl.exe"}, {"offset", 0}, {"size", 4096},
+                {"pattern", "4D 5A"}, {"chunk_size", 4096}, {"max_results", 4}}, 10000,
+            [](const invoke_result_t& ir, std::string& reason) {
+                std::uint64_t match_count = 0;
+                if (!ir.success || !payload_u64_field(ir.data, "match_count", match_count) || match_count == 0 ||
+                    !ir.data.contains("matches") || !ir.data["matches"].is_array() || ir.data["matches"].empty() ||
+                    !ir.data["matches"][0].is_string()) {
+                    reason = "ntoskrnl MZ search did not return a match data=" + compact_json(ir.data, 900);
+                    return false;
+                }
+                return true;
+            }, passed, failed, &kernel_search);
+
+        if (!kernel_search_ok || !kernel_search.success || !kernel_search.data.contains("matches") ||
+            !kernel_search.data["matches"].is_array() || kernel_search.data["matches"].empty()) {
+            const std::string reason = "search_kernel_memory did not produce a kernel header address";
+            test_coverage_domains_1_8_fixture_fail(hf, tag, "driver_read_kernel_memory", reason, failed);
+            test_coverage_domains_1_8_fixture_fail(hf, tag, "driver_write_kernel_memory", reason, failed);
+            return;
+        }
+
+        const std::string kernel_header = kernel_search.data["matches"][0].get<std::string>();
+        test_coverage_domains_1_8_case(hf, tag, "driver_read_kernel_memory", "ntoskrnl_header_read",
+            mcp_standalone::json{{"address", kernel_header}, {"size", 2}}, 5000,
+            [](const invoke_result_t& ir, std::string& reason) {
+                bool complete = false;
+                std::uint64_t requested = 0;
+                std::uint64_t size = 0;
+                if (!ir.success || ir.data.value("hex", std::string()) != "4D5A" ||
+                    !payload_bool_field(ir.data, "complete", complete) || !complete ||
+                    !payload_u64_field(ir.data, "requested_size", requested) || requested != 2 ||
+                    !payload_u64_field(ir.data, "size", size) || size != 2) {
+                    reason = "kernel header read mismatch data=" + compact_json(ir.data, 900);
+                    return false;
+                }
+                return true;
+            }, passed, failed);
+
+        mcp_standalone::json unsafe_args{{"address", kernel_header}, {"bytes", "4D"}};
+        unsafe_args[k_test_lab_safe_fixture_flag] = true;
+        test_coverage_domains_1_8_case(hf, tag, "driver_write_kernel_memory", "live_write_requires_confirm_unsafe",
+            std::move(unsafe_args), 2500,
+            [](const invoke_result_t& ir, std::string& reason) {
+                return test_coverage_domains_1_8_expect_error_any(ir,
+                    {"confirm_unsafe=true", "confirm_unsafe", "can corrupt kernel state"}, reason);
+            }, passed, failed);
+    }
+
     void test_tool_scanner_write_value(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& failed, std::atomic<int>& skipped) {
         uint64_t addr = driver_bridge::allocate_memory(16);
         if (addr == 0) {
@@ -35485,6 +35804,7 @@ void phase_mcp_tests(HANDLE hf, std::atomic<int>& passed, std::atomic<int>& fail
     if (!cancelled()) test_tool_scanner_address_list_manage_list(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_address_list_manage_remove(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_read_memory_typed_value(hf, passed, failed, skipped);
+    if (!cancelled()) test_memory_tool_surface_contracts(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_write_value(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_pointer_scan(hf, passed, failed, skipped);
     if (!cancelled()) test_tool_scanner_cancel_pointer_scan(hf, passed, failed, skipped);

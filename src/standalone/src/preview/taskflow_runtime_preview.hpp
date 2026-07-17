@@ -517,6 +517,9 @@ inline void ensure_preview_workers() {
     g_workers_stop = false;
     g_workers_started = true;
     g_live_workers = 0;
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    return;
+#else
     try {
         for (std::size_t index = 0; index < kPreviewWorkerCount; ++index) {
             g_workers.emplace_back([]() { preview_worker_loop(); });
@@ -529,6 +532,29 @@ inline void ensure_preview_workers() {
         g_workers_cv.notify_all();
         throw;
     }
+#endif
+}
+
+inline std::size_t drain_preview_work(std::size_t maximum_jobs = 1) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    std::size_t drained = 0;
+    while (drained < maximum_jobs) {
+        preview_work_item_t item;
+        {
+            std::lock_guard<std::mutex> lock(g_workers_mutex);
+            if (g_workers_stop || g_work_queue.empty())
+                break;
+            item = std::move(g_work_queue.front());
+            g_work_queue.pop_front();
+        }
+        preview_execute_job(std::move(item));
+        ++drained;
+    }
+    return drained;
+#else
+    static_cast<void>(maximum_jobs);
+    return 0;
+#endif
 }
 
 inline submit_result_t preview_submit(task_descriptor_t&& descriptor, bool graph,

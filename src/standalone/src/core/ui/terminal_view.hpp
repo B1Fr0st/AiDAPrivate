@@ -6,6 +6,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include "../infra/win_thread.hpp"
+#include "../../helpers/diag_log.hpp"
 #endif
 #include "imgui/imgui.h"
 #include "theme.hpp"
@@ -16,12 +17,19 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <cwchar>
+#include <cwctype>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace terminal_view
@@ -35,6 +43,14 @@ struct Cell {
     bool     bold  = false;
 };
 
+enum class ansi_state_t : std::uint8_t {
+    normal,
+    escape,
+    csi,
+    osc,
+    osc_escape
+};
+
 
 struct TerminalSession
 {
@@ -44,20 +60,33 @@ struct TerminalSession
     HANDLE               hPipeOut     = INVALID_HANDLE_VALUE;
     HANDLE               hProcess     = INVALID_HANDLE_VALUE;
     HANDLE               hThread      = INVALID_HANDLE_VALUE;
+    HANDLE               hJob         = INVALID_HANDLE_VALUE;
 
 
     aida::infra::win_thread::joinable_thread_t reader_thread;
+    aida::infra::win_thread::joinable_thread_t writer_thread;
     std::atomic<bool>    stop_reader{false};
     std::atomic<bool>    reader_done{true};
+    std::atomic<bool>    writer_done{true};
 #else
     std::atomic<bool>    stop_reader{false};
     std::atomic<bool>    reader_done{true};
+    std::atomic<bool>    writer_done{true};
 #endif
+
+
+    std::mutex           input_mtx;
+    std::condition_variable input_cv;
+    std::deque<std::string> input_queue;
+    std::size_t          input_queue_bytes = 0;
+    std::string          input_error;
+    static constexpr std::size_t MAX_INPUT_QUEUE_BYTES = 1ULL << 20;
 
 
     std::mutex           buffer_mtx;
     std::deque<std::vector<Cell>> lines;
-    static constexpr int MAX_LINES = 10000;
+    static constexpr int DEFAULT_MAX_LINES = 10000;
+    int                  max_lines = DEFAULT_MAX_LINES;
     int                  cols     = 120;
     int                  rows_vis = 24;
 
@@ -78,6 +107,25 @@ struct TerminalSession
 
     std::string          title = "Terminal";
     std::atomic<bool>    alive{false};
+    std::uint64_t        id = 0;
+    std::string          profile_id;
+    std::string          profile_label;
+    std::wstring         command;
+    std::wstring         cwd;
+    std::string          start_error;
+    std::atomic<std::uint32_t> exit_code{std::numeric_limits<std::uint32_t>::max()};
+    std::atomic<std::uint64_t> buffer_generation{1};
+    bool                 focused = false;
+
+    struct search_match_t {
+        int line = 0;
+        int column = 0;
+        int length = 0;
+    };
+    std::string          search_query;
+    std::vector<search_match_t> search_matches;
+    int                  active_search_match = -1;
+    std::uint64_t        searched_generation = 0;
 
 
     char                 input_buf[4096] = {};
@@ -87,6 +135,8 @@ struct TerminalSession
     std::deque<float>    line_entrance_time;
     aida::ui::flash_t    bell_flash;
     std::atomic<bool>    bell_pending{false};
+    ansi_state_t         ansi_state = ansi_state_t::normal;
+    std::string          ansi_params;
 };
 
 
@@ -250,61 +300,55 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
 {
     std::lock_guard<std::mutex> lk(s.buffer_mtx);
 
-    enum { NORMAL, ESC, CSI } state = NORMAL;
-    std::string csi_params;
-
     for (size_t i = 0; i < len; ++i) {
         char ch = data[i];
-        switch (state) {
-        case NORMAL:
+        switch (s.ansi_state) {
+        case ansi_state_t::normal:
             if (ch == '\x1b') {
-                state = ESC;
+                s.ansi_state = ansi_state_t::escape;
             } else {
                 push_char(s, ch);
             }
             break;
-        case ESC:
+        case ansi_state_t::escape:
             if (ch == '[') {
-                state = CSI;
-                csi_params.clear();
+                s.ansi_state = ansi_state_t::csi;
+                s.ansi_params.clear();
             } else if (ch == ']') {
-
-                for (++i; i < len; ++i) {
-                    if (data[i] == '\x07') {
-                        s.bell_pending.store(true, std::memory_order_release);
-                        break;
-                    }
-                    if (data[i] == '\x1b' && i + 1 < len && data[i + 1] == '\\') { ++i; break; }
-                }
-                state = NORMAL;
+                s.ansi_state = ansi_state_t::osc;
             } else {
-                state = NORMAL;
+                s.ansi_state = ansi_state_t::normal;
             }
             break;
-        case CSI:
+        case ansi_state_t::csi:
             if ((ch >= '0' && ch <= '9') || ch == ';' || ch == '?') {
-                csi_params += ch;
+                if (s.ansi_params.size() < 128)
+                    s.ansi_params += ch;
+                else {
+                    s.ansi_params.clear();
+                    s.ansi_state = ansi_state_t::normal;
+                }
             } else {
 
                 if (ch == 'm') {
-                    parse_ansi_sgr(s, csi_params);
+                    parse_ansi_sgr(s, s.ansi_params);
                 } else if (ch == 'H' || ch == 'f') {
 
                     int r = 1, c2 = 1;
-                    if (!csi_params.empty()) {
-                        auto semi = csi_params.find(';');
+                    if (!s.ansi_params.empty()) {
+                        auto semi = s.ansi_params.find(';');
                         if (semi != std::string::npos) {
-                            r  = std::max(1, atoi(csi_params.substr(0, semi).c_str()));
-                            c2 = std::max(1, atoi(csi_params.substr(semi + 1).c_str()));
+                            r  = std::max(1, atoi(s.ansi_params.substr(0, semi).c_str()));
+                            c2 = std::max(1, atoi(s.ansi_params.substr(semi + 1).c_str()));
                         } else {
-                            r = std::max(1, atoi(csi_params.c_str()));
+                            r = std::max(1, atoi(s.ansi_params.c_str()));
                         }
                     }
                     s.cursor_row = r - 1;
                     s.cursor_col = c2 - 1;
                 } else if (ch == 'J') {
 
-                    int mode = csi_params.empty() ? 0 : atoi(csi_params.c_str());
+                    int mode = s.ansi_params.empty() ? 0 : atoi(s.ansi_params.c_str());
                     if (mode == 2 || mode == 3) {
                         s.lines.clear();
                         s.cursor_row = 0;
@@ -314,7 +358,7 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
 
                     ensure_line(s, s.cursor_row);
                     auto& row = s.lines[static_cast<size_t>(s.cursor_row)];
-                    int mode = csi_params.empty() ? 0 : atoi(csi_params.c_str());
+                    int mode = s.ansi_params.empty() ? 0 : atoi(s.ansi_params.c_str());
                     if (mode == 0) {
                         for (int j = s.cursor_col; j < static_cast<int>(row.size()); ++j)
                             row[static_cast<size_t>(j)] = Cell{};
@@ -325,31 +369,44 @@ inline void process_output(TerminalSession& s, const char* data, size_t len)
                         for (auto& cell : row) cell = Cell{};
                     }
                 } else if (ch == 'A') {
-                    int n = csi_params.empty() ? 1 : std::max(1, atoi(csi_params.c_str()));
+                    int n = s.ansi_params.empty() ? 1 : std::max(1, atoi(s.ansi_params.c_str()));
                     s.cursor_row = std::max(0, s.cursor_row - n);
                 } else if (ch == 'B') {
-                    int n = csi_params.empty() ? 1 : std::max(1, atoi(csi_params.c_str()));
+                    int n = s.ansi_params.empty() ? 1 : std::max(1, atoi(s.ansi_params.c_str()));
                     s.cursor_row += n;
                 } else if (ch == 'C') {
-                    int n = csi_params.empty() ? 1 : std::max(1, atoi(csi_params.c_str()));
+                    int n = s.ansi_params.empty() ? 1 : std::max(1, atoi(s.ansi_params.c_str()));
                     s.cursor_col = std::min(s.cols - 1, s.cursor_col + n);
                 } else if (ch == 'D') {
-                    int n = csi_params.empty() ? 1 : std::max(1, atoi(csi_params.c_str()));
+                    int n = s.ansi_params.empty() ? 1 : std::max(1, atoi(s.ansi_params.c_str()));
                     s.cursor_col = std::max(0, s.cursor_col - n);
                 }
 
-                state = NORMAL;
+                s.ansi_params.clear();
+                s.ansi_state = ansi_state_t::normal;
             }
+            break;
+        case ansi_state_t::osc:
+            if (ch == '\x07') {
+                s.bell_pending.store(true, std::memory_order_release);
+                s.ansi_state = ansi_state_t::normal;
+            } else if (ch == '\x1b') {
+                s.ansi_state = ansi_state_t::osc_escape;
+            }
+            break;
+        case ansi_state_t::osc_escape:
+            s.ansi_state = ch == '\\' ? ansi_state_t::normal : ansi_state_t::osc;
             break;
         }
     }
 
 
-    while (static_cast<int>(s.lines.size()) > TerminalSession::MAX_LINES) {
+    while (static_cast<int>(s.lines.size()) > s.max_lines) {
         s.lines.pop_front();
         if (s.cursor_row > 0) s.cursor_row--;
     }
     if (s.cursor_row < 0) s.cursor_row = 0;
+    s.buffer_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 
@@ -368,6 +425,11 @@ inline void reader_thread_func(TerminalSession* s)
             BOOL ok = ReadFile(s->hPipeIn, buf, sizeof(buf), &bytes_read, nullptr);
             if (!ok || bytes_read == 0) {
                 s->alive.store(false, std::memory_order_release);
+                if (s->hProcess != INVALID_HANDLE_VALUE) {
+                    DWORD code = STILL_ACTIVE;
+                    if (GetExitCodeProcess(s->hProcess, &code) && code != STILL_ACTIVE)
+                        s->exit_code.store(static_cast<std::uint32_t>(code), std::memory_order_release);
+                }
                 break;
             }
             process_output(*s, buf, bytes_read);
@@ -380,10 +442,62 @@ inline void reader_thread_func(TerminalSession* s)
 }
 
 
-inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
+inline void writer_thread_func(TerminalSession* s)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    (void)shell;
+    if (s)
+        s->writer_done.store(true, std::memory_order_release);
+#else
+    if (!s)
+        return;
+    for (;;) {
+        std::string input;
+        {
+            std::unique_lock<std::mutex> lock(s->input_mtx);
+            s->input_cv.wait(lock, [s]() {
+                return s->stop_reader.load(std::memory_order_acquire) || !s->input_queue.empty();
+            });
+            if (s->stop_reader.load(std::memory_order_acquire)) {
+                s->input_queue.clear();
+                s->input_queue_bytes = 0;
+                break;
+            }
+            input = std::move(s->input_queue.front());
+            s->input_queue.pop_front();
+            s->input_queue_bytes -= input.size();
+        }
+        std::size_t offset = 0;
+        bool failed = false;
+        while (offset < input.size() && !s->stop_reader.load(std::memory_order_acquire)) {
+            const DWORD requested = static_cast<DWORD>((std::min)(
+                input.size() - offset, static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+            DWORD written = 0;
+            if (s->hPipeOut == INVALID_HANDLE_VALUE ||
+                !WriteFile(s->hPipeOut, input.data() + offset, requested, &written, nullptr) || written == 0) {
+                const DWORD error = GetLastError();
+                std::lock_guard<std::mutex> lock(s->input_mtx);
+                s->input_error = "Terminal input failed (Win32 " + std::to_string(error) + ")";
+                s->input_queue.clear();
+                s->input_queue_bytes = 0;
+                failed = true;
+                break;
+            }
+            offset += written;
+        }
+        if (failed)
+            break;
+    }
+    s->writer_done.store(true, std::memory_order_release);
+#endif
+}
+
+
+inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr,
+                           const wchar_t* cwd = nullptr)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    s.command = shell ? shell : L"powershell.exe";
+    s.cwd = cwd ? cwd : L"C:\\analysis";
     {
         std::lock_guard<std::mutex> lk(s.buffer_mtx);
         s.lines.clear();
@@ -404,22 +518,34 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
         "\x1b[38;5;114m[ready]\x1b[0m  2,814 functions  47,203 xrefs  186 imports\r\n"
         "PS C:\\analysis> ";
     process_output(s, fixture, sizeof(fixture) - 1);
-    s.title = "PowerShell - AiDA Workspace";
     s.alive.store(true, std::memory_order_release);
+    s.exit_code.store(std::numeric_limits<std::uint32_t>::max(), std::memory_order_release);
+    s.buffer_generation.fetch_add(1, std::memory_order_acq_rel);
     s.reader_done.store(true, std::memory_order_release);
     return true;
 #else
     if (!shell)
         shell = L"powershell.exe";
+    if (*shell == L'\0') {
+        s.start_error = "The terminal profile has no command";
+        return false;
+    }
+    s.command = shell;
+    s.cwd = cwd ? cwd : L"";
+    s.start_error.clear();
 
 
     HANDLE hPipeInRead = INVALID_HANDLE_VALUE, hPipeInWrite = INVALID_HANDLE_VALUE;
     HANDLE hPipeOutRead = INVALID_HANDLE_VALUE, hPipeOutWrite = INVALID_HANDLE_VALUE;
     if (!CreatePipe(&hPipeInRead, &hPipeInWrite, nullptr, 0))
+    {
+        s.start_error = "CreatePipe for terminal input failed (" + std::to_string(GetLastError()) + ")";
         return false;
+    }
     if (!CreatePipe(&hPipeOutRead, &hPipeOutWrite, nullptr, 0)) {
         CloseHandle(hPipeInRead);
         CloseHandle(hPipeInWrite);
+        s.start_error = "CreatePipe for terminal output failed (" + std::to_string(GetLastError()) + ")";
         return false;
     }
 
@@ -434,6 +560,7 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
         CloseHandle(hPipeInWrite);
         CloseHandle(hPipeOutRead);
         CloseHandle(hPipeOutWrite);
+        s.start_error = "CreatePseudoConsole failed (" + std::to_string(static_cast<unsigned long>(hr)) + ")";
         return false;
     }
 
@@ -454,6 +581,7 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
         s.hPC = INVALID_HANDLE_VALUE;
         CloseHandle(s.hPipeIn);
         CloseHandle(s.hPipeOut);
+        s.start_error = "InitializeProcThreadAttributeList failed (" + std::to_string(GetLastError()) + ")";
         return false;
     }
     if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
@@ -463,6 +591,7 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
         s.hPC = INVALID_HANDLE_VALUE;
         CloseHandle(s.hPipeIn);
         CloseHandle(s.hPipeOut);
+        s.start_error = "UpdateProcThreadAttribute failed (" + std::to_string(GetLastError()) + ")";
         return false;
     }
 
@@ -471,25 +600,87 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
     si.lpAttributeList = attr_list;
 
     PROCESS_INFORMATION pi{};
-    wchar_t cmd[512];
-    wcscpy_s(cmd, shell);
+    std::vector<wchar_t> cmd(shell, shell + std::wcslen(shell) + 1);
 
-    BOOL created = CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
-                                  EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                                  nullptr, nullptr, &si.StartupInfo, &pi);
-    DeleteProcThreadAttributeList(attr_list);
-
-    if (!created) {
+    s.hJob = CreateJobObjectW(nullptr, nullptr);
+    if (s.hJob == INVALID_HANDLE_VALUE || s.hJob == nullptr) {
+        s.hJob = INVALID_HANDLE_VALUE;
+        DeleteProcThreadAttributeList(attr_list);
         ClosePseudoConsole(s.hPC);
         s.hPC = INVALID_HANDLE_VALUE;
         CloseHandle(s.hPipeIn);
         CloseHandle(s.hPipeOut);
+        s.start_error = "CreateJobObject failed (" + std::to_string(GetLastError()) + ")";
+        return false;
+    }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(s.hJob, JobObjectExtendedLimitInformation,
+            &limits, sizeof(limits))) {
+        const DWORD error = GetLastError();
+        CloseHandle(s.hJob);
+        s.hJob = INVALID_HANDLE_VALUE;
+        DeleteProcThreadAttributeList(attr_list);
+        ClosePseudoConsole(s.hPC);
+        s.hPC = INVALID_HANDLE_VALUE;
+        CloseHandle(s.hPipeIn);
+        CloseHandle(s.hPipeOut);
+        s.start_error = "SetInformationJobObject failed (" + std::to_string(error) + ")";
+        return false;
+    }
+
+    BOOL created = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                                  EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT |
+                                      CREATE_SUSPENDED,
+                                  nullptr, s.cwd.empty() ? nullptr : s.cwd.c_str(),
+                                  &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(attr_list);
+
+    if (!created) {
+        const DWORD error = GetLastError();
+        ClosePseudoConsole(s.hPC);
+        s.hPC = INVALID_HANDLE_VALUE;
+        CloseHandle(s.hPipeIn);
+        CloseHandle(s.hPipeOut);
+        CloseHandle(s.hJob);
+        s.hJob = INVALID_HANDLE_VALUE;
+        s.start_error = "CreateProcessW failed (" + std::to_string(error) + ")";
+        return false;
+    }
+
+    if (!AssignProcessToJobObject(s.hJob, pi.hProcess)) {
+        const DWORD error = GetLastError();
+        TerminateProcess(pi.hProcess, error);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        ClosePseudoConsole(s.hPC);
+        s.hPC = INVALID_HANDLE_VALUE;
+        CloseHandle(s.hPipeIn);
+        CloseHandle(s.hPipeOut);
+        CloseHandle(s.hJob);
+        s.hJob = INVALID_HANDLE_VALUE;
+        s.start_error = "AssignProcessToJobObject failed (" + std::to_string(error) + ")";
+        return false;
+    }
+    if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
+        const DWORD error = GetLastError();
+        TerminateJobObject(s.hJob, error);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        ClosePseudoConsole(s.hPC);
+        s.hPC = INVALID_HANDLE_VALUE;
+        CloseHandle(s.hPipeIn);
+        CloseHandle(s.hPipeOut);
+        CloseHandle(s.hJob);
+        s.hJob = INVALID_HANDLE_VALUE;
+        s.start_error = "ResumeThread failed (" + std::to_string(error) + ")";
         return false;
     }
 
     s.hProcess = pi.hProcess;
     s.hThread  = pi.hThread;
     s.alive.store(true, std::memory_order_release);
+    s.exit_code.store(std::numeric_limits<std::uint32_t>::max(), std::memory_order_release);
 
 
     s.stop_reader.store(false, std::memory_order_release);
@@ -499,6 +690,7 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
             &reader_err,
             aida::infra::win_thread::default_stack_reserve,
             "terminal_reader")) {
+        s.start_error = reader_err.empty() ? "The terminal reader thread could not start" : reader_err;
         s.stop_reader.store(true, std::memory_order_release);
         s.reader_done.store(true, std::memory_order_release);
         s.alive.store(false, std::memory_order_release);
@@ -523,6 +715,10 @@ inline bool create_session(TerminalSession& s, const wchar_t* shell = nullptr)
             CloseHandle(s.hThread);
             s.hThread = INVALID_HANDLE_VALUE;
         }
+        if (s.hJob != INVALID_HANDLE_VALUE) {
+            CloseHandle(s.hJob);
+            s.hJob = INVALID_HANDLE_VALUE;
+        }
         return false;
     }
 
@@ -538,10 +734,35 @@ inline void send_input(TerminalSession& s, const char* data, size_t len)
         return;
     process_output(s, data, len);
 #else
-    if (s.hPipeOut == INVALID_HANDLE_VALUE || !s.alive.load(std::memory_order_acquire))
+    if (s.hPipeOut == INVALID_HANDLE_VALUE || !s.alive.load(std::memory_order_acquire) ||
+        data == nullptr || len == 0)
         return;
-    DWORD written = 0;
-    WriteFile(s.hPipeOut, data, static_cast<DWORD>(len), &written, nullptr);
+    std::unique_lock<std::mutex> lock(s.input_mtx);
+    if (!s.input_error.empty())
+        return;
+    if (len > TerminalSession::MAX_INPUT_QUEUE_BYTES ||
+        s.input_queue_bytes > TerminalSession::MAX_INPUT_QUEUE_BYTES - len) {
+        s.input_error = "Terminal input queue is full; the child process is not accepting input";
+        return;
+    }
+    if (!s.writer_thread.joinable()) {
+        s.writer_done.store(false, std::memory_order_release);
+        std::string error;
+        if (!s.writer_thread.start([&s]() { writer_thread_func(&s); }, &error,
+                aida::infra::win_thread::default_stack_reserve, "terminal_writer")) {
+            s.writer_done.store(true, std::memory_order_release);
+            s.input_error = error.empty() ? "The terminal input worker could not start" : error;
+            return;
+        }
+    }
+    if (!s.input_queue.empty() && len <= (64ULL << 10) &&
+        s.input_queue.back().size() <= (64ULL << 10) - len)
+        s.input_queue.back().append(data, len);
+    else
+        s.input_queue.emplace_back(data, len);
+    s.input_queue_bytes += len;
+    lock.unlock();
+    s.input_cv.notify_one();
 #endif
 }
 
@@ -556,6 +777,11 @@ inline void clear_session(TerminalSession& s)
     s.scroll_to_bottom = true;
     s.auto_follow = true;
     s.prev_line_count = 0;
+    s.search_matches.clear();
+    s.active_search_match = -1;
+    s.ansi_state = ansi_state_t::normal;
+    s.ansi_params.clear();
+    s.buffer_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 inline bool try_clear_session(TerminalSession& s)
@@ -571,6 +797,65 @@ inline bool try_clear_session(TerminalSession& s)
     s.scroll_to_bottom = true;
     s.auto_follow = true;
     s.prev_line_count = 0;
+    s.search_matches.clear();
+    s.active_search_match = -1;
+    s.buffer_generation.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+inline bool refresh_search(TerminalSession& s, const std::string& query)
+{
+    const std::uint64_t generation = s.buffer_generation.load(std::memory_order_acquire);
+    if (query == s.search_query && generation == s.searched_generation)
+        return true;
+    std::unique_lock<std::mutex> lock(s.buffer_mtx, std::try_to_lock);
+    if (!lock.owns_lock())
+        return false;
+    std::vector<TerminalSession::search_match_t> matches;
+    if (!query.empty()) {
+        for (std::size_t line_index = 0; line_index < s.lines.size(); ++line_index) {
+            const auto& line = s.lines[line_index];
+            std::string text;
+            text.reserve(line.size());
+            for (const auto& cell : line)
+                text.push_back(cell.ch);
+            auto begin = text.begin();
+            while (begin != text.end()) {
+                const auto found = std::search(begin, text.end(), query.begin(), query.end(),
+                    [](unsigned char left, unsigned char right) {
+                        return std::tolower(left) == std::tolower(right);
+                    });
+                if (found == text.end())
+                    break;
+                const auto column = static_cast<int>(std::distance(text.begin(), found));
+                matches.push_back({static_cast<int>(line_index), column,
+                    static_cast<int>(query.size())});
+                begin = found + 1;
+            }
+        }
+    }
+    s.search_query = query;
+    s.search_matches = std::move(matches);
+    s.searched_generation = generation;
+    if (s.search_matches.empty())
+        s.active_search_match = -1;
+    else if (s.active_search_match < 0 ||
+             s.active_search_match >= static_cast<int>(s.search_matches.size()))
+        s.active_search_match = 0;
+    return true;
+}
+
+inline bool move_search_match(TerminalSession& s, int delta)
+{
+    if (s.search_matches.empty())
+        return false;
+    const int count = static_cast<int>(s.search_matches.size());
+    int next = s.active_search_match < 0 ? 0 : s.active_search_match + delta;
+    next %= count;
+    if (next < 0) next += count;
+    s.active_search_match = next;
+    s.auto_follow = false;
+    s.scroll_y = static_cast<float>(s.search_matches[static_cast<std::size_t>(next)].line);
     return true;
 }
 
@@ -612,17 +897,57 @@ inline void resize_pty(TerminalSession& s, int cols, int rows)
 }
 
 
-inline void destroy_session(TerminalSession& s)
+inline void release_session_process_handles(TerminalSession& s)
+{
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (s.hProcess != INVALID_HANDLE_VALUE) {
+        CloseHandle(s.hProcess);
+        s.hProcess = INVALID_HANDLE_VALUE;
+    }
+    if (s.hThread != INVALID_HANDLE_VALUE) {
+        CloseHandle(s.hThread);
+        s.hThread = INVALID_HANDLE_VALUE;
+    }
+#else
+    (void)s;
+#endif
+}
+
+inline bool finalize_destroyed_session(TerminalSession& s, std::uint32_t timeout_ms)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    (void)timeout_ms;
+    s.reader_done.store(true, std::memory_order_release);
+    s.writer_done.store(true, std::memory_order_release);
+    return true;
+#else
+    if (s.reader_thread.joinable() && !s.reader_thread.join_for(timeout_ms))
+        return false;
+    if (s.writer_thread.joinable() && !s.writer_thread.join_for(timeout_ms))
+        return false;
+    if (!s.reader_done.load(std::memory_order_acquire))
+        return false;
+    if (!s.writer_done.load(std::memory_order_acquire))
+        return false;
+    release_session_process_handles(s);
+    return true;
+#endif
+}
+
+inline bool destroy_session(TerminalSession& s)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     s.stop_reader.store(true, std::memory_order_release);
     s.alive.store(false, std::memory_order_release);
     s.reader_done.store(true, std::memory_order_release);
+    s.writer_done.store(true, std::memory_order_release);
+    return true;
 #else
     s.stop_reader.store(true, std::memory_order_release);
     s.alive.store(false, std::memory_order_release);
 
     unsigned reader_tid = 0;
+    unsigned writer_tid = 0;
     const HANDLE log_pipe_in = s.hPipeIn;
     const HANDLE log_pipe_out = s.hPipeOut;
     const HPCON log_hpc = s.hPC;
@@ -637,6 +962,17 @@ inline void destroy_session(TerminalSession& s)
             }
         }
     }
+    if (s.writer_thread.joinable()) {
+        writer_tid = s.writer_thread.id();
+        if (writer_tid != 0) {
+            HANDLE hThread = OpenThread(THREAD_TERMINATE, FALSE, static_cast<DWORD>(writer_tid));
+            if (hThread) {
+                CancelSynchronousIo(hThread);
+                CloseHandle(hThread);
+            }
+        }
+    }
+    s.input_cv.notify_all();
 
     if (s.hPipeOut != INVALID_HANDLE_VALUE) {
         CloseHandle(s.hPipeOut);
@@ -650,31 +986,24 @@ inline void destroy_session(TerminalSession& s)
         ClosePseudoConsole(s.hPC);
         s.hPC = INVALID_HANDLE_VALUE;
     }
-    if (s.hProcess != INVALID_HANDLE_VALUE)
+    if (s.hJob != INVALID_HANDLE_VALUE) {
+        TerminateJobObject(s.hJob, 0);
+        CloseHandle(s.hJob);
+        s.hJob = INVALID_HANDLE_VALUE;
+    } else if (s.hProcess != INVALID_HANDLE_VALUE) {
         TerminateProcess(s.hProcess, 0);
-    if (s.reader_thread.joinable()) {
-        if (!s.reader_thread.join_for(10000)) {
-            diag::log_tagged_fmt("terminal",
-                "reader_join_timeout tid=%u pipe_in=%p pipe_out=%p hpc=%p process=%p",
-                reader_tid,
-                log_pipe_in,
-                log_pipe_out,
-                log_hpc,
-                log_process);
-            s.reader_thread.join();
-        }
     }
-    while (!s.reader_done.load(std::memory_order_acquire)) {
-        Sleep(1);
-    }
-    if (s.hProcess != INVALID_HANDLE_VALUE) {
-        CloseHandle(s.hProcess);
-        s.hProcess = INVALID_HANDLE_VALUE;
-    }
-    if (s.hThread != INVALID_HANDLE_VALUE) {
-        CloseHandle(s.hThread);
-        s.hThread = INVALID_HANDLE_VALUE;
-    }
+    if (finalize_destroyed_session(s, 0))
+        return true;
+    diag::log_tagged_fmt("terminal",
+        "terminal_workers_join_deferred reader_tid=%u writer_tid=%u pipe_in=%p pipe_out=%p hpc=%p process=%p",
+        reader_tid,
+        writer_tid,
+        log_pipe_in,
+        log_pipe_out,
+        log_hpc,
+        log_process);
+    return false;
 #endif
 }
 
@@ -695,6 +1024,18 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
         return;
+    }
+    s.focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+
+    std::string input_error;
+    {
+        std::unique_lock<std::mutex> lock(s.input_mtx, std::try_to_lock);
+        if (lock.owns_lock())
+            input_error = s.input_error;
+    }
+    if (!input_error.empty()) {
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.error), "%s", input_error.c_str());
+        ImGui::Separator();
     }
 
     ImFont* mono = aida::ui::fonts::code();
@@ -747,7 +1088,7 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
             int line_idx = total_lines - new_lines_added + i;
             if (line_idx < 0) continue;
             s.line_entrance_time.push_back(aida::ui::clock::seconds());
-            while (s.line_entrance_time.size() > static_cast<size_t>(TerminalSession::MAX_LINES))
+            while (s.line_entrance_time.size() > static_cast<size_t>(s.max_lines))
                 s.line_entrance_time.pop_front();
         }
     } else if (burst) {
@@ -823,6 +1164,21 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 
             const float y = origin.y + static_cast<float>(vi) * line_height + row_y_off;
 
+            auto match = std::lower_bound(s.search_matches.begin(), s.search_matches.end(), line_idx,
+                [](const TerminalSession::search_match_t& value, int line) {
+                    return value.line < line;
+                });
+            while (match != s.search_matches.end() && match->line == line_idx) {
+                const int match_index = static_cast<int>(std::distance(s.search_matches.begin(), match));
+                const ImU32 color = match_index == s.active_search_match
+                    ? aida::ui::with_alpha(terminal_accent, 0.55f)
+                    : aida::ui::with_alpha(th.warning, 0.30f);
+                const float left = origin.x + static_cast<float>(match->column) * char_width;
+                const float right = left + static_cast<float>(match->length) * char_width;
+                dl->AddRectFilled(ImVec2(left, y), ImVec2(right, y + line_height), color, 1.0f);
+                ++match;
+            }
+
             const size_t rendered_columns = std::min(row.size(),
                 static_cast<size_t>(std::max(0, s.cols)));
             for (size_t ci = 0; ci < rendered_columns; ++ci) {
@@ -881,21 +1237,105 @@ inline void render_terminal(TerminalSession& s, const ImVec2& size, ImU32 bg_col
 }
 
 
+struct profile_t {
+    std::string id;
+    std::string label;
+    std::wstring command;
+};
+
+inline std::vector<profile_t> available_profiles(const std::string& configured_shell)
+{
+    std::vector<profile_t> profiles;
+    std::unordered_set<std::wstring> commands;
+    const auto add = [&](std::string id, std::string label, std::wstring command) {
+        if (command.empty()) return;
+        std::wstring key = command;
+        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t ch) {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+        if (commands.insert(key).second)
+            profiles.push_back({std::move(id), std::move(label), std::move(command)});
+    };
+    add("configured", "Configured Shell",
+        std::wstring(configured_shell.begin(), configured_shell.end()));
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    add("powershell", "Windows PowerShell", L"powershell.exe");
+    add("cmd", "Command Prompt", L"cmd.exe");
+#else
+    const auto resolved = [](const wchar_t* executable) {
+        std::vector<wchar_t> buffer(32768);
+        const DWORD count = SearchPathW(nullptr, executable, nullptr,
+            static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
+        if (count == 0 || count >= buffer.size()) return std::wstring{};
+        const std::wstring path(buffer.data(), count);
+        return path.find(L' ') == std::wstring::npos ? path : L"\"" + path + L"\"";
+    };
+    add("powershell", "Windows PowerShell", resolved(L"powershell.exe"));
+    add("pwsh", "PowerShell 7", resolved(L"pwsh.exe"));
+    add("cmd", "Command Prompt", resolved(L"cmd.exe"));
+#endif
+    return profiles;
+}
+
+enum class split_mode_t : std::uint8_t {
+    none,
+    vertical,
+    horizontal
+};
+
 struct TerminalManager
 {
     std::vector<TerminalSession*> sessions;
+    std::vector<TerminalSession*> retired_sessions;
     int active_tab = -1;
+    int secondary_tab = -1;
+    split_mode_t split_mode = split_mode_t::none;
+    std::uint64_t next_id = 1;
+    std::string last_error;
 
-    TerminalSession* create_terminal(const wchar_t* shell = nullptr)
+    void reap_retired_sessions()
     {
-        auto* s = new TerminalSession();
-        s->title = "Terminal " + std::to_string(sessions.size() + 1);
-        if (create_session(*s, shell)) {
-            sessions.push_back(s);
-            active_tab = static_cast<int>(sessions.size()) - 1;
-            return s;
+        auto it = retired_sessions.begin();
+        while (it != retired_sessions.end()) {
+            auto* session = *it;
+            if (session && finalize_destroyed_session(*session, 0)) {
+                delete session;
+                it = retired_sessions.erase(it);
+            } else {
+                ++it;
+            }
         }
-        delete s;
+    }
+
+    void retire_or_delete(TerminalSession* session)
+    {
+        if (!session)
+            return;
+        if (destroy_session(*session))
+            delete session;
+        else
+            retired_sessions.push_back(session);
+    }
+
+    TerminalSession* create_terminal(const wchar_t* shell = nullptr,
+                                     const wchar_t* cwd = nullptr,
+                                     const char* profile_id = nullptr,
+                                     const char* profile_label = nullptr)
+    {
+        auto* session = new TerminalSession();
+        session->id = next_id++;
+        session->profile_id = profile_id ? profile_id : "configured";
+        session->profile_label = profile_label ? profile_label : "Configured Shell";
+        session->title = session->profile_label + " " + std::to_string(session->id);
+        if (create_session(*session, shell, cwd)) {
+            sessions.push_back(session);
+            active_tab = static_cast<int>(sessions.size()) - 1;
+            last_error.clear();
+            return session;
+        }
+        last_error = session->start_error.empty()
+            ? "The configured terminal process could not be started" : session->start_error;
+        delete session;
         return nullptr;
     }
 
@@ -904,25 +1344,107 @@ struct TerminalManager
         if (idx < 0 || idx >= static_cast<int>(sessions.size()))
             return;
         const size_t session_index = static_cast<size_t>(idx);
-        destroy_session(*sessions[session_index]);
-        delete sessions[session_index];
+        retire_or_delete(sessions[session_index]);
         sessions.erase(sessions.begin() + static_cast<std::ptrdiff_t>(session_index));
+        if (secondary_tab == idx) {
+            secondary_tab = -1;
+            split_mode = split_mode_t::none;
+        } else if (secondary_tab > idx) {
+            --secondary_tab;
+        }
+        if (active_tab > idx) --active_tab;
         if (active_tab >= static_cast<int>(sessions.size()))
             active_tab = static_cast<int>(sessions.size()) - 1;
+        if (sessions.empty()) {
+            active_tab = -1;
+            secondary_tab = -1;
+            split_mode = split_mode_t::none;
+        }
+    }
+
+    bool restart_terminal(int idx)
+    {
+        if (idx < 0 || idx >= static_cast<int>(sessions.size()))
+            return false;
+        auto* prior = sessions[static_cast<std::size_t>(idx)];
+        auto* replacement = new TerminalSession();
+        replacement->id = prior->id;
+        replacement->title = prior->title;
+        replacement->profile_id = prior->profile_id;
+        replacement->profile_label = prior->profile_label;
+        const std::wstring command = prior->command;
+        const std::wstring cwd = prior->cwd;
+        retire_or_delete(prior);
+        sessions[static_cast<std::size_t>(idx)] = replacement;
+        if (!create_session(*replacement, command.c_str(), cwd.empty() ? nullptr : cwd.c_str())) {
+            last_error = replacement->start_error.empty()
+                ? "The terminal session could not be restarted" : replacement->start_error;
+            return false;
+        }
+        last_error.clear();
+        active_tab = idx;
+        return true;
+    }
+
+    bool cycle(int delta)
+    {
+        if (sessions.empty()) return false;
+        const int count = static_cast<int>(sessions.size());
+        active_tab = (active_tab + delta) % count;
+        if (active_tab < 0) active_tab += count;
+        return true;
+    }
+
+    bool set_split(split_mode_t mode)
+    {
+        if (mode == split_mode_t::none) {
+            secondary_tab = -1;
+            split_mode = mode;
+            return true;
+        }
+        if (sessions.size() < 2)
+            return false;
+        if (secondary_tab < 0 || secondary_tab >= static_cast<int>(sessions.size()) ||
+            secondary_tab == active_tab) {
+            secondary_tab = active_tab == 0 ? 1 : 0;
+        }
+        split_mode = mode;
+        return true;
     }
 
     void shutdown()
     {
-        for (auto* s : sessions) {
-            destroy_session(*s);
-            delete s;
-        }
+        for (auto* session : sessions)
+            retire_or_delete(session);
         sessions.clear();
+        reap_retired_sessions();
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        if (!retired_sessions.empty())
+            diag::log_tagged_fmt("terminal", "shutdown_readers_deferred count=%zu",
+                retired_sessions.size());
+#endif
         active_tab = -1;
+        secondary_tab = -1;
+        split_mode = split_mode_t::none;
     }
 
     bool has_active() const { return active_tab >= 0 && active_tab < static_cast<int>(sessions.size()); }
     TerminalSession* current() { return has_active() ? sessions[static_cast<size_t>(active_tab)] : nullptr; }
+    TerminalSession* secondary() {
+        return split_mode != split_mode_t::none && secondary_tab >= 0 &&
+            secondary_tab < static_cast<int>(sessions.size())
+            ? sessions[static_cast<std::size_t>(secondary_tab)] : nullptr;
+    }
+    TerminalSession* focused() {
+        for (auto* session : sessions)
+            if (session->focused) return session;
+        return current();
+    }
+    int focused_index() const {
+        for (int index = 0; index < static_cast<int>(sessions.size()); ++index)
+            if (sessions[static_cast<std::size_t>(index)]->focused) return index;
+        return active_tab;
+    }
 };
 
 }

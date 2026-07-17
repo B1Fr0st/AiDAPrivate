@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -508,15 +509,57 @@ struct finding_t {
 };
 
 struct scan_state_t {
-	std::vector<finding_t> findings;
-	std::mutex mutex;
+	std::shared_ptr<const std::vector<finding_t>> findings =
+		std::make_shared<const std::vector<finding_t>>();
+	std::shared_ptr<const std::string> scan_status =
+		std::make_shared<const std::string>();
 	std::atomic<bool> scanning{false};
 	std::atomic<bool> cancel{false};
 	std::atomic<float> progress{0.f};
-	std::string scan_status;
+	std::atomic<std::uint64_t> generation{1};
 };
 
 inline scan_state_t g_scan;
+
+inline std::shared_ptr<const std::vector<finding_t>> capture_protection_findings()
+{
+	return std::atomic_load_explicit(&g_scan.findings, std::memory_order_acquire);
+}
+
+inline std::shared_ptr<const std::string> capture_protection_scan_status()
+{
+	return std::atomic_load_explicit(&g_scan.scan_status, std::memory_order_acquire);
+}
+
+inline void publish_protection_scan_status(std::string value)
+{
+	auto snapshot = std::make_shared<const std::string>(std::move(value));
+	std::atomic_store_explicit(&g_scan.scan_status, std::move(snapshot),
+		std::memory_order_release);
+}
+
+inline void publish_protection_findings(std::vector<finding_t> value,
+	std::string status)
+{
+	auto findings = std::make_shared<const std::vector<finding_t>>(std::move(value));
+	auto state = std::make_shared<const std::string>(std::move(status));
+	std::atomic_store_explicit(&g_scan.findings, std::move(findings),
+		std::memory_order_release);
+	std::atomic_store_explicit(&g_scan.scan_status, std::move(state),
+		std::memory_order_release);
+	g_scan.generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline bool clear_protection_findings(std::size_t& cleared)
+{
+	if (g_scan.scanning.load(std::memory_order_acquire))
+		return false;
+	const auto current = capture_protection_findings();
+	cleared = current ? current->size() : 0;
+	publish_protection_findings({}, {});
+	g_scan.progress.store(0.f, std::memory_order_release);
+	return true;
+}
 
 inline const char* severity_name(finding_severity_t s)
 {
@@ -583,6 +626,16 @@ inline constexpr int signature_count = sizeof(signatures) / sizeof(signatures[0]
 
 namespace detail_scan {
 
+inline constexpr std::size_t maximum_findings = 16384;
+
+inline bool append_finding(std::vector<finding_t>& output, finding_t value)
+{
+	if (output.size() >= maximum_findings)
+		return false;
+	output.push_back(std::move(value));
+	return true;
+}
+
 inline void scan_drivers(std::vector<finding_t>& out, std::atomic<bool>& cancel)
 {
 	auto modules = driver_bridge::enumerate_modules();
@@ -604,7 +657,7 @@ inline void scan_drivers(std::vector<finding_t>& out, std::atomic<bool>& cancel)
 					m.name.c_str(), static_cast<unsigned long long>(m.base), m.size);
 				f.detail = buf;
 				f.module = m.name;
-				out.push_back(std::move(f));
+				if (!append_finding(out, std::move(f))) return;
 				break;
 			}
 		}
@@ -628,7 +681,7 @@ inline void scan_memory_guards(std::vector<finding_t>& out, std::atomic<bool>& c
 				static_cast<unsigned long long>(r.base),
 				static_cast<unsigned long long>(r.size), r.protect);
 			f.detail = buf;
-			out.push_back(std::move(f));
+			if (!append_finding(out, std::move(f))) return;
 			if (++count >= 256) break;
 		}
 	}
@@ -669,7 +722,7 @@ inline void scan_suspicious_modules(std::vector<finding_t>& out, std::atomic<boo
 				m.name.c_str(), static_cast<unsigned long long>(m.base), m.size);
 			f.detail = buf;
 			f.module = m.name;
-			out.push_back(std::move(f));
+			if (!append_finding(out, std::move(f))) return;
 		}
 	}
 }
@@ -701,7 +754,7 @@ inline void scan_threads(std::vector<finding_t>& out, std::atomic<bool>& cancel)
 				t.tid, static_cast<unsigned long long>(t.rip));
 			f.title = "Thread outside module bounds";
 			f.detail = buf;
-			out.push_back(std::move(f));
+			if (!append_finding(out, std::move(f))) return;
 		}
 	}
 }
@@ -722,7 +775,7 @@ inline void scan_debug_state(std::vector<finding_t>& out, std::atomic<bool>& can
 			std::snprintf(buf, sizeof(buf), "PEB at 0x%llX, NtGlobalFlag: 0x%X",
 				static_cast<unsigned long long>(peb.peb_address), peb.nt_global_flag);
 			f.detail = buf;
-			out.push_back(std::move(f));
+			if (!append_finding(out, std::move(f))) return;
 		}
 		if (peb.nt_global_flag & 0x70) {
 			finding_t f;
@@ -734,7 +787,7 @@ inline void scan_debug_state(std::vector<finding_t>& out, std::atomic<bool>& can
 			std::snprintf(buf, sizeof(buf), "NtGlobalFlag: 0x%X (FLG_HEAP_ENABLE_*)",
 				peb.nt_global_flag);
 			f.detail = buf;
-			out.push_back(std::move(f));
+			if (!append_finding(out, std::move(f))) return;
 		}
 	}
 
@@ -756,7 +809,7 @@ inline void scan_debug_state(std::vector<finding_t>& out, std::atomic<bool>& can
 					static_cast<unsigned long long>(ctx.dr7));
 				f.title = "Hardware breakpoints active";
 				f.detail = buf;
-				out.push_back(std::move(f));
+				if (!append_finding(out, std::move(f))) return;
 			}
 		}
 	}
@@ -802,7 +855,7 @@ inline void scan_wfp_callbacks(std::vector<finding_t>& out, std::atomic<bool>& c
 			co.layer_id, co.callout_id);
 		f.detail = buf;
 		f.module = co.owning_module;
-		out.push_back(std::move(f));
+		if (!append_finding(out, std::move(f))) return;
 	}
 }
 
@@ -830,11 +883,7 @@ inline void run_protection_scan()
 	sub.target_pid = pid_at_start;
 	sub.body = [] {
 		auto t0 = std::chrono::steady_clock::now();
-		{
-			std::lock_guard<std::mutex> lk(g_scan.mutex);
-			g_scan.findings.clear();
-			g_scan.scan_status = "Scanning drivers...";
-		}
+		publish_protection_findings({}, "Scanning drivers...");
 
 		std::vector<finding_t> results;
 
@@ -842,38 +891,23 @@ inline void run_protection_scan()
 		detail_scan::scan_drivers(results, g_scan.cancel);
 
 		g_scan.progress.store(0.2f);
-		{
-			std::lock_guard<std::mutex> lk(g_scan.mutex);
-			g_scan.scan_status = "Scanning memory regions...";
-		}
+		publish_protection_scan_status("Scanning memory regions...");
 		detail_scan::scan_memory_guards(results, g_scan.cancel);
 
 		g_scan.progress.store(0.4f);
-		{
-			std::lock_guard<std::mutex> lk(g_scan.mutex);
-			g_scan.scan_status = "Analyzing modules...";
-		}
+		publish_protection_scan_status("Analyzing modules...");
 		detail_scan::scan_suspicious_modules(results, g_scan.cancel);
 
 		g_scan.progress.store(0.55f);
-		{
-			std::lock_guard<std::mutex> lk(g_scan.mutex);
-			g_scan.scan_status = "Inspecting threads...";
-		}
+		publish_protection_scan_status("Inspecting threads...");
 		detail_scan::scan_threads(results, g_scan.cancel);
 
 		g_scan.progress.store(0.7f);
-		{
-			std::lock_guard<std::mutex> lk(g_scan.mutex);
-			g_scan.scan_status = "Checking debug state...";
-		}
+		publish_protection_scan_status("Checking debug state...");
 		detail_scan::scan_debug_state(results, g_scan.cancel);
 
 		g_scan.progress.store(0.85f);
-		{
-			std::lock_guard<std::mutex> lk(g_scan.mutex);
-			g_scan.scan_status = "Enumerating WFP callbacks...";
-		}
+		publish_protection_scan_status("Enumerating WFP callbacks...");
 		detail_scan::scan_wfp_callbacks(results, g_scan.cancel);
 
 		std::sort(results.begin(), results.end(), [](const finding_t& a, const finding_t& b) {
@@ -887,14 +921,12 @@ inline void run_protection_scan()
 			else if (f.severity == finding_severity_t::high) ++hi_n;
 			else if (f.severity == finding_severity_t::medium) ++med_n;
 		}
-		{
-			std::lock_guard<std::mutex> lk(g_scan.mutex);
-			finding_count = results.size();
-			g_scan.findings = std::move(results);
-			char buf[64];
-			std::snprintf(buf, sizeof(buf), "Scan complete: %zu findings", g_scan.findings.size());
-			g_scan.scan_status = buf;
-		}
+		finding_count = results.size();
+		char buf[96];
+		std::snprintf(buf, sizeof(buf), g_scan.cancel.load(std::memory_order_acquire)
+			? "Scan cancelled: %zu partial findings retained"
+			: "Scan complete: %zu findings", finding_count);
+		publish_protection_findings(std::move(results), buf);
 
 		auto t1 = std::chrono::steady_clock::now();
 		auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -908,6 +940,7 @@ inline void run_protection_scan()
 	};
 	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
 		g_scan.scanning.store(false);
+		publish_protection_scan_status("Protection scan could not be queued");
 		diag::log_tagged_fmt("stealth",
 			"scan_post_failed pid=%u",
 			pid_at_start);

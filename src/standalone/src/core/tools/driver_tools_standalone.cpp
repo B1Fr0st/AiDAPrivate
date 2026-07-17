@@ -28,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -506,6 +507,216 @@ static bool parse_byte_sequence(const json& bytes_value, std::vector<std::uint8_
     return !out.empty();
 }
 
+static bool is_probably_kernel_address(std::uint64_t address);
+
+struct kernel_pattern_t
+{
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::uint8_t> masks;
+    std::size_t anchor = 0;
+};
+
+static bool parse_kernel_pattern(const json& value, kernel_pattern_t& out, std::string& error)
+{
+    out = {};
+    if (!value.is_string())
+    {
+        error = "'pattern' must be a hex string such as '48 8B ?? ?? 89' or '488B????89'.";
+        return false;
+    }
+
+    std::string text = trim_ascii_copy(value.get<std::string>());
+    if (text.empty())
+    {
+        error = "Pattern must not be empty.";
+        return false;
+    }
+
+    auto append_token = [&](std::string token) -> bool {
+        token = trim_ascii_copy(token);
+        if (token == "?" || token == "??")
+        {
+            out.bytes.push_back(0);
+            out.masks.push_back(0);
+            return true;
+        }
+        if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X'))
+            token = token.substr(2);
+        if (token.size() != 2 || !std::all_of(token.begin(), token.end(),
+            [](unsigned char c) { return std::isxdigit(c) != 0; }))
+            return false;
+        out.bytes.push_back(static_cast<std::uint8_t>(std::stoul(token, nullptr, 16)));
+        out.masks.push_back(0xFF);
+        return true;
+    };
+
+    const bool separated = text.find_first_of(" ,\t\r\n") != std::string::npos;
+    if (separated)
+    {
+        std::replace(text.begin(), text.end(), ',', ' ');
+        std::istringstream stream(text);
+        std::string token;
+        std::size_t index = 0;
+        while (stream >> token)
+        {
+            if (!append_token(token))
+            {
+                error = "Invalid pattern token '" + token + "' at index " + std::to_string(index) + ".";
+                return false;
+            }
+            ++index;
+        }
+    }
+    else
+    {
+        if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+            text = text.substr(2);
+        if (text.empty() || (text.size() % 2) != 0)
+        {
+            error = "Packed pattern must contain an even number of hex or wildcard characters.";
+            return false;
+        }
+        for (std::size_t i = 0; i < text.size(); i += 2)
+        {
+            const std::string token = text.substr(i, 2);
+            if (!append_token(token))
+            {
+                error = "Invalid packed pattern token '" + token + "' at byte index " + std::to_string(i / 2) + ".";
+                return false;
+            }
+        }
+    }
+
+    if (out.bytes.empty())
+    {
+        error = "Pattern must contain at least one byte.";
+        return false;
+    }
+    if (out.bytes.size() > 4096)
+    {
+        error = "Pattern exceeds the 4096-byte limit.";
+        return false;
+    }
+
+    bool anchored = false;
+    for (std::size_t i = out.masks.size(); i != 0; --i)
+    {
+        if (out.masks[i - 1] != 0)
+        {
+            out.anchor = i - 1;
+            anchored = true;
+            break;
+        }
+    }
+    if (!anchored)
+    {
+        error = "Pattern must contain at least one concrete byte; all-wildcard searches are rejected.";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_kernel_size(const json& params, const char* key, std::uint64_t& out)
+{
+    out = 0;
+    if (!params.contains(key))
+        return false;
+    const auto& value = params[key];
+    if (value.is_number_unsigned())
+    {
+        out = value.get<std::uint64_t>();
+        return true;
+    }
+    if (value.is_number_integer())
+    {
+        const auto signed_value = value.get<std::int64_t>();
+        if (signed_value < 0)
+            return false;
+        out = static_cast<std::uint64_t>(signed_value);
+        return true;
+    }
+    if (value.is_string())
+    {
+        auto parsed = sa_parse_address(value.get<std::string>());
+        if (parsed)
+        {
+            out = *parsed;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool validate_kernel_range(std::uint64_t address, std::uint64_t size, std::string& error)
+{
+    if (!is_probably_kernel_address(address))
+    {
+        error = "Address must be a canonical kernel virtual address at or above 0xFFFF000000000000.";
+        return false;
+    }
+    if (size == 0)
+    {
+        error = "Size must be greater than zero.";
+        return false;
+    }
+    if (size - 1 > std::numeric_limits<std::uint64_t>::max() - address)
+    {
+        error = "Kernel address range overflows the 64-bit virtual address space.";
+        return false;
+    }
+    const std::uint64_t end = address + size - 1;
+    if (!is_probably_kernel_address(end))
+    {
+        error = "Kernel address range crosses out of canonical kernel space.";
+        return false;
+    }
+    return true;
+}
+
+static std::optional<tool_result_t> ensure_kernel_memory_context()
+{
+    if (mcp_standalone::current_call_cancelled())
+        return tool_result_t::error(OBFSTR("Tool cancelled before the kernel operation started."));
+    std::string reason;
+    if (!driver_bridge::kernel_session_available(&reason))
+    {
+        json details;
+        details["reason"] = reason;
+        details["driver_status"] = driver_bridge::status();
+        details["attached_pid"] = driver_bridge::attached_pid();
+        return tool_result_t::error(
+            OBFSTR("Kernel driver session is unavailable: ") + reason,
+            OBFSTR("kernel_session_unavailable"), details);
+    }
+    if (device == nullptr || !device->is_connected())
+        return tool_result_t::error(OBFSTR("Kernel device is not connected."));
+    if (device->get_kernel_dtb() == 0 && device->get_dtb() == 0)
+        return tool_result_t::error(OBFSTR("No kernel-capable DTB is resolved. Attach a live process before accessing kernel memory."));
+    return std::nullopt;
+}
+
+static std::string kernel_bytes_hex(const std::vector<std::uint8_t>& bytes)
+{
+    static constexpr char digits[] = "0123456789ABCDEF";
+    std::string out;
+    out.resize(bytes.size() * 2);
+    for (std::size_t i = 0; i < bytes.size(); ++i)
+    {
+        out[i * 2] = digits[bytes[i] >> 4];
+        out[i * 2 + 1] = digits[bytes[i] & 0x0F];
+    }
+    return out;
+}
+
+static std::string kernel_bytes_ascii(const std::vector<std::uint8_t>& bytes)
+{
+    std::string out;
+    out.reserve(bytes.size());
+    for (std::uint8_t byte : bytes)
+        out.push_back(byte >= 32 && byte < 127 ? static_cast<char>(byte) : '.');
+    return out;
+}
+
 static bool is_process_alive(std::uint32_t pid)
 {
     if (pid == 0)
@@ -620,8 +831,6 @@ static std::optional<std::uint32_t> parse_tid_param(const json& params)
         return std::nullopt;
     return tid;
 }
-
-static bool is_probably_kernel_address(std::uint64_t address);
 
 struct teb_resolution_diagnostics_t
 {
@@ -1892,6 +2101,428 @@ tool_result_t driver_enumerate_kernel_modules(const json& params)
     return tool_result_t::ok(
         OBFSTR("Enumerated ") + std::to_string(modules_arr.size()) + OBFSTR(" kernel modules") +
         (filter.empty() ? "" : OBFSTR(" matching '") + filter + "'"), result);
+}
+
+static bool parse_kernel_address_param(const json& params, const char* key, std::uint64_t& out)
+{
+    out = 0;
+    if (!params.contains(key))
+        return false;
+    const auto& value = params[key];
+    if (value.is_string())
+    {
+        auto parsed = sa_parse_address(value.get<std::string>());
+        if (parsed)
+        {
+            out = *parsed;
+            return true;
+        }
+        return false;
+    }
+    if (value.is_number_unsigned())
+    {
+        out = value.get<std::uint64_t>();
+        return true;
+    }
+    if (value.is_number_integer())
+    {
+        const auto signed_value = value.get<std::int64_t>();
+        if (signed_value >= 0)
+        {
+            out = static_cast<std::uint64_t>(signed_value);
+            return true;
+        }
+    }
+    return false;
+}
+
+tool_result_t driver_read_kernel_memory(const json& params)
+{
+    diag::log_tagged_fmt("drv_tools", "driver_read_kernel_memory entry");
+    if (auto context_error = ensure_kernel_memory_context())
+        return *context_error;
+
+    std::uint64_t address = 0;
+    if (!parse_kernel_address_param(params, "address", address))
+        return tool_result_t::error(OBFSTR("Missing or invalid kernel address."));
+
+    std::uint64_t size64 = 0;
+    if (!parse_kernel_size(params, "size", size64))
+        return tool_result_t::error(OBFSTR("Missing or invalid size."));
+    constexpr std::uint64_t max_read_size = 1024ULL * 1024ULL;
+    if (size64 > max_read_size)
+        return tool_result_t::error(OBFSTR("Kernel reads are capped at 1048576 bytes per call."));
+
+    std::string range_error;
+    if (!validate_kernel_range(address, size64, range_error))
+        return tool_result_t::error(range_error);
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_error = acquire_driver_debugger_quota("driver_read_kernel_memory", driver_bridge::attached_pid(), quota_guard))
+        return *quota_error;
+
+    std::vector<std::uint8_t> bytes;
+    const bool read_ok = driver_bridge::read_kernel_memory(address, static_cast<std::size_t>(size64), bytes);
+    if (!read_ok || bytes.empty())
+    {
+        json details;
+        details["address"] = sa_format_address(address);
+        details["requested_size"] = size64;
+        details["driver_status"] = driver_bridge::status();
+        details["driver_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("Kernel memory read failed."), OBFSTR("kernel_read_failed"), details);
+    }
+
+    json result;
+    result["address"] = sa_format_address(address);
+    result["requested_size"] = size64;
+    result["size"] = bytes.size();
+    result["complete"] = bytes.size() == size64;
+    result["hex"] = kernel_bytes_hex(bytes);
+    result["ascii"] = kernel_bytes_ascii(bytes);
+    result["kernel_dtb"] = sa_format_address(device->get_kernel_dtb() != 0 ? device->get_kernel_dtb() : device->get_dtb());
+    diag::log_tagged_fmt("drv_tools",
+        "driver_read_kernel_memory exit addr=0x%llX requested=%llu read=%zu complete=%d",
+        static_cast<unsigned long long>(address),
+        static_cast<unsigned long long>(size64),
+        bytes.size(), bytes.size() == size64 ? 1 : 0);
+    if (bytes.size() != size64)
+        return tool_result_t::error(
+            OBFSTR("Kernel memory read was partial; exact-length reads are required."),
+            OBFSTR("kernel_read_partial"), result);
+    return tool_result_t::ok(OBFSTR("Read kernel memory."), result);
+}
+
+tool_result_t driver_write_kernel_memory(const json& params)
+{
+    diag::log_tagged_fmt("drv_tools", "driver_write_kernel_memory entry");
+    std::uint64_t address = 0;
+    if (!parse_kernel_address_param(params, "address", address))
+        return tool_result_t::error(OBFSTR("Missing or invalid kernel address."));
+
+    if (!params.contains("bytes"))
+        return tool_result_t::error(OBFSTR("Missing bytes payload."));
+
+    std::vector<std::uint8_t> bytes;
+    std::string parse_error;
+    if (!parse_byte_sequence(params["bytes"], bytes, parse_error))
+        return tool_result_t::error(parse_error);
+    constexpr std::size_t max_write_size = 1024 * 1024;
+    if (bytes.size() > max_write_size)
+        return tool_result_t::error(OBFSTR("Kernel writes are capped at 1048576 bytes per call."));
+
+    std::string range_error;
+    if (!validate_kernel_range(address, bytes.size(), range_error))
+        return tool_result_t::error(range_error);
+
+    const bool dry_run = params.value("dry_run", false);
+    if (!dry_run && !params.value("confirm_unsafe", false))
+        return tool_result_t::error(
+            OBFSTR("driver_write_kernel_memory can corrupt kernel state or crash Windows. Re-run with confirm_unsafe=true, or use dry_run=true to validate the request without writing."));
+
+    std::vector<std::uint8_t> expected;
+    if (params.contains("expected_bytes"))
+    {
+        if (!parse_byte_sequence(params["expected_bytes"], expected, parse_error))
+            return tool_result_t::error(OBFSTR("Invalid expected_bytes: ") + parse_error);
+        if (expected.size() != bytes.size())
+            return tool_result_t::error(OBFSTR("expected_bytes must have exactly the same length as bytes."));
+    }
+
+    if (auto context_error = ensure_kernel_memory_context())
+        return *context_error;
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_error = acquire_driver_debugger_quota("driver_write_kernel_memory", driver_bridge::attached_pid(), quota_guard))
+        return *quota_error;
+
+    std::vector<std::uint8_t> before;
+    if (!driver_bridge::read_kernel_memory(address, bytes.size(), before) || before.size() != bytes.size())
+    {
+        json details;
+        details["address"] = sa_format_address(address);
+        details["requested_size"] = bytes.size();
+        details["bytes_read"] = before.size();
+        return tool_result_t::error(
+            OBFSTR("Pre-write kernel read failed or was partial; the write was not attempted."),
+            OBFSTR("kernel_prewrite_read_failed"), details);
+    }
+
+    if (!expected.empty() && !std::equal(expected.begin(), expected.end(), before.begin()))
+    {
+        json details;
+        details["address"] = sa_format_address(address);
+        details["expected_hex"] = kernel_bytes_hex(expected);
+        details["actual_hex"] = kernel_bytes_hex(before);
+        return tool_result_t::error(
+            OBFSTR("Kernel memory no longer matches expected_bytes; the write was not attempted."),
+            OBFSTR("kernel_compare_exchange_mismatch"), details);
+    }
+
+    if (dry_run)
+    {
+        json preview;
+        preview["address"] = sa_format_address(address);
+        preview["size"] = bytes.size();
+        preview["before_hex"] = kernel_bytes_hex(before);
+        preview["replacement_hex"] = kernel_bytes_hex(bytes);
+        preview["expected_bytes_checked"] = !expected.empty();
+        preview["written"] = false;
+        return tool_result_t::ok(OBFSTR("Validated kernel write dry-run; no memory was modified."), preview);
+    }
+
+    if (!driver_bridge::write_kernel_memory(address, bytes))
+    {
+        json details;
+        details["address"] = sa_format_address(address);
+        details["size"] = bytes.size();
+        details["before_hex"] = kernel_bytes_hex(before);
+        details["driver_error"] = driver_bridge::last_error();
+        return tool_result_t::error(OBFSTR("Kernel memory write failed or was partial."), OBFSTR("kernel_write_failed"), details);
+    }
+
+    std::vector<std::uint8_t> after;
+    const bool readback_ok = driver_bridge::read_kernel_memory(address, bytes.size(), after) && after.size() == bytes.size();
+    const bool verified = readback_ok && std::equal(bytes.begin(), bytes.end(), after.begin());
+    json result;
+    result["address"] = sa_format_address(address);
+    result["size"] = bytes.size();
+    result["before_hex"] = kernel_bytes_hex(before);
+    result["requested_hex"] = kernel_bytes_hex(bytes);
+    result["readback_hex"] = kernel_bytes_hex(after);
+    result["readback_complete"] = readback_ok;
+    result["verified"] = verified;
+    result["expected_bytes_checked"] = !expected.empty();
+    diag::log_tagged_fmt("drv_tools",
+        "driver_write_kernel_memory exit addr=0x%llX size=%zu readback_ok=%d verified=%d",
+        static_cast<unsigned long long>(address), bytes.size(), readback_ok ? 1 : 0, verified ? 1 : 0);
+    if (!verified)
+        return tool_result_t::error(
+            OBFSTR("Kernel write completed but exact readback verification failed; kernel state may have changed and must be inspected."),
+            OBFSTR("kernel_write_verification_failed"), result);
+    return tool_result_t::ok(OBFSTR("Wrote and verified kernel memory."), result);
+}
+
+tool_result_t search_kernel_memory(const json& params)
+{
+    diag::log_tagged_fmt("drv_tools", "search_kernel_memory entry");
+    if (auto context_error = ensure_kernel_memory_context())
+        return *context_error;
+
+    if (!params.contains("pattern"))
+        return tool_result_t::error(OBFSTR("Missing required pattern."));
+    kernel_pattern_t pattern;
+    std::string pattern_error;
+    if (!parse_kernel_pattern(params["pattern"], pattern, pattern_error))
+        return tool_result_t::error(pattern_error);
+
+    std::uint64_t start = 0;
+    std::uint64_t span = 0;
+    std::string module_name;
+    json module_diagnostics;
+    const bool has_module = params.contains("module") && params["module"].is_string() &&
+        !trim_ascii_copy(params["module"].get<std::string>()).empty();
+    const bool has_address = params.contains("address") || params.contains("start_address");
+    if (has_module && has_address)
+        return tool_result_t::error(OBFSTR("Specify either module or address/start_address, not both."));
+
+    if (has_module)
+    {
+        const std::string query = to_lower_ascii_copy(trim_ascii_copy(params["module"].get<std::string>()));
+        std::vector<std::uint8_t> module_buffer;
+        sys_module_info_t* module_info = nullptr;
+        std::string module_error;
+        kernel_module_query_diagnostics_t query_diagnostics{};
+        if (!query_kernel_modules(module_buffer, module_info, module_error, &query_diagnostics,
+                kernel_module_query_fallback_policy::allow_readonly_kernel_base_evidence))
+            return kernel_module_query_error_result(module_error, query_diagnostics, OBFSTR("Cannot resolve kernel module scan range: "));
+        module_diagnostics = kernel_module_query_diagnostics_json(query_diagnostics);
+
+        std::vector<const sys_module_entry_t*> exact;
+        std::vector<const sys_module_entry_t*> partial;
+        for (ULONG i = 0; i < module_info->NumberOfModules; ++i)
+        {
+            const auto& entry = module_info->Modules[i];
+            const std::string name = to_lower_ascii_copy(bounded_kernel_module_name(entry));
+            const std::string path = to_lower_ascii_copy(bounded_kernel_module_path(entry));
+            if (name == query || path == query)
+                exact.push_back(&entry);
+            else if (name.find(query) != std::string::npos || path.find(query) != std::string::npos)
+                partial.push_back(&entry);
+        }
+        const auto& candidates = exact.empty() ? partial : exact;
+        if (candidates.empty())
+            return tool_result_t::error(OBFSTR("No loaded kernel module matches '") + query + "'.");
+        if (candidates.size() != 1)
+            return tool_result_t::error(OBFSTR("Kernel module query is ambiguous; use the exact module filename."));
+
+        const auto& entry = *candidates.front();
+        const std::uint64_t base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(entry.ImageBase));
+        const std::uint64_t module_size = entry.ImageSize;
+        std::uint64_t offset = 0;
+        if (params.contains("offset") && !parse_kernel_size(params, "offset", offset))
+            return tool_result_t::error(OBFSTR("Invalid module offset."));
+        if (offset >= module_size)
+            return tool_result_t::error(OBFSTR("Module offset is outside the loaded image."));
+        start = base + offset;
+        span = module_size - offset;
+        if (params.contains("size"))
+        {
+            std::uint64_t requested_span = 0;
+            if (!parse_kernel_size(params, "size", requested_span) || requested_span == 0)
+                return tool_result_t::error(OBFSTR("Invalid scan size."));
+            if (requested_span > span)
+                return tool_result_t::error(OBFSTR("Requested scan size extends beyond the selected kernel module."));
+            span = requested_span;
+        }
+        module_name = bounded_kernel_module_name(entry);
+    }
+    else
+    {
+        const char* address_key = params.contains("address") ? "address" : "start_address";
+        if (!parse_kernel_address_param(params, address_key, start))
+            return tool_result_t::error(OBFSTR("Missing or invalid address/start_address."));
+        if (!parse_kernel_size(params, "size", span))
+            return tool_result_t::error(OBFSTR("Missing or invalid scan size."));
+    }
+
+    constexpr std::uint64_t max_scan_span = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+    if (span > max_scan_span)
+        return tool_result_t::error(OBFSTR("Kernel searches are capped at 4294967296 bytes per call."));
+    std::string range_error;
+    if (!validate_kernel_range(start, span, range_error))
+        return tool_result_t::error(range_error);
+    if (span > std::numeric_limits<std::uint64_t>::max() - start)
+        return tool_result_t::error(OBFSTR("Kernel search end-exclusive address overflows the 64-bit virtual address space."));
+    if (span < pattern.bytes.size())
+        return tool_result_t::error(OBFSTR("Scan range is smaller than the pattern."));
+
+    std::uint64_t chunk_size64 = 64 * 1024;
+    if (params.contains("chunk_size") && !parse_kernel_size(params, "chunk_size", chunk_size64))
+        return tool_result_t::error(OBFSTR("Invalid chunk_size."));
+    if (chunk_size64 < 4096 || chunk_size64 > 1024 * 1024)
+        return tool_result_t::error(OBFSTR("chunk_size must be between 4096 and 1048576 bytes."));
+
+    std::uint64_t max_results64 = 256;
+    if (params.contains("max_results") && !parse_kernel_size(params, "max_results", max_results64))
+        return tool_result_t::error(OBFSTR("Invalid max_results."));
+    if (max_results64 == 0 || max_results64 > 4096)
+        return tool_result_t::error(OBFSTR("max_results must be between 1 and 4096."));
+
+    driver_debugger_quota_guard_t quota_guard;
+    if (auto quota_error = acquire_driver_debugger_quota("search_kernel_memory", driver_bridge::attached_pid(), quota_guard))
+        return *quota_error;
+
+    const std::uint64_t end = start + span;
+    std::uint64_t cursor = start;
+    std::uint64_t bytes_scanned = 0;
+    std::uint64_t bytes_unreadable = 0;
+    std::uint64_t read_failures = 0;
+    bool result_limit_reached = false;
+    std::vector<std::uint8_t> tail;
+    json matches = json::array();
+
+    while (cursor < end)
+    {
+        if (mcp_standalone::current_call_cancelled())
+        {
+            json details;
+            details["start_address"] = sa_format_address(start);
+            details["next_address"] = sa_format_address(cursor);
+            details["bytes_scanned"] = bytes_scanned;
+            details["bytes_unreadable"] = bytes_unreadable;
+            details["matches"] = matches;
+            return tool_result_t::error(OBFSTR("Kernel memory search was cancelled."), OBFSTR("cancelled"), details);
+        }
+
+        const std::uint64_t remaining = end - cursor;
+        const std::size_t requested = static_cast<std::size_t>((std::min)(remaining, chunk_size64));
+        std::vector<std::uint8_t> chunk;
+        if (!driver_bridge::read_kernel_memory(cursor, requested, chunk) || chunk.empty())
+        {
+            tail.clear();
+            const std::uint64_t page_remaining = 0x1000ULL - (cursor & 0xFFFULL);
+            const std::uint64_t skipped = (std::min)(remaining, page_remaining);
+            cursor += skipped;
+            bytes_unreadable += skipped;
+            ++read_failures;
+            continue;
+        }
+
+        const std::size_t actual = chunk.size();
+        std::vector<std::uint8_t> window;
+        window.reserve(tail.size() + actual);
+        window.insert(window.end(), tail.begin(), tail.end());
+        window.insert(window.end(), chunk.begin(), chunk.end());
+        const std::uint64_t window_base = cursor - tail.size();
+        if (window.size() >= pattern.bytes.size())
+        {
+            const std::size_t final_start = window.size() - pattern.bytes.size();
+            for (std::size_t offset = 0; offset <= final_start; ++offset)
+            {
+                if (window[offset + pattern.anchor] != pattern.bytes[pattern.anchor])
+                    continue;
+                bool matched = true;
+                for (std::size_t i = 0; i < pattern.bytes.size(); ++i)
+                {
+                    if (pattern.masks[i] != 0 && window[offset + i] != pattern.bytes[i])
+                    {
+                        matched = false;
+                        break;
+                    }
+                }
+                if (!matched)
+                    continue;
+                const std::uint64_t match_address = window_base + offset;
+                if (match_address < start || match_address + pattern.bytes.size() > end)
+                    continue;
+                matches.push_back(sa_format_address(match_address));
+                if (matches.size() >= max_results64)
+                {
+                    result_limit_reached = true;
+                    break;
+                }
+            }
+        }
+
+        bytes_scanned += actual;
+        cursor += actual;
+        if (result_limit_reached)
+            break;
+        const std::size_t tail_size = (std::min)(pattern.bytes.size() - 1, window.size());
+        tail.assign(window.end() - static_cast<std::ptrdiff_t>(tail_size), window.end());
+    }
+
+    json result;
+    result["start_address"] = sa_format_address(start);
+    result["end_address_exclusive"] = sa_format_address(end);
+    result["requested_size"] = span;
+    result["bytes_scanned"] = bytes_scanned;
+    result["bytes_unreadable"] = bytes_unreadable;
+    result["read_failures"] = read_failures;
+    result["matches"] = matches;
+    result["match_count"] = matches.size();
+    result["max_results"] = max_results64;
+    result["result_limit_reached"] = result_limit_reached;
+    result["complete"] = !result_limit_reached && cursor >= end;
+    if (!module_name.empty())
+    {
+        result["module"] = module_name;
+        result["module_base_diagnostics"] = module_diagnostics;
+    }
+    if (bytes_scanned == 0)
+        return tool_result_t::error(
+            OBFSTR("No readable kernel memory was found in the requested range."),
+            OBFSTR("kernel_search_unreadable_range"), result);
+    diag::log_tagged_fmt("drv_tools",
+        "search_kernel_memory exit start=0x%llX span=%llu scanned=%llu unreadable=%llu failures=%llu matches=%zu limit=%d complete=%d",
+        static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(span),
+        static_cast<unsigned long long>(bytes_scanned),
+        static_cast<unsigned long long>(bytes_unreadable),
+        static_cast<unsigned long long>(read_failures),
+        matches.size(), result_limit_reached ? 1 : 0, cursor >= end ? 1 : 0);
+    return tool_result_t::ok(OBFSTR("Searched live kernel memory."), result);
 }
 
 
@@ -6412,6 +7043,45 @@ void register_driver_tools(mcp_standalone::server_t& srv)
          {OBFSTR("limit"), OBFSTR("number"),
           OBFSTR("Maximum number of modules to return (default 500)"), false}},
         driver_enumerate_kernel_modules, false});
+
+    register_compat(srv, {
+        OBFSTR("driver_read_kernel_memory"), OBFSTR("driver"),
+        OBFSTR("Read an arbitrary canonical kernel virtual-address range using the live kernel DTB. "
+               "This is independent of the attached process address space and is intended for ntoskrnl globals, "
+               "driver globals, executive objects, pool allocations, and other live kernel structures. "
+               "Returns exact packed hex, ASCII rendering, byte counts, and whether the full request was readable."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Canonical kernel virtual address, for example 0xFFFFF80000000000"), true},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Bytes to read, from 1 through 1048576"), true}},
+        driver_read_kernel_memory, true});
+
+    register_compat(srv, {
+        OBFSTR("driver_write_kernel_memory"), OBFSTR("driver"),
+        OBFSTR("Write arbitrary canonical kernel virtual memory through the live kernel DTB. "
+               "The operation fails closed unless the original range can be read completely, optionally compare-checks expected_bytes, "
+               "requires confirm_unsafe=true for live mutation, and performs an exact readback verification. "
+               "Use dry_run=true to validate the address, payload, and optional precondition without changing memory."),
+        {{OBFSTR("address"), OBFSTR("string"), OBFSTR("Canonical kernel virtual address to modify"), true},
+         {OBFSTR("bytes"), OBFSTR("string"), OBFSTR("Replacement bytes as packed hex or space/comma-separated hex bytes"), true},
+         {OBFSTR("expected_bytes"), OBFSTR("string"), OBFSTR("Optional exact current bytes required before the write is attempted"), false},
+         {OBFSTR("confirm_unsafe"), OBFSTR("boolean"), OBFSTR("Must be true for a live kernel write"), false},
+         {OBFSTR("dry_run"), OBFSTR("boolean"), OBFSTR("Validate and pre-read without modifying kernel memory"), false}},
+        driver_write_kernel_memory, false});
+
+    register_compat(srv, {
+        OBFSTR("search_kernel_memory"), OBFSTR("driver"),
+        OBFSTR("Search a bounded live kernel virtual-address range for a byte pattern with ?? wildcards. "
+               "Specify either address/start_address plus size, or a unique loaded kernel module name with optional offset and size. "
+               "The scanner preserves overlap across partial and chunked reads, skips unreadable pages, honors cancellation, "
+               "and reports scanned/unreadable byte counts and bounded match results."),
+        {{OBFSTR("pattern"), OBFSTR("string"), OBFSTR("Hex byte pattern such as '48 8B ?? ?? 89' or '488B????89'"), true},
+         {OBFSTR("address"), OBFSTR("string"), OBFSTR("Start of an explicit canonical kernel range; alias: start_address"), false},
+         {OBFSTR("start_address"), OBFSTR("string"), OBFSTR("Alias for address"), false},
+         {OBFSTR("size"), OBFSTR("number"), OBFSTR("Explicit range size, or optional module scan length; maximum 4294967296"), false},
+         {OBFSTR("module"), OBFSTR("string"), OBFSTR("Unique loaded kernel module filename or path used instead of address"), false},
+         {OBFSTR("offset"), OBFSTR("number"), OBFSTR("Offset into module where scanning begins; default 0"), false},
+         {OBFSTR("chunk_size"), OBFSTR("number"), OBFSTR("Read chunk size from 4096 through 1048576; default 65536"), false},
+         {OBFSTR("max_results"), OBFSTR("number"), OBFSTR("Maximum matches to return from 1 through 4096; default 256"), false}},
+        search_kernel_memory, true});
 
 
 

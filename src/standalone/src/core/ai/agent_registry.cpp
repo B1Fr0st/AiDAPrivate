@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -35,6 +36,7 @@ namespace agent {
 		bool&              initialized_flag()      { static bool b = false; return b; }
 		std::vector<agent_info_t>& agents_vector() { static std::vector<agent_info_t> v; return v; }
 		std::vector<agent_info_t>& custom_vector() { static std::vector<agent_info_t> v; return v; }
+		std::uint64_t&     custom_generation_slot() { static std::uint64_t value = 1; return value; }
 		std::string&       default_name_slot()     { static std::string s = "build"; return s; }
 		std::string&       active_name_slot()      { static std::string s = "build"; return s; }
 
@@ -69,6 +71,145 @@ namespace agent {
 			std::filesystem::create_directories(dir, ec);
 			if (ec) {
 				set_last_error_locked("create_directories failed: " + ec.message());
+				return false;
+			}
+			return true;
+		}
+
+		constexpr std::size_t k_max_custom_agents = 256;
+		constexpr std::size_t k_max_catalog_bytes = 16ULL * 1024ULL * 1024ULL;
+		constexpr std::size_t k_max_options_bytes = 1024ULL * 1024ULL;
+
+		std::filesystem::path catalog_path()
+		{
+			return agents_directory() / L"catalog.v2.json";
+		}
+
+		bool valid_agent_name(const std::string& name)
+		{
+			if (name.empty() || name.size() > 95 || name == "." || name == "..") return false;
+			for (const unsigned char ch : name) {
+				if (ch < 0x20 || ch == '/' || ch == '\\' || ch == ':' || ch == '*' ||
+					ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|')
+					return false;
+			}
+			return true;
+		}
+
+		bool validate_custom_catalog(const std::vector<agent_info_t>& agents,
+			std::string& error)
+		{
+			if (agents.size() > k_max_custom_agents) {
+				error = "Custom agent catalog exceeds the 256-agent bound";
+				return false;
+			}
+			std::set<std::string> names;
+			for (const auto& agent : agents) {
+				if (!valid_agent_name(agent.name)) {
+					error = "A custom agent has an invalid name";
+					return false;
+				}
+				if (!names.insert(agent.name).second) {
+					error = "Custom agent names must be unique";
+					return false;
+				}
+				if (agent.description.size() > 1023 || agent.color.size() > 15 ||
+					agent.system_prompt.size() > 16383 || agent.permissions.size() > 512 ||
+					agent.tools_allowed.size() > 256 || agent.tools_denied.size() > 256) {
+					error = "A custom agent exceeds its bounded field limits";
+					return false;
+				}
+				for (const auto& rule : agent.permissions) {
+					if (rule.permission_key.empty() || rule.permission_key.size() > 95 ||
+						rule.pattern.size() > 159) {
+						error = "A custom agent permission rule exceeds its bounds";
+						return false;
+					}
+				}
+				for (const auto& tool : agent.tools_allowed) {
+					if (tool.empty() || tool.size() > 95) {
+						error = "A custom agent allowed-tool identity exceeds its bounds";
+						return false;
+					}
+				}
+				for (const auto& tool : agent.tools_denied) {
+					if (tool.empty() || tool.size() > 95) {
+						error = "A custom agent denied-tool identity exceeds its bounds";
+						return false;
+					}
+				}
+				if (agent.model_override &&
+					(agent.model_override->provider_id.size() > 95 ||
+						agent.model_override->model_id.size() > 159)) {
+					error = "A custom agent model override exceeds its bounds";
+					return false;
+				}
+				if (agent.options.dump().size() > k_max_options_bytes) {
+					error = "A custom agent options payload exceeds 1 MiB";
+					return false;
+				}
+			}
+			return true;
+		}
+
+		bool exact_atomic_write(const std::filesystem::path& destination,
+			const std::string& payload, std::filesystem::path& temporary,
+			std::string& error)
+		{
+			if (payload.size() > k_max_catalog_bytes) {
+				error = "Custom agent catalog exceeds 16 MiB";
+				return false;
+			}
+			if (!ensure_directory(destination.parent_path())) {
+				error = "Custom agent storage directory is unavailable";
+				return false;
+			}
+			temporary = destination;
+			temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+				std::to_wstring(GetTickCount64());
+			HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+				CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+			if (file == INVALID_HANDLE_VALUE) {
+				error = "Custom agent staging file could not be created";
+				return false;
+			}
+			std::size_t offset = 0;
+			bool ok = true;
+			while (offset < payload.size()) {
+				const DWORD chunk = static_cast<DWORD>((std::min)(
+					payload.size() - offset, static_cast<std::size_t>(1024 * 1024)));
+				DWORD written = 0;
+				if (!WriteFile(file, payload.data() + offset, chunk, &written, nullptr) ||
+					written != chunk) {
+					ok = false;
+					break;
+				}
+				offset += written;
+			}
+			LARGE_INTEGER size{};
+			if (ok && (!FlushFileBuffers(file) || !GetFileSizeEx(file, &size) ||
+				static_cast<std::uint64_t>(size.QuadPart) != payload.size())) ok = false;
+			CloseHandle(file);
+			if (!ok) {
+				DeleteFileW(temporary.c_str());
+				error = "Custom agent catalog staging write was incomplete";
+				return false;
+			}
+			return true;
+		}
+
+		bool promote_staged_file(const std::filesystem::path& temporary,
+			const std::filesystem::path& destination, std::string& error)
+		{
+			const DWORD attributes = GetFileAttributesW(destination.c_str());
+			const BOOL promoted = attributes != INVALID_FILE_ATTRIBUTES
+				? ReplaceFileW(destination.c_str(), temporary.c_str(), nullptr,
+					REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)
+				: MoveFileExW(temporary.c_str(), destination.c_str(),
+					MOVEFILE_WRITE_THROUGH);
+			if (!promoted) {
+				DeleteFileW(temporary.c_str());
+				error = "Custom agent catalog atomic replacement failed";
 				return false;
 			}
 			return true;
@@ -841,6 +982,7 @@ Rules:
 			copy.native = false;
 			custom.push_back(std::move(copy));
 		}
+		++custom_generation_slot();
 		return true;
 	}
 
@@ -855,10 +997,8 @@ Rules:
 			set_last_error_locked("custom agent not found: " + name);
 			return false;
 		}
+		++custom_generation_slot();
 
-		std::error_code ec;
-		auto path = agents_directory() / (name + ".json");
-		std::filesystem::remove(path, ec);
 		return true;
 	}
 
@@ -965,55 +1105,172 @@ Rules:
 
 	bool save_custom_to_disk()
 	{
-		std::lock_guard<std::mutex> lk(registry_mutex());
-		auto dir = agents_directory();
-		if (!ensure_directory(dir)) return false;
-		const auto& custom = custom_vector();
-		bool ok = true;
-		for (const auto& a : custom) {
-			auto path = dir / (a.name + ".json");
-			std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-			if (!ofs) {
-				set_last_error_locked("cannot write " + path.string());
-				ok = false;
-				continue;
-			}
-			ofs << to_json(a).dump(2);
-		}
-		return ok;
+		const auto snapshot = custom_catalog_snapshot();
+		std::string error;
+		const bool saved = commit_custom_catalog(snapshot.generation,
+			snapshot.agents, error);
+		if (!saved) set_last_error(error);
+		return saved;
 	}
 
 	bool load_custom_from_disk()
 	{
+		const auto snapshot = custom_catalog_snapshot();
+		std::string error;
+		const bool loaded = reload_custom_catalog(snapshot.generation, error);
+		if (!loaded) set_last_error(error);
+		return loaded;
+	}
+
+	custom_catalog_snapshot_t custom_catalog_snapshot()
+	{
 		std::lock_guard<std::mutex> lk(registry_mutex());
-		auto dir = agents_directory();
-		std::error_code ec;
-		if (!std::filesystem::exists(dir, ec)) return true;
-		auto& custom = custom_vector();
-		custom.clear();
-		for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-			if (ec) break;
-			if (!entry.is_regular_file()) continue;
-			auto path = entry.path();
-			if (path.extension() != ".json") continue;
-			std::ifstream ifs(path, std::ios::binary);
-			if (!ifs) continue;
-			std::stringstream ss;
-			ss << ifs.rdbuf();
-			std::string text = ss.str();
-			if (text.empty()) continue;
-			try {
-				auto obj = nlohmann::json::parse(text, nullptr, false);
-				if (obj.is_discarded()) continue;
-				agent_info_t info;
-				if (from_json(obj, info)) {
-					info.native = false;
-					custom.push_back(std::move(info));
+		custom_catalog_snapshot_t snapshot;
+		snapshot.generation = custom_generation_slot();
+		snapshot.agents = custom_vector();
+		return snapshot;
+	}
+
+	bool commit_custom_catalog(std::uint64_t expected_generation,
+		const std::vector<agent_info_t>& agents, std::string& error)
+	{
+		error.clear();
+		std::vector<agent_info_t> normalized = agents;
+		for (auto& agent : normalized) agent.native = false;
+		if (!validate_custom_catalog(normalized, error)) return false;
+		{
+			std::lock_guard<std::mutex> lk(registry_mutex());
+			if (custom_generation_slot() != expected_generation) {
+				error = "Custom agent catalog changed before persistence began";
+				return false;
+			}
+			for (const auto& custom : normalized) {
+				const auto native = std::find_if(agents_vector().begin(), agents_vector().end(),
+					[&](const auto& agent) { return agent.name == custom.name; });
+				if (native != agents_vector().end()) {
+					error = "A custom agent cannot replace a native agent identity";
+					return false;
 				}
-			} catch (...) {
-				continue;
 			}
 		}
+		nlohmann::json root = {{"schema", 2}, {"agents", nlohmann::json::array()}};
+		for (const auto& agent : normalized) root["agents"].push_back(to_json(agent));
+		const std::string payload = root.dump();
+		if (payload.size() > k_max_catalog_bytes) {
+			error = "Custom agent catalog exceeds 16 MiB";
+			return false;
+		}
+		const auto destination = catalog_path();
+		std::filesystem::path temporary;
+		if (!exact_atomic_write(destination, payload, temporary, error)) return false;
+		{
+			std::lock_guard<std::mutex> lk(registry_mutex());
+			if (custom_generation_slot() != expected_generation) {
+				DeleteFileW(temporary.c_str());
+				error = "Custom agent catalog changed before atomic commit";
+				return false;
+			}
+			if (!promote_staged_file(temporary, destination, error)) return false;
+			custom_vector() = std::move(normalized);
+			++custom_generation_slot();
+		}
+		return true;
+	}
+
+	bool reload_custom_catalog(std::uint64_t expected_generation, std::string& error)
+	{
+		error.clear();
+		std::vector<agent_info_t> loaded;
+		const auto authoritative = catalog_path();
+		std::error_code ec;
+		if (std::filesystem::exists(authoritative, ec)) {
+			const auto bytes = std::filesystem::file_size(authoritative, ec);
+			if (ec || bytes > k_max_catalog_bytes) {
+				error = "Custom agent catalog is unavailable or exceeds 16 MiB";
+				return false;
+			}
+			std::ifstream input(authoritative, std::ios::binary);
+			std::string payload(static_cast<std::size_t>(bytes), '\0');
+			if (!input || (!payload.empty() &&
+				(!input.read(payload.data(), static_cast<std::streamsize>(payload.size())) ||
+				 input.gcount() != static_cast<std::streamsize>(payload.size())))) {
+				error = "Custom agent catalog could not be read exactly";
+				return false;
+			}
+			const auto root = nlohmann::json::parse(payload, nullptr, false);
+			if (!root.is_object() || root.value("schema", 0) != 2 ||
+				!root.contains("agents") || !root["agents"].is_array() ||
+				root["agents"].size() > k_max_custom_agents) {
+				error = "Custom agent catalog schema is invalid";
+				return false;
+			}
+			for (const auto& item : root["agents"]) {
+				agent_info_t agent;
+				if (!from_json(item, agent)) {
+					error = "Custom agent catalog contains an invalid definition";
+					return false;
+				}
+				agent.native = false;
+				loaded.push_back(std::move(agent));
+			}
+		} else {
+			ec.clear();
+			const auto directory = agents_directory();
+			if (std::filesystem::exists(directory, ec)) {
+				std::size_t aggregate = 0;
+				for (std::filesystem::directory_iterator it(directory, ec), end;
+					it != end && !ec; it.increment(ec)) {
+					if (loaded.size() >= k_max_custom_agents) {
+						error = "Legacy custom agent files exceed the 256-agent bound";
+						return false;
+					}
+					if (!it->is_regular_file(ec) || it->path().extension() != ".json" ||
+						it->path().filename() == L"catalog.v2.json") continue;
+					const auto bytes = it->file_size(ec);
+					if (ec || bytes > 2ULL * 1024ULL * 1024ULL ||
+						bytes > k_max_catalog_bytes - aggregate) {
+						error = "A legacy custom agent file exceeds its bounded size";
+						return false;
+					}
+					aggregate += static_cast<std::size_t>(bytes);
+					std::ifstream input(it->path(), std::ios::binary);
+					std::string payload(static_cast<std::size_t>(bytes), '\0');
+					if (!input || (!payload.empty() &&
+						(!input.read(payload.data(), static_cast<std::streamsize>(payload.size())) ||
+						 input.gcount() != static_cast<std::streamsize>(payload.size())))) {
+						error = "A legacy custom agent file could not be read exactly";
+						return false;
+					}
+					const auto item = nlohmann::json::parse(payload, nullptr, false);
+					agent_info_t agent;
+					if (!from_json(item, agent)) {
+						error = "A legacy custom agent definition is invalid";
+						return false;
+					}
+					agent.native = false;
+					loaded.push_back(std::move(agent));
+				}
+				if (ec) {
+					error = "Custom agent directory enumeration failed";
+					return false;
+				}
+			}
+		}
+		if (!validate_custom_catalog(loaded, error)) return false;
+		std::lock_guard<std::mutex> lk(registry_mutex());
+		if (custom_generation_slot() != expected_generation) {
+			error = "Custom agent catalog changed while reload was running";
+			return false;
+		}
+		for (const auto& custom : loaded) {
+			if (std::any_of(agents_vector().begin(), agents_vector().end(),
+				[&](const auto& native) { return native.name == custom.name; })) {
+				error = "A custom agent catalog cannot replace a native agent identity";
+				return false;
+			}
+		}
+		custom_vector() = std::move(loaded);
+		++custom_generation_slot();
 		return true;
 	}
 

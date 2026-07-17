@@ -7,9 +7,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fuzzer_engine {
@@ -88,6 +90,13 @@ struct fuzz_stats_t {
 	std::vector<uint64_t> exec_rate_history;
 };
 
+struct render_snapshot_t {
+	fuzz_stats_t stats;
+	std::vector<crash_info_t> unique_crashes;
+	std::uint64_t generation = 1;
+	bool crash_catalog_truncated = false;
+};
+
 inline crash_info_t preview_crash(crash_type_t type, exploit_score_t score, uint64_t rip,
 	mutation_strategy_t strategy, const char* detail)
 {
@@ -118,15 +127,19 @@ struct state_t {
 	fuzz_stats_t stats;
 	coverage_info_t coverage;
 	std::vector<corpus_entry_t> corpus;
-	std::vector<crash_info_t> crashes;
 	std::vector<crash_info_t> unique_crashes;
 	std::set<uint64_t> crash_hashes;
 	std::string setup_error;
+	std::shared_ptr<const render_snapshot_t> render_snapshot =
+		std::make_shared<const render_snapshot_t>();
+	std::uint64_t render_generation = 1;
 	std::mutex mutex;
 	std::atomic<bool> running{false};
 	std::atomic<bool> cancel{false};
 	std::atomic<bool> minimizing{false};
 	std::atomic<bool> analyzing_crash{false};
+	std::atomic<bool> exporting_crashes{false};
+	std::atomic<bool> importing_crashes{false};
 	std::atomic<bool> worker_active{false};
 	std::atomic<bool> setup_complete{true};
 	std::atomic<bool> setup_success{true};
@@ -158,13 +171,34 @@ struct state_t {
 			preview_crash(crash_type_t::division_by_zero, exploit_score_t::low, 0x140001086,
 				mutation_strategy_t::arithmetic, "Arithmetic mutation produced a zero divisor")
 		};
-		crashes = unique_crashes;
 		for (const auto& crash : unique_crashes) crash_hashes.insert(crash.crash_hash);
 		corpus.push_back({{0x41, 0x49, 0x44, 0x41}, 821, 17, "seed", 1.4f, 76});
+		auto snapshot = std::make_shared<render_snapshot_t>();
+		snapshot->stats = stats;
+		snapshot->unique_crashes = unique_crashes;
+		snapshot->generation = ++render_generation;
+		render_snapshot = std::move(snapshot);
 	}
 };
 
 inline state_t g_state;
+
+inline void publish_render_snapshot_locked()
+{
+	auto next = std::make_shared<render_snapshot_t>();
+	next->stats = g_state.stats;
+	next->unique_crashes = g_state.unique_crashes;
+	next->generation = ++g_state.render_generation;
+	std::shared_ptr<const render_snapshot_t> immutable = std::move(next);
+	std::atomic_store_explicit(&g_state.render_snapshot, std::move(immutable),
+		std::memory_order_release);
+}
+
+inline std::shared_ptr<const render_snapshot_t> capture_render_snapshot()
+{
+	return std::atomic_load_explicit(&g_state.render_snapshot,
+		std::memory_order_acquire);
+}
 
 inline const char* strategy_name(mutation_strategy_t strategy)
 {
@@ -213,6 +247,7 @@ inline bool start_fuzzing()
 	g_state.stats.total_executions += 25000;
 	g_state.stats.executions_per_second = 13120;
 	g_state.stats.exec_rate_history.push_back(g_state.stats.executions_per_second);
+	publish_render_snapshot_locked();
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 3, "fuzzer.run", "deterministic corpus pass complete");
 	return true;
 }
@@ -238,40 +273,47 @@ inline bool reset_state()
 	g_state.stats = {};
 	g_state.coverage = {};
 	g_state.corpus.clear();
-	g_state.crashes.clear();
 	g_state.unique_crashes.clear();
 	g_state.crash_hashes.clear();
 	g_state.active = false;
+	publish_render_snapshot_locked();
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 3, "fuzzer.reset");
 	return true;
 }
 
-inline void ai_analyze_crash(int crash_index)
+inline void ai_analyze_crash(int crash_index, std::uint64_t expected_hash)
 {
 	std::lock_guard<std::mutex> lock(g_state.mutex);
-	if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size())) return;
+	if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size()) ||
+		g_state.unique_crashes[static_cast<std::size_t>(crash_index)].crash_hash != expected_hash) return;
 	g_state.unique_crashes[static_cast<std::size_t>(crash_index)].ai_analysis =
 		"Controlled pointer propagation reaches the faulting write. Reproduce with page-heap and inspect the parser length field before triage.";
+	publish_render_snapshot_locked();
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 3, "fuzzer.analyze");
 }
 
-inline void minimize_crash(int crash_index)
+inline void minimize_crash(int crash_index, std::uint64_t expected_hash)
 {
 	std::lock_guard<std::mutex> lock(g_state.mutex);
-	if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size())) return;
+	if (crash_index < 0 || crash_index >= static_cast<int>(g_state.unique_crashes.size()) ||
+		g_state.unique_crashes[static_cast<std::size_t>(crash_index)].crash_hash != expected_hash) return;
 	auto& crash = g_state.unique_crashes[static_cast<std::size_t>(crash_index)];
 	crash.minimized_input = {0x41, 0x41, 0xFF, 0x7F};
 	crash.is_minimized = true;
+	publish_render_snapshot_locked();
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 3, "fuzzer.minimize");
 }
 
 inline void export_crashes()
 {
+	g_state.exporting_crashes.store(true);
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 3, "fuzzer.export", "3 crash records prepared");
+	g_state.exporting_crashes.store(false);
 }
 
 inline void import_crashes()
 {
+	if (g_state.importing_crashes.exchange(true)) return;
 	std::lock_guard<std::mutex> lock(g_state.mutex);
 	if (g_state.unique_crashes.empty()) {
 		g_state.unique_crashes = {
@@ -282,13 +324,14 @@ inline void import_crashes()
 			preview_crash(crash_type_t::division_by_zero, exploit_score_t::low, 0x140001086,
 				mutation_strategy_t::arithmetic, "Arithmetic mutation produced a zero divisor")
 		};
-		g_state.crashes = g_state.unique_crashes;
 		g_state.stats.total_crashes = 7;
 		g_state.stats.total_unique_crashes = 3;
 		for (const auto& crash : g_state.unique_crashes) g_state.crash_hashes.insert(crash.crash_hash);
 		g_state.active = true;
 	}
+	publish_render_snapshot_locked();
 	aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::analysis, 3, "fuzzer.import", "fixture crash corpus restored");
+	g_state.importing_crashes.store(false);
 }
 
 }

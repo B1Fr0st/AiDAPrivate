@@ -54,10 +54,38 @@ struct document_state_t {
     bool focused = false;
     bool large_file_mode = false;
     bool has_selection = false;
+    bool streamed = false;
+    bool stream_loading = false;
+    std::string stream_error;
     document_capabilities_t capabilities;
 };
 
+struct document_metadata_snapshot_t {
+    bool found = false;
+    std::uint64_t revision = 0;
+    bool dirty = false;
+    int caret_line = 0;
+    int caret_column = 0;
+    float scroll_x = 0.f;
+    float scroll_y = 0.f;
+    bool proposal_pending = false;
+    bool read_only = false;
+};
+
+struct document_payload_snapshot_t : document_metadata_snapshot_t {
+    std::uint64_t content_hash = 0;
+    std::string content;
+};
+
 struct document_pane_render_context_t {
+    std::uint64_t document_id = 0;
+    std::uint64_t revision = 1;
+    std::string_view content;
+    std::string_view filename;
+    std::string_view filepath;
+    bool dirty = false;
+    bool read_only = false;
+    std::string_view read_only_reason;
     float alpha = 1.f;
     float accent_r = 0.f;
     float accent_g = 0.f;
@@ -80,9 +108,15 @@ struct selection_t {
 
 
 struct undo_entry_t {
-    std::string text;
-    int         caret_line = 0;
-    int         caret_col  = 0;
+    int start_line = 0;
+    std::vector<std::string> before_lines;
+    std::vector<std::string> after_lines;
+    int before_caret_line = 0;
+    int before_caret_col = 0;
+    int after_caret_line = 0;
+    int after_caret_col = 0;
+    std::size_t memory_bytes = 0;
+    int coalesce_kind = 0;
 };
 
 
@@ -148,6 +182,9 @@ struct diff_hunk_t {
 
 struct pending_diff_t {
     bool                     active   = false;
+    std::uint64_t            document_id = 0;
+    std::uint64_t            base_revision = 0;
+    std::uint64_t            base_content_hash = 0;
     std::string              origin;
     std::vector<std::string> old_lines;
     std::vector<std::string> new_lines;
@@ -165,6 +202,13 @@ struct pending_diff_t {
 
 void init();
 
+bool load_document(std::uint64_t document_id, std::uint64_t revision,
+                   std::string_view content, std::string_view filename,
+                   std::string_view filepath, bool dirty,
+                   int caret_line = 0, int caret_column = 0,
+                   float scroll_x = 0.f, float scroll_y = 0.f,
+                   bool replace_existing = false);
+
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b);
@@ -173,17 +217,58 @@ void render_document_pane(const document_pane_render_context_t& context = {});
 
 document_state_t document_state();
 
+document_state_t document_state(std::uint64_t document_id);
+
 document_capabilities_t document_capabilities();
 
 bool request_document_action(document_action_t action);
 
 
-void on_text_changed();
-
-
 void get_caret(int& line, int& col);
 
 void set_caret(int line, int col);
+
+void get_scroll(float& x, float& y);
+
+void set_scroll(float x, float y);
+
+void discard_document_state(std::uint64_t document_id);
+
+bool select_document_for_actions(std::uint64_t document_id);
+
+std::uint64_t active_document_id();
+
+std::uint64_t document_revision();
+
+std::uint64_t document_revision(std::uint64_t document_id);
+
+std::string document_content(std::uint64_t document_id);
+
+std::uint64_t document_content_fingerprint(std::uint64_t document_id);
+
+bool get_document_caret(std::uint64_t document_id, int& line, int& col);
+
+bool set_document_caret(std::uint64_t document_id, int line, int col);
+
+bool get_document_scroll(std::uint64_t document_id, float& x, float& y);
+
+bool set_document_scroll(std::uint64_t document_id, float x, float y);
+
+document_metadata_snapshot_t document_metadata(std::uint64_t document_id);
+
+document_payload_snapshot_t document_payload(std::uint64_t document_id,
+                                             std::uint64_t expected_revision = 0);
+
+std::string caret_identifier();
+
+bool document_dirty(std::uint64_t document_id);
+
+void mark_document_saved(std::uint64_t document_id, std::uint64_t revision,
+                         std::string_view filename, std::string_view filepath);
+
+bool request_streamed_document(std::uint64_t document_id, std::uint64_t revision,
+                               std::string_view filename, std::string_view filepath,
+                               std::uint64_t byte_length);
 
 
 void trigger_undo();
@@ -209,6 +294,13 @@ std::uint64_t document_content_fingerprint();
 bool begin_agent_edit(std::string_view origin);
 
 bool propose_full_content(std::string_view new_content);
+
+bool propose_document_content(std::uint64_t document_id,
+                              std::uint64_t base_revision,
+                              std::uint64_t base_content_hash,
+                              std::string_view current_content,
+                              std::string_view new_content,
+                              std::string_view origin);
 
 bool propose_replace_range(int start_line, int end_line, std::string_view replacement);
 

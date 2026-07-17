@@ -33,11 +33,57 @@ const workspace_preset_descriptor_t& descriptor_for(workspace_preset_t preset) n
     return kPresetDescriptors.front();
 }
 
+bool valid_user_layout_name(std::string_view name) noexcept
+{
+    if (name.empty() || name.size() > 64 || name.front() == ' ' || name.back() == ' ')
+        return false;
+    bool previous_space = false;
+    for (const char character : name) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (!(byte >= 'a' && byte <= 'z') &&
+            !(byte >= 'A' && byte <= 'Z') &&
+            !(byte >= '0' && byte <= '9') &&
+            byte != '-' && byte != '_' && byte != ' ')
+            return false;
+        if (byte == ' ' && previous_space)
+            return false;
+        previous_space = byte == ' ';
+    }
+    return true;
+}
+
+std::string identity_key(workspace_preset_t preset, std::string_view user_name)
+{
+    std::string key = user_name.empty() ? "builtin:" : "user:";
+    key.append(descriptor_for(preset).stable_id);
+    if (!user_name.empty()) {
+        key.push_back(':');
+        constexpr char digits[] = "0123456789abcdef";
+        for (const unsigned char byte : user_name) {
+            key.push_back(digits[byte >> 4U]);
+            key.push_back(digits[byte & 0x0FU]);
+        }
+    }
+    return key;
+}
+
 struct layout_ratios_t {
     float left = 0.18f;
     float right = 0.22f;
     float bottom = 0.24f;
 };
+
+float declared_minimum_width(std::initializer_list<const char*> stable_ids) noexcept
+{
+    float width = 0.0f;
+    auto& registry = application_views::registry();
+    for (const char* stable_id : stable_ids) {
+        const auto* descriptor = registry.find_descriptor(stable_view_id_t(stable_id));
+        if (descriptor)
+            width = (std::max)(width, descriptor->minimum_size.width);
+    }
+    return width;
+}
 
 layout_ratios_t calculate_layout_ratios(workspace_preset_t preset, ImVec2 size,
     float dpi_scale) noexcept
@@ -54,10 +100,30 @@ layout_ratios_t calculate_layout_ratios(workspace_preset_t preset, ImVec2 size,
     const float scale = dpi_scale > 0.0f ? dpi_scale : 1.0f;
     const float usable_width = (std::max)(size.x, 1.0f);
     const float usable_height = (std::max)(size.y, 1.0f);
-    const float center_minimum = (std::min)(480.0f * scale, usable_width * 0.60f);
-    const float side_floor = (std::min)(180.0f * scale, usable_width * 0.20f);
-    float left_width = (std::max)(usable_width * desired_left_ratio, side_floor);
-    float right_width = (std::max)(usable_width * desired_right_ratio, side_floor);
+    const bool compact_analysis = preset == workspace_preset_t::analysis &&
+        usable_width / scale < 1500.0f;
+    const float analysis_left_minimum = declared_minimum_width(
+        {"view.project_explorer", "view.navigator", "view.analysis.functions"});
+    const float analysis_right_minimum = declared_minimum_width(
+        {"view.inspector", "view.analysis.references", "view.ai_chat"});
+    const float analysis_center_minimum = declared_minimum_width(
+        {"document.disassembly", "document.pseudocode", "document.graph",
+         "document.hex", "document.code", "view.analysis.binary_map"});
+    const float center_target = preset == workspace_preset_t::analysis
+        ? (compact_analysis ? analysis_center_minimum
+            : (std::max)(640.0f, analysis_center_minimum)) : 480.0f;
+    const float center_minimum = (std::min)(center_target * scale, usable_width * 0.60f);
+    const float generic_side_floor = (std::min)(180.0f * scale, usable_width * 0.20f);
+    const float left_floor = preset == workspace_preset_t::analysis
+        ? (compact_analysis ? (std::min)(260.0f, analysis_left_minimum)
+            : analysis_left_minimum) * scale : generic_side_floor;
+    const float right_floor = preset == workspace_preset_t::analysis
+        ? (compact_analysis ? (std::min)(300.0f, analysis_right_minimum)
+            : analysis_right_minimum) * scale : generic_side_floor;
+    float left_width = (std::max)(usable_width * desired_left_ratio,
+        (std::min)(left_floor, usable_width * 0.28f));
+    float right_width = (std::max)(usable_width * desired_right_ratio,
+        (std::min)(right_floor, usable_width * 0.34f));
     const float side_budget = (std::max)(0.0f, usable_width - center_minimum);
     const float requested_sides = left_width + right_width;
     if (requested_sides > side_budget && requested_sides > 0.0f) {
@@ -77,12 +143,181 @@ layout_ratios_t calculate_layout_ratios(workspace_preset_t preset, ImVec2 size,
     return ratios;
 }
 
+void select_docked_window(ImGuiID node_id, const char* stable_id) noexcept
+{
+    ImGuiDockNode* node = ImGui::DockBuilderGetNode(node_id);
+    if (!node || !stable_id)
+        return;
+    const std::string window_name = application_views::ensure_window_name(
+        stable_view_id_t(stable_id));
+    if (window_name.empty())
+        return;
+    ImGuiWindow* window = ImGui::FindWindowByName(window_name.c_str());
+    if (window && window->DockNode)
+        node = window->DockNode;
+    const ImGuiID selected = window ? window->TabId : ImHashStr(window_name.c_str());
+    node->SelectedTabId = selected;
+    if (node->TabBar) {
+        node->TabBar->SelectedTabId = selected;
+        node->TabBar->NextSelectedTabId = selected;
+        node->TabBar->VisibleTabId = selected;
+        if (window)
+            ImGui::FocusWindow(window);
+    }
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void open_builtin_default_views(workspace_preset_t preset) noexcept
+{
+    auto& registry = application_views::registry();
+    registry.for_each_descriptor([preset](const view_descriptor_t& descriptor) {
+        if (preset_default_opens_view(preset, descriptor.id.value()))
+            static_cast<void>(application_views::open_for_layout(descriptor.id));
+    });
+}
+#endif
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+void open_builtin_default_documents(workspace_preset_t preset) noexcept
+{
+    auto& registry = application_views::registry();
+    registry.for_each_descriptor([preset](const view_descriptor_t& descriptor) {
+        if (descriptor.role == view_presentation_role_t::document &&
+            preset_default_opens_view(preset, descriptor.id.value()))
+            static_cast<void>(application_views::open_for_layout(descriptor.id));
+    });
+}
+#endif
+
+void select_builtin_default_tabs(workspace_preset_t preset, ImGuiID left, ImGuiID center,
+    ImGuiID right, ImGuiID bottom) noexcept
+{
+    if (preset == workspace_preset_t::analysis) {
+        select_docked_window(left, "view.analysis.functions");
+        select_docked_window(right, "view.inspector");
+        select_docked_window(bottom, "view.output");
+        select_docked_window(center, "document.disassembly");
+    } else if (preset == workspace_preset_t::debugging) {
+        select_docked_window(left, "view.debug.threads");
+        select_docked_window(right, "view.debug.breakpoints");
+        select_docked_window(bottom, "view.debug.trace");
+        select_docked_window(center, "view.debug.cpu");
+    } else if (preset == workspace_preset_t::memory) {
+        select_docked_window(left, "view.memory.value_scan");
+        select_docked_window(right, "view.debug.memory_map");
+        select_docked_window(bottom, "view.debug.patches");
+        select_docked_window(center, "document.hex");
+    } else if (preset == workspace_preset_t::types_structures) {
+        select_docked_window(left, "view.types.structures");
+        select_docked_window(right, "view.types.dissector");
+        select_docked_window(bottom, "view.analysis.references");
+        select_docked_window(center, "view.types.struct_recon");
+    } else if (preset == workspace_preset_t::network) {
+        select_docked_window(left, "view.network.site_map");
+        select_docked_window(right, "view.network.scanner");
+        select_docked_window(bottom, "view.network.capture");
+        select_docked_window(center, "view.network.proxy");
+    } else if (preset == workspace_preset_t::automation_ai) {
+        select_docked_window(left, "view.ai.agents");
+        select_docked_window(right, "view.settings");
+        select_docked_window(bottom, "view.background_tasks");
+        select_docked_window(center, "view.ai_chat");
+    } else if (preset == workspace_preset_t::programming) {
+        select_docked_window(left, "view.project_explorer");
+        select_docked_window(right, "view.ai_chat");
+        select_docked_window(bottom, "view.output");
+        select_docked_window(center, "document.code");
+    } else {
+        select_docked_window(left, "view.project_explorer");
+        select_docked_window(right, "view.ai_chat");
+        select_docked_window(bottom, "view.diagnostics");
+        select_docked_window(center, "document.code");
+    }
+}
+
+void dock_open_windows_by_role(ImGuiID left, ImGuiID center, ImGuiID right,
+    ImGuiID bottom) noexcept
+{
+    auto& registry = application_views::registry();
+    registry.for_each_instance([&](const view_descriptor_t& descriptor,
+            const view_instance_state_t& instance) {
+        ImGuiID target = 0;
+        switch (descriptor.role) {
+        case view_presentation_role_t::document:
+            target = center;
+            break;
+        case view_presentation_role_t::inspector:
+            target = right;
+            break;
+        case view_presentation_role_t::bottom_panel:
+            target = bottom;
+            break;
+        case view_presentation_role_t::tool_window:
+            target = left;
+            break;
+        case view_presentation_role_t::shell_surface:
+            break;
+        }
+        if (target == 0)
+            return;
+        const std::string& window_name = registry.window_name(instance.id);
+        if (!window_name.empty())
+            ImGui::DockBuilderDockWindow(window_name.c_str(), target);
+    }, true);
+}
+
 }
 
 const workspace_preset_descriptor_t* presets(std::size_t& count) noexcept
 {
     count = kPresetDescriptors.size();
     return kPresetDescriptors.data();
+}
+
+bool preset_default_opens_view(workspace_preset_t preset,
+    std::string_view stable_view_id) noexcept
+{
+    const auto matches = [stable_view_id](std::initializer_list<std::string_view> ids) noexcept {
+        return std::find(ids.begin(), ids.end(), stable_view_id) != ids.end();
+    };
+    switch (preset) {
+    case workspace_preset_t::analysis:
+        return matches({"view.analysis.functions", "document.disassembly", "document.pseudocode",
+            "document.graph", "document.hex", "view.inspector", "view.analysis.references",
+            "view.ai_chat", "view.output", "view.background_tasks", "view.diagnostics"});
+    case workspace_preset_t::debugging:
+        return matches({"view.sessions", "view.debug.threads", "view.debug.modules",
+            "view.debug.call_stack", "view.debug.cpu", "view.debug.source", "document.hex",
+            "view.debug.breakpoints", "view.debug.watches", "view.debug.memory_map",
+            "view.debug.trace", "view.terminal", "view.background_tasks", "view.diagnostics"});
+    case workspace_preset_t::memory:
+        return matches({"view.sessions", "view.memory.value_scan", "view.memory.aob",
+            "document.hex", "view.memory.pointers", "view.memory.snapshots",
+            "view.debug.memory_map", "view.types.dissector", "view.debug.patches",
+            "view.debug.watches", "view.background_tasks"});
+    case workspace_preset_t::types_structures:
+        return matches({"view.sessions", "view.types.structures", "view.types.unions",
+            "view.types.enums", "view.types.struct_recon", "document.hex",
+            "view.types.dissector", "view.analysis.references", "view.background_tasks"});
+    case workspace_preset_t::network:
+        return matches({"view.sessions", "view.network.site_map", "view.network.scope",
+            "view.network.proxy", "view.network.repeater", "view.network.browser",
+            "view.network.decoder", "view.network.comparer", "view.network.scanner",
+            "view.network.capture", "view.network.logger", "view.background_tasks"});
+    case workspace_preset_t::automation_ai:
+        return matches({"view.sessions", "view.ai.agents", "view.ai.skills",
+            "view.project_explorer", "view.ai_chat", "document.code", "view.settings",
+            "view.background_tasks", "view.mcp_log", "view.output", "view.terminal"});
+    case workspace_preset_t::programming:
+        return matches({"view.project_explorer", "view.programming.outline", "view.sessions",
+            "view.workspace_search", "document.code", "document.disassembly",
+            "view.analysis.references", "view.ai_chat", "view.output", "view.terminal",
+            "view.programming.references", "view.background_tasks"});
+    case workspace_preset_t::safe:
+        return matches({"view.project_explorer", "view.sessions", "view.recent",
+            "document.code", "view.ai_chat", "view.diagnostics", "view.output"});
+    }
+    return false;
 }
 
 }
@@ -93,10 +328,6 @@ namespace aida::ui::workspace_layout {
 namespace {
 
 constexpr std::size_t kPreviewMaximumPayloadBytes = 4U * 1024U * 1024U;
-#if defined(IMGUI_HAS_DOCK)
-constexpr const char* kPreviewCompatibilityWindowName = "Compatibility IDE###aida.view.shell.compatibility";
-#endif
-
 std::size_t preset_index(workspace_preset_t preset) noexcept
 {
     return static_cast<std::size_t>(preset);
@@ -110,10 +341,15 @@ struct preview_state_t {
     std::string in_memory_layout;
     std::array<std::string, kPresetDescriptors.size()> layouts;
     std::map<std::string, std::string> user_layouts;
+    std::map<std::string, workspace_preset_t> user_presets;
+    std::string active_user;
+    std::uint64_t user_generation = 0;
     workspace_preset_t active = workspace_preset_t::analysis;
     workspace_preset_t pending = workspace_preset_t::analysis;
+    std::string active_user;
     bool locked = false;
     bool rebuild = false;
+    std::uint8_t select_defaults_after_realize_frames = 0;
 };
 
 void build_preview_recipe(preview_state_t& current, ImGuiID root_dockspace_id,
@@ -158,10 +394,13 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
         return;
 #if defined(IMGUI_HAS_DOCK)
     if (!current.root_prepared || current.rebuild) {
+        application_views::synchronize_workspace_visibility(current.pending);
         if (!current.rebuild && !current.layouts[preset_index(current.pending)].empty()) {
             const std::string& saved = current.layouts[preset_index(current.pending)];
             ImGui::LoadIniSettingsFromMemory(saved.data(), saved.size());
+            current.select_defaults_after_realize_frames = 0;
         } else {
+            open_builtin_default_documents(current.pending);
             build_preview_recipe(current, root_dockspace_id, position, size);
         }
         current.active = current.pending;
@@ -175,6 +414,21 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
 #endif
     current.root_prepared = true;
     apply_preview_lock(ImGui::DockBuilderGetNode(root_dockspace_id), current.locked);
+}
+
+void settle_default_selection() noexcept
+{
+    preview_state_t& current = preview_state();
+    if (current.select_defaults_after_realize_frames == 0)
+        return;
+    --current.select_defaults_after_realize_frames;
+    if (current.select_defaults_after_realize_frames != 0)
+        return;
+    if (application_views::is_open(stable_view_id_t("view.start_center")))
+        select_docked_window(current.nodes.documents, "view.start_center");
+    else
+        select_builtin_default_tabs(current.active, current.nodes.navigator,
+            current.nodes.documents, current.nodes.inspector, current.nodes.bottom);
 }
 
 namespace {
@@ -200,9 +454,67 @@ void build_preview_recipe(preview_state_t& current, ImGuiID root_dockspace_id,
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, ratios.left, &left, &center);
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, ratios.right, &right, &center);
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, ratios.bottom, &bottom, &center);
-    ImGui::DockBuilderDockWindow(kPreviewCompatibilityWindowName, center);
+    dock_open_windows_by_role(left, center, right, bottom);
+    const auto dock = [](ImGuiID node, std::initializer_list<const char*> stable_ids) {
+        for (const char* stable_id : stable_ids) {
+            const std::string window_name = application_views::ensure_window_name(
+                stable_view_id_t(stable_id));
+            if (!window_name.empty())
+                ImGui::DockBuilderDockWindow(window_name.c_str(), node);
+        }
+    };
+    if (preset == workspace_preset_t::analysis) {
+        dock(left, {"view.project_explorer", "view.sessions", "view.navigator",
+            "view.analysis.functions", "view.analysis.imports", "view.analysis.exports",
+            "view.analysis.names", "view.analysis.strings", "view.analysis.segments",
+			"view.analysis.local_types", "view.analysis.segment_registers",
+			"view.analysis.proximity"});
+        dock(center, {"view.start_center", "document.disassembly", "document.pseudocode", "document.graph", "document.hex", "document.code", "view.analysis.binary_map"});
+        dock(right, {"view.inspector", "view.analysis.references", "view.ai_chat"});
+        dock(bottom, {"view.output", "view.background_tasks", "view.diagnostics"});
+    } else if (preset == workspace_preset_t::debugging) {
+        dock(left, {"view.sessions", "view.debug.threads", "view.debug.modules", "view.debug.call_stack"});
+        dock(center, {"view.start_center", "view.debug.cpu", "view.debug.source", "document.code", "document.hex", "view.debug.cfg"});
+        dock(right, {"view.debug.breakpoints", "view.debug.watches"});
+        dock(bottom, {"view.debug.memory_map", "view.debug.trace", "view.debug.patches", "view.debug.seh", "view.debug.handles", "view.terminal", "view.background_tasks", "view.diagnostics"});
+    } else if (preset == workspace_preset_t::memory) {
+        dock(left, {"view.sessions", "view.memory.value_scan", "view.memory.crypto", "view.memory.aob"});
+        dock(center, {"view.start_center", "document.hex", "view.memory.pointers", "view.memory.snapshots"});
+        dock(right, {"view.debug.memory_map", "view.types.dissector"});
+        dock(bottom, {"view.debug.patches", "view.debug.watches", "view.background_tasks", "view.diagnostics"});
+    } else if (preset == workspace_preset_t::types_structures) {
+        dock(left, {"view.sessions", "view.types.structures", "view.types.unions", "view.types.enums", "view.types.typedefs", "view.types.functions", "view.types.inferred"});
+        dock(center, {"view.start_center", "view.types.struct_recon", "document.code", "document.hex"});
+        dock(right, {"view.types.dissector"});
+        dock(bottom, {"view.analysis.references", "view.background_tasks", "view.diagnostics"});
+    } else if (preset == workspace_preset_t::network) {
+        dock(left, {"view.sessions", "view.network.site_map", "view.network.scope", "view.network.cookies", "view.network.session"});
+        dock(center, {"view.start_center", "view.network.proxy", "view.network.intercept", "view.network.repeater", "view.network.browser", "view.network.api"});
+        dock(right, {"view.network.decoder", "view.network.comparer", "view.network.scanner", "view.network.reports"});
+        dock(bottom, {"view.network.capture", "view.network.logger", "view.network.websocket", "view.network.h2_editor", "view.background_tasks", "view.diagnostics"});
+    } else if (preset == workspace_preset_t::automation_ai) {
+        dock(left, {"view.sessions", "view.ai.agents", "view.ai.skills", "view.project_explorer"});
+        dock(center, {"view.start_center", "view.ai_chat", "document.code"});
+        dock(right, {"view.settings"});
+        dock(bottom, {"view.background_tasks", "view.mcp_log", "view.output", "view.terminal", "view.diagnostics"});
+    } else if (preset == workspace_preset_t::programming) {
+        dock(left, {"view.project_explorer", "view.programming.outline", "view.sessions", "view.workspace_search"});
+        dock(center, {"view.start_center", "document.code", "document.disassembly", "document.pseudocode"});
+        dock(right, {"view.analysis.references", "view.ai_chat"});
+        dock(bottom, {"view.output", "view.terminal", "view.programming.references", "view.background_tasks", "view.diagnostics"});
+    } else {
+        dock(left, {"view.project_explorer", "view.sessions", "view.recent"});
+        dock(center, {"view.start_center", "document.code"});
+        dock(right, {"view.ai_chat"});
+        dock(bottom, {"view.diagnostics", "view.output"});
+    }
     ImGui::DockBuilderFinish(root_dockspace_id);
+    if (application_views::is_open(stable_view_id_t("view.start_center"))) {
+        select_docked_window(center, "view.start_center");
+    } else
+        select_builtin_default_tabs(preset, left, center, right, bottom);
     current.nodes = {root_dockspace_id, left, center, right, bottom};
+    current.select_defaults_after_realize_frames = 2;
 #else
     static_cast<void>(current);
     static_cast<void>(root_dockspace_id);
@@ -224,6 +536,65 @@ ImGuiID node_id(dock_role_t role) noexcept
     case dock_role_t::bottom: return nodes.bottom;
     default: return 0;
     }
+}
+
+window_placement_state_t inspect_window_placement(std::string_view window_name) noexcept
+{
+    window_placement_state_t result;
+    if (window_name.empty() || ImGui::GetCurrentContext() == nullptr)
+        return result;
+    const std::string name(window_name);
+    ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+    if (!window)
+        return result;
+    result.realized = true;
+    result.dock_node = window->DockId;
+    result.docked = window->DockId != 0;
+    const dock_nodes_t nodes = preview_state().nodes;
+    if (window->DockId == nodes.navigator) result.role = dock_role_t::navigator;
+    else if (window->DockId == nodes.documents) result.role = dock_role_t::documents;
+    else if (window->DockId == nodes.inspector) result.role = dock_role_t::inspector;
+    else if (window->DockId == nodes.bottom) result.role = dock_role_t::bottom;
+    return result;
+}
+
+workspace_request_result_t float_window(std::string_view window_name) noexcept
+{
+    preview_state_t& current = preview_state();
+    if (!current.initialized || !current.root_prepared || current.locked || window_name.empty())
+        return workspace_request_result_t::unavailable;
+    const std::string name(window_name);
+    ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+    if (!window)
+        return workspace_request_result_t::unavailable;
+    if (window->DockId == 0)
+        return workspace_request_result_t::unchanged;
+    ImGui::DockContextQueueUndockWindow(ImGui::GetCurrentContext(), window);
+    ImGui::GetIO().WantSaveIniSettings = true;
+    return workspace_request_result_t::completed;
+}
+
+workspace_request_result_t dock_window(std::string_view window_name, dock_role_t role) noexcept
+{
+    preview_state_t& current = preview_state();
+    if (!current.initialized || !current.root_prepared || current.locked || window_name.empty() ||
+        role == dock_role_t::root)
+        return workspace_request_result_t::unavailable;
+    const ImGuiID target = node_id(role);
+    if (target == 0 || ImGui::DockBuilderGetNode(target) == nullptr)
+        return workspace_request_result_t::unavailable;
+    const window_placement_state_t placement = inspect_window_placement(window_name);
+    if (placement.realized && placement.dock_node == target)
+        return workspace_request_result_t::unchanged;
+    const std::string name(window_name);
+    ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+    if (window)
+        ImGui::DockContextQueueDock(ImGui::GetCurrentContext(), nullptr,
+            ImGui::DockBuilderGetNode(target), window, ImGuiDir_None, 0.0f, false);
+    else
+        ImGui::DockBuilderDockWindow(name.c_str(), target);
+    ImGui::GetIO().WantSaveIniSettings = true;
+    return workspace_request_result_t::completed;
 }
 
 void persist_if_requested() noexcept
@@ -252,13 +623,52 @@ void persist_if_requested() noexcept
 
 workspace_preset_t active_preset() noexcept { return preview_state().active; }
 std::string_view active_preset_name() noexcept { return descriptor_for(active_preset()).display_name; }
+workspace_identity_t active_identity() noexcept
+{
+    const preview_state_t& current = preview_state();
+    return {current.active_user.empty() ? workspace_identity_kind_t::built_in :
+        workspace_identity_kind_t::user, current.active, current.active_user};
+}
+std::string active_identity_key() noexcept
+{
+    try {
+        const preview_state_t& current = preview_state();
+        return identity_key(current.active, current.active_user);
+    } catch (...) {
+        return "builtin:analysis";
+    }
+}
+std::shared_ptr<const std::vector<user_workspace_descriptor_t>> user_layout_catalog() noexcept
+{
+    try {
+        const preview_state_t& current = preview_state();
+        auto result = std::make_shared<std::vector<user_workspace_descriptor_t>>();
+        result->reserve(current.user_layouts.size());
+        for (const auto& entry : current.user_layouts) {
+            const auto preset = current.user_presets.find(entry.first);
+            result->push_back({entry.first,
+                preset == current.user_presets.end() ? workspace_preset_t::analysis : preset->second,
+                current.user_generation,
+                current.active_user == entry.first});
+        }
+        return result;
+    } catch (...) {
+        return std::make_shared<const std::vector<user_workspace_descriptor_t>>();
+    }
+}
+bool user_layout_catalog_ready() noexcept { return true; }
 bool layout_locked() noexcept { return preview_state().locked; }
-void set_layout_locked(bool locked) noexcept
+workspace_request_result_t set_layout_locked(bool locked) noexcept
 {
     preview_state_t& current = preview_state();
     current.locked = locked;
     apply_preview_lock(ImGui::DockBuilderGetNode(current.root), locked);
+    ImGui::GetIO().WantSaveIniSettings = true;
+    return workspace_request_result_t::completed;
 }
+
+bool operation_pending() noexcept { return false; }
+std::string operation_status() noexcept { return {}; }
 
 workspace_request_result_t switch_to(workspace_preset_t preset) noexcept
 {
@@ -266,38 +676,61 @@ workspace_request_result_t switch_to(workspace_preset_t preset) noexcept
     if (current.active == preset && !current.rebuild)
         return workspace_request_result_t::unchanged;
     persist_if_requested();
+    current.active_user.clear();
     current.pending = preset;
     current.rebuild = current.layouts[preset_index(preset)].empty();
     current.root_prepared = false;
     return workspace_request_result_t::completed;
 }
 
-workspace_request_result_t save_user_layout(std::string_view name) noexcept
+workspace_request_result_t save_user_layout(std::string_view name, bool overwrite) noexcept
 {
-    if (name.empty() || name.size() > 64)
+    if (!valid_user_layout_name(name))
         return workspace_request_result_t::invalid_name;
     ImGui::GetIO().WantSaveIniSettings = true;
     persist_if_requested();
     preview_state_t& current = preview_state();
     try {
-        current.user_layouts[std::string(name)] = current.in_memory_layout;
+        const std::string saved_name(name);
+        if (!overwrite && current.user_layouts.find(saved_name) != current.user_layouts.end())
+            return workspace_request_result_t::already_exists;
+        const std::string previous_identity = identity_key(current.active, current.active_user);
+        current.user_layouts[saved_name] = current.in_memory_layout;
+        current.user_presets[saved_name] = current.active;
+        current.active_user = saved_name;
+        application_views::clone_persisted_workspace_visibility(previous_identity,
+            identity_key(current.active, current.active_user));
+        ++current.user_generation;
     } catch (...) {
         return workspace_request_result_t::failed;
     }
     return workspace_request_result_t::completed;
 }
 
+workspace_request_result_t save_active_user_layout() noexcept
+{
+    const std::string name = preview_state().active_user;
+    return name.empty() ? workspace_request_result_t::unavailable :
+        save_user_layout(name, true);
+}
+
 workspace_request_result_t load_user_layout(std::string_view name) noexcept
 {
-    if (name.empty() || name.size() > 64)
+    if (!valid_user_layout_name(name))
         return workspace_request_result_t::invalid_name;
     preview_state_t& current = preview_state();
     try {
         const auto found = current.user_layouts.find(std::string(name));
         if (found == current.user_layouts.end())
-            return workspace_request_result_t::unavailable;
+            return workspace_request_result_t::not_found;
+        const auto preset = current.user_presets.find(found->first);
+        if (preset == current.user_presets.end())
+            return workspace_request_result_t::failed;
         ImGui::LoadIniSettingsFromMemory(found->second.data(), found->second.size());
         current.in_memory_layout = found->second;
+        current.active = preset->second;
+        current.pending = preset->second;
+        current.active_user = found->first;
         current.root_prepared = true;
     } catch (...) {
         return workspace_request_result_t::failed;
@@ -305,10 +738,67 @@ workspace_request_result_t load_user_layout(std::string_view name) noexcept
     return workspace_request_result_t::completed;
 }
 
+workspace_request_result_t rename_user_layout(std::string_view current_name,
+    std::string_view new_name) noexcept
+{
+    if (!valid_user_layout_name(current_name) || !valid_user_layout_name(new_name))
+        return workspace_request_result_t::invalid_name;
+    preview_state_t& current = preview_state();
+    try {
+        const std::string old_value(current_name);
+        const std::string new_value(new_name);
+        const auto found = current.user_layouts.find(old_value);
+        if (found == current.user_layouts.end())
+            return workspace_request_result_t::not_found;
+        if (old_value == new_value)
+            return workspace_request_result_t::unchanged;
+        if (current.user_layouts.find(new_value) != current.user_layouts.end())
+            return workspace_request_result_t::already_exists;
+        const workspace_preset_t preset = current.user_presets.at(old_value);
+        current.user_layouts.emplace(new_value, std::move(found->second));
+        current.user_layouts.erase(found);
+        current.user_presets.erase(old_value);
+        current.user_presets.emplace(new_value, preset);
+        application_views::rename_persisted_workspace_visibility(
+            identity_key(preset, old_value), identity_key(preset, new_value));
+        if (current.active_user == old_value)
+            current.active_user = new_value;
+        ++current.user_generation;
+        return workspace_request_result_t::completed;
+    } catch (...) {
+        return workspace_request_result_t::failed;
+    }
+}
+
+workspace_request_result_t delete_user_layout(std::string_view name) noexcept
+{
+    if (!valid_user_layout_name(name))
+        return workspace_request_result_t::invalid_name;
+    preview_state_t& current = preview_state();
+    try {
+        const std::string value(name);
+        const auto preset = current.user_presets.find(value);
+        if (current.user_layouts.erase(value) == 0)
+            return workspace_request_result_t::not_found;
+        if (preset != current.user_presets.end())
+            application_views::remove_persisted_workspace_visibility(
+                identity_key(preset->second, value));
+        current.user_presets.erase(value);
+        if (current.active_user == value)
+            current.active_user.clear();
+        ++current.user_generation;
+        return workspace_request_result_t::completed;
+    } catch (...) {
+        return workspace_request_result_t::failed;
+    }
+}
+
 workspace_request_result_t restore_builtin(workspace_preset_t preset) noexcept
 {
     preview_state_t& current = preview_state();
+    current.active_user.clear();
     current.layouts[preset_index(preset)].clear();
+    application_views::reset_persisted_workspace_visibility(preset, false);
     current.pending = preset;
     current.rebuild = true;
     current.root_prepared = false;
@@ -322,6 +812,11 @@ workspace_request_result_t reset_all() noexcept
     preview_state_t& current = preview_state();
     for (auto& layout : current.layouts)
         layout.clear();
+    current.user_layouts.clear();
+    current.user_presets.clear();
+    current.active_user.clear();
+    application_views::reset_persisted_workspace_visibility(
+        workspace_preset_t::analysis, true);
     return restore_builtin(workspace_preset_t::analysis);
 }
 
@@ -352,6 +847,7 @@ void shutdown() noexcept
 #endif
 
 #include "core/infra/executor.hpp"
+#include "core/ui/task_center.hpp"
 #include "helpers/diag_log.hpp"
 
 #include <windows.h>
@@ -361,11 +857,13 @@ void shutdown() noexcept
 #include <atomic>
 #include <charconv>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string_view>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -376,10 +874,10 @@ namespace {
 constexpr std::uint32_t kSchemaVersion = 2;
 constexpr std::size_t kMaximumPayloadBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaximumContainerBytes = kMaximumPayloadBytes + 1024U;
+constexpr std::size_t kMaximumNamedUserLayouts = 4096U;
 constexpr std::string_view kMagic = "AIDA_WORKSPACE_LAYOUT\r\n";
 constexpr std::string_view kHeaderTerminator = "\r\n\r\n";
 constexpr std::string_view kImguiSourceFingerprint = AIDA_IMGUI_SOURCE_SHA256;
-constexpr const char* kCompatibilityWindowName = "Compatibility IDE###aida.view.shell.compatibility";
 
 enum class read_result_t {
     absent,
@@ -400,6 +898,7 @@ struct state_t {
     workspace_preset_t pending = workspace_preset_t::analysis;
     bool rebuild_requested = false;
     bool locked = false;
+    std::uint8_t select_defaults_after_realize_frames = 0;
     ImVec2 last_position{0.0f, 0.0f};
     ImVec2 last_size{0.0f, 0.0f};
     ImVec2 rehome_work_position{0.0f, 0.0f};
@@ -415,6 +914,8 @@ struct state_t {
     std::filesystem::path invalid;
     std::filesystem::path active_record;
     std::filesystem::path legacy_primary;
+    std::string operation_status;
+    std::string operation_error;
 };
 
 struct layout_paths_t {
@@ -432,10 +933,136 @@ struct record_metadata_t {
     bool locked = false;
 };
 
+enum class operation_kind_t : std::uint8_t {
+    set_lock,
+    switch_preset,
+    save_user,
+    load_user,
+    rename_user,
+    delete_user,
+    restore_preset,
+    reset_all
+};
+
+struct operation_request_t {
+    operation_kind_t kind = operation_kind_t::switch_preset;
+    std::uint64_t serial = 0;
+    std::uint64_t source_generation = 0;
+    ImGuiID expected_root = 0;
+    workspace_preset_t current_preset = workspace_preset_t::analysis;
+    workspace_preset_t target_preset = workspace_preset_t::analysis;
+    bool target_locked = false;
+    std::uint64_t save_generation = 0;
+    std::uint64_t expected_user_generation = 0;
+    std::uint64_t catalog_epoch = 0;
+    bool skip_backup = false;
+    dock_nodes_t nodes;
+    layout_paths_t current_paths;
+    layout_paths_t target_paths;
+    layout_paths_t source_user_paths;
+    std::filesystem::path active_record;
+    std::filesystem::path workspace_directory;
+    std::filesystem::path user_directory;
+    std::string current_user_name;
+    std::string source_user_name;
+    std::string target_user_name;
+    bool overwrite = false;
+    std::vector<layout_paths_t> reset_paths;
+    std::shared_ptr<const std::string> current_payload;
+    std::string task_id;
+};
+
+struct operation_result_t {
+    operation_kind_t kind = operation_kind_t::switch_preset;
+    std::uint64_t serial = 0;
+    std::uint64_t source_generation = 0;
+    workspace_preset_t target_preset = workspace_preset_t::analysis;
+    bool target_locked = false;
+    bool success = false;
+    bool use_default = false;
+    std::uint64_t saved_generation = 0;
+    record_metadata_t metadata;
+    std::string payload;
+    std::string active_user_name;
+    std::string source_user_name;
+    std::string target_user_name;
+    std::shared_ptr<const std::vector<user_workspace_descriptor_t>> catalog;
+    std::uint64_t catalog_epoch = 0;
+    std::string error;
+    std::string task_id;
+};
+
+struct operation_runtime_t {
+    std::atomic<bool> pending{false};
+    std::atomic<std::uint64_t> serial{0};
+    std::mutex result_mutex;
+    std::shared_ptr<operation_result_t> result;
+    std::shared_ptr<const operation_request_t> active_request;
+    std::shared_ptr<const operation_request_t> last_failed_request;
+    std::atomic<std::uint64_t> retry_requested{0};
+};
+
+operation_runtime_t& operation_runtime() noexcept
+{
+    static operation_runtime_t value;
+    return value;
+}
+
 state_t& state() noexcept
 {
     static state_t value;
     return value;
+}
+
+std::shared_ptr<const std::vector<user_workspace_descriptor_t>>& catalog_publication() noexcept
+{
+    static std::shared_ptr<const std::vector<user_workspace_descriptor_t>> value =
+        std::make_shared<const std::vector<user_workspace_descriptor_t>>();
+    return value;
+}
+
+std::atomic<std::uint64_t>& catalog_epoch() noexcept
+{
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+std::atomic<std::uint64_t>& published_catalog_epoch() noexcept
+{
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+std::atomic<bool>& catalog_ready() noexcept
+{
+    static std::atomic<bool> value{false};
+    return value;
+}
+
+std::mutex& catalog_publication_mutex() noexcept
+{
+    static std::mutex value;
+    return value;
+}
+
+std::shared_ptr<const std::vector<user_workspace_descriptor_t>> catalog_snapshot() noexcept
+{
+    return std::atomic_load_explicit(&catalog_publication(), std::memory_order_acquire);
+}
+
+void publish_catalog(
+    std::shared_ptr<const std::vector<user_workspace_descriptor_t>> catalog,
+    std::uint64_t epoch) noexcept
+{
+    if (!catalog)
+        return;
+    std::lock_guard<std::mutex> lock(catalog_publication_mutex());
+    if (epoch < published_catalog_epoch().load(std::memory_order_acquire))
+        return;
+    std::atomic_store_explicit(&catalog_publication(), std::move(catalog),
+        std::memory_order_release);
+    published_catalog_epoch().store(epoch, std::memory_order_release);
+    catalog_ready().store(true, std::memory_order_release);
 }
 
 dock_nodes_t resolved_nodes(const state_t& current) noexcept
@@ -454,9 +1081,9 @@ dock_nodes_t resolved_nodes(const state_t& current) noexcept
     return nodes;
 }
 
-std::mutex& write_mutex() noexcept
+std::recursive_mutex& write_mutex() noexcept
 {
-    static std::mutex value;
+    static std::recursive_mutex value;
     return value;
 }
 
@@ -546,7 +1173,7 @@ void load_active_workspace_record(state_t& current) noexcept
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
         return;
-    char value[64]{};
+    char value[160]{};
     DWORD read = 0;
     const bool valid = ReadFile(file, value, sizeof(value) - 1U, &read, nullptr) != FALSE;
     CloseHandle(file);
@@ -557,6 +1184,13 @@ void load_active_workspace_record(state_t& current) noexcept
     const std::string_view id = record.substr(0, separator);
     current.locked = separator != std::string_view::npos &&
         separator + 1U < record.size() && record[separator + 1U] == '1';
+    const std::size_t user_separator = separator == std::string_view::npos
+        ? std::string_view::npos : record.find('\n', separator + 1U);
+    if (user_separator != std::string_view::npos && user_separator + 1U < record.size()) {
+        const std::string_view user_name = record.substr(user_separator + 1U);
+        if (valid_user_layout_name(user_name))
+            current.active_user.assign(user_name);
+    }
     for (const auto& descriptor : kPresetDescriptors) {
         if (id == descriptor.stable_id) {
             current.active = descriptor.id;
@@ -568,13 +1202,15 @@ void load_active_workspace_record(state_t& current) noexcept
     }
 }
 
-bool save_active_workspace_record(const state_t& current) noexcept
+bool save_active_workspace_record_values(const std::filesystem::path& directory,
+    const std::filesystem::path& active_record, workspace_preset_t preset,
+    bool locked, std::string_view user_name = {}) noexcept
 {
     std::error_code error;
-    std::filesystem::create_directories(current.directory, error);
+    std::filesystem::create_directories(directory, error);
     if (error)
         return false;
-    std::filesystem::path temporary = current.active_record;
+    std::filesystem::path temporary = active_record;
     temporary += L".tmp";
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
@@ -582,8 +1218,13 @@ bool save_active_workspace_record(const state_t& current) noexcept
         return false;
     std::string record;
     try {
-        record = std::string(descriptor_for(current.active).stable_id) +
-            (current.locked ? "\n1" : "\n0");
+        record = std::string(descriptor_for(preset).stable_id) +
+            (locked ? "\n1\n" : "\n0\n");
+        if (!user_name.empty()) {
+            if (!valid_user_layout_name(user_name))
+                throw std::invalid_argument("invalid user workspace name");
+            record.append(user_name);
+        }
     } catch (...) {
         CloseHandle(file);
         DeleteFileW(temporary.c_str());
@@ -593,7 +1234,7 @@ bool save_active_workspace_record(const state_t& current) noexcept
     const bool saved = WriteFile(file, record.data(), static_cast<DWORD>(record.size()), &written, nullptr) != FALSE &&
         written == record.size() && FlushFileBuffers(file) != FALSE;
     CloseHandle(file);
-    if (!saved || !MoveFileExW(temporary.c_str(), current.active_record.c_str(),
+    if (!saved || !MoveFileExW(temporary.c_str(), active_record.c_str(),
         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileW(temporary.c_str());
         return false;
@@ -872,6 +1513,25 @@ bool inspect_layout_file(const std::filesystem::path& path, ImGuiID expected_roo
     return extract_payload(container, expected_root, payload, &metadata);
 }
 
+read_result_t read_layout_payload(const std::filesystem::path& path,
+    ImGuiID expected_root, record_metadata_t& metadata, std::string& payload_copy) noexcept
+{
+    std::vector<char> container;
+    read_result_t result = read_result_t::io_failure;
+    if (!read_file_bounded(path, container, result))
+        return result;
+    std::string_view payload;
+    if (!extract_payload(container, expected_root, payload, &metadata))
+        return read_result_t::invalid;
+    try {
+        payload_copy.assign(payload);
+    } catch (...) {
+        payload_copy.clear();
+        return read_result_t::io_failure;
+    }
+    return read_result_t::valid;
+}
+
 bool write_all(HANDLE file, std::string_view data) noexcept
 {
     std::size_t offset = 0;
@@ -986,7 +1646,7 @@ bool write_generation(const layout_paths_t& paths, ImGuiID expected_root,
     std::string_view payload, std::uint64_t generation, bool clean_shutdown,
     bool skip_backup, const dock_nodes_t& nodes, workspace_preset_t preset, bool locked) noexcept
 {
-    std::lock_guard<std::mutex> lock(write_mutex());
+    std::lock_guard<std::recursive_mutex> lock(write_mutex());
     if (generation <= committed_generation().load(std::memory_order_acquire))
         return true;
     const std::uint64_t started_ms = static_cast<std::uint64_t>(GetTickCount64());
@@ -1014,6 +1674,9 @@ bool queue_write(const layout_paths_t& paths, ImGuiID expected_root,
     std::string_view payload, std::uint64_t generation, bool skip_backup,
     const dock_nodes_t& nodes, workspace_preset_t preset, bool locked)
 {
+    if (payload.empty() || payload.size() > kMaximumPayloadBytes || generation == 0 ||
+        payload.find("[Docking][Data]") == std::string_view::npos)
+        return false;
     auto immutable_payload = std::make_shared<const std::string>(payload);
     aida::infra::executor::submission_t submission;
     submission.owner_subsystem = "workspace_layout";
@@ -1046,47 +1709,47 @@ void dock_named_windows(workspace_preset_t preset, ImGuiID left, ImGuiID center,
                 ImGui::DockBuilderDockWindow(window_name.c_str(), node);
         }
     };
-    ImGuiWindow* compatibility = ImGui::FindWindowByName(kCompatibilityWindowName);
-    if (!missing_only || !compatibility || compatibility->DockId == 0)
-        ImGui::DockBuilderDockWindow(kCompatibilityWindowName, center);
     if (preset == workspace_preset_t::analysis) {
-        dock(left, {"view.project_explorer", "view.analysis.functions"});
-        dock(center, {"document.disassembly", "document.pseudocode", "document.graph", "document.hex", "document.code"});
-        dock(right, {"view.analysis.references", "view.analysis.binary_map"});
+        dock(left, {"view.project_explorer", "view.sessions", "view.analysis.functions",
+            "view.analysis.imports", "view.analysis.exports", "view.analysis.names",
+			"view.analysis.strings", "view.analysis.segments", "view.analysis.local_types",
+			"view.analysis.segment_registers", "view.analysis.proximity"});
+        dock(center, {"view.start_center", "document.disassembly", "document.pseudocode", "document.graph", "document.hex", "document.code", "view.analysis.binary_map"});
+        dock(right, {"view.inspector", "view.analysis.references", "view.ai_chat"});
         dock(bottom, {"view.output", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::debugging) {
-        dock(left, {"view.debug.threads", "view.debug.modules", "view.debug.call_stack"});
-        dock(center, {"view.debug.cpu", "document.code", "document.hex", "view.debug.cfg"});
+        dock(left, {"view.sessions", "view.debug.threads", "view.debug.modules", "view.debug.call_stack"});
+        dock(center, {"view.start_center", "view.debug.cpu", "view.debug.source", "document.code", "document.hex", "view.debug.cfg"});
         dock(right, {"view.debug.breakpoints", "view.debug.watches"});
         dock(bottom, {"view.debug.memory_map", "view.debug.trace", "view.debug.patches", "view.debug.seh", "view.debug.handles", "view.terminal", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::memory) {
-        dock(left, {"view.memory.value_scan", "view.memory.crypto", "view.memory.aob"});
-        dock(center, {"document.hex", "view.memory.pointers", "view.memory.snapshots"});
+        dock(left, {"view.sessions", "view.memory.value_scan", "view.memory.crypto", "view.memory.aob"});
+        dock(center, {"view.start_center", "document.hex", "view.memory.pointers", "view.memory.snapshots"});
         dock(right, {"view.debug.memory_map", "view.types.dissector"});
         dock(bottom, {"view.debug.patches", "view.debug.watches", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::types_structures) {
-        dock(left, {"view.types.structures", "view.types.unions", "view.types.enums", "view.types.typedefs", "view.types.functions", "view.types.inferred"});
-        dock(center, {"view.types.struct_recon", "document.code", "document.hex"});
+        dock(left, {"view.sessions", "view.types.structures", "view.types.unions", "view.types.enums", "view.types.typedefs", "view.types.functions", "view.types.inferred"});
+        dock(center, {"view.start_center", "view.types.struct_recon", "document.code", "document.hex"});
         dock(right, {"view.types.dissector"});
         dock(bottom, {"view.analysis.references", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::network) {
-        dock(left, {"view.network.site_map", "view.network.scope", "view.network.cookies", "view.network.session"});
-        dock(center, {"view.network.proxy", "view.network.intercept", "view.network.repeater", "view.network.browser", "view.network.api"});
+        dock(left, {"view.sessions", "view.network.site_map", "view.network.scope", "view.network.cookies", "view.network.session"});
+        dock(center, {"view.start_center", "view.network.proxy", "view.network.intercept", "view.network.repeater", "view.network.browser", "view.network.api"});
         dock(right, {"view.network.decoder", "view.network.comparer", "view.network.scanner", "view.network.reports"});
         dock(bottom, {"view.network.capture", "view.network.logger", "view.network.websocket", "view.network.h2_editor", "view.background_tasks", "view.diagnostics"});
     } else if (preset == workspace_preset_t::automation_ai) {
-        dock(left, {"view.ai.agents", "view.ai.skills", "view.project_explorer"});
-        dock(center, {"view.ai_chat", "document.code"});
+        dock(left, {"view.sessions", "view.ai.agents", "view.ai.skills", "view.project_explorer"});
+        dock(center, {"view.start_center", "view.ai_chat", "document.code"});
         dock(right, {"view.settings"});
         dock(bottom, {"view.background_tasks", "view.mcp_log", "view.output", "view.terminal", "view.diagnostics"});
     } else if (preset == workspace_preset_t::programming) {
-        dock(left, {"view.project_explorer", "view.workspace_search"});
-        dock(center, {"document.code", "document.disassembly", "document.pseudocode"});
+        dock(left, {"view.project_explorer", "view.programming.outline", "view.sessions", "view.workspace_search"});
+        dock(center, {"view.start_center", "document.code", "document.disassembly", "document.pseudocode"});
         dock(right, {"view.analysis.references", "view.ai_chat"});
-        dock(bottom, {"view.output", "view.terminal", "view.background_tasks", "view.diagnostics"});
+        dock(bottom, {"view.output", "view.terminal", "view.programming.references", "view.background_tasks", "view.diagnostics"});
     } else {
-        dock(left, {"view.project_explorer", "view.recent"});
-        dock(center, {"document.code"});
+        dock(left, {"view.project_explorer", "view.sessions", "view.recent"});
+        dock(center, {"view.start_center", "document.code"});
         dock(right, {"view.ai_chat"});
         dock(bottom, {"view.diagnostics", "view.output"});
     }
@@ -1095,6 +1758,7 @@ void dock_named_windows(workspace_preset_t preset, ImGuiID left, ImGuiID center,
 void build_default_layout(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size,
     workspace_preset_t preset) noexcept
 {
+    open_builtin_default_views(preset);
     ImGui::DockBuilderRemoveNode(root_dockspace_id);
     ImGui::DockBuilderAddNode(root_dockspace_id,
         static_cast<ImGuiDockNodeFlags>(ImGuiDockNodeFlags_DockSpace) |
@@ -1112,9 +1776,15 @@ void build_default_layout(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 siz
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, ratios.left, &left, &center);
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, ratios.right, &right, &center);
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, ratios.bottom, &bottom, &center);
+    dock_open_windows_by_role(left, center, right, bottom);
     dock_named_windows(preset, left, center, right, bottom);
     ImGui::DockBuilderFinish(root_dockspace_id);
+    if (application_views::is_open(stable_view_id_t("view.start_center"))) {
+        select_docked_window(center, "view.start_center");
+    } else
+        select_builtin_default_tabs(preset, left, center, right, bottom);
     state().nodes = {root_dockspace_id, left, center, right, bottom};
+    state().select_defaults_after_realize_frames = 2;
     ImGui::GetIO().WantSaveIniSettings = true;
 }
 
@@ -1146,14 +1816,22 @@ void rehome_floating_windows() noexcept
     const ImVec2 work_max(viewport->WorkPos.x + viewport->WorkSize.x,
         viewport->WorkPos.y + viewport->WorkSize.y);
     for (ImGuiWindow* window : context->Windows) {
-        if (!window || !window->WasActive || window->DockId != 0 ||
+        if (!window || window->DockId != 0 ||
             (window->Flags & (ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_Popup |
                 ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoSavedSettings)) != 0)
             continue;
-        const float minimum_x = work_min.x - (std::max)(0.0f, window->SizeFull.x - visible_width);
-        const float maximum_x = work_max.x - (std::min)(visible_width, window->SizeFull.x);
+        const ImVec2 maximum_size(
+            (std::max)(1.0f, viewport->WorkSize.x),
+            (std::max)(1.0f, viewport->WorkSize.y));
+        const ImVec2 clamped_size(
+            (std::min)(window->SizeFull.x, maximum_size.x),
+            (std::min)(window->SizeFull.y, maximum_size.y));
+        if (clamped_size.x != window->SizeFull.x || clamped_size.y != window->SizeFull.y)
+            ImGui::SetWindowSize(window, clamped_size, ImGuiCond_Always);
+        const float minimum_x = work_min.x - (std::max)(0.0f, clamped_size.x - visible_width);
+        const float maximum_x = work_max.x - (std::min)(visible_width, clamped_size.x);
         const float minimum_y = work_min.y;
-        const float maximum_y = work_max.y - (std::min)(visible_height, window->SizeFull.y);
+        const float maximum_y = work_max.y - (std::min)(visible_height, clamped_size.y);
         const ImVec2 clamped(
             std::clamp(window->Pos.x, minimum_x, (std::max)(minimum_x, maximum_x)),
             std::clamp(window->Pos.y, minimum_y, (std::max)(minimum_y, maximum_y)));
@@ -1162,49 +1840,683 @@ void rehome_floating_windows() noexcept
     }
 }
 
-bool valid_user_layout_name(std::string_view name) noexcept
-{
-    if (name.empty() || name.size() > 64)
-        return false;
-    for (const unsigned char character : name) {
-        if (!(character >= 'a' && character <= 'z') &&
-            !(character >= 'A' && character <= 'Z') &&
-            !(character >= '0' && character <= '9') &&
-            character != '-' && character != '_' && character != ' ')
-            return false;
-    }
-    return true;
-}
-
 std::filesystem::path user_layout_path(const state_t& current, std::string_view name)
 {
-    std::wstring wide(name.begin(), name.end());
-    for (wchar_t& character : wide) {
-        if (character == L' ')
-            character = L'_';
+    constexpr wchar_t digits[] = L"0123456789abcdef";
+    std::wstring encoded = L"u-";
+    encoded.reserve(2U + name.size() * 2U + 12U);
+    for (const unsigned char byte : name) {
+        encoded.push_back(digits[byte >> 4U]);
+        encoded.push_back(digits[byte & 0x0FU]);
     }
-    return current.directory / L"user" / (wide + L".aida-layout");
+    return current.directory / L"user" / (encoded + L".aida-layout");
 }
 
-bool save_current_synchronously(state_t& current, const layout_paths_t& paths,
-    bool clean_shutdown) noexcept
+bool decode_user_layout_filename(const std::filesystem::path& path,
+    std::string& name) noexcept
 {
-    if (!current.root_prepared || !current.persistence_available)
+    try {
+        constexpr std::wstring_view suffix = L".aida-layout";
+        const std::wstring filename = path.filename().wstring();
+        if (filename.size() <= 2U + suffix.size() || filename.compare(
+                filename.size() - suffix.size(), suffix.size(), suffix) != 0 ||
+            filename[0] != L'u' || filename[1] != L'-')
+            return false;
+        const std::wstring_view encoded(filename.data() + 2U,
+            filename.size() - 2U - suffix.size());
+        if (encoded.empty() || encoded.size() % 2U != 0)
+            return false;
+        auto nibble = [](wchar_t value) noexcept -> int {
+            if (value >= L'0' && value <= L'9') return value - L'0';
+            if (value >= L'a' && value <= L'f') return value - L'a' + 10;
+            return -1;
+        };
+        std::string decoded;
+        decoded.reserve(encoded.size() / 2U);
+        for (std::size_t index = 0; index < encoded.size(); index += 2U) {
+            const int high = nibble(encoded[index]);
+            const int low = nibble(encoded[index + 1U]);
+            if (high < 0 || low < 0)
+                return false;
+            decoded.push_back(static_cast<char>((high << 4) | low));
+        }
+        if (!valid_user_layout_name(decoded))
+            return false;
+        name = std::move(decoded);
         return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool managed_user_layout_artifact(const std::filesystem::path& path) noexcept
+{
+    try {
+        std::filesystem::path primary = path;
+        const std::wstring filename = primary.filename().wstring();
+        if (filename.size() > 4U && filename.compare(filename.size() - 4U, 4U, L".bak") == 0)
+            primary.replace_filename(filename.substr(0, filename.size() - 4U));
+        else if (filename.size() > 8U && filename.compare(filename.size() - 8U, 8U, L".invalid") == 0)
+            primary.replace_filename(filename.substr(0, filename.size() - 8U));
+        std::string name;
+        return decode_user_layout_filename(primary, name);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool remove_file_exact(const std::filesystem::path& path) noexcept
+{
+    if (DeleteFileW(path.c_str()))
+        return true;
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+layout_paths_t preset_paths(const state_t& current, workspace_preset_t preset)
+{
+    const std::string_view id = descriptor_for(preset).stable_id;
+    const std::wstring wide_id(id.begin(), id.end());
+    layout_paths_t paths;
+    paths.directory = current.directory;
+    paths.primary = current.directory / (wide_id + L".aida-layout");
+    paths.backup = current.directory / (wide_id + L".aida-layout.bak");
+    paths.invalid = current.directory / (wide_id + L".aida-layout.invalid");
+    return paths;
+}
+
+layout_paths_t named_user_paths(const state_t& current, std::string_view name)
+{
+    layout_paths_t paths;
+    paths.directory = current.directory / L"user";
+    paths.primary = user_layout_path(current, name);
+    paths.backup = paths.primary;
+    paths.backup += L".bak";
+    paths.invalid = paths.primary;
+    paths.invalid += L".invalid";
+    return paths;
+}
+
+std::shared_ptr<const std::vector<user_workspace_descriptor_t>> scan_user_catalog(
+    const std::filesystem::path& directory, ImGuiID expected_root,
+    std::string_view active_user) noexcept
+{
+    try {
+        auto catalog = std::make_shared<std::vector<user_workspace_descriptor_t>>();
+        std::error_code error;
+        if (!std::filesystem::exists(directory, error))
+            return error ? nullptr : catalog;
+        std::filesystem::directory_iterator cursor(directory, error);
+        const std::filesystem::directory_iterator end;
+        while (!error && cursor != end) {
+            if (catalog->size() >= kMaximumNamedUserLayouts)
+                return nullptr;
+            if (cursor->is_regular_file(error)) {
+                std::string name;
+                if (decode_user_layout_filename(cursor->path(), name)) {
+                    record_metadata_t metadata;
+                    if (inspect_layout_file(cursor->path(), expected_root, metadata))
+                        catalog->push_back({name, metadata.preset, metadata.generation,
+                            name == active_user});
+                }
+            }
+            if (error)
+                return nullptr;
+            cursor.increment(error);
+        }
+        if (error)
+            return nullptr;
+        std::sort(catalog->begin(), catalog->end(), [](const auto& left, const auto& right) {
+            return left.name < right.name;
+        });
+        return catalog;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+std::shared_ptr<const std::string> capture_current_payload(state_t& current) noexcept
+{
     std::size_t payload_size = 0;
     const char* payload = ImGui::SaveIniSettingsToMemory(&payload_size);
-    current.nodes = resolved_nodes(current);
-    if (!payload)
-        return false;
-    const std::uint64_t generation = (std::max)(current.generation,
-        committed_generation().load(std::memory_order_acquire)) + 1ULL;
-    const bool saved = write_generation(paths, current.expected_root,
-        std::string_view(payload, payload_size), generation, clean_shutdown,
-        current.recovered_from_backup || current.preserve_recovery_backup,
-        current.nodes, current.active, current.locked);
-    if (saved)
-        current.generation = generation;
-    return saved;
+    if (!payload || payload_size == 0 || payload_size > kMaximumPayloadBytes)
+        return {};
+    try {
+        current.nodes = resolved_nodes(current);
+        return std::make_shared<const std::string>(payload, payload_size);
+    } catch (...) {
+        return {};
+    }
+}
+
+read_result_t read_layout_with_backup(const layout_paths_t& paths, ImGuiID expected_root,
+    record_metadata_t& metadata, std::string& payload) noexcept
+{
+    read_result_t result = read_layout_payload(paths.primary, expected_root, metadata, payload);
+    if (result == read_result_t::valid)
+        return result;
+    if (result == read_result_t::invalid &&
+        !MoveFileExW(paths.primary.c_str(), paths.invalid.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return read_result_t::io_failure;
+    record_metadata_t backup_metadata;
+    std::string backup_payload;
+    const read_result_t backup = read_layout_payload(paths.backup, expected_root,
+        backup_metadata, backup_payload);
+    if (backup == read_result_t::valid) {
+        metadata = backup_metadata;
+        payload = std::move(backup_payload);
+        return read_result_t::valid;
+    }
+    return result == read_result_t::io_failure || backup == read_result_t::io_failure
+        ? read_result_t::io_failure
+        : result == read_result_t::invalid || backup == read_result_t::invalid
+            ? read_result_t::invalid : read_result_t::absent;
+}
+
+void execute_operation(const operation_request_t& request, operation_result_t& result) noexcept
+{
+    result.kind = request.kind;
+    result.serial = request.serial;
+    result.source_generation = request.source_generation;
+    result.catalog_epoch = request.catalog_epoch;
+    result.target_preset = request.target_preset;
+    result.target_locked = request.target_locked;
+    result.source_user_name = request.source_user_name;
+    result.target_user_name = request.target_user_name;
+    result.task_id = request.task_id;
+    const auto fail = [&result](std::string message) {
+        result.success = false;
+        result.error = std::move(message);
+    };
+    try {
+        std::lock_guard<std::recursive_mutex> transaction_lock(write_mutex());
+        if (request.kind == operation_kind_t::set_lock ||
+            request.kind == operation_kind_t::switch_preset ||
+            request.kind == operation_kind_t::save_user ||
+            request.kind == operation_kind_t::load_user) {
+            if (!request.current_payload) {
+                fail("The immutable current layout snapshot is unavailable.");
+                return;
+            }
+            const workspace_preset_t saved_preset = request.current_preset;
+            if (!write_generation(request.current_paths, request.expected_root, *request.current_payload,
+                    request.save_generation, false, request.skip_backup, request.nodes,
+                    saved_preset, request.target_locked)) {
+                fail("The current layout could not be written atomically.");
+                return;
+            }
+            result.saved_generation = request.save_generation;
+            if (request.kind == operation_kind_t::save_user) {
+                const DWORD attributes = GetFileAttributesW(request.target_paths.primary.c_str());
+                if (!request.overwrite && attributes != INVALID_FILE_ATTRIBUTES) {
+                    fail("A named user workspace with this exact name already exists.");
+                    return;
+                }
+                const std::uint64_t named_generation = request.save_generation + 1ULL;
+                if (!write_generation(request.target_paths, request.expected_root,
+                        *request.current_payload, named_generation, false, false,
+                        request.nodes, saved_preset, request.target_locked)) {
+                    fail("The named user layout could not be written atomically.");
+                    return;
+                }
+                result.saved_generation = named_generation;
+                result.active_user_name = request.target_user_name;
+                if (!save_active_workspace_record_values(request.workspace_directory,
+                        request.active_record, saved_preset, request.target_locked,
+                        request.target_user_name)) {
+                    fail("The active named workspace record could not be replaced atomically.");
+                    return;
+                }
+            }
+        }
+
+        if (request.kind == operation_kind_t::switch_preset ||
+            request.kind == operation_kind_t::load_user) {
+            const read_result_t loaded = read_layout_with_backup(request.target_paths,
+                request.expected_root, result.metadata, result.payload);
+            if (request.kind == operation_kind_t::load_user &&
+                loaded == read_result_t::valid && request.expected_user_generation != 0 &&
+                result.metadata.generation != request.expected_user_generation) {
+                fail("The named user workspace changed after it was selected.");
+                return;
+            }
+            if (loaded == read_result_t::valid &&
+                request.kind == operation_kind_t::switch_preset &&
+                result.metadata.preset != request.target_preset) {
+                fail("The saved layout belongs to a different workspace preset.");
+                return;
+            }
+            if (loaded != read_result_t::valid) {
+                if (request.kind == operation_kind_t::load_user) {
+                    fail(loaded == read_result_t::absent
+                        ? "The named user layout does not exist."
+                        : "The named user layout is invalid or unreadable.");
+                    return;
+                }
+                result.use_default = true;
+                result.payload.clear();
+                result.metadata = {};
+                result.metadata.preset = request.target_preset;
+                result.metadata.locked = false;
+            } else {
+                result.target_preset = result.metadata.preset;
+                result.target_locked = result.metadata.locked;
+            }
+            if (!save_active_workspace_record_values(request.workspace_directory,
+                    request.active_record, result.target_preset, result.target_locked,
+                    request.kind == operation_kind_t::load_user
+                        ? std::string_view(request.target_user_name) : std::string_view{})) {
+                fail("The active workspace record could not be replaced atomically.");
+                return;
+            }
+            result.active_user_name = request.kind == operation_kind_t::load_user
+                ? request.target_user_name : std::string{};
+        } else if (request.kind == operation_kind_t::set_lock) {
+            if (!save_active_workspace_record_values(request.workspace_directory,
+                    request.active_record, request.current_preset, request.target_locked,
+                    request.current_user_name)) {
+                fail("The active workspace lock record could not be replaced atomically.");
+                return;
+            }
+            result.active_user_name = request.current_user_name;
+        } else if (request.kind == operation_kind_t::rename_user) {
+            if (GetFileAttributesW(request.source_user_paths.primary.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                fail("The named user workspace no longer exists.");
+                return;
+            }
+            if (GetFileAttributesW(request.target_paths.primary.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                fail("A named user workspace with the new exact name already exists.");
+                return;
+            }
+            record_metadata_t source_metadata;
+            if (!inspect_layout_file(request.source_user_paths.primary,
+                    request.expected_root, source_metadata) ||
+                source_metadata.generation != request.expected_user_generation) {
+                fail("The named user workspace changed after it was selected.");
+                return;
+            }
+            if (!MoveFileExW(request.source_user_paths.primary.c_str(),
+                    request.target_paths.primary.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                fail("The named user workspace could not be renamed atomically.");
+                return;
+            }
+            const auto move_optional = [](const std::filesystem::path& source,
+                const std::filesystem::path& target, bool& moved) noexcept {
+                moved = false;
+                if (GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                    const DWORD error = GetLastError();
+                    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+                }
+                moved = MoveFileExW(source.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
+                return moved;
+            };
+            bool backup_moved = false;
+            bool invalid_moved = false;
+            if (!move_optional(request.source_user_paths.backup, request.target_paths.backup,
+                    backup_moved) ||
+                !move_optional(request.source_user_paths.invalid, request.target_paths.invalid,
+                    invalid_moved)) {
+                if (invalid_moved)
+                    static_cast<void>(MoveFileExW(request.target_paths.invalid.c_str(),
+                        request.source_user_paths.invalid.c_str(), MOVEFILE_WRITE_THROUGH));
+                if (backup_moved)
+                    static_cast<void>(MoveFileExW(request.target_paths.backup.c_str(),
+                        request.source_user_paths.backup.c_str(), MOVEFILE_WRITE_THROUGH));
+                static_cast<void>(MoveFileExW(request.target_paths.primary.c_str(),
+                    request.source_user_paths.primary.c_str(), MOVEFILE_WRITE_THROUGH));
+                fail("The named user workspace companion files could not be renamed exactly.");
+                return;
+            }
+            result.active_user_name = request.current_user_name == request.source_user_name
+                ? request.target_user_name : request.current_user_name;
+            if (!save_active_workspace_record_values(request.workspace_directory,
+                    request.active_record, request.current_preset, request.target_locked,
+                    result.active_user_name)) {
+                static_cast<void>(MoveFileExW(request.target_paths.primary.c_str(),
+                    request.source_user_paths.primary.c_str(), MOVEFILE_WRITE_THROUGH));
+                if (invalid_moved)
+                    static_cast<void>(MoveFileExW(request.target_paths.invalid.c_str(),
+                        request.source_user_paths.invalid.c_str(), MOVEFILE_WRITE_THROUGH));
+                if (backup_moved)
+                    static_cast<void>(MoveFileExW(request.target_paths.backup.c_str(),
+                        request.source_user_paths.backup.c_str(), MOVEFILE_WRITE_THROUGH));
+                fail("The active workspace record could not follow the rename.");
+                return;
+            }
+        } else if (request.kind == operation_kind_t::delete_user) {
+            record_metadata_t target_metadata;
+            if (!inspect_layout_file(request.target_paths.primary,
+                    request.expected_root, target_metadata) ||
+                target_metadata.generation != request.expected_user_generation) {
+                fail("The named user workspace changed after it was selected.");
+                return;
+            }
+            result.active_user_name = request.current_user_name == request.target_user_name
+                ? std::string{} : request.current_user_name;
+            if (!save_active_workspace_record_values(request.workspace_directory,
+                    request.active_record, request.current_preset, request.target_locked,
+                    result.active_user_name)) {
+                fail("The active workspace record could not be prepared for deletion.");
+                return;
+            }
+            if (!remove_file_exact(request.target_paths.primary) ||
+                !remove_file_exact(request.target_paths.backup) ||
+                !remove_file_exact(request.target_paths.invalid)) {
+                static_cast<void>(save_active_workspace_record_values(request.workspace_directory,
+                    request.active_record, request.current_preset, request.target_locked,
+                    request.current_user_name));
+                fail("The named user workspace could not be removed exactly.");
+                return;
+            }
+        } else if (request.kind == operation_kind_t::restore_preset ||
+                   request.kind == operation_kind_t::reset_all) {
+            std::vector<std::filesystem::path> user_files;
+            if (request.kind == operation_kind_t::reset_all) {
+                std::error_code error;
+                if (std::filesystem::exists(request.user_directory, error)) {
+                    std::filesystem::directory_iterator cursor(request.user_directory, error);
+                    const std::filesystem::directory_iterator end;
+                    while (!error && cursor != end) {
+                        const bool regular = cursor->is_regular_file(error);
+                        if (error || !regular) {
+                            fail("The named user workspace set is invalid or exceeds its exact bound.");
+                            return;
+                        }
+                        if (managed_user_layout_artifact(cursor->path())) {
+                            if (user_files.size() >= kMaximumNamedUserLayouts * 3U) {
+                                fail("The named user workspace set exceeds its exact bound.");
+                                return;
+                            }
+                            user_files.push_back(cursor->path());
+                        }
+                        cursor.increment(error);
+                    }
+                }
+                if (error) {
+                    fail("The user workspace directory could not be enumerated exactly.");
+                    return;
+                }
+            }
+            for (const auto& paths : request.reset_paths) {
+                if (!remove_file_exact(paths.primary) || !remove_file_exact(paths.backup) ||
+                    !remove_file_exact(paths.invalid)) {
+                    fail("A saved workspace layout could not be removed exactly.");
+                    return;
+                }
+            }
+            if (request.kind == operation_kind_t::reset_all) {
+                for (const auto& path : user_files) {
+                    if (!remove_file_exact(path)) {
+                        fail("A saved user workspace could not be removed exactly.");
+                        return;
+                    }
+                }
+            }
+            if (!save_active_workspace_record_values(request.workspace_directory,
+                    request.active_record, request.target_preset, false)) {
+                fail("The reset workspace record could not be replaced atomically.");
+                return;
+            }
+            result.use_default = true;
+            result.target_locked = false;
+            result.active_user_name.clear();
+        }
+        result.catalog = scan_user_catalog(request.workspace_directory / L"user",
+            request.expected_root, result.active_user_name);
+        if (!result.catalog) {
+            fail("The named user workspace catalog could not be refreshed exactly.");
+            return;
+        }
+        result.success = true;
+    } catch (const std::exception& exception) {
+        fail(exception.what());
+    } catch (...) {
+        fail("The workspace operation failed with an unknown error.");
+    }
+}
+
+workspace_request_result_t submit_operation(operation_request_t request) noexcept
+{
+    operation_runtime_t& runtime = operation_runtime();
+    bool expected = false;
+    if (!runtime.pending.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel))
+        return workspace_request_result_t::busy;
+    if (request.catalog_epoch == 0)
+        request.catalog_epoch = catalog_epoch().fetch_add(1, std::memory_order_acq_rel) + 1ULL;
+    request.serial = runtime.serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    request.task_id = "workspace.layout." + std::to_string(request.serial);
+    auto immutable_request = std::make_shared<const operation_request_t>(std::move(request));
+    {
+        std::lock_guard<std::mutex> lock(runtime.result_mutex);
+        runtime.active_request = immutable_request;
+    }
+    aida::ui::task_center::task_registration_t registration;
+    registration.id = immutable_request->task_id;
+    registration.source = "workspace_layout";
+    registration.owner = "Workspace Layout";
+    registration.owner_view = "view.background_tasks";
+    registration.owner_action = "Apply workspace transaction";
+    registration.target = std::string(descriptor_for(immutable_request->target_preset).display_name);
+    registration.label = "Workspace layout transaction";
+    registration.stage = "Queued serialized persistence phase";
+    registration.affected_entity = std::string(descriptor_for(
+        immutable_request->target_preset).stable_id);
+    registration.callbacks.retry = [serial = immutable_request->serial] {
+        operation_runtime_t& current = operation_runtime();
+        std::lock_guard<std::mutex> lock(current.result_mutex);
+        if (!current.last_failed_request || current.last_failed_request->serial != serial ||
+            current.pending.load(std::memory_order_acquire))
+            return false;
+        current.retry_requested.store(serial, std::memory_order_release);
+        return true;
+    };
+    if (!aida::ui::task_center::register_task(std::move(registration))) {
+        runtime.pending.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(runtime.result_mutex);
+            runtime.active_request.reset();
+        }
+        state().operation_error = "Task Center rejected the workspace transaction.";
+        state().operation_status = state().operation_error;
+        return workspace_request_result_t::failed;
+    }
+    state().operation_error.clear();
+    state().operation_status = "Workspace transaction queued";
+    auto result = std::make_shared<operation_result_t>();
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "workspace_layout";
+    submission.label = "workspace_layout.transaction";
+    submission.thread_class = "diagnostics_io";
+    submission.domain = aida::infra::executor::domain_t::diagnostics;
+    submission.priority = 2;
+    submission.generation = immutable_request->serial;
+    submission.ui_access_policy = "none";
+    submission.failure_policy = "retain_last_known_good";
+    submission.shutdown_policy = "drain";
+    submission.body = [immutable_request, result] {
+        static_cast<void>(aida::ui::task_center::update_task(immutable_request->task_id,
+            aida::ui::task_center::task_state_t::running, 0.1f,
+            "Executing atomic persistence phase"));
+        execute_operation(*immutable_request, *result);
+        if (result->success) {
+            static_cast<void>(aida::ui::task_center::update_task(result->task_id,
+                aida::ui::task_center::task_state_t::running, 0.9f,
+                "Persistence complete; awaiting UI layout application"));
+        } else {
+            static_cast<void>(aida::ui::task_center::update_task(result->task_id,
+                aida::ui::task_center::task_state_t::failed, 1.0f,
+                "Workspace transaction failed", result->error));
+        }
+        operation_runtime_t& current = operation_runtime();
+        {
+            std::lock_guard<std::mutex> lock(current.result_mutex);
+            current.result = result;
+            if (!result->success)
+                current.last_failed_request = immutable_request;
+        }
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        runtime.pending.store(false, std::memory_order_release);
+        state().operation_error = "Workspace executor rejected the transaction: " +
+            submitted.reject_reason;
+        state().operation_status = state().operation_error;
+        {
+            std::lock_guard<std::mutex> lock(runtime.result_mutex);
+            runtime.last_failed_request = immutable_request;
+            runtime.active_request.reset();
+        }
+        static_cast<void>(aida::ui::task_center::update_task(immutable_request->task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Workspace executor rejected the transaction", submitted.reject_reason));
+        return workspace_request_result_t::failed;
+    }
+    return workspace_request_result_t::queued;
+}
+
+void process_operation_completion() noexcept
+{
+    operation_runtime_t& runtime = operation_runtime();
+    std::shared_ptr<operation_result_t> result;
+    {
+        std::lock_guard<std::mutex> lock(runtime.result_mutex);
+        result = std::move(runtime.result);
+    }
+    if (!result)
+        return;
+    state_t& current = state();
+    if (result->serial != runtime.serial.load(std::memory_order_acquire) ||
+        current.expected_root == 0) {
+        runtime.pending.store(false, std::memory_order_release);
+        static_cast<void>(aida::ui::task_center::update_task(result->task_id,
+            aida::ui::task_center::task_state_t::cancelled, 1.0f,
+            "Discarded stale workspace transaction", "Root or operation serial changed"));
+        {
+            std::lock_guard<std::mutex> lock(runtime.result_mutex);
+            runtime.active_request.reset();
+        }
+        return;
+    }
+    if (!result->success) {
+        current.operation_error = result->error;
+        current.operation_status = result->error;
+        runtime.pending.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(runtime.result_mutex);
+            runtime.active_request.reset();
+        }
+        return;
+    }
+    if (current.generation != result->source_generation) {
+        current.operation_error = "The workspace changed after this transaction was captured; run the action again from the current layout.";
+        current.operation_status = current.operation_error;
+        runtime.pending.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(runtime.result_mutex);
+            runtime.active_request.reset();
+        }
+        static_cast<void>(aida::ui::task_center::update_task(result->task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Workspace generation changed before UI application", current.operation_error));
+        return;
+    }
+    const std::string previous_identity = identity_key(current.active, current.active_user);
+    if (result->catalog)
+        publish_catalog(result->catalog, result->catalog_epoch);
+    if (result->kind == operation_kind_t::set_lock) {
+        current.locked = result->target_locked;
+        current.generation = (std::max)(current.generation, result->saved_generation);
+        apply_lock_recursive(ImGui::DockBuilderGetNode(current.expected_root), current.locked);
+    } else if (result->kind == operation_kind_t::save_user) {
+        current.generation = (std::max)(current.generation, result->saved_generation);
+        current.active_user = result->active_user_name;
+        application_views::clone_persisted_workspace_visibility(previous_identity,
+            identity_key(current.active, current.active_user));
+    } else if (result->kind == operation_kind_t::rename_user) {
+        application_views::rename_persisted_workspace_visibility(
+            identity_key(result->target_preset, result->source_user_name),
+            identity_key(result->target_preset, result->target_user_name));
+        current.active_user = result->active_user_name;
+    } else if (result->kind == operation_kind_t::delete_user) {
+        application_views::remove_persisted_workspace_visibility(
+            identity_key(result->target_preset, result->target_user_name));
+        current.active_user = result->active_user_name;
+    } else {
+        if (!select_preset_paths(current, result->target_preset)) {
+            current.operation_error = "The applied workspace paths could not be represented safely.";
+            current.operation_status = current.operation_error;
+            runtime.pending.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(runtime.result_mutex);
+                runtime.last_failed_request = runtime.active_request;
+                runtime.active_request.reset();
+            }
+            static_cast<void>(aida::ui::task_center::update_task(result->task_id,
+                aida::ui::task_center::task_state_t::failed, 1.0f,
+                "Workspace UI application failed", current.operation_error));
+            return;
+        }
+        ImGui::DockBuilderRemoveNode(current.expected_root);
+        current.active = result->target_preset;
+        current.pending = result->target_preset;
+        current.active_user = result->active_user_name;
+        current.locked = result->target_locked;
+        current.generation = (std::max)(current.generation,
+            (std::max)(result->saved_generation, result->metadata.generation));
+        current.nodes = result->use_default
+            ? dock_nodes_t{current.expected_root, 0, 0, 0, 0}
+            : result->metadata.nodes;
+        if (!result->use_default && !result->payload.empty())
+            ImGui::LoadIniSettingsFromMemory(result->payload.data(), result->payload.size());
+        current.needs_default = result->use_default;
+        current.rebuild_requested = result->use_default;
+        current.root_prepared = false;
+        current.recovered_from_backup = false;
+        current.preserve_recovery_backup = false;
+        if (result->kind == operation_kind_t::restore_preset)
+            application_views::reset_persisted_workspace_visibility(
+                result->target_preset, false);
+        else if (result->kind == operation_kind_t::reset_all)
+            application_views::reset_persisted_workspace_visibility(
+                result->target_preset, true);
+    }
+    current.operation_error.clear();
+    current.operation_status = "Workspace transaction completed";
+    ImGui::GetIO().WantSaveIniSettings = true;
+    runtime.pending.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(runtime.result_mutex);
+        runtime.active_request.reset();
+        runtime.last_failed_request.reset();
+    }
+    static_cast<void>(aida::ui::task_center::update_task(result->task_id,
+        aida::ui::task_center::task_state_t::completed, 1.0f,
+        "Workspace transaction applied", std::string(descriptor_for(
+            result->target_preset).display_name)));
+}
+
+void process_operation_retry() noexcept
+{
+    operation_runtime_t& runtime = operation_runtime();
+    const std::uint64_t retry_serial = runtime.retry_requested.exchange(0,
+        std::memory_order_acq_rel);
+    if (retry_serial == 0 || runtime.pending.load(std::memory_order_acquire))
+        return;
+    std::shared_ptr<const operation_request_t> failed;
+    {
+        std::lock_guard<std::mutex> lock(runtime.result_mutex);
+        if (runtime.last_failed_request && runtime.last_failed_request->serial == retry_serial)
+            failed = runtime.last_failed_request;
+    }
+    if (!failed)
+        return;
+    operation_request_t retry = *failed;
+    retry.serial = 0;
+    retry.catalog_epoch = 0;
+    retry.task_id.clear();
+    static_cast<void>(submit_operation(std::move(retry)));
 }
 
 }
@@ -1294,6 +2606,50 @@ bool initialize(ImGuiID root_dockspace_id) noexcept
             diag::log_tagged_fmt("workspace_layout", "layout_first_run_default schema=%u", kSchemaVersion);
         }
     }
+    if (!current.active_user.empty()) {
+        try {
+            record_metadata_t named_metadata;
+            std::string named_payload;
+            const auto named_paths = named_user_paths(current, current.active_user);
+            if (read_layout_with_backup(named_paths, root_dockspace_id,
+                    named_metadata, named_payload) == read_result_t::valid &&
+                named_metadata.preset == current.active) {
+                ImGui::LoadIniSettingsFromMemory(named_payload.data(), named_payload.size());
+                current.needs_default = false;
+                current.generation = (std::max)(current.generation, named_metadata.generation);
+                current.nodes = named_metadata.nodes;
+                current.locked = named_metadata.locked;
+                current.recovered_from_backup = false;
+                current.preserve_recovery_backup = false;
+                committed_generation().store(current.generation, std::memory_order_release);
+            } else {
+                current.active_user.clear();
+            }
+        } catch (...) {
+            current.active_user.clear();
+        }
+    }
+    aida::infra::executor::submission_t catalog_submission;
+    catalog_submission.owner_subsystem = "workspace_layout";
+    catalog_submission.label = "workspace_layout.catalog_refresh";
+    catalog_submission.thread_class = "diagnostics_io";
+    catalog_submission.domain = aida::infra::executor::domain_t::diagnostics;
+    catalog_submission.priority = 1;
+    catalog_submission.generation = current.generation;
+    catalog_submission.ui_access_policy = "none";
+    catalog_submission.failure_policy = "retain_last_known_good";
+    catalog_submission.shutdown_policy = "drain";
+    const std::filesystem::path user_directory = current.directory / L"user";
+    const std::string active_user = current.active_user;
+    const std::uint64_t refresh_epoch = catalog_epoch().fetch_add(
+        1, std::memory_order_acq_rel) + 1ULL;
+    catalog_submission.body = [user_directory, root_dockspace_id, active_user,
+        refresh_epoch] {
+        if (const auto catalog = scan_user_catalog(user_directory,
+                root_dockspace_id, active_user))
+            publish_catalog(catalog, refresh_epoch);
+    };
+    static_cast<void>(aida::infra::executor::submit(std::move(catalog_submission)));
     current.initialized = true;
     return true;
 }
@@ -1303,6 +2659,8 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
     state_t& current = state();
     if (!current.initialized || current.expected_root != root_dockspace_id)
         return;
+    process_operation_completion();
+    process_operation_retry();
     current.last_position = position;
     current.last_size = ImVec2((std::max)(size.x, 320.0f), (std::max)(size.y, 240.0f));
     if (!current.root_prepared) {
@@ -1339,6 +2697,21 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
     }
 }
 
+void settle_default_selection() noexcept
+{
+    state_t& current = state();
+    if (current.select_defaults_after_realize_frames == 0)
+        return;
+    --current.select_defaults_after_realize_frames;
+    if (current.select_defaults_after_realize_frames != 0)
+        return;
+    if (application_views::is_open(stable_view_id_t("view.start_center")))
+        select_docked_window(current.nodes.documents, "view.start_center");
+    else
+        select_builtin_default_tabs(current.active, current.nodes.navigator,
+            current.nodes.documents, current.nodes.inspector, current.nodes.bottom);
+}
+
 ImGuiID node_id(dock_role_t role) noexcept
 {
     const dock_nodes_t nodes = resolved_nodes(state());
@@ -1352,18 +2725,141 @@ ImGuiID node_id(dock_role_t role) noexcept
     }
 }
 
-workspace_preset_t active_preset() noexcept { return state().active; }
-std::string_view active_preset_name() noexcept { return descriptor_for(active_preset()).display_name; }
-bool layout_locked() noexcept { return state().locked; }
+window_placement_state_t inspect_window_placement(std::string_view window_name) noexcept
+{
+    window_placement_state_t result;
+    if (window_name.empty() || ImGui::GetCurrentContext() == nullptr)
+        return result;
+    const std::string name(window_name);
+    ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+    if (!window)
+        return result;
+    result.realized = true;
+    result.dock_node = window->DockId;
+    result.docked = window->DockId != 0;
+    const dock_nodes_t nodes = resolved_nodes(state());
+    if (window->DockId == nodes.navigator) result.role = dock_role_t::navigator;
+    else if (window->DockId == nodes.documents) result.role = dock_role_t::documents;
+    else if (window->DockId == nodes.inspector) result.role = dock_role_t::inspector;
+    else if (window->DockId == nodes.bottom) result.role = dock_role_t::bottom;
+    return result;
+}
 
-void set_layout_locked(bool locked) noexcept
+workspace_request_result_t float_window(std::string_view window_name) noexcept
 {
     state_t& current = state();
-    current.locked = locked;
-    apply_lock_recursive(ImGui::DockBuilderGetNode(current.expected_root), locked);
-    if (current.persistence_available)
-        save_active_workspace_record(current);
+    if (!current.initialized || !current.root_prepared || current.locked || window_name.empty())
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    const std::string name(window_name);
+    ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+    if (!window)
+        return workspace_request_result_t::unavailable;
+    if (window->DockId == 0)
+        return workspace_request_result_t::unchanged;
+    ImGui::DockContextQueueUndockWindow(ImGui::GetCurrentContext(), window);
     ImGui::GetIO().WantSaveIniSettings = true;
+    return workspace_request_result_t::completed;
+}
+
+workspace_request_result_t dock_window(std::string_view window_name, dock_role_t role) noexcept
+{
+    state_t& current = state();
+    if (!current.initialized || !current.root_prepared || current.locked || window_name.empty() ||
+        role == dock_role_t::root)
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    const ImGuiID target = node_id(role);
+    if (target == 0 || ImGui::DockBuilderGetNode(target) == nullptr)
+        return workspace_request_result_t::unavailable;
+    const window_placement_state_t placement = inspect_window_placement(window_name);
+    if (placement.realized && placement.dock_node == target)
+        return workspace_request_result_t::unchanged;
+    const std::string name(window_name);
+    ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+    if (window)
+        ImGui::DockContextQueueDock(ImGui::GetCurrentContext(), nullptr,
+            ImGui::DockBuilderGetNode(target), window, ImGuiDir_None, 0.0f, false);
+    else
+        ImGui::DockBuilderDockWindow(name.c_str(), target);
+    ImGui::GetIO().WantSaveIniSettings = true;
+    return workspace_request_result_t::completed;
+}
+
+workspace_preset_t active_preset() noexcept { return state().active; }
+std::string_view active_preset_name() noexcept { return descriptor_for(active_preset()).display_name; }
+workspace_identity_t active_identity() noexcept
+{
+    try {
+        const state_t& current = state();
+        return {current.active_user.empty() ? workspace_identity_kind_t::built_in :
+            workspace_identity_kind_t::user, current.active, current.active_user};
+    } catch (...) {
+        return {};
+    }
+}
+std::string active_identity_key() noexcept
+{
+    try {
+        const state_t& current = state();
+        return identity_key(current.active, current.active_user);
+    } catch (...) {
+        return "builtin:analysis";
+    }
+}
+std::shared_ptr<const std::vector<user_workspace_descriptor_t>> user_layout_catalog() noexcept
+{
+    const auto catalog = catalog_snapshot();
+    return catalog ? catalog :
+        std::make_shared<const std::vector<user_workspace_descriptor_t>>();
+}
+bool user_layout_catalog_ready() noexcept
+{
+    return catalog_ready().load(std::memory_order_acquire);
+}
+bool layout_locked() noexcept { return state().locked; }
+
+workspace_request_result_t set_layout_locked(bool locked) noexcept
+{
+    state_t& current = state();
+    if (!current.initialized || !current.root_prepared || !current.persistence_available)
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    if (current.locked == locked)
+        return workspace_request_result_t::unchanged;
+    operation_request_t request;
+    request.kind = operation_kind_t::set_lock;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    request.current_user_name = current.active_user;
+    request.target_preset = current.active;
+    request.target_locked = locked;
+    request.save_generation = (std::max)(current.generation,
+        committed_generation().load(std::memory_order_acquire)) + 1ULL;
+    request.skip_backup = current.recovered_from_backup || current.preserve_recovery_backup;
+    request.nodes = resolved_nodes(current);
+    request.current_paths = capture_paths(current);
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
+    request.current_payload = capture_current_payload(current);
+    if (!request.current_payload)
+        return workspace_request_result_t::failed;
+    return submit_operation(std::move(request));
+}
+
+bool operation_pending() noexcept
+{
+    return operation_runtime().pending.load(std::memory_order_acquire);
+}
+
+std::string operation_status() noexcept
+{
+    const state_t& current = state();
+    return current.operation_error.empty() ? current.operation_status : current.operation_error;
 }
 
 workspace_request_result_t switch_to(workspace_preset_t preset) noexcept
@@ -1371,60 +2867,84 @@ workspace_request_result_t switch_to(workspace_preset_t preset) noexcept
     state_t& current = state();
     if (!current.initialized || !current.persistence_available)
         return workspace_request_result_t::unavailable;
-    if (current.active == preset && !current.rebuild_requested)
+    if (!current.root_prepared)
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    if (current.active == preset && current.active_user.empty() && !current.rebuild_requested)
         return workspace_request_result_t::unchanged;
-    if (!save_current_synchronously(current, capture_paths(current), false))
+    operation_request_t request;
+    request.kind = operation_kind_t::switch_preset;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    request.current_user_name = current.active_user;
+    request.target_preset = preset;
+    request.target_locked = current.locked;
+    request.save_generation = (std::max)(current.generation,
+        committed_generation().load(std::memory_order_acquire)) + 1ULL;
+    request.skip_backup = current.recovered_from_backup || current.preserve_recovery_backup;
+    request.nodes = resolved_nodes(current);
+    request.current_paths = capture_paths(current);
+    request.target_paths = preset_paths(current, preset);
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
+    request.current_payload = capture_current_payload(current);
+    if (!request.current_payload)
         return workspace_request_result_t::failed;
-    current.pending = preset;
-    if (!select_preset_paths(current, preset))
-        return workspace_request_result_t::failed;
-    ImGui::DockBuilderRemoveNode(current.expected_root);
-    record_metadata_t metadata;
-    read_result_t loaded = load_layout_file(current.primary, current.expected_root, metadata);
-    if (loaded == read_result_t::valid && metadata.preset != preset)
-        loaded = read_result_t::invalid;
-    current.active = preset;
-    current.generation = (std::max)(current.generation, metadata.generation);
-    current.nodes.root = current.expected_root;
-    current.needs_default = loaded != read_result_t::valid;
-    if (loaded == read_result_t::valid) {
-        current.nodes = metadata.nodes;
-        current.locked = metadata.locked;
-    } else {
-        current.locked = false;
-        if (loaded == read_result_t::invalid)
-            MoveFileExW(current.primary.c_str(), current.invalid.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    }
-    current.rebuild_requested = current.needs_default;
-    current.root_prepared = false;
-    current.recovered_from_backup = false;
-    current.preserve_recovery_backup = false;
-    save_active_workspace_record(current);
-    return workspace_request_result_t::completed;
+    return submit_operation(std::move(request));
 }
 
-workspace_request_result_t save_user_layout(std::string_view name) noexcept
+workspace_request_result_t save_user_layout(std::string_view name, bool overwrite) noexcept
 {
     state_t& current = state();
     if (!valid_user_layout_name(name))
         return workspace_request_result_t::invalid_name;
     if (!current.initialized || !current.persistence_available)
         return workspace_request_result_t::unavailable;
-    layout_paths_t paths = capture_paths(current);
+    if (!current.root_prepared)
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    if (!overwrite && !catalog_ready().load(std::memory_order_acquire))
+        return workspace_request_result_t::unavailable;
+    const auto catalog = catalog_snapshot();
+    if (!overwrite && catalog && std::any_of(catalog->begin(), catalog->end(),
+            [name](const auto& entry) { return entry.name == name; }))
+        return workspace_request_result_t::already_exists;
+    operation_request_t request;
     try {
-        paths.directory = current.directory / L"user";
-        paths.primary = user_layout_path(current, name);
-        paths.backup = paths.primary;
-        paths.backup += L".bak";
-        paths.invalid = paths.primary;
-        paths.invalid += L".invalid";
+        request.target_paths = named_user_paths(current, name);
     } catch (...) {
         return workspace_request_result_t::failed;
     }
-    return save_current_synchronously(current, paths, false)
-        ? workspace_request_result_t::completed
-        : workspace_request_result_t::failed;
+    request.kind = operation_kind_t::save_user;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    request.current_user_name = current.active_user;
+    request.target_user_name.assign(name);
+    request.overwrite = overwrite;
+    request.target_preset = current.active;
+    request.target_locked = current.locked;
+    request.save_generation = (std::max)(current.generation,
+        committed_generation().load(std::memory_order_acquire)) + 1ULL;
+    request.skip_backup = current.recovered_from_backup || current.preserve_recovery_backup;
+    request.nodes = resolved_nodes(current);
+    request.current_paths = capture_paths(current);
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
+    request.current_payload = capture_current_payload(current);
+    if (!request.current_payload)
+        return workspace_request_result_t::failed;
+    return submit_operation(std::move(request));
+}
+
+workspace_request_result_t save_active_user_layout() noexcept
+{
+    const std::string name = state().active_user;
+    return name.empty() ? workspace_request_result_t::unavailable :
+        save_user_layout(name, true);
 }
 
 workspace_request_result_t load_user_layout(std::string_view name) noexcept
@@ -1434,57 +2954,151 @@ workspace_request_result_t load_user_layout(std::string_view name) noexcept
         return workspace_request_result_t::invalid_name;
     if (!current.initialized || !current.persistence_available)
         return workspace_request_result_t::unavailable;
-    if (!save_current_synchronously(current, capture_paths(current), false))
-        return workspace_request_result_t::failed;
-    record_metadata_t metadata;
-    std::filesystem::path path;
+    if (!current.root_prepared)
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    if (!catalog_ready().load(std::memory_order_acquire))
+        return workspace_request_result_t::unavailable;
+    const auto catalog = catalog_snapshot();
+    const auto selected = catalog ? std::find_if(catalog->begin(), catalog->end(),
+        [name](const auto& entry) { return entry.name == name; }) :
+        std::vector<user_workspace_descriptor_t>::const_iterator{};
+    if (!catalog || selected == catalog->end())
+        return workspace_request_result_t::not_found;
+    operation_request_t request;
     try {
-        path = user_layout_path(current, name);
+        request.target_paths = named_user_paths(current, name);
     } catch (...) {
         return workspace_request_result_t::failed;
     }
-    if (!inspect_layout_file(path, current.expected_root, metadata))
+    request.kind = operation_kind_t::load_user;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    request.current_user_name = current.active_user;
+    request.target_user_name.assign(name);
+    request.expected_user_generation = selected->generation;
+    request.target_preset = current.active;
+    request.target_locked = current.locked;
+    request.save_generation = (std::max)(current.generation,
+        committed_generation().load(std::memory_order_acquire)) + 1ULL;
+    request.skip_backup = current.recovered_from_backup || current.preserve_recovery_backup;
+    request.nodes = resolved_nodes(current);
+    request.current_paths = capture_paths(current);
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
+    request.current_payload = capture_current_payload(current);
+    if (!request.current_payload)
+        return workspace_request_result_t::failed;
+    return submit_operation(std::move(request));
+}
+
+workspace_request_result_t rename_user_layout(std::string_view current_name,
+    std::string_view new_name) noexcept
+{
+    state_t& current = state();
+    if (!valid_user_layout_name(current_name) || !valid_user_layout_name(new_name))
+        return workspace_request_result_t::invalid_name;
+    if (current_name == new_name)
+        return workspace_request_result_t::unchanged;
+    if (!current.initialized || !current.root_prepared || !current.persistence_available)
         return workspace_request_result_t::unavailable;
-    ImGui::DockBuilderRemoveNode(current.expected_root);
-    if (load_layout_file(path, current.expected_root, metadata) != read_result_t::valid) {
-        current.needs_default = true;
-        current.root_prepared = false;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    if (!catalog_ready().load(std::memory_order_acquire))
+        return workspace_request_result_t::unavailable;
+    const auto catalog = catalog_snapshot();
+    if (!catalog || std::none_of(catalog->begin(), catalog->end(),
+            [current_name](const auto& entry) { return entry.name == current_name; }))
+        return workspace_request_result_t::not_found;
+    if (std::any_of(catalog->begin(), catalog->end(),
+            [new_name](const auto& entry) { return entry.name == new_name; }))
+        return workspace_request_result_t::already_exists;
+    operation_request_t request;
+    try {
+        request.source_user_paths = named_user_paths(current, current_name);
+        request.target_paths = named_user_paths(current, new_name);
+    } catch (...) {
         return workspace_request_result_t::failed;
     }
-    current.active = metadata.preset;
-    current.pending = metadata.preset;
-    if (!select_preset_paths(current, current.active))
+    request.kind = operation_kind_t::rename_user;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    const auto source_descriptor = std::find_if(catalog->begin(), catalog->end(),
+        [current_name](const auto& entry) { return entry.name == current_name; });
+    request.target_preset = source_descriptor->base_preset;
+    request.target_locked = current.locked;
+    request.current_user_name = current.active_user;
+    request.source_user_name.assign(current_name);
+    request.target_user_name.assign(new_name);
+    request.expected_user_generation = source_descriptor->generation;
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
+    return submit_operation(std::move(request));
+}
+
+workspace_request_result_t delete_user_layout(std::string_view name) noexcept
+{
+    state_t& current = state();
+    if (!valid_user_layout_name(name))
+        return workspace_request_result_t::invalid_name;
+    if (!current.initialized || !current.root_prepared || !current.persistence_available)
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    if (!catalog_ready().load(std::memory_order_acquire))
+        return workspace_request_result_t::unavailable;
+    const auto catalog = catalog_snapshot();
+    if (!catalog || std::none_of(catalog->begin(), catalog->end(),
+            [name](const auto& entry) { return entry.name == name; }))
+        return workspace_request_result_t::not_found;
+    operation_request_t request;
+    try {
+        request.target_paths = named_user_paths(current, name);
+    } catch (...) {
         return workspace_request_result_t::failed;
-    current.nodes = metadata.nodes;
-    current.locked = metadata.locked;
-    current.generation = (std::max)(current.generation, metadata.generation);
-    current.needs_default = false;
-    current.root_prepared = false;
-    save_active_workspace_record(current);
-    return workspace_request_result_t::completed;
+    }
+    request.kind = operation_kind_t::delete_user;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    const auto target_descriptor = std::find_if(catalog->begin(), catalog->end(),
+        [name](const auto& entry) { return entry.name == name; });
+    request.target_preset = target_descriptor->base_preset;
+    request.target_locked = current.locked;
+    request.current_user_name = current.active_user;
+    request.target_user_name.assign(name);
+    request.expected_user_generation = target_descriptor->generation;
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
+    return submit_operation(std::move(request));
 }
 
 workspace_request_result_t restore_builtin(workspace_preset_t preset) noexcept
 {
     state_t& current = state();
-    if (!current.initialized || !current.persistence_available)
+    if (!current.initialized || !current.root_prepared || !current.persistence_available)
         return workspace_request_result_t::unavailable;
-    if (!select_preset_paths(current, preset))
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    operation_request_t request;
+    request.kind = operation_kind_t::restore_preset;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    request.target_preset = preset;
+    request.target_locked = false;
+    request.current_user_name = current.active_user;
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
+    try {
+        request.reset_paths.push_back(preset_paths(current, preset));
+    } catch (...) {
         return workspace_request_result_t::failed;
-    DeleteFileW(current.primary.c_str());
-    DeleteFileW(current.backup.c_str());
-    DeleteFileW(current.invalid.c_str());
-    current.active = preset;
-    current.pending = preset;
-    current.nodes = {current.expected_root, 0, 0, 0, 0};
-    current.locked = false;
-    current.needs_default = true;
-    current.rebuild_requested = true;
-    current.root_prepared = false;
-    current.recovered_from_backup = false;
-    current.preserve_recovery_backup = false;
-    save_active_workspace_record(current);
-    return workspace_request_result_t::completed;
+    }
+    return submit_operation(std::move(request));
 }
 
 workspace_request_result_t reset_current() noexcept { return restore_builtin(active_preset()); }
@@ -1492,26 +3106,28 @@ workspace_request_result_t reset_current() noexcept { return restore_builtin(act
 workspace_request_result_t reset_all() noexcept
 {
     state_t& current = state();
-    if (!current.initialized || !current.persistence_available)
+    if (!current.initialized || !current.root_prepared || !current.persistence_available)
         return workspace_request_result_t::unavailable;
-    for (const auto& descriptor : kPresetDescriptors) {
-        if (!select_preset_paths(current, descriptor.id))
-            return workspace_request_result_t::failed;
-        DeleteFileW(current.primary.c_str());
-        DeleteFileW(current.backup.c_str());
-        DeleteFileW(current.invalid.c_str());
-    }
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    operation_request_t request;
+    request.kind = operation_kind_t::reset_all;
+    request.source_generation = current.generation;
+    request.expected_root = current.expected_root;
+    request.current_preset = current.active;
+    request.target_preset = workspace_preset_t::analysis;
+    request.target_locked = false;
+    request.current_user_name = current.active_user;
+    request.workspace_directory = current.directory;
+    request.active_record = current.active_record;
     try {
-        std::filesystem::path user_directory = current.directory / L"user";
-        std::error_code error;
-        for (const auto& entry : std::filesystem::directory_iterator(user_directory, error)) {
-            if (!error && entry.is_regular_file(error) && entry.path().extension() == L".aida-layout")
-                std::filesystem::remove(entry.path(), error);
-        }
+        for (const auto& descriptor : kPresetDescriptors)
+            request.reset_paths.push_back(preset_paths(current, descriptor.id));
+        request.user_directory = current.directory / L"user";
     } catch (...) {
         return workspace_request_result_t::failed;
     }
-    return restore_builtin(workspace_preset_t::analysis);
+    return submit_operation(std::move(request));
 }
 
 workspace_request_result_t activate_safe_layout() noexcept
@@ -1524,6 +3140,10 @@ workspace_request_result_t open_missing_views() noexcept
     state_t& current = state();
     if (!current.initialized || !current.root_prepared)
         return workspace_request_result_t::unavailable;
+    if (current.locked)
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
     const dock_nodes_t nodes = resolved_nodes(current);
     dock_named_windows(current.active, nodes.navigator, nodes.documents,
         nodes.inspector, nodes.bottom, true);
@@ -1536,6 +3156,10 @@ void persist_if_requested() noexcept
 {
     state_t& current = state();
     if (!current.initialized || !current.root_prepared || !current.persistence_available)
+        return;
+    process_operation_completion();
+    process_operation_retry();
+    if (operation_runtime().pending.load(std::memory_order_acquire))
         return;
     ImGuiIO& io = ImGui::GetIO();
     const std::uint64_t now_ms = static_cast<std::uint64_t>(GetTickCount64());
@@ -1556,9 +3180,18 @@ void persist_if_requested() noexcept
         return;
     std::size_t payload_size = 0;
     const char* payload = ImGui::SaveIniSettingsToMemory(&payload_size);
+    if (!payload || payload_size == 0 || payload_size > kMaximumPayloadBytes) {
+        current.next_save_attempt_ms = now_ms + 5000ULL;
+        diag::log_tagged_critical_fmt("workspace_layout",
+            "layout_save_capture_rejected payload_bytes=%llu maximum_bytes=%llu",
+            static_cast<unsigned long long>(payload_size),
+            static_cast<unsigned long long>(kMaximumPayloadBytes));
+        return;
+    }
     current.nodes = resolved_nodes(current);
     bool queued = false;
-    const std::uint64_t next_generation = current.generation + 1ULL;
+    const std::uint64_t next_generation = (std::max)(current.generation,
+        committed_generation().load(std::memory_order_acquire)) + 1ULL;
     try {
         queued = payload && queue_write(capture_paths(current), current.expected_root,
             std::string_view(payload, payload_size), next_generation,
@@ -1592,7 +3225,8 @@ void shutdown() noexcept
         const char* payload = ImGui::SaveIniSettingsToMemory(&payload_size);
         current.nodes = resolved_nodes(current);
         bool saved = false;
-        const std::uint64_t final_generation = current.generation + 1ULL;
+        const std::uint64_t final_generation = (std::max)(current.generation,
+            committed_generation().load(std::memory_order_acquire)) + 1ULL;
         try {
             saved = payload && write_generation(capture_paths(current), current.expected_root,
                 std::string_view(payload, payload_size), final_generation, true,
@@ -1610,6 +3244,11 @@ void shutdown() noexcept
                 static_cast<unsigned long long>(final_generation),
                 static_cast<unsigned long long>(payload_size));
     }
+    const std::uint64_t reset_epoch = catalog_epoch().fetch_add(
+        1, std::memory_order_acq_rel) + 1ULL;
+    publish_catalog(std::make_shared<const std::vector<user_workspace_descriptor_t>>(),
+        reset_epoch);
+    catalog_ready().store(false, std::memory_order_release);
     current = {};
 }
 

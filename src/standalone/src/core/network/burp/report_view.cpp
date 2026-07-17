@@ -161,7 +161,14 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     if (aida::ui::button("Clear history", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
         ::diag::log_tagged("report_v", "clear_history");
-        report::clear_history();
+        ::aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.report_view";
+        submission.label = "report.clear_history";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::diagnostics;
+        submission.priority = 3;
+        submission.body = []() { report::clear_history(); };
+        static_cast<void>(::aida::infra::executor::submit(std::move(submission)));
     }
     ImGui::Separator();
     auto reports = report::list_reports();

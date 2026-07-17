@@ -11,8 +11,12 @@
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
 #include "ui/hub_strip.hpp"
+#include "ui/design_system.hpp"
+#include "ui/application_view_registry.hpp"
+#include "ui/application_ui_runtime.hpp"
 #include "imgui/imgui.h"
 #include "../helpers/globals.h"
+#include "../disasm/disasm_view.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
@@ -20,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -35,7 +40,12 @@ struct local_state_t {
 	int   selected_finding = -1;
 	int   category_filter = -1;
 	int   severity_filter = -1;
+	int   applied_category_filter = -2;
+	int   applied_severity_filter = -2;
 	float anim_t = 0.f;
+	std::uint64_t findings_generation = 0;
+	std::shared_ptr<const std::vector<stealth_engine::finding_t>> findings;
+	std::vector<std::size_t> filtered_findings;
 	aida::ui::hub_strip::state_t strip;
 };
 
@@ -104,327 +114,286 @@ inline void render_protection_scan(float pos_x, float pos_y, float w, float h,
 {
 	auto& st = s_state;
 	const auto& th = aida::ui::resolved();
-	float ox = wp.x;
-	float oy = wp.y;
-	const float pad = 12.f;
-	const float dt = aida::ui::clock::dt();
-
-	float cy = oy + pos_y + 6.f;
-	float cx = ox + pos_x + pad;
-
-	const float toolbar_h = 38.f;
-	ImU32 bar_top = aida::ui::with_alpha(th.panel_header, alpha * 0.85f);
-	ImU32 bar_bot = aida::ui::with_alpha(th.panel_bg, alpha * 0.85f);
-	dl->AddRectFilledMultiColor(ImVec2(ox + pos_x, cy), ImVec2(ox + pos_x + w, cy + toolbar_h),
-		bar_top, bar_top, bar_bot, bar_bot);
-	dl->AddLine(ImVec2(ox + pos_x, cy + toolbar_h - 1.f), ImVec2(ox + pos_x + w, cy + toolbar_h - 1.f),
-		aida::ui::with_alpha(th.border_subtle, alpha));
-
-	bool scanning = stealth_engine::g_scan.scanning.load();
-
-	ImGui::SetCursorScreenPos(ImVec2(cx, cy + 8.f));
-	if (!scanning) {
-		if (aida::ui::button("Scan", aida::ui::button_kind_t::primary,
-			aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
-			diag::log_tagged("stealth", "view_scan_request");
-			stealth_engine::run_protection_scan();
-		}
-	} else {
-		if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive,
-			aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
-			diag::log_tagged("stealth", "view_scan_stop");
-			stealth_engine::stop_protection_scan();
-		}
-	}
-	ImGui::SameLine();
-	if (aida::ui::button("Clear", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
-		std::lock_guard<std::mutex> lk(stealth_engine::g_scan.mutex);
-		size_t cleared = stealth_engine::g_scan.findings.size();
-		stealth_engine::g_scan.findings.clear();
-		stealth_engine::g_scan.scan_status.clear();
-		st.selected_finding = -1;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::protection, 0,
-			"protection.clear", std::to_string(cleared) + " findings cleared");
-#endif
-		diag::log_tagged_fmt("stealth", "view_findings_cleared count=%zu", cleared);
-	}
-	ImGui::SameLine();
-	ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
-	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.panel_header, alpha)));
-	ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-		aida::ui::with_alpha(th.text_primary, alpha)));
-	const char* sev_items[] = {"All Severity", "Critical", "High", "Medium", "Low", "Info"};
-	ImGui::PushItemWidth(120.f);
-	int sev_sel = st.severity_filter + 1;
-	if (ImGui::Combo("##sev_combo", &sev_sel, sev_items, 6))
-		st.severity_filter = sev_sel - 1;
-	ImGui::PopItemWidth();
-	ImGui::SameLine();
-	const char* cat_items[] = {"All Categories", "AC Driver", "Memory Guard", "Suspicious Module",
-							   "Thread", "Debug State", "Hook", "WFP Callback"};
-	ImGui::PushItemWidth(150.f);
-	int cat_sel = st.category_filter + 1;
-	if (ImGui::Combo("##cat_combo", &cat_sel, cat_items, 8))
-		st.category_filter = cat_sel - 1;
-	ImGui::PopItemWidth();
-	ImGui::PopStyleColor(2);
-	ImGui::PopStyleVar();
-
-	if (scanning) {
-		ImGui::SameLine();
-		float prog = stealth_engine::g_scan.progress.load();
-		ImVec2 cp = ImGui::GetCursorScreenPos();
-		aida::ui::components::render_progress_ring(ImVec2(cp.x + 8.f, cy + 17.f), 9.f, 2.f, prog, false);
-		ImGui::Dummy(ImVec2(28.f, 0.f));
-		ImGui::SameLine();
-		std::lock_guard<std::mutex> lk(stealth_engine::g_scan.mutex);
-		dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-			11.f, ImVec2(ImGui::GetCursorScreenPos().x, cy + 13.f),
-			aida::ui::with_alpha(th.text_dim, alpha),
-			stealth_engine::g_scan.scan_status.c_str());
-	}
-
-	cy += toolbar_h + 6.f;
-
-	std::vector<stealth_engine::finding_t> filtered;
-	{
-		std::lock_guard<std::mutex> lk(stealth_engine::g_scan.mutex);
-		for (auto& f : stealth_engine::g_scan.findings) {
-			if (st.severity_filter >= 0 &&
-				static_cast<int>(f.severity) != (4 - st.severity_filter))
-				continue;
-			if (st.category_filter >= 0 &&
-				static_cast<int>(f.category) != st.category_filter)
-				continue;
-			filtered.push_back(f);
-		}
-	}
-
-	const float row_h = 30.f;
-	const float bottom_h = 64.f;
-	const float table_top = cy;
-	const float table_h = oy + pos_y + h - cy - 8.f - bottom_h;
-
-	float col_sev_w = 76.f;
-	float col_cat_w = 130.f;
-	float col_addr_w = 144.f;
-	float col_title_w = w * 0.25f;
-	float col_detail_w = w - col_sev_w - col_cat_w - col_addr_w - col_title_w - pad * 2.f - 14.f;
-	if (col_detail_w < 60.f) col_detail_w = 60.f;
-
-	ImU32 hdr_bg = aida::ui::with_alpha(th.panel_header, alpha * 0.9f);
-	dl->AddRectFilled(ImVec2(cx, cy), ImVec2(ox + pos_x + w - pad, cy + row_h), hdr_bg, 6.f);
-	dl->AddLine(ImVec2(cx, cy + row_h - 1.f), ImVec2(ox + pos_x + w - pad, cy + row_h - 1.f),
-		aida::ui::with_alpha(th.border_subtle, alpha));
-
-	ImFont* head_em = aida::ui::fonts::body_em();
-	if (!head_em) head_em = ImGui::GetFont();
-	ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
-	float hx = cx + 6.f;
-	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Severity");
-	hx += col_sev_w;
-	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Category");
-	hx += col_cat_w;
-	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Address");
-	hx += col_addr_w;
-	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Finding");
-	hx += col_title_w;
-	dl->AddText(head_em, 13.f, ImVec2(hx, cy + 8.f), hc, "Details");
-	cy += row_h + 2.f;
-
-	float content_h = static_cast<float>(filtered.size()) * row_h;
-	float visible_h = table_h - row_h - 2.f;
-	if (visible_h < 0.f) visible_h = 0.f;
-
-	float wheel = 0.f;
-	if (ImGui::IsMouseHoveringRect(ImVec2(cx, cy), ImVec2(ox + pos_x + w - pad, cy + visible_h))) {
-		wheel = ImGui::GetIO().MouseWheel;
-	}
-	if (wheel != 0.f) st.target_scroll_y -= wheel * row_h * 3.f;
-	if (st.target_scroll_y < 0.f) st.target_scroll_y = 0.f;
-	float ms = std::max(0.f, content_h - visible_h);
-	if (st.target_scroll_y > ms) st.target_scroll_y = ms;
-	st.scroll_y = aida::motion::smooth_lerp(st.scroll_y, st.target_scroll_y, 14.f, dt);
-
-	ImGui::PushClipRect(ImVec2(ox + pos_x, cy), ImVec2(ox + pos_x + w - pad - 6.f, oy + pos_y + h - 8.f), true);
-
-	int first_vis = static_cast<int>(st.scroll_y / row_h);
-	int last_vis = first_vis + static_cast<int>(visible_h / row_h) + 2;
-	if (first_vis < 0) first_vis = 0;
-	if (last_vis > static_cast<int>(filtered.size())) last_vis = static_cast<int>(filtered.size());
-
-	for (int i = first_vis; i < last_vis; ++i) {
-		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
-		if (ry + row_h < cy || ry > oy + pos_y + h) continue;
-
-		auto& f = filtered[static_cast<size_t>(i)];
-		ImVec2 rmin(cx, ry);
-		ImVec2 rmax(ox + pos_x + w - pad, ry + row_h);
-
-		bool hovered = ImGui::IsMouseHoveringRect(rmin, rmax);
-		bool selected = (st.selected_finding == i);
-
-		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-			st.selected_finding = selected ? -1 : i;
-
-		float entrance_delay = std::min(static_cast<float>(i - first_vis) * 0.012f, 0.240f);
-		float entrance_t = (st.anim_t - entrance_delay) / 0.32f;
-		if (entrance_t < 0.f) entrance_t = 0.f;
-		if (entrance_t > 1.f) entrance_t = 1.f;
-		float entrance = aida::motion::ease::out_cubic(entrance_t);
-
-		ImU32 row_fill;
-		if (selected) row_fill = aida::ui::with_alpha(th.selection, alpha);
-		else if (hovered) row_fill = aida::ui::with_alpha(th.hover_wash, alpha);
-		else row_fill = (i & 1) ? aida::ui::with_alpha(th.panel_bg, alpha * 0.45f * entrance) : 0u;
-		if ((row_fill & 0xFF000000) != 0) {
-			dl->AddRectFilled(rmin, rmax, row_fill, 4.f);
-		}
-		if (selected) {
-			dl->AddRectFilled(ImVec2(rmin.x, rmin.y), ImVec2(rmin.x + 3.f, rmax.y),
-				aida::ui::with_alpha(th.accent_u32, alpha), 1.5f);
-		}
-
-		if (f.severity == stealth_engine::finding_severity_t::critical) {
-			float pulse = (sinf(st.anim_t * 3.f + static_cast<float>(i) * 0.7f) + 1.f) * 0.5f;
-			ImU32 glow = aida::ui::with_alpha(th.error, alpha * (0.18f + pulse * 0.22f));
-			dl->AddRectFilled(rmin, rmax, glow, 4.f);
-		} else if (f.severity == stealth_engine::finding_severity_t::high) {
-			float pulse = (sinf(st.anim_t * 2.2f + static_cast<float>(i) * 0.5f) + 1.f) * 0.5f;
-			ImU32 glow = aida::ui::with_alpha(th.warning, alpha * (0.08f + pulse * 0.12f));
-			dl->AddRectFilled(rmin, rmax, glow, 4.f);
-		}
-
-		float rx = cx + 6.f;
-		ImGui::SetCursorScreenPos(ImVec2(rx, ry + 3.f));
-		aida::ui::pill_kind(stealth_engine::severity_name(f.severity), severity_pill(f.severity),
-			aida::ui::size_t_::sm, true);
-		rx = cx + col_sev_w + 4.f;
-
-		dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-			13.f, ImVec2(rx, ry + 8.f),
-			aida::ui::with_alpha(th.text_secondary, alpha * entrance),
-			stealth_engine::category_name(f.category));
-		rx += col_cat_w;
-
-		ImFont* code_font = aida::ui::fonts::code();
-		if (!code_font) code_font = ImGui::GetFont();
-		if (f.address != 0) {
-			char addr_buf[24];
-			std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
-				static_cast<unsigned long long>(f.address));
-			dl->AddText(code_font, 13.f, ImVec2(rx, ry + 8.f),
-				aida::ui::with_alpha(th.text_address, alpha * entrance), addr_buf);
-		}
-		rx += col_addr_w;
-
-		std::string title = f.title;
-		if (title.size() > 40) title = title.substr(0, 38) + "..";
-		dl->AddText(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : ImGui::GetFont(),
-			13.f, ImVec2(rx, ry + 8.f),
-			aida::ui::with_alpha(th.text_primary, alpha * entrance), title.c_str());
-		rx += col_title_w;
-
-		std::string det = f.detail;
-		if (det.size() > 60) det = det.substr(0, 58) + "..";
-		dl->AddText(aida::ui::fonts::body() ? aida::ui::fonts::body() : ImGui::GetFont(),
-			13.f, ImVec2(rx, ry + 8.f),
-			aida::ui::with_alpha(th.text_secondary, alpha * entrance), det.c_str());
-	}
-
-	ImGui::PopClipRect();
-
-	if (content_h > visible_h && visible_h > 0.f) {
-		float bar_x = ox + pos_x + w - pad - 8.f;
-		float bar_y = cy;
-		float bar_h = visible_h;
-		float ratio = visible_h / content_h;
-		float thumb_h = std::max(bar_h * ratio, 24.f);
-		float track = bar_h - thumb_h;
-		float scroll_ratio = (content_h - visible_h > 0.f) ? st.scroll_y / (content_h - visible_h) : 0.f;
-		float thumb_y = bar_y + track * scroll_ratio;
-		dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + 6.f, bar_y + bar_h),
-			aida::ui::with_alpha(th.panel_header, alpha * 0.4f), 3.f);
-		dl->AddRectFilled(ImVec2(bar_x, thumb_y), ImVec2(bar_x + 6.f, thumb_y + thumb_h),
-			aida::ui::with_alpha(th.accent_dim, alpha), 3.f);
-	}
-
-	if (filtered.empty() && !scanning) {
-		std::lock_guard<std::mutex> lk(stealth_engine::g_scan.mutex);
-		if (stealth_engine::g_scan.findings.empty()) {
-			ImVec2 e_pos = ImVec2(ox + pos_x, table_top);
-			ImVec2 e_sz = ImVec2(w, table_h);
-			aida::ui::empty_state::config_t cfg;
-			cfg.glyph = aida::ui::empty_state::glyph_t::shield;
-			cfg.title = "No findings yet";
-			cfg.body = "Click Scan to analyze the attached process for protection mechanisms.";
-			cfg.max_width = 320.f;
-			aida::ui::empty_state::render(e_pos, e_sz, cfg);
-		}
-	}
-
-	if (!scanning && !filtered.empty()) {
-		int crit = 0, hi = 0, med = 0, lo = 0;
-		for (auto& f : filtered) {
-			switch (f.severity) {
-				case stealth_engine::finding_severity_t::critical: ++crit; break;
-				case stealth_engine::finding_severity_t::high:     ++hi; break;
-				case stealth_engine::finding_severity_t::medium:   ++med; break;
-				case stealth_engine::finding_severity_t::low:      ++lo; break;
-				case stealth_engine::finding_severity_t::info:     break;
+	static_cast<void>(dl);
+	static_cast<void>(th);
+	static_cast<void>(alpha);
+	const auto metrics = aida::ui::design::metrics();
+	const bool scanning = stealth_engine::g_scan.scanning.load(std::memory_order_acquire);
+	const auto findings = stealth_engine::capture_protection_findings();
+	const std::uint64_t generation = stealth_engine::g_scan.generation.load(std::memory_order_acquire);
+	if (generation != st.findings_generation || findings != st.findings ||
+		st.applied_category_filter != st.category_filter ||
+		st.applied_severity_filter != st.severity_filter) {
+		st.findings = findings;
+		st.findings_generation = generation;
+		st.applied_category_filter = st.category_filter;
+		st.applied_severity_filter = st.severity_filter;
+		st.filtered_findings.clear();
+		if (findings) {
+			st.filtered_findings.reserve(findings->size());
+			for (std::size_t index = 0; index < findings->size(); ++index) {
+				const auto& finding = (*findings)[index];
+				if (st.severity_filter >= 0 &&
+					static_cast<int>(finding.severity) != 4 - st.severity_filter)
+					continue;
+				if (st.category_filter >= 0 &&
+					static_cast<int>(finding.category) != st.category_filter)
+					continue;
+				st.filtered_findings.push_back(index);
 			}
 		}
-
-		float card_y = oy + pos_y + h - bottom_h;
-		ImVec2 c_a = ImVec2(ox + pos_x + 8.f, card_y);
-		ImVec2 c_b = ImVec2(ox + pos_x + w - 8.f, card_y + bottom_h - 8.f);
-		aida::ui::blur::render_glass_fill(dl, c_a, c_b, 8.f, alpha);
-		aida::ui::blur::render_glass_border(dl, c_a, c_b, 8.f, alpha, 1.f);
-
-		float card_w = (w - 16.f) / 5.f;
-		float sx = c_a.x + 4.f;
-		float sy = c_a.y + 6.f;
-
-		auto draw_count = [&](const char* label, int v, ImU32 col) {
-			ImVec2 ba = ImVec2(sx, sy);
-			ImVec2 bb = ImVec2(sx + card_w - 6.f, sy + bottom_h - 18.f);
-			dl->AddRectFilled(ba, bb, aida::ui::with_alpha(th.panel_header, alpha * 0.45f), 6.f);
-			dl->AddRect(ba, bb, aida::ui::with_alpha(th.border_subtle, alpha), 6.f, 0, 1.f);
-			ImFont* num = aida::ui::fonts::body_strong();
-			if (!num) num = ImGui::GetFont();
-			char vbuf[16];
-			std::snprintf(vbuf, sizeof(vbuf), "%d", v);
-			dl->AddText(num, 18.f, ImVec2(ba.x + 10.f, ba.y + 4.f), col, vbuf);
-			dl->AddText(aida::ui::fonts::caption() ? aida::ui::fonts::caption() : ImGui::GetFont(),
-				10.f, ImVec2(ba.x + 10.f, ba.y + 26.f),
-				aida::ui::with_alpha(th.text_dim, alpha), label);
-			sx += card_w;
-		};
-
-		int total = static_cast<int>(filtered.size());
-		draw_count("Findings", total, aida::ui::with_alpha(th.text_primary, alpha));
-		draw_count("Critical", crit, aida::ui::with_alpha(th.error, alpha));
-		draw_count("High",     hi,   aida::ui::with_alpha(th.warning, alpha));
-		draw_count("Medium",   med,  aida::ui::with_alpha(th.warning, alpha * 0.85f));
-		draw_count("Low",      lo,   aida::ui::with_alpha(th.success, alpha));
-	} else {
-		float card_y = oy + pos_y + h - bottom_h;
-		ImVec2 c_a = ImVec2(ox + pos_x + 8.f, card_y);
-		ImVec2 c_b = ImVec2(ox + pos_x + w - 8.f, card_y + bottom_h - 8.f);
-		aida::ui::blur::render_glass_fill(dl, c_a, c_b, 8.f, alpha * 0.5f);
-		aida::ui::blur::render_glass_border(dl, c_a, c_b, 8.f, alpha * 0.5f, 1.f);
-		ImFont* font = aida::ui::fonts::body();
-		if (!font) font = ImGui::GetFont();
-		const char* msg = "Run a scan to see summary";
-		ImVec2 sz = font->CalcTextSizeA(12.f, FLT_MAX, 0.f, msg);
-		dl->AddText(font, 13.f,
-			ImVec2(c_a.x + (c_b.x - c_a.x - sz.x) * 0.5f,
-				   c_a.y + (c_b.y - c_a.y - sz.y) * 0.5f),
-			aida::ui::with_alpha(th.text_dim, alpha), msg);
+		if (!findings || st.selected_finding < 0 ||
+			static_cast<std::size_t>(st.selected_finding) >= findings->size())
+			st.selected_finding = -1;
 	}
+
+	ImGui::SetCursorScreenPos(ImVec2(wp.x + pos_x + metrics.spacing_sm,
+		wp.y + pos_y + metrics.spacing_xs));
+	ImGui::PushID("protection_scan");
+	const bool has_findings = findings && !findings->empty();
+	const aida::ui::design::action_t actions[] = {
+		{"scan", "Scan", "Scan", "Scan the attached process for protection mechanisms",
+			nullptr, nullptr, aida::ui::components::button_kind_t::primary,
+			!scanning, false, true},
+		{"stop", "Stop", "Stop", "Request cancellation of the active protection scan",
+			nullptr, nullptr, aida::ui::components::button_kind_t::destructive,
+			scanning, false, true},
+		{"clear", "Clear", "Clear", "Clear the retained protection findings",
+			nullptr, "Removes the retained scan result", aida::ui::components::button_kind_t::ghost,
+			has_findings && !scanning, false, true}
+	};
+	const auto action = aida::ui::design::render_toolbar("protection.scan", actions,
+		sizeof(actions) / sizeof(actions[0]), w - metrics.spacing_sm * 2.f);
+	if (action.invoked && action.id) {
+		if (std::strcmp(action.id, "scan") == 0) {
+			diag::log_tagged("stealth", "view_scan_request");
+			stealth_engine::run_protection_scan();
+		} else if (std::strcmp(action.id, "stop") == 0) {
+			diag::log_tagged("stealth", "view_scan_stop");
+			stealth_engine::stop_protection_scan();
+		} else if (std::strcmp(action.id, "clear") == 0) {
+			std::size_t cleared = 0;
+			if (stealth_engine::clear_protection_findings(cleared)) {
+				st.selected_finding = -1;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::protection,
+					0, "protection.clear", std::to_string(cleared) + " findings cleared");
+#endif
+				diag::log_tagged_fmt("stealth", "view_findings_cleared count=%zu", cleared);
+			}
+		}
+	}
+
+	const char* severities[] = {"All severities", "Critical", "High", "Medium", "Low", "Info"};
+	const char* categories[] = {"All categories", "AC Driver", "Memory Guard", "Suspicious Module",
+		"Thread", "Debug State", "Hook", "WFP Callback"};
+	const float inner_width = (std::max)(1.f, w - metrics.spacing_sm * 2.f);
+	const float filter_width = (std::max)(120.f * metrics.scale,
+		(inner_width - metrics.spacing_sm) * 0.5f);
+	ImGui::SetNextItemWidth(filter_width);
+	int severity = st.severity_filter + 1;
+	if (ImGui::Combo("##severity", &severity, severities, 6))
+		st.severity_filter = severity - 1;
+	aida::ui::design::tooltip_for_last_item("Filter findings by severity");
+	aida::ui::design::draw_focus_ring_for_last_item();
+	ImGui::SameLine(0.f, metrics.spacing_sm);
+	ImGui::SetNextItemWidth((std::max)(1.f, inner_width - filter_width - metrics.spacing_sm));
+	int category = st.category_filter + 1;
+	if (ImGui::Combo("##category", &category, categories, 8))
+		st.category_filter = category - 1;
+	aida::ui::design::tooltip_for_last_item("Filter findings by category");
+	aida::ui::design::draw_focus_ring_for_last_item();
+
+	const auto status = stealth_engine::capture_protection_scan_status();
+	if (scanning) {
+		ImGui::ProgressBar(stealth_engine::g_scan.progress.load(std::memory_order_acquire),
+			ImVec2(inner_width, metrics.control_height * 0.72f),
+			status && !status->empty() ? status->c_str() : "Scanning");
+	} else if (status && !status->empty()) {
+		ImGui::TextDisabled("%s", status->c_str());
+	}
+
+	const float summary_height = metrics.control_height + metrics.spacing_sm;
+	const float table_height = (std::max)(80.f * metrics.scale,
+		wp.y + pos_y + h - ImGui::GetCursorScreenPos().y - summary_height);
+	if (!has_findings && !scanning) {
+		aida::ui::design::state_presentation_t empty;
+		empty.stable_id = "protection.scan.empty";
+		empty.state = aida::ui::design::view_state_t::empty;
+		empty.title = "No protection findings";
+		empty.message = "Run a scan to inspect the attached process for protection mechanisms.";
+		empty.hint = "Scan remains available from this toolbar and the command surface.";
+		aida::ui::design::render_state(empty, ImVec2(inner_width, table_height));
+	} else if (st.filtered_findings.empty() && !scanning) {
+		aida::ui::design::state_presentation_t empty;
+		empty.stable_id = "protection.scan.filtered-empty";
+		empty.state = aida::ui::design::view_state_t::empty;
+		empty.title = "No matching findings";
+		empty.message = "No retained finding matches the selected severity and category filters.";
+		empty.hint = "Choose broader filters to restore hidden findings.";
+		aida::ui::design::render_state(empty, ImVec2(inner_width, table_height));
+	} else if (ImGui::BeginTable("##findings", 5,
+		ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+		ImGuiTableFlags_BordersOuter | ImGuiTableFlags_Resizable |
+		ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+		ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+		ImVec2(inner_width, table_height))) {
+		ImGui::TableSetupScrollFreeze(0, 1);
+		ImGui::TableSetupColumn("Severity", ImGuiTableColumnFlags_WidthFixed, 88.f * metrics.scale);
+		ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 124.f * metrics.scale);
+		ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 142.f * metrics.scale);
+		ImGui::TableSetupColumn("Finding", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+		ImGui::TableSetupColumn("Details", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+		ImGui::TableHeadersRow();
+		if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			!ImGui::GetIO().WantTextInput && !st.filtered_findings.empty()) {
+			auto selected = std::find(st.filtered_findings.begin(), st.filtered_findings.end(),
+				static_cast<std::size_t>((std::max)(st.selected_finding, 0)));
+			if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) {
+				if (selected == st.filtered_findings.end()) selected = st.filtered_findings.begin();
+				else if (++selected == st.filtered_findings.end()) --selected;
+				st.selected_finding = static_cast<int>(*selected);
+			} else if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false)) {
+				if (selected == st.filtered_findings.end()) selected = st.filtered_findings.begin();
+				else if (selected != st.filtered_findings.begin()) --selected;
+				st.selected_finding = static_cast<int>(*selected);
+			}
+		}
+		ImGuiListClipper clipper;
+		clipper.Begin(static_cast<int>(st.filtered_findings.size()), metrics.table_row_height);
+		while (clipper.Step()) {
+			for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+				const std::size_t source_index = st.filtered_findings[static_cast<std::size_t>(row)];
+				const auto& finding = (*findings)[source_index];
+				ImGui::PushID(static_cast<int>(source_index));
+				ImGui::TableNextRow(ImGuiTableRowFlags_None, metrics.table_row_height);
+				ImGui::TableSetColumnIndex(0);
+				const bool selected = st.selected_finding == static_cast<int>(source_index);
+				if (ImGui::Selectable(stealth_engine::severity_name(finding.severity), selected,
+					ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick,
+					ImVec2(0.f, metrics.table_row_height))) {
+					st.selected_finding = static_cast<int>(source_index);
+					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && finding.address != 0) {
+						disasm_view::goto_address(finding.address,
+							disasm_view::capture_selected_workspace());
+						aida::ui::application_views::open_or_focus(
+							aida::ui::stable_view_id_t("document.disassembly"));
+					}
+				}
+				if (ImGui::IsItemHovered() && !finding.detail.empty())
+					ImGui::SetTooltip("%s", finding.detail.c_str());
+				const bool keyboard_context = selected &&
+					aida::ui::design::selection_context_requested();
+				const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+				if (pointer_context || keyboard_context) {
+					st.selected_finding = static_cast<int>(source_index);
+					aida::ui::application_ui::retained_entity_context_t retained;
+					retained.owner_id = "analysis.protection.finding";
+					retained.entity_id = std::to_string(source_index) + ":" + finding.title;
+					retained.entity_generation = generation;
+					retained.active_view = aida::ui::stable_view_id_t("view.analysis.protection");
+					retained.validate_identity = [source_index, generation, findings] {
+						if (stealth_engine::g_scan.generation.load(std::memory_order_acquire) != generation ||
+							stealth_engine::capture_protection_findings() != findings)
+							return aida::ui::capability_state_t::unavailable(
+								"The protection scan publication changed; select the finding again");
+						return source_index < findings->size()
+							? aida::ui::capability_state_t::available()
+							: aida::ui::capability_state_t::unavailable(
+								"The retained finding no longer exists");
+					};
+					auto add_action = [&retained](const char* id, bool enabled,
+						const char* reason, auto invoke) {
+						aida::ui::application_ui::retained_entity_action_t action;
+						action.action_id = id;
+						action.capability = enabled
+							? aida::ui::capability_state_t::available()
+							: aida::ui::capability_state_t::unavailable(reason);
+						action.invoke = std::move(invoke);
+						retained.actions.push_back(std::move(action));
+					};
+					const std::uint64_t address = finding.address;
+					add_action("analysis.protection.finding.follow_disassembly", address != 0,
+						"This finding has no concrete address", [address] {
+							disasm_view::goto_address(address,
+								disasm_view::capture_selected_workspace());
+							aida::ui::application_views::open_or_focus(
+								aida::ui::stable_view_id_t("document.disassembly"));
+							return aida::ui::action_handler_result_t::completed();
+						});
+					add_action("analysis.protection.finding.copy_address", address != 0,
+						"This finding has no concrete address", [address] {
+							char text[32]{};
+							std::snprintf(text, sizeof(text), "0x%llX",
+								static_cast<unsigned long long>(address));
+							ImGui::SetClipboardText(text);
+							return aida::ui::action_handler_result_t::completed();
+						});
+					const std::string title = finding.title;
+					const std::string detail = finding.detail;
+					const std::string module = finding.module;
+					add_action("analysis.protection.finding.copy_title", true, "", [title] {
+						ImGui::SetClipboardText(title.c_str());
+						return aida::ui::action_handler_result_t::completed();
+					});
+					add_action("analysis.protection.finding.copy_details", !detail.empty(),
+						"This finding has no detail text", [detail] {
+						ImGui::SetClipboardText(detail.c_str());
+						return aida::ui::action_handler_result_t::completed();
+					});
+					add_action("analysis.protection.finding.copy_module", !module.empty(),
+						"This finding is not associated with a module", [module] {
+						ImGui::SetClipboardText(module.c_str());
+						return aida::ui::action_handler_result_t::completed();
+					});
+					aida::ui::application_ui::open_retained_entity_context_menu(
+						std::move(retained), pointer_context
+							? aida::ui::context_menu_open_origin_t::pointer
+							: ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+							? aida::ui::context_menu_open_origin_t::menu_key
+							: aida::ui::context_menu_open_origin_t::shift_f10);
+				}
+				aida::ui::application_ui::render_retained_entity_context_menu(
+					"analysis.protection.finding");
+				ImGui::TableSetColumnIndex(1);
+				ImGui::TextUnformatted(stealth_engine::category_name(finding.category));
+				ImGui::TableSetColumnIndex(2);
+				if (finding.address != 0) ImGui::Text("0x%llX", static_cast<unsigned long long>(finding.address));
+				else ImGui::TextDisabled("-");
+				ImGui::TableSetColumnIndex(3);
+				ImGui::TextUnformatted(finding.title.c_str());
+				ImGui::TableSetColumnIndex(4);
+				ImGui::TextUnformatted(finding.detail.c_str());
+				ImGui::PopID();
+			}
+		}
+		ImGui::EndTable();
+	}
+
+	int critical = 0, high = 0, medium = 0, low = 0, info = 0;
+	if (findings) {
+		for (const std::size_t index : st.filtered_findings) {
+			switch ((*findings)[index].severity) {
+			case stealth_engine::finding_severity_t::critical: ++critical; break;
+			case stealth_engine::finding_severity_t::high: ++high; break;
+			case stealth_engine::finding_severity_t::medium: ++medium; break;
+			case stealth_engine::finding_severity_t::low: ++low; break;
+			case stealth_engine::finding_severity_t::info: ++info; break;
+			}
+		}
+	}
+	ImGui::TextDisabled("%zu shown", st.filtered_findings.size());
+	ImGui::SameLine();
+	const std::string critical_status = std::to_string(critical) + " critical";
+	const std::string high_status = std::to_string(high) + " high";
+	aida::ui::components::status_badge(critical_status.c_str(),
+		aida::ui::components::status_kind_t::error);
+	ImGui::SameLine();
+	aida::ui::components::status_badge(high_status.c_str(),
+		aida::ui::components::status_kind_t::warning);
+	ImGui::SameLine();
+	ImGui::TextDisabled("Medium %d  Low %d  Info %d", medium, low, info);
+	ImGui::PopID();
 }
 
 inline void render_stealth_controls(float pos_x, float pos_y, float w, float h,

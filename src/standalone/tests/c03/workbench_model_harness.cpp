@@ -102,45 +102,21 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
 
     dto.views = {first_view, second_view};
 
-    split_node_dto_t first_leaf;
-    first_leaf.id = {101};
-    first_leaf.kind = split_node_kind_t::leaf;
-    first_leaf.view = first_view.id;
-
-    split_node_dto_t second_leaf;
-    second_leaf.id = {102};
-    second_leaf.kind = split_node_kind_t::leaf;
-    second_leaf.view = second_view.id;
-
-    split_node_dto_t root;
-    root.id = {103};
-    root.kind = split_node_kind_t::branch;
-    root.orientation = split_orientation_t::horizontal;
-    root.ratio_basis_points = k_split_ratio_default_basis_points;
-    root.first = first_leaf.id;
-    root.second = second_leaf.id;
-
-    dto.split_tree.root = root.id;
-    dto.split_tree.nodes = {root, second_leaf, first_leaf};
-
     panel_state_dto_t panel;
     panel.id = {401};
     panel.workspace = workspace;
     panel.kind = panel_kind_t::navigator;
-    panel.extent_pixels = dto.layout.navigator_pixels;
     panel.revision = dto.revision;
     panel.selected_document = first.id;
     dto.panels = {panel};
     return dto;
 }
 
-workbench_persistence_dto_t make_max_layout_workspace(workspace_id_t workspace)
+workbench_persistence_dto_t make_max_view_workspace(workspace_id_t workspace)
 {
     workbench_persistence_dto_t dto = make_workspace(workspace);
     dto.views.clear();
-    dto.split_tree = {};
     dto.views.reserve(k_max_views_per_workspace);
-    dto.split_tree.nodes.reserve(k_max_split_nodes_per_workspace);
 
     const auto view_count = static_cast<std::uint64_t>(k_max_views_per_workspace);
     for (std::uint64_t index = 1; index <= view_count; ++index) {
@@ -151,27 +127,7 @@ workbench_persistence_dto_t make_max_layout_workspace(workspace_id_t workspace)
         view.role = index == 1 ? view_role_t::primary : view_role_t::secondary;
         view.focused = index == 1;
         dto.views.push_back(view);
-
-        split_node_dto_t leaf;
-        leaf.id = {index};
-        leaf.kind = split_node_kind_t::leaf;
-        leaf.view = view.id;
-        dto.split_tree.nodes.push_back(leaf);
     }
-
-    split_node_id_t root{1};
-    for (std::uint64_t index = 2; index <= view_count; ++index) {
-        split_node_dto_t branch;
-        branch.id = {view_count + index - 1U};
-        branch.kind = split_node_kind_t::branch;
-        branch.orientation = split_orientation_t::horizontal;
-        branch.ratio_basis_points = k_split_ratio_default_basis_points;
-        branch.first = root;
-        branch.second = {index};
-        root = branch.id;
-        dto.split_tree.nodes.push_back(branch);
-    }
-    dto.split_tree.root = root;
     return dto;
 }
 
@@ -436,56 +392,23 @@ void verify_revisioned_workspace_isolation()
                 stale_result.snapshot == first,
             "stale workspace revision must not alter immutable state");
 
-    workbench_command_t split;
-    split.kind = workbench_command_kind_t::split_view;
-    split.workspace = {1};
-    split.expected_revision = first->revision();
-    split.view = {11};
-    split.document = {1};
-    split.orientation = split_orientation_t::vertical;
-    split.ratio_basis_points = 4200;
-    const auto split_result = model.execute(split);
-    require(split_result.error.ok() && split_result.changed && split_result.view.valid() &&
-                split_result.split.branch.valid() && split_result.split.leaf.valid(),
-            "split must create an independently addressable view");
-    const auto split_snapshot = split_result.snapshot;
-    require(split_snapshot->persistence().views.size() == 3 &&
-                split_snapshot->persistence().split_tree.nodes.size() == 5,
-            "split must expand only the addressed workspace layout");
-    require(second->persistence().views.size() == 2 && second->revision() == workspace_revision_t{1},
-            "unrelated workspace state must remain immutable and unchanged");
-
-    split_node_id_t first_leaf_before;
-    split_node_id_t inserted_leaf_before;
-    require(split_tree_find_leaf(split_snapshot->persistence().split_tree, {11}, first_leaf_before).ok() &&
-                split_tree_find_leaf(split_snapshot->persistence().split_tree, split_result.view,
-                                     inserted_leaf_before).ok(),
-            "split leaves must remain addressable by explicit view identifiers");
-    workbench_command_t move;
-    move.kind = workbench_command_kind_t::move_view;
-    move.workspace = {1};
-    move.expected_revision = split_snapshot->revision();
-    move.view = {11};
-    move.target_view = split_result.view;
-    const auto move_result = model.execute(move);
-    require(move_result.error.ok() && move_result.changed, "view move must route by workspace and view");
-    split_node_id_t first_leaf_after;
-    split_node_id_t inserted_leaf_after;
-    require(split_tree_find_leaf(move_result.snapshot->persistence().split_tree, {11}, first_leaf_after).ok() &&
-                split_tree_find_leaf(move_result.snapshot->persistence().split_tree, split_result.view,
-                                     inserted_leaf_after).ok() &&
-                first_leaf_after == inserted_leaf_before && inserted_leaf_after == first_leaf_before,
-            "view move must swap only split placement, not document ownership");
-
     workbench_command_t focus;
     focus.kind = workbench_command_kind_t::focus_view;
     focus.workspace = {1};
-    focus.expected_revision = move_result.snapshot->revision();
-    focus.view = split_result.view;
+    focus.expected_revision = first->revision();
+    focus.view = {12};
     const auto focus_result = model.execute(focus);
-    require(focus_result.error.ok() && focus_result.snapshot->focused_view() == split_result.view &&
-                focus_result.snapshot->persistence().active_document == document_id_t{1},
-            "focus must be stored per workspace and resolve active document locally");
+    require(focus_result.error.ok() && focus_result.changed &&
+                focus_result.snapshot->focused_view() == view_id_t{12} &&
+                focus_result.snapshot->persistence().active_document == document_id_t{2},
+            "focus must select one ordered logical surface and its active document");
+    require(second->persistence().views.size() == 2 && second->revision() == workspace_revision_t{1},
+            "unrelated workspace state must remain immutable and unchanged");
+    require(first->persistence().views[0].id == view_id_t{11} &&
+                first->persistence().views[1].id == view_id_t{12} &&
+                focus_result.snapshot->persistence().views[0].id == view_id_t{11} &&
+                focus_result.snapshot->persistence().views[1].id == view_id_t{12},
+            "logical view order must remain stable across focus mutations");
 }
 
 void verify_navigation_history_synchronization_and_close()
@@ -729,38 +652,22 @@ void verify_capacity_boundaries()
             "document registry restore must reject one document beyond capacity");
 
     workbench_model_t model;
-    workbench_snapshot_ptr_t maximum_layout;
-    require(model.create_workspace(make_max_layout_workspace({201}), maximum_layout).ok() &&
-                maximum_layout->persistence().views.size() == k_max_views_per_workspace &&
-                maximum_layout->persistence().split_tree.nodes.size() ==
-                    k_max_split_nodes_per_workspace,
-            "workbench must accept exact view and split-node capacities");
-
-    workbench_command_t split;
-    split.kind = workbench_command_kind_t::split_view;
-    split.workspace = {201};
-    split.expected_revision = maximum_layout->revision();
-    split.view = {1};
-    const auto split_result = model.execute(split);
-    require(split_result.error.code == workbench_error_code_t::invalid_persistence &&
-                !split_result.changed && split_result.snapshot == maximum_layout,
-            "workbench must reject a view split beyond maximum layout capacity");
-
-    auto full_tree = maximum_layout->persistence().split_tree;
-    const auto full_tree_root = full_tree.root;
-    split_insert_result_t inserted;
-    const auto direct_split_result = split_tree_split_view(
-        full_tree, {1}, {static_cast<std::uint64_t>(k_max_views_per_workspace) + 1U},
-        split_orientation_t::horizontal, k_split_ratio_default_basis_points,
-        {static_cast<std::uint64_t>(k_max_split_nodes_per_workspace) + 1U},
-        {static_cast<std::uint64_t>(k_max_split_nodes_per_workspace) + 2U}, inserted);
-    require(direct_split_result.code == workbench_error_code_t::invalid_split_tree &&
-                full_tree.nodes.size() == k_max_split_nodes_per_workspace &&
-                full_tree.root == full_tree_root && !inserted.branch.valid() && !inserted.leaf.valid(),
-            "split-tree API must reject growth beyond maximum node capacity without mutation");
+    workbench_snapshot_ptr_t maximum_views;
+    require(model.create_workspace(make_max_view_workspace({201}), maximum_views).ok() &&
+                maximum_views->persistence().views.size() == k_max_views_per_workspace,
+            "workbench must accept the exact logical view capacity");
+    auto excessive_views = make_max_view_workspace({202});
+    auto overflow_view = excessive_views.views.back();
+    overflow_view.id = {static_cast<std::uint64_t>(k_max_views_per_workspace) + 1U};
+    overflow_view.focused = false;
+    excessive_views.views.push_back(overflow_view);
+    workbench_snapshot_ptr_t rejected_views;
+    require(model.create_workspace(excessive_views, rejected_views).code ==
+                workbench_error_code_t::invalid_persistence && !rejected_views,
+            "workbench must reject one logical view beyond capacity");
 
     navigation_history_dto_t history;
-    history.workspace = {202};
+    history.workspace = {203};
     history.capacity = k_max_history_capacity;
     const auto history_capacity = static_cast<std::uint64_t>(k_max_history_capacity);
     for (std::uint64_t index = 1; index <= history_capacity; ++index) {
@@ -802,46 +709,6 @@ void verify_identifier_and_revision_overflow()
                 workbench_error_code_t::revision_overflow &&
                 !opened.valid() && !already_open,
             "document identifier allocation must reject unsigned overflow");
-
-    auto view_overflow_dto = make_workspace({301});
-    for (auto& view : view_overflow_dto.views) {
-        if (view.id == view_id_t{12})
-            view.id = {maximum};
-    }
-    for (auto& node : view_overflow_dto.split_tree.nodes) {
-        if (node.view == view_id_t{12})
-            node.view = {maximum};
-    }
-    workbench_model_t view_model;
-    workbench_snapshot_ptr_t view_snapshot;
-    require(view_model.create_workspace(view_overflow_dto, view_snapshot).ok(),
-            "maximum view identifier fixture must initialize");
-    workbench_command_t view_split;
-    view_split.kind = workbench_command_kind_t::split_view;
-    view_split.workspace = {301};
-    view_split.expected_revision = view_snapshot->revision();
-    view_split.view = {11};
-    require(view_model.execute(view_split).error.code == workbench_error_code_t::revision_overflow,
-            "view identifier allocation must reject unsigned overflow");
-
-    auto split_overflow_dto = make_workspace({302});
-    const auto old_root = split_overflow_dto.split_tree.root;
-    for (auto& node : split_overflow_dto.split_tree.nodes) {
-        if (node.id == old_root)
-            node.id = {maximum - 1U};
-    }
-    split_overflow_dto.split_tree.root = {maximum - 1U};
-    workbench_model_t split_model;
-    workbench_snapshot_ptr_t split_snapshot;
-    require(split_model.create_workspace(split_overflow_dto, split_snapshot).ok(),
-            "near-maximum split identifier fixture must initialize");
-    workbench_command_t split;
-    split.kind = workbench_command_kind_t::split_view;
-    split.workspace = {302};
-    split.expected_revision = split_snapshot->revision();
-    split.view = {11};
-    require(split_model.execute(split).error.code == workbench_error_code_t::revision_overflow,
-            "second split-node identifier allocation must reject unsigned overflow");
 
     auto event_id_overflow_dto = make_workspace({303});
     event_id_overflow_dto.history.back.push_back(

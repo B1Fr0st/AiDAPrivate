@@ -22,12 +22,21 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/components.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
+#include "../../infra/executor.hpp"
+#endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -57,6 +66,9 @@ struct view_state_t
     aida::burp::sequencer::analysis_result_t last_analysis{};
     bool                                     analysis_valid = false;
     uint64_t                                 analysis_for_id = 0;
+    std::atomic<std::uint64_t>               started_id{0};
+    std::shared_ptr<const std::pair<std::uint64_t, aida::burp::sequencer::analysis_result_t>> analysis_publication =
+        std::make_shared<const std::pair<std::uint64_t, aida::burp::sequencer::analysis_result_t>>();
 };
 
 static view_state_t g_view_state;
@@ -78,10 +90,17 @@ static void start_pressed()
         size_t n = strlen(g_view_state.raw_request);
         cfg.raw_request.assign(g_view_state.raw_request, g_view_state.raw_request + n);
     }
-    uint64_t id = aida::burp::sequencer::start_collection(cfg);
-    if (id != 0) g_view_state.selected_id = id;
-    ::diag::log_tagged_fmt("sequencer", "ui_start_collection id=%llu url='%s'",
-        static_cast<unsigned long long>(id), cfg.url.c_str());
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "burp.sequencer_view";
+    submission.label = "sequencer.start_collection";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::external_tool;
+    submission.priority = 3;
+    submission.body = [cfg = std::move(cfg)]() {
+        const std::uint64_t id = aida::burp::sequencer::start_collection(cfg);
+        if (id != 0) g_view_state.started_id.store(id, std::memory_order_release);
+    };
+    static_cast<void>(aida::infra::executor::submit(std::move(submission)));
 }
 
 }
@@ -96,11 +115,40 @@ void shutdown()
     ::diag::log_tagged("sequencer_v", "shutdown");
 }
 
+bool open_new_collection_with(const std::string& url, const std::string& host,
+                              std::uint16_t port, bool use_tls,
+                              const std::string& raw_request, std::string& reason)
+{
+    if (url.empty() || host.empty() || port == 0 || raw_request.empty()) {
+        reason = "Sequencer requires a URL, host, port, and non-empty request.";
+        return false;
+    }
+    std::snprintf(g_view_state.url, sizeof(g_view_state.url), "%s", url.c_str());
+    std::snprintf(g_view_state.host, sizeof(g_view_state.host), "%s", host.c_str());
+    g_view_state.port = port;
+    g_view_state.use_tls = use_tls;
+    const std::size_t count = (std::min)(raw_request.size(), sizeof(g_view_state.raw_request) - 1U);
+    std::memcpy(g_view_state.raw_request, raw_request.data(), count);
+    g_view_state.raw_request[count] = '\0';
+    g_view_state.use_raw_request = true;
+    reason.clear();
+    return true;
+}
+
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
     (void)accent_r; (void)accent_g; (void)accent_b;
     const auto& th = aida::ui::resolved();
+    const std::uint64_t started_id = g_view_state.started_id.exchange(0, std::memory_order_acq_rel);
+    if (started_id != 0) g_view_state.selected_id = started_id;
+    const auto analysis = std::atomic_load_explicit(&g_view_state.analysis_publication,
+        std::memory_order_acquire);
+    if (analysis->first != 0 && analysis->first != g_view_state.analysis_for_id) {
+        g_view_state.analysis_for_id = analysis->first;
+        g_view_state.last_analysis = analysis->second;
+        g_view_state.analysis_valid = analysis->second.valid;
+    }
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##seq_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
@@ -187,24 +235,47 @@ void render(float pos_x, float pos_y, float width, float height,
     if (g_view_state.selected_id != 0) {
         if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
             ::diag::log_tagged_fmt("sequencer_v", "stop_collection id=%llu", static_cast<unsigned long long>(g_view_state.selected_id));
-            aida::burp::sequencer::stop_collection(g_view_state.selected_id);
+            const std::uint64_t id = g_view_state.selected_id;
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.sequencer_view";
+            submission.label = "sequencer.stop_collection";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [id]() { aida::burp::sequencer::stop_collection(id); };
+            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         }
         ImGui::SameLine();
         if (aida::ui::button("Analyze", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             ::diag::log_tagged_fmt("sequencer_v", "analyze_collection id=%llu", static_cast<unsigned long long>(g_view_state.selected_id));
-            g_view_state.last_analysis = aida::burp::sequencer::analyze(g_view_state.selected_id);
-            g_view_state.analysis_valid = g_view_state.last_analysis.valid;
-            g_view_state.analysis_for_id = g_view_state.selected_id;
-            ::diag::log_tagged_fmt("sequencer_v", "analyze_result valid=%d verdict=%s fips=%d samples=%zu",
-                g_view_state.last_analysis.valid ? 1 : 0,
-                g_view_state.last_analysis.verdict.c_str(),
-                g_view_state.last_analysis.passes_fips_140_2 ? 1 : 0,
-                g_view_state.last_analysis.samples_count);
+            const std::uint64_t id = g_view_state.selected_id;
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.sequencer_view";
+            submission.label = "sequencer.analyze_collection";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [id]() {
+                auto publication = std::make_shared<const std::pair<std::uint64_t,
+                    aida::burp::sequencer::analysis_result_t>>(id,
+                    aida::burp::sequencer::analyze(id));
+                std::atomic_store_explicit(&g_view_state.analysis_publication,
+                    std::move(publication), std::memory_order_release);
+            };
+            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         }
         ImGui::SameLine();
         if (aida::ui::button("Delete", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
             ::diag::log_tagged_fmt("sequencer_v", "delete_collection id=%llu", static_cast<unsigned long long>(g_view_state.selected_id));
-            aida::burp::sequencer::delete_collection(g_view_state.selected_id);
+            const std::uint64_t id = g_view_state.selected_id;
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.sequencer_view";
+            submission.label = "sequencer.delete_collection";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [id]() { aida::burp::sequencer::delete_collection(id); };
+            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
             g_view_state.selected_id = 0;
             g_view_state.analysis_valid = false;
         }

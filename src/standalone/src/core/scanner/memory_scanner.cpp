@@ -825,25 +825,6 @@ static bool wait_scan_worker_ready(const char* op) {
 	}
 }
 
-static bool should_run_first_scan_inline(const scan_config_t& config)
-{
-	constexpr uint64_t kMaxInlineRange = 16ull * 1024ull * 1024ull;
-	return config.range_base != 0 && config.range_size != 0 && config.range_size <= kMaxInlineRange;
-}
-
-static bool should_run_next_scan_inline()
-{
-	std::lock_guard<std::mutex> lk(g_state.results_mutex);
-	return g_state.results.size() <= 250000;
-}
-
-static bool should_run_pointer_scan_inline(uint64_t scan_base, uint64_t scan_size, int max_depth)
-{
-	constexpr uint64_t kMaxInlineRange = 16ull * 1024ull * 1024ull;
-	return scan_base != 0 && scan_size != 0 && scan_size <= kMaxInlineRange && max_depth <= 3;
-}
-
-
 static void freeze_loop() {
 	auto& st = g_state;
 	diag::log_tagged("mem_scanner", "freeze_loop start");
@@ -1448,26 +1429,6 @@ bool first_scan(const scan_config_t& config) {
 
 	st.scanning.store(true);
 	st.scan_thread_done.store(false, std::memory_order_release);
-	if (should_run_first_scan_inline(config)) {
-		diag::log_tagged_fmt("mem_scanner",
-			"first_scan inline_dispatch pid=%u range=0x%llX+0x%llX",
-			driver_bridge::attached_pid(),
-			static_cast<unsigned long long>(config.range_base),
-			static_cast<unsigned long long>(config.range_size));
-		try {
-			first_scan_thread(config);
-		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("mem_scanner", "first_scan inline exception err='%s'", ex.what());
-			st.scanning.store(false, std::memory_order_release);
-			st.scan_progress.store(1.f, std::memory_order_release);
-		} catch (...) {
-			diag::log_tagged("mem_scanner", "first_scan inline exception err='<unknown>'");
-			st.scanning.store(false, std::memory_order_release);
-			st.scan_progress.store(1.f, std::memory_order_release);
-		}
-		st.scan_thread_done.store(true, std::memory_order_release);
-		return true;
-	}
 	try {
 		mcp_standalone::downstream::producer_identity_t fs_id;
 		fs_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
@@ -1562,24 +1523,6 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 
 	st.scanning.store(true);
 	st.scan_thread_done.store(false, std::memory_order_release);
-	if (should_run_next_scan_inline()) {
-		diag::log_tagged_fmt("mem_scanner",
-			"next_scan inline_dispatch mode=%s",
-			scan_mode_name(mode));
-		try {
-			next_scan_thread(mode, value_text, value_text2);
-		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("mem_scanner", "next_scan inline exception err='%s'", ex.what());
-			st.scanning.store(false, std::memory_order_release);
-			st.scan_progress.store(1.f, std::memory_order_release);
-		} catch (...) {
-			diag::log_tagged("mem_scanner", "next_scan inline exception err='<unknown>'");
-			st.scanning.store(false, std::memory_order_release);
-			st.scan_progress.store(1.f, std::memory_order_release);
-		}
-		st.scan_thread_done.store(true, std::memory_order_release);
-		return true;
-	}
 	try {
 		mcp_standalone::downstream::producer_identity_t ns_id;
 		ns_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
@@ -1776,8 +1719,19 @@ std::string read_value_string(uint64_t address, value_type_t type) {
 
 void refresh_address_list() {
 	auto& st = g_state;
-	std::lock_guard<std::mutex> lk(st.address_mutex);
-	for (auto& entry : st.address_list) {
+	std::vector<address_entry_t> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(st.address_mutex);
+		snapshot = st.address_list;
+	}
+	struct refreshed_value_t {
+		uint64_t address = 0;
+		value_type_t value_type = value_type_t::int32_val;
+		std::vector<uint8_t> value;
+	};
+	std::vector<refreshed_value_t> refreshed;
+	refreshed.reserve(snapshot.size());
+	for (const auto& entry : snapshot) {
 		size_t sz = value_type_size(entry.value_type);
 		if (entry.value_type == value_type_t::string_ascii ||
 			entry.value_type == value_type_t::string_utf16) sz = 256;
@@ -1787,8 +1741,17 @@ void refresh_address_list() {
 				auto it = std::find(buf.begin(), buf.end(), 0);
 				if (it != buf.end()) buf.erase(it, buf.end());
 			}
-			entry.last_value = std::move(buf);
+			refreshed.push_back({entry.address, entry.value_type, std::move(buf)});
 		}
+	}
+	std::lock_guard<std::mutex> lk(st.address_mutex);
+	for (auto& update : refreshed) {
+		auto current = std::find_if(st.address_list.begin(), st.address_list.end(),
+			[&](const address_entry_t& entry) {
+				return entry.address == update.address && entry.value_type == update.value_type;
+			});
+		if (current != st.address_list.end())
+			current->last_value = std::move(update.value);
 	}
 }
 
@@ -1815,26 +1778,6 @@ bool start_pointer_scan(uint64_t target_address, int max_depth, int max_offset, 
 	while (!st.pointer_thread_done.load(std::memory_order_acquire))
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	st.pointer_thread_done.store(false, std::memory_order_release);
-	if (should_run_pointer_scan_inline(scan_base, scan_size, max_depth)) {
-		diag::log_tagged_fmt("pointer_scan",
-			"start_pointer_scan inline_dispatch target=0x%llX range=0x%llX+0x%llX",
-			static_cast<unsigned long long>(target_address),
-			static_cast<unsigned long long>(scan_base),
-			static_cast<unsigned long long>(scan_size));
-		try {
-			pointer_scan_thread(target_address, max_depth, max_offset, scan_base, scan_size);
-		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("pointer_scan", "inline worker_exception err='%s'", ex.what());
-			st.pointer_progress.store(1.f, std::memory_order_release);
-			st.pointer_scanning.store(false, std::memory_order_release);
-		} catch (...) {
-			diag::log_tagged("pointer_scan", "inline worker_exception err='<unknown>'");
-			st.pointer_progress.store(1.f, std::memory_order_release);
-			st.pointer_scanning.store(false, std::memory_order_release);
-		}
-		st.pointer_thread_done.store(true, std::memory_order_release);
-		return true;
-	}
 	mcp_standalone::downstream::producer_identity_t ps_id;
 	ps_id.kind = mcp_standalone::downstream::producer_kind_t::scanner;
 	ps_id.tool_name = "pointer_scan_dispatch";

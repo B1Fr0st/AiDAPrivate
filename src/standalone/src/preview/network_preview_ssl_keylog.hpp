@@ -92,6 +92,10 @@ inline void stop_watching() {
     aida::preview::network::record_receipt("SSL key log watch", "stopped");
 }
 
+inline bool is_watching() {
+    return g_state.watching.load(std::memory_order_acquire);
+}
+
 inline std::vector<keylog_entry> get_entries(size_t max_count = 0) {
     seed_entries();
     std::lock_guard<std::mutex> lock(g_state.entries_mutex);

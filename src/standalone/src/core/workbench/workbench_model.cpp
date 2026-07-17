@@ -5,7 +5,6 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 namespace aida {
@@ -84,19 +83,6 @@ workbench_error_t validate_model_state(const workbench_persistence_dto_t& dto)
     if (focused_it == dto.views.end() || focused_it->document != dto.active_document)
         return error(workbench_error_code_t::invalid_persistence, dto.active_document.value);
 
-    std::unordered_set<std::uint64_t> leaves;
-    leaves.reserve(dto.split_tree.nodes.size());
-    for (const auto& node : dto.split_tree.nodes) {
-        if (node.kind == split_node_kind_t::leaf)
-            leaves.insert(node.view.value);
-    }
-    if (leaves.size() != dto.views.size())
-        return error(workbench_error_code_t::invalid_split_tree);
-    for (const auto& view : dto.views) {
-        if (leaves.find(view.id.value) == leaves.end())
-            return error(workbench_error_code_t::invalid_split_tree, view.id.value);
-    }
-
     std::unordered_map<std::uint64_t, view_synchronization_policy_t> groups;
     groups.reserve(dto.views.size());
     for (const auto& view : dto.views) {
@@ -120,29 +106,6 @@ workbench_error_t set_focus(workbench_persistence_dto_t& dto, view_id_t id)
     for (auto& view : dto.views)
         view.focused = view.id == id;
     dto.active_document = found->document;
-    return {};
-}
-
-workbench_error_t next_identifier(const std::vector<view_persistence_dto_t>& views,
-                                  view_id_t& output) noexcept
-{
-    std::uint64_t maximum = 0;
-    for (const auto& view : views)
-        maximum = (std::max)(maximum, view.id.value);
-    if (maximum == (std::numeric_limits<std::uint64_t>::max)())
-        return error(workbench_error_code_t::revision_overflow, maximum);
-    output = {maximum + 1U};
-    return {};
-}
-
-workbench_error_t next_split_identifier(const split_tree_dto_t& tree, split_node_id_t& output) noexcept
-{
-    std::uint64_t maximum = 0;
-    for (const auto& node : tree.nodes)
-        maximum = (std::max)(maximum, node.id.value);
-    if (maximum == (std::numeric_limits<std::uint64_t>::max)())
-        return error(workbench_error_code_t::revision_overflow, maximum);
-    output = {maximum + 1U};
     return {};
 }
 
@@ -244,9 +207,6 @@ workbench_error_t remove_view(workbench_persistence_dto_t& dto, view_id_t id)
 {
     if (dto.views.size() <= 1)
         return error(workbench_error_code_t::invalid_view, id.value);
-    const auto tree_result = split_tree_remove_view(dto.split_tree, id);
-    if (!tree_result)
-        return tree_result;
     const auto view = find_view(dto, id);
     if (view == dto.views.end())
         return error(workbench_error_code_t::invalid_view, id.value);
@@ -759,63 +719,6 @@ workbench_command_result_t workbench_model_t::execute(const workbench_command_t&
             operation_result = close_document(working, registry, command.document, false);
             result.document = command.document;
             break;
-        case workbench_command_kind_t::move_view:
-            operation_result = split_tree_swap_views(working.split_tree, command.view,
-                                                     command.target_view);
-            result.view = command.view;
-            break;
-        case workbench_command_kind_t::split_view: {
-            const auto source = find_view(working, command.view);
-            if (source == working.views.end()) {
-                operation_result = error(workbench_error_code_t::invalid_view, command.view.value);
-                break;
-            }
-            if (working.views.size() >= k_max_views_per_workspace ||
-                working.split_tree.nodes.size() > k_max_split_nodes_per_workspace - 2U) {
-                operation_result = error(workbench_error_code_t::invalid_persistence);
-                break;
-            }
-            view_id_t inserted = command.requested_view;
-            if (!inserted.valid()) {
-                operation_result = next_identifier(working.views, inserted);
-                if (!operation_result)
-                    break;
-            } else if (find_view(working, inserted) != working.views.end()) {
-                operation_result = error(workbench_error_code_t::duplicate_identifier, inserted.value);
-                break;
-            }
-            document_id_t target_document = command.document.valid() ? command.document : source->document;
-            if (!contains_document(working, target_document)) {
-                operation_result = error(workbench_error_code_t::invalid_document, target_document.value);
-                break;
-            }
-            split_node_id_t branch;
-            operation_result = next_split_identifier(working.split_tree, branch);
-            if (!operation_result)
-                break;
-            split_node_id_t leaf;
-            split_tree_dto_t provisional = working.split_tree;
-            split_node_dto_t provisional_branch;
-            provisional_branch.id = branch;
-            provisional.nodes.push_back(provisional_branch);
-            operation_result = next_split_identifier(provisional, leaf);
-            if (!operation_result)
-                break;
-            view_persistence_dto_t inserted_view = *source;
-            inserted_view.id = inserted;
-            inserted_view.document = target_document;
-            inserted_view.role = view_role_t::secondary;
-            inserted_view.focused = false;
-            working.views.push_back(inserted_view);
-            operation_result = split_tree_split_view(working.split_tree, source->id, inserted,
-                                                     command.orientation, command.ratio_basis_points,
-                                                     branch, leaf, result.split);
-            if (!operation_result)
-                break;
-            result.view = inserted;
-            result.document = target_document;
-            break;
-        }
         case workbench_command_kind_t::focus_view:
             operation_result = set_focus(working, command.view);
             result.view = command.view;

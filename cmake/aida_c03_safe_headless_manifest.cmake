@@ -189,12 +189,9 @@ set(AIDA_C03_PRODUCTION_STANDALONE_SOURCES
     "${STANDALONE_ROOT}/core/workbench/adapters/graph_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/hex_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/pseudocode_document.cpp"
-    "${STANDALONE_ROOT}/core/workbench/document_host/document_host.cpp"
-    "${STANDALONE_ROOT}/core/workbench/document_host/document_host_contracts.cpp"
     "${STANDALONE_ROOT}/core/workbench/document_registry.cpp"
     "${STANDALONE_ROOT}/core/workbench/inspector/workbench_inspector_contracts.cpp"
     "${STANDALONE_ROOT}/core/workbench/navigator/workbench_navigator.cpp"
-    "${STANDALONE_ROOT}/core/workbench/split_tree.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_contracts.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_model.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_persistence.cpp"
@@ -384,12 +381,9 @@ set(AIDA_C03_COMPILER_MATRIX_CM_13
     "${STANDALONE_ROOT}/core/workbench/adapters/document_adapter_base.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/graph_document.cpp"
     "${STANDALONE_ROOT}/core/workbench/adapters/hex_document.cpp"
-    "${STANDALONE_ROOT}/core/workbench/document_host/document_host.cpp"
-    "${STANDALONE_ROOT}/core/workbench/document_host/document_host_contracts.cpp"
     "${STANDALONE_ROOT}/core/workbench/document_registry.cpp"
     "${STANDALONE_ROOT}/core/workbench/inspector/workbench_inspector_contracts.cpp"
     "${STANDALONE_ROOT}/core/workbench/navigator/workbench_navigator.cpp"
-    "${STANDALONE_ROOT}/core/workbench/split_tree.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_contracts.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_model.cpp"
     "${STANDALONE_ROOT}/core/workbench/workbench_shell_integration.cpp")
@@ -1411,9 +1405,6 @@ function(aida_c03_register_safe_headless_targets application_target)
     aida_c03_register_manifest_entry(
         TARGET aida_c03_b27_workbench_inspector_harness PACKAGE B27
         SOURCES "${AIDA_C03_TEST_ROOT}/workbench_inspector_harness.cpp")
-    aida_c03_register_manifest_entry(
-        TARGET aida_c03_b28_document_host_harness PACKAGE B28
-        SOURCES "${AIDA_C03_TEST_ROOT}/document_host_harness.cpp")
     aida_c03_register_manifest_entry(
         TARGET aida_c03_b29_overlay_journal_v9_harness PACKAGE B29
         SOURCES "${AIDA_C03_TEST_ROOT}/overlay_journal_v9_harness.cpp")

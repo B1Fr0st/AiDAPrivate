@@ -1,7 +1,11 @@
 #include "task_center.hpp"
 
 #include "../infra/executor.hpp"
+#include "application_view_registry.hpp"
+#include "application_ui_runtime.hpp"
+#include "design_system.hpp"
 #include "toast_notification.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #include "imgui/imgui.h"
 
 #include <algorithm>
@@ -9,6 +13,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <mutex>
 #include <unordered_set>
@@ -328,18 +333,11 @@ std::string analysis_id(aida::analysis::analysis_task_id_t id) {
     return "task.analysis." + std::to_string(id);
 }
 
-void render_duration(std::uint64_t milliseconds) {
-    const std::uint64_t seconds = milliseconds / 1000ULL;
-    if (seconds < 60ULL)
-        ImGui::Text("%llus", static_cast<unsigned long long>(seconds));
-    else
-        ImGui::Text("%llum %02llus", static_cast<unsigned long long>(seconds / 60ULL),
-            static_cast<unsigned long long>(seconds % 60ULL));
 }
 
-}
-
-bool register_task(task_registration_t registration) {
+static bool register_task_impl(task_registration_t registration,
+                        std::uint64_t runtime_job_id,
+                        bool try_only) {
     if (registration.id.empty() || registration.label.empty() || registration.owner.empty())
         return false;
     record_t record;
@@ -362,6 +360,7 @@ bool register_task(task_registration_t registration) {
     record.snapshot.security_critical = record.snapshot.security_critical ||
         protected_job_identity(record.snapshot.owner, record.snapshot.label);
     record.callbacks = std::move(registration.callbacks);
+    record.runtime_job_id = runtime_job_id;
     record.explicit_registration = true;
     record.snapshot.cancellable = registration.cancellation_is_safe && !record.snapshot.security_critical &&
                                   static_cast<bool>(record.callbacks.cancel);
@@ -371,12 +370,22 @@ bool register_task(task_registration_t registration) {
     sanitize(record.snapshot);
     const std::string key = record.snapshot.id;
     state_t& store = state();
-    std::lock_guard<std::mutex> lock(store.mutex);
+    std::unique_lock<std::mutex> lock(store.mutex, std::defer_lock);
+    if (try_only) {
+        if (!lock.try_lock())
+            return false;
+    } else {
+        lock.lock();
+    }
     if (store.records.find(key) != store.records.end())
         return false;
     store.records.emplace(key, std::move(record));
     publish_locked(store, now_ms());
     return true;
+}
+
+bool register_task(task_registration_t registration) {
+    return register_task_impl(std::move(registration), 0, false);
 }
 
 bool register_taskflow_job(aida::infra::taskflow_runtime::job_handle_t handle,
@@ -390,15 +399,7 @@ bool register_taskflow_job(aida::infra::taskflow_runtime::job_handle_t handle,
     if (registration.cancellation_is_safe && !registration.security_critical &&
         !protected_job_identity(registration.owner, registration.label) && !registration.callbacks.cancel)
         registration.callbacks.cancel = [handle] { return aida::infra::taskflow_runtime::cancel(handle.id); };
-    const std::string key = registration.id;
-    if (!register_task(std::move(registration)))
-        return false;
-    state_t& store = state();
-    std::lock_guard<std::mutex> lock(store.mutex);
-    const auto found = store.records.find(key);
-    if (found != store.records.end())
-        found->second.runtime_job_id = handle.id;
-    return true;
+    return register_task_impl(std::move(registration), handle.id, false);
 }
 
 bool register_executor_job(std::uint64_t task_id, task_registration_t registration) {
@@ -411,6 +412,19 @@ bool register_executor_job(std::uint64_t task_id, task_registration_t registrati
         !protected_job_identity(registration.owner, registration.label) && !registration.callbacks.cancel)
         registration.callbacks.cancel = [task_id] { return aida::infra::executor::cancel(task_id); };
     return register_taskflow_job({task_id}, std::move(registration));
+}
+
+bool try_register_executor_job(std::uint64_t task_id, task_registration_t registration) {
+    if (task_id == 0)
+        return false;
+    registration.source = "executor";
+    if (registration.id.empty())
+        registration.id = runtime_id(task_id);
+    if (registration.cancellation_is_safe && !registration.security_critical &&
+        !protected_job_identity(registration.owner, registration.label) &&
+        !registration.callbacks.cancel)
+        registration.callbacks.cancel = [task_id] { return aida::infra::executor::cancel(task_id); };
+    return register_task_impl(std::move(registration), task_id, true);
 }
 
 bool register_analysis_task(std::shared_ptr<aida::analysis::analysis_scheduler_t> scheduler,
@@ -837,160 +851,534 @@ void register_views(view_registry_t& registry) {
     registry.register_view(std::move(diagnostics));
 }
 
+namespace {
+
+std::string s_selected_task_id;
+std::string s_selected_diagnostic_id;
+
+const task_snapshot_t* find_task(const immutable_snapshot_t& current, const std::string& id) {
+    const auto found = std::find_if(current.tasks.begin(), current.tasks.end(), [&](const task_snapshot_t& item) {
+        return item.id == id;
+    });
+    return found == current.tasks.end() ? nullptr : &*found;
+}
+
+const diagnostic_snapshot_t* find_diagnostic(const immutable_snapshot_t& current,
+                                             const std::string& id) {
+    const auto found = std::find_if(current.diagnostics.begin(), current.diagnostics.end(),
+        [&](const diagnostic_snapshot_t& item) { return item.id == id; });
+    return found == current.diagnostics.end() ? nullptr : &*found;
+}
+
+bool context_key_pressed() {
+    return ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+        (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
+}
+
+design::semantic_t task_semantic(task_state_t value) {
+    switch (value) {
+    case task_state_t::completed: return design::semantic_t::success;
+    case task_state_t::partial:
+    case task_state_t::timed_out:
+    case task_state_t::interrupted: return design::semantic_t::warning;
+    case task_state_t::failed: return design::semantic_t::error;
+    case task_state_t::cancelled: return design::semantic_t::stale;
+    case task_state_t::running: return design::semantic_t::live;
+    case task_state_t::cancellation_requested: return design::semantic_t::warning;
+    case task_state_t::queued: return design::semantic_t::info;
+    }
+    return design::semantic_t::neutral;
+}
+
+const char* diagnostic_severity_name(diagnostic_severity_t value) {
+    switch (value) {
+    case diagnostic_severity_t::security: return "Security";
+    case diagnostic_severity_t::error: return "Error";
+    case diagnostic_severity_t::warning: return "Warning";
+    case diagnostic_severity_t::information: return "Information";
+    }
+    return "Unknown";
+}
+
+design::semantic_t diagnostic_semantic(diagnostic_severity_t value) {
+    switch (value) {
+    case diagnostic_severity_t::security:
+    case diagnostic_severity_t::error: return design::semantic_t::error;
+    case diagnostic_severity_t::warning: return design::semantic_t::warning;
+    case diagnostic_severity_t::information: return design::semantic_t::info;
+    }
+    return design::semantic_t::neutral;
+}
+
+std::string duration_text(std::uint64_t milliseconds) {
+    const std::uint64_t seconds = milliseconds / 1000ULL;
+    if (seconds < 60ULL) return std::to_string(seconds) + "s";
+    char output[32]{};
+    std::snprintf(output, sizeof(output), "%llum %02llus",
+        static_cast<unsigned long long>(seconds / 60ULL),
+        static_cast<unsigned long long>(seconds % 60ULL));
+    return output;
+}
+
+std::string diagnostic_copy_text(const diagnostic_snapshot_t& item) {
+    return item.id + "\n" + item.summary + "\n" + item.details;
+}
+
+application_ui::retained_entity_action_t retained_action(const char* id,
+    bool enabled, const char* disabled_reason,
+    std::function<action_handler_result_t()> invoke) {
+    application_ui::retained_entity_action_t action;
+    action.action_id = id;
+    action.capability = enabled
+        ? capability_state_t::available()
+        : capability_state_t::unavailable(disabled_reason);
+    action.invoke = std::move(invoke);
+    return action;
+}
+
+void open_task_context(const task_snapshot_t& item, std::uint64_t snapshot_generation,
+                       context_menu_open_origin_t origin) {
+    application_ui::retained_entity_context_t context;
+    context.owner_id = "task-center.tasks";
+    context.entity_id = item.id;
+    context.entity_generation = snapshot_generation;
+    context.active_view = stable_view_id_t("view.background_tasks");
+    const std::string id = item.id;
+    const std::uint64_t queued_ms = item.queued_ms;
+    const std::string owner = item.owner;
+    const std::string label = item.label;
+    context.validate_identity = [id, queued_ms, owner, label] {
+        const auto current = snapshot();
+        if (!current)
+            return capability_state_t::unavailable("The task snapshot is unavailable");
+        const auto* retained = find_task(*current, id);
+        return retained && retained->queued_ms == queued_ms &&
+                retained->owner == owner && retained->label == label
+            ? capability_state_t::available()
+            : capability_state_t::unavailable(
+                "The retained task was removed or replaced; select it again");
+    };
+    context.actions.push_back(retained_action("task.focus_owner", item.focusable,
+        "This task owner did not register a focus target.", [id] {
+            return focus(id) ? action_handler_result_t::completed()
+                             : action_handler_result_t::failed("The task owner could not be focused");
+        }));
+    context.actions.push_back(retained_action("task.open_log", item.log_available,
+        "This task owner did not register a retained log target.", [id] {
+            return open_log(id) ? action_handler_result_t::completed()
+                                : action_handler_result_t::failed("The retained task log could not be opened");
+        }));
+    const bool can_retry = item.retryable && !active_state(item.state);
+    context.actions.push_back(retained_action("task.retry", can_retry,
+        active_state(item.state)
+            ? "An active task cannot be retried until its owner reports a terminal state."
+            : "This task owner did not register a retry operation.", [id] {
+            return retry(id) ? action_handler_result_t::completed()
+                             : action_handler_result_t::failed("The task owner rejected the retry request");
+        }));
+    const bool can_cancel = item.cancellable && active_state(item.state) &&
+        !item.security_critical;
+    const char* cancel_reason = item.state == task_state_t::cancellation_requested
+        ? "Waiting for the task owner to confirm a terminal cancelled state."
+        : item.security_critical
+        ? "Security-critical and liveness jobs are fail-closed and cannot be cancelled here."
+        : active_state(item.state)
+        ? "This task owner did not register a safe cancellation operation."
+        : "Only an active task can be cancelled.";
+    context.actions.push_back(retained_action("task.request_cancel", can_cancel,
+        cancel_reason, [id] {
+            return request_cancel(id) ? action_handler_result_t::completed()
+                : action_handler_result_t::failed("The task owner rejected cancellation");
+        }));
+    context.actions.push_back(retained_action("task.view_diagnostic",
+        !item.diagnostic_id.empty(), "This task has no retained diagnostic.", [] {
+            const auto opened = application_views::open_or_focus(
+                stable_view_id_t("view.diagnostics"));
+            return opened.ok() ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(opened.detail);
+        }));
+    context.actions.push_back(retained_action("task.copy_id", true, "", [id] {
+        ImGui::SetClipboardText(id.c_str());
+        return action_handler_result_t::completed();
+    }));
+    const std::string summary = item.id + "\n" + item.label + "\n" + item.stage +
+        "\n" + item.result_summary;
+    context.actions.push_back(retained_action("task.copy_summary", true, "", [summary] {
+        ImGui::SetClipboardText(summary.c_str());
+        return action_handler_result_t::completed();
+    }));
+    application_ui::open_retained_entity_context_menu(std::move(context), origin);
+}
+
+void open_diagnostic_context(const diagnostic_snapshot_t& item,
+                             std::uint64_t snapshot_generation,
+                             context_menu_open_origin_t origin) {
+    application_ui::retained_entity_context_t context;
+    context.owner_id = "task-center.diagnostics";
+    context.entity_id = item.id;
+    context.entity_generation = snapshot_generation;
+    context.active_view = stable_view_id_t("view.diagnostics");
+    const std::string id = item.id;
+    const std::uint64_t raised_ms = item.raised_ms;
+    const std::string owner = item.owner;
+    const std::string summary = item.summary;
+    context.validate_identity = [id, raised_ms, owner, summary] {
+        const auto current = snapshot();
+        if (!current)
+            return capability_state_t::unavailable("The diagnostic snapshot is unavailable");
+        const auto* retained = find_diagnostic(*current, id);
+        return retained && retained->raised_ms == raised_ms &&
+                retained->owner == owner && retained->summary == summary
+            ? capability_state_t::available()
+            : capability_state_t::unavailable(
+                "The retained diagnostic was removed or replaced; select it again");
+    };
+    context.actions.push_back(retained_action("diagnostic.focus_owner", item.focusable,
+        "This diagnostic has no registered owner focus target.", [id] {
+            return focus_diagnostic(id) ? action_handler_result_t::completed()
+                : action_handler_result_t::failed("The diagnostic owner could not be focused");
+        }));
+    context.actions.push_back(retained_action("diagnostic.open_log", item.log_available,
+        "This diagnostic has no retained log target.", [id] {
+            return open_diagnostic_log(id) ? action_handler_result_t::completed()
+                : action_handler_result_t::failed("The diagnostic log could not be opened");
+        }));
+    context.actions.push_back(retained_action("diagnostic.retry", item.retryable,
+        "The diagnostic owner did not register a safe retry operation.", [id] {
+            return retry_diagnostic(id) ? action_handler_result_t::completed()
+                : action_handler_result_t::failed("The diagnostic owner rejected the retry request");
+        }));
+    context.actions.push_back(retained_action("diagnostic.acknowledge", !item.acknowledged,
+        "This diagnostic is already acknowledged.", [id] {
+            return acknowledge_diagnostic(id) ? action_handler_result_t::completed()
+                : action_handler_result_t::failed("The diagnostic could not be acknowledged");
+        }));
+    const std::string text = diagnostic_copy_text(item);
+    context.actions.push_back(retained_action("diagnostic.copy", true, "", [text] {
+        ImGui::SetClipboardText(text.c_str());
+        return action_handler_result_t::completed();
+    }));
+    context.actions.push_back(retained_action("diagnostic.copy_id", true, "", [id] {
+        ImGui::SetClipboardText(id.c_str());
+        return action_handler_result_t::completed();
+    }));
+    aida::automation_ui::entity_evidence::snapshot_t evidence;
+    evidence.workspace_id = item.target;
+    evidence.source_view_id = "view.diagnostics";
+    evidence.source_kind = "diagnostic";
+    evidence.entity_id = item.id;
+    evidence.display_label = item.summary;
+    evidence.excerpt = "Diagnostic ID: " + item.id + "\nOwner: " + item.owner +
+        "\nTarget: " + item.target + "\nTask ID: " + item.task_id +
+        "\nRaised: " + std::to_string(item.raised_ms) +
+        "\nSeverity: " + std::to_string(static_cast<unsigned>(item.severity)) +
+        "\nSummary: " + item.summary + "\nDetails: " + item.details +
+        "\nLog target: " + item.log_link;
+    evidence.revision = item.raised_ms;
+    evidence.generation = snapshot_generation;
+    evidence.sensitive = true;
+    evidence.return_to_source = [id, raised_ms, owner, summary](std::string& reason) {
+        const auto current = snapshot();
+        const auto* retained = current ? find_diagnostic(*current, id) : nullptr;
+        if (!retained || retained->raised_ms != raised_ms ||
+            retained->owner != owner || retained->summary != summary) {
+            reason = "The retained diagnostic was removed or replaced; capture it again.";
+            return false;
+        }
+        s_selected_diagnostic_id = id;
+        const auto opened = application_views::open_or_focus(
+            stable_view_id_t("view.diagnostics"));
+        if (!opened.ok()) {
+            reason = opened.detail;
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+    aida::automation_ui::entity_evidence::append_actions(context,
+        std::move(evidence));
+    application_ui::open_retained_entity_context_menu(std::move(context), origin);
+}
+
+}
+
 void render_tasks_view(const view_render_context_t&) {
     const auto current = snapshot();
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    if (design::tiny_view_required(available, ImVec2(320.0f, 96.0f))) {
+        design::state_presentation_t tiny;
+        tiny.stable_id = "task-center.tiny";
+        tiny.state = design::view_state_t::tiny;
+        tiny.title = "Tasks needs more room";
+        tiny.message = "Resize or float this panel to inspect background work and its owner-provided actions.";
+        static_cast<void>(design::render_state(tiny, available));
+        return;
+    }
     if (!current || current->tasks.empty()) {
-        ImGui::TextDisabled("No background tasks. Long-running human work appears here.");
+        design::state_presentation_t empty;
+        empty.stable_id = "task-center.empty";
+        empty.state = design::view_state_t::empty;
+        empty.title = "No background tasks";
+        empty.message = "Long-running work appears here with owner, target, progress, cancellation, recovery, and diagnostics.";
+        static_cast<void>(design::render_state(empty, available));
         return;
     }
-    ImGui::Text("%u running  %u queued  %u cancelling  %u failed",
-        current->status.running, current->status.queued,
-        current->status.cancellation_requested, current->status.failures);
-    ImGui::Separator();
-    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("##task_center_table", 7, flags, ImVec2(0.0f, 0.0f)))
-        return;
-    ImGui::TableSetupColumn("Task", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-    ImGui::TableSetupColumn("Owner", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-    ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-    ImGui::TableSetupColumn("Elapsed", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-    ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 205.0f);
-    ImGui::TableHeadersRow();
-    ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(current->tasks.size()));
-    while (clipper.Step()) {
-        for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
-            const task_snapshot_t& item = current->tasks[static_cast<std::size_t>(index)];
-            ImGui::PushID(item.id.c_str());
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(item.label.c_str());
-            if (ImGui::BeginPopupContextItem("##task_context")) {
-                if (item.focusable && ImGui::MenuItem("Focus Owner"))
-                    focus(item.id);
-                if (item.log_available && ImGui::MenuItem("Open Log"))
-                    open_log(item.id);
-                if (item.retryable && !active_state(item.state) && ImGui::MenuItem("Retry"))
-                    retry(item.id);
-                if (item.cancellable && ImGui::MenuItem("Cancel"))
-                    request_cancel(item.id);
-                ImGui::Separator();
-                if (ImGui::MenuItem("Copy Task ID"))
-                    ImGui::SetClipboardText(item.id.c_str());
-                ImGui::EndPopup();
+
+    const auto& metrics = design::metrics();
+    components::status_badge((std::to_string(current->status.running) + " running").c_str(),
+        current->status.running ? components::status_kind_t::success : components::status_kind_t::neutral);
+    ImGui::SameLine(0.0f, metrics.spacing_sm);
+    components::status_badge((std::to_string(current->status.queued) + " queued").c_str(),
+        current->status.queued ? components::status_kind_t::info : components::status_kind_t::neutral);
+    if (current->status.cancellation_requested) {
+        ImGui::SameLine(0.0f, metrics.spacing_sm);
+        components::status_badge((std::to_string(current->status.cancellation_requested) + " cancelling").c_str(),
+            components::status_kind_t::warning);
+    }
+    if (current->status.failures) {
+        ImGui::SameLine(0.0f, metrics.spacing_sm);
+        components::status_badge((std::to_string(current->status.failures) + " failed").c_str(),
+            components::status_kind_t::error);
+    }
+    ImGui::Dummy(ImVec2(0.0f, metrics.spacing_xs));
+
+    const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
+    if (design::begin_expert_table("task-center.table", 7, flags, ImVec2(0.0f, 0.0f))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Task", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Owner", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed,
+            aida::ui::scale_px(116.0f, metrics.scale));
+        ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed,
+            aida::ui::scale_px(132.0f, metrics.scale));
+        ImGui::TableSetupColumn("Elapsed", ImGuiTableColumnFlags_WidthFixed,
+            aida::ui::scale_px(72.0f, metrics.scale));
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed,
+            aida::ui::scale_px(106.0f, metrics.scale));
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(current->tasks.size()), metrics.table_row_height);
+        while (clipper.Step()) {
+            for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                const task_snapshot_t& item = current->tasks[static_cast<std::size_t>(index)];
+                ImGui::PushID(item.id.c_str());
+                ImGui::TableNextRow(ImGuiTableRowFlags_None, metrics.table_row_height);
+                ImGui::TableSetColumnIndex(0);
+                const bool selected = s_selected_task_id == item.id;
+                ImGui::Selectable("##task-row", selected,
+                    ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
+                    ImVec2(0.0f, ImGui::GetTextLineHeight()));
+                if (ImGui::IsItemClicked()) s_selected_task_id = item.id;
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && item.focusable)
+                    static_cast<void>(focus(item.id));
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    s_selected_task_id = item.id;
+                    open_task_context(item, current->generation,
+                        context_menu_open_origin_t::pointer);
+                }
+                ImGui::SameLine(0.0f, 0.0f);
+                ImGui::TextUnformatted(item.label.c_str());
+                if (ImGui::IsItemHovered() && (!item.stage.empty() || !item.result_summary.empty()))
+                    ImGui::SetTooltip("%s%s%s", item.stage.c_str(),
+                        !item.stage.empty() && !item.result_summary.empty() ? "\n" : "",
+                        item.result_summary.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(item.owner.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(item.target.empty() ? "-" : item.target.c_str());
+                ImGui::TableSetColumnIndex(3);
+                components::status_badge(state_name(item.state), design::component_status(task_semantic(item.state)));
+                ImGui::TableSetColumnIndex(4);
+                if (item.progress >= 0.0f) {
+                    components::render_progress_bar(ImGui::GetCursorScreenPos(), ImGui::GetContentRegionAvail().x,
+                        aida::ui::scale_px(5.0f, metrics.scale), (std::max)(0.0f, (std::min)(1.0f, item.progress)),
+                        false, !design::reduced_motion());
+                    ImGui::Dummy(ImVec2(0.0f, aida::ui::scale_px(6.0f, metrics.scale)));
+                } else if (active_state(item.state)) {
+                    if (design::reduced_motion()) ImGui::TextDisabled("Working");
+                    else {
+                        components::render_progress_bar(ImGui::GetCursorScreenPos(), ImGui::GetContentRegionAvail().x,
+                            aida::ui::scale_px(5.0f, metrics.scale), 0.0f, true);
+                        ImGui::Dummy(ImVec2(0.0f, aida::ui::scale_px(6.0f, metrics.scale)));
+                    }
+                } else ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(5);
+                ImGui::TextUnformatted(duration_text(item.elapsed_ms).c_str());
+                ImGui::TableSetColumnIndex(6);
+                if (item.state == task_state_t::cancellation_requested) {
+                    ImGui::TextDisabled("Pending");
+                } else if (item.cancellable && active_state(item.state)) {
+                    if (components::button("Cancel", components::button_kind_t::destructive, components::size_t_::sm))
+                        static_cast<void>(request_cancel(item.id));
+                    design::tooltip_for_last_item("Request cancellation and wait for owner confirmation", nullptr,
+                        "The task remains active until its owner reports a terminal state.");
+                } else if (item.focusable) {
+                    if (components::button("Focus", components::button_kind_t::ghost, components::size_t_::sm))
+                        static_cast<void>(focus(item.id));
+                } else if (item.retryable && !active_state(item.state)) {
+                    if (components::button("Retry", components::button_kind_t::secondary, components::size_t_::sm))
+                        static_cast<void>(retry(item.id));
+                } else ImGui::TextDisabled("-");
+                application_ui::render_retained_entity_context_menu(
+                    "task-center.tasks");
+                ImGui::PopID();
             }
-            if (!item.stage.empty())
-                ImGui::TextDisabled("%s", item.stage.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(item.owner.c_str());
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(item.target.empty() ? "-" : item.target.c_str());
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(state_name(item.state));
-            ImGui::TableSetColumnIndex(4);
-            if (item.progress >= 0.0f)
-                ImGui::ProgressBar(item.progress, ImVec2(-1.0f, 0.0f));
-            else
-                ImGui::TextDisabled("Indeterminate");
-            ImGui::TableSetColumnIndex(5);
-            render_duration(item.elapsed_ms);
-            ImGui::TableSetColumnIndex(6);
-            if (item.focusable && ImGui::SmallButton("Focus"))
-                focus(item.id);
-            if (item.log_available) {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Log"))
-                    open_log(item.id);
-            }
-            if (item.retryable && !active_state(item.state)) {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Retry"))
-                    retry(item.id);
-            }
-            if (item.cancellable) {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Cancel"))
-                    request_cancel(item.id);
-            }
-            ImGui::PopID();
         }
+        design::end_expert_table();
     }
-    ImGui::EndTable();
+
+    if (!s_selected_task_id.empty() &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        context_key_pressed()) {
+        if (const auto* selected = find_task(*current, s_selected_task_id))
+            open_task_context(*selected, current->generation,
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+                    ? context_menu_open_origin_t::menu_key
+                    : context_menu_open_origin_t::shift_f10);
+    }
+    application_ui::render_retained_entity_context_menu("task-center.tasks");
 }
 
 void render_diagnostics_view(const view_render_context_t&) {
     const auto current = snapshot();
-    if (!current || current->diagnostics.empty()) {
-        ImGui::TextDisabled("No persistent diagnostics require attention.");
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    if (design::tiny_view_required(available, ImVec2(320.0f, 96.0f))) {
+        design::state_presentation_t tiny;
+        tiny.stable_id = "diagnostics.tiny";
+        tiny.state = design::view_state_t::tiny;
+        tiny.title = "Diagnostics needs more room";
+        tiny.message = "Resize or float this panel to inspect retained failures and recovery actions.";
+        static_cast<void>(design::render_state(tiny, available));
         return;
     }
-    ImGui::Text("%u unacknowledged diagnostics", current->status.unacknowledged_diagnostics);
-    ImGui::Separator();
-    ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(current->diagnostics.size()));
-    while (clipper.Step()) {
-        for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
-            const diagnostic_snapshot_t& item = current->diagnostics[static_cast<std::size_t>(index)];
-            ImGui::PushID(item.id.c_str());
-            const char* severity = item.severity == diagnostic_severity_t::security ? "Security" :
-                item.severity == diagnostic_severity_t::error ? "Error" :
-                item.severity == diagnostic_severity_t::warning ? "Warning" : "Information";
-            const bool expanded = ImGui::TreeNodeEx("##diagnostic", ImGuiTreeNodeFlags_SpanAvailWidth,
-                "[%s] %s", severity, item.summary.c_str());
-            if (ImGui::BeginPopupContextItem("##diagnostic_context")) {
-                if (item.focusable && ImGui::MenuItem("Focus Owner"))
-                    focus_diagnostic(item.id);
-                if (item.log_available && ImGui::MenuItem("Open Log"))
-                    open_diagnostic_log(item.id);
-                if (item.retryable && ImGui::MenuItem("Retry"))
-                    retry_diagnostic(item.id);
-                if (!item.acknowledged && ImGui::MenuItem("Acknowledge"))
-                    acknowledge_diagnostic(item.id);
-                ImGui::Separator();
-                if (ImGui::MenuItem("Copy Diagnostic")) {
-                    const std::string copy = item.id + "\n" + item.summary + "\n" + item.details;
-                    ImGui::SetClipboardText(copy.c_str());
-                }
-                ImGui::EndPopup();
-            }
-            if (expanded) {
-                if (!item.owner.empty())
-                    ImGui::Text("Owner: %s", item.owner.c_str());
-                if (!item.target.empty())
-                    ImGui::Text("Target: %s", item.target.c_str());
-                if (!item.details.empty())
-                    ImGui::TextWrapped("%s", item.details.c_str());
-                if (item.focusable && ImGui::SmallButton("Focus"))
-                    focus_diagnostic(item.id);
-                if (item.retryable) {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Retry"))
-                        retry_diagnostic(item.id);
-                }
-                if (item.log_available) {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Open Log"))
-                        open_diagnostic_log(item.id);
-                }
-                if (!item.acknowledged) {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Acknowledge"))
-                        acknowledge_diagnostic(item.id);
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Copy")) {
-                    const std::string copy = item.id + "\n" + item.summary + "\n" + item.details;
-                    ImGui::SetClipboardText(copy.c_str());
-                }
-                ImGui::TreePop();
-            }
-            ImGui::Separator();
-            ImGui::PopID();
-        }
+    if (!current || current->diagnostics.empty()) {
+        design::state_presentation_t empty;
+        empty.stable_id = "diagnostics.empty";
+        empty.state = design::view_state_t::empty;
+        empty.title = "No persistent diagnostics";
+        empty.message = "Failures that require attention remain here after transient notifications disappear.";
+        static_cast<void>(design::render_state(empty, available));
+        return;
     }
+
+    const auto& metrics = design::metrics();
+    components::status_badge((std::to_string(current->status.unacknowledged_diagnostics) + " unacknowledged").c_str(),
+        current->status.unacknowledged_diagnostics ? components::status_kind_t::warning
+                                                   : components::status_kind_t::success);
+    ImGui::Dummy(ImVec2(0.0f, metrics.spacing_xs));
+    const float details_height = (std::min)(aida::ui::scale_px(118.0f, metrics.scale),
+        (std::max)(aida::ui::scale_px(72.0f, metrics.scale), available.y * 0.34f));
+    const float table_height = (std::max)(metrics.table_row_height * 2.0f,
+        ImGui::GetContentRegionAvail().y - details_height - metrics.spacing_sm);
+    if (design::begin_expert_table("diagnostics.table", 6, ImGuiTableFlags_ScrollY,
+            ImVec2(0.0f, table_height))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Severity", ImGuiTableColumnFlags_WidthFixed,
+            aida::ui::scale_px(94.0f, metrics.scale));
+        ImGui::TableSetupColumn("Summary", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+        ImGui::TableSetupColumn("Owner", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Age", ImGuiTableColumnFlags_WidthFixed,
+            aida::ui::scale_px(72.0f, metrics.scale));
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed,
+            aida::ui::scale_px(104.0f, metrics.scale));
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(current->diagnostics.size()), metrics.table_row_height);
+        while (clipper.Step()) {
+            for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+                const diagnostic_snapshot_t& item = current->diagnostics[static_cast<std::size_t>(index)];
+                ImGui::PushID(item.id.c_str());
+                ImGui::TableNextRow(ImGuiTableRowFlags_None, metrics.table_row_height);
+                ImGui::TableSetColumnIndex(0);
+                components::status_badge(diagnostic_severity_name(item.severity),
+                    design::component_status(diagnostic_semantic(item.severity)));
+                ImGui::TableSetColumnIndex(1);
+                const bool selected = s_selected_diagnostic_id == item.id;
+                ImGui::Selectable("##diagnostic-row", selected,
+                    ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap,
+                    ImVec2(0.0f, ImGui::GetTextLineHeight()));
+                if (ImGui::IsItemClicked()) s_selected_diagnostic_id = item.id;
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && item.focusable)
+                    static_cast<void>(focus_diagnostic(item.id));
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                    s_selected_diagnostic_id = item.id;
+                    open_diagnostic_context(item, current->generation,
+                        context_menu_open_origin_t::pointer);
+                }
+                ImGui::SameLine(0.0f, 0.0f);
+                ImGui::TextUnformatted(item.summary.c_str());
+                if (ImGui::IsItemHovered() && !item.details.empty()) ImGui::SetTooltip("%s", item.details.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(item.owner.empty() ? "-" : item.owner.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(item.target.empty() ? "-" : item.target.c_str());
+                ImGui::TableSetColumnIndex(4);
+                const std::uint64_t age = current->captured_ms > item.raised_ms
+                    ? current->captured_ms - item.raised_ms : 0;
+                ImGui::TextUnformatted(duration_text(age).c_str());
+                ImGui::TableSetColumnIndex(5);
+                components::status_badge(item.acknowledged ? "Acknowledged" : "Attention",
+                    item.acknowledged ? components::status_kind_t::neutral : components::status_kind_t::warning);
+                application_ui::render_retained_entity_context_menu(
+                    "task-center.diagnostics");
+                ImGui::PopID();
+            }
+        }
+        design::end_expert_table();
+    }
+
+    if (s_selected_diagnostic_id.empty() && !current->diagnostics.empty())
+        s_selected_diagnostic_id = current->diagnostics.front().id;
+    const diagnostic_snapshot_t* selected = find_diagnostic(*current, s_selected_diagnostic_id);
+    if (!selected && !current->diagnostics.empty()) {
+        s_selected_diagnostic_id = current->diagnostics.front().id;
+        selected = &current->diagnostics.front();
+    }
+    if (selected) {
+        ImGui::BeginChild("##diagnostic-details", ImVec2(0.0f, 0.0f), true,
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysUseWindowPadding);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(design::semantic_color(
+            diagnostic_semantic(selected->severity))), "%s", selected->summary.c_str());
+        if (!selected->details.empty()) ImGui::TextWrapped("%s", selected->details.c_str());
+        ImGui::TextDisabled("%s", selected->id.c_str());
+        if (selected->focusable) {
+            if (components::button("Focus Owner", components::button_kind_t::secondary, components::size_t_::sm))
+                static_cast<void>(focus_diagnostic(selected->id));
+        }
+        if (selected->log_available) {
+            if (ImGui::GetContentRegionAvail().x >= aida::ui::scale_px(96.0f, metrics.scale))
+                ImGui::SameLine();
+            if (components::button("Open Log", components::button_kind_t::ghost, components::size_t_::sm))
+                static_cast<void>(open_diagnostic_log(selected->id));
+        }
+        if (selected->retryable) {
+            if (ImGui::GetContentRegionAvail().x >= aida::ui::scale_px(80.0f, metrics.scale))
+                ImGui::SameLine();
+            if (components::button("Retry", components::button_kind_t::secondary, components::size_t_::sm))
+                static_cast<void>(retry_diagnostic(selected->id));
+        }
+        if (!selected->acknowledged) {
+            if (ImGui::GetContentRegionAvail().x >= aida::ui::scale_px(112.0f, metrics.scale))
+                ImGui::SameLine();
+            if (components::button("Acknowledge", components::button_kind_t::ghost, components::size_t_::sm))
+                static_cast<void>(acknowledge_diagnostic(selected->id));
+        }
+        ImGui::EndChild();
+    }
+
+    if (!s_selected_diagnostic_id.empty() &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        context_key_pressed()) {
+        if (const auto* retained = find_diagnostic(*current,
+                s_selected_diagnostic_id))
+            open_diagnostic_context(*retained, current->generation,
+                ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+                    ? context_menu_open_origin_t::menu_key
+                    : context_menu_open_origin_t::shift_f10);
+    }
+    application_ui::render_retained_entity_context_menu("task-center.diagnostics");
 }
 
 }

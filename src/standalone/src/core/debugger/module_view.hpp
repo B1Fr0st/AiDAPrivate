@@ -8,8 +8,10 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "imgui/imgui.h"
@@ -40,9 +42,11 @@ struct subscription_handle_t { uint64_t id = 0; std::string type_name; bool vali
 #include "event_bus.hpp"
 #endif
 #include "../helpers/globals.h"
+#include "../ui/task_center.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
 #else
 #include "../../preview/ui_task_executor.hpp"
 #endif
@@ -51,6 +55,7 @@ namespace module_view {
 
 struct ui_state_t {
 	std::vector<driver_bridge::module_info_t> modules;
+	std::string                               last_error;
 	int                                       selected_module = -1;
 	uint64_t                                  selected_module_base = 0;
 	std::string                               selected_module_name;
@@ -63,6 +68,7 @@ struct ui_state_t {
 	float                                     detail_target_scroll_y = 0.f;
 	char                                      filter_buf[128] = {};
 	std::mutex                                modules_mutex;
+	uint64_t                                  data_generation = 1;
 	std::atomic<bool>                         loading{false};
 	std::atomic<uint64_t>                     last_auto_refresh_ms{0};
 	std::atomic<uint64_t>                     last_event_refresh_ms{0};
@@ -81,6 +87,23 @@ struct ui_state_t {
 };
 
 inline ui_state_t g_ui;
+
+inline void register_background_task(const aida::infra::executor::submit_result_t& submitted,
+	const char* action, const char* label) {
+	if (!submitted.submitted || submitted.task_id == 0) return;
+	aida::ui::task_center::task_registration_t registration;
+	registration.owner = "debugger";
+	registration.owner_view = "view.debug.modules";
+	registration.owner_action = action;
+	registration.label = label;
+	registration.stage = "Queued";
+	registration.progress = -1.f;
+	registration.target = driver_bridge::attached_pid() == 0 ? std::string{} :
+		"PID " + std::to_string(driver_bridge::attached_pid());
+	registration.cancellation_is_safe = false;
+	static_cast<void>(aida::ui::task_center::register_executor_job(
+		submitted.task_id, std::move(registration)));
+}
 
 struct selected_module_snapshot_t {
 	uint64_t    base = 0;
@@ -109,18 +132,21 @@ inline void sync_selected_module_locked()
 
 inline void select_module_by_base(uint64_t base, const std::string& fallback_name = std::string())
 {
-	std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+	std::unique_lock<std::mutex> lk(g_ui.modules_mutex, std::try_to_lock);
+	if (!lk.owns_lock()) return;
 	bool same_base = (g_ui.selected_module_base == base);
 	g_ui.selected_module_base = base;
 	if (!same_base || !fallback_name.empty())
 		g_ui.selected_module_name = fallback_name;
 	sync_selected_module_locked();
+	++g_ui.data_generation;
 }
 
 inline selected_module_snapshot_t selected_module_snapshot()
 {
 	selected_module_snapshot_t out;
-	std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+	std::unique_lock<std::mutex> lk(g_ui.modules_mutex, std::try_to_lock);
+	if (!lk.owns_lock()) return out;
 	sync_selected_module_locked();
 	out.base = g_ui.selected_module_base;
 	out.name = g_ui.selected_module_name;
@@ -161,36 +187,66 @@ inline void refresh()
 		sub.thread_class = "debugger_refresh";
 		sub.domain = aida::infra::executor::domain_t::feature_worker;
 		sub.priority = 3;
-		sub.target_pid = driver_bridge::attached_pid();
-		sub.body = []() {
+		const std::uint32_t target_pid = driver_bridge::attached_pid();
+		const std::uint64_t target_generation = debugger_interaction::current_stop_generation();
+		sub.target_pid = target_pid;
+		sub.generation = target_generation;
+		sub.body = [target_pid, target_generation]() {
 		try {
+		if (driver_bridge::attached_pid() != target_pid ||
+			debugger_interaction::current_stop_generation() != target_generation) {
+			g_ui.loading.store(false);
+			return;
+		}
 		auto mods = driver_bridge::enumerate_modules();
 		size_t n = mods.size();
-		{
+		if (driver_bridge::attached_pid() == target_pid &&
+			debugger_interaction::current_stop_generation() == target_generation) {
 			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
 			g_ui.modules = std::move(mods);
+			g_ui.last_error.clear();
 			sync_selected_module_locked();
+			++g_ui.data_generation;
 		}
 		diag::log_tagged_fmt("modules",
 			"modules_refresh_done count=%zu", n);
 		g_ui.loading.store(false);
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("modules", "modules_refresh_worker_exception err='%s'", ex.what());
+			{
+				std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+				g_ui.last_error = std::string("Module refresh failed: ") + ex.what();
+			}
 			g_ui.loading.store(false);
+			throw;
 		} catch (...) {
 			diag::log_tagged("modules", "modules_refresh_worker_exception err='<unknown>'");
+			{
+				std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+				g_ui.last_error = "Module refresh failed with an unknown error.";
+			}
 			g_ui.loading.store(false);
+			throw;
 		}
 	};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted) {
 			diag::log_tagged("modules", "modules_refresh_worker_post_failed");
+			std::unique_lock<std::mutex> lock(g_ui.modules_mutex, std::try_to_lock);
+			if (lock.owns_lock())
+				g_ui.last_error = "Module refresh could not be queued: " + submitted.reject_reason;
 			g_ui.loading.store(false);
-		}
+		} else register_background_task(submitted, "debugger.modules_refresh",
+			"Refresh target modules");
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("modules", "modules_refresh_worker_create_failed err='%s'", ex.what());
+		std::unique_lock<std::mutex> lock(g_ui.modules_mutex, std::try_to_lock);
+		if (lock.owns_lock()) g_ui.last_error = std::string("Module refresh setup failed: ") + ex.what();
 		g_ui.loading.store(false);
 	} catch (...) {
 		diag::log_tagged("modules", "modules_refresh_worker_create_failed err='<unknown>'");
+		std::unique_lock<std::mutex> lock(g_ui.modules_mutex, std::try_to_lock);
+		if (lock.owns_lock()) g_ui.last_error = "Module refresh setup failed with an unknown error.";
 		g_ui.loading.store(false);
 	}
 }
@@ -250,21 +306,41 @@ inline void load_module_details_by_base(uint64_t base)
 		sub.thread_class = "debugger_refresh";
 		sub.domain = aida::infra::executor::domain_t::feature_worker;
 		sub.priority = 3;
-		sub.target_pid = driver_bridge::attached_pid();
-		sub.body = [base]() {
+		const std::uint32_t target_pid = driver_bridge::attached_pid();
+		const std::uint64_t target_generation = debugger_interaction::current_stop_generation();
+		sub.target_pid = target_pid;
+		sub.generation = target_generation;
+		sub.body = [base, target_pid, target_generation]() {
 		try {
+		if (driver_bridge::attached_pid() != target_pid ||
+			debugger_interaction::current_stop_generation() != target_generation) {
+			g_ui.loading.store(false);
+			return;
+		}
 		pe_parser::pe_info_t pe;
-		pe_parser::parse(base, pe);
+		if (!pe_parser::parse(base, pe))
+			throw std::runtime_error("PE parsing did not produce module details");
 		size_t exp_n = pe.exports.size();
 		size_t imp_n = pe.imports.size();
-		{
+		if (driver_bridge::attached_pid() == target_pid &&
+			debugger_interaction::current_stop_generation() == target_generation) {
 			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
 			g_ui.exports = std::move(pe.exports);
 			g_ui.imports = std::move(pe.imports);
+			++g_ui.data_generation;
+			g_ui.last_error.clear();
+		}
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(aida::ui_thread::post([]() {
 			g_ui.selected_detail = -1;
 			g_ui.detail_scroll_y = 0.f;
 			g_ui.detail_target_scroll_y = 0.f;
-		}
+		}, "module_view", "details_completion", "worker_completion"));
+#else
+		g_ui.selected_detail = -1;
+		g_ui.detail_scroll_y = 0.f;
+		g_ui.detail_target_scroll_y = 0.f;
+#endif
 		diag::log_tagged_fmt("modules",
 			"module_details_loaded base=0x%llx exports=%zu imports=%zu",
 			static_cast<unsigned long long>(base), exp_n, imp_n);
@@ -272,25 +348,44 @@ inline void load_module_details_by_base(uint64_t base)
 		} catch (const std::exception& ex) {
 			diag::log_tagged_fmt("modules", "module_details_worker_exception base=0x%llx err='%s'",
 				static_cast<unsigned long long>(base), ex.what());
+			{
+				std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+				g_ui.last_error = std::string("Module details failed: ") + ex.what();
+			}
 			g_ui.loading.store(false);
+			throw;
 		} catch (...) {
 			diag::log_tagged_fmt("modules", "module_details_worker_exception base=0x%llx err='<unknown>'",
 				static_cast<unsigned long long>(base));
+			{
+				std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+				g_ui.last_error = "Module details failed with an unknown error.";
+			}
 			g_ui.loading.store(false);
+			throw;
 		}
 	};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted) {
 			diag::log_tagged_fmt("modules", "module_details_worker_post_failed base=0x%llx",
 				static_cast<unsigned long long>(base));
+			std::unique_lock<std::mutex> lock(g_ui.modules_mutex, std::try_to_lock);
+			if (lock.owns_lock())
+				g_ui.last_error = "Module details could not be queued: " + submitted.reject_reason;
 			g_ui.loading.store(false);
-		}
+		} else register_background_task(submitted, "debugger.module_details",
+			"Load module details");
 	} catch (const std::exception& ex) {
 		diag::log_tagged_fmt("modules", "module_details_worker_create_failed base=0x%llx err='%s'",
 			static_cast<unsigned long long>(base), ex.what());
+		std::unique_lock<std::mutex> lock(g_ui.modules_mutex, std::try_to_lock);
+		if (lock.owns_lock()) g_ui.last_error = std::string("Module details setup failed: ") + ex.what();
 		g_ui.loading.store(false);
 	} catch (...) {
 		diag::log_tagged_fmt("modules", "module_details_worker_create_failed base=0x%llx err='<unknown>'",
 			static_cast<unsigned long long>(base));
+		std::unique_lock<std::mutex> lock(g_ui.modules_mutex, std::try_to_lock);
+		if (lock.owns_lock()) g_ui.last_error = "Module details setup failed with an unknown error.";
 		g_ui.loading.store(false);
 	}
 }
@@ -302,7 +397,8 @@ inline void load_module_details(int index)
 
 	uint64_t base = 0;
 	{
-		std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
+		std::unique_lock<std::mutex> lk(g_ui.modules_mutex, std::try_to_lock);
+		if (!lk.owns_lock()) return;
 		if (index < 0)
 			return;
 		const size_t module_index = static_cast<size_t>(index);
@@ -356,6 +452,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	const auto _ta = [alpha](ImU32 c) -> ImU32 {
 		return aida::ui::with_alpha(c, alpha);
 	};
+	static std::vector<driver_bridge::module_info_t> modules_snapshot;
+	static std::vector<pe_parser::export_entry_t> exports_snapshot;
+	static std::vector<pe_parser::import_entry_t> imports_snapshot;
+	static std::uint64_t selected_base_snapshot = 0;
+	static std::uint64_t rendered_generation = 0;
+	static std::string error_snapshot;
+	std::unique_lock<std::mutex> modules_lock(g_ui.modules_mutex, std::try_to_lock);
+	if (modules_lock.owns_lock()) error_snapshot = g_ui.last_error;
+	if (modules_lock.owns_lock() && rendered_generation != g_ui.data_generation &&
+		g_ui.modules.size() <= 1000000U &&
+		g_ui.exports.size() <= 1000000U && g_ui.imports.size() <= 1000000U) {
+		sync_selected_module_locked();
+		modules_snapshot = g_ui.modules;
+		exports_snapshot = g_ui.exports;
+		imports_snapshot = g_ui.imports;
+		selected_base_snapshot = g_ui.selected_module_base;
+		rendered_generation = g_ui.data_generation;
+	}
+	if (modules_lock.owns_lock()) modules_lock.unlock();
 
 	dl->AddRectFilled(ImVec2(pos_x, pos_y), ImVec2(pos_x + width, pos_y + height),
 					  _ta(_t.bg_base));
@@ -437,19 +552,32 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float mod_list_y = mod_table_y + col_header_h;
 	float mod_list_h = height - header_h - col_header_h;
 	if (mod_list_h <= 0.f) return;
+	if (modules_snapshot.empty() && !g_ui.loading.load(std::memory_order_acquire)) {
+		const std::string message = error_snapshot.empty()
+			? "No target modules are available. Attach or refresh the target."
+			: error_snapshot;
+		ui_anim::render_inline_callout(dl, pos_x + 12.f, mod_list_y + 12.f,
+			std::max(160.f, left_w - 24.f), 52.f, message.c_str(),
+			error_snapshot.empty() ? ui_anim::callout_kind_t::info : ui_anim::callout_kind_t::warn,
+			ar, ag, ab, alpha);
+	}
 
 	dl->PushClipRect(ImVec2(pos_x, mod_list_y), ImVec2(pos_x + left_w, mod_list_y + mod_list_h), true);
 
-	std::vector<driver_bridge::module_info_t> mods_snapshot;
-	uint64_t selected_base = 0;
-	{
-		std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
-		sync_selected_module_locked();
-		selected_base = g_ui.selected_module_base;
-		for (auto& m : g_ui.modules) {
+	static std::vector<driver_bridge::module_info_t> mods_snapshot;
+	static std::string rendered_filter;
+	static std::uint64_t filtered_generation = 0;
+	uint64_t selected_base = selected_base_snapshot;
+	const std::string active_filter(mod_list_filter);
+	if (filtered_generation != rendered_generation || rendered_filter != active_filter) {
+		mods_snapshot.clear();
+		mods_snapshot.reserve(modules_snapshot.size());
+		for (const auto& m : modules_snapshot) {
 			if (detail::match_filter(m.name, mod_list_filter))
 				mods_snapshot.push_back(m);
 		}
+		rendered_filter = active_filter;
+		filtered_generation = rendered_generation;
 	}
 
 	float mod_content_h = static_cast<float>(mods_snapshot.size()) * row_h;
@@ -615,8 +743,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		std::vector<pe_parser::export_entry_t> filtered;
 		{
-			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
-			for (auto& e : g_ui.exports) {
+			for (auto& e : exports_snapshot) {
 				if (detail::match_filter(e.name, g_ui.filter_buf))
 					filtered.push_back(e);
 			}
@@ -686,8 +813,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		std::vector<pe_parser::import_entry_t> filtered;
 		{
-			std::lock_guard<std::mutex> lk(g_ui.modules_mutex);
-			for (auto& imp : g_ui.imports) {
+			for (auto& imp : imports_snapshot) {
 				if (detail::match_filter(imp.function_name, g_ui.filter_buf))
 					filtered.push_back(imp);
 			}

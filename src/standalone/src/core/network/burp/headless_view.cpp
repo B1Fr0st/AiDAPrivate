@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -76,10 +77,12 @@ struct state_t
     bool        install_panel_user_toggled = false;
 
     std::vector<std::string>     install_log;
-    std::vector<nlohmann::json>  console_cache;
-    std::vector<nlohmann::json>  network_cache;
-    int                          console_cache_signature = 0;
-    int                          network_cache_signature = 0;
+    std::shared_ptr<const std::vector<nlohmann::json>> console_cache =
+        std::make_shared<const std::vector<nlohmann::json>>();
+    std::shared_ptr<const std::vector<nlohmann::json>> network_cache =
+        std::make_shared<const std::vector<nlohmann::json>>();
+    std::atomic<std::uint64_t> console_cache_signature{0};
+    std::atomic<std::uint64_t> network_cache_signature{0};
 
     uint64_t    last_poll_ms = 0;
     int         selected_hook_preset = 0;
@@ -255,9 +258,11 @@ void schedule_status_poll()
                         for (const auto& it : cl.data["entries"]) rows.push_back(it);
                     }
                 } catch (...) {}
-                std::lock_guard<std::mutex> lk(g_state.log_mtx);
-                g_state.console_cache = std::move(rows);
-                g_state.console_cache_signature++;
+                std::shared_ptr<const std::vector<nlohmann::json>> publication =
+                    std::make_shared<const std::vector<nlohmann::json>>(std::move(rows));
+                std::atomic_store_explicit(&g_state.console_cache, std::move(publication),
+                    std::memory_order_release);
+                g_state.console_cache_signature.fetch_add(1, std::memory_order_acq_rel);
             }
 
             auto nr = aida::burp::camoufox::list_network_requests(kNetworkCacheCapacity);
@@ -272,9 +277,11 @@ void schedule_status_poll()
                         for (const auto& it : nr.data["entries"]) rows.push_back(it);
                     }
                 } catch (...) {}
-                std::lock_guard<std::mutex> lk(g_state.log_mtx);
-                g_state.network_cache = std::move(rows);
-                g_state.network_cache_signature++;
+                std::shared_ptr<const std::vector<nlohmann::json>> publication =
+                    std::make_shared<const std::vector<nlohmann::json>>(std::move(rows));
+                std::atomic_store_explicit(&g_state.network_cache, std::move(publication),
+                    std::memory_order_release);
+                g_state.network_cache_signature.fetch_add(1, std::memory_order_acq_rel);
             }
 
             auto pi = aida::burp::camoufox::get_page_info();
@@ -1134,13 +1141,9 @@ ImU32 console_level_color(const aida::ui::theme_t& th, const nlohmann::json& j)
 
 void render_console_section(const aida::ui::theme_t& th, float alpha, float region_height)
 {
-    std::vector<nlohmann::json> snap;
-    int sig = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_state.log_mtx);
-        snap = g_state.console_cache;
-        sig  = g_state.console_cache_signature;
-    }
+    const auto snap = std::atomic_load_explicit(&g_state.console_cache,
+        std::memory_order_acquire);
+    const std::uint64_t sig = g_state.console_cache_signature.load(std::memory_order_acquire);
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
         aida::ui::with_alpha(th.text_secondary, alpha)));
@@ -1151,33 +1154,39 @@ void render_console_section(const aida::ui::theme_t& th, float alpha, float regi
     ImGui::SameLine();
     if (ImGui::SmallButton("Clear##headless_console")) {
         ::diag::log_tagged("headless_v", "clear_console_cache");
-        std::lock_guard<std::mutex> lk(g_state.log_mtx);
-        g_state.console_cache.clear();
-        g_state.console_cache_signature++;
+        std::shared_ptr<const std::vector<nlohmann::json>> empty =
+            std::make_shared<const std::vector<nlohmann::json>>();
+        std::atomic_store_explicit(&g_state.console_cache, std::move(empty),
+            std::memory_order_release);
+        g_state.console_cache_signature.fetch_add(1, std::memory_order_acq_rel);
     }
 
     ImGui::BeginChild("##headless_console_inner",
                       ImVec2(0.f, std::max(60.f, region_height - 28.f)),
                       false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoBackground);
 
-    int idx = 0;
-    for (const auto& row : snap) {
-        float ra = ui_anim::render_row_entrance(idx, g_state.anim_time, 0.010f);
-        ImU32 col = aida::ui::with_alpha(console_level_color(th, row), alpha * ra);
-        std::string line = console_row_summary(row);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
-        ImGui::TextUnformatted(line.c_str());
-        ImGui::PopStyleColor();
-        ++idx;
-    }
-    if (snap.empty()) {
+    if (snap && !snap->empty()) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(snap->size()), ImGui::GetTextLineHeightWithSpacing());
+        while (clipper.Step()) {
+            for (int idx = clipper.DisplayStart; idx < clipper.DisplayEnd; ++idx) {
+                const auto& row = (*snap)[static_cast<std::size_t>(idx)];
+                const float ra = ui_anim::render_row_entrance(idx, g_state.anim_time, 0.010f);
+                const ImU32 col = aida::ui::with_alpha(console_level_color(th, row), alpha * ra);
+                const std::string line = console_row_summary(row);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
+                ImGui::TextUnformatted(line.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+    } else {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
             aida::ui::with_alpha(th.text_dim, alpha)));
         ImGui::TextUnformatted("(no console messages)");
         ImGui::PopStyleColor();
     }
 
-    static int s_last_sig = 0;
+    static std::uint64_t s_last_sig = 0;
     static float s_last_max = 0.f;
     if (g_state.console_autoscroll) {
         float maxs = ImGui::GetScrollMaxY();
@@ -1222,13 +1231,9 @@ std::string network_row_summary(const nlohmann::json& j, std::string& out_status
 
 void render_network_section(const aida::ui::theme_t& th, float alpha, float region_height)
 {
-    std::vector<nlohmann::json> snap;
-    int sig = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_state.log_mtx);
-        snap = g_state.network_cache;
-        sig  = g_state.network_cache_signature;
-    }
+    const auto snap = std::atomic_load_explicit(&g_state.network_cache,
+        std::memory_order_acquire);
+    const std::uint64_t sig = g_state.network_cache_signature.load(std::memory_order_acquire);
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
         aida::ui::with_alpha(th.text_secondary, alpha)));
@@ -1239,48 +1244,54 @@ void render_network_section(const aida::ui::theme_t& th, float alpha, float regi
     ImGui::SameLine();
     if (ImGui::SmallButton("Clear##headless_net")) {
         ::diag::log_tagged("headless_v", "clear_network_cache");
-        std::lock_guard<std::mutex> lk(g_state.log_mtx);
-        g_state.network_cache.clear();
-        g_state.network_cache_signature++;
+        std::shared_ptr<const std::vector<nlohmann::json>> empty =
+            std::make_shared<const std::vector<nlohmann::json>>();
+        std::atomic_store_explicit(&g_state.network_cache, std::move(empty),
+            std::memory_order_release);
+        g_state.network_cache_signature.fetch_add(1, std::memory_order_acq_rel);
     }
 
     ImGui::BeginChild("##headless_net_inner",
                       ImVec2(0.f, std::max(60.f, region_height - 28.f)),
                       false, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoBackground);
 
-    int idx = 0;
-    for (const auto& row : snap) {
-        float ra = ui_anim::render_row_entrance(idx, g_state.anim_time, 0.010f);
-        std::string status, method;
-        uint64_t len = 0, t_ms = 0;
-        std::string url = network_row_summary(row, status, method, len, t_ms);
-        char prefix[64];
-        _snprintf_s(prefix, sizeof(prefix), _TRUNCATE,
-                    "%-4s %-3s %6llu %5llums  ",
-                    method.empty() ? "-" : method.c_str(),
-                    status.empty() ? "-" : status.c_str(),
-                    static_cast<unsigned long long>(len),
-                    static_cast<unsigned long long>(t_ms));
-        ImU32 col = aida::ui::with_alpha(th.text_primary, alpha * ra);
-        if (!status.empty()) {
-            int code = std::atoi(status.c_str());
-            if (code >= 500)      col = aida::ui::with_alpha(th.error, alpha * ra);
-            else if (code >= 400) col = aida::ui::with_alpha(th.warning, alpha * ra);
-            else if (code >= 300) col = aida::ui::with_alpha(th.info, alpha * ra);
-            else if (code >= 200) col = aida::ui::with_alpha(th.success, alpha * ra);
+    if (snap && !snap->empty()) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(snap->size()), ImGui::GetTextLineHeightWithSpacing());
+        while (clipper.Step()) {
+            for (int idx = clipper.DisplayStart; idx < clipper.DisplayEnd; ++idx) {
+                const auto& row = (*snap)[static_cast<std::size_t>(idx)];
+                const float ra = ui_anim::render_row_entrance(idx, g_state.anim_time, 0.010f);
+                std::string status, method;
+                uint64_t len = 0, t_ms = 0;
+                const std::string url = network_row_summary(row, status, method, len, t_ms);
+                char prefix[64];
+                _snprintf_s(prefix, sizeof(prefix), _TRUNCATE,
+                            "%-4s %-3s %6llu %5llums  ",
+                            method.empty() ? "-" : method.c_str(),
+                            status.empty() ? "-" : status.c_str(),
+                            static_cast<unsigned long long>(len),
+                            static_cast<unsigned long long>(t_ms));
+                ImU32 col = aida::ui::with_alpha(th.text_primary, alpha * ra);
+                if (!status.empty()) {
+                    const int code = std::atoi(status.c_str());
+                    if (code >= 500) col = aida::ui::with_alpha(th.error, alpha * ra);
+                    else if (code >= 400) col = aida::ui::with_alpha(th.warning, alpha * ra);
+                    else if (code >= 300) col = aida::ui::with_alpha(th.info, alpha * ra);
+                    else if (code >= 200) col = aida::ui::with_alpha(th.success, alpha * ra);
+                }
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
+                ImGui::Text("%s%s", prefix, url.c_str());
+                ImGui::PopStyleColor();
+            }
         }
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
-        ImGui::Text("%s%s", prefix, url.c_str());
-        ImGui::PopStyleColor();
-        ++idx;
-    }
-    if (snap.empty()) {
+    } else {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
             aida::ui::with_alpha(th.text_dim, alpha)));
         ImGui::TextUnformatted("(no requests)");
         ImGui::PopStyleColor();
     }
-    static int s_last_sig_n = 0;
+    static std::uint64_t s_last_sig_n = 0;
     if (g_state.network_autoscroll) {
         float maxs = ImGui::GetScrollMaxY();
         float cur  = ImGui::GetScrollY();

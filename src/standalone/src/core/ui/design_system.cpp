@@ -6,6 +6,7 @@
 #include "theme.hpp"
 #include "toast_notification.hpp"
 #include "../settings/standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #include "../../preview/studio_semantics.hpp"
 
 #include <algorithm>
@@ -304,18 +305,32 @@ action_result_t render_toolbar(const char* stable_id, const action_t* actions,
             ++visible_count;
         }
     }
-    const bool popup_only = required > width && width < overflow_width + m.control_height;
+    const bool has_overflow = required > width;
+    const bool popup_only = has_overflow && width < overflow_width + m.control_height;
+    std::size_t direct_count = visible_count;
+    if (has_overflow) {
+        direct_count = 0;
+        if (!popup_only) {
+            const float direct_budget = (std::max)(0.f, width - overflow_width - m.spacing_xs);
+            float direct_width = 0.f;
+            for (std::size_t index = 0; index < action_count; ++index) {
+                const auto& action = actions[index];
+                if (!action.visible) continue;
+                const float gap = direct_count > 0 ? m.spacing_xs : 0.f;
+                const float candidate_width = direct_width + gap + action_width(action, compact);
+                if (candidate_width > direct_budget) break;
+                direct_width = candidate_width;
+                ++direct_count;
+            }
+        }
+    }
     float used = 0.f;
-    bool has_overflow = false;
+    std::size_t visible_index = 0;
     for (std::size_t i = 0; i < action_count; ++i) {
         const auto& action = actions[i];
         if (!action.visible) continue;
+        if (visible_index++ >= direct_count) continue;
         const float button_width = action_width(action, compact);
-        const float reserve = i + 1 < action_count ? overflow_width + m.spacing_xs : 0.f;
-        if (popup_only || used + button_width + reserve > width) {
-            has_overflow = true;
-            continue;
-        }
         if (used > 0.f) ImGui::SameLine(0.f, m.spacing_xs);
         if (action_button(stable_id, action, compact, button_width)) {
             result.id = action.id;
@@ -340,17 +355,11 @@ action_result_t render_toolbar(const char* stable_id, const action_t* actions,
         tooltip_for_last_item("Show actions that do not fit in this view", nullptr, nullptr);
         draw_focus_ring_for_last_item();
         if (ImGui::BeginPopup("##overflow")) {
-            float replay_used = 0.f;
+            std::size_t popup_visible_index = 0;
             for (std::size_t index = 0; index < action_count; ++index) {
                 const auto& action = actions[index];
                 if (!action.visible) continue;
-                const float button_width = action_width(action, compact);
-                const float reserve = index + 1 < action_count ? overflow_width + m.spacing_xs : 0.f;
-                const bool overflowed = popup_only || replay_used + button_width + reserve > width;
-                if (!overflowed) {
-                    replay_used += button_width + (replay_used > 0.f ? m.spacing_xs : 0.f);
-                    continue;
-                }
+                if (popup_visible_index++ < direct_count) continue;
                 const char* label = safe(action.label);
                 if (!action.enabled) ImGui::BeginDisabled();
                 const bool invoked = ImGui::MenuItem(label, action.shortcut);
@@ -971,7 +980,8 @@ bool write_view_preference(view_preference_kind_t kind, const char* stable_view_
     std::string serialized = root.dump();
     if (serialized.size() > 1024u * 1024u) return false;
     preference_blob(kind) = std::move(serialized);
-    return g_sa_settings.save();
+    return aida::settings_persistence::accepted(
+        aida::settings_persistence::request_save(g_sa_settings));
 }
 
 bool erase_view_preference(view_preference_kind_t kind, const char* stable_view_id) {
@@ -982,7 +992,8 @@ bool erase_view_preference(view_preference_kind_t kind, const char* stable_view_
     const std::size_t erased = views.erase(id);
     if (!erased) return true;
     preference_blob(kind) = root.dump();
-    return g_sa_settings.save();
+    return aida::settings_persistence::accepted(
+        aida::settings_persistence::request_save(g_sa_settings));
 }
 
 bool publish_notification(notification_t notification) {

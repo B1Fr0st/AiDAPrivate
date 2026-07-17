@@ -15,6 +15,7 @@
 #include "mcp_client.hpp"
 #include "standalone_license.hpp"
 #include "standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #include "../helpers/globals.h"
 #include "../../helpers/diag_log.hpp"
 
@@ -959,7 +960,7 @@ void tick()
         if (g_sa_settings.marketplace_installed_json != serialized)
         {
             g_sa_settings.marketplace_installed_json = std::move(serialized);
-            g_sa_settings.save();
+            static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
         }
     }
 }

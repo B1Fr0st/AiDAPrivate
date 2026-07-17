@@ -56,6 +56,21 @@ enum class sub_tab_t : int {
     COUNT
 };
 
+enum class intercept_command_t : std::uint8_t {
+    forward_selected,
+    drop_selected,
+    forward_all,
+    drop_all
+};
+
+struct intercept_command_capability_t {
+    bool enabled = false;
+    const char* disabled_reason = nullptr;
+};
+
+intercept_command_capability_t intercept_command_capability(intercept_command_t command);
+bool execute_intercept_command(intercept_command_t command, std::string* error = nullptr);
+
 
 struct connection_entry_t {
     uint32_t pid = 0;
@@ -128,6 +143,8 @@ struct repeater_entry_t {
     std::uint64_t       request_hash = 0;
     std::uint64_t       response_hash = 0;
     std::uint64_t       response_timestamp = 0;
+    std::uint64_t       reviewed_source_hash = 0;
+    std::string         review_provenance;
     std::string       host;
     uint16_t          port = 443;
     bool              use_tls = true;
@@ -135,6 +152,7 @@ struct repeater_entry_t {
     std::string       raw_response;
     int               status_code = 0;
     uint64_t          latency_ms = 0;
+    bool              reviewed_draft = false;
     std::atomic<bool> in_progress{false};
 };
 
@@ -151,7 +169,23 @@ enum class artifact_kind_t : std::uint8_t {
     response,
     websocket_frame,
     repeater_request,
-    repeater_response
+    repeater_response,
+    sitemap_request,
+    sitemap_response,
+    api_request,
+    api_response,
+    websocket_editor_frame,
+    http2_request,
+    http2_response,
+    intruder_response,
+    scanner_request,
+    scanner_response
+};
+
+enum class exchange_context_origin_t : std::uint8_t {
+    pointer = 0,
+    menu_key,
+    shift_f10
 };
 
 struct artifact_identity_t {
@@ -169,6 +203,7 @@ struct artifact_identity_t {
     std::string target_host;
     std::uint16_t target_port = 0;
     bool use_tls = false;
+    bool raw_protocol = false;
 
     bool valid() const noexcept {
         return !id.empty() && !source_view_id.empty() && content_hash != 0;
@@ -180,7 +215,18 @@ struct artifact_snapshot_t {
     std::vector<std::uint8_t> bytes;
 };
 
-
+bool resolve_artifact(const artifact_identity_t& identity,
+                      artifact_snapshot_t& snapshot,
+                      std::string& unavailable_reason);
+bool validate_reviewed_request(const artifact_identity_t& source,
+                               const std::vector<std::uint8_t>& reviewed_request,
+                               artifact_identity_t& canonical_source,
+                               std::string& unavailable_reason);
+bool stage_validated_reviewed_request(const artifact_identity_t& canonical_source,
+                                      const std::vector<std::uint8_t>& reviewed_request,
+                                      const std::string& provenance,
+                                      artifact_identity_t& staged_identity,
+                                      std::string& unavailable_reason);
 struct payload_set_t {
     std::string              name;
     std::string              source;
@@ -200,6 +246,7 @@ struct state_t {
 
     std::mutex                    conn_mutex;
     std::vector<connection_entry_t> connections;
+    std::shared_ptr<const std::vector<connection_entry_t>> connection_snapshot;
     int                           conn_selected = -1;
     uint32_t                      conn_filter_pid = 0;
     uint8_t                       conn_filter_protocol = 0;
@@ -208,14 +255,17 @@ struct state_t {
     std::atomic<bool>             conn_auto_refresh_enabled{true};
     std::atomic<bool>             conn_thread_done{true};
     std::atomic<bool>             conn_polling{false};
+    std::atomic<bool>             conn_refresh_pending{false};
+    std::atomic<std::uint64_t>    conn_refresh_serial{0};
     std::mutex                    conn_cv_mutex;
     std::condition_variable       conn_cv;
 
 
     std::mutex                    cap_mutex;
     std::deque<packet_entry_t>    captured_packets;
+    std::shared_ptr<const std::vector<packet_entry_t>> capture_snapshot;
     size_t                        cap_max_packets = 8192;
-    int                           cap_selected = -1;
+    std::atomic<int>              cap_selected{-1};
     std::atomic<bool>             cap_running{false};
     std::atomic<bool>             cap_start_pending{false};
     std::atomic<bool>             cap_stop_pending{false};
@@ -244,6 +294,7 @@ struct state_t {
 
     std::mutex                    dns_mutex;
     std::deque<dns_entry_t>       dns_entries;
+    std::shared_ptr<const std::vector<dns_entry_t>> dns_snapshot;
     size_t                        dns_max_entries = 8192;
     int                           dns_selected = -1;
     uint32_t                      dns_filter_pid = 0;
@@ -251,6 +302,8 @@ struct state_t {
     bool                          dns_auto_scroll = true;
     std::atomic<bool>             dns_thread_done{true};
     std::atomic<bool>             dns_polling{false};
+    std::atomic<bool>             dns_refresh_pending{false};
+    std::atomic<std::uint64_t>    dns_refresh_serial{0};
     std::mutex                    dns_cv_mutex;
     std::condition_variable       dns_cv;
     std::atomic<bool>             dns_thread_alive{false};
@@ -258,6 +311,8 @@ struct state_t {
 
     std::vector<filter_entry_t>   filters;
     int                           filter_selected = -1;
+    std::atomic<bool>             filter_mutation_pending{false};
+    std::atomic<std::uint64_t>    filter_mutation_serial{0};
 
     int   nf_action = 0;
     int   nf_direction = 2;
@@ -269,10 +324,13 @@ struct state_t {
 
     std::mutex                    bw_mutex;
     std::vector<bw_entry_t>       bw_entries;
+    std::shared_ptr<const std::vector<bw_entry_t>> bandwidth_snapshot;
     bool                          bw_monitoring = false;
     int                           bw_selected = -1;
     std::atomic<bool>             bw_thread_done{true};
     std::atomic<bool>             bw_polling{false};
+    std::atomic<bool>             bw_control_pending{false};
+    std::atomic<std::uint64_t>    bw_control_serial{0};
     std::mutex                    bw_cv_mutex;
     std::condition_variable       bw_cv;
     std::atomic<bool>             bw_thread_alive{false};
@@ -297,8 +355,14 @@ struct state_t {
     std::atomic<uint32_t>         pcap_written_count{0};
     uint32_t                      pcap_filter_pid = 0;
     uint8_t                       pcap_filter_protocol = 0;
+    std::string                   pcap_last_path;
     std::string                   pcap_last_error;
     std::mutex                    pcap_error_mutex;
+    std::atomic<bool>             har_writing{false};
+    std::atomic<std::uint32_t>    har_written_count{0};
+    std::string                   har_last_path;
+    std::string                   har_last_error;
+    std::mutex                    har_status_mutex;
 
 
     struct fuzzer_entry_t {
@@ -388,6 +452,9 @@ struct state_t {
     };
     std::vector<script_entry_t>   scripts;
     int                           script_selected = -1;
+    std::atomic<bool>             script_operation_pending{false};
+    std::atomic<bool>             script_open_pending{false};
+    std::atomic<std::uint64_t>    script_operation_serial{0};
     char                          script_editor_buf[32768] = {};
     char                          script_console_buf[512] = {};
     std::mutex                    script_log_mutex;
@@ -439,9 +506,15 @@ void render_pane(sub_tab_t tab, float pos_x, float pos_y, float width, float hei
 
 bool resolve_artifact(const artifact_identity_t& identity, artifact_snapshot_t& snapshot,
                       std::string& unavailable_reason);
+std::uint64_t artifact_content_hash(const std::vector<std::uint8_t>& bytes);
 bool send_artifact_to_repeater(const artifact_identity_t& identity, std::string& unavailable_reason);
 bool send_artifact_to_comparer(const artifact_identity_t& identity, std::string& unavailable_reason);
 bool add_artifact_to_chat(const artifact_identity_t& identity, std::string& unavailable_reason);
 bool assign_artifact_to_agent(const artifact_identity_t& identity, std::string& unavailable_reason);
+bool make_sitemap_artifact(std::uint64_t exchange_id, artifact_kind_t kind,
+                           artifact_identity_t& identity, std::string& unavailable_reason);
+void open_exchange_context(artifact_identity_t primary, artifact_identity_t related,
+                           exchange_context_origin_t origin);
+void render_exchange_context();
 
 }

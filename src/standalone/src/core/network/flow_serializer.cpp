@@ -9,6 +9,27 @@
 #include <iomanip>
 #include <sstream>
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+namespace protocol_parser {
+
+std::string find_header(const std::vector<http_header>& headers, const std::string& name)
+{
+    const auto same_ascii = [](const std::string& left, const std::string& right) {
+        return left.size() == right.size() &&
+            std::equal(left.begin(), left.end(), right.begin(), [](const char lhs, const char rhs) {
+                return std::tolower(static_cast<unsigned char>(lhs)) ==
+                    std::tolower(static_cast<unsigned char>(rhs));
+            });
+    };
+    const auto found = std::find_if(headers.begin(), headers.end(), [&](const http_header& header) {
+        return same_ascii(header.name, name);
+    });
+    return found == headers.end() ? std::string{} : found->value;
+}
+
+}
+#endif
+
 namespace flow_serializer {
 namespace {
 
@@ -89,7 +110,11 @@ std::string iso_from_ms(uint64_t ms)
 {
     std::time_t seconds = static_cast<std::time_t>(ms / 1000);
     std::tm tm{};
+#if defined(_WIN32)
     gmtime_s(&tm, &seconds);
+#else
+    static_cast<void>(gmtime_r(&seconds, &tm));
+#endif
     std::ostringstream out;
     out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S") << '.'
         << std::setw(3) << std::setfill('0') << (ms % 1000) << 'Z';
@@ -242,7 +267,8 @@ bool base64_decode(const std::string& value, std::vector<uint8_t>& out)
     out.clear();
     int bits = 0;
     int val = 0;
-    for (unsigned char c : value) {
+    for (const char byte : value) {
+        const auto c = static_cast<unsigned char>(byte);
         if (std::isspace(c))
             continue;
         if (c == '=')

@@ -78,6 +78,7 @@ enum class action_check_state_t : std::uint8_t {
 
 enum class action_invocation_source_t : std::uint8_t {
     application_menu,
+    activity_bar,
     toolbar,
     command_palette,
     context_menu,

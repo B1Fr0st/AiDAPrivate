@@ -10,7 +10,9 @@
 #include "ui/responsive.hpp"
 #include "ui/skeleton.hpp"
 #include "ui/fonts.hpp"
+#include "ui/design_system.hpp"
 #include "ui/toast_notification.hpp"
+#include "ui/application_ui_runtime.hpp"
 #include "imgui.h"
 #include "../helpers/globals.h"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -20,6 +22,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -33,6 +36,8 @@ struct local_state_t {
 	bool  scrollbar_dragging = false;
 	float scrollbar_drag_offset = 0.f;
 	int   selected_crash = -1;
+	uint64_t selected_crash_hash = 0;
+	uint64_t crash_snapshot_generation = 0;
 	bool  show_corpus = false;
 	float anim_time = 0.f;
 	float detail_slide = 0.f;
@@ -236,26 +241,31 @@ void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 	ImGui::SameLine();
-	if (aida::ui::button("Export", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(78.f, 28.f))) {
+	const bool persistence_busy = fz.exporting_crashes.load() || fz.importing_crashes.load();
+	if (aida::ui::button(fz.exporting_crashes.load() ? "Exporting" : "Export",
+		aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm, ImVec2(88.f, 28.f),
+		persistence_busy, nullptr, fz.exporting_crashes.load())) {
 		diag::log_tagged("fuzzer", "export_requested");
 		fuzzer_engine::export_crashes();
 	}
 	ImGui::SameLine();
-	if (aida::ui::button("Import", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(78.f, 28.f))) {
+	if (aida::ui::button(fz.importing_crashes.load() ? "Importing" : "Import",
+		aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm, ImVec2(88.f, 28.f),
+		persistence_busy, nullptr, fz.importing_crashes.load())) {
 		diag::log_tagged("fuzzer", "import_requested");
 		fuzzer_engine::import_crashes();
 	}
 	ImGui::SameLine();
 	{
-		bool reset_disabled = running || fz.minimizing.load() || fz.analyzing_crash.load();
+		bool reset_disabled = running || fz.minimizing.load() || fz.analyzing_crash.load() ||
+			persistence_busy;
 		if (aida::ui::button("Reset", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::sm, ImVec2(78.f, 28.f),
 			reset_disabled, nullptr, false)) {
 			diag::log_tagged("fuzzer", "[analysis_audit] view_reset_request");
 			if (fuzzer_engine::reset_state()) {
 				st.selected_crash = -1;
+				st.selected_crash_hash = 0;
 				st.scroll_y = 0.f;
 				st.target_scroll_y = 0.f;
 				st.last_unique_crashes = 0;
@@ -282,17 +292,29 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	cy = oy + toolbar_h + 8.f;
 
-	fuzzer_engine::fuzz_stats_t stats_copy;
-	std::vector<fuzzer_engine::crash_info_t> crashes_copy;
-	std::vector<uint64_t> rate_history;
-	{
-		std::lock_guard<std::mutex> lk(fz.mutex);
-		stats_copy = fz.stats;
-		crashes_copy = fz.unique_crashes;
-		rate_history = fz.stats.exec_rate_history;
+	const auto render_snapshot = fuzzer_engine::capture_render_snapshot();
+	static const fuzzer_engine::render_snapshot_t empty_snapshot;
+	const auto& published = render_snapshot ? *render_snapshot : empty_snapshot;
+	const auto& stats_copy = published.stats;
+	const auto& crashes_copy = published.unique_crashes;
+	const auto& rate_history = stats_copy.exec_rate_history;
+	if (st.crash_snapshot_generation != published.generation) {
+		st.crash_snapshot_generation = published.generation;
+		if (st.selected_crash_hash != 0) {
+			const auto selected = std::find_if(crashes_copy.begin(), crashes_copy.end(),
+				[&](const fuzzer_engine::crash_info_t& crash) {
+					return crash.crash_hash == st.selected_crash_hash;
+				});
+			if (selected == crashes_copy.end()) {
+				st.selected_crash = -1;
+				st.selected_crash_hash = 0;
+			} else {
+				st.selected_crash = static_cast<int>(std::distance(crashes_copy.begin(), selected));
+			}
+		}
 	}
 
-	uint64_t cur_unique = stats_copy.total_unique_crashes;
+	uint64_t cur_unique = static_cast<uint64_t>(crashes_copy.size());
 	if (cur_unique > st.last_unique_crashes) {
 		st.new_crash_flash.trigger();
 		st.new_crash_index = static_cast<int>(crashes_copy.size()) - 1;
@@ -601,6 +623,13 @@ void render(float pos_x, float pos_y, float width, float height,
 	if (!head_em) head_em = ImGui::GetFont();
 	dl->AddText(head_em, 13.f, ImVec2(ox + 12.f, cy),
 		aida::ui::with_alpha(th.text_primary, alpha), "Unique Crashes");
+	if (published.crash_catalog_truncated) {
+		ImGui::SetCursorScreenPos(ImVec2(ox + width - 154.f, cy - 3.f));
+		aida::ui::components::status_badge("Catalog bounded",
+			aida::ui::components::status_kind_t::warning);
+		aida::ui::design::tooltip_for_last_item(
+			"Additional unique crashes were counted but not retained after the bounded catalog reached its memory limit.");
+	}
 	cy += 22.f;
 
 	const float row_h = 28.f;
@@ -666,12 +695,15 @@ void render(float pos_x, float pos_y, float width, float height,
 		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
 		if (ry + row_h < cy || ry > oy + height) continue;
 
-		auto& crash = crashes_copy[static_cast<size_t>(i)];
+		const auto& crash = crashes_copy[static_cast<size_t>(i)];
+		ImGui::PushID(i);
 
 		ImVec2 rmin(ox + 8.f, ry);
 		ImVec2 rmax(ox + width - 14.f, ry + row_h);
 
-		bool hovered = ImGui::IsMouseHoveringRect(rmin, rmax);
+		ImGui::SetCursorScreenPos(rmin);
+		ImGui::InvisibleButton("##crash_row", ImVec2(rmax.x - rmin.x, rmax.y - rmin.y));
+		bool hovered = ImGui::IsItemHovered();
 		bool selected = (st.selected_crash == i);
 
 		float entrance_delay = std::min(static_cast<float>(i - first_vis) * 0.012f, 0.240f);
@@ -703,7 +735,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				aida::ui::with_alpha(th.accent_u32, alpha), 1.5f);
 		}
 
-		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+		if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
 			int new_sel = selected ? -1 : i;
 			diag::log_tagged_fmt("fuzz_view",
 				"crash_row_click idx=%d new_selected=%d type=%s addr=0x%llX score=%s",
@@ -712,7 +744,108 @@ void render(float pos_x, float pos_y, float width, float height,
 				static_cast<unsigned long long>(crash.instruction_address),
 				fuzzer_engine::exploit_score_name(crash.score));
 			st.selected_crash = new_sel;
+			st.selected_crash_hash = new_sel >= 0 ? crash.crash_hash : 0;
 		}
+		const bool keyboard_context = selected &&
+			ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+				(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+		const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+		if (pointer_context) {
+			st.selected_crash = i;
+			st.selected_crash_hash = crash.crash_hash;
+		}
+		if (pointer_context || keyboard_context) {
+			aida::ui::application_ui::retained_entity_context_t retained;
+			retained.owner_id = "analysis.fuzzer.crash";
+			retained.entity_id = std::to_string(crash.crash_hash);
+			retained.entity_generation = published.generation;
+			retained.active_view = aida::ui::stable_view_id_t("view.analysis.fuzzer");
+			const std::uint64_t crash_hash = crash.crash_hash;
+			const std::uint64_t generation = published.generation;
+			retained.validate_identity = [crash_hash, generation] {
+				const auto current = fuzzer_engine::capture_render_snapshot();
+				if (!current || current->generation != generation)
+					return aida::ui::capability_state_t::unavailable(
+						"The crash publication changed; select the crash again");
+				const auto found = std::find_if(current->unique_crashes.begin(),
+					current->unique_crashes.end(), [crash_hash](const auto& item) {
+						return item.crash_hash == crash_hash;
+					});
+				return found != current->unique_crashes.end()
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(
+						"The retained crash no longer exists in this publication");
+			};
+			auto add_action = [&retained](const char* id, bool enabled,
+				const char* reason, auto invoke) {
+				aida::ui::application_ui::retained_entity_action_t action;
+				action.action_id = id;
+				action.capability = enabled
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(reason);
+				action.invoke = std::move(invoke);
+				retained.actions.push_back(std::move(action));
+			};
+			add_action("analysis.fuzzer.crash.ai_analyze",
+				!fz.analyzing_crash.load(std::memory_order_acquire),
+				"Another crash is already being analyzed", [i, crash_hash] {
+					fuzzer_engine::ai_analyze_crash(i, crash_hash);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_action("analysis.fuzzer.crash.minimize",
+				!fz.minimizing.load(std::memory_order_acquire) && !crash.input.empty(),
+				crash.input.empty() ? "The retained crash has no reproducer input"
+					: "Another crash minimization is already running", [i, crash_hash] {
+					fuzzer_engine::minimize_crash(i, crash_hash);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			const std::uint64_t instruction_address = crash.instruction_address;
+			add_action("analysis.fuzzer.crash.copy_instruction_address", true, "",
+				[instruction_address] {
+					char text[32]{};
+					std::snprintf(text, sizeof(text), "0x%llX",
+						static_cast<unsigned long long>(instruction_address));
+					ImGui::SetClipboardText(text);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_action("analysis.fuzzer.crash.copy_hash", true, "", [crash_hash] {
+				char text[32]{};
+				std::snprintf(text, sizeof(text), "%016llX",
+					static_cast<unsigned long long>(crash_hash));
+				ImGui::SetClipboardText(text);
+				return aida::ui::action_handler_result_t::completed();
+			});
+			const std::string description = crash.description;
+			add_action("analysis.fuzzer.crash.copy_description", true, "", [description] {
+				ImGui::SetClipboardText(description.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
+			const std::size_t retained_input_size = (std::min)(
+				crash.input.size(), std::size_t{64u * 1024u});
+			const std::vector<std::uint8_t> input(crash.input.begin(),
+				crash.input.begin() + static_cast<std::ptrdiff_t>(retained_input_size));
+			add_action("analysis.fuzzer.crash.copy_input_hex", !input.empty(),
+				"The retained crash has no reproducer input", [input] {
+				std::string hex;
+				hex.reserve(input.size() * 2u);
+				char byte[3]{};
+				for (std::size_t index = 0; index < input.size(); ++index) {
+					std::snprintf(byte, sizeof(byte), "%02X", input[index]);
+					hex.append(byte);
+				}
+				ImGui::SetClipboardText(hex.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
+			aida::ui::application_ui::open_retained_entity_context_menu(
+				std::move(retained), pointer_context
+					? aida::ui::context_menu_open_origin_t::pointer
+					: ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+					? aida::ui::context_menu_open_origin_t::menu_key
+					: aida::ui::context_menu_open_origin_t::shift_f10);
+		}
+		aida::ui::application_ui::render_retained_entity_context_menu(
+			"analysis.fuzzer.crash");
 
 		float rx = ox + 16.f;
 		ImFont* code_font = aida::ui::fonts::code();
@@ -767,6 +900,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			desc.c_str());
 
 		(void)col_desc_w;
+		ImGui::PopID();
 	}
 
 	ImGui::PopClipRect();
@@ -794,7 +928,7 @@ void render(float pos_x, float pos_y, float width, float height,
 			if (s_last_detail_crash != st.selected_crash) {
 				s_last_detail_crash = st.selected_crash;
 				if (st.selected_crash >= 0) {
-					auto& dc = crashes_copy[static_cast<size_t>(st.selected_crash)];
+					const auto& dc = crashes_copy[static_cast<size_t>(st.selected_crash)];
 					diag::log_tagged_fmt("fuzz_view",
 						"detail_panel_shown crash_idx=%d type=%s score=%s fault=0x%llX rip=0x%llX",
 						st.selected_crash,
@@ -805,7 +939,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				}
 			}
 		}
-		auto& sel = crashes_copy[static_cast<size_t>(st.selected_crash)];
+		const auto& sel = crashes_copy[static_cast<size_t>(st.selected_crash)];
 		float dy = cy + crash_table_h + 4.f;
 		float dw = width - 16.f;
 		float detail_alpha = alpha * st.detail_slide;
@@ -939,7 +1073,7 @@ void render(float pos_x, float pos_y, float width, float height,
 					st.selected_crash,
 					fuzzer_engine::crash_type_name(sel.type),
 					static_cast<unsigned long long>(sel.instruction_address));
-				fuzzer_engine::ai_analyze_crash(st.selected_crash);
+				fuzzer_engine::ai_analyze_crash(st.selected_crash, sel.crash_hash);
 			}
 		}
 		ImGui::SameLine();
@@ -952,7 +1086,7 @@ void render(float pos_x, float pos_y, float width, float height,
 				diag::log_tagged_fmt("fuzz_view",
 					"minimize_clicked crash_idx=%d input_size=%zu",
 					st.selected_crash, sel.input.size());
-				fuzzer_engine::minimize_crash(st.selected_crash);
+				fuzzer_engine::minimize_crash(st.selected_crash, sel.crash_hash);
 			}
 		}
 		dy_inner += 28.f;

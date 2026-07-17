@@ -7,11 +7,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -24,6 +28,8 @@
 #endif
 
 namespace decrypt_oracle {
+
+inline constexpr std::size_t maximum_results = 65536;
 
 struct decrypted_string_t {
 	uint64_t    source_function = 0;
@@ -49,6 +55,8 @@ struct scan_config_t {
 
 struct state_t {
 	std::vector<decrypted_string_t> results;
+	std::shared_ptr<const std::vector<decrypted_string_t>> published_results =
+		std::make_shared<const std::vector<decrypted_string_t>>();
 	std::mutex mutex;
 	std::atomic<bool> scanning{false};
 	std::atomic<bool> cancel{false};
@@ -63,6 +71,11 @@ struct state_t {
 };
 
 inline state_t g_state;
+
+inline std::shared_ptr<const std::vector<decrypted_string_t>> capture_results()
+{
+	return std::atomic_load_explicit(&g_state.published_results, std::memory_order_acquire);
+}
 
 namespace detail {
 
@@ -233,6 +246,8 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 	{
 		std::lock_guard<std::mutex> lk(g_state.mutex);
 		g_state.results.clear();
+		std::atomic_store_explicit(&g_state.published_results,
+			std::make_shared<const std::vector<decrypted_string_t>>(), std::memory_order_release);
 		g_state.status_text = "Scanning xrefs...";
 	}
 
@@ -285,6 +300,9 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			if (!candidates.empty()) {
 				g_state.results = std::move(candidates);
+				std::atomic_store_explicit(&g_state.published_results,
+					std::make_shared<const std::vector<decrypted_string_t>>(g_state.results),
+					std::memory_order_release);
 				g_state.status_text = "No xrefs found; reported plaintext candidates already present in region";
 			} else {
 				g_state.status_text = "No xrefs found to target region";
@@ -301,6 +319,7 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 		}
 
 		std::map<uint64_t, bool> processed_functions;
+		std::unordered_set<std::string> seen_results;
 		int processed = 0;
 
 		for (auto& xref : xrefs) {
@@ -377,18 +396,13 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 						? static_cast<float>(printable) / static_cast<float>(ds.length)
 						: 0.f;
 
-					std::lock_guard<std::mutex> lk(g_state.mutex);
-
-					bool duplicate = false;
-					for (auto& existing : g_state.results) {
-						if (existing.write_addr == ds.write_addr &&
-						    existing.decrypted == ds.decrypted) {
-							duplicate = true;
-							break;
-						}
-					}
-					if (!duplicate) {
-						g_state.results.push_back(std::move(ds));
+					std::string identity(sizeof(ds.write_addr), '\0');
+					std::memcpy(identity.data(), &ds.write_addr, sizeof(ds.write_addr));
+					identity.append(ds.decrypted);
+					if (seen_results.insert(std::move(identity)).second) {
+						std::lock_guard<std::mutex> lk(g_state.mutex);
+						if (g_state.results.size() < maximum_results)
+							g_state.results.push_back(std::move(ds));
 					}
 				}
 			}
@@ -406,28 +420,15 @@ inline void scan_and_decrypt(uint64_t region_address, uint64_t region_size, uint
 				if (!candidates.empty())
 					g_state.results = std::move(candidates);
 			}
+			std::atomic_store_explicit(&g_state.published_results,
+				std::make_shared<const std::vector<decrypted_string_t>>(g_state.results),
+				std::memory_order_release);
 			g_state.status_text = "Complete: " + std::to_string(g_state.results.size()) + " strings decrypted";
 		}
 
 		g_state.progress.store(1.f);
 		g_state.scanning.store(false);
 	};
-	const bool run_inline = search_start != 0 && search_size != 0 && search_size <= 1024ull * 1024ull &&
-		region_size != 0 && region_size <= 1024ull * 1024ull;
-	if (run_inline) {
-		try {
-			worker();
-		} catch (const std::exception& ex) {
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.status_text = std::string("Decrypt scan failed: ") + ex.what();
-			g_state.scanning.store(false);
-		} catch (...) {
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.status_text = "Decrypt scan failed: unknown exception";
-			g_state.scanning.store(false);
-		}
-		return;
-	}
 	aida::infra::executor::submission_t sub;
 	sub.owner_subsystem = "analysis";
 	sub.label = "analysis.decrypt_oracle.scan";

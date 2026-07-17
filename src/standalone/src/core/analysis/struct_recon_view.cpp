@@ -26,6 +26,8 @@
 #include "ui/ui_anim.hpp"
 #include "imgui.h"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ui/task_center.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
@@ -36,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -125,20 +128,16 @@ static void publish_field_selection(const struct_recon::reconstructed_struct_t& 
 
 bool has_current_structure()
 {
-	std::lock_guard<std::mutex> lock(struct_recon::g_state.mutex);
-	return struct_recon::g_state.active && !struct_recon::g_state.current.fields.empty();
+	const auto structure = struct_recon::capture_current_snapshot();
+	return structure && !structure->fields.empty();
 }
 
 command_result_t copy_current_declaration()
 {
-	struct_recon::reconstructed_struct_t structure;
-	{
-		std::lock_guard<std::mutex> lock(struct_recon::g_state.mutex);
-		if (!struct_recon::g_state.active || struct_recon::g_state.current.fields.empty())
-			return {false, "Reconstruct or load a structure first"};
-		structure = struct_recon::g_state.current;
-	}
-	const std::string declaration = struct_recon::export_as_cpp(structure);
+	const auto structure = struct_recon::capture_current_snapshot();
+	if (!structure || structure->fields.empty())
+		return {false, "Reconstruct or load a structure first"};
+	const std::string declaration = struct_recon::export_as_cpp(*structure);
 	if (declaration.empty())
 		return {false, "The reconstruction engine produced no declaration"};
 	ImGui::SetClipboardText(declaration.c_str());
@@ -147,26 +146,22 @@ command_result_t copy_current_declaration()
 
 command_result_t declare_and_apply_current()
 {
-	struct_recon::reconstructed_struct_t structure;
-	{
-		std::lock_guard<std::mutex> lock(struct_recon::g_state.mutex);
-		if (!struct_recon::g_state.active || struct_recon::g_state.current.fields.empty())
-			return {false, "Reconstruct or load a structure first"};
-		structure = struct_recon::g_state.current;
-	}
+	const auto structure = struct_recon::capture_current_snapshot();
+	if (!structure || structure->fields.empty())
+		return {false, "Reconstruct or load a structure first"};
 	auto context = disasm_view::capture_selected_workspace();
 	if (!context.workspace)
 		return {false, "Open and analyze the static or live target that owns this structure first"};
 	if (context.workspace->closing() || context.workspace->closed())
 		return {false, "The selected analysis workspace is closing"};
-	const auto address = disasm_view::typed_address(context, structure.base_address);
+	const auto address = disasm_view::typed_address(context, structure->base_address);
 	if (!address)
 		return {false, "The reconstructed base address is outside the selected workspace mapping"};
-	const std::string declaration = struct_recon::export_as_cpp(structure);
-	if (declaration.empty() || structure.name.empty())
+	const std::string declaration = struct_recon::export_as_cpp(*structure);
+	if (declaration.empty() || structure->name.empty())
 		return {false, "The reconstruction has no valid generated declaration or type name"};
 	if (!disasm_view::queue_type_declaration_and_application(context, *address,
-			declaration, structure.name))
+			declaration, structure->name))
 		return {false, "The reversible overlay rejected the atomic declaration and application request"};
 	return {true, "Queued one atomic overlay transaction; views update after its revision commits"};
 }
@@ -286,6 +281,8 @@ void render(float pos_x, float pos_y, float width, float height,
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
 	auto& sr = struct_recon::g_state;
+	const auto frame_structure = struct_recon::capture_current_snapshot();
+	const bool has_frame_structure = frame_structure && !frame_structure->fields.empty();
 	ImVec2 wp = ImGui::GetWindowPos();
 	float ox = wp.x;
 	float oy = wp.y;
@@ -463,16 +460,11 @@ void render(float pos_x, float pos_y, float width, float height,
 
 	ImGui::SameLine(0.f, 10.f);
 	if (aida::ui::button("Export C++", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(94.f, 28.f))) {
-		std::string cpp;
-		std::string name;
-		size_t field_count = 0;
-		{
-			std::lock_guard<std::mutex> lk(sr.mutex);
-			cpp = struct_recon::export_as_cpp(sr.current);
-			name = sr.current.name;
-			field_count = sr.current.fields.size();
-		}
+		aida::ui::size_t_::sm, ImVec2(94.f, 28.f), !has_frame_structure)) {
+		const std::string cpp = frame_structure
+			? struct_recon::export_as_cpp(*frame_structure) : std::string{};
+		const std::string name = frame_structure ? frame_structure->name : std::string{};
+		const size_t field_count = frame_structure ? frame_structure->fields.size() : 0;
 		if (!cpp.empty()) {
 			ImGui::SetClipboardText(cpp.c_str());
 		}
@@ -480,9 +472,11 @@ void render(float pos_x, float pos_y, float width, float height,
 			"export_cpp_clipboard name='%s' fields=%zu bytes=%zu",
 			name.c_str(), field_count, cpp.size());
 	}
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !has_frame_structure)
+		ImGui::SetTooltip("Reconstruct or load a structure before exporting its declaration");
 	ImGui::SameLine(0.f, 6.f);
 	if (aida::ui::button("Apply Type", aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(92.f, 28.f))) {
+		aida::ui::size_t_::sm, ImVec2(92.f, 28.f), !has_frame_structure)) {
 		const auto result = declare_and_apply_current();
 		st.operation_status = result.detail;
 		st.operation_error = !result.completed;
@@ -495,28 +489,30 @@ void render(float pos_x, float pos_y, float width, float height,
 				? workspace.workspace->overlay_revision() : 0;
 		}
 	}
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Queue the generated declaration and base-address application as one reversible overlay transaction");
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+		ImGui::SetTooltip(has_frame_structure
+			? "Queue the generated declaration and base-address application as one reversible overlay transaction"
+			: "Reconstruct or load a structure before applying its type");
 	ImGui::SameLine(0.f, 6.f);
 	{
 		bool ai_naming = sr.ai_naming.load();
 		bool clicked = aida::ui::button(ai_naming ? "Naming" : "AI Name",
 			aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::sm,
-			ImVec2(88.f, 28.f), ai_naming, nullptr, ai_naming);
+			ImVec2(88.f, 28.f), ai_naming || !has_frame_structure, nullptr, ai_naming);
 		if (clicked && !ai_naming) {
 			diag::log_tagged_fmt("struct_recon", "ai_name_clicked");
 			struct_recon::ai_name_fields();
 		}
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+			!ai_naming && !has_frame_structure)
+			ImGui::SetTooltip("Reconstruct or load a structure before requesting field names");
 	}
 	ImGui::SameLine(0.f, 6.f);
 	if (aida::ui::button("Save", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(64.f, 28.f))) {
-		struct_recon::reconstructed_struct_t snap;
-		{
-			std::lock_guard<std::mutex> lk(sr.mutex);
-			snap = sr.current;
-		}
+		aida::ui::size_t_::sm, ImVec2(64.f, 28.f), !has_frame_structure)) {
+		const struct_recon::reconstructed_struct_t snap = frame_structure
+			? *frame_structure : struct_recon::reconstructed_struct_t{};
 		aida::infra::executor::submission_t sub;
 		sub.owner_subsystem = "analysis";
 		sub.label = "analysis.struct_recon.save_struct";
@@ -524,7 +520,10 @@ void render(float pos_x, float pos_y, float width, float height,
 		sub.domain = aida::infra::executor::domain_t::diagnostics;
 		sub.priority = 4;
 		sub.body = [snap]() {
-			struct_recon::save_struct_to_disk(snap);
+			std::string error;
+			if (!struct_recon::save_struct_to_disk(snap, error))
+				throw std::runtime_error(error.empty()
+					? "The structure could not be saved" : error);
 			diag::log_tagged_fmt("struct_recon",
 				"save_disk_done name='%s' fields=%zu",
 				snap.name.c_str(), snap.fields.size());
@@ -541,11 +540,22 @@ void render(float pos_x, float pos_y, float width, float height,
 		} else {
 			st.operation_error = false;
 			st.operation_status = "Save queued; the persisted structure remains available after restart.";
+			aida::ui::task_center::task_registration_t registration;
+			registration.owner = "analysis";
+			registration.owner_view = "view.types.struct_recon";
+			registration.owner_action = "types.structure.save";
+			registration.label = "Save reconstructed structure";
+			registration.stage = "Queued";
+			registration.target = snap.name;
+			static_cast<void>(aida::ui::task_center::register_executor_job(
+				save_submission.task_id, std::move(registration)));
 		}
 		diag::log_tagged_fmt("struct_recon",
 			"save_clicked name='%s' fields=%zu",
 			snap.name.c_str(), snap.fields.size());
 	}
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !has_frame_structure)
+		ImGui::SetTooltip("Reconstruct or load a structure before saving it");
 	ImGui::SameLine(0.f, 6.f);
 	if (aida::ui::button("Load All", aida::ui::button_kind_t::ghost,
 		aida::ui::size_t_::sm, ImVec2(82.f, 28.f))) {
@@ -556,7 +566,10 @@ void render(float pos_x, float pos_y, float width, float height,
 		sub.domain = aida::infra::executor::domain_t::diagnostics;
 		sub.priority = 4;
 		sub.body = []() {
-			struct_recon::load_structs_from_disk();
+			std::string error;
+			if (!struct_recon::load_structs_from_disk(error))
+				throw std::runtime_error(error.empty()
+					? "The structure catalog could not be loaded" : error);
 			size_t loaded = 0;
 			{
 				std::lock_guard<std::mutex> lk(struct_recon::g_state.mutex);
@@ -575,21 +588,24 @@ void render(float pos_x, float pos_y, float width, float height,
 		} else {
 			st.operation_error = false;
 			st.operation_status = "Load All queued; saved structures will appear when disk loading completes.";
+			aida::ui::task_center::task_registration_t registration;
+			registration.owner = "analysis";
+			registration.owner_view = "view.types.struct_recon";
+			registration.owner_action = "types.structure.load_all";
+			registration.label = "Load reconstructed structures";
+			registration.stage = "Queued";
+			static_cast<void>(aida::ui::task_center::register_executor_job(
+				load_submission.task_id, std::move(registration)));
 		}
 		diag::log_tagged_fmt("struct_recon", "load_all_clicked");
 	}
 	ImGui::SameLine(0.f, 6.f);
+	const bool refresh_available = has_frame_structure && frame_structure->base_address != 0;
 	if (aida::ui::button("Refresh", aida::ui::button_kind_t::ghost,
-		aida::ui::size_t_::sm, ImVec2(76.f, 28.f))) {
-		uint64_t base = 0;
-		bool active = false;
-		bool any_fields = false;
-		{
-			std::lock_guard<std::mutex> lk(sr.mutex);
-			active = sr.active;
-			base = sr.current.base_address;
-			any_fields = !sr.current.fields.empty();
-		}
+		aida::ui::size_t_::sm, ImVec2(76.f, 28.f), !refresh_available)) {
+		const uint64_t base = frame_structure ? frame_structure->base_address : 0;
+		const bool active = frame_structure && !frame_structure->fields.empty();
+		const bool any_fields = active;
 		if (active && base != 0 && any_fields) {
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "analysis";
@@ -598,7 +614,10 @@ void render(float pos_x, float pos_y, float width, float height,
 			sub.domain = aida::infra::executor::domain_t::diagnostics;
 			sub.priority = 4;
 			sub.body = []() {
-				struct_recon::refresh_value_history();
+				std::string error;
+				if (!struct_recon::refresh_value_history(error))
+					throw std::runtime_error(error.empty()
+						? "The reconstructed live values could not be refreshed" : error);
 				diag::log_tagged_fmt("struct_recon",
 					"refresh_value_history_done");
 			};
@@ -612,6 +631,15 @@ void render(float pos_x, float pos_y, float width, float height,
 			} else {
 				st.operation_error = false;
 				st.operation_status = "Value refresh queued; displayed values remain the last completed snapshot.";
+				aida::ui::task_center::task_registration_t registration;
+				registration.owner = "analysis";
+				registration.owner_view = "view.types.struct_recon";
+				registration.owner_action = "types.structure.refresh_values";
+				registration.label = "Refresh reconstructed live values";
+				registration.stage = "Queued";
+				registration.target = "Address " + std::to_string(base);
+				static_cast<void>(aida::ui::task_center::register_executor_job(
+					refresh_submission.task_id, std::move(registration)));
 			}
 			diag::log_tagged_fmt("struct_recon",
 				"refresh_clicked base=0x%llX",
@@ -646,6 +674,8 @@ void render(float pos_x, float pos_y, float width, float height,
 			st.operation_status = mutation.error;
 		}
 	}
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !refresh_available)
+		ImGui::SetTooltip("Refresh requires a reconstructed structure with a nonzero live base address");
 	if (!st.operation_status.empty()) {
 		dl->AddText(ImVec2(ox + 12.f, cy), aida::ui::with_alpha(
 			st.operation_error ? th.error : (st.operation_pending ? th.warning : th.success), alpha),
@@ -672,11 +702,8 @@ void render(float pos_x, float pos_y, float width, float height,
 		cy += callout_h + 8.f;
 	}
 
-	struct_recon::reconstructed_struct_t current_copy;
-	{
-		std::lock_guard<std::mutex> lk(sr.mutex);
-		current_copy = sr.current;
-	}
+	const struct_recon::reconstructed_struct_t empty_frame_structure;
+	const auto& current_copy = frame_structure ? *frame_structure : empty_frame_structure;
 
 	if (current_copy.fields.empty() && !monitoring) {
 		ImVec2 sz = ImVec2(width, oy + height - cy - 8.f);
@@ -774,11 +801,12 @@ void render(float pos_x, float pos_y, float width, float height,
 	const float per_item_delay = 0.008f;
 	const float total_stagger_cap = 0.240f;
 	int context_request = -1;
+	bool pointer_context_request = false;
 	for (int i = first_vis; i < last_vis; ++i) {
 		float ry = cy + static_cast<float>(i) * row_h - st.scroll_y;
 		if (ry + row_h < cy || ry > oy + height) continue;
 
-		auto& field = current_copy.fields[static_cast<size_t>(i)];
+		const auto& field = current_copy.fields[static_cast<size_t>(i)];
 		auto& fa = fanim(i);
 
 		float entrance_delay = std::min(static_cast<float>(i) * per_item_delay, total_stagger_cap);
@@ -850,6 +878,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		if (right_clicked) {
 			st.selected_field = i;
 			context_request = i;
+			pointer_context_request = true;
 			publish_field_selection(current_copy, field);
 		}
 		const ImGuiIO& field_io = ImGui::GetIO();
@@ -957,17 +986,14 @@ void render(float pos_x, float pos_y, float width, float height,
 		st.context_size = field.size;
 		st.context_name = field.name;
 		st.context_struct_name = current_copy.name;
-		ImGui::OpenPopup("##struct_recon_field_context");
 	}
 
 	ImGui::PopClipRect();
 
-	if (ImGui::BeginPopup("##struct_recon_field_context")) {
-		struct_recon::reconstructed_struct_t live;
-		{
-			std::lock_guard<std::mutex> lock(sr.mutex);
-			live = sr.current;
-		}
+	if (context_request >= 0) {
+		const auto live_snapshot = struct_recon::capture_current_snapshot();
+		const struct_recon::reconstructed_struct_t empty_live_structure;
+		const auto& live = live_snapshot ? *live_snapshot : empty_live_structure;
 		const bool current = context_is_current(live, st);
 		const bool valid_field = current && st.context_field >= 0 &&
 			st.context_field < static_cast<int>(live.fields.size());
@@ -980,57 +1006,94 @@ void render(float pos_x, float pos_y, float width, float height,
 		auto workspace = disasm_view::capture_selected_workspace();
 		const bool mapped = address_valid && workspace &&
 			disasm_view::typed_address(workspace, absolute).has_value();
-		if (!current) {
-			ImGui::TextDisabled("Selection is stale");
-			ImGui::Separator();
-		}
-		if (ImGui::MenuItem("Open field in Disassembly", "Enter", false,
-				current && mapped)) {
-			disasm_view::goto_address(absolute, workspace);
-			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-		}
-		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && !mapped)
-			ImGui::SetTooltip("The field address is not mapped by the selected analysis workspace");
-		if (ImGui::BeginMenu("Access References", valid_field && !field.accesses.empty())) {
-			const size_t shown = (std::min)(field.accesses.size(), static_cast<size_t>(64));
-			for (size_t index = 0; index < shown; ++index) {
-				const auto& access = field.accesses[index];
-				char label[320]{};
-				std::snprintf(label, sizeof(label), "0x%llX  %s  %s",
-					static_cast<unsigned long long>(access.instruction_addr),
-					access.is_write ? "write" : "read", access.disasm_text.c_str());
-				if (ImGui::MenuItem(label)) {
+		aida::ui::application_ui::retained_entity_context_t retained;
+		retained.owner_id = "types.reconstruction.field";
+		retained.entity_id = st.context_struct_name + ":" + st.context_name + ":" +
+			std::to_string(st.context_offset);
+		retained.entity_generation = workspace.publication
+			? workspace.publication->generation : 0;
+		retained.active_view = aida::ui::stable_view_id_t("view.types.struct_recon");
+		const int retained_field = st.context_field;
+		const std::uint64_t retained_base = st.context_base;
+		const std::uint64_t retained_offset = st.context_offset;
+		const int retained_size = st.context_size;
+		const std::string retained_name = st.context_name;
+		const std::string retained_struct_name = st.context_struct_name;
+		retained.validate_identity = [retained_field, retained_base, retained_offset,
+			retained_size, retained_name, retained_struct_name] {
+			const auto snapshot = struct_recon::capture_current_snapshot();
+			if (!snapshot || retained_field < 0 ||
+				retained_field >= static_cast<int>(snapshot->fields.size()) ||
+				snapshot->base_address != retained_base || snapshot->name != retained_struct_name)
+				return aida::ui::capability_state_t::unavailable(
+					"The reconstruction snapshot changed; select the field again");
+			const auto& candidate = snapshot->fields[static_cast<std::size_t>(retained_field)];
+			return candidate.offset == retained_offset && candidate.size == retained_size &&
+				candidate.name == retained_name
+				? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(
+					"The retained field identity no longer matches the live reconstruction");
+		};
+		auto add_action = [&retained](std::string id, bool enabled,
+			const char* reason, auto invoke) {
+			aida::ui::application_ui::retained_entity_action_t action;
+			action.action_id = std::move(id);
+			action.capability = enabled ? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(reason);
+			action.invoke = std::move(invoke);
+			retained.actions.push_back(std::move(action));
+		};
+		add_action("types.reconstruction.field.follow_disassembly", current && mapped,
+			"The field address is not mapped by the selected analysis workspace",
+			[absolute, workspace] {
+				disasm_view::goto_address(absolute, workspace);
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("document.disassembly"));
+				return aida::ui::action_handler_result_t::completed();
+			});
+		const size_t shown = (std::min)(field.accesses.size(), static_cast<size_t>(64));
+		for (size_t index = 0; index < shown; ++index) {
+			const auto access = field.accesses[index];
+			add_action("types.reconstruction.field.follow_access." + std::to_string(index + 1),
+				static_cast<bool>(workspace), "No analysis workspace is selected",
+				[access, workspace] {
 					disasm_view::goto_address(access.instruction_addr, workspace);
-					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-				}
-			}
-			if (field.accesses.size() > shown)
-				ImGui::TextDisabled("%zu more references; use the field detail evidence view",
-					field.accesses.size() - shown);
-			ImGui::EndMenu();
+					aida::ui::application_views::open_or_focus(
+						aida::ui::stable_view_id_t("document.disassembly"));
+					return aida::ui::action_handler_result_t::completed();
+				});
 		}
-		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
-			valid_field && field.accesses.empty())
-			ImGui::SetTooltip("No monitored instruction access references were captured for this field");
-		ImGui::Separator();
-		if (ImGui::MenuItem("Copy field name", "Ctrl+C", false, valid_field))
-			ImGui::SetClipboardText(field.name.c_str());
-		if (ImGui::MenuItem("Copy field type", nullptr, false, valid_field))
-			ImGui::SetClipboardText(struct_recon::field_type_name(field.type));
-		if (ImGui::MenuItem("Copy offset", nullptr, false, valid_field)) {
+		const std::string field_name = field.name;
+		const std::string field_type = valid_field ? struct_recon::field_type_name(field.type) : "";
+		add_action("types.reconstruction.field.copy_name", valid_field,
+			"The retained field is stale", [field_name] {
+				ImGui::SetClipboardText(field_name.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
+		add_action("types.reconstruction.field.copy_type", valid_field,
+			"The retained field is stale", [field_type] {
+				ImGui::SetClipboardText(field_type.c_str());
+				return aida::ui::action_handler_result_t::completed();
+			});
+		add_action("types.reconstruction.field.copy_offset", valid_field,
+			"The retained field is stale", [field] {
 			char text[32]{};
 			std::snprintf(text, sizeof(text), "0x%llX",
 				static_cast<unsigned long long>(field.offset));
 			ImGui::SetClipboardText(text);
-		}
-		if (ImGui::MenuItem("Copy absolute address", nullptr, false, address_valid)) {
+			return aida::ui::action_handler_result_t::completed();
+		});
+		add_action("types.reconstruction.field.copy_absolute_address", address_valid,
+			"The field address overflowed the target address range", [absolute] {
 			char text[32]{};
 			std::snprintf(text, sizeof(text), "0x%llX",
 				static_cast<unsigned long long>(absolute));
 			ImGui::SetClipboardText(text);
-		}
-		if (ImGui::MenuItem("Copy access evidence", nullptr, false,
-				valid_field && !field.accesses.empty())) {
+			return aida::ui::action_handler_result_t::completed();
+		});
+		add_action("types.reconstruction.field.copy_access_evidence",
+			valid_field && !field.accesses.empty(),
+			"No monitored instruction access references were captured for this field", [field] {
 			std::string evidence;
 			for (const auto& access : field.accesses) {
 				char prefix[96]{};
@@ -1042,9 +1105,10 @@ void render(float pos_x, float pos_y, float width, float height,
 				evidence.push_back('\n');
 			}
 			ImGui::SetClipboardText(evidence.c_str());
-		}
-		ImGui::Separator();
-		if (ImGui::MenuItem("Declare and Apply Structure", nullptr, false, valid_field)) {
+			return aida::ui::action_handler_result_t::completed();
+		});
+		add_action("types.reconstruction.field.declare_apply", valid_field,
+			"The retained field is stale", [&st] {
 			const auto result = declare_and_apply_current();
 			st.operation_status = result.detail;
 			st.operation_error = !result.completed;
@@ -1056,22 +1120,30 @@ void render(float pos_x, float pos_y, float width, float height,
 				st.operation_overlay_revision = selected_workspace.workspace
 					? selected_workspace.workspace->overlay_revision() : 0;
 			}
-		}
-		ImGui::MenuItem("Rename field...", nullptr, false, false);
-		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-			ImGui::SetTooltip("The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction");
-		ImGui::MenuItem("Set field type...", nullptr, false, false);
-		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-			ImGui::SetTooltip("The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction");
-		ImGui::MenuItem("Edit live value...", nullptr, false, false);
-		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-			ImGui::SetTooltip("The reconstruction view has no target-session-bound write and readback provider");
-		ImGui::Separator();
-		ImGui::MenuItem("Send Field Evidence to AI Chat", nullptr, false, false);
-		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-			ImGui::SetTooltip("No evidence-review adapter currently accepts reconstruction field snapshots");
-		ImGui::EndPopup();
+			return result.completed ? aida::ui::action_handler_result_t::completed()
+				: aida::ui::action_handler_result_t::failed(result.detail);
+		});
+		add_action("types.reconstruction.field.rename", false,
+			"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction",
+			[] { return aida::ui::action_handler_result_t::completed(); });
+		add_action("types.reconstruction.field.set_type", false,
+			"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction",
+			[] { return aida::ui::action_handler_result_t::completed(); });
+		add_action("types.reconstruction.field.edit_live", false,
+			"The reconstruction view has no target-session-bound write and readback provider",
+			[] { return aida::ui::action_handler_result_t::completed(); });
+		add_action("types.reconstruction.field.send_ai", false,
+			"No evidence-review adapter currently accepts reconstruction field snapshots",
+			[] { return aida::ui::action_handler_result_t::completed(); });
+		aida::ui::application_ui::open_retained_entity_context_menu(
+			std::move(retained), pointer_context_request
+				? aida::ui::context_menu_open_origin_t::pointer
+				: ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+				? aida::ui::context_menu_open_origin_t::menu_key
+				: aida::ui::context_menu_open_origin_t::shift_f10);
 	}
+	aida::ui::application_ui::render_retained_entity_context_menu(
+		"types.reconstruction.field");
 
 	if (content_h > visible_h && visible_h > 0.f) {
 		float bar_x = ox + main_w - 12.f;
@@ -1091,7 +1163,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	if (show_right_panel && st.selected_field >= 0 &&
 		st.selected_field < static_cast<int>(current_copy.fields.size())) {
 
-		auto& sel = current_copy.fields[static_cast<size_t>(st.selected_field)];
+		const auto& sel = current_copy.fields[static_cast<size_t>(st.selected_field)];
 
 		float rp_w = (ox + width - 8.f) - (right_x - 4.f);
 		float rp_h = oy + height - table_top - 8.f;

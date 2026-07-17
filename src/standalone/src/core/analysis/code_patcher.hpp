@@ -3,10 +3,13 @@
 #include "standalone_driver.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -20,6 +23,7 @@ struct patch_entry_t {
 	std::string          description;
 	bool                 active = false;
 	int64_t              timestamp = 0;
+	std::uint32_t        target_pid = 0;
 };
 
 struct code_cave_t {
@@ -28,9 +32,28 @@ struct code_cave_t {
 	std::string module_name;
 };
 
+struct patch_snapshot_row_t {
+	std::uint64_t address = 0;
+	std::size_t patched_size = 0;
+	std::string original;
+	std::string patched;
+	std::string description;
+	bool active = false;
+};
+
+struct patch_snapshot_t {
+	std::uint64_t generation = 1;
+	std::size_t total_count = 0;
+	std::vector<patch_snapshot_row_t> rows;
+};
+
 struct state_t {
 	std::vector<patch_entry_t> patches;
 	std::mutex                 mtx;
+	std::atomic<std::uint64_t> generation{1};
+	std::atomic<std::uint64_t> publication_failure_generation{0};
+	std::shared_ptr<const patch_snapshot_t> publication =
+		std::make_shared<const patch_snapshot_t>();
 };
 
 inline state_t g_state;
@@ -51,6 +74,74 @@ inline std::string format_bytes(const std::vector<uint8_t>& bytes) {
 	}
 	return out;
 }
+
+inline std::string format_bytes_preview(const std::vector<uint8_t>& bytes) {
+	constexpr std::size_t k_max_characters = 22;
+	std::string out;
+	out.reserve(k_max_characters + 3);
+	for (std::size_t i = 0; i < bytes.size(); ++i) {
+		const std::size_t required = i == 0 ? 2U : 3U;
+		if (out.size() + required > k_max_characters) {
+			out.append("...");
+			break;
+		}
+		if (i > 0) out.push_back(' ');
+		char hex[4];
+		std::snprintf(hex, sizeof(hex), "%02X", bytes[i]);
+		out.append(hex);
+	}
+	return out;
+}
+
+inline void publish_snapshot_locked() noexcept {
+	constexpr std::size_t k_max_rows = 4096;
+	const std::uint64_t next_generation =
+		g_state.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+	try {
+		auto next = std::make_shared<patch_snapshot_t>();
+		next->generation = next_generation;
+		next->total_count = g_state.patches.size();
+		const std::size_t row_count = (std::min)(g_state.patches.size(), k_max_rows);
+		next->rows.reserve(row_count);
+		for (std::size_t i = 0; i < row_count; ++i) {
+			const auto& patch = g_state.patches[i];
+			patch_snapshot_row_t row;
+			row.address = patch.address;
+			row.patched_size = patch.patched_bytes.size();
+			row.original = format_bytes_preview(patch.original_bytes);
+			row.patched = format_bytes_preview(patch.patched_bytes);
+			row.description = patch.description;
+			row.active = patch.active;
+			next->rows.push_back(std::move(row));
+		}
+		std::shared_ptr<const patch_snapshot_t> immutable = std::move(next);
+		std::atomic_store_explicit(&g_state.publication, std::move(immutable),
+			std::memory_order_release);
+		g_state.publication_failure_generation.store(0, std::memory_order_release);
+	} catch (...) {
+		g_state.publication_failure_generation.store(next_generation,
+			std::memory_order_release);
+	}
+}
+
+inline std::shared_ptr<const patch_snapshot_t> published_snapshot() {
+	return std::atomic_load_explicit(&g_state.publication, std::memory_order_acquire);
+}
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline const bool g_preview_patch_publication_initialized = [] {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (g_state.patches.empty()) {
+		g_state.patches = {
+			{0x00007FF7A4C16A32, {0x75, 0x14}, {0x90, 0x90}, "Bypass conditional branch", true, 1720946700, 0},
+			{0x00007FF7A4C1B420, {0x48, 0x85, 0xC0}, {0xB0, 0x01, 0x90}, "Force decrypt success", false, 1720946760, 0},
+			{0x00007FF7A4C208F0, {0x74, 0x05}, {0xEB, 0x05}, "Follow unpacked path", true, 1720946820, 0}
+		};
+		publish_snapshot_locked();
+	}
+	return true;
+}();
+#endif
 
 inline std::vector<uint8_t> parse_bytes(const std::string& hex_str) {
 	std::vector<uint8_t> out;
@@ -103,8 +194,11 @@ inline int create_patch(uint64_t address, const std::vector<uint8_t>& new_bytes,
 	if (!driver_bridge::is_loaded()) return -1;
 	if (new_bytes.empty()) return -1;
 
+	const std::uint32_t target_pid = driver_bridge::attached_pid();
+	if (target_pid == 0) return -1;
 	std::vector<uint8_t> orig;
-	if (!driver_bridge::read_memory(address, new_bytes.size(), orig))
+	if (!driver_bridge::read_memory(address, new_bytes.size(), orig) ||
+		driver_bridge::attached_pid() != target_pid)
 		return -1;
 
 	patch_entry_t entry;
@@ -114,6 +208,7 @@ inline int create_patch(uint64_t address, const std::vector<uint8_t>& new_bytes,
 	entry.description = description;
 	entry.active = false;
 	entry.timestamp = current_timestamp();
+	entry.target_pid = target_pid;
 
 	std::lock_guard<std::mutex> lk(g_state.mtx);
 	if (g_state.patches.size() >= static_cast<std::vector<patch_entry_t>::size_type>(
@@ -121,6 +216,36 @@ inline int create_patch(uint64_t address, const std::vector<uint8_t>& new_bytes,
 		return -1;
 	const auto index = g_state.patches.size();
 	g_state.patches.push_back(std::move(entry));
+	publish_snapshot_locked();
+	return static_cast<int>(index);
+}
+
+inline int create_patch_exact(uint64_t address,
+							 const std::vector<uint8_t>& expected_before,
+							 const std::vector<uint8_t>& new_bytes,
+							 std::uint32_t expected_pid,
+							 const std::string& description) {
+	if (expected_pid == 0 || !driver_bridge::is_loaded() ||
+		driver_bridge::attached_pid() != expected_pid || expected_before.empty() ||
+		new_bytes.empty() || expected_before.size() != new_bytes.size()) return -1;
+	std::vector<uint8_t> current;
+	if (!driver_bridge::read_memory(address, expected_before.size(), current) ||
+		driver_bridge::attached_pid() != expected_pid ||
+		current != expected_before) return -1;
+	patch_entry_t entry;
+	entry.address = address;
+	entry.original_bytes = std::move(current);
+	entry.patched_bytes = new_bytes;
+	entry.description = description;
+	entry.active = false;
+	entry.timestamp = current_timestamp();
+	entry.target_pid = expected_pid;
+	std::lock_guard<std::mutex> lk(g_state.mtx);
+	if (g_state.patches.size() >= static_cast<std::vector<patch_entry_t>::size_type>(
+			(std::numeric_limits<int>::max)())) return -1;
+	const auto index = g_state.patches.size();
+	g_state.patches.push_back(std::move(entry));
+	publish_snapshot_locked();
 	return static_cast<int>(index);
 }
 
@@ -132,9 +257,15 @@ inline bool apply_patch(int index) {
 		return false;
 	auto& p = g_state.patches[resolved];
 	if (p.active) return true;
+	if (p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) return false;
+	std::vector<uint8_t> current;
+	if (!driver_bridge::read_memory(p.address, p.original_bytes.size(), current) ||
+		(p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) ||
+		current != p.original_bytes) return false;
 	if (!driver_bridge::write_memory(p.address, p.patched_bytes))
 		return false;
 	p.active = true;
+	publish_snapshot_locked();
 	return true;
 }
 
@@ -146,9 +277,15 @@ inline bool revert_patch(int index) {
 		return false;
 	auto& p = g_state.patches[resolved];
 	if (!p.active) return true;
+	if (p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) return false;
+	std::vector<uint8_t> current;
+	if (!driver_bridge::read_memory(p.address, p.patched_bytes.size(), current) ||
+		(p.target_pid != 0 && driver_bridge::attached_pid() != p.target_pid) ||
+		current != p.patched_bytes) return false;
 	if (!driver_bridge::write_memory(p.address, p.original_bytes))
 		return false;
 	p.active = false;
+	publish_snapshot_locked();
 	return true;
 }
 
@@ -167,22 +304,37 @@ inline bool toggle_patch(int index) {
 }
 
 inline bool remove_patch(int index) {
-	bool need_revert = false;
-	{
-		std::lock_guard<std::mutex> lk(g_state.mtx);
-		std::vector<patch_entry_t>::size_type resolved = 0;
-		if (!resolve_patch_index(index, g_state.patches.size(), resolved))
-			return false;
-		need_revert = g_state.patches[resolved].active;
-	}
-	if (need_revert)
-		revert_patch(index);
 	std::lock_guard<std::mutex> lk(g_state.mtx);
 	std::vector<patch_entry_t>::size_type resolved = 0;
 	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
 		return false;
+	const auto& patch = g_state.patches[resolved];
+	if (patch.active && (!driver_bridge::is_loaded() ||
+		(patch.target_pid != 0 && driver_bridge::attached_pid() != patch.target_pid) ||
+		!driver_bridge::write_memory(patch.address, patch.original_bytes)))
+		return false;
 	g_state.patches.erase(g_state.patches.begin() +
 		static_cast<std::vector<patch_entry_t>::difference_type>(resolved));
+	publish_snapshot_locked();
+	return true;
+}
+
+inline bool remove_patch_exact(int index, uint64_t expected_address,
+							   const std::vector<uint8_t>& expected_bytes) {
+	std::lock_guard<std::mutex> lk(g_state.mtx);
+	std::vector<patch_entry_t>::size_type resolved = 0;
+	if (!resolve_patch_index(index, g_state.patches.size(), resolved))
+		return false;
+	const auto& patch = g_state.patches[resolved];
+	if (patch.address != expected_address || patch.patched_bytes != expected_bytes)
+		return false;
+	if (patch.active && (!driver_bridge::is_loaded() ||
+		(patch.target_pid != 0 && driver_bridge::attached_pid() != patch.target_pid) ||
+		!driver_bridge::write_memory(patch.address, patch.original_bytes)))
+		return false;
+	g_state.patches.erase(g_state.patches.begin() +
+		static_cast<std::vector<patch_entry_t>::difference_type>(resolved));
+	publish_snapshot_locked();
 	return true;
 }
 

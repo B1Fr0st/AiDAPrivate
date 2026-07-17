@@ -4352,7 +4352,6 @@ struct workspace_integration_state_t final {
     std::shared_ptr<navigator::navigator_tree_model_t> navigator_tree;
     std::shared_ptr<navigator::navigator_query_model_t> navigator_query;
     std::shared_ptr<navigator::navigator_navigation_model_t> navigator_nav;
-    std::shared_ptr<document_host::document_host_t> document_host;
     std::shared_ptr<inspector::inspector_query_session_t> inspector_session;
     std::shared_ptr<document_registry_t> document_registry;
     std::shared_ptr<analysis::analysis_workspace_t> analysis_workspace;
@@ -4361,7 +4360,6 @@ struct workspace_integration_state_t final {
     std::shared_ptr<workbench_document_bridge_t> bridge;
     std::shared_ptr<workbench_persistence_adapter_t> persistence_adapter;
     const navigator::navigator_packed_store_adapter_t* navigator_adapter = nullptr;
-    document_host::document_host_services_t host_services;
     std::optional<inspector::inspector_context_t> inspector_context;
 };
 
@@ -4370,7 +4368,6 @@ struct workspace_context_lifetime_t final {
     std::shared_ptr<navigator::navigator_tree_model_t> navigator_tree;
     std::shared_ptr<navigator::navigator_query_model_t> navigator_query;
     std::shared_ptr<navigator::navigator_navigation_model_t> navigator_nav;
-    std::shared_ptr<document_host::document_host_t> document_host;
     std::shared_ptr<inspector::inspector_query_session_t> inspector_session;
     std::shared_ptr<document_registry_t> document_registry;
     std::shared_ptr<analysis::analysis_workspace_t> analysis_workspace;
@@ -4399,19 +4396,11 @@ struct integration_state_t final {
 
 workbench_persistence_dto_t build_default_persistence(
     workspace_id_t workspace,
-    const fixed_layout_constraints_t& layout,
     std::uint32_t history_capacity) {
     workbench_persistence_dto_t dto;
     dto.schema_version = k_workbench_contract_schema_version;
     dto.workspace = workspace;
     dto.revision = workspace_revision_t{1};
-    dto.layout = layout;
-    dto.split_tree.root = split_node_id_t{1};
-    split_node_dto_t root_node;
-    root_node.id = split_node_id_t{1};
-    root_node.kind = split_node_kind_t::leaf;
-    root_node.view = view_id_t{1};
-    dto.split_tree.nodes.push_back(std::move(root_node));
     dto.active_document = document_id_t{1};
     dto.history.workspace = workspace;
     dto.history.capacity = std::min(history_capacity, k_max_history_capacity);
@@ -4436,7 +4425,6 @@ workbench_persistence_dto_t build_default_persistence(
     navigator_panel.workspace = workspace;
     navigator_panel.kind = panel_kind_t::navigator;
     navigator_panel.visible = true;
-    navigator_panel.extent_pixels = layout.navigator_pixels;
     navigator_panel.revision = workspace_revision_t{1};
     dto.panels.push_back(std::move(navigator_panel));
     panel_state_dto_t inspector_panel;
@@ -4444,7 +4432,6 @@ workbench_persistence_dto_t build_default_persistence(
     inspector_panel.workspace = workspace;
     inspector_panel.kind = panel_kind_t::inspector;
     inspector_panel.visible = true;
-    inspector_panel.extent_pixels = layout.inspector_pixels;
     inspector_panel.revision = workspace_revision_t{1};
     dto.panels.push_back(std::move(inspector_panel));
     return dto;
@@ -4490,8 +4477,7 @@ struct workbench_shell_integration_t::impl_t {
         inserted->bridge = std::make_shared<workbench_document_bridge_t>(workspace);
         inserted->document_registry = std::make_shared<document_registry_t>(workspace);
         inserted->persistence = build_default_persistence(
-            workspace, state.config.default_layout,
-            state.config.default_history_capacity);
+            workspace, state.config.default_history_capacity);
         state.workspace_states.emplace(workspace.value, inserted);
         return inserted;
     }
@@ -4508,7 +4494,6 @@ struct workbench_shell_integration_t::impl_t {
         lifetime->navigator_tree = workspace_state->navigator_tree;
         lifetime->navigator_query = workspace_state->navigator_query;
         lifetime->navigator_nav = workspace_state->navigator_nav;
-        lifetime->document_host = workspace_state->document_host;
         lifetime->inspector_session = workspace_state->inspector_session;
         lifetime->document_registry = workspace_state->document_registry;
         lifetime->analysis_workspace = workspace_state->analysis_workspace;
@@ -4524,8 +4509,6 @@ struct workbench_shell_integration_t::impl_t {
             output.navigator_query = lifetime->navigator_query.get();
             output.navigator_nav = lifetime->navigator_nav.get();
         }
-        if (state.config.integrate_document_host)
-            output.document_host = lifetime->document_host.get();
         if (state.config.integrate_inspector)
             output.inspector_session = lifetime->inspector_session.get();
         output.document_registry = lifetime->document_registry.get();
@@ -4616,8 +4599,7 @@ std::shared_ptr<workbench_shell_integration_t>
 workbench_shell_integration_t::create(
     workbench_model_t& model,
     workbench_shell_integration_config_t config) {
-    if (!validate_fixed_layout_constraints(config.default_layout) ||
-        config.default_history_capacity == 0 ||
+    if (config.default_history_capacity == 0 ||
         config.default_history_capacity > k_max_history_capacity ||
         config.retained_generation_limit == 0 ||
         config.retained_overlay_revision_limit == 0 ||
@@ -4743,36 +4725,6 @@ workbench_shell_integration_t::integrate_navigator(
         ws_state->navigator_nav = std::move(navigation);
     }
     impl_->increment_metric(&workbench_shell_metrics_t::navigator_integrations);
-    return workbench_error_t{};
-}
-
-workbench_error_t
-workbench_shell_integration_t::integrate_document_host(
-    workspace_id_t workspace,
-    const document_host::document_host_services_t& services) {
-    if (!impl_)
-        return workbench_error_t{workbench_error_code_t::invalid_workspace};
-    if (!workspace.valid())
-        return workbench_error_t{workbench_error_code_t::invalid_workspace};
-    if (!impl_->state.config.integrate_document_host)
-        return workbench_error_t{};
-    auto ws_state = impl_->ensure_state(workspace);
-    auto effective_services = services;
-    {
-        std::lock_guard<std::mutex> lock(ws_state->mutex);
-        if (!effective_services.documents)
-            effective_services.documents = ws_state->bridge.get();
-        if (!effective_services.navigation)
-            effective_services.navigation = ws_state->bridge.get();
-    }
-    auto host = std::make_shared<document_host::document_host_t>(
-        *impl_->state.model, effective_services);
-    {
-        std::lock_guard<std::mutex> lock(ws_state->mutex);
-        ws_state->host_services = effective_services;
-        ws_state->document_host = std::move(host);
-    }
-    impl_->increment_metric(&workbench_shell_metrics_t::document_host_integrations);
     return workbench_error_t{};
 }
 
@@ -5069,36 +5021,6 @@ workbench_shell_integration_t::dispatch_command(
 }
 
 workbench_error_t
-workbench_shell_integration_t::dispatch_host_command(
-    const document_host::document_host_dispatch_t& dispatch,
-    workbench_command_result_t& output) {
-    if (!impl_)
-        return workbench_error_t{workbench_error_code_t::invalid_workspace};
-    auto ws_state = impl_->get_state(dispatch.workspace);
-    if (!ws_state) {
-        return workbench_error_t{workbench_error_code_t::invalid_workspace,
-            dispatch.workspace.value};
-    }
-    std::shared_ptr<document_host::document_host_t> host;
-    {
-        std::lock_guard<std::mutex> lock(ws_state->mutex);
-        host = ws_state->document_host;
-    }
-    if (!host)
-        return shell_error(workbench_error_code_t::invalid_workspace,
-                           dispatch.workspace.value);
-    output = host->dispatch(dispatch);
-    if (!output.error || !output.snapshot)
-        return output.error;
-    const auto remember_error = impl_->remember_snapshot(ws_state, output.snapshot);
-    if (!remember_error) {
-        output.error = remember_error;
-        return remember_error;
-    }
-    return output.error;
-}
-
-workbench_error_t
 workbench_shell_integration_t::dispatch_navigation(
     workspace_id_t workspace,
     workspace_revision_t expected_revision,
@@ -5183,9 +5105,8 @@ workbench_shell_integration_t::metrics() const noexcept {
 workbench_persistence_dto_t
 workbench_shell_integration_t::create_default_persistence(
     workspace_id_t workspace,
-    const fixed_layout_constraints_t& layout,
     std::uint32_t history_capacity) {
-    return build_default_persistence(workspace, layout, history_capacity);
+    return build_default_persistence(workspace, history_capacity);
 }
 
 namespace {
@@ -5483,7 +5404,7 @@ struct workbench_shell_runtime_t::impl_t {
         binding->model = std::make_unique<workbench_model_t>();
         const auto initial =
             workbench_shell_integration_t::create_default_persistence(
-                binding->workspace, {}, k_default_history_capacity);
+                binding->workspace, k_default_history_capacity);
         workbench_snapshot_ptr_t initial_snapshot;
         const auto created =
             binding->model->create_workspace(initial, initial_snapshot);
@@ -5562,10 +5483,6 @@ workbench_error_t workbench_shell_runtime_t::attach_analysis_workspace(
                 binding->workspace, analysis_workspace);
             if (!integrated)
                 return integrated;
-            const auto host = binding->shell->integrate_document_host(
-                binding->workspace, {});
-            if (!host)
-                return host;
             workbench_snapshot_ptr_t snapshot;
             const auto made_default =
                 binding->shell->make_default_for_analysis(
@@ -6136,43 +6053,6 @@ workbench_error_t workbench_shell_runtime_t::navigate_history(
             if (!inspector_error)
                 return inspector_error;
         }
-        if (result.changed)
-            changed_revision = output.persistence.revision.value;
-    }
-    if (changed_revision != 0)
-        mark_runtime_dirty(binding, changed_revision);
-    return {};
-}
-
-workbench_error_t workbench_shell_runtime_t::dispatch_host_command(
-    const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
-    document_host::document_host_dispatch_t dispatch,
-    workbench_command_result_t& result,
-    workbench_shell_workspace_context_t& output)
-{
-    result = {};
-    const auto attached = attach_analysis_workspace(analysis_workspace, output);
-    if (!attached)
-        return attached;
-    std::shared_ptr<workbench_runtime_binding_t> binding;
-    const auto binding_error = impl_->binding_for(analysis_workspace, binding);
-    if (!binding_error)
-        return binding_error;
-    std::uint64_t changed_revision = 0;
-    {
-        std::lock_guard<std::mutex> lock(binding->lifecycle_mutex);
-        dispatch.workspace = binding->workspace;
-        dispatch.expected_revision = output.persistence.revision;
-        const auto dispatched = binding->shell->dispatch_host_command(
-            dispatch, result);
-        if (!dispatched)
-            return dispatched;
-        const auto* current =
-            binding->shell->workspace_context(binding->workspace);
-        if (!current)
-            return shell_error(workbench_error_code_t::invalid_workspace,
-                               binding->workspace.value);
-        output = *current;
         if (result.changed)
             changed_revision = output.persistence.revision.value;
     }

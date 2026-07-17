@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -360,6 +361,8 @@ struct workspace_state_t
 {
     std::string root_path;
     std::string open_tabs_json;
+    std::string view_visibility_json = "{}";
+    std::string quick_open_mru_json = "{}";
     int         active_tab = -1;
     std::string last_active_path;
     std::string active_view = "editor";
@@ -460,6 +463,13 @@ struct settings_sa_t
 
     std::string terminal_shell = "powershell.exe";
     int         terminal_scrollback = 10000;
+    std::string terminal_profile_id = "configured";
+    std::string terminal_default_cwd;
+    bool        terminal_restore_sessions = true;
+    std::string terminal_sessions_json;
+    std::string programming_tasks_json;
+    std::string programming_selected_task_id;
+    std::string keybinding_overrides_json = "{}";
 
 
     bool        tool_auto_approve    = false;
@@ -1440,6 +1450,13 @@ struct settings_sa_t
         integer("auto_save_interval_s", auto_save_interval_s);
         str("terminal_shell", terminal_shell);
         integer("terminal_scrollback", terminal_scrollback);
+        str("terminal_profile_id", terminal_profile_id);
+        str("terminal_default_cwd", terminal_default_cwd);
+        boolean("terminal_restore_sessions", terminal_restore_sessions);
+        str("terminal_sessions_json", terminal_sessions_json);
+        str("programming_tasks_json", programming_tasks_json);
+        str("programming_selected_task_id", programming_selected_task_id);
+        str("keybinding_overrides_json", keybinding_overrides_json);
         boolean("tool_auto_approve", tool_auto_approve);
         str("tool_always_allow", tool_always_allow);
         str("tool_always_deny", tool_always_deny);
@@ -1543,6 +1560,10 @@ struct settings_sa_t
             const auto& ws = root["workspace"];
             workspace.root_path = json_get_string(ws, "root_path", "");
             workspace.open_tabs_json = json_get_string(ws, "open_tabs_json", "[]");
+            workspace.view_visibility_json = json_get_string(ws, "view_visibility_json", "{}");
+            workspace.quick_open_mru_json = json_get_string(ws, "quick_open_mru_json", "{}");
+            if (workspace.quick_open_mru_json.size() > 256U * 1024U)
+                workspace.quick_open_mru_json = "{}";
             workspace.active_tab = json_get_int(ws, "active_tab", -1);
             workspace.last_active_path = json_get_string(ws, "last_active_path", "");
             workspace.active_view = json_get_string(ws, "active_view", "editor");
@@ -1724,6 +1745,13 @@ struct settings_sa_t
         root["auto_save_interval_s"] = auto_save_interval_s;
         root["terminal_shell"] = terminal_shell;
         root["terminal_scrollback"] = terminal_scrollback;
+        root["terminal_profile_id"] = terminal_profile_id;
+        root["terminal_default_cwd"] = terminal_default_cwd;
+        root["terminal_restore_sessions"] = terminal_restore_sessions;
+        root["terminal_sessions_json"] = terminal_sessions_json;
+        root["programming_tasks_json"] = programming_tasks_json;
+        root["programming_selected_task_id"] = programming_selected_task_id;
+        root["keybinding_overrides_json"] = keybinding_overrides_json;
         root["tool_auto_approve"] = tool_auto_approve;
         root["tool_always_allow"] = tool_always_allow;
         root["tool_always_deny"] = tool_always_deny;
@@ -1815,6 +1843,8 @@ struct settings_sa_t
         root["workspace"] = {
             {"root_path", workspace.root_path},
             {"open_tabs_json", workspace.open_tabs_json},
+            {"view_visibility_json", workspace.view_visibility_json},
+            {"quick_open_mru_json", workspace.quick_open_mru_json},
             {"active_tab", workspace.active_tab},
             {"last_active_path", workspace.last_active_path},
             {"active_view", workspace.active_view}
@@ -1861,6 +1891,11 @@ struct settings_sa_t
         root["provider_headers_overrides"] = header_overrides;
 
         const std::string payload = root.dump(4);
+        constexpr std::size_t maximum_payload_bytes = 16U * 1024U * 1024U;
+        if (payload.empty() || payload.size() > maximum_payload_bytes) {
+            sa_settings_detail::last_error_ref() = "serialized settings payload exceeds the exact bound";
+            return false;
+        }
 
         nlohmann::json verify_parse;
         try {
@@ -1876,29 +1911,43 @@ struct settings_sa_t
 
         auto tmp_path = path;
         tmp_path += L".tmp";
-        {
-            std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
-            if (!ofs.is_open()) {
-                sa_settings_detail::last_error_ref() = "failed to open temp settings file for write";
-                return false;
+        HANDLE file = CreateFileW(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            sa_settings_detail::last_error_ref() = "failed to open temp settings file for write: " +
+                std::to_string(GetLastError());
+            return false;
+        }
+        std::size_t offset = 0;
+        bool wrote = true;
+        while (offset < payload.size()) {
+            const DWORD requested = static_cast<DWORD>((std::min)(payload.size() - offset,
+                static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+            DWORD completed = 0;
+            if (!WriteFile(file, payload.data() + offset, requested, &completed, nullptr) ||
+                completed == 0) {
+                wrote = false;
+                break;
             }
-            ofs.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-            if (!ofs.good()) {
-                sa_settings_detail::last_error_ref() = "failed to write temp settings file";
-                ofs.close();
-                std::error_code rm_ec;
-                std::filesystem::remove(tmp_path, rm_ec);
-                return false;
-            }
-            ofs.flush();
-            ofs.close();
+            offset += completed;
+        }
+        LARGE_INTEGER written_size{};
+        const bool exact_size = wrote && FlushFileBuffers(file) != FALSE &&
+            GetFileSizeEx(file, &written_size) != FALSE && written_size.QuadPart >= 0 &&
+            static_cast<std::uint64_t>(written_size.QuadPart) == payload.size();
+        const DWORD write_error = exact_size ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(file);
+        if (!exact_size) {
+            sa_settings_detail::last_error_ref() = "failed exact settings temp write: " +
+                std::to_string(write_error);
+            DeleteFileW(tmp_path.c_str());
+            return false;
         }
 
         if (!MoveFileExW(tmp_path.c_str(), path.c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             sa_settings_detail::last_error_ref() = "MoveFileExW failed: " + std::to_string(GetLastError());
-            std::error_code rm_ec;
-            std::filesystem::remove(tmp_path, rm_ec);
+            DeleteFileW(tmp_path.c_str());
             return false;
         }
         return true;

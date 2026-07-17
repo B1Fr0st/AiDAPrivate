@@ -92,6 +92,15 @@ void synchronize_target(std::uint32_t target_pid, bool stopped) {
 		stop_address = debugger_engine::cached_registers().rip;
 		stop_thread = debugger_engine::g_state.active_tid;
 	}
+	synchronize_target_snapshot(target_pid, stopped, stop_address, stop_thread);
+}
+
+void synchronize_target_snapshot(std::uint32_t target_pid, bool stopped,
+	std::uint64_t stop_address, std::uint32_t stop_thread) {
+	if (!stopped || target_pid == 0) {
+		stop_address = 0;
+		stop_thread = 0;
+	}
 	if (target_pid != g_target_pid || (!g_stopped && stopped) ||
 		(stopped && g_stopped && target_pid != 0 &&
 			(stop_address != g_stop_address || stop_thread != g_stop_thread))) {

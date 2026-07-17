@@ -11,6 +11,7 @@
 #endif
 
 #include "burp_logger_view.hpp"
+#include "../network_view.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_burp_core.hpp"
 #else
@@ -113,7 +114,14 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SameLine();
     if (aida::ui::button("Clear", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
         ::diag::log_tagged("logger_v", "clear_log");
-        logger::clear();
+        ::aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.logger_view";
+        submission.label = "logger.clear";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::diagnostics;
+        submission.priority = 3;
+        submission.body = []() { logger::clear(); };
+        static_cast<void>(::aida::infra::executor::submit(std::move(submission)));
     }
 
     ImGui::SetCursorPos(ImVec2(8.f, 70.f));
@@ -191,6 +199,17 @@ void render(float pos_x, float pos_y, float width, float height,
         cache.next_refresh_time = now + 0.100;
     }
     const auto& rows = cache.rows;
+    const auto open_row_context = [](const logger::log_row_t& row,
+                                     network_view::exchange_context_origin_t origin) {
+        network_view::artifact_identity_t request;
+        network_view::artifact_identity_t response;
+        std::string reason;
+        static_cast<void>(network_view::make_sitemap_artifact(
+            row.exchange_id, network_view::artifact_kind_t::sitemap_request, request, reason));
+        static_cast<void>(network_view::make_sitemap_artifact(
+            row.exchange_id, network_view::artifact_kind_t::sitemap_response, response, reason));
+        network_view::open_exchange_context(std::move(request), std::move(response), origin);
+    };
 
     ImGui::SetCursorPos(ImVec2(0.f, content_y));
     ImGui::BeginChild("##bl_table", ImVec2(width, content_h), false);
@@ -220,7 +239,19 @@ void render(float pos_x, float pos_y, float width, float height,
                 for (int row_index = clipper.DisplayStart; row_index < clipper.DisplayEnd; ++row_index) {
                     const auto& r = rows[static_cast<std::size_t>(row_index)];
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); ImGui::Text("%llu", static_cast<unsigned long long>(r.id));
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::PushID(row_index);
+                    const bool selected = s_state.selected_row == row_index;
+                    if (ImGui::Selectable("##logger_row", selected,
+                            ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                        s_state.selected_row = row_index;
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                        s_state.selected_row = row_index;
+                        open_row_context(r, network_view::exchange_context_origin_t::pointer);
+                    }
+                    ImGui::SameLine(0.f, 0.f);
+                    ImGui::Text("%llu", static_cast<unsigned long long>(r.id));
+                    ImGui::PopID();
                     ImGui::TableSetColumnIndex(1); ImGui::Text("%llu", static_cast<unsigned long long>(r.ts_ms));
                     ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(r.method.c_str());
                     ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(r.url.c_str());
@@ -231,6 +262,20 @@ void render(float pos_x, float pos_y, float width, float height,
                 }
             }
             ImGui::EndTable();
+        }
+        const bool row_menu_key = s_state.selected_row >= 0 &&
+            s_state.selected_row < static_cast<int>(rows.size()) &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool row_shift_f10 = !row_menu_key && s_state.selected_row >= 0 &&
+            s_state.selected_row < static_cast<int>(rows.size()) &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        if (row_menu_key || row_shift_f10) {
+            open_row_context(rows[static_cast<std::size_t>(s_state.selected_row)],
+                row_menu_key
+                    ? network_view::exchange_context_origin_t::menu_key
+                    : network_view::exchange_context_origin_t::shift_f10);
         }
         if (mono) ImGui::PopFont();
     }

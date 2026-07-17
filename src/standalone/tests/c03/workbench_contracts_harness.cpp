@@ -106,81 +106,15 @@ workbench_persistence_dto_t make_persistence(workspace_id_t workspace)
 
     dto.views = {second_view, first_view};
 
-    split_node_dto_t first_leaf;
-    first_leaf.id = {1};
-    first_leaf.kind = split_node_kind_t::leaf;
-    first_leaf.view = first_view.id;
-
-    split_node_dto_t second_leaf;
-    second_leaf.id = {2};
-    second_leaf.kind = split_node_kind_t::leaf;
-    second_leaf.view = second_view.id;
-
-    split_node_dto_t root;
-    root.id = {3};
-    root.kind = split_node_kind_t::branch;
-    root.orientation = split_orientation_t::vertical;
-    root.ratio_basis_points = 1;
-    root.first = first_leaf.id;
-    root.second = second_leaf.id;
-
-    dto.split_tree.root = root.id;
-    dto.split_tree.nodes = {root, second_leaf, first_leaf};
-
     panel_state_dto_t panel;
     panel.id = {501};
     panel.workspace = workspace;
     panel.kind = panel_kind_t::navigator;
-    panel.extent_pixels = dto.layout.navigator_pixels;
     panel.selected_document = first.id;
     panel.state_token = "navigator:expanded";
     panel.revision = dto.revision;
     dto.panels = {panel};
     return dto;
-}
-
-std::vector<view_persistence_dto_t> make_split_views()
-{
-    return {{{101}}, {{102}}, {{103}}};
-}
-
-split_tree_dto_t make_nested_split_tree(split_orientation_t root_orientation,
-                                        split_orientation_t nested_orientation,
-                                        std::uint16_t root_ratio,
-                                        std::uint16_t nested_ratio)
-{
-    split_node_dto_t first_leaf;
-    first_leaf.id = {1};
-    first_leaf.kind = split_node_kind_t::leaf;
-    first_leaf.view = {101};
-
-    split_node_dto_t second_leaf;
-    second_leaf.id = {2};
-    second_leaf.kind = split_node_kind_t::leaf;
-    second_leaf.view = {102};
-
-    split_node_dto_t third_leaf;
-    third_leaf.id = {3};
-    third_leaf.kind = split_node_kind_t::leaf;
-    third_leaf.view = {103};
-
-    split_node_dto_t nested;
-    nested.id = {4};
-    nested.kind = split_node_kind_t::branch;
-    nested.orientation = nested_orientation;
-    nested.ratio_basis_points = nested_ratio;
-    nested.first = first_leaf.id;
-    nested.second = second_leaf.id;
-
-    split_node_dto_t root;
-    root.id = {5};
-    root.kind = split_node_kind_t::branch;
-    root.orientation = root_orientation;
-    root.ratio_basis_points = root_ratio;
-    root.first = nested.id;
-    root.second = third_leaf.id;
-
-    return {root.id, {first_leaf, second_leaf, third_leaf, nested, root}};
 }
 
 class catalog_adapter_t final : public document_catalog_adapter_t {
@@ -250,16 +184,14 @@ private:
     workbench_persistence_dto_t stored_;
 };
 
-void verify_split_normalization_and_document_identity()
+void verify_flat_view_order_and_document_identity()
 {
     const workspace_id_t workspace{1};
     auto dto = make_persistence(workspace);
-    require(normalize_persistence_dto(dto).ok(), "split fixture must normalize");
-    require(dto.split_tree.nodes.size() == 3, "split fixture node count must be preserved");
-    require(dto.split_tree.nodes[0].id.value == 1 && dto.split_tree.nodes[2].id.value == 3,
-            "split nodes must use deterministic identifier order");
-    require(dto.split_tree.nodes[2].ratio_basis_points == k_split_ratio_min_basis_points,
-            "split ratio must clamp to the fixed lower bound");
+    require(normalize_persistence_dto(dto).ok(), "flat workspace fixture must normalize");
+    require(dto.views.size() == 2 && dto.views[0].id == view_id_t{102} &&
+                dto.views[1].id == view_id_t{101},
+            "logical view order must remain stable during normalization");
 
     const auto original = dto.documents[0].identity;
     auto same = original;
@@ -274,40 +206,6 @@ void verify_split_normalization_and_document_identity()
             "diff documents must retain a stable typed identity");
     require(dto.documents[0].identity.kind == document_kind_t::diff,
             "diff documents must persist through the typed document contract");
-}
-
-void verify_nested_split_layout_extents()
-{
-    const fixed_layout_constraints_t constraints;
-    const auto views = make_split_views();
-    const auto valid_tree = make_nested_split_tree(split_orientation_t::horizontal,
-                                                   split_orientation_t::vertical,
-                                                   k_split_ratio_default_basis_points,
-                                                   k_split_ratio_default_basis_points);
-    require(validate_split_tree(valid_tree, views).ok(),
-            "nested split topology must remain valid without a runtime extent");
-    require(validate_split_tree(valid_tree, views, constraints, {1298, 406}).ok(),
-            "nested horizontal and vertical splits must preserve minimum leaf extents");
-
-    const auto horizontal_underflow = make_nested_split_tree(split_orientation_t::horizontal,
-                                                             split_orientation_t::horizontal,
-                                                             k_split_ratio_default_basis_points,
-                                                             k_split_ratio_min_basis_points);
-    const auto horizontal_result = validate_split_tree(horizontal_underflow, views, constraints,
-                                                       {1298, 200});
-    require(horizontal_result.code == workbench_error_code_t::invalid_split_tree &&
-                horizontal_result.subject == 1,
-            "nested horizontal split must reject a leaf below minimum document width");
-
-    const auto vertical_underflow = make_nested_split_tree(split_orientation_t::vertical,
-                                                           split_orientation_t::vertical,
-                                                           k_split_ratio_default_basis_points,
-                                                           k_split_ratio_min_basis_points);
-    const auto vertical_result = validate_split_tree(vertical_underflow, views, constraints,
-                                                     {320, 818});
-    require(vertical_result.code == workbench_error_code_t::invalid_split_tree &&
-                vertical_result.subject == 1,
-            "nested vertical split must reject a leaf below minimum document height");
 }
 
 void verify_history_and_workspace_isolation()
@@ -361,30 +259,20 @@ void verify_history_and_workspace_isolation()
             "workspace persistence must reject cross-workspace documents");
 }
 
-void verify_fixed_dimensions_and_revisioning()
+void verify_flat_state_and_revisioning()
 {
-    fixed_layout_constraints_t constraints;
-    const auto minimum = minimum_layout_extent(constraints);
-    require(minimum.width_pixels == 1024 && minimum.height_pixels == 514,
-            "default fixed layout dimensions must remain stable");
-    require(layout_extent_satisfies(constraints, minimum),
-            "minimum extent must satisfy fixed layout constraints");
-    require(!layout_extent_satisfies(constraints, {minimum.width_pixels - 1U, minimum.height_pixels}),
-            "undersized fixed layout width must reject");
-    constraints.navigator_pixels = 1;
-    constraints.inspector_pixels = 5000;
-    constraints.bottom_panel_pixels = 1;
-    normalize_fixed_layout_constraints(constraints);
-    require(validate_fixed_layout_constraints(constraints).ok(),
-            "normalized fixed dimensions must validate");
-    require(constraints.navigator_pixels == 160 && constraints.inspector_pixels == 720 &&
-                constraints.bottom_panel_pixels == 120,
-            "fixed layout normalization must use deterministic bounds");
     auto dto = make_persistence({1});
-    require(normalize_persistence_dto(dto).ok(), "fixed panel fixture must normalize");
-    dto.panels[0].extent_pixels += 1U;
-    require(validate_persistence_dto(dto).code == workbench_error_code_t::invalid_panel,
-            "panel state must not diverge from fixed workspace dimensions");
+    require(normalize_persistence_dto(dto).ok(), "flat state fixture must normalize");
+    auto missing_focus = dto;
+    for (auto& view : missing_focus.views)
+        view.focused = false;
+    require(validate_persistence_dto(missing_focus).code == workbench_error_code_t::invalid_view,
+            "flat persistence must retain exactly one focused logical surface");
+    auto conflicting_focus = dto;
+    for (auto& view : conflicting_focus.views)
+        view.focused = true;
+    require(validate_persistence_dto(conflicting_focus).code == workbench_error_code_t::invalid_view,
+            "flat persistence must reject multiple focused logical surfaces");
 
     auto missing_active_document = make_persistence({1});
     missing_active_document.active_document = {};
@@ -427,8 +315,6 @@ void verify_deterministic_persistence_and_adapters()
     auto first = make_persistence({1});
     auto second = first;
     std::swap(second.documents[0], second.documents[1]);
-    std::swap(second.views[0], second.views[1]);
-    std::swap(second.split_tree.nodes[0], second.split_tree.nodes[2]);
     require(normalize_persistence_dto(first).ok() && normalize_persistence_dto(second).ok(),
             "equivalent persistence fixtures must normalize");
     const auto first_fingerprint = persistence_fingerprint(first);
@@ -437,6 +323,12 @@ void verify_deterministic_persistence_and_adapters()
             "canonical persistence values must be deterministic");
     require(persistence_dto_equal(first, second),
             "canonical persistence DTOs must round-trip equivalently");
+    auto reordered_views = first;
+    std::swap(reordered_views.views[0], reordered_views.views[1]);
+    require(normalize_persistence_dto(reordered_views).ok() &&
+                !persistence_dto_equal(first, reordered_views) &&
+                persistence_fingerprint(first) != persistence_fingerprint(reordered_views),
+            "flat logical view order must participate in persistent identity");
     require(first.active_document == document_id_t{11} &&
                 first.documents[0].local_state.cursor.has_position &&
                 first.documents[0].local_state.selection.kind != selection_kind_t::none,
@@ -449,6 +341,8 @@ void verify_deterministic_persistence_and_adapters()
             "document-local cursor state must participate in persistent identity");
     auto active_document_variant = first;
     active_document_variant.active_document = {12};
+    for (auto& view : active_document_variant.views)
+        view.focused = view.document == active_document_variant.active_document;
     require(normalize_persistence_dto(active_document_variant).ok() &&
                 !persistence_dto_equal(first, active_document_variant) &&
                 persistence_fingerprint(first) != persistence_fingerprint(active_document_variant),
@@ -484,10 +378,9 @@ void verify_deterministic_persistence_and_adapters()
 bool run_workbench_contracts_harness(std::string& failure)
 {
     try {
-        verify_split_normalization_and_document_identity();
-        verify_nested_split_layout_extents();
+        verify_flat_view_order_and_document_identity();
         verify_history_and_workspace_isolation();
-        verify_fixed_dimensions_and_revisioning();
+        verify_flat_state_and_revisioning();
         verify_deterministic_persistence_and_adapters();
         failure.clear();
         return true;

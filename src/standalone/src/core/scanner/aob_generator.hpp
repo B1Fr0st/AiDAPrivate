@@ -7,13 +7,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <exception>
 #include <filesystem>
-#include <fstream>
+#include <functional>
+#include <cmath>
 #include <mutex>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -53,6 +56,7 @@ struct signature_t {
 
 struct state_t {
 	std::vector<signature_t> saved_signatures;
+	std::atomic<std::uint64_t> catalog_generation{1};
 	signature_t              current;
 	std::mutex               mutex;
 	std::atomic<bool>        generating{false};
@@ -1015,6 +1019,7 @@ inline void save_current()
 	std::string saved_name = copy.name;
 	size_t bytes_count = copy.bytes.size();
 	g_state.saved_signatures.push_back(std::move(copy));
+	g_state.catalog_generation.fetch_add(1, std::memory_order_acq_rel);
 	diag::log_tagged_fmt("aob", "save_current saved name='%s' bytes=%zu total_saved=%zu",
 		saved_name.c_str(), bytes_count, g_state.saved_signatures.size());
 }
@@ -1040,6 +1045,7 @@ inline void save_current(const std::shared_ptr<state_t>& state)
 	const std::string saved_name = copy.name;
 	const size_t bytes_count = copy.bytes.size();
 	state->saved_signatures.push_back(std::move(copy));
+	state->catalog_generation.fetch_add(1, std::memory_order_acq_rel);
 	diag::log_tagged_fmt("aob", "save_current saved name='%s' bytes=%zu total_saved=%zu",
 		saved_name.c_str(), bytes_count, state->saved_signatures.size());
 }
@@ -1144,6 +1150,7 @@ inline void generate_batch(const std::vector<uint64_t>& addresses, int num_instr
 			{
 				std::lock_guard<std::mutex> lk(g_state.mutex);
 				g_state.saved_signatures.push_back(std::move(sig));
+				g_state.catalog_generation.fetch_add(1, std::memory_order_acq_rel);
 			}
 
 			g_state.batch_done.fetch_add(1);
@@ -1289,228 +1296,224 @@ inline std::string get_aob_cache_dir()
 	return dir;
 }
 
-inline void export_signatures_json(const std::shared_ptr<state_t>& state, const std::string& path)
+enum class export_format_t : std::uint8_t { json, yara, header };
+
+inline constexpr std::size_t max_catalog_entries = 10000;
+inline constexpr std::size_t max_signature_bytes = 4096;
+inline constexpr std::size_t max_catalog_bytes = 4ULL * 1024ULL * 1024ULL;
+inline constexpr std::size_t max_catalog_file_bytes = 64ULL * 1024ULL * 1024ULL;
+
+inline bool valid_catalog_text(const std::string& value, std::size_t maximum)
 {
-	if (!state) return;
-	std::lock_guard<std::mutex> lk(state->mutex);
-	nlohmann::json arr = nlohmann::json::array();
-
-	for (auto& sig : state->saved_signatures) {
-		nlohmann::json obj;
-		obj["id"] = sig.id;
-		obj["name"] = sig.name;
-		obj["address"] = sig.address;
-		obj["module"] = sig.module_name;
-		obj["quality"] = sig.quality_score;
-		obj["unique"] = sig.unique;
-		obj["uniqueness_count"] = sig.uniqueness_count;
-
-		std::string hex = format_signature(sig);
-		obj["pattern"] = hex;
-		obj["ida_pattern"] = format_ida_signature(sig);
-
-		nlohmann::json bytes_arr = nlohmann::json::array();
-		for (auto& b : sig.bytes) {
-			nlohmann::json bo;
-			bo["value"] = b.value;
-			bo["wildcard"] = b.wildcard;
-			bytes_arr.push_back(bo);
-		}
-		obj["bytes"] = bytes_arr;
-		arr.push_back(obj);
-	}
-
-	std::ofstream f(path);
-	if (f.is_open()) {
-		f << arr.dump(2);
-		diag::log_tagged_fmt("aob", "export_signatures_json ok path='%s' count=%zu",
-			path.c_str(), arr.size());
-	} else {
-		diag::log_tagged_fmt("aob", "export_signatures_json failed path='%s'", path.c_str());
-	}
+	if (value.size() > maximum || value.find('\0') != std::string::npos) return false;
+	return std::none_of(value.begin(), value.end(), [](unsigned char character) {
+		return character < 0x20 && character != '\t';
+	});
 }
 
-inline void export_signatures_json(const std::string& path)
+inline bool append_bounded(std::string& output, const std::string& value, std::string& error)
 {
-	export_signatures_json(legacy_state(), path);
+	if (value.size() > max_catalog_file_bytes || output.size() > max_catalog_file_bytes - value.size()) {
+		error = "AOB serialization exceeds the 64 MiB limit";
+		return false;
+	}
+	output += value;
+	return true;
 }
 
-inline void export_signatures_header(const std::shared_ptr<state_t>& state, const std::string& path)
+inline bool serialize_catalog(const std::vector<signature_t>& signatures, export_format_t format,
+	std::string& output, std::string& error,
+	const std::shared_ptr<std::atomic<bool>>& cancellation)
 {
-	if (!state) return;
-	std::lock_guard<std::mutex> lk(state->mutex);
-	std::ofstream f(path);
-	if (!f.is_open()) {
-		diag::log_tagged_fmt("aob", "export_signatures_header failed path='%s'", path.c_str());
-		return;
+	output.clear();
+	if (signatures.size() > max_catalog_entries) {
+		error = "AOB catalog exceeds the 10000-signature limit";
+		return false;
 	}
-
-	f << "#pragma once\n\n";
-	f << "#include <cstdint>\n\n";
-	f << "namespace signatures {\n\n";
-
-	for (auto& sig : state->saved_signatures) {
-		std::string safe_name;
-		for (char c : sig.name) {
-			if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-				(c >= '0' && c <= '9') || c == '_')
-				safe_name += c;
-			else
-				safe_name += '_';
-		}
-		if (safe_name.empty()) safe_name = "unnamed";
-
-		auto code_fmt = format_code_signature(sig);
-		f << "constexpr auto " << safe_name << "_pattern = " << code_fmt << ";\n";
-	}
-
-	f << "\n}\n";
-	diag::log_tagged_fmt("aob", "export_signatures_header ok path='%s' count=%zu",
-		path.c_str(), state->saved_signatures.size());
-}
-
-inline void export_signatures_header(const std::string& path)
-{
-	export_signatures_header(legacy_state(), path);
-}
-
-inline void export_signatures_yara(const std::shared_ptr<state_t>& state, const std::string& path)
-{
-	if (!state) return;
-	std::lock_guard<std::mutex> lk(state->mutex);
-	std::ofstream f(path);
-	if (!f.is_open()) {
-		diag::log_tagged_fmt("aob", "export_signatures_yara failed path='%s'", path.c_str());
-		return;
-	}
-
-	for (auto& sig : state->saved_signatures) {
-		f << format_yara_rule(sig) << "\n";
-	}
-	diag::log_tagged_fmt("aob", "export_signatures_yara ok path='%s' count=%zu",
-		path.c_str(), state->saved_signatures.size());
-}
-
-inline void export_signatures_yara(const std::string& path)
-{
-	export_signatures_yara(legacy_state(), path);
-}
-
-inline void import_signatures_json(const std::shared_ptr<state_t>& state, const std::string& path)
-{
-	if (!state) return;
-	std::ifstream f(path);
-	if (!f.is_open()) {
-		diag::log_tagged_fmt("aob", "import_signatures_json failed_to_open path='%s'", path.c_str());
-		return;
-	}
-
-	nlohmann::json arr;
 	try {
-		f >> arr;
-	} catch (...) {
-		diag::log_tagged_fmt("aob", "import_signatures_json parse_failed path='%s'", path.c_str());
-		return;
-	}
-
-	if (!arr.is_array()) {
-		diag::log_tagged_fmt("aob", "import_signatures_json not_an_array path='%s'", path.c_str());
-		return;
-	}
-
-	std::lock_guard<std::mutex> lk(state->mutex);
-	for (auto& obj : arr) {
-		signature_t sig;
-		sig.id = obj.value("id", static_cast<uint64_t>(0));
-		sig.name = obj.value("name", "");
-		sig.address = obj.value("address", static_cast<uint64_t>(0));
-		sig.module_name = obj.value("module", "");
-		sig.quality_score = obj.value("quality", 0.0f);
-		sig.unique = obj.value("unique", false);
-		sig.uniqueness_count = obj.value("uniqueness_count", 0);
-
-		if (obj.contains("bytes") && obj["bytes"].is_array()) {
-			for (auto& bo : obj["bytes"]) {
-				aob_byte_t b;
-				b.value = bo.value("value", static_cast<uint8_t>(0));
-				b.wildcard = bo.value("wildcard", false);
-				sig.bytes.push_back(b);
+	std::size_t total_bytes = 0;
+	if (format == export_format_t::json) {
+		nlohmann::json array = nlohmann::json::array();
+		for (const auto& signature : signatures) {
+			if (cancellation && cancellation->load(std::memory_order_acquire)) {
+				error = "AOB serialization cancelled";
+				return false;
 			}
+			if (!valid_catalog_text(signature.name, 256) ||
+				!valid_catalog_text(signature.module_name, 512) || signature.bytes.empty() ||
+				signature.bytes.size() > max_signature_bytes ||
+				total_bytes > max_catalog_bytes - signature.bytes.size()) {
+				error = "AOB signature violates catalog field bounds";
+				return false;
+			}
+			total_bytes += signature.bytes.size();
+			nlohmann::json object;
+			object["id"] = signature.id;
+			object["name"] = signature.name;
+			object["address"] = signature.address;
+			object["module"] = signature.module_name;
+			object["quality"] = signature.quality_score;
+			object["unique"] = signature.unique;
+			object["uniqueness_count"] = signature.uniqueness_count;
+			object["pattern"] = format_signature(signature);
+			object["ida_pattern"] = format_ida_signature(signature);
+			object["bytes"] = nlohmann::json::array();
+			for (const auto& byte : signature.bytes)
+				object["bytes"].push_back({{"value", byte.value}, {"wildcard", byte.wildcard}});
+			array.push_back(std::move(object));
 		}
-
-		if (sig.id == 0)
-			sig.id = allocate_signature_id();
-		else {
-			uint64_t expected = g_next_signature_id.load(std::memory_order_relaxed);
-			while (sig.id >= expected &&
-				!g_next_signature_id.compare_exchange_weak(expected, sig.id + 1, std::memory_order_relaxed)) {}
+		output = array.dump(2);
+		if (output.size() > max_catalog_file_bytes) {
+			output.clear();
+			error = "AOB JSON serialization exceeds the 64 MiB limit";
+			return false;
 		}
-
-		if (!sig.bytes.empty())
-			state->saved_signatures.push_back(std::move(sig));
+		return true;
+	}
+	if (format == export_format_t::header &&
+		!append_bounded(output, "#pragma once\n\n#include <cstdint>\n\nnamespace signatures {\n\n", error))
+		return false;
+	for (const auto& signature : signatures) {
+		if (cancellation && cancellation->load(std::memory_order_acquire)) {
+			error = "AOB serialization cancelled";
+			return false;
+		}
+		if (!valid_catalog_text(signature.name, 256) || signature.bytes.empty() ||
+			signature.bytes.size() > max_signature_bytes) {
+			error = "AOB signature violates export field bounds";
+			return false;
+		}
+		if (format == export_format_t::yara) {
+			if (!append_bounded(output, format_yara_rule(signature) + "\n", error)) return false;
+		} else {
+			std::string name;
+			for (const char character : signature.name)
+				name += std::isalnum(static_cast<unsigned char>(character)) || character == '_'
+					? character : '_';
+			if (name.empty()) name = "unnamed";
+			if (std::isdigit(static_cast<unsigned char>(name.front()))) name = "sig_" + name;
+			if (!append_bounded(output, "constexpr auto " + name + "_pattern = " +
+				format_code_signature(signature) + ";\n", error)) return false;
+		}
+	}
+	if (format == export_format_t::header)
+		return append_bounded(output, "\n}\n", error);
+	return true;
+	} catch (const std::exception& exception) {
+		output.clear();
+		error = "AOB serialization failed: " + std::string(exception.what());
+		return false;
 	}
 }
 
-inline void import_signatures_json(const std::string& path)
+inline bool json_depth_within(const std::string& input, std::size_t maximum)
 {
-	import_signatures_json(legacy_state(), path);
-}
-
-inline std::string workspace_cache_path(const disasm_view::workspace_context_t& context)
-{
-	const auto directory = get_aob_cache_dir();
-	if (directory.empty() || !context.workspace) return {};
-	return directory + "\\" + context.workspace->identity().binary_id().to_hex() + ".json";
-}
-
-inline void save_signatures_to_disk(const disasm_view::workspace_context_t& context,
-	const std::shared_ptr<state_t>& state)
-{
-	auto dir = get_aob_cache_dir();
-	if (dir.empty()) {
-		diag::log_tagged("aob", "save_signatures_to_disk no_appdata");
-		return;
+	std::size_t depth = 0;
+	bool string = false;
+	bool escape = false;
+	for (const char character : input) {
+		if (string) {
+			if (escape) escape = false;
+			else if (character == '\\') escape = true;
+			else if (character == '"') string = false;
+			continue;
+		}
+		if (character == '"') string = true;
+		else if (character == '{' || character == '[') {
+			if (++depth > maximum) return false;
+		} else if ((character == '}' || character == ']') && depth != 0) --depth;
 	}
-	std::error_code ec;
-	std::filesystem::create_directories(dir, ec);
-	const std::string path = workspace_cache_path(context);
-	if (path.empty()) return;
-	export_signatures_json(state, path);
+	return !string && depth == 0;
 }
 
-inline void save_signatures_to_disk()
+inline bool parse_catalog(const std::string& input, std::vector<signature_t>& staged,
+	std::uint64_t& maximum_id, std::string& error,
+	const std::shared_ptr<std::atomic<bool>>& cancellation)
 {
-	auto dir = get_aob_cache_dir();
-	if (dir.empty()) return;
-	std::error_code ec;
-	std::filesystem::create_directories(dir, ec);
-	export_signatures_json(dir + "\\saved.json");
-}
-
-inline void load_signatures_from_disk(const disasm_view::workspace_context_t& context,
-	const std::shared_ptr<state_t>& state)
-{
-	const std::string path = workspace_cache_path(context);
-	if (path.empty()) {
-		diag::log_tagged("aob", "load_signatures_from_disk no_appdata");
-		return;
+	staged.clear();
+	maximum_id = 0;
+	if (input.empty() || input.size() > max_catalog_file_bytes || !json_depth_within(input, 16)) {
+		error = "AOB catalog is empty, oversized, malformed, or deeper than 16 levels";
+		return false;
 	}
-	if (!std::filesystem::exists(path)) {
-		diag::log_tagged_fmt("aob", "load_signatures_from_disk missing path='%s'", path.c_str());
-		return;
+	nlohmann::json array;
+	try { array = nlohmann::json::parse(input); }
+	catch (const std::exception& exception) { error = exception.what(); return false; }
+	if (!array.is_array() || array.size() > max_catalog_entries) {
+		error = "AOB catalog root must be an array of at most 10000 signatures";
+		return false;
 	}
-	import_signatures_json(state, path);
-	const size_t total = state ? state->saved_signatures.size() : 0;
-	diag::log_tagged_fmt("aob", "load_signatures_from_disk loaded path='%s' total=%zu",
-		path.c_str(), total);
-}
-
-inline void load_signatures_from_disk()
-{
-	auto dir = get_aob_cache_dir();
-	if (dir.empty()) return;
-	const std::string path = dir + "\\saved.json";
-	if (std::filesystem::exists(path)) import_signatures_json(path);
+	std::set<std::uint64_t> ids;
+	std::size_t total_bytes = 0;
+	try {
+	staged.reserve(array.size());
+	for (const auto& object : array) {
+		if (cancellation && cancellation->load(std::memory_order_acquire)) {
+			error = "AOB catalog import cancelled";
+			return false;
+		}
+		if (!object.is_object() || !object.contains("id") || !object["id"].is_number_unsigned() ||
+			!object.contains("name") || !object["name"].is_string() ||
+			!object.contains("address") || !object["address"].is_number_unsigned() ||
+			!object.contains("module") || !object["module"].is_string() ||
+			!object.contains("quality") || !object["quality"].is_number() ||
+			!object.contains("unique") || !object["unique"].is_boolean() ||
+			!object.contains("uniqueness_count") || !object["uniqueness_count"].is_number_integer() ||
+			!object.contains("pattern") || !object["pattern"].is_string() ||
+			!object.contains("ida_pattern") || !object["ida_pattern"].is_string() ||
+			!object.contains("bytes") || !object["bytes"].is_array()) {
+			error = "AOB catalog signature does not match the complete schema";
+			return false;
+		}
+		signature_t signature;
+		signature.id = object["id"].get<std::uint64_t>();
+		signature.name = object["name"].get<std::string>();
+		signature.address = object["address"].get<std::uint64_t>();
+		signature.module_name = object["module"].get<std::string>();
+		signature.quality_score = object["quality"].get<float>();
+		signature.unique = object["unique"].get<bool>();
+		signature.uniqueness_count = object["uniqueness_count"].get<int>();
+		const std::string pattern = object["pattern"].get<std::string>();
+		const std::string ida_pattern = object["ida_pattern"].get<std::string>();
+		if (signature.id == 0 || !ids.insert(signature.id).second ||
+			!valid_catalog_text(signature.name, 256) || !valid_catalog_text(signature.module_name, 512) ||
+			!std::isfinite(signature.quality_score) || signature.quality_score < 0.0f ||
+			signature.quality_score > 1.0f || signature.uniqueness_count < 0 ||
+			signature.uniqueness_count > 1000000 || object["bytes"].empty() ||
+			object["bytes"].size() > max_signature_bytes || pattern.size() > 12288 ||
+			ida_pattern.size() > 12288) {
+			error = "AOB catalog signature field is invalid or exceeds its bound";
+			return false;
+		}
+		if (total_bytes > max_catalog_bytes - object["bytes"].size()) {
+			error = "AOB catalog byte fields exceed the 4 MiB aggregate limit";
+			return false;
+		}
+		for (const auto& byte : object["bytes"]) {
+			if (!byte.is_object() || !byte.contains("value") || !byte["value"].is_number_unsigned() ||
+				byte["value"].get<std::uint64_t>() > 255 || !byte.contains("wildcard") ||
+				!byte["wildcard"].is_boolean()) {
+				error = "AOB catalog byte field is invalid";
+				return false;
+			}
+			signature.bytes.push_back({static_cast<std::uint8_t>(byte["value"].get<std::uint64_t>()),
+				byte["wildcard"].get<bool>()});
+		}
+		total_bytes += signature.bytes.size();
+		if (pattern != format_signature(signature) || ida_pattern != format_ida_signature(signature)) {
+			error = "AOB catalog pattern fields do not match the validated byte fields";
+			return false;
+		}
+		maximum_id = (std::max)(maximum_id, signature.id);
+		staged.push_back(std::move(signature));
+	}
+	return true;
+	} catch (const std::exception& exception) {
+		staged.clear();
+		maximum_id = 0;
+		error = "AOB catalog validation failed: " + std::string(exception.what());
+		return false;
+	}
 }
 
 struct comparison_result_t {
@@ -1522,38 +1525,75 @@ struct comparison_result_t {
 };
 
 inline std::vector<comparison_result_t> compare_signatures_against_process(
-	std::uint32_t pid, const std::vector<signature_t>& sigs)
+	std::uint32_t pid, const std::vector<signature_t>& sigs,
+	const std::shared_ptr<std::atomic<bool>>& cancellation,
+	const std::function<bool()>& still_current, std::string& error)
 {
 #ifdef AIDA_STANDALONE
 	std::vector<comparison_result_t> results;
-	if (pid == 0) {
-		diag::log_tagged("aob", "compare_signatures_against_process refused missing_pid");
+	if (pid == 0 || sigs.size() > max_catalog_entries) {
+		error = pid == 0 ? "AOB comparison requires an exact process ID" :
+			"AOB comparison exceeds the 10000-signature limit";
 		return results;
+	}
+	std::size_t signature_bytes = 0;
+	for (const auto& signature : sigs) {
+		if (signature.bytes.empty() || signature.bytes.size() > max_signature_bytes ||
+			signature_bytes > max_catalog_bytes - signature.bytes.size()) {
+			error = "AOB comparison signature bytes violate the bounded catalog contract";
+			return results;
+		}
+		signature_bytes += signature.bytes.size();
 	}
 	auto t_start = std::chrono::steady_clock::now();
 	diag::log_tagged_fmt("aob", "compare_signatures_against_process start count=%zu pid=%u",
 		sigs.size(), pid);
+	if (!driver_bridge::is_loaded()) {
+		error = "AOB comparison requires the loaded standalone driver";
+		return results;
+	}
 
 	auto regions = driver_bridge::enumerate_memory_regions_for(pid, 4096);
-	std::vector<uint8_t> all_data;
-	std::vector<std::pair<uint64_t, size_t>> region_map;
+	struct captured_region_t {
+		std::uint64_t base = 0;
+		std::vector<std::uint8_t> bytes;
+	};
+	std::vector<captured_region_t> captured_regions;
+	std::size_t captured_bytes = 0;
+	constexpr std::size_t max_process_bytes = 512ULL * 1024ULL * 1024ULL;
 
 	for (auto& region : regions) {
+		if ((cancellation && cancellation->load(std::memory_order_acquire)) ||
+			(still_current && !still_current())) {
+			error = cancellation && cancellation->load(std::memory_order_acquire)
+				? "AOB comparison cancelled" : "AOB comparison target or source generation changed";
+			return {};
+		}
 		if (region.state != 0x1000) continue;
 		if (region.protect & 0x100) continue;
 		uint32_t prot = region.protect & 0xFF;
 		if (prot == 0x01 || prot == 0x00) continue;
-		if (region.size > 0x10000000) continue;
+		if (region.size > 0x10000000 || region.size > max_process_bytes - captured_bytes) continue;
 
 		std::vector<uint8_t> data;
-		driver_bridge::read_memory_for(pid, region.base, static_cast<size_t>(region.size), data);
+		if (!driver_bridge::read_memory_for(pid, region.base, static_cast<size_t>(region.size), data) ||
+			data.size() != static_cast<std::size_t>(region.size)) continue;
 		if (data.empty()) continue;
-
-		region_map.push_back({region.base, all_data.size()});
-		all_data.insert(all_data.end(), data.begin(), data.end());
+		captured_bytes += data.size();
+		captured_regions.push_back({region.base, std::move(data)});
+	}
+	if (captured_regions.empty()) {
+		error = "AOB comparison could not capture any readable region for the exact process";
+		return results;
 	}
 
 	for (auto& sig : sigs) {
+		if ((cancellation && cancellation->load(std::memory_order_acquire)) ||
+			(still_current && !still_current())) {
+			error = cancellation && cancellation->load(std::memory_order_acquire)
+				? "AOB comparison cancelled" : "AOB comparison target or source generation changed";
+			return {};
+		}
 		comparison_result_t cr;
 		cr.name = sig.name;
 		cr.original_address = sig.address;
@@ -1561,33 +1601,31 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 		cr.new_address = 0;
 		cr.still_found = false;
 
-		if (all_data.empty() || sig.bytes.empty() || sig.bytes.size() > all_data.size()) {
-			results.push_back(cr);
-			continue;
-		}
-
-		for (size_t i = 0; i <= all_data.size() - sig.bytes.size(); ++i) {
-			bool match = true;
-			for (size_t j = 0; j < sig.bytes.size(); ++j) {
-				if (!sig.bytes[j].wildcard && all_data[i + j] != sig.bytes[j].value) {
-					match = false;
-					break;
+		for (const auto& region : captured_regions) {
+			if (sig.bytes.size() > region.bytes.size()) continue;
+			for (size_t i = 0; i <= region.bytes.size() - sig.bytes.size(); ++i) {
+				if ((i & 0x3FFFU) == 0 && ((cancellation && cancellation->load(std::memory_order_acquire)) ||
+					(still_current && !still_current()))) {
+					error = cancellation && cancellation->load(std::memory_order_acquire)
+						? "AOB comparison cancelled" : "AOB comparison target or source generation changed";
+					return {};
 				}
-			}
-			if (match) {
-				cr.match_count++;
-				if (cr.match_count == 1) {
-					uint64_t found_addr = 0;
-					for (auto it = region_map.rbegin(); it != region_map.rend(); ++it) {
-						if (i >= it->second) {
-							found_addr = it->first + (i - it->second);
-							break;
-						}
+				bool match = true;
+				for (size_t j = 0; j < sig.bytes.size(); ++j) {
+					if (!sig.bytes[j].wildcard && region.bytes[i + j] != sig.bytes[j].value) {
+						match = false;
+						break;
 					}
-					cr.new_address = found_addr;
 				}
-				if (cr.match_count > 100) break;
+				if (match) {
+					cr.match_count++;
+					if (cr.match_count == 1) {
+						cr.new_address = region.base + i;
+					}
+					if (cr.match_count > 100) break;
+				}
 			}
+			if (cr.match_count > 100) break;
 		}
 
 		cr.still_found = (cr.match_count > 0);
@@ -1605,17 +1643,10 @@ inline std::vector<comparison_result_t> compare_signatures_against_process(
 #else
 	(void)pid;
 	(void)sigs;
+	(void)cancellation;
+	(void)still_current;
+	error = "AOB process comparison is unavailable in this target";
 	return {};
-#endif
-}
-
-inline std::vector<comparison_result_t> compare_signatures_against_process(
-	const std::vector<signature_t>& sigs)
-{
-#ifdef AIDA_STANDALONE
-	return compare_signatures_against_process(driver_bridge::attached_pid(), sigs);
-#else
-	return compare_signatures_against_process(0, sigs);
 #endif
 }
 

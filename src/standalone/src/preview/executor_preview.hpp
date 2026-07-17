@@ -341,6 +341,7 @@ inline submit_result_t submit(submission_t&& submission) {
 
 inline void drain_preview_frame() {
     taskflow_runtime::check_deadlines();
+    static_cast<void>(taskflow_runtime::drain_preview_work(1));
 }
 
 inline active_snapshot_t active_snapshot() {

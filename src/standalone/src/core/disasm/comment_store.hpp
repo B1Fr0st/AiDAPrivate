@@ -50,6 +50,18 @@ public:
         return output;
     }
 
+    void replace(const std::vector<std::pair<aida::analysis::address_t, std::string>>& values) {
+        std::unordered_map<aida::analysis::address_t, std::string,
+            aida::analysis::address_hash_t> next;
+        next.reserve(values.size());
+        for (const auto& item : values) {
+            if (!item.second.empty())
+                next.insert_or_assign(item.first, item.second);
+        }
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        values_.swap(next);
+    }
+
 private:
     aida::analysis::binary_id_t binary_id_;
     mutable std::shared_mutex mutex_;

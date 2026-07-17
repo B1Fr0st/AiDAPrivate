@@ -162,6 +162,7 @@ namespace mcp_standalone
     };
 
     void register_standalone_tools(server_t& server);
+    tool_result_t read_live_struct(const json& params);
     void register_c03_compatibility_tools(server_t& server);
     void register_c03_compatibility_tools(tool_registry_t& registry);
     std::string handle_body(server_t* self, const std::string& body, const std::function<bool()>& connection_closed = {});

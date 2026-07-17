@@ -140,6 +140,7 @@ struct connection_t
     std::atomic<bool>                connected{false};
     std::atomic<size_t>              frames_sent{0};
     std::atomic<size_t>              frames_received{0};
+    std::atomic<uint64_t>            next_frame_id{1};
     uint64_t                         opened_ms = 0;
     SOCKET                           sock = INVALID_SOCKET;
     SSL_CTX*                         ssl_ctx = nullptr;
@@ -168,6 +169,10 @@ registry_t& registry()
     static registry_t r;
     return r;
 }
+
+std::atomic<uint64_t> s_frame_query_count{0};
+std::atomic<uint64_t> s_frame_count_query_count{0};
+std::atomic<uint64_t> s_connection_query_count{0};
 
 void set_conn_err(connection_t& c, const std::string& msg)
 {
@@ -633,6 +638,7 @@ bool send_frame_internal(connection_t& c, uint8_t opcode, bool fin, bool masked,
     }
     {
         ws_frame_log_t row;
+        row.id       = c.next_frame_id.fetch_add(1);
         row.ts_ms    = now_ms();
         row.outbound = true;
         row.opcode   = opcode;
@@ -706,6 +712,7 @@ void receive_loop(std::shared_ptr<connection_t> cptr)
                 for (size_t i = 0; i < payload.size(); ++i) payload[i] ^= mk[i & 3];
             }
             ws_frame_log_t row;
+            row.id       = c.next_frame_id.fetch_add(1);
             row.ts_ms    = now_ms();
             row.outbound = false;
             row.opcode   = opcode;
@@ -1112,7 +1119,11 @@ bool disconnect_all()
 
 std::vector<ws_status_t> list_connections()
 {
-    diag::log_tagged_fmt("ws_edit", "list_connections entry");
+    const uint64_t query = s_connection_query_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool summarize = query == 1 || (query % 1024U) == 0;
+    if (summarize)
+        diag::log_tagged_fmt("ws_edit", "list_connections query=%llu",
+            static_cast<unsigned long long>(query));
     std::vector<ws_status_t> out;
     auto& r = registry();
     std::lock_guard<std::mutex> lk(r.mtx);
@@ -1127,7 +1138,9 @@ std::vector<ws_status_t> list_connections()
         st.last_error      = get_conn_err(*kv.second);
         out.push_back(std::move(st));
     }
-    diag::log_tagged_fmt("ws_edit", "list_connections result count=%zu", out.size());
+    if (summarize)
+        diag::log_tagged_fmt("ws_edit", "list_connections result query=%llu count=%zu",
+            static_cast<unsigned long long>(query), out.size());
     return out;
 }
 
@@ -1151,6 +1164,18 @@ bool get_status(uint64_t conn_id, ws_status_t& out)
     diag::log_tagged_fmt("ws_edit", "get_status conn_id=%llu connected=%d sent=%zu recv=%zu",
         static_cast<unsigned long long>(conn_id), static_cast<int>(out.connected),
         out.frames_sent, out.frames_received);
+    return true;
+}
+
+bool get_frame(uint64_t conn_id, uint64_t frame_id, ws_frame_log_t& out)
+{
+    auto cptr = find_conn(conn_id);
+    if (!cptr) return false;
+    std::lock_guard<std::mutex> lk(cptr->frames_mtx);
+    const auto found = std::find_if(cptr->frames.begin(), cptr->frames.end(),
+        [frame_id](const ws_frame_log_t& frame) { return frame.id == frame_id; });
+    if (found == cptr->frames.end()) return false;
+    out = *found;
     return true;
 }
 
@@ -1264,8 +1289,11 @@ bool send_close(uint64_t conn_id, uint16_t code, const std::string& reason)
 
 std::vector<ws_frame_log_t> frames(uint64_t conn_id, size_t start, size_t max)
 {
-    diag::log_tagged_fmt("ws_edit", "frames conn_id=%llu start=%zu max=%zu",
-        static_cast<unsigned long long>(conn_id), start, max);
+    const uint64_t query = s_frame_query_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool summarize = query == 1 || (query % 1024U) == 0;
+    if (summarize)
+        diag::log_tagged_fmt("ws_edit", "frames query=%llu conn_id=%llu start=%zu max=%zu",
+            static_cast<unsigned long long>(query), static_cast<unsigned long long>(conn_id), start, max);
     auto cptr = find_conn(conn_id);
     if (!cptr) {
         diag::log_tagged_fmt("ws_edit", "frames not_found conn_id=%llu",
@@ -1275,20 +1303,23 @@ std::vector<ws_frame_log_t> frames(uint64_t conn_id, size_t start, size_t max)
     std::lock_guard<std::mutex> lk(cptr->frames_mtx);
     std::vector<ws_frame_log_t> out;
     if (start >= cptr->frames.size()) {
-        diag::log_tagged_fmt("ws_edit", "frames start_out_of_range start=%zu total=%zu",
-            start, cptr->frames.size());
+        if (summarize)
+            diag::log_tagged_fmt("ws_edit", "frames start_out_of_range start=%zu total=%zu",
+                start, cptr->frames.size());
         return out;
     }
     size_t count = std::min(max == 0 ? cptr->frames.size() : max, cptr->frames.size() - start);
     out.reserve(count);
     for (size_t i = 0; i < count; ++i) out.push_back(cptr->frames[start + i]);
-    diag::log_tagged_fmt("ws_edit", "frames result count=%zu conn_id=%llu",
-        out.size(), static_cast<unsigned long long>(conn_id));
+    if (summarize)
+        diag::log_tagged_fmt("ws_edit", "frames result count=%zu conn_id=%llu",
+            out.size(), static_cast<unsigned long long>(conn_id));
     return out;
 }
 
 size_t frame_count(uint64_t conn_id)
 {
+    const uint64_t query = s_frame_count_query_count.fetch_add(1, std::memory_order_relaxed) + 1;
     auto cptr = find_conn(conn_id);
     if (!cptr) {
         diag::log_tagged_fmt("ws_edit", "frame_count not_found conn_id=%llu",
@@ -1297,8 +1328,9 @@ size_t frame_count(uint64_t conn_id)
     }
     std::lock_guard<std::mutex> lk(cptr->frames_mtx);
     size_t n = cptr->frames.size();
-    diag::log_tagged_fmt("ws_edit", "frame_count conn_id=%llu count=%zu",
-        static_cast<unsigned long long>(conn_id), n);
+    if (query == 1 || (query % 1024U) == 0)
+        diag::log_tagged_fmt("ws_edit", "frame_count query=%llu conn_id=%llu count=%zu",
+            static_cast<unsigned long long>(query), static_cast<unsigned long long>(conn_id), n);
     return n;
 }
 

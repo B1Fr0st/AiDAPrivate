@@ -51,6 +51,10 @@ struct breakpoint_t {
 	bool        persistent_definition = false;
 	bool        definition_resolved = true;
 	std::string definition_status;
+	std::string source_definition_id;
+	std::string source_file;
+	uint32_t    source_line = 0;
+	uint32_t    source_location_ordinal = 0;
 };
 
 struct internal_bp_t {
@@ -285,7 +289,13 @@ void shutdown();
 int  add_breakpoint(uint64_t address, bp_type_t type = bp_type_t::software,
 					const std::string& name = "", const std::string& condition = "",
 					int size = 1);
+int add_source_breakpoint(uint64_t address, const std::string& definition_id,
+	const std::string& file_path, uint32_t line, uint32_t location_ordinal);
 bool remove_breakpoint(int index);
+bool remove_source_breakpoint(const std::string& definition_id,
+	uint32_t location_ordinal);
+bool discard_source_breakpoints_for_target_change(uint32_t previous_pid,
+	uint32_t current_pid);
 bool toggle_breakpoint(int index);
 void clear_all_breakpoints();
 bool set_breakpoint_condition(int index, const std::string& condition);
@@ -327,6 +337,7 @@ bool set_register(const std::string& name, uint64_t value);
 
 
 register_set_t              cached_registers();
+bool                        try_cached_registers(register_set_t& output);
 std::vector<cached_thread_t> cached_thread_list();
 std::vector<uint8_t>        cached_stack_bytes(uint64_t& addr_out);
 std::vector<uint8_t>        cached_dump_bytes(uint64_t& addr_out, size_t& size_out);

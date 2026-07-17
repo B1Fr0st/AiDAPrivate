@@ -1,5 +1,6 @@
 #include "memory_scanner_view.hpp"
 #include "memory_scanner.hpp"
+#include "scanner_task_center.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
 #else
@@ -14,6 +15,8 @@
 #include "hex_view.hpp"
 #include "../debugger/debugger_view.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #include "../helpers/helpers.h"
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
@@ -38,6 +41,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
+#include <initializer_list>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <utility>
 
 namespace memory_scanner_view {
 
@@ -77,6 +85,8 @@ struct column_layout_t {
 
 std::atomic<bool> s_open_result_ctx{false};
 std::atomic<bool> s_open_address_ctx{false};
+std::atomic<int> s_result_context_origin{0};
+std::atomic<int> s_address_context_origin{0};
 std::atomic<bool> s_open_add_dialog{false};
 std::atomic<uint64_t> s_pending_add_addr{0};
 std::atomic<int> s_pending_add_vtype{0};
@@ -84,6 +94,151 @@ std::atomic<int> s_pending_edit_value_index{-1};
 char s_edit_value_buf[128] = {};
 std::atomic<int> s_pending_change_type_index{-1};
 int s_pending_change_type_value = 0;
+
+struct value_write_result_t {
+	memory_interaction::context_t context;
+	memory_scanner::value_type_t value_type = memory_scanner::value_type_t::int32_val;
+	bool verified = false;
+	bool rollback_verified = false;
+	std::string detail;
+};
+
+std::atomic<bool> s_value_write_pending{false};
+std::shared_ptr<const value_write_result_t> s_value_write_completion;
+bool s_value_write_close_requested = false;
+
+memory_interaction::runtime_t runtime_snapshot();
+
+bool request_value_write(const memory_interaction::context_t& context,
+	memory_scanner::value_type_t value_type, std::vector<std::uint8_t> expected,
+	std::string& error) {
+	bool idle = false;
+	if (!s_value_write_pending.compare_exchange_strong(idle, true,
+		std::memory_order_acq_rel)) {
+		error = "Another reviewed memory write is still pending.";
+		return false;
+	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	auto result = std::make_shared<value_write_result_t>();
+	result->context = context;
+	result->value_type = value_type;
+	result->verified = true;
+	result->detail = "Preview memory write verified.";
+	{
+		std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+		if (context.index >= 0 && context.index <
+			static_cast<int>(memory_scanner::g_state.address_list.size()) &&
+			memory_scanner::g_state.address_list[static_cast<std::size_t>(context.index)].address ==
+				context.address)
+			memory_scanner::g_state.address_list[static_cast<std::size_t>(context.index)].last_value =
+				std::move(expected);
+	}
+	std::atomic_store_explicit(&s_value_write_completion,
+		std::shared_ptr<const value_write_result_t>(std::move(result)),
+		std::memory_order_release);
+	s_value_write_pending.store(false, std::memory_order_release);
+	return true;
+#else
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "memory_scanner";
+	submission.label = "Write and verify memory value";
+	submission.thread_class = "live_memory_mutation";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 4;
+	submission.target_pid = context.target_pid;
+	submission.generation = context.scan_revision;
+	submission.ui_access_policy = "completion_snapshot_only";
+	submission.failure_policy = "rollback_and_fail_closed";
+	submission.body = [context, value_type, expected = std::move(expected)]() mutable {
+		auto result = std::make_shared<value_write_result_t>();
+		result->context = context;
+		result->value_type = value_type;
+		try {
+			const auto current_runtime = runtime_snapshot();
+			if (!memory_interaction::is_current(context, current_runtime))
+				result->detail = "The target or scan generation changed before the memory write.";
+			if (result->detail.empty()) {
+				std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+				if (context.index < 0 || context.index >=
+					static_cast<int>(memory_scanner::g_state.address_list.size()))
+					result->detail = "The reviewed address-list entry no longer exists.";
+				else {
+					const auto& entry = memory_scanner::g_state.address_list[
+						static_cast<std::size_t>(context.index)];
+					if (entry.address != context.address || entry.value_type != value_type)
+						result->detail = "The reviewed address-list entry changed before the write.";
+				}
+			}
+			std::vector<std::uint8_t> original;
+			if (result->detail.empty() &&
+				(!driver_bridge::read_memory(context.address, expected.size(), original) ||
+				 original.size() != expected.size()))
+				result->detail = "The original target bytes could not be captured exactly.";
+			if (result->detail.empty() && !driver_bridge::write_memory(context.address, expected))
+				result->detail = "The target rejected the reviewed memory write.";
+			std::vector<std::uint8_t> observed;
+			if (result->detail.empty()) {
+				result->verified = driver_bridge::read_memory(context.address,
+					expected.size(), observed) && observed == expected;
+				if (result->verified) {
+					std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+					result->verified = context.index >= 0 && context.index <
+						static_cast<int>(memory_scanner::g_state.address_list.size()) &&
+						memory_scanner::g_state.address_list[
+							static_cast<std::size_t>(context.index)].address == context.address &&
+						memory_scanner::g_state.address_list[
+							static_cast<std::size_t>(context.index)].value_type == value_type;
+					if (!result->verified)
+						result->detail = "The address-list identity changed while the reviewed write was in flight.";
+				}
+				if (!result->verified) {
+					const bool rolled_back = driver_bridge::write_memory(context.address, original);
+					std::vector<std::uint8_t> rollback_readback;
+					result->rollback_verified = rolled_back && driver_bridge::read_memory(
+						context.address, original.size(), rollback_readback) && rollback_readback == original;
+					const std::string failure = result->detail.empty()
+						? "Memory write verification failed." : result->detail;
+					result->detail = failure + (result->rollback_verified
+						? " Original bytes were restored and verified."
+						: " Original-byte restoration could not be verified.");
+				}
+			}
+			if (result->verified) {
+				std::lock_guard<std::mutex> lock(memory_scanner::g_state.address_mutex);
+				if (context.index >= 0 && context.index <
+					static_cast<int>(memory_scanner::g_state.address_list.size())) {
+					auto& entry = memory_scanner::g_state.address_list[
+						static_cast<std::size_t>(context.index)];
+					if (entry.address == context.address && entry.value_type == value_type)
+						entry.last_value = expected;
+				}
+				result->detail = "Memory value written and read back exactly.";
+			}
+		} catch (const std::exception& exception) {
+			result->detail = std::string("Memory write failed: ") + exception.what();
+		} catch (...) {
+			result->detail = "Memory write failed with an unknown error.";
+		}
+		const bool verified = result->verified;
+		const std::string failure = result->detail;
+		std::atomic_store_explicit(&s_value_write_completion,
+			std::shared_ptr<const value_write_result_t>(std::move(result)),
+			std::memory_order_release);
+		s_value_write_pending.store(false, std::memory_order_release);
+		if (!verified) throw std::runtime_error(failure);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		s_value_write_pending.store(false, std::memory_order_release);
+		error = submitted.reject_reason.empty()
+			? "The memory-write executor rejected the operation." : submitted.reject_reason;
+		return false;
+	}
+	scanner_task_center::register_executor_task(submitted, "view.memory.value_scan",
+		"memory.address.write", "Write and verify memory value", context.target_pid, false);
+	return true;
+#endif
+}
 
 bool input_is_active() {
 	return ImGui::GetActiveID() != 0 && ImGui::IsAnyItemActive();
@@ -203,17 +358,140 @@ memory_interaction::runtime_t runtime_snapshot() {
 	return runtime_snapshot_locked(state.results.size());
 }
 
+std::string s_consumed_memory_action;
+
+const char* memory_action_id(const char* label) {
+	if (std::strcmp(label, "Add to address list") == 0) return "memory.result.add_address";
+	if (std::strcmp(label, "Open in Hex view") == 0) return "memory.entity.open_hex";
+	if (std::strcmp(label, "Open in Disassembly") == 0) return "memory.entity.open_disassembly";
+	if (std::strcmp(label, "Copy address") == 0) return "memory.entity.copy_address";
+	if (std::strcmp(label, "Copy current value") == 0) return "memory.entity.copy_value";
+	if (std::strcmp(label, "Copy previous value") == 0) return "memory.entity.copy_previous";
+	if (std::strcmp(label, "Copy module + offset") == 0) return "memory.entity.copy_module_offset";
+	if (std::strcmp(label, "Stage patch in Patches view...") == 0) return "memory.entity.stage_patch";
+	if (std::strcmp(label, "Edit description") == 0) return "memory.address.edit_description";
+	if (std::strcmp(label, "Change type") == 0) return "memory.address.change_type";
+	if (std::strcmp(label, "Change value...") == 0) return "memory.address.change_value";
+	if (std::strcmp(label, "Freeze") == 0) return "memory.address.freeze";
+	if (std::strcmp(label, "Unfreeze") == 0) return "memory.address.unfreeze";
+	if (std::strcmp(label, "Remove from address list") == 0) return "memory.address.remove";
+	return "";
+}
+
 bool context_item(const char* label,
 	memory_interaction::capability_t capability,
 	const memory_interaction::context_t& context,
 	const memory_interaction::runtime_t& runtime,
-	const char* shortcut = nullptr) {
-	const auto result = memory_interaction::evaluate(capability, context, runtime);
-	const bool activated = ImGui::MenuItem(label, shortcut, false, result.enabled);
-	if (!result.enabled && result.disabled_reason != nullptr &&
-		ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-		ImGui::SetTooltip("%s", result.disabled_reason);
-	return activated;
+	const char* = nullptr) {
+	const auto evaluated = memory_interaction::evaluate(capability, context, runtime);
+	return evaluated.enabled && s_consumed_memory_action == memory_action_id(label);
+}
+
+aida::ui::context_menu_open_origin_t retained_origin(int value) {
+	return value == 1 ? aida::ui::context_menu_open_origin_t::menu_key
+		: value == 2 ? aida::ui::context_menu_open_origin_t::shift_f10
+		: aida::ui::context_menu_open_origin_t::pointer;
+}
+
+aida::ui::application_ui::retained_entity_context_t make_memory_actions(const char* owner,
+	const memory_interaction::context_t& context,
+	const memory_interaction::runtime_t& runtime,
+	std::initializer_list<std::pair<const char*, memory_interaction::capability_t>> actions) {
+	aida::ui::application_ui::retained_entity_context_t retained;
+	retained.owner_id = owner;
+	retained.entity_id = std::to_string(context.address) + ":" + std::to_string(context.index);
+	retained.entity_generation = context.scan_revision;
+	retained.active_view = aida::ui::stable_view_id_t("view.memory.value_scan");
+	const auto selected_workspace = disasm_view::capture_selected_workspace();
+	const auto workspace_generation = selected_workspace.workspace
+		? selected_workspace.workspace->generation() : 0;
+	const std::string static_workspace_id = selected_workspace.workspace
+		? selected_workspace.workspace->identity().binary_id().to_hex() : std::string{};
+	retained.validate_identity = [context, workspace_generation, static_workspace_id]() {
+		if (!memory_interaction::is_current(context, runtime_snapshot()))
+			return aida::ui::capability_state_t::unavailable(
+				"The target, scan publication, or selected memory entity changed.");
+		if (context.source == memory_interaction::source_t::static_binary) {
+			const auto current_workspace = disasm_view::capture_selected_workspace();
+			if (!current_workspace.workspace ||
+				current_workspace.workspace->generation() != workspace_generation ||
+				current_workspace.workspace->identity().binary_id().to_hex() != static_workspace_id)
+				return aida::ui::capability_state_t::unavailable(
+					"The static analysis workspace changed; select the memory entity again.");
+		}
+		return aida::ui::capability_state_t::available();
+	};
+	for (const auto& [id, capability] : actions) {
+		const auto evaluated = memory_interaction::evaluate(capability, context, runtime);
+		retained.actions.push_back({id, evaluated.enabled
+			? aida::ui::capability_state_t::available()
+			: aida::ui::capability_state_t::unavailable(
+				evaluated.disabled_reason ? evaluated.disabled_reason : "The memory action is unavailable."),
+			[]() { return aida::ui::action_handler_result_t::completed(); }});
+	}
+	const char* source_kind = context.kind == memory_interaction::kind_t::scan_result
+		? "memory_scan_result" : context.kind == memory_interaction::kind_t::address_entry
+		? "memory_address_entry" : "memory_entity";
+	char address[24]{};
+	std::snprintf(address, sizeof(address), "0x%016llX",
+		static_cast<unsigned long long>(context.address));
+	aida::automation_ui::entity_evidence::snapshot_t evidence;
+	evidence.workspace_id = context.source == memory_interaction::source_t::live_process
+		? "pid:" + std::to_string(context.target_pid) : static_workspace_id;
+	evidence.source_view_id = "view.memory.value_scan";
+	evidence.source_kind = source_kind;
+	evidence.entity_id = retained.entity_id;
+	evidence.display_label = std::string(source_kind) + " " + address;
+	evidence.excerpt = "Source: " + std::string(context.source == memory_interaction::source_t::live_process
+		? "live process" : "static binary") + "\nPID: " + std::to_string(context.target_pid) +
+		"\nScan revision: " + std::to_string(context.scan_revision) +
+		"\nAddress: " + address + "\nExtent: " + std::to_string(context.extent) +
+		"\nValue: " + context.value + "\nPrevious value: " + context.previous_value +
+		"\nModule offset: " + context.module_offset;
+	evidence.address = context.address;
+	evidence.revision = context.scan_revision;
+	evidence.generation = context.scan_revision;
+	evidence.sensitive = context.source == memory_interaction::source_t::live_process;
+	evidence.return_to_source = [context, workspace_generation,
+		static_workspace_id](std::string& reason) {
+		if (!memory_interaction::is_current(context, runtime_snapshot())) {
+			reason = "The target, scan publication, or retained memory entity changed; capture it again.";
+			return false;
+		}
+		if (context.source == memory_interaction::source_t::static_binary) {
+			const auto current_workspace = disasm_view::capture_selected_workspace();
+			if (!current_workspace.workspace ||
+				current_workspace.workspace->generation() != workspace_generation ||
+				current_workspace.workspace->identity().binary_id().to_hex() != static_workspace_id) {
+				reason = "The static analysis workspace changed; capture the memory entity again.";
+				return false;
+			}
+		}
+		memory_interaction::select(context);
+		const auto opened = aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.memory.value_scan"));
+		if (!opened.ok()) {
+			reason = opened.detail;
+			return false;
+		}
+		reason.clear();
+		return true;
+	};
+	aida::automation_ui::entity_evidence::append_actions(retained, std::move(evidence),
+		context.kind != memory_interaction::kind_t::none && context.address != 0
+			? aida::ui::capability_state_t::available()
+			: aida::ui::capability_state_t::unavailable(
+				"A current retained memory entity with a resolved address is required for evidence handoff."));
+	return retained;
+}
+
+void open_memory_actions(const char* owner,
+	const memory_interaction::context_t& context,
+	const memory_interaction::runtime_t& runtime,
+	std::initializer_list<std::pair<const char*, memory_interaction::capability_t>> actions,
+	aida::ui::context_menu_open_origin_t origin) {
+	aida::ui::application_ui::open_retained_entity_context_menu(
+		make_memory_actions(owner, context, runtime, actions), origin);
 }
 
 void copy_address(std::uint64_t address) {
@@ -442,9 +720,13 @@ void rebuild_sorted_indices(int total) {
 			}
 		};
 
-		auto module_label = [&](const memory_scanner::scan_result_t& r) -> std::string {
-			return compose_module_label(r, regions_snapshot);
-		};
+		std::vector<std::string> module_labels;
+		if (field == result_sort_t::by_module) {
+			module_labels.reserve(static_cast<std::size_t>(safe_total));
+			for (int index = 0; index < safe_total; ++index)
+				module_labels.push_back(compose_module_label(
+					sc.results[static_cast<std::size_t>(index)], regions_snapshot));
+		}
 
 		std::sort(ui.sorted_result_indices.begin(), ui.sorted_result_indices.end(),
 			[&](int aa, int bb) {
@@ -471,9 +753,8 @@ void rebuild_sorted_indices(int total) {
 						break;
 					}
 					case result_sort_t::by_module: {
-						std::string la = module_label(ra);
-						std::string lb = module_label(rb);
-						cmp = la.compare(lb);
+						cmp = module_labels[static_cast<std::size_t>(aa)].compare(
+							module_labels[static_cast<std::size_t>(bb)]);
 						break;
 					}
 					default: break;
@@ -898,7 +1179,7 @@ void update_results_diff_flash(int total, std::uint64_t revision) {
 	ui.last_flash_revision = revision;
 	ui.flash_revision_age = 0.f;
 	ui.last_result_count = static_cast<std::size_t>(total);
-	if (total > 250000) {
+	if (total > 10000) {
 		ui.row_flash.clear();
 		return;
 	}
@@ -955,7 +1236,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		total = static_cast<int>(sc.results.size());
 	}
 	bool include_sb = total > 0;
-	const bool sort_allowed = total <= 250000;
+	const bool sort_allowed = total <= 10000;
 	compute_result_columns(ox, w, cols, content_w_total, include_sb);
 
 	ImFont* hdr_font = aida::ui::fonts::body_em();
@@ -1013,7 +1294,7 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 		if (clicked) {
 			if (!sort_allowed) {
-				toast_notification::push("Refine results below 250,000 rows before changing sort order.",
+				toast_notification::push("Refine results below 10,000 rows before changing sort order.",
 					toast_notification::toast_type_t::warning, 4.f);
 			} else if (ui.result_sort_field == field) {
 				if (!ui.result_sort_desc) ui.result_sort_desc = true;
@@ -1035,13 +1316,15 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	int visible_rows = static_cast<int>(body_h / kResultRowHeight);
 	if (visible_rows < 1) visible_rows = 1;
 
-	std::lock_guard<std::mutex> lk(sc.results_mutex);
-	total = static_cast<int>(sc.results.size());
-	const auto runtime = runtime_snapshot_locked(sc.results.size());
+	memory_interaction::runtime_t runtime;
+	{
+		std::lock_guard<std::mutex> lk(sc.results_mutex);
+		total = static_cast<int>(sc.results.size());
+		runtime = runtime_snapshot_locked(sc.results.size());
 
-	update_results_diff_flash(total, runtime.scan_revision);
+		update_results_diff_flash(total, runtime.scan_revision);
 
-	if (total > 250000 && ui.result_sort_field != result_sort_t::by_index) {
+	if (total > 10000 && ui.result_sort_field != result_sort_t::by_index) {
 		ui.result_sort_field = result_sort_t::by_index;
 		ui.result_sort_desc = false;
 		ui.sorted_result_indices.clear();
@@ -1050,10 +1333,11 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			toast_notification::toast_type_t::info, 4.f);
 	}
 	const bool indexed_sort = ui.result_sort_field != result_sort_t::by_index;
-	if (ui.sorted_indices_dirty ||
-		(indexed_sort && static_cast<int>(ui.sorted_result_indices.size()) != total) ||
-		(!indexed_sort && !ui.sorted_result_indices.empty()))
-		rebuild_sorted_indices(total);
+		if (ui.sorted_indices_dirty ||
+			(indexed_sort && static_cast<int>(ui.sorted_result_indices.size()) != total) ||
+			(!indexed_sort && !ui.sorted_result_indices.empty()))
+			rebuild_sorted_indices(total);
+	}
 
 	{
 		uint64_t cur_gen = 0;
@@ -1100,6 +1384,27 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	int first_row = static_cast<int>(ui.result_sb.scroll_y / kResultRowHeight);
 	if (first_row < 0) first_row = 0;
 	int last_row = std::min(total, first_row + visible_rows + 2);
+	struct visible_result_t {
+		int row = -1;
+		int source_index = -1;
+		memory_scanner::scan_result_t value;
+	};
+	std::vector<visible_result_t> visible_results;
+	{
+		std::lock_guard<std::mutex> lock(sc.results_mutex);
+		total = static_cast<int>(sc.results.size());
+		last_row = std::min(total, first_row + visible_rows + 2);
+		visible_results.reserve(last_row > first_row
+			? static_cast<std::size_t>(last_row - first_row) : 0);
+		for (int row = first_row; row < last_row; ++row) {
+			int source_index = row;
+			if (row >= 0 && row < static_cast<int>(ui.sorted_result_indices.size()))
+				source_index = ui.sorted_result_indices[static_cast<std::size_t>(row)];
+			if (source_index >= 0 && source_index < total)
+				visible_results.push_back({row, source_index,
+					sc.results[static_cast<std::size_t>(source_index)]});
+		}
+	}
 
 	{
 		std::lock_guard<std::mutex> rgk(ui.region_cache.mtx);
@@ -1126,12 +1431,10 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 	float row_right_edge = include_sb ? (ox + w - kScrollbarTrackW - 6.f) : (ox + w);
 
-	for (int i = first_row; i < last_row; ++i) {
-		int src_index = i;
-		if (i >= 0 && i < static_cast<int>(ui.sorted_result_indices.size()))
-			src_index = ui.sorted_result_indices[static_cast<size_t>(i)];
-		if (src_index < 0 || src_index >= total) continue;
-		const auto& r = sc.results[static_cast<size_t>(src_index)];
+	for (const auto& visible : visible_results) {
+		const int i = visible.row;
+		const int src_index = visible.source_index;
+		const auto& r = visible.value;
 
 		float ry = body_y + static_cast<float>(i) * kResultRowHeight - ui.result_sb.scroll_y;
 		if (ry + kResultRowHeight < body_y || ry > body_y + body_h) continue;
@@ -1225,19 +1528,27 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 	ImGui::PopClipRect();
 
+	auto capture_result = [&](int source_index) -> std::optional<memory_scanner::scan_result_t> {
+		if (source_index < 0)
+			return {};
+		std::lock_guard<std::mutex> lock(sc.results_mutex);
+		if (source_index >= static_cast<int>(sc.results.size()))
+			return {};
+		return sc.results[static_cast<std::size_t>(source_index)];
+	};
+
 	if (clicked_row >= 0) {
 		ui.selected_result = clicked_row;
 		handle_multi_select(ui.result_multi_sel, ui.last_result_anchor, clicked_row, total);
 		int source_index = clicked_row;
 		if (source_index < static_cast<int>(ui.sorted_result_indices.size()))
 			source_index = ui.sorted_result_indices[static_cast<std::size_t>(source_index)];
-		if (source_index >= 0 && source_index < total) {
-			const auto& result = sc.results[static_cast<std::size_t>(source_index)];
+		if (const auto result = capture_result(source_index)) {
 			memory_interaction::select(memory_interaction::capture_result(runtime,
-				result.address, source_index,
-				memory_scanner::format_value(result.current_value, sc.config.value_type),
-				memory_scanner::format_value(result.previous_value, sc.config.value_type),
-				compose_module_label(result, regions_snapshot)));
+				result->address, source_index,
+				memory_scanner::format_value(result->current_value, sc.config.value_type),
+				memory_scanner::format_value(result->previous_value, sc.config.value_type),
+				compose_module_label(*result, regions_snapshot)));
 		}
 		diag_logf("results row_click idx=%d multi_count=%zu",
 			clicked_row, ui.result_multi_sel.size());
@@ -1246,8 +1557,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		int src_index = dbl_click_row;
 		if (src_index >= 0 && src_index < static_cast<int>(ui.sorted_result_indices.size()))
 			src_index = ui.sorted_result_indices[static_cast<size_t>(src_index)];
-		if (src_index >= 0 && src_index < total) {
-			uint64_t addr = sc.results[static_cast<size_t>(src_index)].address;
+		if (const auto result = capture_result(src_index)) {
+			uint64_t addr = result->address;
 			diag_logf("results dbl_click_add addr=0x%llX", static_cast<unsigned long long>(addr));
 			s_pending_add_addr.store(addr);
 			s_pending_add_vtype.store(static_cast<int>(sc.config.value_type));
@@ -1258,9 +1569,8 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		int src_index = right_click_row;
 		if (src_index >= 0 && src_index < static_cast<int>(ui.sorted_result_indices.size()))
 			src_index = ui.sorted_result_indices[static_cast<size_t>(src_index)];
-		if (src_index >= 0 && src_index < total) {
-			const auto& result = sc.results[static_cast<size_t>(src_index)];
-			uint64_t addr = result.address;
+		if (const auto result = capture_result(src_index)) {
+			uint64_t addr = result->address;
 			ui.selected_result = right_click_row;
 			if (ui.result_multi_sel.count(right_click_row) == 0) {
 				ui.result_multi_sel.clear();
@@ -1269,10 +1579,11 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 			}
 			ui.result_context = memory_interaction::capture_result(runtime, addr,
 				src_index,
-				memory_scanner::format_value(result.current_value, sc.config.value_type),
-				memory_scanner::format_value(result.previous_value, sc.config.value_type),
-				compose_module_label(result, regions_snapshot));
+				memory_scanner::format_value(result->current_value, sc.config.value_type),
+				memory_scanner::format_value(result->previous_value, sc.config.value_type),
+				compose_module_label(*result, regions_snapshot));
 			memory_interaction::select(ui.result_context);
+			s_result_context_origin.store(0);
 			s_open_result_ctx.store(true);
 			diag_logf("results right_click row=%d addr=0x%llX",
 				right_click_row, static_cast<unsigned long long>(addr));
@@ -1284,13 +1595,13 @@ void render_results_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 		int source_index = ui.selected_result;
 		if (source_index < static_cast<int>(ui.sorted_result_indices.size()))
 			source_index = ui.sorted_result_indices[static_cast<std::size_t>(source_index)];
-		if (source_index >= 0 && source_index < total) {
-			const auto& result = sc.results[static_cast<std::size_t>(source_index)];
+		if (const auto result = capture_result(source_index)) {
 			ui.result_context = memory_interaction::capture_result(runtime,
-				result.address, source_index,
-				memory_scanner::format_value(result.current_value, sc.config.value_type),
-				memory_scanner::format_value(result.previous_value, sc.config.value_type),
-				compose_module_label(result, regions_snapshot));
+				result->address, source_index,
+				memory_scanner::format_value(result->current_value, sc.config.value_type),
+				memory_scanner::format_value(result->previous_value, sc.config.value_type),
+				compose_module_label(*result, regions_snapshot));
+			s_result_context_origin.store(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ? 1 : 2);
 			s_open_result_ctx.store(true);
 		}
 	}
@@ -1505,8 +1816,10 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	if (visible_rows < 1) visible_rows = 1;
 
 	int freeze_toggle_idx = -1;
+	std::uint64_t freeze_toggle_address = 0;
 	bool freeze_toggle_val = false;
 	int delete_idx = -1;
+	std::uint64_t delete_address = 0;
 	int desc_edit_request_idx = -1;
 	int value_edit_request_idx = -1;
 	int change_type_request_idx = -1;
@@ -1514,8 +1827,11 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	memory_interaction::context_t requested_context;
 	const auto runtime = runtime_snapshot();
 
-	std::unique_lock<std::mutex> lk(sc.address_mutex);
-	int total = static_cast<int>(sc.address_list.size());
+	int total = 0;
+	{
+		std::lock_guard<std::mutex> lock(sc.address_mutex);
+		total = static_cast<int>(sc.address_list.size());
+	}
 
 	bool body_hover = ImGui::IsMouseHoveringRect(
 		ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), false) &&
@@ -1542,6 +1858,17 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	int first_row = static_cast<int>(ui.address_sb.scroll_y / kAddrRowHeight);
 	if (first_row < 0) first_row = 0;
 	int last_row = std::min(total, first_row + visible_rows + 2);
+	std::vector<std::pair<int, memory_scanner::address_entry_t>> visible_entries;
+	{
+		std::lock_guard<std::mutex> lock(sc.address_mutex);
+		total = static_cast<int>(sc.address_list.size());
+		last_row = std::min(total, first_row + visible_rows + 2);
+		visible_entries.reserve(last_row > first_row
+			? static_cast<std::size_t>(last_row - first_row) : 0);
+		for (int index = first_row; index < last_row; ++index)
+			visible_entries.emplace_back(index,
+				sc.address_list[static_cast<std::size_t>(index)]);
+	}
 
 	ImGui::PushClipRect(ImVec2(ox, body_y), ImVec2(ox + w, body_y + body_h), true);
 
@@ -1552,7 +1879,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 	float row_right_edge = include_sb ? (ox + w - kScrollbarTrackW - 6.f) : (ox + w);
 
-	for (int i = first_row; i < last_row; ++i) {
+	for (auto& [i, e] : visible_entries) {
 		float ry = body_y + static_cast<float>(i) * kAddrRowHeight - ui.address_sb.scroll_y;
 		if (ry + kAddrRowHeight < body_y || ry > body_y + body_h) continue;
 
@@ -1578,8 +1905,6 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 				aida::ui::with_alpha(t.hover_wash, 0.22f * a));
 		}
 
-		auto& e = sc.address_list[static_cast<size_t>(i)];
-
 		{
 			float box_w = 16.f;
 			float box_h = 16.f;
@@ -1603,6 +1928,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 					context, runtime);
 				if (capability.enabled) {
 					freeze_toggle_idx = i;
+					freeze_toggle_address = e.address;
 					freeze_toggle_val = !e.frozen;
 					diag_logf("address freeze_toggle idx=%d addr=0x%llX now=%d",
 						i, static_cast<unsigned long long>(e.address),
@@ -1745,6 +2071,7 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 				e.address, i, e.frozen,
 				memory_scanner::format_value(e.last_value, e.value_type));
 			memory_interaction::select(requested_context);
+			s_address_context_origin.store(0);
 			ui.selected_address = i;
 			if (ui.address_multi_sel.count(i) == 0) {
 				ui.address_multi_sel.clear();
@@ -1757,20 +2084,31 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 
 		if (sel && ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !input_is_active()) {
 			delete_idx = i;
+			delete_address = e.address;
 			ui.selected_address = -1;
 			diag_logf("address key_delete idx=%d", i);
 			break;
 		}
 	}
 
+	auto capture_address_entry = [&](int index) -> std::optional<memory_scanner::address_entry_t> {
+		if (index < 0)
+			return {};
+		std::lock_guard<std::mutex> lock(sc.address_mutex);
+		if (index >= static_cast<int>(sc.address_list.size()))
+			return {};
+		return sc.address_list[static_cast<std::size_t>(index)];
+	};
 	if (ui.address_pane_focused && memory_interaction::context_key_pressed() &&
-		ui.selected_address >= 0 && ui.selected_address < total) {
+		ui.selected_address >= 0) {
 		const int selected = ui.selected_address;
-		const auto& entry = sc.address_list[static_cast<std::size_t>(selected)];
-		ctx_addr_request_row = selected;
-		requested_context = memory_interaction::capture_address(runtime,
-			entry.address, selected, entry.frozen,
-			memory_scanner::format_value(entry.last_value, entry.value_type));
+		if (const auto entry = capture_address_entry(selected)) {
+			ctx_addr_request_row = selected;
+			requested_context = memory_interaction::capture_address(runtime,
+				entry->address, selected, entry->frozen,
+				memory_scanner::format_value(entry->last_value, entry->value_type));
+			s_address_context_origin.store(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ? 1 : 2);
+		}
 	}
 
 	ImGui::PopClipRect();
@@ -1796,33 +2134,54 @@ void render_address_pane(ImDrawList* dl, float ox, float oy, float w, float h, f
 	}
 
 	if (desc_edit_request_idx >= 0) {
-		ui.desc_edit.active = true;
-		ui.desc_edit.address_index = desc_edit_request_idx;
-		ui.desc_edit.open_from_add_dialog = false;
-		const auto& cur = sc.address_list[static_cast<size_t>(desc_edit_request_idx)].description;
-		_snprintf_s(ui.desc_edit.buf, sizeof(ui.desc_edit.buf), _TRUNCATE,
-			"%s", cur.c_str());
+		if (const auto entry = capture_address_entry(desc_edit_request_idx)) {
+			ui.desc_edit.active = true;
+			ui.desc_edit.address_index = desc_edit_request_idx;
+			ui.desc_edit.open_from_add_dialog = false;
+			_snprintf_s(ui.desc_edit.buf, sizeof(ui.desc_edit.buf), _TRUNCATE,
+				"%s", entry->description.c_str());
+		}
 	}
 
 	if (value_edit_request_idx >= 0) {
-		s_pending_edit_value_index.store(value_edit_request_idx);
-		const auto& e = sc.address_list[static_cast<size_t>(value_edit_request_idx)];
-		std::string vs = memory_scanner::format_value(e.last_value, e.value_type);
-		_snprintf_s(s_edit_value_buf, sizeof(s_edit_value_buf), _TRUNCATE, "%s", vs.c_str());
+		if (const auto entry = capture_address_entry(value_edit_request_idx)) {
+			s_pending_edit_value_index.store(value_edit_request_idx);
+			std::string vs = memory_scanner::format_value(entry->last_value, entry->value_type);
+			_snprintf_s(s_edit_value_buf, sizeof(s_edit_value_buf), _TRUNCATE, "%s", vs.c_str());
+		}
 	}
 
 	if (change_type_request_idx >= 0) {
-		s_pending_change_type_index.store(change_type_request_idx);
-		s_pending_change_type_value = static_cast<int>(
-			sc.address_list[static_cast<size_t>(change_type_request_idx)].value_type);
+		if (const auto entry = capture_address_entry(change_type_request_idx)) {
+			s_pending_change_type_index.store(change_type_request_idx);
+			s_pending_change_type_value = static_cast<int>(entry->value_type);
+		}
 	}
 
-	lk.unlock();
-
-	if (freeze_toggle_idx >= 0)
-		memory_scanner::freeze_address(static_cast<size_t>(freeze_toggle_idx), freeze_toggle_val);
-	if (delete_idx >= 0)
-		memory_scanner::remove_address(static_cast<size_t>(delete_idx));
+	if (freeze_toggle_idx >= 0) {
+		const auto current = capture_address_entry(freeze_toggle_idx);
+		if (current && current->address == freeze_toggle_address)
+			memory_scanner::freeze_address(static_cast<size_t>(freeze_toggle_idx), freeze_toggle_val);
+	}
+	if (delete_idx >= 0) {
+		const auto current = capture_address_entry(delete_idx);
+		if (current && current->address == delete_address) {
+			auto context = memory_interaction::capture_address(runtime,
+				current->address, delete_idx, current->frozen,
+				memory_scanner::format_value(current->last_value, current->value_type));
+			ui.address_context = context;
+			auto retained = make_memory_actions("memory.value_scan.address",
+				context, runtime, {{"memory.address.remove",
+					memory_interaction::capability_t::remove}});
+			const auto executed = aida::ui::application_ui::execute_retained_entity_action(
+				"memory.address.remove", aida::ui::action_invocation_source_t::shortcut,
+				retained);
+			if (executed.executed()) {
+				ui.address_multi_sel.clear();
+				ui.address_multi_sel.insert(delete_idx);
+			}
+		}
+	}
 }
 
 void render_splitter(ImDrawList* dl, float ox, float oy, float w, float a,
@@ -2108,7 +2467,20 @@ void process_edit_description_dialog() {
 void process_edit_value_dialog() {
 	auto& sc = memory_scanner::g_state;
 	int idx = s_pending_edit_value_index.load();
-	if (idx < 0) return;
+	auto completion = std::atomic_exchange_explicit(&s_value_write_completion,
+		std::shared_ptr<const value_write_result_t>{}, std::memory_order_acq_rel);
+	if (completion) {
+		toast_notification::push(completion->detail,
+			completion->verified ? toast_notification::toast_type_t::success
+				: toast_notification::toast_type_t::error,
+			completion->verified ? 3.f : 6.f);
+		if (completion->verified && idx == completion->context.index)
+			s_value_write_close_requested = true;
+	}
+	if (idx < 0) {
+		s_value_write_close_requested = false;
+		return;
+	}
 
 	static bool s_ev_was_open = false;
 	bool is_open_now = ImGui::IsPopupOpen("##value_scan_edit_value");
@@ -2135,6 +2507,12 @@ void process_edit_value_dialog() {
 		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
 		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
 	{
+		if (s_value_write_close_requested) {
+			s_value_write_close_requested = false;
+			s_pending_edit_value_index.store(-1);
+			s_ev_was_open = false;
+			ImGui::CloseCurrentPopup();
+		}
 		ImFont* h_fn = aida::ui::fonts::h2();
 		ImGui::PushFont(h_fn);
 		ImGui::TextUnformatted("Change value");
@@ -2175,6 +2553,8 @@ void process_edit_value_dialog() {
 		float region_w = ImGui::GetContentRegionAvail().x;
 		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + region_w - total_btn_w);
 
+		const bool write_pending = s_value_write_pending.load(std::memory_order_acquire);
+		if (write_pending) ImGui::BeginDisabled();
 		bool cancel_clicked = aida::ui::button("Cancel",
 			aida::ui::button_kind_t::ghost, aida::ui::size_t_::md,
 			ImVec2(btn_w, 0.f));
@@ -2182,13 +2562,15 @@ void process_edit_value_dialog() {
 		bool write_clicked = aida::ui::button("Write",
 			aida::ui::button_kind_t::primary, aida::ui::size_t_::md,
 			ImVec2(btn_w, 0.f));
+		if (write_pending) ImGui::EndDisabled();
+		if (write_pending) ImGui::TextDisabled("Writing, verifying, and retaining rollback bytes...");
 
-		if (cancel_clicked || esc_cancel) {
+		if (!write_pending && (cancel_clicked || esc_cancel)) {
 			diag_log("dialog edit_value_cancel");
 			ImGui::CloseCurrentPopup();
 			s_pending_edit_value_index.store(-1);
 			s_ev_was_open = false;
-		} else if (write_clicked || enter_submit) {
+		} else if (!write_pending && (write_clicked || enter_submit)) {
 			std::string text(s_edit_value_buf);
 			const auto runtime = runtime_snapshot();
 			const auto context = memory_interaction::capture_address(runtime,
@@ -2204,24 +2586,18 @@ void process_edit_value_dialog() {
 					toast_notification::push("Value is invalid for the selected type.",
 						toast_notification::toast_type_t::error, 4.f);
 				} else {
-					const std::string expected = memory_scanner::format_value(expected_bytes, vt);
-					memory_scanner::write_value(addr_v, vt, text, sc.config.hex_input);
-					const std::string observed = memory_scanner::read_value_string(addr_v, vt);
-					const bool verified = !observed.empty() && observed == expected;
-					diag_logf("dialog edit_value_write addr=0x%llX val='%s' verified=%d observed='%s'",
-						static_cast<unsigned long long>(addr_v), text.c_str(),
-						static_cast<int>(verified), observed.c_str());
-					anti_tamper::webhook::write_log("scan_audit",
-						"[scan_audit] memory_scanner write_value readback");
-					if (verified) {
-						toast_notification::push("Value written and verified.",
-							toast_notification::toast_type_t::success, 2.f);
-						ImGui::CloseCurrentPopup();
-						s_pending_edit_value_index.store(-1);
-						s_ev_was_open = false;
-					} else {
-						toast_notification::push("Write could not be verified; target memory may be stale or protected.",
+					std::string error;
+					if (!request_value_write(context, vt, expected_bytes, error))
+						toast_notification::push(error,
 							toast_notification::toast_type_t::error, 5.f);
+					else {
+						diag_logf("dialog edit_value_queued addr=0x%llX pid=%u revision=%llu",
+							static_cast<unsigned long long>(addr_v), context.target_pid,
+							static_cast<unsigned long long>(context.scan_revision));
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						anti_tamper::webhook::write_log("scan_audit",
+							"[scan_audit] memory_scanner write_value queued_for_worker_readback");
+#endif
 					}
 				}
 			}
@@ -2334,33 +2710,25 @@ void process_change_type_dialog() {
 void process_result_context_menu() {
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
-	if (s_open_result_ctx.load()) {
-		s_open_result_ctx.store(false);
-		ImGui::OpenPopup("##value_scan_result_ctx");
-	}
-
 	const auto runtime = runtime_snapshot();
 	const auto context = ui.result_context;
 	uint64_t ctx_addr = context.address;
-	const auto& t = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f);
-
-	if (ImGui::BeginPopup("##value_scan_result_ctx")) {
+	if (s_open_result_ctx.exchange(false))
+		open_memory_actions("memory.value_scan.result", context, runtime, {
+			{"memory.result.add_address", memory_interaction::capability_t::add_to_address_list},
+			{"memory.entity.open_hex", memory_interaction::capability_t::open_hex},
+			{"memory.entity.open_disassembly", memory_interaction::capability_t::open_disassembly},
+			{"memory.entity.copy_address", memory_interaction::capability_t::copy_address},
+			{"memory.entity.copy_value", memory_interaction::capability_t::copy_value},
+			{"memory.entity.copy_previous", memory_interaction::capability_t::copy_previous_value},
+			{"memory.entity.copy_module_offset", memory_interaction::capability_t::copy_module_offset},
+			{"memory.entity.stage_patch", memory_interaction::capability_t::stage_patch}},
+			retained_origin(s_result_context_origin.load()));
+	aida::ui::application_ui::render_retained_entity_context_menu("memory.value_scan.result");
+	s_consumed_memory_action = aida::ui::application_ui::consume_retained_entity_action(
+		"memory.value_scan.result", (std::to_string(context.address) + ":" + std::to_string(context.index)).c_str());
+	if (!s_consumed_memory_action.empty()) {
 		size_t multi_count = ui.result_multi_sel.size();
-		if (multi_count > 1) {
-			char hdr[64];
-			snprintf(hdr, sizeof(hdr), "%zu selected", multi_count);
-			ImGui::TextDisabled("%s", hdr);
-			ImGui::Separator();
-		}
-		ImGui::TextDisabled("%s  |  %s",
-			context.source == memory_interaction::source_t::live_process ? "Live process" :
-				(context.source == memory_interaction::source_t::static_binary ? "Static binary" : "No source"),
-			context.module_offset.empty() ? "absolute address" : context.module_offset.c_str());
-		ImGui::Separator();
 		if (context_item("Add to address list", memory_interaction::capability_t::add_to_address_list,
 			context, runtime, "Enter")) {
 			diag_logf("ctx_result add_to_list count=%zu primary_addr=0x%llX",
@@ -2402,7 +2770,7 @@ void process_result_context_menu() {
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
 				const auto context = disasm_view::capture_selected_workspace();
-				if (hex_view::read_live_memory(context, ctx_addr, 256))
+				if (hex_view::request_live_memory(context, ctx_addr, 256))
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] memory_scanner ctx open_hex");
@@ -2420,7 +2788,6 @@ void process_result_context_menu() {
 					"[scan_audit] memory_scanner ctx open_disasm");
 			}
 		}
-		ImGui::Separator();
 		if (context_item("Copy address", memory_interaction::capability_t::copy_address,
 			context, runtime, "Ctrl+C")) {
 			copy_address(ctx_addr);
@@ -2437,7 +2804,6 @@ void process_result_context_menu() {
 		if (context_item("Copy module + offset", memory_interaction::capability_t::copy_module_offset,
 			context, runtime))
 			ImGui::SetClipboardText(context.module_offset.c_str());
-		ImGui::Separator();
 		if (context_item("Stage patch in Patches view...", memory_interaction::capability_t::stage_patch,
 			context, runtime)) {
 			std::string error;
@@ -2450,45 +2816,38 @@ void process_result_context_menu() {
 			else
 				toast_notification::push(error.c_str(), toast_notification::toast_type_t::warning, 4.f);
 		}
-		ImGui::EndPopup();
 	}
-
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor(3);
+	s_consumed_memory_action.clear();
 }
 
 void process_address_context_menu() {
 	auto& sc = memory_scanner::g_state;
 	auto& ui = g_ui;
-	if (s_open_address_ctx.load()) {
-		s_open_address_ctx.store(false);
-		ImGui::OpenPopup("##value_scan_addr_ctx");
-	}
-
 	const auto runtime = runtime_snapshot();
 	auto context = ui.address_context;
 	uint64_t ctx_addr = context.address;
 	int ctx_row = find_address_index(ctx_addr);
 	if (ctx_row < 0)
 		context.kind = memory_interaction::kind_t::none;
-	const auto& t = aida::ui::resolved();
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f);
-
-	if (ImGui::BeginPopup("##value_scan_addr_ctx")) {
-		ImGui::TextDisabled("Live watch  |  0x%016" PRIX64, ctx_addr);
-		if (ctx_row < 0)
-			ImGui::TextDisabled("Entry removed; select it again.");
-		ImGui::Separator();
+	if (s_open_address_ctx.exchange(false))
+		open_memory_actions("memory.value_scan.address", context, runtime, {
+			{"memory.address.edit_description", memory_interaction::capability_t::edit_description},
+			{"memory.address.change_type", memory_interaction::capability_t::change_type},
+			{"memory.address.change_value", memory_interaction::capability_t::change_value},
+			{context.frozen ? "memory.address.unfreeze" : "memory.address.freeze",
+				context.frozen ? memory_interaction::capability_t::unfreeze : memory_interaction::capability_t::freeze},
+			{"memory.entity.open_hex", memory_interaction::capability_t::open_hex},
+			{"memory.entity.open_disassembly", memory_interaction::capability_t::open_disassembly},
+			{"memory.entity.copy_address", memory_interaction::capability_t::copy_address},
+			{"memory.entity.copy_value", memory_interaction::capability_t::copy_value},
+			{"memory.entity.stage_patch", memory_interaction::capability_t::stage_patch},
+			{"memory.address.remove", memory_interaction::capability_t::remove}},
+			retained_origin(s_address_context_origin.load()));
+	aida::ui::application_ui::render_retained_entity_context_menu("memory.value_scan.address");
+	s_consumed_memory_action = aida::ui::application_ui::consume_retained_entity_action(
+		"memory.value_scan.address", (std::to_string(context.address) + ":" + std::to_string(context.index)).c_str());
+	if (!s_consumed_memory_action.empty()) {
 		size_t multi_count = ui.address_multi_sel.size();
-		if (multi_count > 1) {
-			char hdr[64];
-			snprintf(hdr, sizeof(hdr), "%zu selected", multi_count);
-			ImGui::TextDisabled("%s", hdr);
-			ImGui::Separator();
-		}
 		if (context_item("Edit description", memory_interaction::capability_t::edit_description,
 			context, runtime)) {
 			diag_logf("ctx_addr edit_description row=%d", ctx_row);
@@ -2535,14 +2894,13 @@ void process_address_context_menu() {
 			context.frozen = !context.frozen;
 			ui.address_context.frozen = context.frozen;
 		}
-		ImGui::Separator();
 		if (context_item("Open in Hex view", memory_interaction::capability_t::open_hex,
 			context, runtime)) {
 			diag_logf("ctx_addr open_hex addr=0x%llX",
 				static_cast<unsigned long long>(ctx_addr));
 			if (ctx_addr != 0) {
 				const auto context = disasm_view::capture_selected_workspace();
-				if (hex_view::read_live_memory(context, ctx_addr, 256))
+				if (hex_view::request_live_memory(context, ctx_addr, 256))
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] address_list ctx open_hex");
@@ -2560,7 +2918,6 @@ void process_address_context_menu() {
 					"[scan_audit] address_list ctx open_disasm");
 			}
 		}
-		ImGui::Separator();
 		if (context_item("Copy address", memory_interaction::capability_t::copy_address,
 			context, runtime, "Ctrl+C")) {
 			copy_address(ctx_addr);
@@ -2569,7 +2926,6 @@ void process_address_context_menu() {
 		if (context_item("Copy current value", memory_interaction::capability_t::copy_value,
 			context, runtime))
 			ImGui::SetClipboardText(context.value.c_str());
-		ImGui::Separator();
 		if (context_item("Stage patch in Patches view...", memory_interaction::capability_t::stage_patch,
 			context, runtime)) {
 			std::uint64_t extent = 1;
@@ -2587,7 +2943,6 @@ void process_address_context_menu() {
 			else
 				toast_notification::push(error.c_str(), toast_notification::toast_type_t::warning, 4.f);
 		}
-		ImGui::Separator();
 		if (context_item("Remove from address list", memory_interaction::capability_t::remove,
 			context, runtime, "Delete")) {
 			diag_logf("ctx_addr remove row=%d multi=%zu", ctx_row, multi_count);
@@ -2605,11 +2960,8 @@ void process_address_context_menu() {
 			anti_tamper::webhook::write_log("scan_audit",
 				"[scan_audit] address_list ctx remove");
 		}
-		ImGui::EndPopup();
 	}
-
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor(3);
+	s_consumed_memory_action.clear();
 }
 
 }

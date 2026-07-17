@@ -5,10 +5,17 @@
 #include "../core/analysis/workspace/overlay_journal.hpp"
 #include "../core/workbench/workbench_shell_integration.hpp"
 
+#include <Zydis/Zydis.h>
+
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
+#include <optional>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -335,10 +342,30 @@ std::shared_ptr<const pe_image_t> pe_image_t::create_preview() {
     image->imports_.push_back({"KERNEL32.dll", std::string("CreateFileW"),
                                std::nullopt, std::nullopt, 0x3080, 0x4080,
                                false});
-    image->imports_.push_back({"USER32.dll", std::string("MessageBoxW"),
+    image->imports_.push_back({"KERNEL32.dll", std::string("ReadFile"),
                                std::nullopt, std::nullopt, 0x3090, 0x4090,
                                false});
-    image->exports_.push_back({std::string("AnalyzeTarget"), 1, 0x1180,
+    image->imports_.push_back({"KERNEL32.dll", std::string("VirtualAlloc"),
+                               std::nullopt, std::nullopt, 0x30A0, 0x40A0,
+                               false});
+    image->imports_.push_back({"KERNEL32.dll", std::string("VirtualProtect"),
+                               std::nullopt, std::nullopt, 0x30B0, 0x40B0,
+                               false});
+    image->imports_.push_back({"KERNEL32.dll", std::string("CreateProcessW"),
+                               std::nullopt, std::nullopt, 0x30C0, 0x40C0,
+                               false});
+    image->imports_.push_back({"WINHTTP.dll", std::string("WinHttpSendRequest"),
+                               std::nullopt, std::nullopt, 0x30D0, 0x40D0,
+                               false});
+    image->imports_.push_back({"BCRYPT.dll", std::string("BCryptDecrypt"),
+                               std::nullopt, std::nullopt, 0x30E0, 0x40E0,
+                               false});
+    image->imports_.push_back({"ADVAPI32.dll", std::string("RegSetValueExW"),
+                               std::nullopt, std::nullopt, 0x30F0, 0x40F0,
+                               false});
+    image->exports_.push_back({std::string("AnalyzeTarget"), 1, 0x1000,
+                               std::nullopt});
+    image->exports_.push_back({std::string("ExportEvidence"), 2, 0x22D0,
                                std::nullopt});
     pe_codeview_t codeview;
     codeview.guid = {0xA1, 0xDA, 0x7B, 0x42, 0x94, 0x11, 0x4C, 0x2D,
@@ -519,30 +546,414 @@ analysis::address_t rva(std::uint64_t value) {
             analysis::architecture_mode_t::x86_64};
 }
 
-std::vector<std::uint8_t> fixture_bytes() {
-    std::vector<std::uint8_t> bytes(0x6000, 0);
-    const std::array<std::uint8_t, 128> code{{
-        0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF9,0x48,0x85,0xC9,
-        0x74,0x23,0x48,0x8B,0x01,0xFF,0x50,0x18,0x84,0xC0,0x74,0x18,0x48,0x8B,0xCF,0xE8,
-        0x5B,0x00,0x00,0x00,0x48,0x8B,0x5C,0x24,0x30,0x48,0x83,0xC4,0x20,0x5F,0xC3,0x33,
-        0xC0,0xEB,0xF0,0xCC,0xCC,0xCC,0xCC,0x48,0x83,0xEC,0x28,0x48,0x8D,0x0D,0x99,0x20,
-        0x00,0x00,0xE8,0x3B,0x00,0x00,0x00,0x48,0x85,0xC0,0x74,0x0A,0x48,0x8B,0xC8,0xE8,
-        0x21,0x00,0x00,0x00,0x48,0x83,0xC4,0x28,0xC3,0xCC,0xCC,0x40,0x53,0x48,0x83,0xEC,
-        0x20,0x48,0x8B,0xD9,0x48,0x8B,0x49,0x10,0x48,0x85,0xC9,0x74,0x06,0xFF,0x15,0xCA,
-        0x1F,0x00,0x00,0x48,0x8B,0xC3,0x48,0x83,0xC4,0x20,0x5B,0xC3,0xCC,0xCC,0xCC,0xCC
+struct preview_corpus_t final {
+    std::vector<std::uint8_t> bytes;
+    std::vector<analysis::instruction_record_t> instructions;
+    std::vector<analysis::operand_fact_t> operand_facts;
+    std::vector<analysis::target_fact_t> target_facts;
+    std::vector<analysis::basic_block_record_t> blocks;
+    std::vector<analysis::function_record_t> functions;
+    std::vector<analysis::edge_record_t> edges;
+    std::vector<analysis::xref_record_t> xrefs;
+    std::vector<analysis::string_record_t> strings;
+    std::vector<analysis::symbol_record_t> symbols;
+    std::vector<analysis::coverage_span_t> coverage;
+};
+
+struct pending_relative_t final {
+    std::size_t file_offset = 0;
+    std::uint8_t width = 0;
+    std::uint64_t instruction_end = 0;
+    std::uint64_t target = 0;
+};
+
+preview_corpus_t build_preview_corpus() {
+    static constexpr std::array<const char*, 64> function_names{{
+        "image_entry", "initialize_runtime", "validate_dos_header",
+        "validate_nt_headers", "enumerate_sections", "resolve_import_table",
+        "resolve_delay_imports", "inspect_tls_callbacks",
+        "recover_exception_directory", "detect_packer_stub",
+        "score_entropy_regions", "locate_embedded_config",
+        "decrypt_stage_buffer", "decompress_payload", "map_payload_image",
+        "relocate_image", "bind_imports", "protect_mapped_sections",
+        "register_unwind_metadata", "recover_control_flow",
+        "enumerate_functions", "discover_basic_blocks", "build_call_graph",
+        "index_cross_references", "scan_suspicious_strings",
+        "identify_crypto_primitives", "recover_runtime_types",
+        "propagate_signatures", "analyze_indirect_calls",
+        "classify_network_behavior", "inspect_persistence_paths",
+        "inspect_process_injection", "inspect_anti_debug", "inspect_anti_vm",
+        "trace_registry_activity", "trace_filesystem_activity",
+        "trace_socket_activity", "decode_command_channel",
+        "parse_beacon_config", "verify_signature_chain", "calculate_file_hash",
+        "compare_known_indicators", "build_evidence_timeline",
+        "export_analysis_report", "submit_analysis_jobs",
+        "wait_analysis_workers", "merge_analysis_results",
+        "resolve_symbol_names", "reconstruct_pseudocode",
+        "normalize_stack_frames", "recover_class_layouts", "infer_vtables",
+        "infer_protocol_messages", "inspect_http_handlers",
+        "inspect_websocket_frames", "inspect_driver_interface",
+        "inspect_syscall_usage", "inspect_privilege_changes",
+        "inspect_token_operations", "inspect_memory_permissions",
+        "finalize_findings", "publish_workspace", "flush_analysis_cache",
+        "shutdown_runtime"
     }};
-    std::copy(code.begin(), code.end(), bytes.begin() + 0x400);
-    const std::string banner = "AiDA Reverse Engineering Workspace";
-    std::copy(banner.begin(), banner.end(), bytes.begin() + 0x2400);
-    const std::string target = "suspicious_payload.bin";
-    std::copy(target.begin(), target.end(), bytes.begin() + 0x2440);
-    return bytes;
+    static constexpr std::array<const char*, 12> data_names{{
+        "aAnalysisStarted", "aSuspiciousPayl", "aEncryptedStage",
+        "aCommandChannel", "__imp_CreateFileW", "__imp_ReadFile",
+        "__imp_VirtualAlloc", "__imp_VirtualProtect", "__imp_CreateProcessW",
+        "__imp_WinHttpSendRequest", "__imp_BCryptDecrypt",
+        "__imp_RegSetValueExW"
+    }};
+    static constexpr std::array<std::uint64_t, 4> string_addresses{{
+        0x3000, 0x3040, 0x3100, 0x3140
+    }};
+    preview_corpus_t corpus;
+    corpus.bytes.assign(0x6000, 0);
+    std::fill(corpus.bytes.begin() + 0x400, corpus.bytes.begin() + 0x2400, 0xCC);
+    corpus.instructions.reserve(1600);
+    corpus.operand_facts.reserve(6400);
+    corpus.target_facts.reserve(640);
+    corpus.blocks.reserve(384);
+    corpus.functions.reserve(64);
+    corpus.edges.reserve(448);
+    corpus.xrefs.reserve(640);
+    corpus.symbols.reserve(80);
+    std::vector<pending_relative_t> relatives;
+    relatives.reserve(640);
+    std::uint64_t instruction_serial = 1;
+    std::uint64_t block_serial = 1;
+    std::uint64_t edge_serial = 1;
+    std::uint64_t xref_serial = 1;
+    const auto function_address = [](std::size_t index) {
+        return 0x1000ULL + static_cast<std::uint64_t>(index) * 0x70ULL;
+    };
+    const auto file_offset = [](std::uint64_t address) {
+        return static_cast<std::size_t>(0x400ULL + address - 0x1000ULL);
+    };
+    for (std::size_t function_index = 0; function_index < function_names.size();
+         ++function_index) {
+        const std::uint64_t function_start = function_address(function_index);
+        std::uint64_t cursor = function_start;
+        const std::size_t first_block = corpus.blocks.size();
+        std::array<std::size_t, 6> block_indices{};
+        const auto emit = [&](std::initializer_list<std::uint8_t> encoded,
+                              std::uint32_t flow_flags,
+                              std::optional<std::uint64_t> target = {},
+                              analysis::target_kind_record_t target_kind =
+                                  analysis::target_kind_record_t::branch,
+                                  analysis::xref_kind_t xref_kind =
+                                  analysis::xref_kind_t::code) {
+            analysis::instruction_record_t instruction;
+            instruction.id = (1ULL << 56) | instruction_serial++;
+            instruction.address = rva(cursor);
+            instruction.length = static_cast<std::uint8_t>(encoded.size());
+            instruction.mnemonic_id = static_cast<std::uint16_t>(
+                1 + corpus.instructions.size() % 61);
+            instruction.opcode_id = static_cast<std::uint32_t>(
+                0x100 + corpus.instructions.size() % 251);
+            instruction.flow_flags = flow_flags;
+            instruction.target_fact_begin =
+                static_cast<std::uint32_t>(corpus.target_facts.size());
+            instruction.provenance = analysis::fact_provenance_t::recursive_decode;
+            instruction.confidence = static_cast<std::uint8_t>(
+                96 + (corpus.instructions.size() % 4));
+            instruction.stable_source_id = 0xA1DA00000000ULL +
+                corpus.instructions.size();
+            const auto destination = file_offset(cursor);
+            std::copy(encoded.begin(), encoded.end(),
+                      corpus.bytes.begin() + static_cast<std::ptrdiff_t>(destination));
+            if (target) {
+                instruction.target_fact_count = 1;
+                analysis::target_fact_t fact;
+                fact.instruction_id = instruction.id;
+                fact.target = rva(*target);
+                fact.kind = target_kind;
+                fact.resolution = analysis::target_resolution_t::image_relative;
+                fact.direct = true;
+                corpus.target_facts.push_back(fact);
+                corpus.xrefs.push_back({(5ULL << 56) | xref_serial++,
+                    instruction.address, rva(*target), xref_kind,
+                    analysis::fact_provenance_t::recursive_decode, 97});
+            }
+            corpus.instructions.push_back(std::move(instruction));
+            cursor += encoded.size();
+            return corpus.instructions.size() - 1;
+        };
+        const auto emit_rel8 = [&](std::uint8_t opcode, std::uint64_t target,
+                                   std::uint32_t flow_flags) {
+            const auto index = emit({opcode, 0}, flow_flags, target,
+                analysis::target_kind_record_t::branch,
+                analysis::xref_kind_t::code);
+            relatives.push_back({file_offset(corpus.instructions[index].address.value) + 1,
+                                 1, corpus.instructions[index].address.value + 2, target});
+            return index;
+        };
+        const auto emit_rel32 = [&](std::uint64_t target) {
+            const auto index = emit({0xE8, 0, 0, 0, 0},
+                analysis::flow_fallthrough | analysis::flow_direct |
+                    analysis::flow_call,
+                target, analysis::target_kind_record_t::call,
+                analysis::xref_kind_t::call);
+            relatives.push_back({file_offset(corpus.instructions[index].address.value) + 1,
+                                 4, corpus.instructions[index].address.value + 5, target});
+            return index;
+        };
+        const auto emit_lea_data = [&](std::uint64_t target) {
+            const auto index = emit({0x48, 0x8D, 0x15, 0, 0, 0, 0},
+                analysis::flow_fallthrough, target,
+                analysis::target_kind_record_t::data,
+                analysis::xref_kind_t::read);
+            relatives.push_back({file_offset(corpus.instructions[index].address.value) + 3,
+                                 4, corpus.instructions[index].address.value + 7, target});
+            return index;
+        };
+        const auto begin_block = [&](std::size_t ordinal) {
+            block_indices[ordinal] = corpus.blocks.size();
+            analysis::basic_block_record_t block;
+            block.id = (2ULL << 56) | block_serial++;
+            block.function_id = (4ULL << 56) | (function_index + 1);
+            block.start = rva(cursor);
+            block.first_instruction =
+                static_cast<std::uint32_t>(corpus.instructions.size());
+            block.provenance = analysis::fact_provenance_t::recursive_decode;
+            block.confidence = 98;
+            corpus.blocks.push_back(block);
+        };
+        const auto end_block = [&](std::size_t ordinal) {
+            auto& block = corpus.blocks[block_indices[ordinal]];
+            block.end = rva(cursor);
+            block.instruction_count = static_cast<std::uint32_t>(
+                corpus.instructions.size() - block.first_instruction);
+        };
+        const std::uint64_t block3_target = function_start + 0x2F;
+        const std::uint64_t block4_target = function_start + 0x3C;
+        const std::uint64_t block5_target = function_start + 0x4A;
+        begin_block(0);
+        emit({0x55}, analysis::flow_fallthrough);
+        emit({0x48, 0x89, 0xE5}, analysis::flow_fallthrough);
+        emit({0x48, 0x83, 0xEC, 0x30}, analysis::flow_fallthrough);
+        emit({0x48, 0x8B, 0x41, 0x08}, analysis::flow_fallthrough);
+        emit({0x48, 0x85, 0xC0}, analysis::flow_fallthrough);
+        emit_rel8(0x74, block4_target,
+            analysis::flow_fallthrough | analysis::flow_direct |
+                analysis::flow_branch | analysis::flow_conditional);
+        end_block(0);
+        begin_block(1);
+        emit({0xB9, static_cast<std::uint8_t>(function_index), 0, 0, 0},
+             analysis::flow_fallthrough);
+        emit_rel32(function_address((function_index + 7) % function_names.size()));
+        emit({0x85, 0xC0}, analysis::flow_fallthrough);
+        emit_rel8(0x75, block3_target,
+            analysis::flow_fallthrough | analysis::flow_direct |
+                analysis::flow_branch | analysis::flow_conditional);
+        end_block(1);
+        begin_block(2);
+        emit_lea_data(string_addresses[function_index % string_addresses.size()]);
+        emit_rel32(function_address((function_index + 13) % function_names.size()));
+        emit({0x33, 0xDB}, analysis::flow_fallthrough);
+        emit_rel8(0xEB, block5_target,
+            analysis::flow_direct | analysis::flow_branch);
+        end_block(2);
+        begin_block(3);
+        emit({0x89, 0xC3}, analysis::flow_fallthrough);
+        emit({0x48, 0x8B, 0x4D, 0x10}, analysis::flow_fallthrough);
+        emit_rel32(function_address((function_index + 23) % function_names.size()));
+        emit_rel8(0xEB, block5_target,
+            analysis::flow_direct | analysis::flow_branch);
+        end_block(3);
+        begin_block(4);
+        emit({0x33, 0xDB}, analysis::flow_fallthrough);
+        emit_lea_data(0x3080 + (function_index % 8) * 0x10);
+        emit_rel32(function_address((function_index + 31) % function_names.size()));
+        end_block(4);
+        begin_block(5);
+        emit({0x89, 0xD8}, analysis::flow_fallthrough);
+        emit({0x48, 0x83, 0xC4, 0x30}, analysis::flow_fallthrough);
+        emit({0x5D}, analysis::flow_fallthrough);
+        emit({0xC3}, analysis::flow_return | analysis::flow_terminal);
+        end_block(5);
+        analysis::function_record_t function;
+        function.id = (4ULL << 56) | (function_index + 1);
+        function.start = rva(function_start);
+        function.end = rva(cursor);
+        function.first_block = static_cast<std::uint32_t>(first_block);
+        function.block_count = 6;
+        function.symbol_id = (7ULL << 56) | (function_index + 1);
+        function.provenance = function_index < 16
+            ? analysis::fact_provenance_t::debug_symbol
+            : analysis::fact_provenance_t::recursive_decode;
+        function.confidence = static_cast<std::uint8_t>(99 - function_index % 3);
+        corpus.functions.push_back(function);
+        corpus.symbols.push_back({*function.symbol_id, rva(function_start),
+            function_names[function_index], analysis::symbol_kind_t::function,
+            function.provenance, function.confidence});
+        const auto add_edge = [&](std::size_t source_block, std::size_t target_block,
+                                  analysis::edge_kind_t kind) {
+            const auto& source = corpus.blocks[block_indices[source_block]];
+            const auto& target = corpus.blocks[block_indices[target_block]];
+            corpus.edges.push_back({(3ULL << 56) | edge_serial++, source.id,
+                target.id, source.end, target.start, kind,
+                analysis::fact_provenance_t::recursive_decode, 97});
+        };
+        add_edge(0, 4, analysis::edge_kind_t::conditional_taken);
+        add_edge(0, 1, analysis::edge_kind_t::fallthrough);
+        add_edge(1, 3, analysis::edge_kind_t::conditional_taken);
+        add_edge(1, 2, analysis::edge_kind_t::fallthrough);
+        add_edge(2, 5, analysis::edge_kind_t::unconditional);
+        add_edge(3, 5, analysis::edge_kind_t::unconditional);
+        add_edge(4, 5, analysis::edge_kind_t::fallthrough);
+    }
+    for (const auto& relative : relatives) {
+        const std::int64_t displacement = static_cast<std::int64_t>(relative.target) -
+            static_cast<std::int64_t>(relative.instruction_end);
+        if (relative.width == 1) {
+            corpus.bytes[relative.file_offset] = static_cast<std::uint8_t>(
+                static_cast<std::int8_t>(displacement));
+        } else {
+            const auto value = static_cast<std::int32_t>(displacement);
+            for (std::size_t byte = 0; byte < 4; ++byte)
+                corpus.bytes[relative.file_offset + byte] =
+                    static_cast<std::uint8_t>(
+                        static_cast<std::uint32_t>(value) >> (byte * 8));
+        }
+    }
+    ZydisDecoder decoder{};
+    if (ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64,
+                                      ZYDIS_STACK_WIDTH_64))) {
+        std::uint64_t operand_serial = 1;
+        for (auto& instruction : corpus.instructions) {
+            ZydisDecodedInstruction decoded{};
+            std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands{};
+            const auto offset = file_offset(instruction.address.value);
+            const auto status = ZydisDecoderDecodeFull(&decoder,
+                corpus.bytes.data() + static_cast<std::ptrdiff_t>(offset),
+                instruction.length, &decoded, operands.data());
+            if (!ZYAN_SUCCESS(status) || decoded.length != instruction.length)
+                continue;
+            instruction.mnemonic_id = static_cast<std::uint16_t>(decoded.mnemonic);
+            instruction.opcode_id =
+                (static_cast<std::uint32_t>(decoded.encoding) << 16) |
+                (static_cast<std::uint32_t>(decoded.opcode_map) << 8) |
+                decoded.opcode;
+            instruction.operand_fact_begin =
+                static_cast<std::uint32_t>(corpus.operand_facts.size());
+            instruction.operand_fact_count = decoded.operand_count;
+            for (std::uint8_t index = 0; index < decoded.operand_count; ++index) {
+                const auto& decoded_operand = operands[index];
+                analysis::operand_fact_t operand;
+                operand.id = (8ULL << 56) | operand_serial++;
+                operand.instruction_id = instruction.id;
+                operand.operand_index = index;
+                operand.access = static_cast<std::uint8_t>(decoded_operand.actions);
+                operand.bit_width = decoded_operand.size;
+                operand.access_width_bits = decoded_operand.size;
+                switch (decoded_operand.type) {
+                case ZYDIS_OPERAND_TYPE_REGISTER:
+                    operand.kind = analysis::operand_kind_t::reg;
+                    operand.reg = static_cast<std::uint16_t>(
+                        decoded_operand.reg.value);
+                    break;
+                case ZYDIS_OPERAND_TYPE_MEMORY:
+                    operand.kind = analysis::operand_kind_t::memory;
+                    operand.segment_reg = static_cast<std::uint16_t>(
+                        decoded_operand.mem.segment);
+                    operand.base_reg = static_cast<std::uint16_t>(
+                        decoded_operand.mem.base);
+                    operand.index_reg = static_cast<std::uint16_t>(
+                        decoded_operand.mem.index);
+                    operand.scale = decoded_operand.mem.scale;
+                    operand.displacement = decoded_operand.mem.disp.value;
+                    operand.access_width = static_cast<std::uint8_t>(
+                        decoded_operand.size);
+                    if (decoded_operand.mem.segment != ZYDIS_REGISTER_NONE)
+                        operand.address_components |= analysis::address_component_segment;
+                    if (decoded_operand.mem.base != ZYDIS_REGISTER_NONE)
+                        operand.address_components |= analysis::address_component_base;
+                    if (decoded_operand.mem.index != ZYDIS_REGISTER_NONE) {
+                        operand.address_components |= analysis::address_component_index;
+                        if (decoded_operand.mem.scale != 0)
+                            operand.address_components |= analysis::address_component_scale;
+                    }
+                    if (decoded_operand.mem.disp.has_displacement != ZYAN_FALSE) {
+                        operand.has_displacement = true;
+                        operand.address_components |= analysis::address_component_displacement;
+                    }
+                    if (decoded_operand.mem.segment == ZYDIS_REGISTER_FS ||
+                        decoded_operand.mem.segment == ZYDIS_REGISTER_GS) {
+                        operand.address_expression =
+                            analysis::address_expression_kind_t::segment_relative;
+                        operand.address_resolution =
+                            analysis::target_resolution_t::segment_relative;
+                    }
+                    break;
+                case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+                    operand.kind = analysis::operand_kind_t::immediate;
+                    operand.relative = decoded_operand.imm.is_relative != ZYAN_FALSE;
+                    operand.signed_value = decoded_operand.imm.is_signed != ZYAN_FALSE;
+                    operand.immediate = decoded_operand.imm.value.u;
+                    break;
+                case ZYDIS_OPERAND_TYPE_POINTER:
+                    operand.kind = analysis::operand_kind_t::pointer;
+                    operand.immediate =
+                        (static_cast<std::uint64_t>(decoded_operand.ptr.segment) << 32) |
+                        decoded_operand.ptr.offset;
+                    break;
+                default:
+                    operand.kind = analysis::operand_kind_t::none;
+                    break;
+                }
+                corpus.operand_facts.push_back(std::move(operand));
+            }
+        }
+    }
+    const std::array<std::string, 4> strings{{
+        "Analysis pipeline initialized",
+        "suspicious_payload.exe",
+        "Encrypted stage recovered",
+        "Command channel configuration"
+    }};
+    for (std::size_t index = 0; index < strings.size(); ++index) {
+        const std::uint64_t address = string_addresses[index];
+        const auto offset = static_cast<std::size_t>(0x2400 + address - 0x3000);
+        std::copy(strings[index].begin(), strings[index].end(),
+                  corpus.bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+        corpus.strings.push_back({(6ULL << 56) | (index + 1), rva(address),
+            strings[index].size(), analysis::string_encoding_t::ascii,
+            strings[index], analysis::fact_provenance_t::linear_validation, 99});
+        corpus.symbols.push_back({(7ULL << 56) | (65 + index), rva(address),
+            data_names[index], analysis::symbol_kind_t::data,
+            analysis::fact_provenance_t::linear_validation, 99});
+    }
+    for (std::size_t index = 4; index < data_names.size(); ++index) {
+        corpus.symbols.push_back({(7ULL << 56) | (65 + index),
+            rva(0x3080 + (index - 4) * 0x10), data_names[index],
+            analysis::symbol_kind_t::import_symbol,
+            analysis::fact_provenance_t::relocation, 100});
+    }
+    std::sort(corpus.symbols.begin(), corpus.symbols.end(),
+        [](const auto& left, const auto& right) {
+            return left.address < right.address;
+        });
+    std::sort(corpus.edges.begin(), corpus.edges.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.source, left.target, left.kind, left.id) <
+                   std::tie(right.source, right.target, right.kind, right.id);
+        });
+    corpus.coverage = {
+        {rva(0x1000), 0x1C00, analysis::coverage_reason_t::decoded,
+         analysis::fact_provenance_t::recursive_decode, 98, 0},
+        {rva(0x3000), 0x180, analysis::coverage_reason_t::proven_data,
+         analysis::fact_provenance_t::linear_validation, 99, 0}
+    };
+    return corpus;
 }
 
 std::shared_ptr<const analysis::workspace_image_t> normalized_image(
     const analysis::binary_id_t& binary_id,
     const analysis::binary_id_t& content_hash,
-    const std::string& source) {
+    const std::string& source,
+    const preview_corpus_t& corpus) {
     auto image = std::make_shared<analysis::workspace_image_t>();
     image->format = analysis::format_id_t::pe32_plus;
     image->architecture = analysis::architecture_id_t::x86_64;
@@ -581,26 +992,43 @@ std::shared_ptr<const analysis::workspace_image_t> normalized_image(
          analysis::image_permission_read},
         {2, ".data", 0x4000, 0x1000, 0x3400, 0x1000, 0xC0000040,
          analysis::image_permission_read | analysis::image_permission_write}};
-    image->symbols = {
-        {1, "entry_point", rva(0x1000), 0x34,
-         analysis::image_symbol_kind_t::function,
-         analysis::image_symbol_binding_t::global, true, false},
-        {2, "analyze_image", rva(0x1040), 0x30,
-         analysis::image_symbol_kind_t::function,
-         analysis::image_symbol_binding_t::global, true, false},
-        {3, "validate_header", rva(0x1080), 0x28,
-         analysis::image_symbol_kind_t::function,
-         analysis::image_symbol_binding_t::local, true, false},
-        {4, "dispatch_analysis", rva(0x10C0), 0x30,
-         analysis::image_symbol_kind_t::function,
-         analysis::image_symbol_binding_t::local, true, false}};
+    for (std::size_t index = 0; index < corpus.functions.size(); ++index) {
+        const auto& function = corpus.functions[index];
+        const auto symbol = std::find_if(corpus.symbols.begin(), corpus.symbols.end(),
+            [&](const auto& candidate) {
+                return candidate.id == function.symbol_id.value_or(0);
+            });
+        if (symbol == corpus.symbols.end())
+            continue;
+        image->symbols.push_back({static_cast<std::uint64_t>(index + 1),
+            symbol->name, function.start,
+            function.end.value - function.start.value,
+            analysis::image_symbol_kind_t::function,
+            index < 16 ? analysis::image_symbol_binding_t::global
+                       : analysis::image_symbol_binding_t::local,
+            true, false});
+    }
     image->imports = {
         {"KERNEL32.dll", std::string("CreateFileW"), std::nullopt,
          rva(0x3080), rva(0x4080), false},
-        {"USER32.dll", std::string("MessageBoxW"), std::nullopt,
-         rva(0x3090), rva(0x4090), false}};
-    image->exports = {{std::string("AnalyzeTarget"), 1, rva(0x1040),
-                       std::nullopt}};
+        {"KERNEL32.dll", std::string("ReadFile"), std::nullopt,
+         rva(0x3090), rva(0x4090), false},
+        {"KERNEL32.dll", std::string("VirtualAlloc"), std::nullopt,
+         rva(0x30A0), rva(0x40A0), false},
+        {"KERNEL32.dll", std::string("VirtualProtect"), std::nullopt,
+         rva(0x30B0), rva(0x40B0), false},
+        {"KERNEL32.dll", std::string("CreateProcessW"), std::nullopt,
+         rva(0x30C0), rva(0x40C0), false},
+        {"WINHTTP.dll", std::string("WinHttpSendRequest"), std::nullopt,
+         rva(0x30D0), rva(0x40D0), false},
+        {"BCRYPT.dll", std::string("BCryptDecrypt"), std::nullopt,
+         rva(0x30E0), rva(0x40E0), false},
+        {"ADVAPI32.dll", std::string("RegSetValueExW"), std::nullopt,
+         rva(0x30F0), rva(0x40F0), false}};
+    image->exports = {
+        {std::string("AnalyzeTarget"), 1, rva(0x1000), std::nullopt},
+        {std::string("ExportEvidence"), 2, rva(0x22D0), std::nullopt}
+    };
     image->workspace_binary_id = binary_id;
     image->provider_content_hash = content_hash;
     image->provider_source = source;
@@ -613,7 +1041,8 @@ std::shared_ptr<const analysis::analysis_snapshot_t> analysis_snapshot(
     const analysis::binary_id_t& binary_id,
     const analysis::binary_id_t& profile_hash,
     const std::shared_ptr<const analysis::workspace_image_t>& normalized,
-    const std::shared_ptr<const analysis::pe_image_t>& pe) {
+    const std::shared_ptr<const analysis::pe_image_t>& pe,
+    const preview_corpus_t& corpus) {
     auto snapshot = std::make_shared<analysis::analysis_snapshot_t>();
     snapshot->binary_id = binary_id;
     snapshot->load_profile_hash = profile_hash;
@@ -622,88 +1051,17 @@ std::shared_ptr<const analysis::analysis_snapshot_t> analysis_snapshot(
     snapshot->overlay_revision = 0;
     snapshot->normalized_image = normalized;
     snapshot->image = pe;
-    const std::array<std::uint64_t, 16> starts{{
-        0x1000,0x1005,0x1009,0x100D,0x1010,0x1012,0x1017,0x1019,
-        0x1040,0x1044,0x104B,0x1050,0x1080,0x1084,0x108B,0x1091}};
-    const std::array<std::uint8_t, 16> lengths{{5,4,4,3,2,5,2,5,4,7,5,8,4,7,6,7}};
-    for (std::size_t index = 0; index < starts.size(); ++index) {
-        analysis::instruction_record_t instruction;
-        instruction.id = (1ULL << 56) | (index + 1);
-        instruction.address = rva(starts[index]);
-        instruction.length = lengths[index];
-        instruction.mnemonic_id = static_cast<std::uint16_t>(index % 9 + 1);
-        instruction.opcode_id = static_cast<std::uint32_t>(0x100 + index);
-        instruction.flow_flags = index == 7 || index == 11 || index == 15
-            ? analysis::flow_return | analysis::flow_terminal
-            : analysis::flow_fallthrough;
-        instruction.provenance = analysis::fact_provenance_t::recursive_decode;
-        instruction.confidence = 98;
-        instruction.stable_source_id = 0xA1DA0000ULL + index;
-        snapshot->instructions.push_back(std::move(instruction));
-    }
-    const std::array<std::pair<std::size_t, std::size_t>, 3> block_ranges{{
-        {0, 8}, {8, 12}, {12, 16}}};
-    for (std::size_t index = 0; index < block_ranges.size(); ++index) {
-        const auto first = block_ranges[index].first;
-        const auto end = block_ranges[index].second;
-        analysis::basic_block_record_t block;
-        block.id = (2ULL << 56) | (index + 1);
-        block.function_id = (4ULL << 56) | (index + 1);
-        block.start = snapshot->instructions[first].address;
-        block.end = rva(snapshot->instructions[end - 1].address.value +
-                        snapshot->instructions[end - 1].length);
-        block.first_instruction = static_cast<std::uint32_t>(first);
-        block.instruction_count = static_cast<std::uint32_t>(end - first);
-        block.provenance = analysis::fact_provenance_t::recursive_decode;
-        block.confidence = 96;
-        snapshot->blocks.push_back(block);
-        analysis::function_record_t function;
-        function.id = block.function_id;
-        function.start = block.start;
-        function.end = block.end;
-        function.first_block = static_cast<std::uint32_t>(index);
-        function.block_count = 1;
-        function.symbol_id = (7ULL << 56) | (index + 1);
-        function.provenance = analysis::fact_provenance_t::debug_symbol;
-        function.confidence = 97;
-        snapshot->functions.push_back(std::move(function));
-    }
-    const std::array<const char*, 3> names{{
-        "entry_point", "analyze_image", "validate_header"}};
-    for (std::size_t index = 0; index < names.size(); ++index) {
-        analysis::symbol_record_t symbol;
-        symbol.id = (7ULL << 56) | (index + 1);
-        symbol.address = snapshot->functions[index].start;
-        symbol.name = names[index];
-        symbol.kind = analysis::symbol_kind_t::function;
-        symbol.provenance = analysis::fact_provenance_t::debug_symbol;
-        symbol.confidence = 100;
-        snapshot->symbols.push_back(std::move(symbol));
-    }
-    snapshot->strings = {
-        {(6ULL << 56) | 1, rva(0x3000), 35,
-         analysis::string_encoding_t::ascii,
-         "AiDA Reverse Engineering Workspace",
-         analysis::fact_provenance_t::linear_validation, 99},
-        {(6ULL << 56) | 2, rva(0x3040), 23,
-         analysis::string_encoding_t::ascii, "suspicious_payload.bin",
-         analysis::fact_provenance_t::linear_validation, 99}};
-    snapshot->xrefs = {
-        {(5ULL << 56) | 1, rva(0x1019), rva(0x1040),
-         analysis::xref_kind_t::call,
-         analysis::fact_provenance_t::recursive_decode, 96},
-        {(5ULL << 56) | 2, rva(0x1044), rva(0x3000),
-         analysis::xref_kind_t::read,
-         analysis::fact_provenance_t::recursive_decode, 94}};
-    snapshot->coverage = {
-        {rva(0x1000), 0x1E, analysis::coverage_reason_t::decoded,
-         analysis::fact_provenance_t::recursive_decode, 98, 0},
-        {rva(0x1040), 0x18, analysis::coverage_reason_t::decoded,
-         analysis::fact_provenance_t::recursive_decode, 98, 0},
-        {rva(0x1080), 0x18, analysis::coverage_reason_t::decoded,
-         analysis::fact_provenance_t::recursive_decode, 98, 0},
-        {rva(0x3000), 0x57, analysis::coverage_reason_t::proven_data,
-         analysis::fact_provenance_t::linear_validation, 99, 0}};
+    snapshot->instructions = corpus.instructions;
+    snapshot->delay_slot_counts.assign(corpus.instructions.size(), 0);
+    snapshot->operand_facts = corpus.operand_facts;
+    snapshot->target_facts = corpus.target_facts;
+    snapshot->blocks = corpus.blocks;
+    snapshot->functions = corpus.functions;
+    snapshot->edges = corpus.edges;
+    snapshot->xrefs = corpus.xrefs;
+    snapshot->strings = corpus.strings;
+    snapshot->symbols = corpus.symbols;
+    snapshot->coverage = corpus.coverage;
     return snapshot;
 }
 
@@ -716,8 +1074,9 @@ workspace_preview_fixture_t make_fixture() {
     const auto content_hash = digest(0x31);
     const auto profile_hash = digest(0xA4);
     const auto binary_id = digest(0x6D);
+    auto corpus = build_preview_corpus();
     auto provider = analysis::memory_provider_t::create(
-        fixture.source_path, fixture_bytes(), content_hash);
+        fixture.source_path, std::move(corpus.bytes), content_hash);
     analysis::workspace_identity_input_t input;
     input.bin_name = fixture.filename;
     input.source_path = fixture.source_path;
@@ -732,18 +1091,44 @@ workspace_preview_fixture_t make_fixture() {
         binary_id, std::move(input));
     auto pe = analysis::pe_image_t::create_preview();
     auto normalized = normalized_image(binary_id, content_hash,
-                                       fixture.source_path);
-    auto snapshot = analysis_snapshot(binary_id, profile_hash, normalized, pe);
+                                       fixture.source_path, corpus);
+    auto snapshot = analysis_snapshot(binary_id, profile_hash, normalized, pe,
+                                      corpus);
     auto created = analysis::analysis_workspace_t::create_preview(
         std::move(identity), std::move(provider), std::move(normalized),
         std::move(pe), std::move(snapshot));
     if (created) {
         fixture.workspace = created.take_value();
-        static_cast<void>(analysis::overlay_journal_t::open_preview(
-            fixture.workspace));
+        auto overlay = analysis::overlay_journal_t::open_preview(fixture.workspace);
+        if (overlay) {
+            static constexpr std::array<const char*, 12> analyst_notes{{
+                "Program entry; initializes the staged analysis pipeline",
+                "Validates image metadata before recursive traversal",
+                "Walks section descriptors and records executable ranges",
+                "Resolves import slots with module provenance",
+                "Examines TLS callbacks before the nominal entry point",
+                "High-entropy region promoted for unpacking review",
+                "Recovered buffer is retained as immutable evidence",
+                "Rebuilds control-flow edges from direct and indirect targets",
+                "Indexes code and data references for synchronized navigation",
+                "Potential command-channel behavior requires network review",
+                "Reconstructs types from repeated field access patterns",
+                "Publishes findings without mutating the original sample"
+            }};
+            analysis::overlay_transaction_request_t request;
+            request.operations.reserve(analyst_notes.size());
+            for (std::size_t index = 0; index < analyst_notes.size(); ++index) {
+                analysis::overlay_operation_t operation;
+                operation.kind = analysis::overlay_operation_kind_t::comment;
+                operation.address = rva(0x1000 + index * 0x1C0);
+                operation.text = analyst_notes[index];
+                request.operations.push_back(std::move(operation));
+            }
+            static_cast<void>(overlay.value()->transact(request, {}));
+        }
         static_cast<void>(fixture.workspace->update_view_state([](auto& view) {
             view.selection = rva(0x1000);
-            view.bookmarks = {rva(0x1040), rva(0x1080)};
+            view.bookmarks = {rva(0x1460), rva(0x1C40), rva(0x2420)};
             view.revision = 3;
         }));
         workbench::workbench_shell_workspace_context_t workbench_context;

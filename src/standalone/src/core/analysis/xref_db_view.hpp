@@ -345,17 +345,44 @@ inline void render(float, float, float width, float height,
 			if (pointer || keyboard) {
 				using namespace aida::ui::analysis_context_menu;
 				using aida::ui::action_handler_result_t;
+                if (pointer) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->selected_runtime = result.runtime;
+                }
+                if (pointer)
+                    disasm_view::select_address(result.runtime, context, false);
                 context_t menu;
                 menu.kind = menu_kind_t::xref;
+                menu.entity_id = "xref:" + std::to_string(result.runtime) + ":" +
+                    result.name + ":" + result.label;
                 const auto generation = context.workspace->generation();
                 const auto revision = context.workspace->analysis_revision();
+                std::uint64_t visible_version = 0;
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    visible_version = state->visible_version;
+                }
                 menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
-                    (generation << 6u) + (generation >> 2u));
-                menu.live_generation = [workspace = context.workspace]() {
+                    (generation << 6u) + (generation >> 2u)) ^ visible_version;
+                menu.live_generation = [workspace = context.workspace, state]() {
                     const auto current = workspace->generation();
                     const auto current_revision = workspace->analysis_revision();
+                    std::lock_guard<std::mutex> lock(state->mutex);
                     return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
-                        (current << 6u) + (current >> 2u));
+                        (current << 6u) + (current >> 2u)) ^ state->visible_version;
+                };
+                menu.validate_identity = [state, runtime = result.runtime,
+                                          label = result.label]() {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    const auto visible = state->visible_results;
+                    const bool retained = visible && std::any_of(
+                        visible->begin(), visible->end(), [&](const auto& item) {
+                            return item.runtime == runtime && item.label == label;
+                        });
+                    return state->selected_runtime == runtime && retained
+                        ? aida::ui::capability_state_t::available()
+                        : aida::ui::capability_state_t::unavailable(
+                            "The selected cross-reference changed");
                 };
                 menu.actions["analysis.navigate.disassembly"].invoke = [context, runtime = result.runtime]() {
                     disasm_view::goto_address(runtime, context);

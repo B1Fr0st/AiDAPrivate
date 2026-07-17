@@ -35,6 +35,8 @@ namespace aida::preview::editor
 	inline std::vector<receipt_t> receipts;
 	inline std::uint64_t next_sequence = 1;
 	inline bool ghost_text_enabled = true;
+	inline constexpr std::uint64_t fixture_document_id = 0x5052455649455701ULL;
+	inline std::uint64_t fixture_revision = 0;
 
 	inline void record(std::string action, std::string detail = {})
 	{
@@ -45,19 +47,13 @@ namespace aida::preview::editor
 
 	inline void load_fixture(std::string_view content, std::string name, std::string path)
 	{
-		code_editor::buffer.resize(content.size() + 64 * 1024);
-		std::memcpy(code_editor::buffer.data(), content.data(), content.size());
-		code_editor::buffer[content.size()] = '\0';
-		code_editor::filename = std::move(name);
-		code_editor::filepath = std::move(path);
-		code_editor::active = true;
-		code_editor::dirty = false;
-		code_editor::scroll_y = 0.f;
+		static_cast<void>(code_editor_widget::load_document(fixture_document_id,
+			++fixture_revision, content, name, path, false, 0, 0, 0.f, 0.f, true));
 	}
 
 	inline void ensure_fixture()
 	{
-		if (code_editor::active && !code_editor::buffer.empty())
+		if (code_editor_widget::document_state(fixture_document_id).active)
 			return;
 		constexpr std::string_view source =
 			"#include <cstdint>\n"
@@ -83,20 +79,24 @@ namespace aida::preview::editor
 			"}\n\n"
 			"}\n";
 		load_fixture(source, "unpacker.cpp", "C:/Preview/ReverseEngineering/unpacker.cpp");
-		record("fixture_loaded", code_editor::filepath);
+		record("fixture_loaded",
+			code_editor_widget::document_state(fixture_document_id).filepath);
 	}
 
 	inline std::string content()
 	{
 		ensure_fixture();
-		return code_editor::buffer.empty() ? std::string() : std::string(code_editor::buffer.data());
+		return code_editor_widget::document_content(fixture_document_id);
 	}
 
 	inline bool save_document()
 	{
 		ensure_fixture();
-		code_editor::dirty = false;
-		record("save", code_editor::filepath);
+		const auto state = code_editor_widget::document_state(fixture_document_id);
+		code_editor_widget::mark_document_saved(fixture_document_id,
+			code_editor_widget::document_revision(fixture_document_id),
+			state.filename, state.filepath);
+		record("save", state.filepath);
 		return true;
 	}
 

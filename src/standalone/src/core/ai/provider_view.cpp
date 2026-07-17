@@ -11,22 +11,15 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <utility>
 #include <unordered_map>
 #include <vector>
-
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include <windows.h>
-#include <shlobj.h>
-#endif
 
 #include "imgui/imgui.h"
 #include <nlohmann/json.hpp>
@@ -37,11 +30,13 @@
 #include "provider_catalog.hpp"
 #include "provider_transforms.hpp"
 #include "standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
 #include "../infra/executor.hpp"
 #include "../ui/task_center.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/brand.hpp"
@@ -863,9 +858,13 @@ namespace {
 		bool hov = ImGui::IsItemHovered();
 		bool clicked = ImGui::IsItemClicked();
 		bool right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-		bool keyboard_context = selected && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-			(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-			 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+		const bool menu_key_context = selected &&
+			ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+		const bool shift_f10_context = !menu_key_context && selected &&
+			ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+		const bool keyboard_context = menu_key_context || shift_f10_context;
 		ImGui::PopID();
 
 		float hov_v = ca->hover.tick(hov, dt, aida::motion::spring::playful);
@@ -913,27 +912,79 @@ namespace {
 			? nullptr
 			: aida::provider::catalog::get_model(provider.id, current_model_id);
 		auto render_context = [&] {
-			if (right || keyboard_context) ImGui::OpenPopup("##provider_context");
-			if (!ImGui::BeginPopup("##provider_context")) return;
-			if (ImGui::MenuItem("Show Provider Details")) {
-				st.selected_detail_provider_id = provider.id;
-				load_detail_buffers(provider.id);
+			if (right || keyboard_context) {
+				aida::ui::application_ui::retained_entity_context_t context;
+				context.owner_id = "ai.provider.model";
+				context.entity_id = provider.id + ":" + current_model_id;
+				context.entity_generation = std::hash<std::string>{}(
+					provider.id + "\n" + current_model_id);
+				context.active_view = aida::ui::stable_view_id_t("view.ai.providers");
+				const auto retained_provider_id = provider.id;
+				const auto retained_model_id = current_model_id;
+				context.validate_identity = [retained_provider_id, retained_model_id] {
+					const auto* live_provider = aida::provider::catalog::get_provider(
+						retained_provider_id);
+					if (!live_provider)
+						return aida::ui::capability_state_t::unavailable(
+							"The provider was removed or replaced; select it again");
+					if (!retained_model_id.empty() &&
+						!aida::provider::catalog::get_model(retained_provider_id,
+							retained_model_id))
+						return aida::ui::capability_state_t::unavailable(
+							"The retained provider model is no longer available");
+					return aida::ui::capability_state_t::available();
+				};
+				const auto add = [&context](const char* id, bool enabled,
+						const char* reason,
+						std::function<aida::ui::action_handler_result_t()> invoke) {
+					aida::ui::application_ui::retained_entity_action_t action;
+					action.action_id = id;
+					action.capability = enabled
+						? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable(reason);
+					action.invoke = std::move(invoke);
+					context.actions.push_back(std::move(action));
+				};
+				add("ai.provider.open_details", true, "", [retained_provider_id] {
+				g_state().selected_detail_provider_id = retained_provider_id;
+				load_detail_buffers(retained_provider_id);
+				return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.provider.set_default_model", current_model != nullptr,
+					"Choose a provider model before making it the default",
+					[retained_provider_id, retained_model_id] {
+					g_sa_settings.set_selection(retained_provider_id, retained_model_id);
+					const auto result = aida::settings_persistence::request_save(g_sa_settings);
+					return aida::settings_persistence::accepted(result)
+						? aida::ui::action_handler_result_t::completed()
+						: aida::ui::action_handler_result_t::failed(
+							"The default model could not be persisted");
+				});
+				add("ai.provider.test_model", current_model != nullptr,
+					"Choose a provider model before testing the connection",
+					[retained_provider_id, retained_model_id] {
+					run_test_connection(retained_provider_id, retained_model_id);
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.provider.copy_provider_id", true, "", [retained_provider_id] {
+					ImGui::SetClipboardText(retained_provider_id.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.provider.copy_model_id", current_model != nullptr,
+					"Choose a provider model before copying its identifier",
+					[retained_model_id] {
+					ImGui::SetClipboardText(retained_model_id.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+				aida::ui::application_ui::open_retained_entity_context_menu(
+					std::move(context), right
+						? aida::ui::context_menu_open_origin_t::pointer
+						: menu_key_context
+						? aida::ui::context_menu_open_origin_t::menu_key
+						: aida::ui::context_menu_open_origin_t::shift_f10);
 			}
-			if (ImGui::MenuItem("Set Current Model as Default", nullptr, false, current_model != nullptr)) {
-				g_sa_settings.set_selection(provider.id, current_model_id);
-				g_sa_settings.save();
-			}
-			if (!current_model && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-				ImGui::SetTooltip("Choose a provider model before making it the default");
-			if (ImGui::MenuItem("Test Current Model", nullptr, false, current_model != nullptr))
-				run_test_connection(provider.id, current_model_id);
-			if (!current_model && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-				ImGui::SetTooltip("Choose a provider model before testing the connection");
-			ImGui::Separator();
-			if (ImGui::MenuItem("Copy Provider ID")) ImGui::SetClipboardText(provider.id.c_str());
-			if (ImGui::MenuItem("Copy Model ID", nullptr, false, current_model != nullptr))
-				ImGui::SetClipboardText(current_model_id.c_str());
-			ImGui::EndPopup();
+			aida::ui::application_ui::render_retained_entity_context_menu(
+				"ai.provider.model");
 		};
 
 		if (current_model) {
@@ -970,7 +1021,7 @@ namespace {
 					ImGui::PushID(m->id.c_str());
 					if (ImGui::Selectable(label, is_sel)) {
 						set_preferred_model_for(provider.id, m->id);
-						g_sa_settings.save();
+						static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 					}
 					if (is_sel)
 						ImGui::SetItemDefaultFocus();
@@ -1007,7 +1058,7 @@ namespace {
 					ImVec2(96.f, 24.f))) {
 				if (!current_model_id.empty()) {
 					g_sa_settings.set_selection(provider.id, current_model_id);
-					g_sa_settings.save();
+					static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 					aida::events::model_changed_t evt;
 					evt.session_id.clear();
 					evt.provider_id = provider.id;
@@ -1065,7 +1116,7 @@ namespace {
 				ImGui::PushID(m->id.c_str());
 				if (ImGui::Selectable(label, is_sel)) {
 					set_preferred_model_for(provider.id, m->id);
-					g_sa_settings.save();
+					static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 				}
 				if (is_sel)
 					ImGui::SetItemDefaultFocus();
@@ -1148,7 +1199,7 @@ namespace {
 				ImVec2(112.f, 24.f))) {
 			if (!current_model_id.empty()) {
 				g_sa_settings.set_selection(provider.id, current_model_id);
-				g_sa_settings.save();
+				static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 				aida::events::model_changed_t evt;
 				evt.session_id.clear();
 				evt.provider_id = provider.id;
@@ -1275,7 +1326,7 @@ namespace {
 					toast_notification::toast_type_t::warning, 4.0f);
 			} else {
 				g_sa_settings.provider_headers_overrides[st.selected_detail_provider_id] = headers_text;
-				g_sa_settings.save();
+				static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 				toast_notification::push("Provider details saved",
 					toast_notification::toast_type_t::info, 3.0f);
 			}
@@ -1286,7 +1337,7 @@ namespace {
 				aida::ui::size_t_::md, ImVec2(detail_actions_stack ? (std::min)(pane_w - 28.f, 140.f) : 110.f, 28.f))) {
 			g_sa_settings.provider_base_url_overrides.erase(st.selected_detail_provider_id);
 			g_sa_settings.provider_headers_overrides.erase(st.selected_detail_provider_id);
-			g_sa_settings.save();
+			static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 			load_detail_buffers(st.selected_detail_provider_id);
 			toast_notification::push("Provider overrides cleared",
 				toast_notification::toast_type_t::info, 3.0f);
@@ -1482,27 +1533,7 @@ void render(float panel_w, float panel_h)
 	const float callout_y = root_y + root_h - 30.f;
 	const float callout_h = 24.f;
 	bool show_age_callout = false;
-	int64_t cache_age = -1;
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	{
-		std::error_code ec;
-		wchar_t* appdata = nullptr;
-		std::filesystem::path cache_p;
-		if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata))) {
-			cache_p = std::filesystem::path(appdata) / L"AiDA" / L"Standalone" / L"models.json";
-			CoTaskMemFree(appdata);
-		}
-		if (!cache_p.empty() && std::filesystem::exists(cache_p, ec)) {
-			const auto ftime = std::filesystem::last_write_time(cache_p, ec);
-			if (!ec) {
-				const auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-					ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
-				const auto now = std::chrono::system_clock::now();
-				cache_age = std::chrono::duration_cast<std::chrono::seconds>(now - sctp).count();
-			}
-		}
-	}
-#endif
+	const int64_t cache_age = aida::provider::catalog::cached_age_seconds();
 	if (cache_age > 3600)
 		show_age_callout = true;
 
@@ -1563,7 +1594,7 @@ void render_chat_header_picker(float max_width)
 				if (ImGui::Selectable(ml, is_sel)) {
 					g_sa_settings.set_selection(p.id, m->id);
 					set_preferred_model_for(p.id, m->id);
-					g_sa_settings.save();
+					static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 					aida::events::model_changed_t evt;
 					evt.session_id.clear();
 					evt.provider_id = p.id;

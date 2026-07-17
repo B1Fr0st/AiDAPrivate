@@ -1,12 +1,11 @@
 #pragma once
 
 #include "disasm_view.hpp"
-#include "../ui/theme.hpp"
-#include "imgui/imgui.h"
-
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace file_metadata_banner {
 
@@ -24,99 +23,118 @@ inline std::string machine_name(std::uint16_t machine) {
     }
 }
 
-inline const char* readiness_name(aida::analysis::workspace_readiness_t readiness) {
-    using aida::analysis::workspace_readiness_t;
-    switch (readiness) {
-    case workspace_readiness_t::created: return "created";
-    case workspace_readiness_t::provider_ready: return "provider ready";
-    case workspace_readiness_t::parsed: return "parsed";
-    case workspace_readiness_t::analyzing: return "analyzing";
-    case workspace_readiness_t::baseline_ready: return "baseline ready";
-    case workspace_readiness_t::partial: return "partial";
-    case workspace_readiness_t::failed: return "failed";
-    case workspace_readiness_t::cancelling: return "cancelling";
-    case workspace_readiness_t::closing: return "closing";
-    case workspace_readiness_t::closed: return "closed";
-    }
-    return "unknown";
+inline std::string section_flags(const aida::analysis::pe_section_t& section) {
+    std::string value;
+    auto append = [&value](const char* label) {
+        if (!value.empty())
+            value.push_back(' ');
+        value.append(label);
+    };
+    if ((section.characteristics & 0x08000000u) != 0)
+        append("Not pageable");
+    if (section.executable)
+        append("Executable");
+    if (section.readable)
+        append("Readable");
+    if (section.writable)
+        append("Writable");
+    return value.empty() ? "No access attributes" : value;
 }
 
-inline void render(const disasm_view::workspace_context_t& context, float alpha) {
+inline std::uint64_t signature(const disasm_view::workspace_context_t& context,
+                               std::uint64_t image_base) {
+    std::uint64_t value = context.publication ? context.publication->generation : 0;
+    value ^= image_base + 0x9E3779B97F4A7C15ull + (value << 6u) + (value >> 2u);
+    if (context.image) {
+        value ^= static_cast<std::uint64_t>(context.image->timestamp()) << 32u;
+        value ^= static_cast<std::uint64_t>(context.image->sections().size()) *
+            0xD6E8FEB86659FD93ull;
+    }
+    return value == 0 ? 1 : value;
+}
+
+inline void refresh(const disasm_view::workspace_context_t& context) {
     if (!context.workspace || !context.image)
         return;
     const auto& identity = context.workspace->identity();
     const auto& image = *context.image;
-    const auto& theme = aida::ui::resolved();
     std::uint64_t image_base = image.image_base();
-    bool selected_all = false;
     {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         if (context.view->display_image_base)
             image_base = *context.view->display_image_base;
-        selected_all = context.view->banner_selected_all;
+        const auto current_signature = signature(context, image_base);
+        if (context.view->metadata_signature == current_signature &&
+            !context.view->metadata_lines.empty())
+            return;
     }
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, aida::ui::with_alpha(
-        selected_all ? theme.selection : theme.panel_bg, alpha));
-    ImGui::BeginChild("##workspace_metadata_banner", ImVec2(0.0f, 92.0f), true,
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    char identity_line[512]{};
-    std::snprintf(identity_line, sizeof(identity_line), "%s  %s  image 0x%016llX  entry +0x%08llX",
-        identity.bin_name().c_str(), machine_name(image.machine()).c_str(),
-        static_cast<unsigned long long>(image_base),
-        static_cast<unsigned long long>(image.entry_rva()));
-    char counts_line[256]{};
-    std::snprintf(counts_line, sizeof(counts_line),
-        "%zu sections  %zu imports  %zu exports  %zu unwind records",
-        image.sections().size(), image.imports().size(), image.exports().size(),
-        image.runtime_functions().size());
-    char revision_line[256]{};
-    std::snprintf(revision_line, sizeof(revision_line),
-        "generation %llu  analysis %llu  overlay %llu  %s",
-        static_cast<unsigned long long>(context.publication->generation),
-        static_cast<unsigned long long>(context.publication->analysis_revision),
-        static_cast<unsigned long long>(context.workspace->overlay_revision()),
-        readiness_name(context.progress.readiness));
-    const std::string hash_line = "SHA-256 " + identity.content_hash().to_hex();
-    const std::string full_text = std::string(identity_line) + "\n" + hash_line + "\n" +
-        counts_line + "\n" + revision_line;
-    ImGui::TextUnformatted(identity.bin_name().c_str());
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s  image 0x%016llX  entry +0x%08llX",
-        machine_name(image.machine()).c_str(),
-        static_cast<unsigned long long>(image_base),
-        static_cast<unsigned long long>(image.entry_rva()));
-    ImGui::TextDisabled("SHA-256 %s", identity.content_hash().to_hex().c_str());
-    ImGui::TextDisabled("%zu sections  %zu imports  %zu exports  %zu unwind records",
-        image.sections().size(), image.imports().size(), image.exports().size(),
-        image.runtime_functions().size());
-    ImGui::TextDisabled("generation %llu  analysis %llu  overlay %llu  %s",
-        static_cast<unsigned long long>(context.publication->generation),
-        static_cast<unsigned long long>(context.publication->analysis_revision),
-        static_cast<unsigned long long>(context.workspace->overlay_revision()),
-        readiness_name(context.progress.readiness));
-    ImGui::EndChild();
-    if (ImGui::BeginPopupContextItem("##metadata_banner_context")) {
-        if (ImGui::MenuItem("Copy", "Ctrl+C"))
-            ImGui::SetClipboardText(full_text.c_str());
-        if (ImGui::MenuItem("Copy Line Text"))
-            ImGui::SetClipboardText(identity_line);
-        if (ImGui::MenuItem("Copy Address")) {
-            char address[32]{};
-            std::snprintf(address, sizeof(address), "%016llX",
-                static_cast<unsigned long long>(image_base));
-            ImGui::SetClipboardText(address);
-        }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Select All Banner")) {
-            std::lock_guard<std::mutex> lock(context.view->mutex);
-            context.view->banner_selected_all = true;
-        }
-        ImGui::EndPopup();
+
+    std::vector<disasm_view::metadata_line_t> lines;
+    lines.reserve(36);
+    auto append = [&lines](disasm_view::metadata_line_kind_t kind, std::string text = {}) {
+        lines.push_back({std::move(text), kind});
+    };
+    using kind_t = disasm_view::metadata_line_kind_t;
+    append(kind_t::comment, ";");
+    append(kind_t::banner, "; +-------------------------------------------------------------------------+");
+    append(kind_t::banner, "; |             AiDA - Reverse-engineering toolkit by AiDA Team             |");
+    append(kind_t::banner, "; |                          aida.app - Standalone                          |");
+    append(kind_t::banner, "; +-------------------------------------------------------------------------+");
+    append(kind_t::comment, ";");
+    append(kind_t::comment, "; Input SHA256 : " + identity.content_hash().to_hex());
+    append(kind_t::comment, "; Input MD5    : (unavailable)");
+    append(kind_t::comment, "; Input CRC32  : (unavailable)");
+    append(kind_t::comment, "; Compiler     : (unavailable)");
+    append(kind_t::blank);
+    append(kind_t::comment, "; File Name   : " + identity.normalized_source_path());
+    append(kind_t::comment, "; Format      : Portable executable for " + machine_name(image.machine()));
+    char buffer[512]{};
+    std::snprintf(buffer, sizeof(buffer), "; Imagebase   : %llX",
+        static_cast<unsigned long long>(image_base));
+    append(kind_t::comment, buffer);
+    const auto primary = std::find_if(image.sections().begin(), image.sections().end(),
+        [](const aida::analysis::pe_section_t& section) { return section.executable; });
+    if (primary != image.sections().end()) {
+        const auto section_number = static_cast<std::size_t>(
+            std::distance(image.sections().begin(), primary)) + 1;
+        std::snprintf(buffer, sizeof(buffer), "; Section %zu. (virtual address %08X)",
+            section_number, primary->virtual_address);
+        append(kind_t::comment, buffer);
+        std::snprintf(buffer, sizeof(buffer), "; Virtual size                  : %08X ( %u.)",
+            primary->virtual_size, primary->virtual_size);
+        append(kind_t::comment, buffer);
+        std::snprintf(buffer, sizeof(buffer), "; Section size in file          : %08X ( %u.)",
+            primary->raw_size, primary->raw_size);
+        append(kind_t::comment, buffer);
+        std::snprintf(buffer, sizeof(buffer), "; Offset to raw data for section: %08X",
+            primary->raw_offset);
+        append(kind_t::comment, buffer);
+        const auto flags = section_flags(*primary);
+        std::snprintf(buffer, sizeof(buffer), "; Flags %08X: %s",
+            primary->characteristics, flags.c_str());
+        append(kind_t::comment, buffer);
+        append(kind_t::comment, "; Alignment     : default");
     }
-    if (selected_all && ImGui::IsItemFocused() && ImGui::GetIO().KeyCtrl &&
-        ImGui::IsKeyPressed(ImGuiKey_C, false))
-        ImGui::SetClipboardText(full_text.c_str());
-    ImGui::PopStyleColor();
+    append(kind_t::blank);
+    append(kind_t::directive, image.machine() == 0x8664 ? ".x64" : ".686p");
+    append(kind_t::directive, ".model flat");
+    append(kind_t::blank);
+    append(kind_t::banner, "; ===========================================================================");
+    append(kind_t::blank);
+    append(kind_t::keyword, "; Segment type: Pure code");
+    append(kind_t::keyword, "; Segment permissions: Read/Execute");
+    if (primary != image.sections().end()) {
+        std::string name = primary->name;
+        if (!name.empty() && name.front() == '.')
+            name.front() = '_';
+        append(kind_t::directive, name + " segment para public 'CODE' use64");
+        append(kind_t::directive, "assume cs:" + name);
+    }
+    append(kind_t::blank);
+
+    std::lock_guard<std::mutex> lock(context.view->mutex);
+    context.view->metadata_lines = std::move(lines);
+    context.view->metadata_signature = signature(context, image_base);
 }
 
 }

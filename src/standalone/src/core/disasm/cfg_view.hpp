@@ -56,6 +56,10 @@
 #include "../ui/fonts.hpp"
 #endif
 #include "disasm_view.hpp"
+#include "comment_dialog.hpp"
+#include "pseudocode_view.hpp"
+#include "rename_dialog.hpp"
+#include "../ai/standalone_chat.hpp"
 #include "../ui/theme.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
@@ -105,12 +109,20 @@ struct block_motion_t {
 	bool  initialized = false;
 };
 
-struct cfg_state_t {
+struct cfg_model_snapshot_t {
 	std::vector<basic_block_t> blocks;
-	cfg_layout::graph_t        graph;
-	uint64_t                   entry_addr = 0;
-	bool                       built = false;
-	uint64_t                   current_rip = 0;
+	cfg_layout::graph_t graph;
+	uint64_t entry_addr = 0;
+	uint64_t current_rip = 0;
+	std::unordered_map<int, std::size_t> node_lookup;
+	std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
+	std::uint64_t generation = 0;
+};
+
+struct cfg_state_t {
+	std::shared_ptr<const cfg_model_snapshot_t> model;
+	std::atomic<std::uint64_t> next_model_generation{1};
+	std::uint64_t              displayed_model_generation = 0;
 	uint64_t                   last_cursor_addr = 0;
 	float                      pan_x = 0.f;
 	float                      pan_y = 0.f;
@@ -125,8 +137,6 @@ struct cfg_state_t {
 	float                      rebuild_anim = 1.f;
 	bool                       fit_request = false;
 	std::unordered_map<int, block_motion_t> block_motion;
-	std::unordered_map<int, std::size_t> node_lookup;
-	std::map<int, std::vector<function_index::injection_row_t>> entry_injections;
 	bool                       minimap_dragging = false;
 	int                        text_sel_block = -1;
 	int                        text_sel_line_anchor = -1;
@@ -140,6 +150,18 @@ struct cfg_state_t {
 };
 
 inline cfg_state_t g_state;
+
+inline std::shared_ptr<const cfg_model_snapshot_t> capture_model()
+{
+	std::lock_guard<std::mutex> lock(g_state.mutex);
+	return g_state.model;
+}
+
+inline void publish_model(std::shared_ptr<const cfg_model_snapshot_t> model)
+{
+	std::lock_guard<std::mutex> lock(g_state.mutex);
+	g_state.model = std::move(model);
+}
 
 inline void build_cfg(uint64_t entry_address);
 inline void build_cfg(const disasm_view::workspace_context_t& context,
@@ -212,12 +234,8 @@ inline aida::events::subscription_handle_t& pdb_subscription_slot()
 inline void rebuild_on_pdb_load(const aida::events::event_pdb_loaded& ev)
 {
 	if (!ev.success) return;
-	uint64_t entry = 0;
-	{
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		if (!g_state.built) return;
-		entry = g_state.entry_addr;
-	}
+	const auto model = capture_model();
+	const uint64_t entry = model ? model->entry_addr : 0;
 	if (entry == 0) return;
 	build_cfg(entry);
 }
@@ -245,15 +263,10 @@ inline void ensure_pdb_subscription() {}
 
 inline void clear()
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	g_state.blocks.clear();
-	g_state.graph = {};
-	g_state.entry_addr = 0;
-	g_state.built = false;
+	publish_model({});
+	g_state.displayed_model_generation = 0;
 	g_state.selected_block = -1;
 	g_state.block_motion.clear();
-	g_state.node_lookup.clear();
-	g_state.entry_injections.clear();
 	g_state.rebuild_anim = 1.f;
 	g_state.text_sel_block = -1;
 	g_state.text_sel_line_anchor = -1;
@@ -470,12 +483,12 @@ inline std::string substitute_branch_operand(
 
 inline void fit_to_view(float view_width, float view_height)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	if (!g_state.built || g_state.graph.nodes.empty())
+	const auto model = capture_model();
+	if (!model || model->graph.nodes.empty())
 		return;
 
 	float min_x, min_y, max_x, max_y;
-	detail::compute_world_bounds(g_state.graph, min_x, min_y, max_x, max_y);
+	detail::compute_world_bounds(model->graph, min_x, min_y, max_x, max_y);
 	float ww = max_x - min_x;
 	float wh = max_y - min_y;
 	if (ww < 1.f) ww = 1.f;
@@ -498,18 +511,15 @@ inline void fit_to_view(float view_width, float view_height)
 
 inline void center_on_address(uint64_t addr)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	if (!g_state.built)
+	const auto model = capture_model();
+	if (!model)
 		return;
-	for (std::size_t i = 0; i < g_state.blocks.size(); ++i) {
-		auto& b = g_state.blocks[i];
+	for (std::size_t i = 0; i < model->blocks.size(); ++i) {
+		const auto& b = model->blocks[i];
 		if (addr >= b.start_addr && addr < b.end_addr) {
-			std::size_t node_idx = g_state.graph.nodes.size();
-			for (std::size_t ni = 0; ni < g_state.graph.nodes.size(); ++ni) {
-				if (g_state.graph.nodes[ni].id == static_cast<int>(i)) { node_idx = ni; break; }
-			}
-			if (node_idx < g_state.graph.nodes.size()) {
-				auto& n = g_state.graph.nodes[node_idx];
+			const auto found = model->node_lookup.find(static_cast<int>(i));
+			if (found != model->node_lookup.end() && found->second < model->graph.nodes.size()) {
+				const auto& n = model->graph.nodes[found->second];
 				g_state.target_pan_x = -n.x;
 				g_state.target_pan_y = -(n.y + n.height * 0.5f);
 				g_state.selected_block = static_cast<int>(i);
@@ -538,10 +548,7 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 		static_cast<unsigned long long>(entry_address), target_pid);
 
 	g_state.building.store(true);
-	{
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		g_state.rebuild_anim = 0.f;
-	}
+	g_state.rebuild_anim = 0.f;
 
 	try {
 		aida::infra::executor::submission_t sub;
@@ -862,36 +869,25 @@ inline void build_cfg(const disasm_view::workspace_context_t& workspace_context,
 		const std::size_t block_count = blocks.size();
 		const std::size_t node_count = graph.nodes.size();
 		const std::size_t edge_count = graph.edges.size();
+		if (workspace_context &&
+			(workspace_context.workspace->closed() ||
+			 workspace_context.workspace->generation() != workspace_context.publication->generation ||
+			 workspace_context.workspace->analysis_revision() !=
+				workspace_context.publication->analysis_revision))
+			return;
 
-		{
-			std::lock_guard<std::mutex> lk(g_state.mutex);
-			g_state.blocks = std::move(blocks);
-			g_state.graph = std::move(graph);
-			g_state.node_lookup.clear();
-			g_state.node_lookup.reserve(g_state.graph.nodes.size());
-			for (std::size_t node_index = 0; node_index < g_state.graph.nodes.size(); ++node_index)
-				g_state.node_lookup.emplace(g_state.graph.nodes[node_index].id, node_index);
-			g_state.entry_injections = std::move(entry_injections);
-			g_state.entry_addr = entry_address;
-			g_state.built = true;
-			g_state.selected_block = -1;
-			g_state.target_pan_x = 0.f;
-			g_state.target_pan_y = 0.f;
-			g_state.pan_x = 0.f;
-			g_state.pan_y = 0.f;
-			g_state.target_zoom = 1.f;
-			g_state.zoom = 1.f;
-			g_state.block_motion.clear();
-			g_state.rebuild_anim = 0.f;
-			g_state.fit_request = true;
-			g_state.text_sel_block = -1;
-			g_state.text_sel_line_anchor = -1;
-			g_state.text_sel_line_extent = -1;
-			g_state.text_sel_dragging = false;
-			g_state.text_ctx_block = -1;
-			g_state.text_ctx_line = -1;
-			g_state.sel_log_frame = -1;
-		}
+		auto model = std::make_shared<cfg_model_snapshot_t>();
+		model->blocks = std::move(blocks);
+		model->graph = std::move(graph);
+		model->entry_addr = entry_address;
+		model->current_rip = debugger_engine::cached_registers().rip;
+		model->entry_injections = std::move(entry_injections);
+		model->node_lookup.reserve(model->graph.nodes.size());
+		for (std::size_t node_index = 0; node_index < model->graph.nodes.size(); ++node_index)
+			model->node_lookup.emplace(model->graph.nodes[node_index].id, node_index);
+		model->generation = g_state.next_model_generation.fetch_add(1,
+			std::memory_order_acq_rel);
+		publish_model(std::move(model));
 
 		auto t_end = std::chrono::steady_clock::now();
 		uint64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
@@ -934,40 +930,37 @@ inline void build_cfg(uint64_t entry_address)
 #else
 inline void build_cfg(const disasm_view::workspace_context_t&, uint64_t entry_address)
 {
-	std::lock_guard<std::mutex> lock(g_state.mutex);
-	g_state.entry_addr = entry_address ? entry_address : 0x00007FF7A4C16A10;
-	g_state.current_rip = debugger_engine::cached_registers().rip;
-	g_state.blocks = {
-		{g_state.entry_addr, g_state.entry_addr + 0x0D, {{g_state.entry_addr, "mov rax, qword ptr [rbx+18h]"}, {g_state.entry_addr + 4, "test rax, rax"}, {g_state.entry_addr + 7, "je loc_7FF7A4C16A32"}}, {1, 2}, true, false},
-		{g_state.entry_addr + 0x10, g_state.entry_addr + 0x1D, {{g_state.entry_addr + 0x10, "call decrypt_stage"}, {g_state.entry_addr + 0x15, "test al, al"}, {g_state.entry_addr + 0x17, "jne loc_7FF7A4C16A48"}}, {3, 2}, false, false},
-		{g_state.entry_addr + 0x22, g_state.entry_addr + 0x28, {{g_state.entry_addr + 0x22, "xor eax, eax"}, {g_state.entry_addr + 0x24, "jmp loc_7FF7A4C16A52"}}, {4}, false, true},
-		{g_state.entry_addr + 0x38, g_state.entry_addr + 0x42, {{g_state.entry_addr + 0x38, "mov eax, 1"}, {g_state.entry_addr + 0x3D, "mov [rdi+40h], al"}}, {4}, false, false},
-		{g_state.entry_addr + 0x48, g_state.entry_addr + 0x4D, {{g_state.entry_addr + 0x48, "add rsp, 30h"}, {g_state.entry_addr + 0x4C, "ret"}}, {}, false, false}
+	auto model = std::make_shared<cfg_model_snapshot_t>();
+	model->entry_addr = entry_address ? entry_address : 0x00007FF7A4C16A10;
+	model->current_rip = debugger_engine::cached_registers().rip;
+	model->blocks = {
+		{model->entry_addr, model->entry_addr + 0x0D, {{model->entry_addr, "mov rax, qword ptr [rbx+18h]"}, {model->entry_addr + 4, "test rax, rax"}, {model->entry_addr + 7, "je loc_7FF7A4C16A32"}}, {1, 2}, true, false},
+		{model->entry_addr + 0x10, model->entry_addr + 0x1D, {{model->entry_addr + 0x10, "call decrypt_stage"}, {model->entry_addr + 0x15, "test al, al"}, {model->entry_addr + 0x17, "jne loc_7FF7A4C16A48"}}, {3, 2}, false, false},
+		{model->entry_addr + 0x22, model->entry_addr + 0x28, {{model->entry_addr + 0x22, "xor eax, eax"}, {model->entry_addr + 0x24, "jmp loc_7FF7A4C16A52"}}, {4}, false, true},
+		{model->entry_addr + 0x38, model->entry_addr + 0x42, {{model->entry_addr + 0x38, "mov eax, 1"}, {model->entry_addr + 0x3D, "mov [rdi+40h], al"}}, {4}, false, false},
+		{model->entry_addr + 0x48, model->entry_addr + 0x4D, {{model->entry_addr + 0x48, "add rsp, 30h"}, {model->entry_addr + 0x4C, "ret"}}, {}, false, false}
 	};
-	g_state.graph = {};
-	for (std::size_t i = 0; i < g_state.blocks.size(); ++i) {
+	for (std::size_t i = 0; i < model->blocks.size(); ++i) {
 		const int block_id = static_cast<int>(i);
 		cfg_layout::node_t node;
 		node.id = block_id;
 		node.width = 286.f;
-		node.height = 72.f + static_cast<float>(g_state.blocks[i].instructions.size()) * 20.f;
+		node.height = 72.f + static_cast<float>(model->blocks[i].instructions.size()) * 20.f;
 		node.addr_col_w = 116.f;
 		node.is_entry = i == 0;
-		g_state.graph.nodes.push_back(node);
-		for (int successor : g_state.blocks[i].successors)
-			g_state.graph.edges.push_back({block_id, successor, i == 0 && successor == 1});
+		model->graph.nodes.push_back(node);
+		for (int successor : model->blocks[i].successors)
+			model->graph.edges.push_back({block_id, successor, i == 0 && successor == 1});
 	}
-	cfg_layout::layout(g_state.graph, 92.f, 76.f);
-	g_state.node_lookup.clear();
-	g_state.node_lookup.reserve(g_state.graph.nodes.size());
-	for (std::size_t node_index = 0; node_index < g_state.graph.nodes.size(); ++node_index)
-		g_state.node_lookup.emplace(g_state.graph.nodes[node_index].id, node_index);
-	g_state.entry_injections.clear();
-	g_state.entry_injections[0] = {{function_index::injection_t::function_banner, "; validate_license", g_state.entry_addr}, {function_index::injection_t::prototype_line, "bool __fastcall validate_license(session_t* session)", g_state.entry_addr}};
-	g_state.built = true;
-	g_state.fit_request = true;
-	g_state.rebuild_anim = 0.f;
-	aida::preview::debugger::record("build_cfg", std::to_string(g_state.entry_addr));
+	cfg_layout::layout(model->graph, 92.f, 76.f);
+	model->node_lookup.reserve(model->graph.nodes.size());
+	for (std::size_t node_index = 0; node_index < model->graph.nodes.size(); ++node_index)
+		model->node_lookup.emplace(model->graph.nodes[node_index].id, node_index);
+	model->entry_injections[0] = {{function_index::injection_t::function_banner, "; validate_license", model->entry_addr}, {function_index::injection_t::prototype_line, "bool __fastcall validate_license(session_t* session)", model->entry_addr}};
+	model->generation = g_state.next_model_generation.fetch_add(1, std::memory_order_acq_rel);
+	const auto logged_entry = model->entry_addr;
+	publish_model(std::move(model));
+	aida::preview::debugger::record("build_cfg", std::to_string(logged_entry));
 }
 
 inline void build_cfg(uint64_t entry_address)
@@ -978,7 +971,8 @@ inline void build_cfg(uint64_t entry_address)
 
 inline bool handle_view_keys(float view_width, float view_height)
 {
-	if (g_state.fit_request && g_state.built && !g_state.graph.nodes.empty()) {
+	const auto model = capture_model();
+	if (g_state.fit_request && model && !model->graph.nodes.empty()) {
 		g_state.fit_request = false;
 		fit_to_view(view_width, view_height);
 	}
@@ -1003,17 +997,7 @@ inline bool handle_view_keys(float view_width, float view_height)
 		}
 		uint64_t back_addr = g_state.last_cursor_addr != 0
 			? g_state.last_cursor_addr
-			: g_state.entry_addr;
-		aida::ui::application_views::open_or_focus(
-			aida::ui::stable_view_id_t("document.disassembly"));
-		if (back_addr != 0)
-			disasm_view::goto_address(back_addr, disasm_view::capture_selected_workspace());
-		return true;
-	}
-	if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-		uint64_t back_addr = g_state.last_cursor_addr != 0
-			? g_state.last_cursor_addr
-			: g_state.entry_addr;
+			: (model ? model->entry_addr : 0);
 		aida::ui::application_views::open_or_focus(
 			aida::ui::stable_view_id_t("document.disassembly"));
 		if (back_addr != 0)
@@ -1024,13 +1008,6 @@ inline bool handle_view_keys(float view_width, float view_height)
 		fit_to_view(view_width, view_height);
 		return true;
 	}
-	if (ImGui::IsKeyPressed(ImGuiKey_G, false)) {
-		if (g_state.last_cursor_addr != 0)
-			center_on_address(g_state.last_cursor_addr);
-		else if (g_state.entry_addr != 0)
-			center_on_address(g_state.entry_addr);
-		return true;
-	}
 	return false;
 }
 
@@ -1038,7 +1015,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				   float alpha, float accent_r, float accent_g, float accent_b)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	if (!g_state.built)
+	if (!capture_model())
 		build_cfg(debugger_engine::cached_registers().rip);
 #endif
 	ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1086,9 +1063,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		return;
 	}
 
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-
-	if (!g_state.built || g_state.blocks.empty()) {
+	const auto model = capture_model();
+	if (!model || model->blocks.empty()) {
 		aida::ui::empty_state::config_t cfg;
 		cfg.glyph = aida::ui::empty_state::glyph_t::flow;
 		cfg.title = "No CFG built";
@@ -1097,6 +1073,26 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		aida::ui::empty_state::render(ImVec2(pos_x, pos_y), ImVec2(width, height), cfg);
 		dl->PopClipRect();
 		return;
+	}
+	if (g_state.displayed_model_generation != model->generation) {
+		g_state.displayed_model_generation = model->generation;
+		g_state.selected_block = -1;
+		g_state.target_pan_x = 0.f;
+		g_state.target_pan_y = 0.f;
+		g_state.pan_x = 0.f;
+		g_state.pan_y = 0.f;
+		g_state.target_zoom = 1.f;
+		g_state.zoom = 1.f;
+		g_state.block_motion.clear();
+		g_state.rebuild_anim = 0.f;
+		g_state.fit_request = true;
+		g_state.text_sel_block = -1;
+		g_state.text_sel_line_anchor = -1;
+		g_state.text_sel_line_extent = -1;
+		g_state.text_sel_dragging = false;
+		g_state.text_ctx_block = -1;
+		g_state.text_ctx_line = -1;
+		g_state.sel_log_frame = -1;
 	}
 
 	g_state.rebuild_anim = aida::motion::smooth_lerp(g_state.rebuild_anim, 1.f, 4.f, dt);
@@ -1172,11 +1168,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 	}
 
-	auto& nodes = g_state.graph.nodes;
-	auto& edges = g_state.graph.edges;
-	auto& blocks = g_state.blocks;
+	const auto& nodes = model->graph.nodes;
+	const auto& edges = model->graph.edges;
+	const auto& blocks = model->blocks;
 
-	for (auto& n : nodes) {
+	for (const auto& n : nodes) {
 		auto& m = g_state.block_motion[n.id];
 		if (!m.initialized) {
 			m.current_x = n.x;
@@ -1188,15 +1184,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		m.current_y = aida::motion::spring_step(m.current_y, n.y, m.vel_y, aida::motion::spring::gentle, dt);
 	}
 
-	for (auto& e : edges) {
-		const auto from_found = g_state.node_lookup.find(e.from);
-		const auto to_found = g_state.node_lookup.find(e.to);
-		if (from_found == g_state.node_lookup.end() || to_found == g_state.node_lookup.end()) continue;
+	for (const auto& e : edges) {
+		const auto from_found = model->node_lookup.find(e.from);
+		const auto to_found = model->node_lookup.find(e.to);
+		if (from_found == model->node_lookup.end() || to_found == model->node_lookup.end()) continue;
 		const std::size_t from_idx = from_found->second;
 		const std::size_t to_idx = to_found->second;
 
-		auto& fn = nodes[from_idx];
-		auto& tn = nodes[to_idx];
+		const auto& fn = nodes[from_idx];
+		const auto& tn = nodes[to_idx];
 		auto& fm = g_state.block_motion[fn.id];
 		auto& tm = g_state.block_motion[tn.id];
 
@@ -1321,15 +1317,15 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (br.x < pos_x || tl.x > pos_x + width || br.y < pos_y || tl.y > pos_y + height)
 			continue;
 
-		bool is_rip_block = (g_state.current_rip >= blk.start_addr && g_state.current_rip < blk.end_addr);
+		bool is_rip_block = (model->current_rip >= blk.start_addr && model->current_rip < blk.end_addr);
 		bool is_selected = (n.id == g_state.selected_block);
 		bool is_exit = blk.successors.empty() && !blk.is_entry;
 
 		char header_buf[160];
 		const char* kind = blk.is_entry ? "ENTRY" : (is_exit ? "EXIT" : "BLOCK");
 		if (blk.is_entry) {
-			std::string fname = detail::resolve_branch_symbol_for_cfg(g_state.entry_addr);
-			if (fname.empty() && g_state.entry_addr != blk.start_addr)
+			std::string fname = detail::resolve_branch_symbol_for_cfg(model->entry_addr);
+			if (fname.empty() && model->entry_addr != blk.start_addr)
 				fname = detail::resolve_branch_symbol_for_cfg(blk.start_addr);
 			if (!fname.empty()) {
 				std::size_t avail = sizeof(header_buf) - 12;
@@ -1413,8 +1409,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 			const std::vector<function_index::injection_row_t>* injs = nullptr;
 			if (blk.is_entry) {
-				auto it_inj = g_state.entry_injections.find(n.id);
-				if (it_inj != g_state.entry_injections.end() && !it_inj->second.empty())
+				auto it_inj = model->entry_injections.find(n.id);
+				if (it_inj != model->entry_injections.end() && !it_inj->second.empty())
 					injs = &it_inj->second;
 			}
 			std::size_t inj_count = injs ? injs->size() : 0;
@@ -1491,7 +1487,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 				ImU32 addr_col = aida::ui::with_alpha(tk.text_address, row_alpha * 0.85f);
 
-				if (line.addr == g_state.current_rip) {
+				if (line.addr == model->current_rip) {
 					dl->AddRectFilled(line_a, line_b,
 									  aida::ui::with_alpha(tk.accent_glow, row_alpha));
 				}
@@ -1608,9 +1604,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			|| g_state.text_sel_line_anchor < 0
 			|| g_state.text_sel_line_extent < 0)
 			return std::string();
-		if (static_cast<std::size_t>(g_state.text_sel_block) >= g_state.blocks.size())
+		if (static_cast<std::size_t>(g_state.text_sel_block) >= model->blocks.size())
 			return std::string();
-		const auto& sblk = g_state.blocks[static_cast<std::size_t>(g_state.text_sel_block)];
+		const auto& sblk = model->blocks[static_cast<std::size_t>(g_state.text_sel_block)];
 		int lo = g_state.text_sel_line_anchor < g_state.text_sel_line_extent
 			? g_state.text_sel_line_anchor : g_state.text_sel_line_extent;
 		int hi = g_state.text_sel_line_anchor > g_state.text_sel_line_extent
@@ -1636,6 +1632,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	};
 	aida::ui::analysis_context_menu::render();
 	aida::ui::context_menu_open_origin_t legacy_graph_origin{};
+	const bool legacy_pointer_context_requested = typed_context_requested;
 	if (hovered && aida::ui::analysis_context_menu::keyboard_request(legacy_graph_origin))
 		typed_context_requested = g_state.last_cursor_addr != 0;
 	if (typed_context_requested) {
@@ -1643,9 +1640,22 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		using aida::ui::action_handler_result_t;
 		context_t menu;
 		menu.kind = menu_kind_t::graph;
-		menu.generation = g_state.entry_addr;
-		menu.live_generation = []() { return g_state.entry_addr; };
+		menu.entity_id = "legacy-graph:" + std::to_string(g_state.selected_block) + ":" +
+			std::to_string(g_state.last_cursor_addr);
+		menu.generation = model->generation;
+		menu.live_generation = []() {
+			const auto current = capture_model();
+			return current ? current->generation : 0;
+		};
 		const auto address = g_state.last_cursor_addr;
+		const auto selected_block = g_state.selected_block;
+		menu.validate_identity = [address, selected_block]() {
+			return g_state.last_cursor_addr == address &&
+				g_state.selected_block == selected_block
+				? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(
+					"The selected graph entity changed");
+		};
 		menu.actions["analysis.navigate.disassembly"].invoke = [address]() {
 			aida::ui::application_views::open_or_focus(
 				aida::ui::stable_view_id_t("document.disassembly"));
@@ -1684,10 +1694,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			return action_handler_result_t::completed();
 		};
 		if (g_state.text_ctx_block >= 0 &&
-			static_cast<std::size_t>(g_state.text_ctx_block) < g_state.blocks.size()) {
-			menu.actions["analysis.graph.select_block"].invoke = []() {
-				const auto& block = g_state.blocks[static_cast<std::size_t>(g_state.text_ctx_block)];
-				g_state.text_sel_block = g_state.text_ctx_block;
+			static_cast<std::size_t>(g_state.text_ctx_block) < model->blocks.size()) {
+			const int context_block = g_state.text_ctx_block;
+			menu.actions["analysis.graph.select_block"].invoke = [model, context_block]() {
+				const auto& block = model->blocks[static_cast<std::size_t>(context_block)];
+				g_state.text_sel_block = context_block;
 				g_state.text_sel_line_anchor = 0;
 				g_state.text_sel_line_extent = static_cast<int>(block.instructions.size()) - 1;
 				return action_handler_result_t::completed();
@@ -1701,12 +1712,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				return action_handler_result_t::completed();
 			};
 		}
-		open(std::move(menu), typed_context_requested && ImGui::IsMouseClicked(ImGuiMouseButton_Right)
+		open(std::move(menu), legacy_pointer_context_requested
 			? aida::ui::context_menu_open_origin_t::pointer : legacy_graph_origin);
 	}
 
 	if (hovered && !io.WantTextInput && !io.WantCaptureKeyboard
-		&& io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
+		&& io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+			ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
 	{
 		std::string txt = build_sel_text(true);
 		if (!txt.empty()) ImGui::SetClipboardText(txt.c_str());
@@ -1715,9 +1727,9 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		&& io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
 	{
 		if (g_state.selected_block >= 0
-			&& static_cast<std::size_t>(g_state.selected_block) < g_state.blocks.size())
+			&& static_cast<std::size_t>(g_state.selected_block) < model->blocks.size())
 		{
-			const auto& sblk = g_state.blocks[static_cast<std::size_t>(g_state.selected_block)];
+			const auto& sblk = model->blocks[static_cast<std::size_t>(g_state.selected_block)];
 			g_state.text_sel_block = g_state.selected_block;
 			g_state.text_sel_line_anchor = 0;
 			g_state.text_sel_line_extent = static_cast<int>(sblk.instructions.size()) - 1;
@@ -1843,16 +1855,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			g_state.fit_request = true;
 		}
 		if (home_hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-			if (g_state.entry_addr != 0) {
-				for (std::size_t i = 0; i < g_state.blocks.size(); ++i) {
-					auto& b = g_state.blocks[i];
-					if (g_state.entry_addr >= b.start_addr && g_state.entry_addr < b.end_addr) {
-						std::size_t node_idx = g_state.graph.nodes.size();
-						for (std::size_t ni = 0; ni < g_state.graph.nodes.size(); ++ni) {
-							if (g_state.graph.nodes[ni].id == static_cast<int>(i)) { node_idx = ni; break; }
-						}
-						if (node_idx < g_state.graph.nodes.size()) {
-							auto& nd = g_state.graph.nodes[node_idx];
+			if (model->entry_addr != 0) {
+				for (std::size_t i = 0; i < model->blocks.size(); ++i) {
+					const auto& block = model->blocks[i];
+					if (model->entry_addr >= block.start_addr && model->entry_addr < block.end_addr) {
+						const auto found = model->node_lookup.find(static_cast<int>(i));
+						if (found != model->node_lookup.end() &&
+							found->second < model->graph.nodes.size()) {
+							const auto& nd = model->graph.nodes[found->second];
 							g_state.target_pan_x = -nd.x;
 							g_state.target_pan_y = -(nd.y + nd.height * 0.5f);
 							g_state.selected_block = static_cast<int>(i);
@@ -1889,7 +1899,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		}
 
 		float wmin_x, wmin_y, wmax_x, wmax_y;
-		detail::compute_world_bounds(g_state.graph, wmin_x, wmin_y, wmax_x, wmax_y);
+		detail::compute_world_bounds(model->graph, wmin_x, wmin_y, wmax_x, wmax_y);
 		float ww = wmax_x - wmin_x;
 		float wh = wmax_y - wmin_y;
 		if (ww < 1.f) ww = 1.f;
@@ -1909,16 +1919,16 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			              oy + (wy - wmin_y) * scale);
 		};
 
-		for (std::size_t ni = 0; ni < g_state.graph.nodes.size(); ++ni) {
-			auto& n = g_state.graph.nodes[ni];
-			if (n.id < 0 || static_cast<std::size_t>(n.id) >= g_state.blocks.size()) continue;
-			auto& blk = g_state.blocks[static_cast<std::size_t>(n.id)];
+		for (std::size_t ni = 0; ni < model->graph.nodes.size(); ++ni) {
+			const auto& n = model->graph.nodes[ni];
+			if (n.id < 0 || static_cast<std::size_t>(n.id) >= model->blocks.size()) continue;
+			const auto& blk = model->blocks[static_cast<std::size_t>(n.id)];
 
 			ImVec2 t1 = wts(n.x - n.width * 0.5f, n.y);
 			ImVec2 t2 = wts(n.x + n.width * 0.5f, n.y + n.height);
 
 			ImU32 nc;
-			if (g_state.current_rip >= blk.start_addr && g_state.current_rip < blk.end_addr)
+			if (model->current_rip >= blk.start_addr && model->current_rip < blk.end_addr)
 				nc = aida::ui::with_alpha(tk.accent_u32, alpha);
 			else if (blk.is_entry)
 				nc = aida::ui::with_alpha(tk.accent_dim, alpha);
@@ -1985,7 +1995,23 @@ struct workspace_graph_view_state_t {
 	float pan_x = 0.0f;
 	float pan_y = 0.0f;
 	float zoom = 1.0f;
+	float target_zoom = 1.0f;
+	bool fit_request = true;
+	bool minimap_dragging = false;
+	std::uint64_t layout_signature = 0;
+	cfg_layout::graph_t layout;
+	std::vector<std::size_t> block_indices;
+	struct edge_t {
+		int from = 0;
+		int to = 0;
+		aida::analysis::edge_kind_t kind = aida::analysis::edge_kind_t::fallthrough;
+	};
+	std::vector<edge_t> edges;
+	std::vector<int> outgoing;
+	std::unordered_map<aida::analysis::entity_id_t, std::size_t> node_by_entity;
 	std::optional<aida::analysis::entity_id_t> selected_block;
+	std::optional<aida::analysis::entity_id_t> selected_instruction;
+	std::uint64_t selected_address = 0;
 };
 
 inline std::mutex& workspace_graph_registry_mutex()
@@ -2044,20 +2070,211 @@ inline const aida::analysis::function_record_t* workspace_graph_function(
 	return &functions.front();
 }
 
+inline std::uint64_t workspace_graph_generation(
+	const disasm_view::workspace_context_t& context)
+{
+	const auto generation = context.workspace->generation();
+	const auto revision = context.workspace->analysis_revision();
+	return generation ^ (revision + 0x9E3779B97F4A7C15ull +
+		(generation << 6u) + (generation >> 2u));
+}
+
+inline std::uint64_t workspace_graph_layout_signature(
+	const disasm_view::workspace_context_t& context,
+	const aida::analysis::function_record_t& function,
+	std::size_t page)
+{
+	std::uint64_t value = workspace_graph_generation(context);
+	value ^= function.id + 0x9E3779B97F4A7C15ull + (value << 6u) + (value >> 2u);
+	value ^= static_cast<std::uint64_t>(page) + 0x9E3779B97F4A7C15ull +
+		(value << 6u) + (value >> 2u);
+	return value == 0 ? 1 : value;
+}
+
+inline std::uint64_t workspace_graph_evidence_hash(const std::string& value)
+{
+	std::uint64_t hash = 1469598103934665603ull;
+	for (const char character : value) {
+		hash ^= static_cast<unsigned char>(character);
+		hash *= 1099511628211ull;
+	}
+	return hash == 0 ? 1 : hash;
+}
+
+inline const char* workspace_graph_edge_label(aida::analysis::edge_kind_t kind,
+	bool branching)
+{
+	switch (kind) {
+	case aida::analysis::edge_kind_t::fallthrough: return branching ? "F" : nullptr;
+	case aida::analysis::edge_kind_t::conditional_taken: return "T";
+	case aida::analysis::edge_kind_t::unconditional: return "J";
+	case aida::analysis::edge_kind_t::call: return "CALL";
+	case aida::analysis::edge_kind_t::tail_call: return "TAIL";
+	case aida::analysis::edge_kind_t::return_edge: return "RET";
+	case aida::analysis::edge_kind_t::exception_edge: return "EX";
+	case aida::analysis::edge_kind_t::indirect: return "IND";
+	}
+	return nullptr;
+}
+
+inline ImU32 workspace_graph_edge_color(aida::analysis::edge_kind_t kind,
+	const aida::ui::theme_t& theme, float alpha, bool branching = false)
+{
+	ImU32 color = theme.text_secondary;
+	switch (kind) {
+	case aida::analysis::edge_kind_t::fallthrough:
+		color = branching ? theme.error : theme.text_secondary;
+		break;
+	case aida::analysis::edge_kind_t::conditional_taken: color = theme.success; break;
+	case aida::analysis::edge_kind_t::unconditional: color = theme.info; break;
+	case aida::analysis::edge_kind_t::call: color = theme.accent_hover; break;
+	case aida::analysis::edge_kind_t::tail_call: color = theme.warning; break;
+	case aida::analysis::edge_kind_t::return_edge: color = theme.error; break;
+	case aida::analysis::edge_kind_t::exception_edge: color = theme.warning; break;
+	case aida::analysis::edge_kind_t::indirect: color = theme.syn_keyword; break;
+	}
+	return aida::ui::with_alpha(color, alpha);
+}
+
+inline void workspace_graph_rebuild_layout(
+	workspace_graph_view_state_t& view,
+	const disasm_view::workspace_context_t& context,
+	const aida::analysis::function_record_t& function,
+	std::size_t page_begin, std::size_t page_end)
+{
+	const auto& snapshot = *context.publication->snapshot;
+	view.layout = {};
+	view.block_indices.clear();
+	view.edges.clear();
+	view.outgoing.clear();
+	view.node_by_entity.clear();
+	view.block_indices.reserve(page_end - page_begin);
+	view.layout.nodes.reserve(page_end - page_begin);
+	for (std::size_t local = page_begin; local < page_end; ++local) {
+		const std::size_t index = static_cast<std::size_t>(function.first_block) + local;
+		if (index >= snapshot.blocks.size())
+			break;
+		const auto& block = snapshot.blocks[index];
+		const int node_id = static_cast<int>(view.layout.nodes.size());
+		const std::size_t shown = (std::min)(static_cast<std::size_t>(block.instruction_count),
+			static_cast<std::size_t>(14));
+		cfg_layout::node_t node;
+		node.id = node_id;
+		node.width = 410.0f;
+		node.height = 43.0f + static_cast<float>(shown) * 19.0f +
+			(block.instruction_count > shown ? 20.0f : 8.0f);
+		node.addr_col_w = 112.0f;
+		node.is_entry = local == 0;
+		view.node_by_entity.emplace(block.id, view.layout.nodes.size());
+		view.block_indices.push_back(index);
+		view.layout.nodes.push_back(node);
+	}
+	for (const auto& edge : snapshot.edges) {
+		if (!edge.target_entity)
+			continue;
+		const auto from = view.node_by_entity.find(edge.source_entity);
+		const auto to = view.node_by_entity.find(*edge.target_entity);
+		if (from == view.node_by_entity.end() || to == view.node_by_entity.end())
+			continue;
+		workspace_graph_view_state_t::edge_t visual;
+		visual.from = static_cast<int>(from->second);
+		visual.to = static_cast<int>(to->second);
+		visual.kind = edge.kind;
+		view.edges.push_back(visual);
+		if (visual.to > visual.from) {
+			cfg_layout::edge_t layout_edge;
+			layout_edge.from = visual.from;
+			layout_edge.to = visual.to;
+			layout_edge.is_true_branch = edge.kind ==
+				aida::analysis::edge_kind_t::conditional_taken;
+			view.layout.edges.push_back(layout_edge);
+		}
+	}
+	view.outgoing.assign(view.layout.nodes.size(), 0);
+	for (const auto& edge : view.edges) {
+		if (edge.from >= 0 && static_cast<std::size_t>(edge.from) < view.outgoing.size())
+			++view.outgoing[static_cast<std::size_t>(edge.from)];
+	}
+	cfg_layout::layout(view.layout, 82.0f, 94.0f);
+	if (view.selected_block &&
+		view.node_by_entity.find(*view.selected_block) == view.node_by_entity.end()) {
+		view.selected_block.reset();
+		view.selected_instruction.reset();
+		view.selected_address = 0;
+	}
+	view.fit_request = true;
+}
+
+inline std::optional<std::uint64_t> workspace_graph_direct_target(
+	const disasm_view::workspace_context_t& context,
+	const aida::analysis::instruction_record_t& instruction)
+{
+	if (!context.publication || !context.publication->snapshot ||
+		instruction.target_fact_count == 0)
+		return std::nullopt;
+	const auto& facts = context.publication->snapshot->target_facts;
+	const std::size_t begin = instruction.target_fact_begin;
+	const std::size_t end = (std::min)(facts.size(),
+		begin + static_cast<std::size_t>(instruction.target_fact_count));
+	for (std::size_t index = begin; index < end; ++index) {
+		if (!facts[index].direct)
+			continue;
+		return disasm_view::runtime_address(context, facts[index].target).value_or(
+			facts[index].target.value);
+	}
+	return std::nullopt;
+}
+
+inline const aida::analysis::instruction_record_t* workspace_graph_selected_instruction(
+	const workspace_graph_view_state_t& view,
+	const aida::analysis::analysis_snapshot_t& snapshot)
+{
+	if (!view.selected_instruction)
+		return nullptr;
+	const auto found = std::find_if(snapshot.instructions.begin(), snapshot.instructions.end(),
+		[&](const aida::analysis::instruction_record_t& instruction) {
+			return instruction.id == *view.selected_instruction;
+		});
+	return found == snapshot.instructions.end() ? nullptr : &*found;
+}
+
+inline void workspace_graph_open_disassembly(
+	const disasm_view::workspace_context_t& context, std::uint64_t address)
+{
+	disasm_view::goto_address(address, context);
+	aida::ui::application_views::open_or_focus(
+		aida::ui::stable_view_id_t("document.disassembly"));
+}
+
+inline void workspace_graph_open_pseudocode(
+	const disasm_view::workspace_context_t& context, std::uint64_t address)
+{
+	const auto function = disasm_view::enclosing_function_start(address, context);
+	if (function == 0)
+		return;
+	pseudocode_view::request_decompile(context, function, false);
+	aida::ui::application_views::open_or_focus(
+		aida::ui::stable_view_id_t("document.pseudocode"));
+}
+
 inline void render(float, float, float width, float height,
 	float alpha, float, float, float,
 	const disasm_view::workspace_context_t& context)
 {
 	if (!context || !context.publication || !context.publication->snapshot) {
 		ImGui::BeginChild("##workspace_cfg_empty", ImVec2(width, height), false);
-		ImGui::TextUnformatted("A workspace CFG is not available at this readiness level.");
+		aida::ui::compact_empty_state("workspace_cfg_empty", "Graph is not ready",
+			"Open a binary and wait for function recovery to publish a control-flow snapshot.",
+			nullptr, ImVec2(0.0f, (std::max)(160.0f, height)));
 		ImGui::EndChild();
 		return;
 	}
 	const auto* function = workspace_graph_function(context);
 	if (!function) {
 		ImGui::BeginChild("##workspace_cfg_no_function", ImVec2(width, height), false);
-		ImGui::TextUnformatted("No recovered function contains the current selection.");
+		aida::ui::compact_empty_state("workspace_cfg_no_function", "No recovered function",
+			"Select an instruction inside a recovered function, then return to Graph.",
+			nullptr, ImVec2(0.0f, (std::max)(160.0f, height)));
 		ImGui::EndChild();
 		return;
 	}
@@ -2075,215 +2292,783 @@ inline void render(float, float, float width, float height,
 		view->block_page = page_count - 1;
 	const std::size_t page_begin = view->block_page * blocks_per_page;
 	const std::size_t page_end = (std::min)(total, page_begin + blocks_per_page);
+	const auto signature = workspace_graph_layout_signature(context, *function, view->block_page);
+	if (view->layout_signature != signature) {
+		view->layout_signature = signature;
+		workspace_graph_rebuild_layout(*view, context, *function, page_begin, page_end);
+	}
 	const std::string id = context.workspace->identity().binary_id().to_hex();
-	ImGui::PushID(id.c_str());
-	ImGui::BeginChild("##workspace_cfg", ImVec2(width, height), false);
 	const auto function_address = disasm_view::runtime_address(context, function->start).value_or(
 		function->start.value);
 	const std::string function_name = disasm_view::resolve_name(context, function->start);
-	ImGui::Text("%s  0x%016llX  %zu blocks",
-		function_name.empty() ? "Recovered function" : function_name.c_str(),
-		static_cast<unsigned long long>(function_address), total);
+	ImGui::PushID(id.c_str());
+	ImGui::BeginChild("##workspace_cfg", ImVec2(width, height), false,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+	const auto& theme = aida::ui::resolved();
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 5.0f));
+	ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(theme.text_primary));
+	ImGui::TextUnformatted(function_name.empty() ? "Recovered function" : function_name.c_str());
 	ImGui::SameLine();
-	if (ImGui::Button("Disassembly")) {
-		disasm_view::goto_address(function_address, context);
-		aida::ui::application_views::open_or_focus(
-			aida::ui::stable_view_id_t("document.disassembly"));
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_address),
+		"%016llX", static_cast<unsigned long long>(function_address));
+	ImGui::SameLine();
+	ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.text_dim),
+		"%zu blocks  %zu edges", total, view->edges.size());
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Disassembly  Space"))
+		workspace_graph_open_disassembly(context,
+			view->selected_address != 0 ? view->selected_address : function_address);
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Pseudocode  F5"))
+		workspace_graph_open_pseudocode(context,
+			view->selected_address != 0 ? view->selected_address : function_address);
+	ImGui::SameLine();
+	if (ImGui::SmallButton("Fit  F"))
+		view->fit_request = true;
+	ImGui::SameLine();
+	if (ImGui::SmallButton("-"))
+		view->target_zoom = (std::max)(0.16f, view->target_zoom * 0.85f);
+	ImGui::SameLine();
+	if (ImGui::SmallButton("100%")) {
+		view->zoom = 1.0f;
+		view->target_zoom = 1.0f;
+		view->pan_x = 0.0f;
+		view->pan_y = 0.0f;
 	}
+	ImGui::SameLine();
+	if (ImGui::SmallButton("+"))
+		view->target_zoom = (std::min)(2.5f, view->target_zoom * 1.18f);
 	if (page_count > 1) {
 		ImGui::SameLine();
-		if (ImGui::Button("Previous") && view->block_page != 0)
+		if (ImGui::SmallButton("Previous") && view->block_page != 0) {
 			--view->block_page;
+			view->layout_signature = 0;
+		}
 		ImGui::SameLine();
-		ImGui::Text("Page %zu / %zu", view->block_page + 1, page_count);
+		ImGui::Text("Page %zu/%zu", view->block_page + 1, page_count);
 		ImGui::SameLine();
-		if (ImGui::Button("Next") && view->block_page + 1 < page_count)
+		if (ImGui::SmallButton("Next") && view->block_page + 1 < page_count) {
 			++view->block_page;
+			view->layout_signature = 0;
+		}
 	}
+	ImGui::PopStyleColor();
+	ImGui::PopStyleVar();
 	ImGui::Separator();
+	if (total == 0) {
+		aida::ui::compact_empty_state("workspace_cfg_zero_blocks", "No control-flow blocks",
+			"Function recovery published this function without a displayable block graph.",
+			nullptr, ImVec2(0.0f, (std::max)(160.0f, height - 34.0f)));
+		ImGui::EndChild();
+		ImGui::PopID();
+		return;
+	}
 	ImGui::BeginChild("##workspace_cfg_canvas", ImVec2(0.0f, 0.0f), false,
 		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 	ImDrawList* draw = ImGui::GetWindowDrawList();
 	const ImVec2 canvas = ImGui::GetWindowPos();
 	const ImVec2 canvas_size = ImGui::GetWindowSize();
-	if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-		view->pan_x += ImGui::GetIO().MouseDelta.x;
-		view->pan_y += ImGui::GetIO().MouseDelta.y;
+	const ImVec2 canvas_max(canvas.x + canvas_size.x, canvas.y + canvas_size.y);
+	draw->AddRectFilled(canvas, canvas_max, aida::ui::with_alpha(theme.bg_base, alpha));
+	const bool canvas_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+	ImGuiIO& io = ImGui::GetIO();
+	if (canvas_hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f)) {
+		view->pan_x += io.MouseDelta.x / (std::max)(view->zoom, 0.01f);
+		view->pan_y += io.MouseDelta.y / (std::max)(view->zoom, 0.01f);
 	}
-	if (ImGui::IsWindowHovered()) {
-		const float wheel = ImGui::GetIO().MouseWheel;
-		if (wheel != 0.0f)
-			view->zoom = (std::clamp)(view->zoom + wheel * 0.08f, 0.55f, 1.8f);
+	if (canvas_hovered && io.MouseWheel != 0.0f) {
+		if (io.KeyCtrl) {
+			const float old_zoom = view->target_zoom;
+			const float new_zoom = (std::clamp)(old_zoom * (io.MouseWheel > 0.0f ? 1.12f : 0.89f),
+				0.16f, 2.5f);
+			const ImVec2 center(canvas.x + canvas_size.x * 0.5f,
+				canvas.y + canvas_size.y * 0.5f);
+			const float world_x = (io.MousePos.x - center.x) / old_zoom - view->pan_x;
+			const float world_y = (io.MousePos.y - center.y) / old_zoom - view->pan_y;
+			view->pan_x = (io.MousePos.x - center.x) / new_zoom - world_x;
+			view->pan_y = (io.MousePos.y - center.y) / new_zoom - world_y;
+			view->target_zoom = new_zoom;
+		} else {
+			view->pan_y += io.MouseWheel * 46.0f / (std::max)(view->zoom, 0.01f);
+		}
 	}
-	const auto& theme = aida::ui::resolved();
-	const ImU32 edge_color = aida::ui::with_alpha(theme.text_dim, alpha * 0.8f);
-	const ImU32 call_color = aida::ui::with_alpha(theme.info, alpha);
-	const float node_width = 330.0f * view->zoom;
-	const float column_gap = 90.0f * view->zoom;
-	const float row_gap = 58.0f * view->zoom;
-	const int columns = (std::max)(1, static_cast<int>(canvas_size.x /
-		(node_width + column_gap)));
-	std::unordered_map<aida::analysis::entity_id_t, ImVec2> node_centers;
-	for (std::size_t local = page_begin; local < page_end; ++local) {
-		const auto& block = snapshot.blocks[first + local];
-		const std::size_t shown = (std::min)(static_cast<std::size_t>(block.instruction_count),
-			static_cast<std::size_t>(12));
-		const float node_height = (52.0f + static_cast<float>(shown) * 18.0f) * view->zoom;
-		const std::size_t page_local = local - page_begin;
-		const int column = static_cast<int>(page_local % static_cast<std::size_t>(columns));
-		const int row = static_cast<int>(page_local / static_cast<std::size_t>(columns));
-		const ImVec2 top_left(canvas.x + 20.0f + view->pan_x +
-			static_cast<float>(column) * (node_width + column_gap),
-			canvas.y + 20.0f + view->pan_y + static_cast<float>(row) *
-			(300.0f * view->zoom + row_gap));
-		const ImVec2 bottom_right(top_left.x + node_width, top_left.y + node_height);
-		node_centers[block.id] = ImVec2((top_left.x + bottom_right.x) * 0.5f,
-			(top_left.y + bottom_right.y) * 0.5f);
+	view->zoom += (view->target_zoom - view->zoom) *
+		(1.0f - std::pow(0.001f, (std::min)(ImGui::GetIO().DeltaTime, 0.05f)));
+	float min_x, min_y, max_x, max_y;
+	detail::compute_world_bounds(view->layout, min_x, min_y, max_x, max_y);
+	if (view->fit_request && !view->layout.nodes.empty() &&
+		canvas_size.x > 80.0f && canvas_size.y > 80.0f) {
+		view->fit_request = false;
+		const float graph_width = (std::max)(1.0f, max_x - min_x);
+		const float graph_height = (std::max)(1.0f, max_y - min_y);
+		view->target_zoom = (std::clamp)((std::min)(
+			(canvas_size.x - 88.0f) / graph_width,
+			(canvas_size.y - 88.0f) / graph_height), 0.16f, 1.35f);
+		view->zoom = view->target_zoom;
+		view->pan_x = -(min_x + max_x) * 0.5f;
+		view->pan_y = -(min_y + max_y) * 0.5f;
 	}
-	for (const auto& edge : snapshot.edges) {
-		auto source = node_centers.find(edge.source_entity);
-		if (source == node_centers.end() || !edge.target_entity)
+	const ImVec2 center(canvas.x + canvas_size.x * 0.5f,
+		canvas.y + canvas_size.y * 0.5f);
+	auto world_to_screen = [&](float x, float y) {
+		return ImVec2(center.x + (x + view->pan_x) * view->zoom,
+			center.y + (y + view->pan_y) * view->zoom);
+	};
+	const float grid_world = 40.0f;
+	const float visible_left = -view->pan_x - canvas_size.x * 0.5f / view->zoom;
+	const float visible_right = -view->pan_x + canvas_size.x * 0.5f / view->zoom;
+	const float visible_top = -view->pan_y - canvas_size.y * 0.5f / view->zoom;
+	const float visible_bottom = -view->pan_y + canvas_size.y * 0.5f / view->zoom;
+	if ((visible_right - visible_left) * (visible_bottom - visible_top) /
+		(grid_world * grid_world) < 5000.0f) {
+		const ImU32 grid_color = aida::ui::with_alpha(theme.border_subtle, alpha * 0.42f);
+		for (float y = std::floor(visible_top / grid_world) * grid_world;
+			y <= visible_bottom; y += grid_world) {
+			for (float x = std::floor(visible_left / grid_world) * grid_world;
+				x <= visible_right; x += grid_world) {
+				draw->AddCircleFilled(world_to_screen(x, y), 0.8f, grid_color, 4);
+			}
+		}
+	}
+	const auto& outgoing = view->outgoing;
+	for (const auto& edge : view->edges) {
+		if (edge.from < 0 || edge.to < 0 ||
+			static_cast<std::size_t>(edge.from) >= view->layout.nodes.size() ||
+			static_cast<std::size_t>(edge.to) >= view->layout.nodes.size())
 			continue;
-		auto target = node_centers.find(*edge.target_entity);
-		if (target == node_centers.end())
+		const auto& from = view->layout.nodes[static_cast<std::size_t>(edge.from)];
+		const auto& to = view->layout.nodes[static_cast<std::size_t>(edge.to)];
+		ImVec2 p1;
+		ImVec2 p4;
+		ImVec2 p2;
+		ImVec2 p3;
+		if (to.y > from.y + from.height * 0.25f) {
+			p1 = world_to_screen(from.x, from.y + from.height);
+			p4 = world_to_screen(to.x, to.y);
+			const float middle = (p1.y + p4.y) * 0.5f;
+			p2 = ImVec2(p1.x, middle);
+			p3 = ImVec2(p4.x, middle);
+		} else {
+			p1 = world_to_screen(from.x + from.width * 0.5f, from.y + from.height * 0.5f);
+			p4 = world_to_screen(to.x + to.width * 0.5f, to.y + to.height * 0.5f);
+			const float route_x = (std::max)(p1.x, p4.x) + 54.0f * view->zoom;
+			p2 = ImVec2(route_x, p1.y);
+			p3 = ImVec2(route_x, p4.y);
+		}
+		const float minimum_x = (std::min)((std::min)(p1.x, p2.x), (std::min)(p3.x, p4.x));
+		const float maximum_x = (std::max)((std::max)(p1.x, p2.x), (std::max)(p3.x, p4.x));
+		const float minimum_y = (std::min)((std::min)(p1.y, p2.y), (std::min)(p3.y, p4.y));
+		const float maximum_y = (std::max)((std::max)(p1.y, p2.y), (std::max)(p3.y, p4.y));
+		if (maximum_x < canvas.x || minimum_x > canvas_max.x ||
+			maximum_y < canvas.y || minimum_y > canvas_max.y)
 			continue;
-		const ImU32 color = edge.kind == aida::analysis::edge_kind_t::call
-			? call_color : edge_color;
-		draw->AddBezierCubic(source->second,
-			ImVec2(source->second.x, (source->second.y + target->second.y) * 0.5f),
-			ImVec2(target->second.x, (source->second.y + target->second.y) * 0.5f),
-			target->second, color, 1.5f * view->zoom);
+		const bool branching = outgoing[static_cast<std::size_t>(edge.from)] > 1;
+		const ImU32 edge_color = workspace_graph_edge_color(edge.kind, theme,
+			alpha * 0.92f, branching);
+		draw->AddBezierCubic(p1, p2, p3, p4,
+			aida::ui::with_alpha(edge_color, 0.18f), (std::max)(3.0f, 5.0f * view->zoom));
+		draw->AddBezierCubic(p1, p2, p3, p4, edge_color,
+			(std::max)(1.25f, 1.9f * view->zoom));
+		ImVec2 direction(p4.x - p3.x, p4.y - p3.y);
+		float length = std::sqrt(direction.x * direction.x + direction.y * direction.y);
+		if (length > 0.001f) {
+			direction.x /= length;
+			direction.y /= length;
+			const ImVec2 perpendicular(-direction.y, direction.x);
+			const float arrow = (std::max)(5.0f, 7.0f * view->zoom);
+			draw->AddTriangleFilled(p4,
+				ImVec2(p4.x - direction.x * arrow + perpendicular.x * arrow * 0.52f,
+					p4.y - direction.y * arrow + perpendicular.y * arrow * 0.52f),
+				ImVec2(p4.x - direction.x * arrow - perpendicular.x * arrow * 0.52f,
+					p4.y - direction.y * arrow - perpendicular.y * arrow * 0.52f),
+				edge_color);
+		}
+		const char* label = workspace_graph_edge_label(edge.kind, branching);
+		if (label && view->zoom > 0.32f) {
+			const ImVec2 text_size = ImGui::CalcTextSize(label);
+			const ImVec2 label_position((p1.x + p4.x) * 0.5f + 5.0f,
+				(p1.y + p4.y) * 0.5f - text_size.y * 0.5f);
+			draw->AddRectFilled(ImVec2(label_position.x - 4.0f, label_position.y - 1.0f),
+				ImVec2(label_position.x + text_size.x + 4.0f,
+					label_position.y + text_size.y + 1.0f),
+				aida::ui::with_alpha(theme.bg_overlay, alpha * 0.96f), 3.0f);
+			draw->AddText(label_position, edge_color, label);
+		}
 	}
-	for (std::size_t local = page_begin; local < page_end; ++local) {
-		const auto& block = snapshot.blocks[first + local];
-		const std::size_t shown = (std::min)(static_cast<std::size_t>(block.instruction_count),
-			static_cast<std::size_t>(12));
-		const float node_height = (52.0f + static_cast<float>(shown) * 18.0f) * view->zoom;
-		const std::size_t page_local = local - page_begin;
-		const int column = static_cast<int>(page_local % static_cast<std::size_t>(columns));
-		const int row = static_cast<int>(page_local / static_cast<std::size_t>(columns));
-		const ImVec2 top_left(canvas.x + 20.0f + view->pan_x +
-			static_cast<float>(column) * (node_width + column_gap),
-			canvas.y + 20.0f + view->pan_y + static_cast<float>(row) *
-			(300.0f * view->zoom + row_gap));
-		const ImVec2 bottom_right(top_left.x + node_width, top_left.y + node_height);
+	const auto workspace_selection = context.workspace->view_state().selection;
+	if (workspace_selection) {
+		const auto selection_runtime = disasm_view::runtime_address(context, *workspace_selection).value_or(
+			workspace_selection->value);
+		if (view->selected_address != selection_runtime) {
+			for (std::size_t node_index = 0; node_index < view->block_indices.size(); ++node_index) {
+				const auto& block = snapshot.blocks[view->block_indices[node_index]];
+				if (workspace_selection->space != block.start.space ||
+					workspace_selection->value < block.start.value ||
+					workspace_selection->value >= block.end.value)
+					continue;
+				view->selected_block = block.id;
+				view->selected_address = selection_runtime;
+				view->selected_instruction.reset();
+				const std::size_t begin = block.first_instruction;
+				const std::size_t count = (std::min)(static_cast<std::size_t>(block.instruction_count),
+					begin <= snapshot.instructions.size() ? snapshot.instructions.size() - begin : 0);
+				for (std::size_t row = 0; row < count; ++row) {
+					if (snapshot.instructions[begin + row].address == *workspace_selection) {
+						view->selected_instruction = snapshot.instructions[begin + row].id;
+						break;
+					}
+				}
+				break;
+			}
+		}
+	}
+	bool context_requested = false;
+	aida::ui::context_menu_open_origin_t context_origin{};
+	const aida::analysis::basic_block_record_t* context_block = nullptr;
+	for (std::size_t node_index = 0; node_index < view->layout.nodes.size(); ++node_index) {
+		if (node_index >= view->block_indices.size())
+			break;
+		const auto& node = view->layout.nodes[node_index];
+		const auto& block = snapshot.blocks[view->block_indices[node_index]];
+		const ImVec2 top_left = world_to_screen(node.x - node.width * 0.5f, node.y);
+		const ImVec2 bottom_right = world_to_screen(node.x + node.width * 0.5f,
+			node.y + node.height);
+		if (bottom_right.x < canvas.x || top_left.x > canvas_max.x ||
+			bottom_right.y < canvas.y || top_left.y > canvas_max.y)
+			continue;
 		const bool selected = view->selected_block && *view->selected_block == block.id;
+		const bool selection_inside = workspace_selection &&
+			workspace_selection->space == block.start.space &&
+			workspace_selection->value >= block.start.value &&
+			workspace_selection->value < block.end.value;
+		const bool entry = node.is_entry;
+		const bool terminal = outgoing[node_index] == 0;
+		const float rounding = (std::max)(3.0f, 7.0f * view->zoom);
+		draw->AddRectFilled(ImVec2(top_left.x + 4.0f, top_left.y + 5.0f),
+			ImVec2(bottom_right.x + 4.0f, bottom_right.y + 5.0f),
+			aida::ui::with_alpha(IM_COL32(0, 0, 0, 255), alpha * 0.34f), rounding);
 		draw->AddRectFilled(top_left, bottom_right,
-			aida::ui::with_alpha(selected ? theme.accent_dim : theme.panel_bg, alpha),
-			7.0f * view->zoom);
-		draw->AddRect(top_left, bottom_right,
-			aida::ui::with_alpha(selected ? theme.accent_u32 : theme.border_subtle, alpha),
-			7.0f * view->zoom, 0, selected ? 2.0f : 1.0f);
+			aida::ui::with_alpha(selected || selection_inside ? theme.bg_overlay : theme.panel_bg,
+				alpha), rounding);
+		const float header_height = 34.0f * view->zoom;
+		draw->AddRectFilled(top_left, ImVec2(bottom_right.x, top_left.y + header_height),
+			aida::ui::with_alpha(entry ? theme.accent_dim : theme.panel_header, alpha), rounding,
+			ImDrawFlags_RoundCornersTop);
+		const ImU32 border = aida::ui::with_alpha(
+			selected || selection_inside ? theme.accent_u32 :
+			(terminal ? theme.warning : theme.border_strong), alpha);
+		draw->AddRect(top_left, bottom_right, border, rounding, 0,
+			selected || selection_inside ? 2.0f : 1.0f);
 		const auto block_address = disasm_view::runtime_address(context, block.start).value_or(
 			block.start.value);
-		char header[96]{};
-		std::snprintf(header, sizeof(header), "loc_%llX  confidence %u",
-			static_cast<unsigned long long>(block_address),
-			static_cast<unsigned>(block.confidence));
-		draw->AddText(ImVec2(top_left.x + 10.0f, top_left.y + 8.0f),
-			aida::ui::with_alpha(theme.text_primary, alpha), header);
+		const std::string block_name = disasm_view::resolve_name(context, block.start);
+		char header[192]{};
+		if (!block_name.empty())
+			std::snprintf(header, sizeof(header), "%s", block_name.c_str());
+		else if (entry)
+			std::snprintf(header, sizeof(header), "entry_%llX",
+				static_cast<unsigned long long>(block_address));
+		else
+			std::snprintf(header, sizeof(header), "loc_%llX",
+				static_cast<unsigned long long>(block_address));
+		ImFont* code_font = aida::ui::fonts::code();
+		if (!code_font)
+			code_font = ImGui::GetFont();
+		const float base_size = aida::ui::fonts::size_or(code_font, ImGui::GetFontSize());
+		const float font_size = (std::max)(7.0f, base_size * view->zoom);
+		if (view->zoom > 0.22f) {
+			draw->AddText(code_font, font_size,
+				ImVec2(top_left.x + 10.0f * view->zoom,
+					top_left.y + (header_height - font_size) * 0.5f),
+				aida::ui::with_alpha(theme.text_primary, alpha), header);
+			char confidence[32]{};
+			std::snprintf(confidence, sizeof(confidence), "%u%%",
+				static_cast<unsigned>(block.confidence));
+			const float confidence_width = code_font->CalcTextSizeA(font_size, FLT_MAX, 0.0f,
+				confidence).x;
+			draw->AddText(code_font, font_size,
+				ImVec2(bottom_right.x - confidence_width - 9.0f * view->zoom,
+					top_left.y + (header_height - font_size) * 0.5f),
+				aida::ui::with_alpha(theme.text_dim, alpha), confidence);
+		}
 		const std::size_t instruction_begin = block.first_instruction;
-		const std::size_t instruction_end = (std::min)(snapshot.instructions.size(),
-			instruction_begin + shown);
-		disasm_view::request_format_range(context, instruction_begin, instruction_end);
-		float text_y = top_left.y + 30.0f * view->zoom;
-		for (std::size_t index = instruction_begin; index < instruction_end; ++index) {
-			const auto& instruction = snapshot.instructions[index];
+		const std::size_t available_instructions = instruction_begin <= snapshot.instructions.size()
+			? snapshot.instructions.size() - instruction_begin : 0;
+		const std::size_t instruction_total = (std::min)(
+			static_cast<std::size_t>(block.instruction_count), available_instructions);
+		const std::size_t shown = (std::min)(instruction_total, static_cast<std::size_t>(14));
+		disasm_view::request_format_range(context, instruction_begin,
+			instruction_begin + instruction_total);
+		const float line_height = 19.0f * view->zoom;
+		const float body_y = top_left.y + header_height + 4.0f * view->zoom;
+		draw->PushClipRect(ImVec2(top_left.x + 1.0f, top_left.y + header_height),
+			ImVec2(bottom_right.x - 1.0f, bottom_right.y - 1.0f), true);
+		for (std::size_t row = 0; row < shown; ++row) {
+			const auto& instruction = snapshot.instructions[instruction_begin + row];
 			const auto formatted = disasm_view::formatted_instruction(context, instruction.id);
 			const auto address = disasm_view::runtime_address(context, instruction.address).value_or(
 				instruction.address.value);
-			char prefix[32]{};
-			std::snprintf(prefix, sizeof(prefix), "%llX",
-				static_cast<unsigned long long>(address));
-			draw->AddText(ImVec2(top_left.x + 10.0f, text_y),
-				aida::ui::with_alpha(theme.text_dim, alpha), prefix);
-			draw->AddText(ImVec2(top_left.x + 92.0f * view->zoom, text_y),
-				aida::ui::with_alpha(theme.text_primary, alpha),
-				formatted ? formatted->text.c_str() : "Formatting...");
-			text_y += 18.0f * view->zoom;
+			const float row_y = body_y + static_cast<float>(row) * line_height;
+			const bool instruction_selected = view->selected_instruction &&
+				*view->selected_instruction == instruction.id;
+			if (instruction_selected || (workspace_selection &&
+				*workspace_selection == instruction.address)) {
+				draw->AddRectFilled(ImVec2(top_left.x + 2.0f, row_y),
+					ImVec2(bottom_right.x - 2.0f, row_y + line_height),
+					aida::ui::with_alpha(theme.selection, alpha));
+				draw->AddRectFilled(ImVec2(top_left.x + 2.0f, row_y),
+					ImVec2(top_left.x + 4.0f, row_y + line_height),
+					aida::ui::with_alpha(theme.accent_u32, alpha));
+			}
+			if (view->zoom > 0.22f) {
+				char address_text[32]{};
+				std::snprintf(address_text, sizeof(address_text), "%016llX",
+					static_cast<unsigned long long>(address));
+				const float text_y = row_y + (line_height - font_size) * 0.5f;
+				draw->AddText(code_font, font_size,
+					ImVec2(top_left.x + 8.0f * view->zoom, text_y),
+					aida::ui::with_alpha(theme.text_address, alpha * 0.88f), address_text);
+				detail::render_colored_insn(draw,
+					top_left.x + 126.0f * view->zoom, text_y,
+					formatted ? formatted->text.c_str() : "formatting...",
+					theme, alpha, bottom_right.x - 8.0f * view->zoom,
+					code_font, font_size);
+			}
 		}
+		if (instruction_total > shown && view->zoom > 0.28f) {
+			char remainder[48]{};
+			std::snprintf(remainder, sizeof(remainder), "+ %zu more instructions",
+				instruction_total - shown);
+			draw->AddText(code_font, font_size,
+				ImVec2(top_left.x + 8.0f * view->zoom,
+					body_y + static_cast<float>(shown) * line_height),
+				aida::ui::with_alpha(theme.text_dim, alpha), remainder);
+		}
+		draw->PopClipRect();
 		ImGui::SetCursorScreenPos(top_left);
 		ImGui::PushID(static_cast<int>(block.id & 0x7FFFFFFF));
-		if (ImGui::InvisibleButton("##workspace_cfg_node",
-			ImVec2(node_width, node_height))) {
+		ImGui::InvisibleButton("##workspace_cfg_node",
+			ImVec2((std::max)(1.0f, bottom_right.x - top_left.x),
+				(std::max)(1.0f, bottom_right.y - top_left.y)));
+		const bool hovered = ImGui::IsItemHovered();
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+			std::size_t row = 0;
+			if (io.MousePos.y >= body_y && shown != 0)
+				row = (std::min)(shown - 1, static_cast<std::size_t>(
+					(io.MousePos.y - body_y) / (std::max)(line_height, 1.0f)));
 			view->selected_block = block.id;
-			disasm_view::select_address(block_address, context);
-			if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-				disasm_view::goto_address(block_address, context);
-				aida::ui::application_views::open_or_focus(
-					aida::ui::stable_view_id_t("document.disassembly"));
+			if (shown != 0) {
+				const auto& instruction = snapshot.instructions[instruction_begin + row];
+				view->selected_instruction = instruction.id;
+				view->selected_address = disasm_view::runtime_address(context,
+					instruction.address).value_or(instruction.address.value);
+				disasm_view::select_address(instruction.address, context);
+			} else {
+				view->selected_instruction.reset();
+				view->selected_address = block_address;
+				disasm_view::select_address(block.start, context);
 			}
 		}
-		const bool typed_pointer_request = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-		aida::ui::context_menu_open_origin_t graph_origin{};
-		const bool graph_pointer = typed_pointer_request;
-		const bool graph_keyboard = selected &&
-			aida::ui::analysis_context_menu::keyboard_request(graph_origin);
-		if (graph_pointer || graph_keyboard) {
-			using namespace aida::ui::analysis_context_menu;
-			using aida::ui::action_handler_result_t;
-			context_t menu;
-			menu.kind = menu_kind_t::graph;
-			const auto generation = context.workspace->generation();
-			const auto revision = context.workspace->analysis_revision();
-			menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
-				(generation << 6u) + (generation >> 2u));
-			menu.live_generation = [workspace = context.workspace]() {
-				const auto current = workspace->generation();
-				const auto current_revision = workspace->analysis_revision();
-				return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
-					(current << 6u) + (current >> 2u));
-			};
-			menu.actions["analysis.navigate.disassembly"].invoke = [context, block_address]() {
-				disasm_view::goto_address(block_address, context);
-				aida::ui::application_views::open_or_focus(
-					aida::ui::stable_view_id_t("document.disassembly"));
-				return action_handler_result_t::completed();
-			};
-			char address[32]{};
-			std::snprintf(address, sizeof(address), "%016llX",
-				static_cast<unsigned long long>(block_address));
-			menu.actions["analysis.copy.address"].invoke = [value = std::string(address)]() {
-				ImGui::SetClipboardText(value.c_str());
-				return action_handler_result_t::completed();
-			};
-			std::string block_text;
-			std::string addressed_text;
-			for (std::size_t index = instruction_begin; index < instruction_end; ++index) {
-				const auto& instruction = snapshot.instructions[index];
-				const auto formatted = disasm_view::formatted_instruction(context, instruction.id);
-				if (!formatted)
-					continue;
-				if (!block_text.empty()) {
-					block_text.push_back('\n');
-					addressed_text.push_back('\n');
-				}
-				block_text += formatted->text;
-				const auto runtime = disasm_view::runtime_address(context, instruction.address).value_or(
-					instruction.address.value);
-				char prefix[32]{};
-				std::snprintf(prefix, sizeof(prefix), "%016llX  ",
-					static_cast<unsigned long long>(runtime));
-				addressed_text += prefix;
-				addressed_text += formatted->text;
+		if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+			const auto* instruction = workspace_graph_selected_instruction(*view, snapshot);
+			const auto target = instruction
+				? workspace_graph_direct_target(context, *instruction) : std::nullopt;
+			if (target) {
+				disasm_view::goto_address(*target, context);
+				view->selected_address = *target;
+			} else {
+				workspace_graph_open_disassembly(context,
+					view->selected_address != 0 ? view->selected_address : block_address);
 			}
-			if (!block_text.empty()) {
-				menu.actions["analysis.copy.block"].invoke = [value = std::move(block_text)]() {
-					ImGui::SetClipboardText(value.c_str());
-					return action_handler_result_t::completed();
-				};
-				menu.actions["analysis.copy.block_addressed"].invoke =
-					[value = std::move(addressed_text)]() {
-						ImGui::SetClipboardText(value.c_str());
-						return action_handler_result_t::completed();
-					};
+		}
+		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+			view->selected_block = block.id;
+			std::size_t row = 0;
+			if (io.MousePos.y >= body_y && shown != 0)
+				row = (std::min)(shown - 1, static_cast<std::size_t>(
+					(io.MousePos.y - body_y) / (std::max)(line_height, 1.0f)));
+			if (shown != 0) {
+				const auto& instruction = snapshot.instructions[instruction_begin + row];
+				view->selected_instruction = instruction.id;
+				view->selected_address = disasm_view::runtime_address(context,
+					instruction.address).value_or(instruction.address.value);
+				disasm_view::select_address(instruction.address, context);
+			} else {
+				view->selected_instruction.reset();
+				view->selected_address = block_address;
+				disasm_view::select_address(block.start, context);
 			}
-			open(std::move(menu), graph_pointer
-				? aida::ui::context_menu_open_origin_t::pointer : graph_origin);
+			context_requested = true;
+			context_origin = aida::ui::context_menu_open_origin_t::pointer;
+			context_block = &block;
 		}
 		ImGui::PopID();
 	}
+	if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+		aida::ui::analysis_context_menu::keyboard_request(context_origin)) {
+		context_requested = view->selected_block.has_value();
+		if (context_requested) {
+			const auto found = view->node_by_entity.find(*view->selected_block);
+			if (found != view->node_by_entity.end() && found->second < view->block_indices.size())
+				context_block = &snapshot.blocks[view->block_indices[found->second]];
+		}
+	}
+	if (context_requested && context_block) {
+		using namespace aida::ui::analysis_context_menu;
+		using aida::ui::action_handler_result_t;
+		using aida::ui::capability_state_t;
+		context_t menu;
+		menu.kind = menu_kind_t::graph;
+		const auto retained_block = context_block->id;
+		const auto retained_instruction = view->selected_instruction;
+		const auto retained_address = view->selected_address;
+		menu.entity_id = "graph-block:" + std::to_string(retained_block) + ":" +
+			std::to_string(retained_instruction ? *retained_instruction : 0) + ":" +
+			std::to_string(retained_address);
+		menu.generation = workspace_graph_generation(context);
+		menu.live_generation = [context]() { return workspace_graph_generation(context); };
+		menu.validate_identity = [view, retained_block, retained_instruction,
+			retained_address]() {
+			return view->selected_block && *view->selected_block == retained_block &&
+				view->selected_instruction == retained_instruction &&
+				view->selected_address == retained_address
+				? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(
+					"The selected graph block or instruction changed");
+		};
+		auto unavailable = [&menu](const char* id, std::string reason) {
+			action_slot_t slot;
+			slot.capability = capability_state_t::unavailable(reason);
+			slot.invoke = [reason = std::move(reason)]() {
+				return action_handler_result_t::failed(reason);
+			};
+			menu.actions.emplace(id, std::move(slot));
+		};
+		const auto address = view->selected_address != 0 ? view->selected_address :
+			disasm_view::runtime_address(context, context_block->start).value_or(
+				context_block->start.value);
+		const auto typed = disasm_view::typed_address(context, address);
+		menu.actions["analysis.navigate.back"].invoke = [context]() {
+			disasm_view::navigate_back(context);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.forward"].invoke = [context]() {
+			disasm_view::navigate_forward(context);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.disassembly"].invoke = [context, address]() {
+			workspace_graph_open_disassembly(context, address);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.graph"].invoke = []() {
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.graph"));
+			return action_handler_result_t::completed();
+		};
+		const auto function_start = disasm_view::enclosing_function_start(address, context);
+		if (function_start != 0) {
+			auto decompile = [context, function_start]() {
+				pseudocode_view::request_decompile(context, function_start, false);
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("document.pseudocode"));
+				return action_handler_result_t::completed();
+			};
+			menu.actions["analysis.navigate.pseudocode"].invoke = decompile;
+			menu.actions["analysis.function.decompile"].invoke = std::move(decompile);
+		} else {
+			unavailable("analysis.navigate.pseudocode", "No recovered function contains this graph selection");
+			unavailable("analysis.function.decompile", "No recovered function contains this graph selection");
+		}
+		menu.actions["analysis.navigate.functions"].invoke = [context, address]() {
+			disasm_view::select_address(address, context, false);
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.analysis.functions"));
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.structures"].invoke = [context, address]() {
+			disasm_view::select_address(address, context, false);
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.types.structures"));
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.types"].invoke = [context, address]() {
+			disasm_view::select_address(address, context, false);
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.types.inferred"));
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.xrefs"].invoke = [context, address]() {
+			disasm_view::open_xrefs(address, context);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.callers"].invoke = [context, function_start, address]() {
+			disasm_view::open_xrefs(function_start != 0 ? function_start : address, context);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.xrefs_from"].invoke = [context, address]() {
+			disasm_view::select_address(address, context, false);
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.analysis.references"));
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.navigate.hex"].invoke = [context, address]() {
+			disasm_view::select_address(address, context, false);
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.hex"));
+			return action_handler_result_t::completed();
+		};
+		const auto* selected_instruction = workspace_graph_selected_instruction(*view, snapshot);
+		const auto direct_target = selected_instruction
+			? workspace_graph_direct_target(context, *selected_instruction) : std::nullopt;
+		if (direct_target) {
+			menu.actions["analysis.navigate.follow"].invoke = [context, target = *direct_target]() {
+				disasm_view::goto_address(target, context);
+				return action_handler_result_t::completed();
+			};
+		} else {
+			unavailable("analysis.navigate.follow", "The selected graph instruction has no direct resolved target");
+		}
+		char address_text[32]{};
+		std::snprintf(address_text, sizeof(address_text), "%016llX",
+			static_cast<unsigned long long>(address));
+		menu.actions["analysis.copy.address"].invoke = [value = std::string(address_text)]() {
+			ImGui::SetClipboardText(value.c_str());
+			return action_handler_result_t::completed();
+		};
+		const auto block_begin = static_cast<std::size_t>(context_block->first_instruction);
+		const auto block_count = (std::min)(static_cast<std::size_t>(context_block->instruction_count),
+			block_begin <= snapshot.instructions.size() ? snapshot.instructions.size() - block_begin : 0);
+		std::string block_text;
+		std::string addressed_text;
+		bool complete_text = block_count != 0;
+		for (std::size_t row = 0; row < block_count; ++row) {
+			const auto& instruction = snapshot.instructions[block_begin + row];
+			const auto formatted = disasm_view::formatted_instruction(context, instruction.id);
+			if (!formatted) {
+				complete_text = false;
+				continue;
+			}
+			if (!block_text.empty()) {
+				block_text.push_back('\n');
+				addressed_text.push_back('\n');
+			}
+			block_text += formatted->text;
+			const auto runtime = disasm_view::runtime_address(context, instruction.address).value_or(
+				instruction.address.value);
+			char prefix[32]{};
+			std::snprintf(prefix, sizeof(prefix), "%016llX  ",
+				static_cast<unsigned long long>(runtime));
+			addressed_text += prefix;
+			addressed_text += formatted->text;
+		}
+		if (complete_text) {
+			const std::string evidence_text = addressed_text;
+			const std::string graph_name = disasm_view::resolve_name(context, context_block->start);
+			const std::string evidence_label = graph_name.empty()
+				? std::string(address_text) : graph_name;
+			const std::string evidence_return = std::string(address_text);
+			const auto queue_evidence = [context, address, block_id = context_block->id,
+				evidence_text, evidence_label, evidence_return](bool agent) {
+				aida::automation_ui::evidence_envelope_t envelope;
+				envelope.workspace_id = context.workspace->identity().binary_id().to_hex();
+				envelope.source_view_id = "document.graph";
+				envelope.source_kind = "basic_block";
+				envelope.entity_id = "block:" + std::to_string(block_id);
+				envelope.display_label = evidence_label;
+				envelope.return_target = "address:" + evidence_return;
+				envelope.excerpt = evidence_text;
+				envelope.address = address;
+				envelope.revision = context.publication->analysis_revision;
+				envelope.generation = context.publication->generation;
+				envelope.snapshot_hash = workspace_graph_generation(context);
+				envelope.content_hash = workspace_graph_evidence_hash(evidence_text);
+				const auto evidence_id = aida::automation_ui::register_evidence(std::move(envelope));
+				if (evidence_id.empty())
+					return action_handler_result_t::failed(
+						"The bounded evidence registry rejected this graph block");
+				std::string error;
+				const bool queued = agent
+					? aida::automation_ui::queue_evidence_for_agent(evidence_id, error)
+					: aida::automation_ui::queue_evidence_for_chat(evidence_id, error);
+				return queued ? action_handler_result_t::completed()
+					: action_handler_result_t::failed(error);
+			};
+			menu.actions["analysis.evidence.chat"].invoke = [queue_evidence]() {
+				return queue_evidence(false);
+			};
+			menu.actions["analysis.evidence.agent"].invoke = [queue_evidence]() {
+				return queue_evidence(true);
+			};
+			menu.actions["analysis.copy.block"].invoke = [value = std::move(block_text)]() {
+				ImGui::SetClipboardText(value.c_str());
+				return action_handler_result_t::completed();
+			};
+			menu.actions["analysis.copy.block_addressed"].invoke =
+				[value = std::move(addressed_text)]() {
+					ImGui::SetClipboardText(value.c_str());
+					return action_handler_result_t::completed();
+				};
+		} else {
+			unavailable("analysis.copy.block", "Block formatting is still in progress");
+			unavailable("analysis.copy.block_addressed", "Block formatting is still in progress");
+			unavailable("analysis.evidence.chat", "Block formatting is still in progress");
+			unavailable("analysis.evidence.agent", "Block formatting is still in progress");
+		}
+		if (typed) {
+			bool bookmarked = false;
+			{
+				std::lock_guard<std::mutex> lock(context.view->mutex);
+				bookmarked = std::any_of(context.view->bookmarks.begin(),
+					context.view->bookmarks.end(), [&](const disasm_view::bookmark_t& item) {
+						return item.addr == typed->value;
+					});
+			}
+			menu.actions["analysis.modify.rename"].invoke = [context, value = *typed]() {
+				rename_dialog::open(context, value);
+				return action_handler_result_t::completed();
+			};
+			menu.actions["analysis.modify.comment"].invoke = [context, value = *typed]() {
+				comment_dialog::open(context, value);
+				return action_handler_result_t::completed();
+			};
+			if (bookmarked) {
+				unavailable("analysis.modify.bookmark", "The selected address is already bookmarked");
+				menu.actions["analysis.modify.remove_bookmark"].invoke =
+					[context, value = *typed]() {
+						return disasm_view::queue_bookmark(context, value, {})
+							? action_handler_result_t::completed()
+							: action_handler_result_t::failed("The bookmark update was rejected");
+					};
+			} else {
+				menu.actions["analysis.modify.bookmark"].invoke = [context, value = *typed,
+					label = std::string(address_text)]() {
+					return disasm_view::queue_bookmark(context, value, label)
+						? action_handler_result_t::completed()
+						: action_handler_result_t::failed("The bookmark update was rejected");
+				};
+				unavailable("analysis.modify.remove_bookmark", "The selected address is not bookmarked");
+			}
+		} else {
+			unavailable("analysis.modify.rename", "The graph selection has no mapped workspace address");
+			unavailable("analysis.modify.comment", "The graph selection has no mapped workspace address");
+			unavailable("analysis.modify.bookmark", "The graph selection has no mapped workspace address");
+			unavailable("analysis.modify.remove_bookmark", "The graph selection has no mapped workspace address");
+		}
+		menu.actions["analysis.graph.fit"].invoke = [view]() {
+			view->fit_request = true;
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.graph.zoom_in"].invoke = [view]() {
+			view->target_zoom = (std::min)(2.5f, view->target_zoom * 1.18f);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.graph.zoom_out"].invoke = [view]() {
+			view->target_zoom = (std::max)(0.16f, view->target_zoom * 0.85f);
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.graph.reset"].invoke = [view]() {
+			view->zoom = 1.0f;
+			view->target_zoom = 1.0f;
+			view->pan_x = 0.0f;
+			view->pan_y = 0.0f;
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.graph.select_block"].invoke = [view, id = context_block->id,
+			address]() {
+			view->selected_block = id;
+			view->selected_address = address;
+			return action_handler_result_t::completed();
+		};
+		menu.actions["analysis.graph.clear_selection"].invoke = [view]() {
+			view->selected_block.reset();
+			view->selected_instruction.reset();
+			view->selected_address = 0;
+			return action_handler_result_t::completed();
+		};
+		unavailable("analysis.navigate.disassembly_side", "The document registry exposes one canonical Disassembly document");
+		unavailable("analysis.navigate.callees", "Filtered outgoing-call presentation is not available in the graph snapshot");
+		unavailable("analysis.modify.retype", "Use Type Views to stage a type application for this address");
+		unavailable("analysis.modify.patch", "Use the reviewed Patch workflow from Disassembly");
+		unavailable("analysis.modify.assemble", "Use the reviewed assembler workflow from Disassembly");
+		unavailable("analysis.modify.nop", "Use the reviewed NOP workflow from Disassembly");
+		unavailable("analysis.debug.breakpoint", "Use the debugger Breakpoints workflow from Disassembly");
+		unavailable("analysis.debug.hardware_breakpoint", "Use the debugger Breakpoints workflow from Disassembly");
+		open(std::move(menu), context_origin);
+	}
+	if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+		!io.WantTextInput && !ImGui::IsAnyItemActive()) {
+		if (!io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_F, false))
+			view->fit_request = true;
+	}
+	if (!view->layout.nodes.empty() && canvas_size.x >= 320.0f && canvas_size.y >= 220.0f) {
+		const float minimap_width = 214.0f;
+		const float minimap_height = 132.0f;
+		const ImVec2 map_min(canvas_max.x - minimap_width - 12.0f,
+			canvas_max.y - minimap_height - 12.0f);
+		const ImVec2 map_max(map_min.x + minimap_width, map_min.y + minimap_height);
+		draw->AddRectFilled(map_min, map_max,
+			aida::ui::with_alpha(theme.bg_overlay, alpha * 0.96f), 6.0f);
+		draw->AddRect(map_min, map_max,
+			aida::ui::with_alpha(theme.border_strong, alpha), 6.0f);
+		draw->AddText(ImVec2(map_min.x + 8.0f, map_min.y + 4.0f),
+			aida::ui::with_alpha(theme.text_dim, alpha), "Overview");
+		const float map_pad = 9.0f;
+		const float map_top = 21.0f;
+		const float graph_width = (std::max)(1.0f, max_x - min_x);
+		const float graph_height = (std::max)(1.0f, max_y - min_y);
+		const float map_scale = (std::min)(
+			(minimap_width - map_pad * 2.0f) / graph_width,
+			(minimap_height - map_top - map_pad) / graph_height);
+		const float map_ox = map_min.x + map_pad +
+			((minimap_width - map_pad * 2.0f) - graph_width * map_scale) * 0.5f;
+		const float map_oy = map_min.y + map_top +
+			((minimap_height - map_top - map_pad) - graph_height * map_scale) * 0.5f;
+		auto world_to_map = [&](float x, float y) {
+			return ImVec2(map_ox + (x - min_x) * map_scale,
+				map_oy + (y - min_y) * map_scale);
+		};
+		for (const auto& edge : view->edges) {
+			const auto& from = view->layout.nodes[static_cast<std::size_t>(edge.from)];
+			const auto& to = view->layout.nodes[static_cast<std::size_t>(edge.to)];
+			draw->AddLine(world_to_map(from.x, from.y + from.height * 0.5f),
+				world_to_map(to.x, to.y + to.height * 0.5f),
+				workspace_graph_edge_color(edge.kind, theme, alpha * 0.46f,
+					outgoing[static_cast<std::size_t>(edge.from)] > 1), 1.0f);
+		}
+		for (std::size_t index = 0; index < view->layout.nodes.size(); ++index) {
+			const auto& node = view->layout.nodes[index];
+			const ImVec2 a = world_to_map(node.x - node.width * 0.5f, node.y);
+			const ImVec2 b = world_to_map(node.x + node.width * 0.5f, node.y + node.height);
+			const auto& block = snapshot.blocks[view->block_indices[index]];
+			const bool selected = view->selected_block && *view->selected_block == block.id;
+			draw->AddRectFilled(a, b, aida::ui::with_alpha(
+				selected ? theme.accent_u32 : theme.text_secondary, alpha * 0.72f), 1.0f);
+		}
+		const float world_view_width = canvas_size.x / view->zoom;
+		const float world_view_height = canvas_size.y / view->zoom;
+		const ImVec2 viewport_min = world_to_map(-view->pan_x - world_view_width * 0.5f,
+			-view->pan_y - world_view_height * 0.5f);
+		const ImVec2 viewport_max = world_to_map(-view->pan_x + world_view_width * 0.5f,
+			-view->pan_y + world_view_height * 0.5f);
+		draw->AddRectFilled(viewport_min, viewport_max,
+			aida::ui::with_alpha(theme.accent_glow, alpha * 0.8f), 2.0f);
+		draw->AddRect(viewport_min, viewport_max,
+			aida::ui::with_alpha(theme.accent_u32, alpha), 2.0f, 0, 1.3f);
+		const bool minimap_hovered = ImGui::IsMouseHoveringRect(map_min, map_max, false);
+		if (minimap_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+			view->minimap_dragging = true;
+		if (view->minimap_dragging) {
+			if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+				view->pan_x = -(min_x + (io.MousePos.x - map_ox) / map_scale);
+				view->pan_y = -(min_y + (io.MousePos.y - map_oy) / map_scale);
+			} else {
+				view->minimap_dragging = false;
+			}
+		}
+	}
 	aida::ui::analysis_context_menu::render();
+	comment_dialog::render();
+	rename_dialog::render();
 	ImGui::EndChild();
 	ImGui::EndChild();
 	ImGui::PopID();

@@ -5,7 +5,6 @@
 #include "document_registry.h"
 #include "navigator/workbench_navigator.hpp"
 #include "inspector/workbench_inspector_contracts.hpp"
-#include "document_host/document_host.hpp"
 #include "adapters/disasm_document.hpp"
 #include "adapters/hex_document.hpp"
 #include "adapters/pseudocode_document.hpp"
@@ -31,14 +30,12 @@ struct workbench_shell_integration_config_t {
     bool make_default_for_analysis_workspaces = true;
     bool restore_per_workspace_context = true;
     bool integrate_navigator = true;
-    bool integrate_document_host = true;
     bool integrate_inspector = true;
     bool preserve_all_center_views = true;
     bool preserve_commands = true;
     bool preserve_shortcuts = true;
     bool integrate_analysis_documents = true;
     bool integrate_persistence = true;
-    fixed_layout_constraints_t default_layout = {};
     std::uint32_t default_history_capacity = k_default_history_capacity;
     std::uint32_t retained_generation_limit = 4;
     std::uint32_t retained_overlay_revision_limit = 16;
@@ -52,7 +49,6 @@ struct workbench_shell_metrics_t {
     std::uint64_t workspaces_restored = 0;
     std::uint64_t center_views_appended = 0;
     std::uint64_t navigator_integrations = 0;
-    std::uint64_t document_host_integrations = 0;
     std::uint64_t inspector_integrations = 0;
     std::uint64_t commands_preserved = 0;
     std::uint64_t shortcuts_preserved = 0;
@@ -82,7 +78,6 @@ struct workbench_shell_workspace_context_t {
     navigator::navigator_tree_model_t* navigator_tree = nullptr;
     navigator::navigator_query_model_t* navigator_query = nullptr;
     navigator::navigator_navigation_model_t* navigator_nav = nullptr;
-    document_host::document_host_t* document_host = nullptr;
     inspector::inspector_query_session_t* inspector_session = nullptr;
     document_registry_t* document_registry = nullptr;
     disasm_document::disasm_document_model_t* disassembly_document = nullptr;
@@ -129,10 +124,6 @@ public:
         workspace_id_t workspace,
         const navigator::navigator_packed_store_adapter_t& adapter);
 
-    workbench_error_t integrate_document_host(
-        workspace_id_t workspace,
-        const document_host::document_host_services_t& services);
-
     workbench_error_t integrate_inspector(
         workspace_id_t workspace,
         const inspector::inspector_context_t& context);
@@ -158,10 +149,6 @@ public:
         const workbench_services_t& services,
         workbench_command_result_t& output);
 
-    workbench_error_t dispatch_host_command(
-        const document_host::document_host_dispatch_t& dispatch,
-        workbench_command_result_t& output);
-
     workbench_error_t dispatch_navigation(
         workspace_id_t workspace,
         workspace_revision_t expected_revision,
@@ -181,7 +168,6 @@ public:
 
     static workbench_persistence_dto_t
         create_default_persistence(workspace_id_t workspace,
-                                   const fixed_layout_constraints_t& layout,
                                    std::uint32_t history_capacity);
 
 private:
@@ -257,12 +243,6 @@ public:
     workbench_error_t navigate_history(
         const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
         bool forward,
-        workbench_shell_workspace_context_t& output);
-
-    workbench_error_t dispatch_host_command(
-        const std::shared_ptr<analysis::analysis_workspace_t>& analysis_workspace,
-        document_host::document_host_dispatch_t dispatch,
-        workbench_command_result_t& result,
         workbench_shell_workspace_context_t& output);
 
     std::vector<std::shared_ptr<analysis::analysis_workspace_t>>

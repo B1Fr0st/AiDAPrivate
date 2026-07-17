@@ -1,9 +1,11 @@
 #pragma once
 
 #include "imgui/imgui.h"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace aida::preview
@@ -66,6 +68,7 @@ namespace aida::preview
 
 	struct shell_controls_t
 	{
+		static constexpr std::size_t requested_view_id_capacity = 96;
 		std::uint64_t revision = 1;
 		bool settle_animations = true;
 		int open_menu = -1;
@@ -85,11 +88,14 @@ namespace aida::preview
 		int driver_tab = 0;
 		bool shortcuts_dialog_open = false;
 		bool invalidate_bottom_cache = false;
+		std::array<char, requested_view_id_capacity> requested_view_id{};
 	};
 
 	void initialize_shell_fixture(const ImVec2& display_size);
 	void reset_shell_fixture();
 	shell_controls_t& controls();
+	bool set_requested_view(shell_controls_t& target, std::string_view id);
+	bool apply_requested_view(const shell_controls_t& source);
 	void set_phase(shell_phase_t phase);
 	shell_phase_t phase();
 	bool runtime_ready();

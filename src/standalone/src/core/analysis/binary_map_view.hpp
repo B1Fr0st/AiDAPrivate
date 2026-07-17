@@ -8,6 +8,8 @@
 #include "../../helpers/win32_dialog.hpp"
 #endif
 #include "../ui/application_view_registry.hpp"
+#include "../ui/task_center.hpp"
+#include "../ui/application_ui_runtime.hpp"
 #include "../../helpers/helpers.h"
 #include "binary_map.hpp"
 #include "../editor/hex_view.hpp"
@@ -51,7 +53,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
+#include <exception>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -121,20 +124,27 @@ namespace binary_map_view {
 	struct view_state_t
 	{
 		std::mutex                              mutex;
-		binary_map::map_t                       map;
+		std::shared_ptr<const binary_map::map_t> map = std::make_shared<binary_map::map_t>();
 		binary_map::map_options_t               opts;
-		std::string                             rendered_text;
+		std::shared_ptr<const std::string>      rendered_text = std::make_shared<std::string>();
 		std::set<std::string>                   collapsed_groups;
 		std::set<std::string>                   expanded_imports;
 		char                                    filter_buf[160] = {};
 		std::string                             filter_lower;
+		const live_snapshot_t*                  filtered_live_identity = nullptr;
+		std::string                             filtered_live_query;
+		std::vector<int>                        filtered_live_indices;
 		std::string                             last_error;
+		std::string                             live_last_error;
 		std::atomic<bool>                       has_map{false};
 		std::atomic<bool>                       refreshing{false};
 		std::atomic<bool>                       refresh_requested{false};
+		std::atomic<std::uint64_t>              refresh_serial{0};
+		std::atomic<bool>                       export_pending{false};
 		std::atomic<uint64_t>                   selected_va{0};
 		std::atomic<int>                        ctx_target{-1};
 		uint64_t                                ctx_va = 0;
+		std::string                             selected_entity_id;
 		float                                   left_split = 0.58f;
 		float                                   list_scroll_y = 0.f;
 		float                                   list_target_scroll_y = 0.f;
@@ -154,9 +164,10 @@ namespace binary_map_view {
 		uint64_t                                hover_function_va = 0;
 		display_mode_t                          mode_pref = display_mode_t::auto_detect;
 		std::atomic<int>                        active_mode_atomic{0};
-		live_snapshot_t                         live;
+		std::shared_ptr<const live_snapshot_t>  live = std::make_shared<live_snapshot_t>();
 		std::atomic<bool>                       live_refreshing{false};
 		std::atomic<bool>                       live_refresh_requested{false};
+		std::atomic<std::uint64_t>              live_refresh_serial{0};
 		std::atomic<int64_t>                    live_last_refresh_unix{0};
 		std::atomic<uint64_t>                   live_selected_base{0};
 		std::atomic<int>                        live_hover_index{-1};
@@ -170,6 +181,9 @@ namespace binary_map_view {
 		float                                   canvas_drag_anchor = 0.f;
 		double                                  canvas_drag_offset_start = 0.0;
 		bool                                    change_protect_open = false;
+		bool                                    change_protect_popup_requested = false;
+		bool                                    refresh_after_pin_requested = false;
+		std::atomic<bool>                       change_protect_pending{false};
 		uint64_t                                change_protect_addr = 0;
 		uint64_t                                change_protect_size = 0;
 		int                                     change_protect_choice = 0;
@@ -208,6 +222,34 @@ namespace binary_map_view {
 	}
 
 	namespace detail {
+		template <typename Invoke>
+		inline void add_retained_action(
+			aida::ui::application_ui::retained_entity_context_t& context,
+			std::string id, bool enabled, const char* reason, Invoke invoke)
+		{
+			aida::ui::application_ui::retained_entity_action_t action;
+			action.action_id = std::move(id);
+			action.capability = enabled ? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(reason);
+			action.invoke = std::move(invoke);
+			context.actions.push_back(std::move(action));
+		}
+
+		inline bool keyboard_context_requested(bool selected)
+		{
+			const ImGuiIO& io = ImGui::GetIO();
+			return selected && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+				(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+					(io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+		}
+
+		inline aida::ui::context_menu_open_origin_t context_origin(bool pointer)
+		{
+			return pointer ? aida::ui::context_menu_open_origin_t::pointer
+				: ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+				? aida::ui::context_menu_open_origin_t::menu_key
+				: aida::ui::context_menu_open_origin_t::shift_f10;
+		}
 		inline int count_as_int(std::size_t count)
 		{
 			const auto maximum = static_cast<std::size_t>((std::numeric_limits<int>::max)());
@@ -218,6 +260,318 @@ namespace binary_map_view {
 		{
 			return index >= 0 && static_cast<std::size_t>(index) < count;
 		}
+
+		inline std::string export_live_snapshot_json(const live_snapshot_t& snap);
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		inline bool atomic_write_exact(const std::string& destination,
+			const void* data, std::size_t size, std::string& error)
+		{
+			if (destination.empty() || (size != 0 && data == nullptr)) {
+				error = "The export destination or payload is invalid";
+				return false;
+			}
+			const std::filesystem::path final_path = std::filesystem::u8path(destination);
+			static std::atomic<std::uint64_t> sequence{1};
+			const std::filesystem::path temporary(final_path.wstring() + L".tmp." +
+				std::to_wstring(GetCurrentProcessId()) + L"." +
+				std::to_wstring(GetCurrentThreadId()) + L"." +
+				std::to_wstring(sequence.fetch_add(1, std::memory_order_relaxed)));
+			HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr,
+				CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH, nullptr);
+			if (file == INVALID_HANDLE_VALUE) {
+				error = "Creating the export temporary file failed with Win32 error " +
+					std::to_string(GetLastError());
+				return false;
+			}
+			bool succeeded = true;
+			std::size_t offset = 0;
+			const auto* bytes = static_cast<const std::uint8_t*>(data);
+			while (offset < size) {
+				const DWORD chunk = static_cast<DWORD>((std::min)(size - offset,
+					static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+				DWORD written = 0;
+				if (!WriteFile(file, bytes + offset, chunk, &written, nullptr)) {
+					error = "Writing the export temporary file failed with Win32 error " +
+						std::to_string(GetLastError());
+					succeeded = false;
+					break;
+				}
+				if (written != chunk) {
+					error = "Writing the export temporary file completed with a short write";
+					succeeded = false;
+					break;
+				}
+				offset += written;
+			}
+			if (succeeded && !FlushFileBuffers(file)) {
+				error = "Flushing the export temporary file failed with Win32 error " +
+					std::to_string(GetLastError());
+				succeeded = false;
+			}
+			LARGE_INTEGER observed_size{};
+			if (succeeded && (!GetFileSizeEx(file, &observed_size) ||
+				observed_size.QuadPart < 0 ||
+				static_cast<std::uint64_t>(observed_size.QuadPart) != size)) {
+				error = "The export temporary file size did not match the requested payload";
+				succeeded = false;
+			}
+			if (!CloseHandle(file) && succeeded) {
+				error = "Closing the export temporary file failed with Win32 error " +
+					std::to_string(GetLastError());
+				succeeded = false;
+			}
+			if (succeeded && !MoveFileExW(temporary.c_str(), final_path.c_str(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+				error = "Replacing the export destination failed with Win32 error " +
+					std::to_string(GetLastError());
+				succeeded = false;
+			}
+			if (!succeeded)
+				DeleteFileW(temporary.c_str());
+			return succeeded;
+		}
+
+		inline bool queue_snapshot_export(const std::shared_ptr<view_state_t>& state,
+			const std::string& destination,
+			std::string label,
+			std::shared_ptr<const live_snapshot_t> live,
+			std::shared_ptr<const std::string> text)
+		{
+			if (!state || (!live && (!text || text->empty())) || destination.empty())
+				return false;
+			bool expected = false;
+			if (!state->export_pending.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+				return false;
+			static std::atomic<std::uint64_t> sequence{1};
+			const std::string task_id = "analysis.binary_map.export." +
+				std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+			aida::ui::task_center::task_registration_t registration;
+			registration.id = task_id;
+			registration.source = "analysis.binary_map";
+			registration.owner = "Binary Map";
+			registration.owner_view = "view.analysis.binary_map";
+			registration.owner_action = "analysis.binary_map.export";
+			registration.target = destination;
+			registration.label = std::move(label);
+			registration.stage = "Queued for immutable serialization and atomic export";
+			registration.affected_entity = destination;
+			registration.callbacks.focus = [] {
+				static_cast<void>(aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.analysis.binary_map")));
+			};
+			registration.callbacks.open_log = registration.callbacks.focus;
+			if (!aida::ui::task_center::register_task(std::move(registration))) {
+				state->export_pending.store(false, std::memory_order_release);
+				return false;
+			}
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "analysis";
+			submission.label = "analysis.binary_map.export";
+			submission.thread_class = "bounded_file_io";
+			submission.domain = aida::infra::executor::domain_t::external_tool;
+			submission.session_id = task_id.c_str();
+			submission.target_id = destination.c_str();
+			submission.diagnostic_id = task_id.c_str();
+			submission.ui_access_policy = "immutable_snapshots_only";
+			submission.failure_policy = "typed_diagnostic";
+			submission.shutdown_policy = "drain";
+			submission.body = [state, task_id, destination,
+				live = std::move(live), text = std::move(text)] {
+				struct pending_guard_t {
+					std::shared_ptr<view_state_t> state;
+					~pending_guard_t() {
+						state->export_pending.store(false, std::memory_order_release);
+					}
+				} pending_guard{state};
+				static_cast<void>(pending_guard);
+				try {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::running, -1.0f,
+						"Serializing an immutable Binary Map snapshot"));
+					std::string payload = live ? export_live_snapshot_json(*live) : *text;
+					constexpr std::size_t maximum_export_bytes = 64U * 1024U * 1024U;
+					if (payload.size() > maximum_export_bytes) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Binary Map export exceeded the size limit",
+							"The serialized export exceeded the 64 MiB bounded export limit",
+							"diagnostic." + task_id));
+						return;
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::running, -1.0f,
+						"Writing a same-directory temporary file"));
+					std::string error;
+					if (!atomic_write_exact(destination, payload.data(), payload.size(), error)) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Atomic Binary Map export failed", error,
+							"diagnostic." + task_id));
+						return;
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::completed, 1.0f,
+						"Finished", "Binary Map exported atomically to " + destination));
+				} catch (const std::exception& exception) {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Binary Map export failed", exception.what(),
+						"diagnostic." + task_id));
+				} catch (...) {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Binary Map export failed", "Unknown export failure",
+						"diagnostic." + task_id));
+				}
+			};
+			const auto submitted = aida::infra::executor::submit(std::move(submission));
+			if (!submitted.submitted) {
+				state->export_pending.store(false, std::memory_order_release);
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::failed, 1.0f,
+					"Executor rejected Binary Map export", submitted.reject_reason,
+					"diagnostic." + task_id));
+				return false;
+			}
+			return true;
+		}
+
+		inline bool queue_protection_change(const std::shared_ptr<view_state_t>& state,
+			const disasm_view::workspace_context_t& context,
+			std::uint64_t address, std::uint64_t size, std::uint32_t new_protect)
+		{
+			if (!state || !context || !context.workspace->identity().process() ||
+				address == 0 || size == 0 ||
+				address > (std::numeric_limits<std::uint64_t>::max)() - size)
+				return false;
+			bool expected = false;
+			if (!state->change_protect_pending.compare_exchange_strong(expected, true,
+				std::memory_order_acq_rel))
+				return false;
+			const std::uint32_t pid = context.workspace->identity().process()->pid;
+			const std::uint64_t generation = context.workspace->generation();
+			static std::atomic<std::uint64_t> sequence{1};
+			const std::string task_id = "analysis.binary_map.protect." +
+				std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+			char target[160] = {};
+			std::snprintf(target, sizeof(target), "PID %u 0x%llX-0x%llX",
+				static_cast<unsigned>(pid), static_cast<unsigned long long>(address),
+				static_cast<unsigned long long>(address + size));
+			aida::ui::task_center::task_registration_t registration;
+			registration.id = task_id;
+			registration.source = "analysis.binary_map";
+			registration.owner = "Binary Map";
+			registration.owner_view = "view.analysis.binary_map";
+			registration.owner_action = "analysis.binary_map.change_protection";
+			registration.target = target;
+			registration.label = "Change live memory protection";
+			registration.stage = "Queued after reviewed confirmation";
+			registration.affected_entity = target;
+			registration.callbacks.focus = [] {
+				static_cast<void>(aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.analysis.binary_map")));
+			};
+			registration.callbacks.open_log = registration.callbacks.focus;
+			if (!aida::ui::task_center::register_task(std::move(registration))) {
+				state->change_protect_pending.store(false, std::memory_order_release);
+				return false;
+			}
+			aida::infra::executor::submission_t submission;
+			submission.owner_subsystem = "analysis";
+			submission.label = "analysis.binary_map.change_protection";
+			submission.thread_class = "live_target_mutation";
+			submission.domain = aida::infra::executor::domain_t::feature_worker;
+			submission.target_pid = pid;
+			submission.generation = generation;
+			submission.session_id = task_id.c_str();
+			submission.target_id = target;
+			submission.diagnostic_id = task_id.c_str();
+			submission.ui_access_policy = "immutable_snapshots_only";
+			submission.failure_policy = "typed_diagnostic";
+			submission.shutdown_policy = "drain";
+			submission.body = [state, context, task_id, pid, generation,
+				address, size, new_protect] {
+				struct pending_guard_t {
+					std::shared_ptr<view_state_t> state;
+					~pending_guard_t() {
+						state->change_protect_pending.store(false, std::memory_order_release);
+					}
+				} pending_guard{state};
+				static_cast<void>(pending_guard);
+				try {
+					const auto process = context.workspace->identity().process();
+					if (context.workspace->generation() != generation || !process ||
+						process->pid != pid) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Target identity changed before mutation",
+							"The reviewed PID or workspace generation is no longer current",
+							"diagnostic." + task_id));
+						return;
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::running, -1.0f,
+						"Applying reviewed protection change"));
+					std::uint32_t old_protect = 0;
+					if (!driver_bridge::protect_memory_for(pid, address, size,
+						new_protect, &old_protect)) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Protection mutation failed",
+							"The driver rejected the reviewed protection change",
+							"diagnostic." + task_id));
+						return;
+					}
+					bool verified = false;
+					const auto regions = driver_bridge::enumerate_memory_regions_for(pid, 8192);
+					for (const auto& region : regions) {
+						if (address >= region.base && address - region.base < region.size) {
+							verified = region.protect == new_protect;
+							break;
+						}
+					}
+					state->live_refresh_requested.store(true, std::memory_order_release);
+					if (!verified) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Protection readback did not match",
+							"The mutation returned success but the post-operation region snapshot did not confirm the requested protection",
+							"diagnostic." + task_id));
+						return;
+					}
+					char summary[160] = {};
+					std::snprintf(summary, sizeof(summary),
+						"Protection changed and verified: 0x%X -> 0x%X",
+						static_cast<unsigned>(old_protect), static_cast<unsigned>(new_protect));
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::completed, 1.0f,
+						"Finished", summary));
+				} catch (const std::exception& exception) {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Protection mutation failed", exception.what(),
+						"diagnostic." + task_id));
+				} catch (...) {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Protection mutation failed", "Unknown mutation failure",
+						"diagnostic." + task_id));
+				}
+			};
+			const auto submitted = aida::infra::executor::submit(std::move(submission));
+			if (!submitted.submitted) {
+				state->change_protect_pending.store(false, std::memory_order_release);
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::failed, 1.0f,
+					"Executor rejected protection mutation", submitted.reject_reason,
+					"diagnostic." + task_id));
+				return false;
+			}
+			return true;
+		}
+#endif
 
 		inline std::size_t hex_request_size(std::uint64_t size)
 		{
@@ -381,11 +735,6 @@ namespace binary_map_view {
 			return std::string(buf);
 		}
 
-		inline void rebuild_text_locked(view_state_t& s)
-		{
-			s.rendered_text = binary_map::render_text(s.map, s.opts);
-		}
-
 		inline void inject_to_chat(const std::string& text)
 		{
 			if (text.empty()) return;
@@ -483,8 +832,10 @@ namespace binary_map_view {
 			}
 		}
 
-		inline void perform_refresh(view_state_t& s)
+		inline void perform_refresh(const std::shared_ptr<view_state_t>& state)
 		{
+			if (!state) return;
+			auto& s = *state;
 			const auto workspace = s.workspace.lock();
 			if (!workspace || workspace->target_kind() != aida::analysis::target_kind_t::static_file) {
 				std::lock_guard<std::mutex> lock(s.mutex);
@@ -509,6 +860,27 @@ namespace binary_map_view {
 				opts_copy.max_callees_per_function,
 				opts_copy.include_imports ? 1 : 0,
 				opts_copy.include_exports ? 1 : 0);
+			const std::uint64_t request_generation = workspace->generation();
+			const std::uint64_t refresh_serial = s.refresh_serial.fetch_add(1,
+				std::memory_order_acq_rel) + 1;
+			const std::string task_id = "binary_map.static_refresh." + s.binary_id + "." +
+				std::to_string(refresh_serial);
+			aida::ui::task_center::task_registration_t registration;
+			registration.id = task_id;
+			registration.source = "binary_map";
+			registration.owner = "Binary Map";
+			registration.owner_view = "view.analysis.binary_map";
+			registration.owner_action = "Refresh static map";
+			registration.target = workspace->identity().bin_name();
+			registration.label = "Generate static Binary Map";
+			registration.stage = "Queued workspace analysis";
+			registration.affected_entity = workspace->identity().normalized_source_path();
+			if (!aida::ui::task_center::register_task(std::move(registration))) {
+				s.refreshing.store(false, std::memory_order_release);
+				std::lock_guard<std::mutex> lock(s.mutex);
+				s.last_error = "Task Center rejected ownership of the static Binary Map refresh.";
+				return;
+			}
 
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "analysis";
@@ -516,14 +888,32 @@ namespace binary_map_view {
 			sub.thread_class = "bounded_task";
 			sub.domain = aida::infra::executor::domain_t::diagnostics;
 			sub.priority = 3;
-			sub.body = [&s, workspace, opts_copy]() {
+			sub.generation = request_generation;
+			sub.body = [state, workspace, opts_copy, request_generation, task_id]() {
+				auto& s = *state;
+				struct refresh_guard_t {
+					std::shared_ptr<view_state_t> state;
+					~refresh_guard_t() {
+						state->refreshing.store(false, std::memory_order_release);
+					}
+				} refresh_guard{state};
+				static_cast<void>(refresh_guard);
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::running, 0.05f,
+					"Generating static workspace map"));
+				try {
 				const auto start_clock = std::chrono::steady_clock::now();
 				binary_map::clear_cache(workspace);
 
 				binary_map::map_t fresh;
-				const bool ok = binary_map::generate(workspace, opts_copy, fresh);
+				bool ok = binary_map::generate(workspace, opts_copy, fresh);
 				std::string err_copy;
 				if (!ok) err_copy = "Workspace binary-map generation failed.";
+				if (ok && workspace->generation() != request_generation) {
+					ok = false;
+					err_copy = "The workspace changed while the Binary Map was being generated.";
+					s.refresh_requested.store(true, std::memory_order_release);
+				}
 
 				std::size_t f = 0, g_count = 0, i = 0, e = 0, sec = 0;
 				std::string mod;
@@ -536,19 +926,24 @@ namespace binary_map_view {
 					mod = fresh.module_name;
 				}
 
+				if (ok) {
+					auto published_map = std::make_shared<const binary_map::map_t>(std::move(fresh));
+					auto rendered = std::make_shared<const std::string>(
+						binary_map::render_text(*published_map, opts_copy));
+					std::atomic_store_explicit(&s.map, std::move(published_map),
+						std::memory_order_release);
+					std::atomic_store_explicit(&s.rendered_text, std::move(rendered),
+						std::memory_order_release);
+				}
 				{
 					std::lock_guard<std::mutex> g(s.mutex);
 					if (ok) {
-						s.map = std::move(fresh);
 						s.has_map.store(true);
 						s.last_error.clear();
-						rebuild_text_locked(s);
 					} else {
-						s.last_error = std::move(err_copy);
+						s.last_error = err_copy;
 					}
 				}
-				s.refreshing.store(false);
-
 				const auto end_clock = std::chrono::steady_clock::now();
 				const auto dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 					end_clock - start_clock).count();
@@ -560,20 +955,56 @@ namespace binary_map_view {
 				} else {
 					diag::log_tagged_fmt("binary_map",
 						"refresh FAILED err='%s' duration_ms=%lld",
-						s.last_error.c_str(), static_cast<long long>(dur_ms));
+						err_copy.c_str(), static_cast<long long>(dur_ms));
+				}
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					ok ? aida::ui::task_center::task_state_t::completed
+					   : workspace->generation() != request_generation
+						? aida::ui::task_center::task_state_t::cancelled
+						: aida::ui::task_center::task_state_t::failed,
+					1.0f, ok ? "Static map published" : "Static map not published",
+					ok ? std::to_string(sec) + " sections, " + std::to_string(f) +
+						" functions" : err_copy));
+				} catch (const std::exception& exception) {
+					{
+						std::lock_guard<std::mutex> lock(s.mutex);
+						s.last_error = "Static Binary Map refresh failed: " +
+							std::string(exception.what());
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Static refresh failed", exception.what()));
+				} catch (...) {
+					{
+						std::lock_guard<std::mutex> lock(s.mutex);
+						s.last_error = "Static Binary Map refresh failed with an unknown worker error.";
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Static refresh failed", "Unknown worker error"));
 				}
 			};
-			const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
+			const auto submitted = aida::infra::executor::submit(std::move(sub));
 
-			if (!posted) {
+			if (!submitted.submitted) {
 				s.refreshing.store(false);
+				{
+					std::lock_guard<std::mutex> lock(s.mutex);
+					s.last_error = "Worker queue rejected the static Binary Map refresh: " +
+						submitted.reject_reason;
+				}
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::failed, 1.0f,
+					"Worker queue rejected", submitted.reject_reason));
 				diag::log_tagged_fmt("binary_map",
 					"refresh FAILED post rejected by executor");
 			}
 		}
 
-		inline void perform_live_refresh(view_state_t& s)
+		inline void perform_live_refresh(const std::shared_ptr<view_state_t>& state)
 		{
+			if (!state) return;
+			auto& s = *state;
 			const auto workspace = s.workspace.lock();
 			const auto process = workspace ? workspace->identity().process() :
 				std::optional<aida::analysis::process_identity_t>{};
@@ -593,6 +1024,27 @@ namespace binary_map_view {
 			diag::log_tagged_fmt("binary_map",
 				"live_refresh START pid=%u",
 				static_cast<unsigned>(process->pid));
+			const std::uint64_t request_generation = workspace->generation();
+			const std::uint64_t refresh_serial = s.live_refresh_serial.fetch_add(1,
+				std::memory_order_acq_rel) + 1;
+			const std::string task_id = "binary_map.live_refresh." + s.binary_id + "." +
+				std::to_string(refresh_serial);
+			aida::ui::task_center::task_registration_t registration;
+			registration.id = task_id;
+			registration.source = "binary_map";
+			registration.owner = "Binary Map";
+			registration.owner_view = "view.analysis.binary_map";
+			registration.owner_action = "Refresh live map";
+			registration.target = "PID " + std::to_string(process->pid);
+			registration.label = "Enumerate live Binary Map";
+			registration.stage = "Queued target enumeration";
+			registration.affected_entity = workspace->identity().bin_name();
+			if (!aida::ui::task_center::register_task(std::move(registration))) {
+				s.live_refreshing.store(false, std::memory_order_release);
+				std::lock_guard<std::mutex> lock(s.mutex);
+				s.live_last_error = "Task Center rejected ownership of the live Binary Map refresh.";
+				return;
+			}
 
 			aida::infra::executor::submission_t sub;
 			sub.owner_subsystem = "analysis";
@@ -601,12 +1053,36 @@ namespace binary_map_view {
 			sub.domain = aida::infra::executor::domain_t::diagnostics;
 			sub.priority = 3;
 			sub.target_pid = process->pid;
-			sub.body = [&s, workspace, pid = process->pid]() {
+			sub.generation = request_generation;
+			sub.body = [state, workspace, pid = process->pid, request_generation, task_id]() {
+				auto& s = *state;
+				struct refresh_guard_t {
+					std::shared_ptr<view_state_t> state;
+					~refresh_guard_t() {
+						state->live_refreshing.store(false, std::memory_order_release);
+					}
+				} refresh_guard{state};
+				static_cast<void>(refresh_guard);
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::running, 0.05f,
+					"Enumerating target regions, modules, and threads"));
+				try {
 				const auto start_clock = std::chrono::steady_clock::now();
 
 				auto regions_raw = driver_bridge::enumerate_memory_regions_for(pid, 8192);
 				auto modules     = driver_bridge::enumerate_modules_for(pid);
 				auto threads     = driver_bridge::enumerate_threads_for(pid);
+				if (regions_raw.empty()) {
+					const std::string error = "The target returned no readable memory-region enumeration.";
+					{
+						std::lock_guard<std::mutex> lock(s.mutex);
+						s.live_last_error = error;
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Live enumeration failed", error));
+					return;
+				}
 				const std::string proc_name = workspace->identity().bin_name();
 
 				driver_bridge::peb_info_t peb{};
@@ -687,31 +1163,79 @@ namespace binary_map_view {
 					std::chrono::duration_cast<std::chrono::milliseconds>(
 						end_clock - start_clock).count());
 
+				const auto current_process = workspace->identity().process();
+				if (workspace->generation() != request_generation ||
+					!current_process || current_process->pid != pid) {
+					s.live_refresh_requested.store(true, std::memory_order_release);
+					{
+						std::lock_guard<std::mutex> lock(s.mutex);
+						s.live_last_error = "The target or workspace changed during live enumeration.";
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::cancelled, 1.0f,
+						"Discarded stale live map", "Target PID or workspace generation changed"));
+					diag::log_tagged_fmt("binary_map",
+						"live_refresh STALE pid=%u request_generation=%llu current_generation=%llu",
+						static_cast<unsigned>(pid),
+						static_cast<unsigned long long>(request_generation),
+						static_cast<unsigned long long>(workspace->generation()));
+					return;
+				}
+				auto published = std::make_shared<const live_snapshot_t>(std::move(snap));
+				std::atomic_store_explicit(&s.live, published, std::memory_order_release);
 				{
-					std::lock_guard<std::mutex> g(s.mutex);
-					s.live = std::move(snap);
+					std::lock_guard<std::mutex> lock(s.mutex);
+					s.live_last_error.clear();
 				}
 				s.live_last_refresh_unix.store(static_cast<int64_t>(
 					std::chrono::duration_cast<std::chrono::seconds>(
 						std::chrono::system_clock::now().time_since_epoch()).count()));
-				s.live_refreshing.store(false);
-
 				diag::log_tagged_fmt("binary_map",
 					"live_refresh DONE pid=%u proc='%s' regions=%zu modules=%zu threads=%zu committed=%llu reserved=%llu rwx=%u elapsed_ms=%llu",
-					static_cast<unsigned>(s.live.pid),
-					s.live.process_name.c_str(),
-					s.live.regions.size(),
-					s.live.modules.size(),
-					s.live.threads.size(),
-					static_cast<unsigned long long>(s.live.total_committed),
-					static_cast<unsigned long long>(s.live.total_reserved),
-					static_cast<unsigned>(s.live.rwx_count),
-					static_cast<unsigned long long>(s.live.enum_elapsed_ms));
+					static_cast<unsigned>(published->pid),
+					published->process_name.c_str(),
+					published->regions.size(),
+					published->modules.size(),
+					published->threads.size(),
+					static_cast<unsigned long long>(published->total_committed),
+					static_cast<unsigned long long>(published->total_reserved),
+					static_cast<unsigned>(published->rwx_count),
+					static_cast<unsigned long long>(published->enum_elapsed_ms));
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::completed, 1.0f,
+					"Live map published", std::to_string(published->regions.size()) +
+						" regions, " + std::to_string(published->modules.size()) + " modules"));
+				} catch (const std::exception& exception) {
+					{
+						std::lock_guard<std::mutex> lock(s.mutex);
+						s.live_last_error = "Live Binary Map refresh failed: " +
+							std::string(exception.what());
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Live refresh failed", exception.what()));
+				} catch (...) {
+					{
+						std::lock_guard<std::mutex> lock(s.mutex);
+						s.live_last_error = "Live Binary Map refresh failed with an unknown worker error.";
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Live refresh failed", "Unknown worker error"));
+				}
 			};
-			const bool posted = aida::infra::executor::submit(std::move(sub)).submitted;
+			const auto submitted = aida::infra::executor::submit(std::move(sub));
 
-			if (!posted) {
+			if (!submitted.submitted) {
 				s.live_refreshing.store(false);
+				{
+					std::lock_guard<std::mutex> lock(s.mutex);
+					s.live_last_error = "Worker queue rejected the live Binary Map refresh: " +
+						submitted.reject_reason;
+				}
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::failed, 1.0f,
+					"Worker queue rejected", submitted.reject_reason));
 				diag::log_tagged_fmt("binary_map",
 					"live_refresh FAILED post rejected by executor");
 			}
@@ -745,10 +1269,17 @@ namespace binary_map_view {
 							vs.last_binary_identity_path = payload.binary_path;
 							vs.last_binary_identity_base = payload.image_base;
 							vs.last_binary_identity_size = payload.image_size;
-							if (identity_changed) {
-								vs.collapsed_groups.clear();
+						if (identity_changed) {
+							std::atomic_store_explicit(&vs.map,
+								std::shared_ptr<const binary_map::map_t>(
+									std::make_shared<binary_map::map_t>()),
+								std::memory_order_release);
+							vs.has_map.store(false, std::memory_order_release);
+							vs.collapsed_groups.clear();
 								vs.expanded_imports.clear();
-								vs.rendered_text.clear();
+								std::atomic_store_explicit(&vs.rendered_text,
+									std::shared_ptr<const std::string>(std::make_shared<std::string>()),
+									std::memory_order_release);
 								vs.fn_pulses.clear();
 							}
 						}
@@ -792,10 +1323,9 @@ namespace binary_map_view {
 						if (!state || !workspace || !workspace->identity().process() ||
 							workspace->identity().process()->pid != payload.process_id) return;
 						auto& vs = *state;
-						{
-							std::lock_guard<std::mutex> g(vs.mutex);
-							vs.live = live_snapshot_t{};
-						}
+						std::atomic_store_explicit(&vs.live,
+							std::shared_ptr<const live_snapshot_t>(std::make_shared<live_snapshot_t>()),
+							std::memory_order_release);
 						vs.live_selected_base.store(0);
 						vs.live_hover_index.store(-1);
 						diag::log_tagged_fmt("binary_map",
@@ -847,7 +1377,7 @@ namespace binary_map_view {
 			bool used_static = false;
 			bool ok = false;
 			if (live_ok) {
-				ok = hex_view::read_live_memory(context, va, size);
+				ok = hex_view::request_live_memory(context, va, size);
 			}
 			if (!ok) {
 				const auto address = disasm_view::typed_address(context, va);
@@ -938,6 +1468,9 @@ namespace binary_map_view {
 			const auto context = disasm_view::capture_workspace(state.workspace.lock());
 			if (!context) return false;
 			const std::string output_path = path_buf;
+			static std::atomic<std::uint64_t> dump_sequence{1};
+			const std::string task_id = "analysis.binary_map.dump." +
+				std::to_string(dump_sequence.fetch_add(1, std::memory_order_relaxed));
 
 			diag::log_tagged_critical_fmt("binary_map",
 				"dump_region START base=0x%llX size=%llu path='%s'",
@@ -945,46 +1478,100 @@ namespace binary_map_view {
 				static_cast<unsigned long long>(size),
 				path_buf);
 
+			aida::ui::task_center::task_registration_t registration;
+			registration.id = task_id;
+			registration.source = "analysis.binary_map";
+			registration.owner = "Binary Map";
+			registration.owner_view = "view.analysis.binary_map";
+			registration.owner_action = "analysis.binary_map.dump_region";
+			registration.target = output_path;
+			registration.label = "Dump Binary Map region";
+			registration.stage = "Queued for exact target read and atomic dump";
+			registration.affected_entity = output_path;
+			registration.callbacks.focus = [] {
+				static_cast<void>(aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.analysis.binary_map")));
+			};
+			registration.callbacks.open_log = registration.callbacks.focus;
+			if (!aida::ui::task_center::register_task(std::move(registration))) {
+				toast_notification::push("Task Center rejected the region dump",
+					toast_notification::toast_type_t::error, 3.0f);
+				return false;
+			}
 			aida::infra::executor::submission_t submission;
 			submission.owner_subsystem = "analysis";
 			submission.label = "analysis.binary_map.dump_region";
-			submission.thread_class = "bounded_task";
-			submission.domain = aida::infra::executor::domain_t::feature_worker;
+			submission.thread_class = "bounded_file_io";
+			submission.domain = aida::infra::executor::domain_t::external_tool;
 			submission.priority = 2;
 			submission.target_pid = context.workspace->identity().process()
 				? context.workspace->identity().process()->pid : 0;
-			submission.body = [context, base, size, output_path]() {
-				std::vector<uint8_t> buffer;
-				if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot &&
-					context.workspace->identity().process()) {
-					driver_bridge::read_memory_for(context.workspace->identity().process()->pid,
-						base, static_cast<std::size_t>(size), buffer);
-				} else if (const auto address = disasm_view::typed_address(context, base)) {
-					auto bytes = disasm_view::read_bytes(context, *address, static_cast<std::size_t>(size));
-					if (bytes) buffer = std::move(bytes.value());
+			submission.session_id = task_id.c_str();
+			submission.target_id = output_path.c_str();
+			submission.generation = context.workspace->generation();
+			submission.diagnostic_id = task_id.c_str();
+			submission.ui_access_policy = "immutable_snapshots_only";
+			submission.failure_policy = "typed_diagnostic";
+			submission.shutdown_policy = "drain";
+			submission.body = [context, base, size, output_path, task_id]() {
+				try {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::running, -1.0f,
+						"Reading exact bytes from the captured target identity"));
+					std::vector<uint8_t> buffer;
+					if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot &&
+						context.workspace->identity().process()) {
+						driver_bridge::read_memory_for(context.workspace->identity().process()->pid,
+							base, static_cast<std::size_t>(size), buffer);
+					} else if (const auto address = disasm_view::typed_address(context, base)) {
+						auto bytes = disasm_view::read_bytes(context, *address,
+							static_cast<std::size_t>(size));
+						if (bytes) buffer = std::move(bytes.value());
+					}
+					if (buffer.size() != static_cast<std::size_t>(size)) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Exact target read failed",
+							"Requested " + std::to_string(size) + " bytes but received " +
+							std::to_string(buffer.size()), "diagnostic." + task_id));
+						return;
+					}
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::running, -1.0f,
+						"Writing a same-directory temporary file"));
+					std::string error;
+					if (!atomic_write_exact(output_path, buffer.data(), buffer.size(), error)) {
+						static_cast<void>(aida::ui::task_center::update_task(task_id,
+							aida::ui::task_center::task_state_t::failed, 1.0f,
+							"Atomic region dump failed", error, "diagnostic." + task_id));
+						return;
+					}
+					diag::log_tagged_critical_fmt("binary_map",
+						"dump_region DONE bytes=%zu path='%s'", buffer.size(), output_path.c_str());
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::completed, 1.0f,
+						"Finished", "Region dumped atomically to " + output_path));
+				} catch (const std::exception& exception) {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Region dump failed", exception.what(), "diagnostic." + task_id));
+				} catch (...) {
+					static_cast<void>(aida::ui::task_center::update_task(task_id,
+						aida::ui::task_center::task_state_t::failed, 1.0f,
+						"Region dump failed", "Unknown dump failure", "diagnostic." + task_id));
 				}
-				if (buffer.empty()) {
-					toast_notification::push("Failed to read region for dump",
-						toast_notification::toast_type_t::error, 3.0f);
-					return;
-				}
-				std::ofstream stream(output_path, std::ios::binary | std::ios::trunc);
-				if (!stream.is_open()) {
-					toast_notification::push("Failed to open dump file for writing",
-						toast_notification::toast_type_t::error, 3.0f);
-					return;
-				}
-				stream.write(reinterpret_cast<const char*>(buffer.data()),
-					static_cast<std::streamsize>(buffer.size()));
-				stream.close();
-				diag::log_tagged_critical_fmt("binary_map",
-					"dump_region DONE bytes=%zu path='%s'", buffer.size(), output_path.c_str());
-				char message[MAX_PATH + 64];
-				std::snprintf(message, sizeof(message), "Dumped %llu bytes to %s",
-					static_cast<unsigned long long>(buffer.size()), output_path.c_str());
-				toast_notification::push(message, toast_notification::toast_type_t::info, 3.5f);
 			};
-			return aida::infra::executor::submit(std::move(submission)).submitted;
+			const auto submitted = aida::infra::executor::submit(std::move(submission));
+			if (!submitted.submitted) {
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::failed, 1.0f,
+					"Executor rejected region dump", submitted.reject_reason,
+					"diagnostic." + task_id));
+				toast_notification::push("The region dump could not be queued; see Task Center",
+					toast_notification::toast_type_t::error, 3.0f);
+				return false;
+			}
+			return true;
 #endif
 		}
 
@@ -1433,27 +2020,42 @@ namespace binary_map_view {
 						static_cast<unsigned long long>(fn.va));
 					jump_to_address(vs, fn.va);
 				}
-				if (right_clicked) {
+				const bool keyboard_context = keyboard_context_requested(
+					selected_va == fn.va);
+				if (right_clicked || keyboard_context) {
 					diag::log_tagged_fmt("binary_map",
 						"heatmap_right_click name='%s' va=0x%llX",
 						fn.name.c_str(),
 						static_cast<unsigned long long>(fn.va));
 					vs.selected_va.store(fn.va);
-					ImGui::OpenPopup("##bm_heat_ctx");
+					aida::ui::application_ui::retained_entity_context_t retained;
+					retained.owner_id = "analysis.binary_map.heat_function";
+					retained.entity_id = std::to_string(fn.va) + ":" + fn.name;
+					retained.entity_generation = vs.workspace_generation;
+					retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+					const uint64_t va = fn.va;
+					const uint64_t generation = vs.workspace_generation;
+					retained.validate_identity = [&vs, va, generation] {
+						return vs.workspace_generation == generation && vs.selected_va.load() == va
+							? aida::ui::capability_state_t::available()
+							: aida::ui::capability_state_t::unavailable(
+								"The Binary Map workspace or selected function changed");
+					};
+					add_retained_action(retained, "analysis.binary_map.function.follow_disassembly",
+						true, "", [&vs, va] {
+							jump_to_address(vs, va);
+							return aida::ui::action_handler_result_t::completed();
+						});
+					add_retained_action(retained, "analysis.binary_map.function.open_hex",
+						true, "", [&vs, va] {
+							jump_to_hex(vs, va, 0x400);
+							return aida::ui::action_handler_result_t::completed();
+						});
+					aida::ui::application_ui::open_retained_entity_context_menu(
+						std::move(retained), context_origin(right_clicked));
 				}
-				if (ImGui::BeginPopup("##bm_heat_ctx")) {
-					if (ImGui::MenuItem("Jump to disassembly")) {
-						const uint64_t va_local = fn.va;
-						ImGui::CloseCurrentPopup();
-						jump_to_address(vs, va_local);
-					}
-					if (ImGui::MenuItem("Open in hex view")) {
-						const uint64_t va_local = fn.va;
-						ImGui::CloseCurrentPopup();
-						jump_to_hex(vs, va_local, 0x400);
-					}
-					ImGui::EndPopup();
-				}
+				aida::ui::application_ui::render_retained_entity_context_menu(
+					"analysis.binary_map.heat_function");
 			}
 		}
 
@@ -1798,10 +2400,16 @@ namespace binary_map_view {
 		}
 		s.collapsed_groups.clear();
 		s.expanded_imports.clear();
-		s.rendered_text.clear();
-		s.map = binary_map::map_t{};
+		std::atomic_store_explicit(&s.rendered_text,
+			std::shared_ptr<const std::string>(std::make_shared<std::string>()),
+			std::memory_order_release);
+		std::atomic_store_explicit(&s.map,
+			std::shared_ptr<const binary_map::map_t>(std::make_shared<binary_map::map_t>()),
+			std::memory_order_release);
 		s.has_map.store(false);
-		s.live = live_snapshot_t{};
+		std::atomic_store_explicit(&s.live,
+			std::shared_ptr<const live_snapshot_t>(std::make_shared<live_snapshot_t>()),
+			std::memory_order_release);
 		s.initialized = false;
 		}
 		std::lock_guard<std::mutex> lock(workspace_states_mutex());
@@ -1813,7 +2421,9 @@ namespace binary_map_view {
 		auto selected = state_for(disasm_view::capture_selected_workspace());
 		if (!selected) return "No selected workspace";
 		std::lock_guard<std::mutex> g(selected->mutex);
-		return selected->last_error;
+		if (selected->last_error.empty()) return selected->live_last_error;
+		if (selected->live_last_error.empty()) return selected->last_error;
+		return selected->last_error + " | " + selected->live_last_error;
 	}
 
 	inline void refresh()
@@ -1894,17 +2504,17 @@ namespace binary_map_view {
 			std::string proc;
 			std::size_t region_n = 0, module_n = 0, thread_n = 0;
 			uint64_t enum_ms = 0;
-			{
-				std::lock_guard<std::mutex> g(s.mutex);
-				committed = s.live.total_committed;
-				reserved  = s.live.total_reserved;
-				rwx       = s.live.rwx_count;
-				pid       = s.live.pid;
-				proc      = s.live.process_name;
-				region_n  = s.live.regions.size();
-				module_n  = s.live.modules.size();
-				thread_n  = s.live.threads.size();
-				enum_ms   = s.live.enum_elapsed_ms;
+			const auto live = std::atomic_load_explicit(&s.live, std::memory_order_acquire);
+			if (live) {
+				committed = live->total_committed;
+				reserved  = live->total_reserved;
+				rwx       = live->rwx_count;
+				pid       = live->pid;
+				proc      = live->process_name;
+				region_n  = live->regions.size();
+				module_n  = live->modules.size();
+				thread_n  = live->threads.size();
+				enum_ms   = live->enum_elapsed_ms;
 			}
 
 			struct stat_pod_t { const char* label; std::string value; ImU32 color; };
@@ -2007,10 +2617,10 @@ namespace binary_map_view {
 			|| (resolved_mode == active_mode_t::merged);
 
 		if (s.refresh_requested.exchange(false) && want_static) {
-			detail::perform_refresh(s);
+			detail::perform_refresh(state_handle);
 		}
 		if (s.live_refresh_requested.exchange(false) && want_live) {
-			detail::perform_live_refresh(s);
+			detail::perform_live_refresh(state_handle);
 		}
 
 		const auto& t = aida::ui::resolved();
@@ -2056,52 +2666,50 @@ namespace binary_map_view {
 		dl->AddLine(ImVec2(ox, oy + toolbar_h - 1.f), ImVec2(ox + w, oy + toolbar_h - 1.f),
 			aida::ui::with_alpha(t.border_subtle, a));
 
-		int total_funcs = 0;
-		int total_globs = 0;
-		int total_imports = 0;
-		int total_exports = 0;
-		int total_sections = 0;
-		std::string module_name;
-		std::string module_format;
-		uint64_t image_base = 0;
-		uint64_t image_size = 0;
 		std::size_t live_region_count = 0;
 		uint32_t live_pid_now = 0;
 		std::string live_proc_name;
-		std::vector<binary_map::map_section_t> sections_copy;
-		std::vector<binary_map::map_function_t> functions_copy;
-		std::vector<binary_map::map_global_t> globals_copy;
-		std::vector<std::string> imports_copy;
-		std::vector<std::string> exports_copy;
-		std::vector<live_region_t> regions_copy;
-		std::vector<driver_bridge::thread_info_t> threads_copy;
 		std::string last_error_copy;
+		std::string live_last_error_copy;
+		const auto map_snapshot = std::atomic_load_explicit(&s.map, std::memory_order_acquire);
+		const auto live_snapshot = std::atomic_load_explicit(&s.live, std::memory_order_acquire);
+		static const binary_map::map_t empty_map;
+		static const std::vector<live_region_t> empty_regions;
+		static const std::vector<driver_bridge::thread_info_t> empty_threads;
+		static const std::vector<driver_bridge::module_info_t> empty_modules;
+		const auto& map = map_snapshot ? *map_snapshot : empty_map;
+		const auto& sections_copy = map.sections;
+		const auto& functions_copy = map.functions;
+		const auto& globals_copy = map.globals;
+		const auto& imports_copy = map.imports;
+		const auto& exports_copy = map.exports;
+		const auto& regions_copy = live_snapshot ? live_snapshot->regions : empty_regions;
+		const auto& threads_copy = live_snapshot ? live_snapshot->threads : empty_threads;
+		const auto& modules_copy = live_snapshot ? live_snapshot->modules : empty_modules;
+		const int total_funcs = detail::count_as_int(map.functions.size());
+		const int total_globs = detail::count_as_int(map.globals.size());
+		const int total_imports = detail::count_as_int(map.imports.size());
+		const int total_exports = detail::count_as_int(map.exports.size());
+		const int total_sections = detail::count_as_int(map.sections.size());
+		const auto& module_name = map.module_name;
+		const auto& module_format = map.format;
+		const uint64_t image_base = map.image_base;
+		const uint64_t image_size = map.image_size;
 
 		uint64_t selected_va_local = s.selected_va.load();
 		uint64_t live_selected_base = s.live_selected_base.load();
 
 		{
-			std::lock_guard<std::mutex> g(s.mutex);
-			total_funcs    = detail::count_as_int(s.map.functions.size());
-			total_globs    = detail::count_as_int(s.map.globals.size());
-			total_imports  = detail::count_as_int(s.map.imports.size());
-			total_exports  = detail::count_as_int(s.map.exports.size());
-			total_sections = detail::count_as_int(s.map.sections.size());
-			module_name    = s.map.module_name;
-			module_format  = s.map.format;
-			image_base     = s.map.image_base;
-			image_size     = s.map.image_size;
-			sections_copy  = s.map.sections;
-			functions_copy = s.map.functions;
-			globals_copy   = s.map.globals;
-			imports_copy   = s.map.imports;
-			exports_copy   = s.map.exports;
-			last_error_copy = s.last_error;
-			regions_copy = s.live.regions;
-			threads_copy = s.live.threads;
-			live_region_count = s.live.regions.size();
-			live_pid_now = s.live.pid;
-			live_proc_name = s.live.process_name;
+			std::unique_lock<std::mutex> lock(s.mutex, std::try_to_lock);
+			if (lock.owns_lock()) {
+				last_error_copy = s.last_error;
+				live_last_error_copy = s.live_last_error;
+			}
+		}
+		if (live_snapshot) {
+			live_region_count = live_snapshot->regions.size();
+			live_pid_now = live_snapshot->pid;
+			live_proc_name = live_snapshot->process_name;
 		}
 
 		ImGui::SetCursorScreenPos(ImVec2(ox + pad, oy + 6.f));
@@ -2277,12 +2885,9 @@ namespace binary_map_view {
 		ImGui::SetCursorScreenPos(ImVec2(bx, btn_y));
 		if (aida::ui::button("To chat", aida::ui::button_kind_t::secondary,
 			aida::ui::size_t_::sm, ImVec2(btn_w, btn_h))) {
-			std::string payload;
-			{
-				std::lock_guard<std::mutex> g(s.mutex);
-				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
-				payload = s.rendered_text;
-			}
+			const auto rendered = std::atomic_load_explicit(&s.rendered_text,
+				std::memory_order_acquire);
+			std::string payload = rendered ? *rendered : std::string{};
 			if (resolved_mode == active_mode_t::live_process) {
 				std::string live_payload = "Live memory map:\n";
 				uint64_t committed_total = 0;
@@ -2325,16 +2930,12 @@ namespace binary_map_view {
 		ImGui::PushID("bm_toolbar_copy");
 		if (aida::ui::button("Copy", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::sm, ImVec2(btn_w, btn_h))) {
-			std::string payload;
-			{
-				std::lock_guard<std::mutex> g(s.mutex);
-				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
-				payload = s.rendered_text;
-			}
+			const auto payload = std::atomic_load_explicit(&s.rendered_text,
+				std::memory_order_acquire);
 			diag::log_tagged_fmt("binary_map",
 				"toolbar copy bytes=%zu module='%s'",
-				payload.size(), module_name.c_str());
-			ImGui::SetClipboardText(payload.c_str());
+				payload ? payload->size() : 0, module_name.c_str());
+			ImGui::SetClipboardText(payload ? payload->c_str() : "");
 			toast_notification::push("Binary map copied to clipboard",
 				toast_notification::toast_type_t::info, 3.0f);
 		}
@@ -2343,36 +2944,28 @@ namespace binary_map_view {
 		bx -= (btn_w + btn_gap);
 		ImGui::SetCursorScreenPos(ImVec2(bx, btn_y));
 		ImGui::PushID("bm_export_live");
-		if (aida::ui::button("Export", aida::ui::button_kind_t::ghost,
-			aida::ui::size_t_::sm, ImVec2(btn_w, btn_h))) {
+		const bool export_pending = s.export_pending.load(std::memory_order_acquire);
+		if (aida::ui::button(export_pending ? "Exporting" : "Export",
+			aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm,
+			ImVec2(btn_w, btn_h), export_pending, nullptr, export_pending)) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			std::string export_receipt;
 			if (resolved_mode == active_mode_t::live_process || resolved_mode == active_mode_t::merged) {
-				live_snapshot_t snap_copy;
-				{
-					std::lock_guard<std::mutex> g(s.mutex);
-					snap_copy = s.live;
-				}
-				export_receipt = detail::export_live_snapshot_json(snap_copy);
+				export_receipt = live_snapshot
+					? detail::export_live_snapshot_json(*live_snapshot) : std::string{};
 			} else {
-				std::lock_guard<std::mutex> g(s.mutex);
-				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
-				export_receipt = s.rendered_text;
+				const auto rendered = std::atomic_load_explicit(&s.rendered_text,
+					std::memory_order_acquire);
+				if (rendered) export_receipt = *rendered;
 			}
 			ImGui::SetClipboardText(export_receipt.c_str());
 			toast_notification::push("Export receipt copied",
 				toast_notification::toast_type_t::info, 3.0f);
 #else
 			if (resolved_mode == active_mode_t::live_process || resolved_mode == active_mode_t::merged) {
-				live_snapshot_t snap_copy;
-				{
-					std::lock_guard<std::mutex> g(s.mutex);
-					snap_copy = s.live;
-				}
-				const std::string js = detail::export_live_snapshot_json(snap_copy);
 				char path_buf[MAX_PATH] = {};
 				std::snprintf(path_buf, sizeof(path_buf), "memory_map_pid%u.json",
-					static_cast<unsigned>(snap_copy.pid));
+					static_cast<unsigned>(live_snapshot ? live_snapshot->pid : 0));
 				static const char k_filter[] =
 					"JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0";
 				if (win32_dialog::show_save_file_dialog(g_hwnd,
@@ -2382,28 +2975,14 @@ namespace binary_map_view {
 					path_buf, sizeof(path_buf),
 					"binary_map_view::export_live"))
 				{
-					std::ofstream ofs(path_buf, std::ios::binary | std::ios::trunc);
-					if (ofs.is_open()) {
-						ofs.write(js.data(), static_cast<std::streamsize>(js.size()));
-						ofs.close();
-						diag::log_tagged_fmt("binary_map",
-							"export_live DONE bytes=%zu path='%s'", js.size(), path_buf);
-						toast_notification::push("Memory map exported",
-							toast_notification::toast_type_t::info, 3.0f);
-					} else {
-						diag::log_tagged_fmt("binary_map",
-							"export_live FAILED_open path='%s'", path_buf);
-						toast_notification::push("Failed to write export file",
+					if (!detail::queue_snapshot_export(state_handle, path_buf, "Export live memory map",
+						live_snapshot, {}))
+						toast_notification::push("The memory-map export could not be queued; see Task Center",
 							toast_notification::toast_type_t::error, 3.0f);
-					}
 				}
 			} else {
-				std::string payload;
-				{
-					std::lock_guard<std::mutex> g(s.mutex);
-					if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
-					payload = s.rendered_text;
-				}
+				const auto payload = std::atomic_load_explicit(&s.rendered_text,
+					std::memory_order_acquire);
 				char path_buf[MAX_PATH] = "binary_map.txt";
 				static const char k_filter[] =
 					"Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
@@ -2414,24 +2993,16 @@ namespace binary_map_view {
 					path_buf, sizeof(path_buf),
 					"binary_map_view::export_pe"))
 				{
-					std::ofstream ofs(path_buf, std::ios::binary | std::ios::trunc);
-					if (ofs.is_open()) {
-						ofs.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-						ofs.close();
-						diag::log_tagged_fmt("binary_map",
-							"export_pe DONE bytes=%zu path='%s'", payload.size(), path_buf);
-						toast_notification::push("Binary map exported",
-							toast_notification::toast_type_t::info, 3.0f);
-					} else {
-						diag::log_tagged_fmt("binary_map",
-							"export_pe FAILED_open path='%s'", path_buf);
-						toast_notification::push("Failed to write export file",
+					if (!detail::queue_snapshot_export(state_handle, path_buf, "Export static Binary Map",
+						{}, payload))
+						toast_notification::push("The Binary Map export could not be queued; see Task Center",
 							toast_notification::toast_type_t::error, 3.0f);
-					}
 				}
 			}
 #endif
 		}
+		if (export_pending && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip("A Binary Map export is already running");
 		ImGui::PopID();
 
 		const float content_y = oy + toolbar_h;
@@ -2537,16 +3108,12 @@ namespace binary_map_view {
 		ImGui::PushID("bm_preview_copy");
 		if (aida::ui::button("Copy", aida::ui::button_kind_t::ghost,
 			aida::ui::size_t_::md, ImVec2(96.f, 30.f))) {
-			std::string payload;
-			{
-				std::lock_guard<std::mutex> g(s.mutex);
-				if (s.rendered_text.empty()) detail::rebuild_text_locked(s);
-				payload = s.rendered_text;
-			}
+			const auto payload = std::atomic_load_explicit(&s.rendered_text,
+				std::memory_order_acquire);
 			diag::log_tagged_fmt("binary_map",
 				"preview copy bytes=%zu module='%s'",
-				payload.size(), module_name.c_str());
-			ImGui::SetClipboardText(payload.c_str());
+				payload ? payload->size() : 0, module_name.c_str());
+			ImGui::SetClipboardText(payload ? payload->c_str() : "");
 			toast_notification::push("Preview copied to clipboard",
 				toast_notification::toast_type_t::info, 3.0f);
 		}
@@ -2557,8 +3124,8 @@ namespace binary_map_view {
 		if (aida::ui::input_text("##bm_filter", s.filter_buf, sizeof(s.filter_buf),
 			"Filter sections, regions, modules, imports...", false,
 			ImVec2(panel_inner_w, 32.f))) {
+			s.filter_lower = detail::to_lower_copy(std::string(s.filter_buf));
 		}
-		s.filter_lower = detail::to_lower_copy(std::string(s.filter_buf));
 
 		float section_y = filter_y + 42.f;
 		float section_inner_h = (r_b.y - section_y) - 12.f;
@@ -2572,8 +3139,6 @@ namespace binary_map_view {
 			ImGuiWindowFlags_NoBackground);
 
 		const std::string& filter_lower = s.filter_lower;
-		bool refresh_after_pin = false;
-		bool open_change_protect_popup_local = false;
 
 		auto draw_section_header = [&](const char* title, int count_value,
 		                                const std::string& key) -> bool {
@@ -2709,99 +3274,130 @@ namespace binary_map_view {
 					static_cast<unsigned long long>(r.base));
 				detail::jump_to_address(s, r.base);
 			}
-			if (right_clicked) {
+			const bool keyboard_context = detail::keyboard_context_requested(
+				s.live_selected_base.load() == r.base);
+			if (right_clicked || keyboard_context) {
 				s.live_selected_base.store(r.base);
 				s.ctx_va = r.base;
 				diag::log_tagged_fmt("binary_map",
 					"region_row_right_click base=0x%llX",
 					static_cast<unsigned long long>(r.base));
-				ImGui::OpenPopup("##bm_reg_ctx");
-			}
-			if (ImGui::BeginPopup("##bm_reg_ctx")) {
-				if (ImGui::MenuItem("Jump to disassembly")) {
-					const uint64_t va_local = r.base;
-					ImGui::CloseCurrentPopup();
-					detail::jump_to_address(s, va_local);
-				}
-				if (ImGui::MenuItem("Open in hex view")) {
-					const uint64_t va_local = r.base;
-					const uint64_t sz_local = r.size;
-					ImGui::CloseCurrentPopup();
-					detail::jump_to_hex(s, va_local, detail::hex_request_size(sz_local));
-				}
-				if (ImGui::MenuItem("Dump region")) {
-					const uint64_t va_local = r.base;
-					const uint64_t sz_local = r.size;
-					const std::string klabel = detail::region_kind_label(r);
-					ImGui::CloseCurrentPopup();
-					detail::dump_region_to_disk(s, va_local, sz_local, klabel);
-				}
-				if (ImGui::MenuItem("Change protection")) {
-					s.change_protect_addr = r.base;
-					s.change_protect_size = r.size;
-					s.change_protect_old = r.protect;
+				aida::ui::application_ui::retained_entity_context_t retained;
+				retained.owner_id = "analysis.binary_map.region";
+				retained.entity_id = std::to_string(r.base) + ":" + std::to_string(r.size);
+				retained.entity_generation = s.workspace_generation;
+				retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+				const auto retained_live = live_snapshot;
+				const auto region = r;
+				retained.validate_identity = [&s, retained_live, region] {
+					const auto current_live = std::atomic_load_explicit(&s.live, std::memory_order_acquire);
+					return current_live == retained_live && s.live_selected_base.load() == region.base
+						? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable(
+							"The live memory-map publication or selected region changed");
+				};
+			detail::add_retained_action(retained, "analysis.binary_map.region.follow_disassembly",
+				true, "", [&s, region] {
+					detail::jump_to_address(s, region.base);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			detail::add_retained_action(retained, "analysis.binary_map.region.open_hex",
+				true, "", [&s, region] {
+					detail::jump_to_hex(s, region.base, detail::hex_request_size(region.size));
+					return aida::ui::action_handler_result_t::completed();
+				});
+			detail::add_retained_action(retained, "analysis.binary_map.region.dump",
+				region.size != 0, "The retained region is empty", [&s, region] {
+					detail::dump_region_to_disk(s, region.base, region.size,
+						detail::region_kind_label(region));
+					return aida::ui::action_handler_result_t::completed();
+				});
+			detail::add_retained_action(retained, "analysis.binary_map.region.change_protection",
+				region.size != 0 && !s.change_protect_pending.load(std::memory_order_acquire),
+				s.change_protect_pending.load(std::memory_order_acquire)
+					? "Another reviewed protection change is running" : "The retained region is empty",
+				[&s, region] {
+					s.change_protect_addr = region.base;
+					s.change_protect_size = region.size;
+					s.change_protect_old = region.protect;
 					s.change_protect_choice = 0;
 					s.change_protect_open = true;
-					open_change_protect_popup_local = true;
+					s.change_protect_popup_requested = true;
 					ImGui::CloseCurrentPopup();
-				}
-				if (ImGui::MenuItem("Copy VA")) {
+					return aida::ui::action_handler_result_t::completed();
+				});
+			detail::add_retained_action(retained, "analysis.binary_map.region.copy_va",
+				true, "", [region] {
 					char vbuf[32];
 					std::snprintf(vbuf, sizeof(vbuf), "0x%llX",
-						static_cast<unsigned long long>(r.base));
+						static_cast<unsigned long long>(region.base));
 					ImGui::SetClipboardText(vbuf);
 					toast_notification::push("Region VA copied",
 						toast_notification::toast_type_t::info, 2.0f);
-				}
-				if (ImGui::MenuItem("Copy as JSON")) {
-					std::string js = detail::region_to_json(r);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			detail::add_retained_action(retained, "analysis.binary_map.region.copy_json",
+				true, "", [region] {
+					std::string js = detail::region_to_json(region);
 					ImGui::SetClipboardText(js.c_str());
 					diag::log_tagged_fmt("binary_map",
 						"region_ctx copy_json base=0x%llX bytes=%zu",
-						static_cast<unsigned long long>(r.base), js.size());
+						static_cast<unsigned long long>(region.base), js.size());
 					toast_notification::push("Region JSON copied",
 						toast_notification::toast_type_t::info, 2.0f);
-				}
-				if (ImGui::MenuItem("Copy summary to chat")) {
-					std::string p = detail::make_region_chat_payload(r);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			detail::add_retained_action(retained, "analysis.binary_map.region.send_chat",
+				true, "", [region] {
+					std::string p = detail::make_region_chat_payload(region);
 					detail::inject_to_chat(p);
-				}
-				ImGui::EndPopup();
+					return aida::ui::action_handler_result_t::completed();
+				});
+			aida::ui::application_ui::open_retained_entity_context_menu(
+					std::move(retained), detail::context_origin(right_clicked));
 			}
+			aida::ui::application_ui::render_retained_entity_context_menu(
+				"analysis.binary_map.region");
 			ImGui::PopID();
 		};
 
 		if (resolved_mode == active_mode_t::live_process || resolved_mode == active_mode_t::merged) {
-			std::vector<int> filtered;
-			filtered.reserve(regions_copy.size());
-			for (std::size_t i = 0; i < regions_copy.size(); ++i) {
-				const auto& r = regions_copy[i];
-				if (filter_lower.empty()
-					|| detail::filter_matches(filter_lower, r.module_name)
-					|| detail::filter_matches(filter_lower, detail::region_kind_label(r))
-					|| detail::filter_matches(filter_lower, r.info)
-					|| detail::filter_matches(filter_lower, detail::format_protect_word(r.protect)))
-				{
-					if (i <= static_cast<std::size_t>((std::numeric_limits<int>::max)()))
-						filtered.push_back(static_cast<int>(i));
+			if (s.filtered_live_identity != live_snapshot.get() ||
+				s.filtered_live_query != filter_lower) {
+				s.filtered_live_identity = live_snapshot.get();
+				s.filtered_live_query = filter_lower;
+				s.filtered_live_indices.clear();
+				s.filtered_live_indices.reserve(regions_copy.size());
+				for (std::size_t i = 0; i < regions_copy.size(); ++i) {
+					const auto& region = regions_copy[i];
+					if (filter_lower.empty() ||
+						detail::filter_matches(filter_lower, region.module_name) ||
+						detail::filter_matches(filter_lower, detail::region_kind_label(region)) ||
+						detail::filter_matches(filter_lower, region.info) ||
+						detail::filter_matches(filter_lower,
+							detail::format_protect_word(region.protect))) {
+						if (i <= static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+							s.filtered_live_indices.push_back(static_cast<int>(i));
+					}
 				}
 			}
-			int header_count = detail::count_as_int(filtered.size());
+			const int header_count = detail::count_as_int(s.filtered_live_indices.size());
 			if (draw_section_header("Regions", header_count, "regions")) {
-				for (int idx : filtered) {
-					if (detail::valid_index(idx, regions_copy.size()))
-						render_region_row(regions_copy[static_cast<std::size_t>(idx)], idx);
+				ImGuiListClipper clipper;
+				clipper.Begin(header_count, 32.f);
+				while (clipper.Step()) {
+					for (int visible = clipper.DisplayStart; visible < clipper.DisplayEnd; ++visible) {
+						const int index = s.filtered_live_indices[static_cast<std::size_t>(visible)];
+						if (detail::valid_index(index, regions_copy.size()))
+							render_region_row(regions_copy[static_cast<std::size_t>(index)], index);
+					}
 				}
+				clipper.End();
 			}
-			std::vector<driver_bridge::module_info_t> mods_copy;
-			{
-				std::lock_guard<std::mutex> g(s.mutex);
-				mods_copy = s.live.modules;
-			}
-			if (draw_section_header("Modules", detail::count_as_int(mods_copy.size()), "modules"))
+			if (draw_section_header("Modules", detail::count_as_int(modules_copy.size()), "modules"))
 			{
 				int mi = 0;
-				for (const auto& m : mods_copy) {
+				for (const auto& m : modules_copy) {
 					if (!detail::filter_matches(filter_lower, m.name)) { ++mi; continue; }
 					ImVec2 cp = ImGui::GetCursorScreenPos();
 					float row_w = ImGui::GetContentRegionAvail().x;
@@ -2845,32 +3441,54 @@ namespace binary_map_view {
 					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
 						detail::jump_to_address(s, m.base);
 					}
-					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-						ImGui::OpenPopup("##bm_mod_ctx");
-					}
-					if (ImGui::BeginPopup("##bm_mod_ctx")) {
-						if (ImGui::MenuItem("Jump to disassembly")) {
-							const uint64_t v = m.base;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(s, v);
-						}
-						if (ImGui::MenuItem("Open in hex view")) {
-							const uint64_t v = m.base;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(s, v, 0x400);
-						}
-						if (ImGui::MenuItem("Copy module name")) {
-							ImGui::SetClipboardText(m.name.c_str());
+					const bool module_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+					const bool module_keyboard_context = detail::keyboard_context_requested(
+						s.live_selected_base.load() == m.base);
+					if (module_pointer_context || module_keyboard_context) {
+						s.live_selected_base.store(m.base);
+						aida::ui::application_ui::retained_entity_context_t retained;
+						retained.owner_id = "analysis.binary_map.module";
+						retained.entity_id = std::to_string(m.base) + ":" + m.name;
+						retained.entity_generation = s.workspace_generation;
+						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+						const auto module = m;
+						const auto retained_live = live_snapshot;
+						retained.validate_identity = [&s, module, retained_live] {
+							return std::atomic_load_explicit(&s.live, std::memory_order_acquire) == retained_live &&
+								s.live_selected_base.load() == module.base
+								? aida::ui::capability_state_t::available()
+								: aida::ui::capability_state_t::unavailable(
+									"The live module publication or selection changed");
+						};
+						detail::add_retained_action(retained, "analysis.binary_map.module.follow_disassembly",
+							true, "", [&s, module] {
+								detail::jump_to_address(s, module.base);
+								return aida::ui::action_handler_result_t::completed();
+							});
+						detail::add_retained_action(retained, "analysis.binary_map.module.open_hex",
+							true, "", [&s, module] {
+								detail::jump_to_hex(s, module.base, 0x400);
+								return aida::ui::action_handler_result_t::completed();
+							});
+						detail::add_retained_action(retained, "analysis.binary_map.module.copy_name",
+							!module.name.empty(), "The retained module has no name", [module] {
+							ImGui::SetClipboardText(module.name.c_str());
 							toast_notification::push("Module name copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						if (ImGui::MenuItem("Copy module path")) {
-							ImGui::SetClipboardText(m.path.c_str());
+							return aida::ui::action_handler_result_t::completed();
+						});
+						detail::add_retained_action(retained, "analysis.binary_map.module.copy_path",
+							!module.path.empty(), "The retained module has no path", [module] {
+							ImGui::SetClipboardText(module.path.c_str());
 							toast_notification::push("Module path copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						ImGui::EndPopup();
+							return aida::ui::action_handler_result_t::completed();
+						});
+						aida::ui::application_ui::open_retained_entity_context_menu(
+							std::move(retained), detail::context_origin(module_pointer_context));
 					}
+					aida::ui::application_ui::render_retained_entity_context_menu(
+						"analysis.binary_map.module");
 					ImGui::PopID();
 					ImGui::Dummy(ImVec2(row_w, row_h));
 					++mi;
@@ -2969,40 +3587,56 @@ namespace binary_map_view {
 							static_cast<unsigned long long>(sec.va));
 						detail::jump_to_hex(s, sec.va, detail::hex_request_size(sec.size));
 					}
-					if (right_clicked) {
-						ImGui::OpenPopup("##bm_sec_ctx");
-					}
-					if (ImGui::BeginPopup("##bm_sec_ctx")) {
-						if (ImGui::MenuItem("Jump to disassembly")) {
-							const uint64_t va_local = sec.va;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(s, va_local);
-						}
-						if (ImGui::MenuItem("Open in hex view")) {
-							const uint64_t va_local = sec.va;
-							const std::size_t sz_local = detail::hex_request_size(sec.size);
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(s, va_local, sz_local);
-						}
-						if (ImGui::MenuItem("Dump section")) {
-							const uint64_t va_local = sec.va;
-							const uint64_t sz_local = sec.size;
-							const std::string klabel = sec.name.empty() ? std::string("section") : sec.name;
-							ImGui::CloseCurrentPopup();
-							detail::dump_region_to_disk(s, va_local, sz_local, klabel);
-						}
-						if (ImGui::MenuItem("Copy section name")) {
-							ImGui::SetClipboardText(sec.name.c_str());
+					const bool section_keyboard_context = detail::keyboard_context_requested(
+						s.selected_va.load() == sec.va);
+					if (right_clicked || section_keyboard_context) {
+						s.selected_va.store(sec.va);
+						aida::ui::application_ui::retained_entity_context_t retained;
+						retained.owner_id = "analysis.binary_map.section";
+						retained.entity_id = std::to_string(sec.va) + ":" + sec.name;
+						retained.entity_generation = s.workspace_generation;
+						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+						const auto section = sec;
+						const auto retained_map = map_snapshot;
+						retained.validate_identity = [&s, section, retained_map] {
+							return std::atomic_load_explicit(&s.map, std::memory_order_acquire) == retained_map &&
+								s.selected_va.load() == section.va
+								? aida::ui::capability_state_t::available()
+								: aida::ui::capability_state_t::unavailable(
+									"The static Binary Map publication or selected section changed");
+						};
+						detail::add_retained_action(retained, "analysis.binary_map.section.follow_disassembly",
+							true, "", [&s, section] { detail::jump_to_address(s, section.va);
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.section.open_hex",
+							true, "", [&s, section] { detail::jump_to_hex(s, section.va,
+								detail::hex_request_size(section.size));
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.section.dump",
+							section.size != 0, "The retained section is empty", [&s, section] {
+								detail::dump_region_to_disk(s, section.va, section.size,
+									section.name.empty() ? std::string("section") : section.name);
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.section.copy_name",
+							!section.name.empty(), "The retained section has no name", [section] {
+							ImGui::SetClipboardText(section.name.c_str());
 							toast_notification::push("Section name copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						if (ImGui::MenuItem("Copy section VA")) {
-							ImGui::SetClipboardText(addr_buf);
+							return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.section.copy_va",
+							true, "", [section] {
+							char text[32]{};
+							std::snprintf(text, sizeof(text), "0x%llX",
+								static_cast<unsigned long long>(section.va));
+							ImGui::SetClipboardText(text);
 							toast_notification::push("Section VA copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						ImGui::EndPopup();
+							return aida::ui::action_handler_result_t::completed(); });
+						aida::ui::application_ui::open_retained_entity_context_menu(
+							std::move(retained), detail::context_origin(right_clicked));
 					}
+					aida::ui::application_ui::render_retained_entity_context_menu(
+						"analysis.binary_map.section");
 					ImGui::PopID();
 					++idx;
 				}
@@ -3055,7 +3689,7 @@ namespace binary_map_view {
 						const bool was_pinned = fn.pinned;
 						detail::set_function_pinned(s, fn.va, !was_pinned);
 						flash.trigger();
-						refresh_after_pin = true;
+						s.refresh_after_pin_requested = true;
 						diag::log_tagged_fmt("binary_map",
 							"pin_btn_click name='%s' va=0x%llX was_pinned=%d action=%s",
 							fn.name.c_str(),
@@ -3113,14 +3747,16 @@ namespace binary_map_view {
 							fn.xref_count, fn.callee_count,
 							fn.pinned ? 1 : 0);
 					}
-					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+					const bool function_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+					const bool function_keyboard_context = detail::keyboard_context_requested(sel);
+					if (function_pointer_context || function_keyboard_context) {
 						s.ctx_target.store(idx);
 						s.ctx_va = fn.va;
+						s.selected_va.store(fn.va);
 						diag::log_tagged_fmt("binary_map",
 							"function_row_right_click name='%s' va=0x%llX",
 							fn.name.c_str(),
 							static_cast<unsigned long long>(fn.va));
-						ImGui::OpenPopup("##bm_fn_ctx");
 					}
 					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
 						diag::log_tagged_fmt("binary_map",
@@ -3129,42 +3765,58 @@ namespace binary_map_view {
 							static_cast<unsigned long long>(fn.va));
 						detail::jump_to_address(s, fn.va);
 					}
-					if (ImGui::BeginPopup("##bm_fn_ctx")) {
-						if (ImGui::MenuItem("Copy summary to chat")) {
-							std::string payload = detail::make_function_chat_payload(fn);
+						aida::ui::application_ui::retained_entity_context_t retained;
+						retained.owner_id = "analysis.binary_map.function";
+						retained.entity_id = std::to_string(fn.va) + ":" + fn.name;
+						retained.entity_generation = s.workspace_generation;
+						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+						const auto function = fn;
+						const auto retained_map = map_snapshot;
+						retained.validate_identity = [&s, function, retained_map] {
+							return std::atomic_load_explicit(&s.map, std::memory_order_acquire) == retained_map &&
+								s.selected_va.load() == function.va
+								? aida::ui::capability_state_t::available()
+								: aida::ui::capability_state_t::unavailable(
+									"The Binary Map function publication or selection changed");
+						};
+						detail::add_retained_action(retained, "analysis.binary_map.function.send_chat",
+							true, "", [function] {
+							std::string payload = detail::make_function_chat_payload(function);
 							detail::inject_to_chat(payload);
-						}
-						if (ImGui::MenuItem(fn.pinned ? "Unpin" : "Pin")) {
-							const bool was_pinned = fn.pinned;
-							detail::set_function_pinned(s, fn.va, !was_pinned);
-							flash.trigger();
-							refresh_after_pin = true;
-						}
-						if (ImGui::MenuItem("Jump to disassembly")) {
-							const uint64_t va = fn.va;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(s, va);
-						}
-						if (ImGui::MenuItem("Open in hex view")) {
-							const uint64_t va = fn.va;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(s, va, 0x400);
-						}
-						if (ImGui::MenuItem("Copy VA")) {
+							return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, function.pinned
+							? "analysis.binary_map.function.unpin" : "analysis.binary_map.function.pin",
+							true, "", [&s, function] {
+							detail::set_function_pinned(s, function.va, !function.pinned);
+							s.pin_flashes[function.va].trigger();
+							s.refresh_after_pin_requested = true;
+							return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.function.follow_disassembly",
+							true, "", [&s, function] { detail::jump_to_address(s, function.va);
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.function.open_hex",
+							true, "", [&s, function] { detail::jump_to_hex(s, function.va, 0x400);
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.function.copy_va",
+							true, "", [function] {
 							char vbuf[32];
 							std::snprintf(vbuf, sizeof(vbuf), "0x%llX",
-								static_cast<unsigned long long>(fn.va));
+								static_cast<unsigned long long>(function.va));
 							ImGui::SetClipboardText(vbuf);
 							toast_notification::push("Function VA copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						if (ImGui::MenuItem("Copy name")) {
-							ImGui::SetClipboardText(fn.name.c_str());
+							return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.function.copy_name",
+							!function.name.empty(), "The retained function has no name", [function] {
+							ImGui::SetClipboardText(function.name.c_str());
 							toast_notification::push("Function name copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						ImGui::EndPopup();
+							return aida::ui::action_handler_result_t::completed(); });
+						aida::ui::application_ui::open_retained_entity_context_menu(
+							std::move(retained), detail::context_origin(function_pointer_context));
 					}
+					aida::ui::application_ui::render_retained_entity_context_menu(
+						"analysis.binary_map.function");
 					ImGui::PopID();
 					ImGui::Dummy(ImVec2(row_w, row_h));
 					++idx;
@@ -3224,6 +3876,7 @@ namespace binary_map_view {
 					ImGui::PushID(static_cast<int>(0x50000000 | idx));
 					ImGui::InvisibleButton("##bm_gl_row", ImVec2(row_w, row_h));
 					if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+						s.selected_entity_id = "global:" + std::to_string(gl.va);
 						diag::log_tagged_fmt("binary_map",
 							"global_row_click name='%s' va=0x%llX xrefs=%d writable=%d",
 							gl.name.c_str(),
@@ -3235,39 +3888,57 @@ namespace binary_map_view {
 					if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsItemHovered()) {
 						detail::jump_to_address(s, gl.va);
 					}
-					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-						ImGui::OpenPopup("##bm_gl_ctx");
-					}
-					if (ImGui::BeginPopup("##bm_gl_ctx")) {
-						if (ImGui::MenuItem("Copy summary to chat")) {
-							std::string payload = detail::make_global_chat_payload(gl);
+					const std::string global_id = "global:" + std::to_string(gl.va);
+					const bool global_pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+					const bool global_keyboard_context = detail::keyboard_context_requested(
+						s.selected_entity_id == global_id);
+					if (global_pointer_context || global_keyboard_context) {
+						s.selected_entity_id = global_id;
+						aida::ui::application_ui::retained_entity_context_t retained;
+						retained.owner_id = "analysis.binary_map.global";
+						retained.entity_id = global_id + ":" + gl.name;
+						retained.entity_generation = s.workspace_generation;
+						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+						const auto global = gl;
+						const auto retained_map = map_snapshot;
+						retained.validate_identity = [&s, global_id, retained_map] {
+							return std::atomic_load_explicit(&s.map, std::memory_order_acquire) == retained_map &&
+								s.selected_entity_id == global_id
+								? aida::ui::capability_state_t::available()
+								: aida::ui::capability_state_t::unavailable(
+									"The Binary Map global publication or selection changed");
+						};
+						detail::add_retained_action(retained, "analysis.binary_map.global.send_chat",
+							true, "", [global] {
+							std::string payload = detail::make_global_chat_payload(global);
 							detail::inject_to_chat(payload);
-						}
-						if (ImGui::MenuItem("Open in hex view")) {
-							const uint64_t va = gl.va;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_hex(s, va, 0x200);
-						}
-						if (ImGui::MenuItem("Jump to disassembly")) {
-							const uint64_t va = gl.va;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(s, va);
-						}
-						if (ImGui::MenuItem("Copy VA")) {
+							return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.global.open_hex",
+							true, "", [&s, global] { detail::jump_to_hex(s, global.va, 0x200);
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.global.follow_disassembly",
+							true, "", [&s, global] { detail::jump_to_address(s, global.va);
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.global.copy_va",
+							true, "", [global] {
 							char vbuf[32];
 							std::snprintf(vbuf, sizeof(vbuf), "0x%llX",
-								static_cast<unsigned long long>(gl.va));
+								static_cast<unsigned long long>(global.va));
 							ImGui::SetClipboardText(vbuf);
 							toast_notification::push("Global VA copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						if (ImGui::MenuItem("Copy name")) {
-							ImGui::SetClipboardText(gl.name.c_str());
+							return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.global.copy_name",
+							!global.name.empty(), "The retained global has no name", [global] {
+							ImGui::SetClipboardText(global.name.c_str());
 							toast_notification::push("Global name copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						ImGui::EndPopup();
+							return aida::ui::action_handler_result_t::completed(); });
+						aida::ui::application_ui::open_retained_entity_context_menu(
+							std::move(retained), detail::context_origin(global_pointer_context));
 					}
+					aida::ui::application_ui::render_retained_entity_context_menu(
+						"analysis.binary_map.global");
 					ImGui::PopID();
 					++idx;
 				}
@@ -3349,21 +4020,39 @@ namespace binary_map_view {
 					ImGui::PushID(static_cast<int>(0x60000000 | imp_idx));
 					ImGui::InvisibleButton("##bm_imp_hdr", ImVec2(row_w, row_h));
 					if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+						s.selected_entity_id = "import-dll:" + dll;
 						diag::log_tagged_fmt("binary_map",
 							"import_dll_toggle dll='%s' funcs=%zu now_collapsed=%d",
 							dll.c_str(), funcs.size(), (!collapsed) ? 1 : 0);
 						detail::toggle_group(s, key);
 					}
-					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-						ImGui::OpenPopup("##bm_imp_hdr_ctx");
-					}
-					if (ImGui::BeginPopup("##bm_imp_hdr_ctx")) {
-						if (ImGui::MenuItem("Copy DLL name")) {
+					const std::string import_dll_id = "import-dll:" + dll;
+					const bool import_dll_pointer = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+					const bool import_dll_keyboard = detail::keyboard_context_requested(
+						s.selected_entity_id == import_dll_id);
+					if (import_dll_pointer || import_dll_keyboard) {
+						s.selected_entity_id = import_dll_id;
+						aida::ui::application_ui::retained_entity_context_t retained;
+						retained.owner_id = "analysis.binary_map.import_dll";
+						retained.entity_id = import_dll_id;
+						retained.entity_generation = s.workspace_generation;
+						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+						const auto retained_map = map_snapshot;
+						retained.validate_identity = [&s, import_dll_id, retained_map] {
+							return std::atomic_load_explicit(&s.map, std::memory_order_acquire) == retained_map &&
+								s.selected_entity_id == import_dll_id
+								? aida::ui::capability_state_t::available()
+								: aida::ui::capability_state_t::unavailable(
+									"The import publication or selected DLL changed");
+						};
+						detail::add_retained_action(retained, "analysis.binary_map.import.copy_dll_name",
+							!dll.empty(), "The retained import has no DLL name", [dll] {
 							ImGui::SetClipboardText(dll.c_str());
 							toast_notification::push("DLL name copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						if (ImGui::MenuItem("Copy function list")) {
+							return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.import.copy_function_list",
+							!funcs.empty(), "The retained DLL has no imported functions", [funcs] {
 							std::string joined;
 							for (std::size_t fi = 0; fi < funcs.size(); ++fi) {
 								if (fi) joined += "\n";
@@ -3372,9 +4061,12 @@ namespace binary_map_view {
 							ImGui::SetClipboardText(joined.c_str());
 							toast_notification::push("Function list copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						ImGui::EndPopup();
+							return aida::ui::action_handler_result_t::completed(); });
+						aida::ui::application_ui::open_retained_entity_context_menu(
+							std::move(retained), detail::context_origin(import_dll_pointer));
 					}
+					aida::ui::application_ui::render_retained_entity_context_menu(
+						"analysis.binary_map.import_dll");
 					ImGui::PopID();
 
 					if (!collapsed) {
@@ -3398,26 +4090,47 @@ namespace binary_map_view {
 							ImGui::PushID(static_cast<int>(0x70000000 | (imp_idx * 4096 + fn_idx)));
 							ImGui::InvisibleButton("##bm_imp_fn", ImVec2(row_w, imp_row_h));
 							if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+								s.selected_entity_id = "import-function:" + dll + "!" + fn;
 								std::string clip = dll + "!" + fn;
 								ImGui::SetClipboardText(clip.c_str());
 								toast_notification::push("Import symbol copied",
 									toast_notification::toast_type_t::info, 2.0f);
 							}
-							if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-								ImGui::OpenPopup("##bm_imp_fn_ctx");
-							}
-							if (ImGui::BeginPopup("##bm_imp_fn_ctx")) {
-								if (ImGui::MenuItem("Copy DLL!fn")) {
+							const std::string import_function_id = "import-function:" + dll + "!" + fn;
+							const bool import_function_pointer = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+							const bool import_function_keyboard = detail::keyboard_context_requested(
+								s.selected_entity_id == import_function_id);
+							if (import_function_pointer || import_function_keyboard) {
+								s.selected_entity_id = import_function_id;
+								aida::ui::application_ui::retained_entity_context_t retained;
+								retained.owner_id = "analysis.binary_map.import_function";
+								retained.entity_id = import_function_id;
+								retained.entity_generation = s.workspace_generation;
+								retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+								const auto retained_map = map_snapshot;
+								retained.validate_identity = [&s, import_function_id, retained_map] {
+									return std::atomic_load_explicit(&s.map, std::memory_order_acquire) == retained_map &&
+										s.selected_entity_id == import_function_id
+										? aida::ui::capability_state_t::available()
+										: aida::ui::capability_state_t::unavailable(
+											"The import publication or selected function changed");
+								};
+								detail::add_retained_action(retained, "analysis.binary_map.import.copy_qualified_name",
+									true, "", [dll, fn] {
 									std::string clip = dll + "!" + fn;
 									ImGui::SetClipboardText(clip.c_str());
 									toast_notification::push("Import symbol copied",
 										toast_notification::toast_type_t::info, 2.0f);
-								}
-								if (ImGui::MenuItem("Copy function name")) {
+									return aida::ui::action_handler_result_t::completed(); });
+								detail::add_retained_action(retained, "analysis.binary_map.import.copy_function_name",
+									!fn.empty(), "The retained import has no function name", [fn] {
 									ImGui::SetClipboardText(fn.c_str());
-								}
-								ImGui::EndPopup();
+									return aida::ui::action_handler_result_t::completed(); });
+								aida::ui::application_ui::open_retained_entity_context_menu(
+									std::move(retained), detail::context_origin(import_function_pointer));
 							}
+							aida::ui::application_ui::render_retained_entity_context_menu(
+								"analysis.binary_map.import_function");
 							ImGui::PopID();
 							ImGui::Dummy(ImVec2(row_w, imp_row_h));
 							++fn_idx;
@@ -3448,13 +4161,11 @@ namespace binary_map_view {
 						ImVec2(cp.x + 18.f, cp.y + (exp_row_h - exp_fs) * 0.5f),
 						aida::ui::with_alpha(t.text_primary, a), ex.c_str());
 					uint64_t resolved_va = 0;
-					{
-						std::lock_guard<std::mutex> gl(s.mutex);
-						for (const auto& fn : s.map.functions) {
-							if (fn.name == ex) { resolved_va = fn.va; break; }
-						}
+					for (const auto& fn : map.functions) {
+						if (fn.name == ex) { resolved_va = fn.va; break; }
 					}
 					if (clicked) {
+						s.selected_entity_id = "export:" + ex;
 						if (resolved_va != 0) {
 							detail::jump_to_address(s, resolved_va);
 						} else {
@@ -3463,22 +4174,39 @@ namespace binary_map_view {
 								toast_notification::toast_type_t::info, 2.5f);
 						}
 					}
-					if (right_clicked) {
-						ImGui::OpenPopup("##bm_exp_ctx");
-					}
-					if (ImGui::BeginPopup("##bm_exp_ctx")) {
-						if (resolved_va != 0 && ImGui::MenuItem("Jump to disassembly")) {
-							const uint64_t va_local = resolved_va;
-							ImGui::CloseCurrentPopup();
-							detail::jump_to_address(s, va_local);
-						}
-						if (ImGui::MenuItem("Copy export name")) {
+					const std::string export_id = "export:" + ex;
+					const bool export_keyboard_context = detail::keyboard_context_requested(
+						s.selected_entity_id == export_id);
+					if (right_clicked || export_keyboard_context) {
+						s.selected_entity_id = export_id;
+						aida::ui::application_ui::retained_entity_context_t retained;
+						retained.owner_id = "analysis.binary_map.export";
+						retained.entity_id = export_id;
+						retained.entity_generation = s.workspace_generation;
+						retained.active_view = aida::ui::stable_view_id_t("view.analysis.binary_map");
+						const auto retained_map = map_snapshot;
+						retained.validate_identity = [&s, export_id, retained_map] {
+							return std::atomic_load_explicit(&s.map, std::memory_order_acquire) == retained_map &&
+								s.selected_entity_id == export_id
+								? aida::ui::capability_state_t::available()
+								: aida::ui::capability_state_t::unavailable(
+									"The export publication or selected symbol changed");
+						};
+						detail::add_retained_action(retained, "analysis.binary_map.export.follow_disassembly",
+							resolved_va != 0, "No function address was resolved for this export",
+							[&s, resolved_va] { detail::jump_to_address(s, resolved_va);
+								return aida::ui::action_handler_result_t::completed(); });
+						detail::add_retained_action(retained, "analysis.binary_map.export.copy_name",
+							!ex.empty(), "The retained export has no name", [ex] {
 							ImGui::SetClipboardText(ex.c_str());
 							toast_notification::push("Export name copied",
 								toast_notification::toast_type_t::info, 2.0f);
-						}
-						ImGui::EndPopup();
+							return aida::ui::action_handler_result_t::completed(); });
+						aida::ui::application_ui::open_retained_entity_context_menu(
+							std::move(retained), detail::context_origin(right_clicked));
 					}
+					aida::ui::application_ui::render_retained_entity_context_menu(
+						"analysis.binary_map.export");
 					ImGui::PopID();
 					ImGui::Dummy(ImVec2(row_w, exp_row_h));
 					++idx;
@@ -3507,7 +4235,9 @@ namespace binary_map_view {
 			aida::ui::empty_state::config_t cfg;
 			cfg.glyph = aida::ui::empty_state::glyph_t::memory;
 			cfg.title = "No live regions";
-			cfg.body = "Press Refresh while attached to enumerate memory regions.";
+			cfg.body = live_last_error_copy.empty()
+				? "Press Refresh while attached to enumerate memory regions."
+				: live_last_error_copy;
 			cfg.max_width = 320.f;
 			aida::ui::empty_state::render(cp, sz, cfg);
 		}
@@ -3518,7 +4248,8 @@ namespace binary_map_view {
 
 		ImGui::EndChild();
 
-		if (open_change_protect_popup_local) {
+		if (s.change_protect_popup_requested) {
+			s.change_protect_popup_requested = false;
 			ImGui::OpenPopup("Change Protection");
 		}
 
@@ -3526,6 +4257,8 @@ namespace binary_map_view {
 			ImGui::Text("Address: %016llX", static_cast<unsigned long long>(s.change_protect_addr));
 			ImGui::Text("Size:    %llu bytes", static_cast<unsigned long long>(s.change_protect_size));
 			ImGui::Text("Current: 0x%X", s.change_protect_old);
+			ImGui::TextWrapped("This mutates the attached process over the exact range above. "
+				"AiDA will read back the resulting region protection, but this operation has no automatic undo.");
 			ImGui::Separator();
 			const char* labels_arr[] = {
 				"PAGE_NOACCESS (0x01)",
@@ -3543,36 +4276,35 @@ namespace binary_map_view {
 			if (s.change_protect_choice >= val_count) s.change_protect_choice = val_count - 1;
 			ImGui::Combo("##bm_new_protect", &s.change_protect_choice, labels_arr, val_count);
 			ImGui::Separator();
+			const bool protection_pending = s.change_protect_pending.load(std::memory_order_acquire);
+			ImGui::BeginDisabled(protection_pending);
 			if (ImGui::Button("Apply", ImVec2(100.f, 0.f))) {
 				const uint32_t new_protect = values_arr[s.change_protect_choice];
-				uint32_t old_protect = 0;
 				diag::log_tagged_critical_fmt("binary_map",
 					"change_protect_request addr=0x%llx size=%llu new=0x%X",
 					static_cast<unsigned long long>(s.change_protect_addr),
 					static_cast<unsigned long long>(s.change_protect_size),
 					static_cast<unsigned>(new_protect));
+				bool queued = false;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+				std::uint32_t old_protect = 0;
 				const auto process = context.workspace->identity().process();
-				const bool ok = process && driver_bridge::protect_memory_for(process->pid,
+				queued = process && driver_bridge::protect_memory_for(process->pid,
 					s.change_protect_addr, s.change_protect_size, new_protect, &old_protect);
-				diag::log_tagged_critical_fmt("binary_map",
-					"change_protect_done addr=0x%llx ok=%d old=0x%X new=0x%X",
-					static_cast<unsigned long long>(s.change_protect_addr),
-					ok ? 1 : 0,
-					static_cast<unsigned>(old_protect),
-					static_cast<unsigned>(new_protect));
-				if (ok) {
-					char msg[96];
-					std::snprintf(msg, sizeof(msg), "Protection changed 0x%X -> 0x%X",
-						old_protect, new_protect);
-					toast_notification::push(msg, toast_notification::toast_type_t::info, 3.0f);
-					s.live_refresh_requested.store(true);
-				} else {
-					toast_notification::push("Failed to change protection",
+				if (queued) s.live_refresh_requested.store(true, std::memory_order_release);
+#else
+				queued = detail::queue_protection_change(state_handle, context,
+					s.change_protect_addr, s.change_protect_size, new_protect);
+#endif
+				if (!queued)
+					toast_notification::push("The reviewed protection change could not be queued; see Task Center",
 						toast_notification::toast_type_t::error, 3.0f);
-				}
 				s.change_protect_open = false;
 				ImGui::CloseCurrentPopup();
 			}
+			ImGui::EndDisabled();
+			if (protection_pending && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+				ImGui::SetTooltip("A reviewed protection change is already running");
 			ImGui::SameLine();
 			if (ImGui::Button("Cancel", ImVec2(100.f, 0.f))) {
 				s.change_protect_open = false;
@@ -3581,7 +4313,8 @@ namespace binary_map_view {
 			ImGui::EndPopup();
 		}
 
-		if (refresh_after_pin) {
+		if (s.refresh_after_pin_requested) {
+			s.refresh_after_pin_requested = false;
 			s.refresh_requested.store(true);
 		}
 
@@ -3600,10 +4333,10 @@ namespace binary_map_view {
 			const uint32_t live_pid_attached = process ? process->pid : 0;
 			uint32_t cached_pid = 0;
 			std::size_t cached_regions = 0;
-			{
-				std::lock_guard<std::mutex> g(s.mutex);
-				cached_pid = s.live.pid;
-				cached_regions = s.live.regions.size();
+			const auto cached_live = std::atomic_load_explicit(&s.live, std::memory_order_acquire);
+			if (cached_live) {
+				cached_pid = cached_live->pid;
+				cached_regions = cached_live->regions.size();
 			}
 			if (cached_pid != live_pid_attached || (live_pid_attached != 0 && cached_regions == 0)) {
 				diag::log_tagged_fmt("binary_map",

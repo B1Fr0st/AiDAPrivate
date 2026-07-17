@@ -140,6 +140,7 @@ bool register_task(task_registration_t registration);
 bool register_taskflow_job(aida::infra::taskflow_runtime::job_handle_t handle,
                            task_registration_t registration);
 bool register_executor_job(std::uint64_t task_id, task_registration_t registration);
+bool try_register_executor_job(std::uint64_t task_id, task_registration_t registration);
 bool register_analysis_task(std::shared_ptr<aida::analysis::analysis_scheduler_t> scheduler,
                             aida::analysis::analysis_task_id_t task_id,
                             task_registration_t registration);

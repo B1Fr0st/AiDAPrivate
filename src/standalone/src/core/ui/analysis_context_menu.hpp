@@ -14,7 +14,8 @@ enum class menu_kind_t : std::uint8_t {
     pseudocode,
     graph,
     function,
-    xref
+    xref,
+    metadata
 };
 
 struct action_slot_t {
@@ -25,8 +26,10 @@ struct action_slot_t {
 
 struct context_t {
     menu_kind_t kind = menu_kind_t::instruction;
+    std::string entity_id;
     std::uint64_t generation = 0;
     std::function<std::uint64_t()> live_generation;
+    std::function<capability_state_t()> validate_identity;
     std::map<std::string, action_slot_t> actions;
 };
 

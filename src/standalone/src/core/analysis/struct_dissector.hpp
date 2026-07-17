@@ -1,10 +1,13 @@
 #pragma once
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../../preview/shell_preview_platform.hpp"
 #include "../../preview/re_hubs_preview_adapter.hpp"
 #else
 #include "standalone_driver.hpp"
 #include "../infra/executor.hpp"
+#include "../scanner/scanner_async_io.hpp"
+#include "../ui/task_center.hpp"
 #include "../../helpers/diag_log.hpp"
 #endif
 
@@ -14,11 +17,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
 #include <limits>
 #include <mutex>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 namespace struct_dissector {
 
@@ -42,6 +55,23 @@ enum class field_type_t : int {
 	COUNT
 };
 
+enum class structure_kind_t : std::uint8_t {
+	structure = 0,
+	union_type = 1
+};
+
+struct enum_value_t {
+	std::string name;
+	std::int64_t value = 0;
+};
+
+struct enum_def_t {
+	std::uint64_t stable_id = 0;
+	std::string name;
+	field_type_t underlying_type = field_type_t::int32;
+	std::vector<enum_value_t> values;
+};
+
 struct field_def_t {
 	std::string   name;
 	field_type_t  type = field_type_t::int32;
@@ -53,12 +83,48 @@ struct field_def_t {
 	bool          is_pointer = false;
 	int           pointer_target_struct = -1;
 	std::string   description;
+	std::uint64_t stable_id = 0;
+	std::uint64_t target_structure_id = 0;
+	std::uint64_t enum_id = 0;
+	std::string   referenced_type_name;
+	std::uint16_t bit_offset = 0;
+	std::uint16_t bit_width = 0;
+	std::uint16_t explicit_alignment = 0;
 };
 
 struct struct_def_t {
 	std::string              name;
 	std::vector<field_def_t> fields;
 	uint32_t                 total_size = 0;
+	std::uint64_t            stable_id = 0;
+	std::uint64_t            layout_revision = 1;
+	structure_kind_t         kind = structure_kind_t::structure;
+	std::uint16_t            packing = 0;
+	std::uint16_t            explicit_alignment = 0;
+};
+
+enum class layout_issue_severity_t : std::uint8_t {
+	error,
+	warning
+};
+
+struct layout_issue_t {
+	layout_issue_severity_t severity = layout_issue_severity_t::error;
+	int field_index = -1;
+	std::string code;
+	std::string detail;
+};
+
+struct layout_validation_t {
+	std::vector<layout_issue_t> issues;
+	std::uint32_t computed_size = 0;
+	std::uint32_t effective_alignment = 1;
+
+	bool valid() const {
+		return std::none_of(issues.begin(), issues.end(), [](const layout_issue_t& issue) {
+			return issue.severity == layout_issue_severity_t::error;
+		});
+	}
 };
 
 struct live_value_t {
@@ -69,6 +135,7 @@ struct live_value_t {
 
 struct state_t {
 	std::vector<struct_def_t> structs;
+	std::vector<enum_def_t>   enums;
 	int                       active_struct = -1;
 	uint64_t                  base_address = 0;
 	std::vector<live_value_t> cached_values;
@@ -79,9 +146,18 @@ struct state_t {
 	std::atomic<bool>         refresh_in_flight{false};
 	std::atomic<uint64_t>     refresh_seq{0};
 	std::atomic<uint64_t>     last_completed_seq{0};
+	std::uint64_t             schema_revision = 1;
+	std::uint64_t             next_stable_id = 1;
+	std::atomic<bool>         persistence_in_flight{false};
+	std::atomic<bool>         persistence_initial_load_requested{false};
+	std::shared_ptr<std::atomic<bool>> persistence_cancellation;
+	std::string               persistence_status;
+	bool                      persistence_error = false;
 };
 
 inline state_t g_state;
+
+inline std::size_t field_type_size(field_type_t t);
 
 inline bool valid_index(int index, std::size_t count) {
 	return index >= 0 && static_cast<std::size_t>(index) < count;
@@ -89,6 +165,243 @@ inline bool valid_index(int index, std::size_t count) {
 
 inline bool index_fits_int(std::size_t index) {
 	return index <= static_cast<std::size_t>((std::numeric_limits<int>::max)());
+}
+
+inline bool valid_power_of_two(std::uint32_t value) {
+	return value != 0 && (value & (value - 1)) == 0;
+}
+
+inline bool checked_add_u32(std::uint32_t left, std::uint32_t right,
+	std::uint32_t& result) {
+	if (right > (std::numeric_limits<std::uint32_t>::max)() - left)
+		return false;
+	result = left + right;
+	return true;
+}
+
+inline bool checked_multiply_u32(std::uint32_t left, std::uint32_t right,
+	std::uint32_t& result) {
+	if (left != 0 && right > (std::numeric_limits<std::uint32_t>::max)() / left)
+		return false;
+	result = left * right;
+	return true;
+}
+
+inline std::uint32_t align_up_u32(std::uint32_t value, std::uint32_t alignment) {
+	if (alignment <= 1)
+		return value;
+	const std::uint32_t mask = alignment - 1;
+	if (value > (std::numeric_limits<std::uint32_t>::max)() - mask)
+		return (std::numeric_limits<std::uint32_t>::max)();
+	return (value + mask) & ~mask;
+}
+
+inline std::uint64_t allocate_stable_id_locked() {
+	if (g_state.next_stable_id == 0)
+		g_state.next_stable_id = 1;
+	return g_state.next_stable_id++;
+}
+
+inline int structure_index_by_id_locked(std::uint64_t stable_id) {
+	if (stable_id == 0)
+		return -1;
+	for (std::size_t index = 0; index < g_state.structs.size(); ++index)
+		if (g_state.structs[index].stable_id == stable_id)
+			return index_fits_int(index) ? static_cast<int>(index) : -1;
+	return -1;
+}
+
+inline int structure_index_by_name(const std::string& name) {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	for (std::size_t index = 0; index < g_state.structs.size(); ++index)
+		if (g_state.structs[index].name == name)
+			return index_fits_int(index) ? static_cast<int>(index) : -1;
+	return -1;
+}
+
+inline int enum_index_by_id_locked(std::uint64_t stable_id) {
+	for (std::size_t index = 0; index < g_state.enums.size(); ++index)
+		if (g_state.enums[index].stable_id == stable_id)
+			return index_fits_int(index) ? static_cast<int>(index) : -1;
+	return -1;
+}
+
+inline bool structure_reaches_locked(std::uint64_t current_id, std::uint64_t target_id,
+	std::set<std::uint64_t>& visited) {
+	if (current_id == target_id)
+		return true;
+	if (!visited.insert(current_id).second)
+		return false;
+	const int current = structure_index_by_id_locked(current_id);
+	if (!valid_index(current, g_state.structs.size()))
+		return false;
+	for (const auto& field : g_state.structs[static_cast<std::size_t>(current)].fields)
+		if (field.type == field_type_t::nested_struct && field.target_structure_id != 0 &&
+			structure_reaches_locked(field.target_structure_id, target_id, visited))
+			return true;
+	return false;
+}
+
+inline std::size_t field_scalar_size_locked(const field_def_t& field) {
+	if (field.type == field_type_t::nested_struct && field.target_structure_id != 0) {
+		const int target = structure_index_by_id_locked(field.target_structure_id);
+		if (valid_index(target, g_state.structs.size()))
+			return g_state.structs[static_cast<std::size_t>(target)].total_size;
+	}
+	if (field.size != 0)
+		return field.size;
+	const std::size_t natural = field_type_size(field.type);
+	return natural == 0 ? 1 : natural;
+}
+
+inline std::uint32_t field_natural_alignment_locked(const field_def_t& field) {
+	if (field.explicit_alignment != 0)
+		return field.explicit_alignment;
+	const std::size_t size = field_scalar_size_locked(field);
+	std::uint32_t alignment = 1;
+	while (alignment < size && alignment < 16)
+		alignment <<= 1;
+	return alignment;
+}
+
+inline layout_validation_t validate_structure_locked(const struct_def_t& definition) {
+	layout_validation_t result;
+	if (definition.name.empty() || definition.name.size() > 256)
+		result.issues.push_back({layout_issue_severity_t::error, -1,
+			"structure.name", "Structure names must contain 1-256 bytes"});
+	if (definition.packing != 0 &&
+		(!valid_power_of_two(definition.packing) || definition.packing > 4096))
+		result.issues.push_back({layout_issue_severity_t::error, -1,
+			"structure.packing", "Packing must be 0 or a power of two no greater than 4096"});
+	if (definition.explicit_alignment != 0 &&
+		(!valid_power_of_two(definition.explicit_alignment) ||
+			definition.explicit_alignment > 4096))
+		result.issues.push_back({layout_issue_severity_t::error, -1,
+			"structure.alignment", "Structure alignment must be 0 or a power of two no greater than 4096"});
+	std::uint32_t max_end = 0;
+	std::uint32_t structure_alignment = definition.explicit_alignment == 0
+		? 1 : definition.explicit_alignment;
+	std::set<std::string> names;
+	struct span_t { std::uint32_t begin; std::uint32_t end; int index; };
+	std::vector<span_t> spans;
+	spans.reserve(definition.fields.size());
+	for (std::size_t index = 0; index < definition.fields.size(); ++index) {
+		const auto& field = definition.fields[index];
+		const int field_index = index_fits_int(index) ? static_cast<int>(index) : -1;
+		if (field.name.empty() || field.name.size() > 256)
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.name", "Field names must contain 1-256 bytes"});
+		else if (!names.insert(field.name).second)
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.duplicate_name", "Field names must be unique within a structure"});
+		if (field.parent_idx != -1 && !valid_index(field.parent_idx, definition.fields.size()))
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.parent", "Field parent index is outside the structure"});
+		std::set<int> child_indices;
+		for (const int child : field.children)
+			if (!valid_index(child, definition.fields.size()) ||
+				!child_indices.insert(child).second ||
+				definition.fields[static_cast<std::size_t>(child)].parent_idx != field_index)
+				result.issues.push_back({layout_issue_severity_t::error, field_index,
+					"field.children", "Field child links must be unique, in range, and reciprocal"});
+		if (field.array_count == 0 || field.array_count > 1048576)
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.array_count", "Array count must be between 1 and 1,048,576"});
+		if (field.explicit_alignment != 0 &&
+			(!valid_power_of_two(field.explicit_alignment) || field.explicit_alignment > 4096))
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.alignment", "Field alignment must be 0 or a power of two no greater than 4096"});
+		if (field.type == field_type_t::nested_struct) {
+			const int target = structure_index_by_id_locked(field.target_structure_id);
+			if (!valid_index(target, g_state.structs.size()))
+				result.issues.push_back({layout_issue_severity_t::error, field_index,
+					"field.nested_target", "Nested fields require a current target structure"});
+			else if (g_state.structs[static_cast<std::size_t>(target)].stable_id == definition.stable_id)
+				result.issues.push_back({layout_issue_severity_t::error, field_index,
+					"field.recursive_value", "A structure cannot contain itself by value"});
+			else {
+				std::set<std::uint64_t> visited;
+				if (structure_reaches_locked(field.target_structure_id, definition.stable_id, visited))
+					result.issues.push_back({layout_issue_severity_t::error, field_index,
+						"field.recursive_cycle", "Nested value fields cannot form a recursive structure cycle"});
+			}
+		}
+		if (field.enum_id != 0 && !valid_index(enum_index_by_id_locked(field.enum_id), g_state.enums.size()))
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.enum", "Enum fields require a current enum definition"});
+		if (field.bit_width != 0) {
+			const std::size_t scalar = field_scalar_size_locked(field);
+			if (field.array_count != 1 || scalar == 0 || scalar > 8 ||
+				field.bit_width > scalar * 8 || field.bit_offset >= scalar * 8 ||
+				field.bit_offset + field.bit_width > scalar * 8)
+				result.issues.push_back({layout_issue_severity_t::error, field_index,
+					"field.bitfield", "Bitfield offset and width must fit one 1-8 byte scalar and cannot be arrays"});
+		}
+		std::uint32_t scalar = 0;
+		const std::size_t scalar_size = field_scalar_size_locked(field);
+		if (scalar_size > 16777216 || scalar_size > (std::numeric_limits<std::uint32_t>::max)())
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.size", "Field scalar size exceeds the 16 MiB structure limit"});
+		else
+			scalar = static_cast<std::uint32_t>(scalar_size);
+		std::uint32_t span = 0;
+		std::uint32_t end = 0;
+		if (!checked_multiply_u32(scalar, field.array_count, span) ||
+			!checked_add_u32(field.offset, span, end) || end > 16777216)
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"field.range", "Field range overflows or exceeds the 16 MiB structure limit"});
+		else {
+			max_end = (std::max)(max_end, end);
+			if (field.parent_idx < 0 && span != 0)
+				spans.push_back({field.offset, end, field_index});
+		}
+		std::uint32_t alignment = field_natural_alignment_locked(field);
+		if (definition.packing != 0)
+			alignment = (std::min)(alignment, static_cast<std::uint32_t>(definition.packing));
+		structure_alignment = (std::max)(structure_alignment, alignment);
+		if (definition.kind == structure_kind_t::structure && alignment > 1 &&
+			field.offset % alignment != 0)
+			result.issues.push_back({layout_issue_severity_t::warning, field_index,
+				"field.misaligned", "Field offset does not satisfy its effective alignment"});
+		if (definition.kind == structure_kind_t::union_type && field.parent_idx < 0 && field.offset != 0)
+			result.issues.push_back({layout_issue_severity_t::error, field_index,
+				"union.offset", "Top-level union fields must start at offset zero"});
+	}
+	if (definition.kind == structure_kind_t::structure) {
+		std::sort(spans.begin(), spans.end(), [](const span_t& left, const span_t& right) {
+			return left.begin < right.begin || (left.begin == right.begin && left.end < right.end);
+		});
+		for (std::size_t index = 1; index < spans.size(); ++index)
+			if (spans[index].begin < spans[index - 1].end) {
+				const auto& current = definition.fields[static_cast<std::size_t>(spans[index].index)];
+				const auto& previous = definition.fields[static_cast<std::size_t>(spans[index - 1].index)];
+				const bool compatible_bits = current.bit_width != 0 && previous.bit_width != 0 &&
+					current.offset == previous.offset &&
+					field_scalar_size_locked(current) == field_scalar_size_locked(previous) &&
+					(current.bit_offset + current.bit_width <= previous.bit_offset ||
+					 previous.bit_offset + previous.bit_width <= current.bit_offset);
+				if (!compatible_bits)
+					result.issues.push_back({layout_issue_severity_t::error, spans[index].index,
+						"field.overlap", "Field overlaps another top-level field"});
+			}
+	}
+	result.effective_alignment = (std::max)(std::uint32_t{1}, structure_alignment);
+	result.computed_size = align_up_u32(max_end, result.effective_alignment);
+	if (result.computed_size > 16777216)
+		result.issues.push_back({layout_issue_severity_t::error, -1,
+			"structure.size", "Aligned structure size exceeds 16 MiB"});
+	return result;
+}
+
+inline layout_validation_t validate_structure(int structure_index) {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (!valid_index(structure_index, g_state.structs.size())) {
+		layout_validation_t result;
+		result.issues.push_back({layout_issue_severity_t::error, -1,
+			"structure.index", "The structure no longer exists"});
+		return result;
+	}
+	return validate_structure_locked(g_state.structs[static_cast<std::size_t>(structure_index)]);
 }
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -119,6 +432,12 @@ inline void ensure_preview_fixture() {
 		{"confidence", field_type_t::float32, 0x20, 4, 1, -1, {}, false, -1, "Recovery confidence"}
 	};
 	node.total_size = 0x24;
+	context.stable_id = allocate_stable_id_locked();
+	for (auto& field : context.fields)
+		field.stable_id = allocate_stable_id_locked();
+	node.stable_id = allocate_stable_id_locked();
+	for (auto& field : node.fields)
+		field.stable_id = allocate_stable_id_locked();
 	g_state.structs = {std::move(context), std::move(node)};
 	g_state.active_struct = 0;
 	g_state.base_address = 0x0000000140005000ULL;
@@ -272,18 +591,73 @@ inline std::string format_field_value(const std::vector<uint8_t>& bytes, field_t
 	}
 }
 
-inline void recalc_total_size(struct_def_t& sd) {
-	uint32_t max_end = 0;
-	for (const auto& f : sd.fields) {
-		uint32_t fsz = f.size;
-		if (fsz == 0) {
-			std::size_t ts = field_type_size(f.type);
-			fsz = static_cast<uint32_t>(ts > 0 ? ts : 1);
-		}
-		uint32_t end = f.offset + fsz * f.array_count;
-		if (end > max_end) max_end = end;
+inline std::string format_field_value_locked(const std::vector<uint8_t>& bytes,
+	const field_def_t& field) {
+	if (bytes.empty())
+		return "<no data>";
+	if (field.bit_width != 0) {
+		std::uint64_t storage = 0;
+		std::memcpy(&storage, bytes.data(), (std::min)(bytes.size(), sizeof(storage)));
+		const std::uint64_t mask = field.bit_width == 64
+			? (std::numeric_limits<std::uint64_t>::max)()
+			: ((std::uint64_t{1} << field.bit_width) - 1);
+		const std::uint64_t value = (storage >> field.bit_offset) & mask;
+		char output[96];
+		std::snprintf(output, sizeof(output), "%llu (0x%llX, bits %u:%u)",
+			static_cast<unsigned long long>(value), static_cast<unsigned long long>(value),
+			static_cast<unsigned int>(field.bit_offset), static_cast<unsigned int>(field.bit_width));
+		return output;
 	}
-	sd.total_size = max_end;
+	if (field.enum_id != 0) {
+		const int enum_index = enum_index_by_id_locked(field.enum_id);
+		if (valid_index(enum_index, g_state.enums.size())) {
+			const auto enumeration = g_state.enums.begin() + enum_index;
+			std::uint64_t raw = 0;
+			std::memcpy(&raw, bytes.data(), (std::min)(bytes.size(), sizeof(raw)));
+			const auto value = std::find_if(enumeration->values.begin(), enumeration->values.end(),
+				[&](const enum_value_t& item) { return static_cast<std::uint64_t>(item.value) == raw; });
+			if (value != enumeration->values.end())
+				return enumeration->name + "::" + value->name + " (" + std::to_string(value->value) + ")";
+			return enumeration->name + "(" + std::to_string(raw) + ")";
+		}
+	}
+	if (field.type == field_type_t::nested_struct) {
+		const int target = structure_index_by_id_locked(field.target_structure_id);
+		const std::string name = valid_index(target, g_state.structs.size())
+			? g_state.structs[static_cast<std::size_t>(target)].name : field.referenced_type_name;
+		return (name.empty() ? std::string("structure") : name) + " {" +
+			std::to_string(bytes.size()) + " bytes}";
+	}
+	if (field.array_count > 1) {
+		const std::size_t scalar = field_scalar_size_locked(field);
+		std::string output = field_type_name(field.type);
+		output += "[" + std::to_string(field.array_count) + "] ";
+		const std::size_t shown = (std::min)(static_cast<std::size_t>(field.array_count), std::size_t{4});
+		for (std::size_t index = 0; index < shown; ++index) {
+			if (index != 0)
+				output += ", ";
+			const std::size_t begin = index * scalar;
+			if (begin >= bytes.size()) {
+				output += "<out of range>";
+				continue;
+			}
+			const std::size_t end = (std::min)(bytes.size(), begin + scalar);
+			output += format_field_value(std::vector<std::uint8_t>(bytes.begin() +
+				static_cast<std::ptrdiff_t>(begin), bytes.begin() + static_cast<std::ptrdiff_t>(end)), field.type);
+		}
+		if (shown < field.array_count)
+			output += ", ...";
+		return output;
+	}
+	std::string output = format_field_value(bytes, field.type);
+	if (field.type == field_type_t::pointer && !field.referenced_type_name.empty())
+		output += " -> " + field.referenced_type_name;
+	return output;
+}
+
+inline void recalc_total_size(struct_def_t& sd) {
+	const auto validation = validate_structure_locked(sd);
+	sd.total_size = validation.computed_size;
 }
 
 inline int create_struct(const std::string& name) {
@@ -291,6 +665,11 @@ inline int create_struct(const std::string& name) {
 	std::size_t total = 0;
 	{
 		std::lock_guard<std::mutex> lk(g_state.mtx);
+		if (name.empty() || name.size() > 256 || g_state.structs.size() >= 1024 ||
+			std::any_of(g_state.structs.begin(), g_state.structs.end(), [&](const struct_def_t& item) {
+				return item.name == name;
+			}))
+			return -1;
 		if (!index_fits_int(g_state.structs.size())) {
 			diag::log_tagged_fmt("dissector",
 				"create_struct rejected reason='index_overflow' total=%zu", g_state.structs.size());
@@ -299,8 +678,10 @@ inline int create_struct(const std::string& name) {
 		struct_def_t sd;
 		sd.name = name;
 		sd.total_size = 0;
+		sd.stable_id = allocate_stable_id_locked();
 		idx = static_cast<int>(g_state.structs.size());
 		g_state.structs.push_back(std::move(sd));
+		++g_state.schema_revision;
 		total = g_state.structs.size();
 	}
 	diag::log_tagged_fmt("dissector",
@@ -321,22 +702,42 @@ inline int add_field(int struct_idx, const field_def_t& field) {
 			return -1;
 		}
 		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
+		struct_def_t candidate = sd;
 		field_def_t f = field;
+		if (f.stable_id == 0)
+			f.stable_id = allocate_stable_id_locked();
+		else if (std::any_of(g_state.structs.begin(), g_state.structs.end(), [&](const struct_def_t& definition) {
+			return definition.stable_id == f.stable_id ||
+				std::any_of(definition.fields.begin(), definition.fields.end(), [&](const field_def_t& item) {
+					return item.stable_id == f.stable_id;
+				});
+		}) || std::any_of(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
+			return item.stable_id == f.stable_id;
+		}))
+			return -1;
+		if (f.array_count == 0)
+			f.array_count = 1;
 		if (f.size == 0) {
 			std::size_t ts = field_type_size(f.type);
 			f.size = static_cast<uint32_t>(ts > 0 ? ts : 1);
 		}
-		if (!index_fits_int(sd.fields.size())) {
+		if (!index_fits_int(candidate.fields.size()) || candidate.fields.size() >= 65536) {
 			diag::log_tagged_fmt("dissector",
 				"add_field rejected reason='index_overflow' struct='%s' field_count=%zu",
 				sd.name.c_str(), sd.fields.size());
 			return -1;
 		}
-		idx = static_cast<int>(sd.fields.size());
-		if (valid_index(f.parent_idx, sd.fields.size()))
-			sd.fields[static_cast<std::size_t>(f.parent_idx)].children.push_back(idx);
-		sd.fields.push_back(std::move(f));
-		recalc_total_size(sd);
+		idx = static_cast<int>(candidate.fields.size());
+		if (valid_index(f.parent_idx, candidate.fields.size()))
+			candidate.fields[static_cast<std::size_t>(f.parent_idx)].children.push_back(idx);
+		candidate.fields.push_back(std::move(f));
+		const auto validation = validate_structure_locked(candidate);
+		if (!validation.valid())
+			return -1;
+		candidate.total_size = validation.computed_size;
+		candidate.layout_revision = sd.layout_revision + 1;
+		sd = std::move(candidate);
+		++g_state.schema_revision;
 		total_after = sd.total_size;
 		sd_name = sd.name;
 	}
@@ -391,6 +792,8 @@ inline bool remove_field(int struct_idx, int field_idx) {
 				f.children.end());
 		}
 		recalc_total_size(sd);
+		++sd.layout_revision;
+		++g_state.schema_revision;
 		total_after = sd.total_size;
 	}
 	diag::log_tagged_fmt("dissector",
@@ -408,7 +811,10 @@ inline bool rename_struct(int struct_idx, const std::string& new_name) {
 				"rename_struct rejected reason='bad_idx' idx=%d", struct_idx);
 			return false;
 		}
-		if (new_name.empty()) {
+		if (new_name.empty() || new_name.size() > 256 ||
+			std::any_of(g_state.structs.begin(), g_state.structs.end(), [&](const struct_def_t& item) {
+				return item.name == new_name && item.stable_id != g_state.structs[static_cast<std::size_t>(struct_idx)].stable_id;
+			})) {
 			diag::log_tagged_fmt("dissector",
 				"rename_struct rejected reason='empty_name' idx=%d", struct_idx);
 			return false;
@@ -416,6 +822,18 @@ inline bool rename_struct(int struct_idx, const std::string& new_name) {
 		auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
 		old_name = sd.name;
 		sd.name = new_name;
+		++sd.layout_revision;
+		for (auto& definition : g_state.structs) {
+			bool changed = false;
+			for (auto& field : definition.fields)
+				if (field.target_structure_id == sd.stable_id) {
+					field.referenced_type_name = new_name;
+					changed = true;
+				}
+			if (changed && definition.stable_id != sd.stable_id)
+				++definition.layout_revision;
+		}
+		++g_state.schema_revision;
 	}
 	diag::log_tagged_fmt("dissector",
 		"rename_struct idx=%d old='%s' new='%s'",
@@ -442,7 +860,14 @@ inline bool rename_field(int struct_idx, int field_idx, const std::string& new_n
 		const auto field_index = static_cast<std::size_t>(field_idx);
 		sd_name = sd.name;
 		old_name = sd.fields[field_index].name;
+		if (new_name.empty() || new_name.size() > 256 ||
+			std::any_of(sd.fields.begin(), sd.fields.end(), [&](const field_def_t& item) {
+				return item.name == new_name && item.stable_id != sd.fields[field_index].stable_id;
+			}))
+			return false;
 		sd.fields[field_index].name = new_name;
+		++sd.layout_revision;
+		++g_state.schema_revision;
 	}
 	diag::log_tagged_fmt("dissector",
 		"rename_field struct='%s' field_idx=%d old='%s' new='%s'",
@@ -468,7 +893,8 @@ inline bool retype_field(int struct_idx, int field_idx, field_type_t new_type) {
 				sd.name.c_str(), field_idx);
 			return false;
 		}
-		auto& f = sd.fields[static_cast<std::size_t>(field_idx)];
+		struct_def_t candidate = sd;
+		auto& f = candidate.fields[static_cast<std::size_t>(field_idx)];
 		old_type = f.type;
 		f.type = new_type;
 		std::size_t ts = field_type_size(new_type);
@@ -477,9 +903,19 @@ inline bool retype_field(int struct_idx, int field_idx, field_type_t new_type) {
 		} else if (f.size == 0) {
 			f.size = 1;
 		}
-		recalc_total_size(sd);
-		sd_name = sd.name;
+		f.target_structure_id = new_type == field_type_t::nested_struct ? f.target_structure_id : 0;
+		f.enum_id = 0;
+		f.bit_offset = 0;
+		f.bit_width = 0;
+		const auto validation = validate_structure_locked(candidate);
+		if (!validation.valid())
+			return false;
 		fname = f.name;
+		candidate.total_size = validation.computed_size;
+		candidate.layout_revision = sd.layout_revision + 1;
+		sd = std::move(candidate);
+		++g_state.schema_revision;
+		sd_name = sd.name;
 		total_after = sd.total_size;
 	}
 	diag::log_tagged_fmt("dissector",
@@ -512,12 +948,19 @@ inline bool set_field_size(int struct_idx, int field_idx, uint32_t new_size) {
 				"set_field_size rejected reason='bad_size' new=%u", new_size);
 			return false;
 		}
-		auto& f = sd.fields[static_cast<std::size_t>(field_idx)];
+		struct_def_t candidate = sd;
+		auto& f = candidate.fields[static_cast<std::size_t>(field_idx)];
 		old_size = f.size;
 		f.size = new_size;
-		recalc_total_size(sd);
-		sd_name = sd.name;
+		const auto validation = validate_structure_locked(candidate);
+		if (!validation.valid())
+			return false;
 		fname = f.name;
+		candidate.total_size = validation.computed_size;
+		candidate.layout_revision = sd.layout_revision + 1;
+		sd = std::move(candidate);
+		++g_state.schema_revision;
+		sd_name = sd.name;
 		total_after = sd.total_size;
 	}
 	diag::log_tagged_fmt("dissector",
@@ -544,6 +987,8 @@ inline bool set_field_comment(int struct_idx, int field_idx, const std::string& 
 		}
 		const auto field_index = static_cast<std::size_t>(field_idx);
 		sd.fields[field_index].description = comment;
+		++sd.layout_revision;
+		++g_state.schema_revision;
 		sd_name = sd.name;
 		fname = sd.fields[field_index].name;
 	}
@@ -551,6 +996,256 @@ inline bool set_field_comment(int struct_idx, int field_idx, const std::string& 
 		"set_field_comment struct='%s' field='%s' bytes=%zu",
 		sd_name.c_str(), fname.c_str(), comment.size());
 	return true;
+}
+
+inline bool remove_structure(int struct_idx, std::string& error) {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (!valid_index(struct_idx, g_state.structs.size())) {
+		error = "The structure no longer exists";
+		return false;
+	}
+	const auto target_id = g_state.structs[static_cast<std::size_t>(struct_idx)].stable_id;
+	for (const auto& definition : g_state.structs)
+		for (const auto& field : definition.fields)
+			if (field.target_structure_id == target_id) {
+				error = "Remove or retarget fields that reference this structure first";
+				return false;
+			}
+	g_state.structs.erase(g_state.structs.begin() + static_cast<std::ptrdiff_t>(struct_idx));
+	for (auto& definition : g_state.structs)
+		for (auto& field : definition.fields) {
+			if (field.pointer_target_struct > struct_idx)
+				--field.pointer_target_struct;
+		}
+	if (g_state.active_struct == struct_idx)
+		g_state.active_struct = g_state.structs.empty() ? -1 :
+			(static_cast<std::size_t>(struct_idx) < g_state.structs.size() ? struct_idx :
+			static_cast<int>(g_state.structs.size() - 1));
+	else if (g_state.active_struct > struct_idx)
+		--g_state.active_struct;
+	g_state.cached_values.clear();
+	++g_state.schema_revision;
+	error.clear();
+	return true;
+}
+
+template <typename Mutator>
+inline bool mutate_structure(int struct_idx, Mutator&& mutator) {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	if (!valid_index(struct_idx, g_state.structs.size()))
+		return false;
+	auto& current = g_state.structs[static_cast<std::size_t>(struct_idx)];
+	struct_def_t candidate = current;
+	if (!mutator(candidate))
+		return false;
+	const auto validation = validate_structure_locked(candidate);
+	if (!validation.valid())
+		return false;
+	candidate.total_size = validation.computed_size;
+	candidate.layout_revision = current.layout_revision + 1;
+	current = std::move(candidate);
+	++g_state.schema_revision;
+	return true;
+}
+
+inline bool set_field_array_count(int struct_idx, int field_idx, std::uint32_t count) {
+	if (count == 0 || count > 1048576)
+		return false;
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		if (!valid_index(field_idx, definition.fields.size()))
+			return false;
+		auto& field = definition.fields[static_cast<std::size_t>(field_idx)];
+		if (field.bit_width != 0 && count != 1)
+			return false;
+		field.array_count = count;
+		return true;
+	});
+}
+
+inline bool set_field_nested_target(int struct_idx, int field_idx, int target_idx,
+	bool pointer_target) {
+	std::uint64_t target_id = 0;
+	std::string target_name;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		if (!valid_index(target_idx, g_state.structs.size()))
+			return false;
+		target_id = g_state.structs[static_cast<std::size_t>(target_idx)].stable_id;
+		target_name = g_state.structs[static_cast<std::size_t>(target_idx)].name;
+	}
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		if (!valid_index(field_idx, definition.fields.size()))
+			return false;
+		auto& field = definition.fields[static_cast<std::size_t>(field_idx)];
+		field.type = pointer_target ? field_type_t::pointer : field_type_t::nested_struct;
+		field.is_pointer = pointer_target;
+		field.target_structure_id = target_id;
+		field.enum_id = 0;
+		field.pointer_target_struct = target_idx;
+		field.referenced_type_name = target_name;
+		field.size = pointer_target ? 8u : field.size;
+		field.bit_offset = 0;
+		field.bit_width = 0;
+		return true;
+	});
+}
+
+inline bool set_field_nested_target_by_name(int struct_idx, int field_idx,
+	const std::string& target_name, bool pointer_target) {
+	int target = -1;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		for (std::size_t index = 0; index < g_state.structs.size(); ++index)
+			if (g_state.structs[index].name == target_name) {
+				target = index_fits_int(index) ? static_cast<int>(index) : -1;
+				break;
+			}
+	}
+	return set_field_nested_target(struct_idx, field_idx, target, pointer_target);
+}
+
+inline bool set_field_bitfield(int struct_idx, int field_idx, std::uint16_t bit_offset,
+	std::uint16_t bit_width) {
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		if (!valid_index(field_idx, definition.fields.size()))
+			return false;
+		auto& field = definition.fields[static_cast<std::size_t>(field_idx)];
+		field.bit_offset = bit_width == 0 ? 0 : bit_offset;
+		field.bit_width = bit_width;
+		return true;
+	});
+}
+
+inline bool set_field_alignment(int struct_idx, int field_idx, std::uint16_t alignment) {
+	if (alignment != 0 && (!valid_power_of_two(alignment) || alignment > 4096))
+		return false;
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		if (!valid_index(field_idx, definition.fields.size()))
+			return false;
+		definition.fields[static_cast<std::size_t>(field_idx)].explicit_alignment = alignment;
+		return true;
+	});
+}
+
+inline bool set_structure_packing(int struct_idx, std::uint16_t packing) {
+	if (packing != 0 && (!valid_power_of_two(packing) || packing > 4096))
+		return false;
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		definition.packing = packing;
+		return true;
+	});
+}
+
+inline bool set_structure_alignment(int struct_idx, std::uint16_t alignment) {
+	if (alignment != 0 && (!valid_power_of_two(alignment) || alignment > 4096))
+		return false;
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		definition.explicit_alignment = alignment;
+		return true;
+	});
+}
+
+inline bool set_structure_kind(int struct_idx, structure_kind_t kind) {
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		definition.kind = kind;
+		if (kind == structure_kind_t::union_type)
+			for (auto& field : definition.fields)
+				if (field.parent_idx < 0)
+					field.offset = 0;
+		if (kind == structure_kind_t::structure) {
+			std::uint32_t cursor = 0;
+			for (auto& field : definition.fields) {
+				if (field.parent_idx >= 0)
+					continue;
+				std::uint32_t alignment = field_natural_alignment_locked(field);
+				if (definition.packing != 0)
+					alignment = (std::min)(alignment, static_cast<std::uint32_t>(definition.packing));
+				field.offset = align_up_u32(cursor, alignment);
+				std::uint32_t span = 0;
+				if (!checked_multiply_u32(static_cast<std::uint32_t>(field_scalar_size_locked(field)),
+					field.array_count, span) || !checked_add_u32(field.offset, span, cursor))
+					return false;
+			}
+		}
+		return true;
+	});
+}
+
+inline bool upsert_enum(const enum_def_t& source) {
+	if (source.name.empty() || source.name.size() > 256 || source.values.size() > 65536 ||
+		static_cast<int>(source.underlying_type) < static_cast<int>(field_type_t::int8) ||
+		static_cast<int>(source.underlying_type) > static_cast<int>(field_type_t::uint64))
+		return false;
+	std::set<std::string> names;
+	for (const auto& value : source.values)
+		if (value.name.empty() || value.name.size() > 256 || !names.insert(value.name).second)
+			return false;
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	auto found = std::find_if(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
+		return item.name == source.name;
+	});
+	if (found != g_state.enums.end() && found->underlying_type != source.underlying_type &&
+		std::any_of(g_state.structs.begin(), g_state.structs.end(), [&](const struct_def_t& definition) {
+			return std::any_of(definition.fields.begin(), definition.fields.end(), [&](const field_def_t& field) {
+				return field.enum_id == found->stable_id;
+			});
+		}))
+		return false;
+	enum_def_t candidate = source;
+	if (candidate.stable_id == 0)
+		candidate.stable_id = found == g_state.enums.end() ? allocate_stable_id_locked() : found->stable_id;
+	else if ((found == g_state.enums.end() || found->stable_id != candidate.stable_id) &&
+		(std::any_of(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
+			return item.stable_id == candidate.stable_id;
+		}) || std::any_of(g_state.structs.begin(), g_state.structs.end(), [&](const struct_def_t& definition) {
+			return definition.stable_id == candidate.stable_id ||
+				std::any_of(definition.fields.begin(), definition.fields.end(), [&](const field_def_t& field) {
+					return field.stable_id == candidate.stable_id;
+				});
+		})))
+		return false;
+	if (found == g_state.enums.end()) {
+		if (g_state.enums.size() >= 4096)
+			return false;
+		g_state.enums.push_back(std::move(candidate));
+	} else {
+		*found = std::move(candidate);
+	}
+	const auto published = std::find_if(g_state.enums.begin(), g_state.enums.end(),
+		[&](const enum_def_t& item) { return item.name == source.name; });
+	const std::uint64_t published_id = published->stable_id;
+	for (auto& definition : g_state.structs)
+		if (std::any_of(definition.fields.begin(), definition.fields.end(), [&](const field_def_t& field) {
+			return field.enum_id == published_id;
+		}))
+			++definition.layout_revision;
+	++g_state.schema_revision;
+	return true;
+}
+
+inline bool set_field_enum_reference(int struct_idx, int field_idx, const std::string& enum_name) {
+	field_type_t underlying = field_type_t::int32;
+	std::uint64_t enum_id = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		auto found = std::find_if(g_state.enums.begin(), g_state.enums.end(), [&](const enum_def_t& item) {
+			return item.name == enum_name;
+		});
+		if (found == g_state.enums.end())
+			return false;
+		underlying = found->underlying_type;
+		enum_id = found->stable_id;
+	}
+	return mutate_structure(struct_idx, [&](struct_def_t& definition) {
+		if (!valid_index(field_idx, definition.fields.size()))
+			return false;
+		auto& field = definition.fields[static_cast<std::size_t>(field_idx)];
+		field.type = underlying;
+		field.size = static_cast<std::uint32_t>((std::max)(std::size_t{1}, field_type_size(underlying)));
+		field.referenced_type_name = enum_name;
+		field.enum_id = enum_id;
+		return true;
+	});
 }
 
 inline void refresh_values() {
@@ -565,7 +1260,7 @@ inline void refresh_values() {
 	for (std::size_t index = 0; index < definition.fields.size(); ++index) {
 		const auto& field = definition.fields[index];
 		const std::size_t length = (std::max)(std::size_t{1},
-			static_cast<std::size_t>(field.size) * field.array_count);
+			field_scalar_size_locked(field) * field.array_count);
 		std::vector<std::uint8_t> bytes(length);
 		for (std::size_t offset = 0; offset < length; ++offset)
 			bytes[offset] = static_cast<std::uint8_t>(
@@ -578,7 +1273,7 @@ inline void refresh_values() {
 		auto& value = g_state.cached_values[index];
 		value.changed = !value.raw_bytes.empty() && value.raw_bytes != bytes;
 		value.raw_bytes = std::move(bytes);
-		value.display_text = format_field_value(value.raw_bytes, field.type);
+		value.display_text = format_field_value_locked(value.raw_bytes, field);
 	}
 	g_state.last_completed_seq.store(sequence, std::memory_order_release);
 	g_state.refresh_in_flight.store(false, std::memory_order_release);
@@ -667,7 +1362,7 @@ inline void refresh_values() {
 			for (std::size_t i = 0; i < sd.fields.size(); ++i) {
 				const auto& f = sd.fields[i];
 				const std::size_t field_offset = static_cast<std::size_t>(f.offset);
-				const std::size_t field_size = static_cast<std::size_t>(f.size) * f.array_count;
+				const std::size_t field_size = field_scalar_size_locked(f) * f.array_count;
 				if (field_offset > block.size() || field_size > block.size() - field_offset) {
 					g_state.cached_values[i].display_text = "<out of range>";
 					g_state.cached_values[i].changed = false;
@@ -680,7 +1375,7 @@ inline void refresh_values() {
 				bool changed = (raw != g_state.cached_values[i].raw_bytes);
 				g_state.cached_values[i].raw_bytes = std::move(raw);
 				g_state.cached_values[i].display_text =
-					format_field_value(g_state.cached_values[i].raw_bytes, f.type);
+					format_field_value_locked(g_state.cached_values[i].raw_bytes, f);
 				g_state.cached_values[i].changed = changed;
 				if (changed) ++changed_count;
 			}
@@ -771,6 +1466,448 @@ inline bool write_preview_value(int field_index, const std::string& text) {
 }
 #endif
 
+inline nlohmann::json schema_json_locked() {
+	nlohmann::json root = {
+		{"schema_version", 3},
+		{"schema_revision", g_state.schema_revision},
+		{"structures", nlohmann::json::array()},
+		{"enums", nlohmann::json::array()}
+	};
+	for (const auto& definition : g_state.structs) {
+		nlohmann::json item = {
+			{"id", definition.stable_id}, {"revision", definition.layout_revision},
+			{"name", definition.name},
+			{"kind", definition.kind == structure_kind_t::union_type ? "union" : "struct"},
+			{"packing", definition.packing}, {"alignment", definition.explicit_alignment},
+			{"size", definition.total_size}, {"fields", nlohmann::json::array()}
+		};
+		for (const auto& field : definition.fields)
+			item["fields"].push_back({
+				{"id", field.stable_id}, {"name", field.name},
+				{"type", static_cast<int>(field.type)}, {"offset", field.offset},
+				{"size", field.size}, {"array_count", field.array_count},
+				{"parent", field.parent_idx}, {"children", field.children},
+				{"is_pointer", field.is_pointer}, {"pointer_target", field.pointer_target_struct},
+				{"target_structure_id", field.target_structure_id}, {"enum_id", field.enum_id},
+				{"referenced_type", field.referenced_type_name},
+				{"bit_offset", field.bit_offset}, {"bit_width", field.bit_width},
+				{"alignment", field.explicit_alignment}, {"description", field.description}
+			});
+		root["structures"].push_back(std::move(item));
+	}
+	for (const auto& enumeration : g_state.enums) {
+		nlohmann::json item = {
+			{"id", enumeration.stable_id}, {"name", enumeration.name},
+			{"underlying_type", static_cast<int>(enumeration.underlying_type)},
+			{"values", nlohmann::json::array()}
+		};
+		for (const auto& value : enumeration.values)
+			item["values"].push_back({{"name", value.name}, {"value", value.value}});
+		root["enums"].push_back(std::move(item));
+	}
+	return root;
+}
+
+inline std::string serialize_schema() {
+	std::lock_guard<std::mutex> lock(g_state.mtx);
+	return schema_json_locked().dump(2);
+}
+
+inline bool deserialize_schema(const std::string& encoded, std::string& error,
+	std::uint64_t expected_schema_revision = 0) {
+	if (encoded.empty() || encoded.size() > 16777216) {
+		error = "Schema payload must contain 1 byte to 16 MiB";
+		return false;
+	}
+	if (expected_schema_revision == 0) {
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		expected_schema_revision = g_state.schema_revision;
+	}
+	try {
+		const auto root = nlohmann::json::parse(encoded,
+			[](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+				return depth <= 64;
+			});
+		const int version = root.value("schema_version", 1);
+		if (version < 1 || version > 3 || !root.contains("structures") || !root["structures"].is_array()) {
+			error = "Unsupported or malformed structure schema";
+			return false;
+		}
+		if (root["structures"].size() > 1024) {
+			error = "Schema exceeds the 1,024 structure limit";
+			return false;
+		}
+		std::vector<struct_def_t> structures;
+		std::vector<enum_def_t> enums;
+		std::set<std::uint64_t> identities;
+		std::set<std::string> structure_names;
+		std::set<std::string> enum_names;
+		std::uint64_t max_identity = 0;
+		std::size_t total_fields = 0;
+		for (const auto& item : root["structures"]) {
+			struct_def_t definition;
+			definition.stable_id = item.value("id", std::uint64_t{0});
+			definition.layout_revision = (std::max)(std::uint64_t{1}, item.value("revision", std::uint64_t{1}));
+			definition.name = item.value("name", std::string{});
+			definition.kind = item.value("kind", std::string{"struct"}) == "union"
+				? structure_kind_t::union_type : structure_kind_t::structure;
+			definition.packing = item.value("packing", std::uint16_t{0});
+			definition.explicit_alignment = item.value("alignment", std::uint16_t{0});
+			if (!item.contains("fields") || !item["fields"].is_array() ||
+				item["fields"].size() > 65536 || total_fields + item["fields"].size() > 65536 ||
+				definition.name.empty() || !structure_names.insert(definition.name).second) {
+				error = "Schema contains invalid structure names or field counts";
+				return false;
+			}
+			total_fields += item["fields"].size();
+			for (const auto& entry : item["fields"]) {
+				field_def_t field;
+				field.stable_id = entry.value("id", std::uint64_t{0});
+				field.name = entry.value("name", std::string{});
+				const int type = entry.value("type", static_cast<int>(field_type_t::byte_array));
+				if (!valid_index(type, static_cast<std::size_t>(field_type_t::COUNT))) {
+					error = "Schema contains an unknown field type";
+					return false;
+				}
+				field.type = static_cast<field_type_t>(type);
+				field.offset = entry.value("offset", std::uint32_t{0});
+				field.size = entry.value("size", static_cast<std::uint32_t>((std::max)(std::size_t{1}, field_type_size(field.type))));
+				field.array_count = entry.value("array_count", std::uint32_t{1});
+				field.parent_idx = entry.value("parent", -1);
+				field.children = entry.value("children", std::vector<int>{});
+				field.is_pointer = entry.value("is_pointer", field.type == field_type_t::pointer);
+				field.pointer_target_struct = entry.value("pointer_target", -1);
+				field.target_structure_id = entry.value("target_structure_id", std::uint64_t{0});
+				field.enum_id = entry.value("enum_id", std::uint64_t{0});
+				field.referenced_type_name = entry.value("referenced_type", std::string{});
+				field.bit_offset = entry.value("bit_offset", std::uint16_t{0});
+				field.bit_width = entry.value("bit_width", std::uint16_t{0});
+				field.explicit_alignment = entry.value("alignment", std::uint16_t{0});
+				field.description = entry.value("description", std::string{});
+				definition.fields.push_back(std::move(field));
+			}
+			structures.push_back(std::move(definition));
+		}
+		if (root.contains("enums")) {
+			if (!root["enums"].is_array() || root["enums"].size() > 4096) {
+				error = "Schema enum catalog exceeds limits";
+				return false;
+			}
+			for (const auto& item : root["enums"]) {
+				enum_def_t enumeration;
+				enumeration.stable_id = item.value("id", std::uint64_t{0});
+				enumeration.name = item.value("name", std::string{});
+				const int type = item.value("underlying_type", static_cast<int>(field_type_t::int32));
+				if (enumeration.name.empty() || enumeration.name.size() > 256 ||
+					!enum_names.insert(enumeration.name).second || type < static_cast<int>(field_type_t::int8) ||
+					type > static_cast<int>(field_type_t::uint64) ||
+					!item.contains("values") || !item["values"].is_array() || item["values"].size() > 65536) {
+					error = "Schema contains an invalid enum";
+					return false;
+				}
+				enumeration.underlying_type = static_cast<field_type_t>(type);
+				std::set<std::string> value_names;
+				for (const auto& value : item["values"]) {
+					const std::string name = value.value("name", std::string{});
+					if (name.empty() || name.size() > 256 || !value_names.insert(name).second) {
+						error = "Schema contains invalid enum values";
+						return false;
+					}
+					enumeration.values.push_back({name, value.value("value", std::int64_t{0})});
+				}
+				enums.push_back(std::move(enumeration));
+			}
+		}
+		for (auto& definition : structures) {
+			if (definition.stable_id == 0)
+				definition.stable_id = ++max_identity;
+			if (!identities.insert(definition.stable_id).second) {
+				error = "Schema stable identities are not unique";
+				return false;
+			}
+			max_identity = (std::max)(max_identity, definition.stable_id);
+			for (auto& field : definition.fields) {
+				if (field.stable_id == 0)
+					field.stable_id = ++max_identity;
+				if (!identities.insert(field.stable_id).second) {
+					error = "Schema stable identities are not unique";
+					return false;
+				}
+				max_identity = (std::max)(max_identity, field.stable_id);
+			}
+		}
+		for (auto& definition : structures)
+			for (auto& field : definition.fields)
+				if (field.target_structure_id == 0 &&
+					valid_index(field.pointer_target_struct, structures.size())) {
+					const auto& target = structures[static_cast<std::size_t>(field.pointer_target_struct)];
+					field.target_structure_id = target.stable_id;
+					if (field.referenced_type_name.empty())
+						field.referenced_type_name = target.name;
+				}
+		for (auto& enumeration : enums) {
+			if (enumeration.stable_id == 0)
+				enumeration.stable_id = ++max_identity;
+			if (!identities.insert(enumeration.stable_id).second) {
+				error = "Schema stable identities are not unique";
+				return false;
+			}
+			max_identity = (std::max)(max_identity, enumeration.stable_id);
+		}
+		for (auto& definition : structures)
+			for (auto& field : definition.fields)
+				if (field.enum_id == 0 && field.type != field_type_t::pointer &&
+					field.type != field_type_t::nested_struct && !field.referenced_type_name.empty()) {
+					const auto enumeration = std::find_if(enums.begin(), enums.end(), [&](const enum_def_t& item) {
+						return item.name == field.referenced_type_name;
+					});
+					if (enumeration != enums.end())
+						field.enum_id = enumeration->stable_id;
+				}
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		if (expected_schema_revision != 0 && g_state.schema_revision != expected_schema_revision) {
+			error = "The structure catalog changed while the saved schema was loading";
+			return false;
+		}
+		auto previous = std::move(g_state.structs);
+		auto previous_enums = std::move(g_state.enums);
+		g_state.structs = std::move(structures);
+		g_state.enums = std::move(enums);
+		bool valid = true;
+		for (auto& definition : g_state.structs) {
+			const auto validation = validate_structure_locked(definition);
+			if (!validation.valid()) {
+				valid = false;
+				break;
+			}
+			definition.total_size = validation.computed_size;
+		}
+		if (!valid) {
+			g_state.structs = std::move(previous);
+			g_state.enums = std::move(previous_enums);
+			error = "Schema layout validation failed";
+			return false;
+		}
+		g_state.schema_revision = (std::max)(g_state.schema_revision + 1,
+			root.value("schema_revision", std::uint64_t{1}) + 1);
+		g_state.next_stable_id = max_identity == (std::numeric_limits<std::uint64_t>::max)()
+			? 1 : max_identity + 1;
+		g_state.active_struct = g_state.structs.empty() ? -1 : 0;
+		g_state.cached_values.clear();
+		error.clear();
+		return true;
+	} catch (const std::exception& exception) {
+		error = exception.what();
+		return false;
+	}
+}
+
+inline std::string durable_schema_path() {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	return {};
+#else
+	const char* appdata = std::getenv("APPDATA");
+	if (!appdata || !*appdata)
+		return {};
+	return (std::filesystem::path(appdata) / "AiDA" / "Standalone" / "types" /
+		"dissector_schema_v3.json").string();
+#endif
+}
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::string g_preview_durable_schema;
+#endif
+
+inline bool request_persistence(bool save) {
+	bool expected = false;
+	if (!g_state.persistence_in_flight.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel, std::memory_order_acquire))
+		return false;
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	{
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		g_state.persistence_cancellation = cancellation;
+		g_state.persistence_error = false;
+		g_state.persistence_status = save ? "Saving structure schema..." : "Loading structure schema...";
+	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	std::string error;
+	if (save)
+		g_preview_durable_schema = serialize_schema();
+	const bool success = save || (!g_preview_durable_schema.empty() &&
+		deserialize_schema(g_preview_durable_schema, error));
+	{
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		g_state.persistence_error = !success;
+		g_state.persistence_status = success ? (save ? "Structure schema saved" : "Structure schema loaded") :
+			(error.empty() ? "No saved structure schema exists" : error);
+		g_state.persistence_cancellation.reset();
+	}
+	g_state.persistence_in_flight.store(false, std::memory_order_release);
+	return success;
+#else
+	const std::string path = durable_schema_path();
+	if (path.empty()) {
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		g_state.persistence_error = true;
+		g_state.persistence_status = "APPDATA is unavailable for structure schema persistence";
+		g_state.persistence_cancellation.reset();
+		g_state.persistence_in_flight.store(false, std::memory_order_release);
+		return false;
+	}
+	std::string payload;
+	std::uint64_t captured_revision = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		captured_revision = g_state.schema_revision;
+		if (save)
+			payload = schema_json_locked().dump(2);
+	}
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "analysis";
+	submission.label = save ? "analysis.struct_dissector.save_schema" :
+		"analysis.struct_dissector.load_schema";
+	submission.thread_class = "bounded_task";
+	submission.domain = aida::infra::executor::domain_t::diagnostics;
+	submission.priority = 3;
+	submission.body = [save, path, payload = std::move(payload), captured_revision, cancellation] {
+		bool success = false;
+		bool missing_catalog = false;
+		std::string error;
+		if (save) {
+			const auto result = scanner_async_io::atomic_replace(path, payload, true, cancellation,
+				[captured_revision] {
+					std::lock_guard<std::mutex> lock(g_state.mtx);
+					return g_state.schema_revision == captured_revision;
+				});
+			success = result.success;
+			error = result.error;
+		} else {
+			std::error_code exists_error;
+			missing_catalog = !std::filesystem::exists(path, exists_error) && !exists_error;
+			if (missing_catalog)
+				success = true;
+			else {
+				std::string encoded;
+				const auto result = scanner_async_io::read_bounded(path, 16777216, cancellation, encoded);
+				if (result.success && !cancellation->load(std::memory_order_acquire))
+					success = deserialize_schema(encoded, error, captured_revision);
+				else
+					error = result.error.empty() ? "Structure schema load cancelled" : result.error;
+			}
+		}
+		{
+			std::lock_guard<std::mutex> lock(g_state.mtx);
+			g_state.persistence_error = !success;
+			g_state.persistence_status = success ? (save ? "Structure schema saved" :
+				(missing_catalog ? "No saved structure schema; using an empty catalog" : "Structure schema loaded")) :
+				(error.empty() ? "Structure schema persistence failed" : error);
+			g_state.persistence_cancellation.reset();
+		}
+		g_state.persistence_in_flight.store(false, std::memory_order_release);
+		if (!success)
+			throw std::runtime_error(error.empty() ? "Structure schema persistence failed" : error);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		g_state.persistence_error = true;
+		g_state.persistence_status = submitted.reject_reason;
+		g_state.persistence_cancellation.reset();
+		g_state.persistence_in_flight.store(false, std::memory_order_release);
+		return false;
+	}
+	aida::ui::task_center::task_registration_t registration;
+	registration.owner = "analysis";
+	registration.owner_view = "view.types.dissector";
+	registration.owner_action = save ? "types.dissector.schema.save" :
+		"types.dissector.schema.load";
+	registration.label = save ? "Save structure schema" : "Load structure schema";
+	registration.stage = "Queued";
+	registration.progress = -1.f;
+	registration.cancellation_is_safe = true;
+	registration.callbacks.cancel = [cancellation] {
+		cancellation->store(true, std::memory_order_release);
+		return true;
+	};
+	static_cast<void>(aida::ui::task_center::register_executor_job(submitted.task_id,
+		std::move(registration)));
+	return true;
+#endif
+}
+
+inline bool request_save_schema() {
+	return request_persistence(true);
+}
+
+inline bool request_load_schema() {
+	return request_persistence(false);
+}
+
+inline void ensure_persistence_loaded() {
+	bool expected = false;
+	if (g_state.persistence_initial_load_requested.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel, std::memory_order_acquire))
+		request_load_schema();
+}
+
+inline bool cancel_persistence() {
+	std::shared_ptr<std::atomic<bool>> cancellation;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mtx);
+		cancellation = g_state.persistence_cancellation;
+	}
+	if (!cancellation)
+		return false;
+	cancellation->store(true, std::memory_order_release);
+	return true;
+}
+
+inline std::string c_identifier(std::string value, const std::string& fallback) {
+	for (auto& character : value)
+		if (!(character == '_' || (character >= '0' && character <= '9') ||
+			(character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')))
+			character = '_';
+	if (value.empty())
+		value = fallback;
+	if (value.front() >= '0' && value.front() <= '9')
+		value.insert(value.begin(), '_');
+	return value;
+}
+
+inline std::string c_field_type_locked(const field_def_t& field) {
+	if (field.type == field_type_t::nested_struct) {
+		const int target = structure_index_by_id_locked(field.target_structure_id);
+		const std::string name = valid_index(target, g_state.structs.size())
+			? g_state.structs[static_cast<std::size_t>(target)].name : field.referenced_type_name;
+		return c_identifier(name, "anonymous_structure") + "_t";
+	}
+	if (field.enum_id != 0) {
+		const int enumeration = enum_index_by_id_locked(field.enum_id);
+		if (valid_index(enumeration, g_state.enums.size()))
+			return c_identifier(g_state.enums[static_cast<std::size_t>(enumeration)].name,
+				"anonymous_enum") + "_t";
+	}
+	if (field.type == field_type_t::pointer && !field.referenced_type_name.empty())
+		return c_identifier(field.referenced_type_name, "void") + "_t*";
+	switch (field.type) {
+	case field_type_t::int8: return "int8_t";
+	case field_type_t::uint8: return "uint8_t";
+	case field_type_t::int16: return "int16_t";
+	case field_type_t::uint16: return "uint16_t";
+	case field_type_t::int32: return "int32_t";
+	case field_type_t::uint32: return "uint32_t";
+	case field_type_t::int64: return "int64_t";
+	case field_type_t::uint64: return "uint64_t";
+	case field_type_t::float32: return "float";
+	case field_type_t::float64: return "double";
+	case field_type_t::pointer: return "void*";
+	case field_type_t::ascii_string: return "char";
+	case field_type_t::utf16_string: return "char16_t";
+	default: return "uint8_t";
+	}
+}
+
 inline std::string export_to_c(int struct_idx) {
 	std::lock_guard<std::mutex> lk(g_state.mtx);
 	if (!valid_index(struct_idx, g_state.structs.size())) {
@@ -779,45 +1916,73 @@ inline std::string export_to_c(int struct_idx) {
 		return {};
 	}
 	const auto& sd = g_state.structs[static_cast<std::size_t>(struct_idx)];
-	std::string out;
-	out += "typedef struct {\n";
-	for (const auto& f : sd.fields) {
-		if (f.parent_idx >= 0) continue;
+	const std::string type_name = c_identifier(sd.name, "anonymous_structure") + "_t";
+	std::string out = "#include <cstddef>\n#include <cstdint>\n\n";
+	if (sd.packing != 0)
+		out += "#pragma pack(push, " + std::to_string(sd.packing) + ")\n";
+	out += "typedef ";
+	if (sd.explicit_alignment != 0)
+		out += "alignas(" + std::to_string(sd.explicit_alignment) + ") ";
+	out += sd.kind == structure_kind_t::union_type ? "union {\n" : "struct {\n";
+	std::vector<const field_def_t*> fields;
+	for (const auto& field : sd.fields)
+		if (field.parent_idx < 0)
+			fields.push_back(&field);
+	std::stable_sort(fields.begin(), fields.end(), [](const field_def_t* left, const field_def_t* right) {
+		return left->offset < right->offset;
+	});
+	std::uint32_t cursor = 0;
+	std::size_t padding_index = 0;
+	std::uint32_t bit_storage_offset = (std::numeric_limits<std::uint32_t>::max)();
+	std::uint32_t bit_cursor = 0;
+	for (const auto* field : fields) {
+		if (sd.kind == structure_kind_t::structure && field->offset > cursor) {
+			out += "    uint8_t __padding_" + std::to_string(padding_index++) + "[" +
+				std::to_string(field->offset - cursor) + "];\n";
+		}
 		out += "    ";
-		switch (f.type) {
-		case field_type_t::int8:          out += "int8_t"; break;
-		case field_type_t::uint8:         out += "uint8_t"; break;
-		case field_type_t::int16:         out += "int16_t"; break;
-		case field_type_t::uint16:        out += "uint16_t"; break;
-		case field_type_t::int32:         out += "int32_t"; break;
-		case field_type_t::uint32:        out += "uint32_t"; break;
-		case field_type_t::int64:         out += "int64_t"; break;
-		case field_type_t::uint64:        out += "uint64_t"; break;
-		case field_type_t::float32:       out += "float"; break;
-		case field_type_t::float64:       out += "double"; break;
-		case field_type_t::pointer:       out += "void*"; break;
-		case field_type_t::ascii_string:  out += "char"; break;
-		case field_type_t::utf16_string:  out += "wchar_t"; break;
-		case field_type_t::byte_array:    out += "uint8_t"; break;
-		case field_type_t::padding:       out += "uint8_t"; break;
-		case field_type_t::nested_struct: out += "uint8_t"; break;
-		default:                          out += "uint8_t"; break;
+		if (field->explicit_alignment != 0)
+			out += "alignas(" + std::to_string(field->explicit_alignment) + ") ";
+		const std::string declared_type = c_field_type_locked(*field);
+		if (field->bit_width != 0) {
+			if (bit_storage_offset != field->offset) {
+				bit_storage_offset = field->offset;
+				bit_cursor = 0;
+			}
+			if (field->bit_offset > bit_cursor)
+				out += declared_type + " : " + std::to_string(field->bit_offset - bit_cursor) + ";\n    ";
+			out += declared_type + " " +
+				c_identifier(field->name, "field_" + std::to_string(field->offset)) +
+				" : " + std::to_string(field->bit_width);
+			bit_cursor = field->bit_offset + field->bit_width;
+		} else {
+			bit_storage_offset = (std::numeric_limits<std::uint32_t>::max)();
+			bit_cursor = 0;
+			out += declared_type + " " +
+				c_identifier(field->name, "field_" + std::to_string(field->offset));
 		}
-		out += " ";
-		out += f.name.empty() ? "field_" + std::to_string(f.offset) : f.name;
-		if (f.type == field_type_t::ascii_string || f.type == field_type_t::utf16_string ||
-			f.type == field_type_t::byte_array || f.type == field_type_t::padding ||
-			f.type == field_type_t::nested_struct) {
-			out += "[" + std::to_string(f.size * f.array_count) + "]";
-		} else if (f.array_count > 1) {
-			out += "[" + std::to_string(f.array_count) + "]";
-		}
-		out += ";";
-		if (!f.description.empty())
-			out += " /* " + f.description + " */";
-		out += "\n";
+		if (field->bit_width == 0 && field->array_count > 1)
+			out += "[" + std::to_string(field->array_count) + "]";
+		else if (field->bit_width == 0 && (field->type == field_type_t::ascii_string || field->type == field_type_t::utf16_string ||
+			field->type == field_type_t::byte_array || field->type == field_type_t::padding))
+			out += "[" + std::to_string(field->size) + "]";
+		out += ";\n";
+		std::uint32_t span = 0;
+		checked_multiply_u32(static_cast<std::uint32_t>(field_scalar_size_locked(*field)), field->array_count, span);
+		cursor = (std::max)(cursor, field->offset + span);
 	}
-	out += "} " + sd.name + "_t;\n";
+	if (sd.kind == structure_kind_t::structure && sd.total_size > cursor)
+		out += "    uint8_t __padding_" + std::to_string(padding_index) + "[" +
+			std::to_string(sd.total_size - cursor) + "];\n";
+	out += "} " + type_name + ";\n";
+	if (sd.packing != 0)
+		out += "#pragma pack(pop)\n";
+	for (const auto* field : fields)
+		if (field->bit_width == 0)
+			out += "static_assert(offsetof(" + type_name + ", " +
+				c_identifier(field->name, "field_" + std::to_string(field->offset)) + ") == " +
+				std::to_string(field->offset) + ");\n";
+	out += "static_assert(sizeof(" + type_name + ") == " + std::to_string(sd.total_size) + ");\n";
 	diag::log_tagged_fmt("dissector",
 		"export_to_c name='%s' fields=%zu bytes=%zu",
 		sd.name.c_str(), sd.fields.size(), out.size());

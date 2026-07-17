@@ -1,7 +1,6 @@
 #include "workbench_persistence.hpp"
 
 #include "../analysis/workspace/workspace_database.hpp"
-#include "split_tree.h"
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +23,38 @@ namespace workbench {
 namespace {
 
 using json = nlohmann::json;
+
+constexpr std::size_t k_legacy_split_node_limit = 8191;
+constexpr std::uint16_t k_legacy_split_ratio_min = 500;
+constexpr std::uint16_t k_legacy_split_ratio_max = 9500;
+constexpr std::uint16_t k_legacy_split_ratio_default = 5000;
+
+struct legacy_layout_t final {
+    std::uint32_t left_rail_pixels = 0;
+    std::uint32_t navigator_pixels = 0;
+    std::uint32_t inspector_pixels = 0;
+    std::uint32_t bottom_panel_pixels = 0;
+    std::uint32_t tab_strip_pixels = 0;
+    std::uint32_t toolbar_pixels = 0;
+    std::uint32_t splitter_pixels = 0;
+    std::uint32_t minimum_document_width_pixels = 0;
+    std::uint32_t minimum_document_height_pixels = 0;
+};
+
+struct legacy_split_node_t final {
+    std::uint64_t id = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t orientation = 0;
+    std::uint16_t ratio_basis_points = 0;
+    std::uint64_t view = 0;
+    std::uint64_t first = 0;
+    std::uint64_t second = 0;
+};
+
+struct legacy_split_tree_t final {
+    std::uint64_t root = 0;
+    std::vector<legacy_split_node_t> nodes;
+};
 
 persistence_codec_result_t codec_error(persistence_codec_code_t code,
                                        std::string detail = {}) noexcept
@@ -64,7 +95,7 @@ std::optional<persistence_codec_result_t> preflight_json(
             !containers[depth - 1].array_expects_value)
             return true;
         auto& frame = containers[depth - 1];
-        if (frame.array_items >= k_max_split_nodes_per_workspace ||
+        if (frame.array_items >= k_legacy_split_node_limit ||
             structural_values >= k_persistence_codec_max_collection_elements)
             return false;
         ++frame.array_items;
@@ -160,12 +191,12 @@ bool valid_nav_origin_ordinal(std::uint64_t value) noexcept
 
 bool valid_split_node_kind_ordinal(std::uint64_t value) noexcept
 {
-    return value <= static_cast<unsigned>(split_node_kind_t::branch);
+    return value <= 1;
 }
 
 bool valid_split_orientation_ordinal(std::uint64_t value) noexcept
 {
-    return value <= static_cast<unsigned>(split_orientation_t::vertical);
+    return value <= 1;
 }
 
 bool valid_panel_kind_ordinal(std::uint64_t value) noexcept
@@ -194,22 +225,7 @@ bool exact_fields(const json& value, const std::array<const char*, Size>& fields
                        [&](const char* field) { return value.contains(field); });
 }
 
-json layout_json(const fixed_layout_constraints_t& layout)
-{
-    return json{
-        {"left_rail_pixels", std::to_string(layout.left_rail_pixels)},
-        {"navigator_pixels", std::to_string(layout.navigator_pixels)},
-        {"inspector_pixels", std::to_string(layout.inspector_pixels)},
-        {"bottom_panel_pixels", std::to_string(layout.bottom_panel_pixels)},
-        {"tab_strip_pixels", std::to_string(layout.tab_strip_pixels)},
-        {"toolbar_pixels", std::to_string(layout.toolbar_pixels)},
-        {"splitter_pixels", std::to_string(layout.splitter_pixels)},
-        {"minimum_document_width_pixels", std::to_string(layout.minimum_document_width_pixels)},
-        {"minimum_document_height_pixels", std::to_string(layout.minimum_document_height_pixels)}
-    };
-}
-
-std::optional<fixed_layout_constraints_t> parse_layout_json(const json& value) noexcept
+std::optional<legacy_layout_t> parse_legacy_layout_v9(const json& value) noexcept
 {
     try {
         static constexpr std::array<const char*, 9> fields{{
@@ -219,7 +235,7 @@ std::optional<fixed_layout_constraints_t> parse_layout_json(const json& value) n
         }};
         if (!exact_fields(value, fields))
             return std::nullopt;
-        fixed_layout_constraints_t layout;
+        legacy_layout_t layout;
         if (!parse_decimal(value["left_rail_pixels"], layout.left_rail_pixels) ||
             !parse_decimal(value["navigator_pixels"], layout.navigator_pixels) ||
             !parse_decimal(value["inspector_pixels"], layout.inspector_pixels) ||
@@ -236,7 +252,7 @@ std::optional<fixed_layout_constraints_t> parse_layout_json(const json& value) n
     }
 }
 
-std::optional<fixed_layout_constraints_t> parse_layout_json_v8(const json& value) noexcept
+std::optional<legacy_layout_t> parse_legacy_layout_v8(const json& value) noexcept
 {
     try {
         static constexpr std::array<const char*, 6> v8_fields{{
@@ -245,7 +261,7 @@ std::optional<fixed_layout_constraints_t> parse_layout_json_v8(const json& value
         }};
         if (!exact_fields(value, v8_fields))
             return std::nullopt;
-        fixed_layout_constraints_t layout;
+        legacy_layout_t layout;
         if (!parse_decimal(value["left_rail_pixels"], layout.left_rail_pixels) ||
             !parse_decimal(value["navigator_pixels"], layout.navigator_pixels) ||
             !parse_decimal(value["inspector_pixels"], layout.inspector_pixels) ||
@@ -259,20 +275,7 @@ std::optional<fixed_layout_constraints_t> parse_layout_json_v8(const json& value
     }
 }
 
-json split_node_json(const split_node_dto_t& node)
-{
-    return json{
-        {"id", std::to_string(node.id.value)},
-        {"kind", static_cast<std::uint8_t>(node.kind)},
-        {"orientation", static_cast<std::uint8_t>(node.orientation)},
-        {"ratio_basis_points", std::to_string(node.ratio_basis_points)},
-        {"view", std::to_string(node.view.value)},
-        {"first", std::to_string(node.first.value)},
-        {"second", std::to_string(node.second.value)}
-    };
-}
-
-std::optional<split_node_dto_t> parse_split_node_json(const json& value) noexcept
+std::optional<legacy_split_node_t> parse_legacy_split_node(const json& value) noexcept
 {
     try {
         static constexpr std::array<const char*, 7> fields{{
@@ -286,14 +289,14 @@ std::optional<split_node_dto_t> parse_split_node_json(const json& value) noexcep
         if (!valid_split_node_kind_ordinal(kind_ordinal) ||
             !valid_split_orientation_ordinal(orientation_ordinal))
             return std::nullopt;
-        split_node_dto_t node;
-        node.kind = static_cast<split_node_kind_t>(kind_ordinal);
-        node.orientation = static_cast<split_orientation_t>(orientation_ordinal);
-        if (!parse_decimal(value["id"], node.id.value) ||
+        legacy_split_node_t node;
+        node.kind = static_cast<std::uint8_t>(kind_ordinal);
+        node.orientation = static_cast<std::uint8_t>(orientation_ordinal);
+        if (!parse_decimal(value["id"], node.id) ||
             !parse_decimal(value["ratio_basis_points"], node.ratio_basis_points) ||
-            !parse_decimal(value["view"], node.view.value) ||
-            !parse_decimal(value["first"], node.first.value) ||
-            !parse_decimal(value["second"], node.second.value))
+            !parse_decimal(value["view"], node.view) ||
+            !parse_decimal(value["first"], node.first) ||
+            !parse_decimal(value["second"], node.second))
             return std::nullopt;
         return node;
     } catch (...) {
@@ -301,28 +304,20 @@ std::optional<split_node_dto_t> parse_split_node_json(const json& value) noexcep
     }
 }
 
-json split_tree_json(const split_tree_dto_t& tree)
-{
-    json nodes = json::array();
-    for (const auto& node : tree.nodes)
-        nodes.push_back(split_node_json(node));
-    return json{{"root", std::to_string(tree.root.value)}, {"nodes", std::move(nodes)}};
-}
-
-std::optional<split_tree_dto_t> parse_split_tree_json(const json& value) noexcept
+std::optional<legacy_split_tree_t> parse_legacy_split_tree(const json& value) noexcept
 {
     try {
         static constexpr std::array<const char*, 2> fields{{"nodes", "root"}};
         if (!exact_fields(value, fields) || !value["nodes"].is_array())
             return std::nullopt;
-        split_tree_dto_t tree;
-        if (!parse_decimal(value["root"], tree.root.value))
+        legacy_split_tree_t tree;
+        if (!parse_decimal(value["root"], tree.root))
             return std::nullopt;
-        if (value["nodes"].size() > k_max_split_nodes_per_workspace)
+        if (value["nodes"].size() > k_legacy_split_node_limit)
             return std::nullopt;
         tree.nodes.reserve(value["nodes"].size());
         for (const auto& node_json : value["nodes"]) {
-            auto node = parse_split_node_json(node_json);
+            auto node = parse_legacy_split_node(node_json);
             if (!node)
                 return std::nullopt;
             tree.nodes.push_back(std::move(*node));
@@ -331,6 +326,84 @@ std::optional<split_tree_dto_t> parse_split_tree_json(const json& value) noexcep
     } catch (...) {
         return std::nullopt;
     }
+}
+
+bool migrate_legacy_view_order(const legacy_split_tree_t& tree,
+                               std::vector<view_persistence_dto_t>& views) noexcept
+{
+    if (tree.root == 0 || tree.nodes.empty() || tree.nodes.size() > k_legacy_split_node_limit ||
+        views.empty() || tree.nodes.size() > views.size() * 2U - 1U)
+        return false;
+    std::unordered_map<std::uint64_t, std::size_t> node_indices;
+    node_indices.reserve(tree.nodes.size());
+    for (std::size_t index = 0; index < tree.nodes.size(); ++index) {
+        const auto& node = tree.nodes[index];
+        if (node.id == 0 || node.kind > 1 || node.orientation > 1 ||
+            !node_indices.emplace(node.id, index).second)
+            return false;
+        if (node.kind == 0) {
+            if (node.view == 0 || node.first != 0 || node.second != 0 || node.orientation != 0 ||
+                node.ratio_basis_points != k_legacy_split_ratio_default)
+                return false;
+        } else if (node.view != 0 || node.first == 0 || node.second == 0 ||
+                   node.first == node.second ||
+                   node.ratio_basis_points < k_legacy_split_ratio_min ||
+                   node.ratio_basis_points > k_legacy_split_ratio_max) {
+            return false;
+        }
+    }
+    const auto root = node_indices.find(tree.root);
+    if (root == node_indices.end())
+        return false;
+    std::vector<std::uint8_t> parent_counts(tree.nodes.size(), 0);
+    for (const auto& node : tree.nodes) {
+        if (node.kind == 0)
+            continue;
+        for (const auto child_id : {node.first, node.second}) {
+            const auto child = node_indices.find(child_id);
+            if (child == node_indices.end() || ++parent_counts[child->second] != 1)
+                return false;
+        }
+    }
+    if (parent_counts[root->second] != 0)
+        return false;
+    for (std::size_t index = 0; index < parent_counts.size(); ++index) {
+        if (index != root->second && parent_counts[index] != 1)
+            return false;
+    }
+    std::unordered_map<std::uint64_t, view_persistence_dto_t> views_by_id;
+    views_by_id.reserve(views.size());
+    for (const auto& view : views) {
+        if (!view.id.valid() || !views_by_id.emplace(view.id.value, view).second)
+            return false;
+    }
+    std::vector<view_persistence_dto_t> ordered;
+    ordered.reserve(views.size());
+    std::vector<std::size_t> pending{root->second};
+    std::vector<bool> reached(tree.nodes.size(), false);
+    while (!pending.empty()) {
+        const auto index = pending.back();
+        pending.pop_back();
+        if (index >= tree.nodes.size() || reached[index])
+            return false;
+        reached[index] = true;
+        const auto& node = tree.nodes[index];
+        if (node.kind == 0) {
+            const auto view = views_by_id.find(node.view);
+            if (view == views_by_id.end())
+                return false;
+            ordered.push_back(view->second);
+            views_by_id.erase(view);
+        } else {
+            pending.push_back(node_indices.at(node.second));
+            pending.push_back(node_indices.at(node.first));
+        }
+    }
+    if (!views_by_id.empty() || ordered.size() != views.size() ||
+        std::find(reached.begin(), reached.end(), false) != reached.end())
+        return false;
+    views = std::move(ordered);
+    return true;
 }
 
 json selection_json(const selection_context_t& selection)
@@ -564,7 +637,6 @@ json panel_dto_json(const panel_state_dto_t& panel)
         {"kind", static_cast<std::uint8_t>(panel.kind)},
         {"visible", panel.visible},
         {"pinned", panel.pinned},
-        {"extent_pixels", std::to_string(panel.extent_pixels)},
         {"selected_document", std::to_string(panel.selected_document.value)},
         {"state_token", panel.state_token},
         {"revision", std::to_string(panel.revision.value)}
@@ -574,8 +646,8 @@ json panel_dto_json(const panel_state_dto_t& panel)
 std::optional<panel_state_dto_t> parse_panel_dto_json(const json& value) noexcept
 {
     try {
-        static constexpr std::array<const char*, 9> fields{{
-            "extent_pixels", "id", "kind", "pinned", "revision", "selected_document",
+        static constexpr std::array<const char*, 8> fields{{
+            "id", "kind", "pinned", "revision", "selected_document",
             "state_token", "visible", "workspace"
         }};
         if (!exact_fields(value, fields) || !value["kind"].is_number_unsigned() ||
@@ -596,11 +668,30 @@ std::optional<panel_state_dto_t> parse_panel_dto_json(const json& value) noexcep
         panel.state_token = state_token;
         if (!parse_decimal(value["id"], panel.id.value) ||
             !parse_decimal(value["workspace"], panel.workspace.value) ||
-            !parse_decimal(value["extent_pixels"], panel.extent_pixels) ||
             !parse_decimal(value["selected_document"], panel.selected_document.value) ||
             !parse_decimal(value["revision"], panel.revision.value))
             return std::nullopt;
         return panel;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<panel_state_dto_t> parse_legacy_panel_dto(const json& value) noexcept
+{
+    try {
+        static constexpr std::array<const char*, 9> fields{{
+            "extent_pixels", "id", "kind", "pinned", "revision", "selected_document",
+            "state_token", "visible", "workspace"
+        }};
+        if (!exact_fields(value, fields))
+            return std::nullopt;
+        json migrated = value;
+        std::uint32_t discarded_extent = 0;
+        if (!parse_decimal(value["extent_pixels"], discarded_extent))
+            return std::nullopt;
+        migrated.erase("extent_pixels");
+        return parse_panel_dto_json(migrated);
     } catch (...) {
         return std::nullopt;
     }
@@ -795,7 +886,7 @@ std::optional<navigation_history_dto_t> parse_history_json(const json& value) no
     }
 }
 
-json payload_json_v9(const workbench_persistence_dto_t& dto)
+json payload_json_v10(const workbench_persistence_dto_t& dto)
 {
     json documents = json::array();
     for (const auto& document : dto.documents)
@@ -811,8 +902,6 @@ json payload_json_v9(const workbench_persistence_dto_t& dto)
         {"workspace", std::to_string(dto.workspace.value)},
         {"revision", std::to_string(dto.revision.value)},
         {"active_document", std::to_string(dto.active_document.value)},
-        {"layout", layout_json(dto.layout)},
-        {"split_tree", split_tree_json(dto.split_tree)},
         {"documents", std::move(documents)},
         {"views", std::move(views)},
         {"panels", std::move(panels)},
@@ -820,12 +909,12 @@ json payload_json_v9(const workbench_persistence_dto_t& dto)
     };
 }
 
-std::optional<workbench_persistence_dto_t> parse_payload_json_v9(const json& payload) noexcept
+std::optional<workbench_persistence_dto_t> parse_payload_json_v10(const json& payload) noexcept
 {
     try {
-        static constexpr std::array<const char*, 10> fields{{
-            "active_document", "documents", "history", "layout", "panels",
-            "revision", "schema_version", "split_tree", "views", "workspace"
+        static constexpr std::array<const char*, 8> fields{{
+            "active_document", "documents", "history", "panels",
+            "revision", "schema_version", "views", "workspace"
         }};
         if (!exact_fields(payload, fields) || !payload["documents"].is_array() ||
             !payload["views"].is_array() || !payload["panels"].is_array())
@@ -840,13 +929,9 @@ std::optional<workbench_persistence_dto_t> parse_payload_json_v9(const json& pay
             !parse_decimal(payload["revision"], dto.revision.value) ||
             !parse_decimal(payload["active_document"], dto.active_document.value))
             return std::nullopt;
-        auto layout = parse_layout_json(payload["layout"]);
-        auto split_tree = parse_split_tree_json(payload["split_tree"]);
         auto history = parse_history_json(payload["history"]);
-        if (!layout || !split_tree || !history)
+        if (!history)
             return std::nullopt;
-        dto.layout = std::move(*layout);
-        dto.split_tree = std::move(*split_tree);
         dto.history = std::move(*history);
         dto.documents.reserve(payload["documents"].size());
         for (const auto& doc_json : payload["documents"]) {
@@ -865,6 +950,63 @@ std::optional<workbench_persistence_dto_t> parse_payload_json_v9(const json& pay
         dto.panels.reserve(payload["panels"].size());
         for (const auto& panel_json : payload["panels"]) {
             auto panel = parse_panel_dto_json(panel_json);
+            if (!panel)
+                return std::nullopt;
+            dto.panels.push_back(std::move(*panel));
+        }
+        return dto;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<workbench_persistence_dto_t> parse_payload_json_v9(const json& payload) noexcept
+{
+    try {
+        static constexpr std::array<const char*, 10> fields{{
+            "active_document", "documents", "history", "layout", "panels",
+            "revision", "schema_version", "split_tree", "views", "workspace"
+        }};
+        if (!exact_fields(payload, fields) || !payload["documents"].is_array() ||
+            !payload["views"].is_array() || !payload["panels"].is_array() ||
+            payload["documents"].size() > k_max_documents_per_workspace ||
+            payload["views"].size() > k_max_views_per_workspace ||
+            payload["panels"].size() > k_max_panels_per_workspace)
+            return std::nullopt;
+        workbench_persistence_dto_t dto;
+        std::uint32_t legacy_contract_schema = 0;
+        if (!parse_decimal(payload["schema_version"], legacy_contract_schema) ||
+            legacy_contract_schema != 2 ||
+            !parse_decimal(payload["workspace"], dto.workspace.value) ||
+            !parse_decimal(payload["revision"], dto.revision.value) ||
+            !parse_decimal(payload["active_document"], dto.active_document.value))
+            return std::nullopt;
+        const auto discarded_layout = parse_legacy_layout_v9(payload["layout"]);
+        const auto legacy_tree = parse_legacy_split_tree(payload["split_tree"]);
+        auto history = parse_history_json(payload["history"]);
+        if (!discarded_layout || !legacy_tree || !history)
+            return std::nullopt;
+        dto.schema_version = k_workbench_contract_schema_version;
+        dto.history = std::move(*history);
+        dto.documents.reserve(payload["documents"].size());
+        for (const auto& value : payload["documents"]) {
+            auto document = parse_document_dto_json(value);
+            if (!document)
+                return std::nullopt;
+            dto.documents.push_back(std::move(*document));
+        }
+        dto.views.reserve(payload["views"].size());
+        for (const auto& value : payload["views"]) {
+            auto view = parse_view_dto_json(value);
+            if (!view)
+                return std::nullopt;
+            dto.views.push_back(std::move(*view));
+        }
+        if (!migrate_legacy_view_order(*legacy_tree, dto.views))
+            return std::nullopt;
+        dto.panels.reserve(payload["panels"].size());
+        for (const auto& value : payload["panels"]) {
+            auto panel = parse_legacy_panel_dto(value);
             if (!panel)
                 return std::nullopt;
             dto.panels.push_back(std::move(*panel));
@@ -894,13 +1036,13 @@ std::optional<workbench_persistence_dto_t> parse_payload_json_v8(const json& pay
             !parse_decimal(payload["revision"], dto.revision.value) ||
             !parse_decimal(payload["active_document"], dto.active_document.value))
             return std::nullopt;
-        auto layout = parse_layout_json_v8(payload["layout"]);
+        auto layout = parse_legacy_layout_v8(payload["layout"]);
         auto history = parse_history_json(payload["history"]);
         if (!layout || !history)
             return std::nullopt;
-        dto.layout = std::move(*layout);
+        static_cast<void>(layout);
         dto.history = std::move(*history);
-        dto.split_tree = split_tree_dto_t{};
+        dto.schema_version = k_workbench_contract_schema_version;
         dto.panels.clear();
         dto.documents.reserve(payload["documents"].size());
         for (const auto& doc_json : payload["documents"]) {
@@ -984,23 +1126,6 @@ bool recover_unknown_documents(workbench_persistence_dto_t& dto,
         return false;
     }
 
-    std::vector<std::uint64_t> removed_view_ids;
-    for (const auto& view : dto.views) {
-        if (removed_doc_ids.count(view.document.value))
-            removed_view_ids.push_back(view.id.value);
-    }
-    std::sort(removed_view_ids.begin(), removed_view_ids.end());
-
-    if (!dto.split_tree.nodes.empty() && !removed_view_ids.empty()) {
-        for (const auto view_id : removed_view_ids) {
-            const auto remove_result = split_tree_remove_view(dto.split_tree, {view_id});
-            if (!remove_result.ok()) {
-                dto.split_tree = {};
-                break;
-            }
-        }
-    }
-
     dto.views.erase(
         std::remove_if(dto.views.begin(), dto.views.end(),
             [&](const view_persistence_dto_t& v) {
@@ -1008,8 +1133,27 @@ bool recover_unknown_documents(workbench_persistence_dto_t& dto,
             }),
         dto.views.end());
 
+    if (dto.views.empty()) {
+        detail = "all logical views referenced unknown documents";
+        return false;
+    }
+
     if (removed_doc_ids.count(dto.active_document.value) != 0)
         dto.active_document = dto.documents.front().id;
+
+    auto focused = std::find_if(dto.views.begin(), dto.views.end(),
+        [](const auto& view) { return view.focused; });
+    if (focused == dto.views.end() || focused->document != dto.active_document) {
+        for (auto& view : dto.views)
+            view.focused = false;
+        auto replacement = std::find_if(dto.views.begin(), dto.views.end(),
+            [&](const auto& view) { return view.document == dto.active_document; });
+        if (replacement == dto.views.end()) {
+            replacement = dto.views.begin();
+            dto.active_document = replacement->document;
+        }
+        replacement->focused = true;
+    }
 
     for (auto& panel : dto.panels) {
         if (removed_doc_ids.count(panel.selected_document.value) != 0)
@@ -1113,9 +1257,9 @@ persistence_codec_result_t workbench_persistence_codec_t::encode(
                            "fingerprint computation produced zero");
     try {
         json envelope = json{
-            {"schema", k_persistence_codec_schema_v9},
-            {"kind", k_persistence_codec_kind_v9},
-            {"payload", payload_json_v9(normalized)}
+            {"schema", k_persistence_codec_schema_v10},
+            {"kind", k_persistence_codec_kind_v10},
+            {"payload", payload_json_v10(normalized)}
         };
         output = envelope.dump();
     } catch (const std::exception& exc) {
@@ -1131,7 +1275,7 @@ persistence_codec_result_t workbench_persistence_codec_t::encode(
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
     result.fingerprint = fingerprint;
-    result.decoded_schema = k_persistence_codec_schema_v9;
+    result.decoded_schema = k_persistence_codec_schema_v10;
     return result;
 }
 
@@ -1162,11 +1306,17 @@ persistence_codec_result_t workbench_persistence_codec_t::decode(
         return codec_error(persistence_codec_code_t::corrupt_payload,
                            "envelope missing required fields");
     const auto schema = envelope["schema"].get<std::uint64_t>();
-    if (schema != k_persistence_codec_schema_v9)
-        return codec_error(persistence_codec_code_t::schema_mismatch,
-                           "expected schema v9, got " + std::to_string(schema));
     const auto& kind = envelope["kind"].get_ref<const std::string&>();
-    if (kind != k_persistence_codec_kind_v9)
+    if (schema != k_persistence_codec_schema_v10 &&
+        schema != k_persistence_codec_schema_v9)
+        return codec_error(persistence_codec_code_t::schema_mismatch,
+                           "unsupported workbench persistence schema " +
+                               std::to_string(schema));
+    const bool current = schema == k_persistence_codec_schema_v10;
+    const bool legacy = schema == k_persistence_codec_schema_v9;
+    const auto* expected_kind = current ? k_persistence_codec_kind_v10
+                                        : k_persistence_codec_kind_v9;
+    if (kind != expected_kind)
         return codec_error(persistence_codec_code_t::unknown_kind,
                            "unexpected kind: " + kind);
     std::size_t field_count = 0;
@@ -1176,10 +1326,12 @@ persistence_codec_result_t workbench_persistence_codec_t::decode(
     if (field_count > limits.max_field_count)
         return codec_error(persistence_codec_code_t::field_count_exceeded,
                            "total field count exceeds max_field_count");
-    auto dto = parse_payload_json_v9(envelope["payload"]);
+    auto dto = current ? parse_payload_json_v10(envelope["payload"])
+                       : parse_payload_json_v9(envelope["payload"]);
     if (!dto)
         return codec_error(persistence_codec_code_t::corrupt_payload,
-                           "failed to parse v9 payload");
+                           current ? "failed to parse v10 payload"
+                                   : "failed to migrate v9 payload");
     if (dto->workspace != expected_workspace)
         return codec_error(persistence_codec_code_t::workspace_isolation_violation,
                            "payload workspace does not match expected workspace");
@@ -1199,7 +1351,9 @@ persistence_codec_result_t workbench_persistence_codec_t::decode(
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
     result.fingerprint = fingerprint;
-    result.decoded_schema = k_persistence_codec_schema_v9;
+    result.decoded_schema = static_cast<std::uint32_t>(schema);
+    if (legacy)
+        result.detail = "migrated v9 logical view order and discarded obsolete geometry";
     return result;
 }
 
@@ -1246,12 +1400,9 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_v8_default(
         return codec_error(persistence_codec_code_t::workspace_isolation_violation,
                            "v8 payload workspace does not match expected workspace");
     dto->schema_version = k_workbench_contract_schema_version;
-    normalize_fixed_layout_constraints(dto->layout);
     if (dto->history.capacity == 0)
         dto->history.capacity = k_default_history_capacity;
     dto->history.workspace = dto->workspace;
-    if (dto->split_tree.nodes.empty())
-        dto->split_tree.root = split_node_id_t{0};
     for (auto& view : dto->views) {
         if (view.workspace.value == 0)
             view.workspace = dto->workspace;
@@ -1294,7 +1445,7 @@ persistence_codec_result_t workbench_persistence_codec_t::round_trip(
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
     result.fingerprint = decode_fingerprint;
-    result.decoded_schema = k_persistence_codec_schema_v9;
+    result.decoded_schema = k_persistence_codec_schema_v10;
     return result;
 }
 
@@ -1313,7 +1464,9 @@ bool workbench_persistence_codec_t::is_corrupt(std::string_view input) noexcept
         if (!value.contains("payload") || !value["payload"].is_object())
             return true;
         const auto schema = value["schema"].get<std::uint64_t>();
-        if (schema != k_persistence_codec_schema_v9 && schema != k_persistence_codec_schema_v8)
+        if (schema != k_persistence_codec_schema_v10 &&
+            schema != k_persistence_codec_schema_v9 &&
+            schema != k_persistence_codec_schema_v8)
             return true;
         return false;
     } catch (...) {
@@ -1350,6 +1503,7 @@ std::optional<persistence_envelope_t> workbench_persistence_codec_t::peek_envelo
         if (value.contains("kind") && value["kind"].is_string())
             envelope.kind = value["kind"].get<std::string>();
         envelope.is_v8_legacy = envelope.schema == k_persistence_codec_schema_v8;
+        envelope.is_v9_legacy = envelope.schema == k_persistence_codec_schema_v9;
         return envelope;
     } catch (...) {
         return std::nullopt;
@@ -1422,11 +1576,17 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_with_recovery(
         return codec_error(persistence_codec_code_t::corrupt_payload,
                            "envelope missing required fields");
     const auto schema = envelope["schema"].get<std::uint64_t>();
-    if (schema != k_persistence_codec_schema_v9)
-        return codec_error(persistence_codec_code_t::schema_mismatch,
-                           "expected schema v9, got " + std::to_string(schema));
     const auto& kind = envelope["kind"].get_ref<const std::string&>();
-    if (kind != k_persistence_codec_kind_v9)
+    if (schema != k_persistence_codec_schema_v10 &&
+        schema != k_persistence_codec_schema_v9)
+        return codec_error(persistence_codec_code_t::schema_mismatch,
+                           "unsupported workbench persistence schema " +
+                               std::to_string(schema));
+    const bool current = schema == k_persistence_codec_schema_v10;
+    const bool legacy = schema == k_persistence_codec_schema_v9;
+    const auto* expected_kind = current ? k_persistence_codec_kind_v10
+                                        : k_persistence_codec_kind_v9;
+    if (kind != expected_kind)
         return codec_error(persistence_codec_code_t::unknown_kind,
                            "unexpected kind: " + kind);
     std::size_t field_count = 0;
@@ -1436,10 +1596,12 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_with_recovery(
     if (field_count > limits.max_field_count)
         return codec_error(persistence_codec_code_t::field_count_exceeded,
                            "total field count exceeds max_field_count");
-    auto dto = parse_payload_json_v9(envelope["payload"]);
+    auto dto = current ? parse_payload_json_v10(envelope["payload"])
+                       : parse_payload_json_v9(envelope["payload"]);
     if (!dto)
         return codec_error(persistence_codec_code_t::corrupt_payload,
-                           "failed to parse v9 payload");
+                           current ? "failed to parse v10 payload"
+                                   : "failed to migrate v9 payload");
     if (dto->workspace != expected_workspace)
         return codec_error(persistence_codec_code_t::workspace_isolation_violation,
                            "payload workspace does not match expected workspace");
@@ -1475,7 +1637,12 @@ persistence_codec_result_t workbench_persistence_codec_t::decode_with_recovery(
     persistence_codec_result_t result;
     result.code = persistence_codec_code_t::ok;
     result.fingerprint = fingerprint;
-    result.decoded_schema = k_persistence_codec_schema_v9;
+    result.decoded_schema = static_cast<std::uint32_t>(schema);
+    if (legacy) {
+        if (!recovery_detail.empty())
+            recovery_detail += "; ";
+        recovery_detail += "migrated v9 logical view order and discarded obsolete geometry";
+    }
     result.detail = std::move(recovery_detail);
     return result;
 }

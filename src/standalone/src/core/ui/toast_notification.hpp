@@ -183,16 +183,17 @@ namespace toast_notification
         }
 
         inline void draw_severity_icon(ImDrawList* dl, ImVec2 center, toast_type_t k,
-                                        ImU32 color, ImU32 fill, float alpha)
+                                        ImU32 color, ImU32 fill, float alpha, float scale)
         {
             ImU32 c   = multiply_alpha(color, alpha);
             ImU32 f   = multiply_alpha(fill, alpha);
-            float th  = 1.7f;
+            float th  = 1.7f * scale;
+            const float icon_size = ICON_SIZE * scale;
             switch (k) {
-                case toast_type_t::success: draw_check(dl, center, ICON_SIZE, c, th); break;
-                case toast_type_t::warning: draw_warning(dl, center, ICON_SIZE + 1.0f, c, f, th); break;
-                case toast_type_t::error:   draw_error(dl, center, ICON_SIZE, c, f, th); break;
-                case toast_type_t::info:    draw_info(dl, center, ICON_SIZE, c, f, th); break;
+                case toast_type_t::success: draw_check(dl, center, icon_size, c, th); break;
+                case toast_type_t::warning: draw_warning(dl, center, icon_size + scale, c, f, th); break;
+                case toast_type_t::error:   draw_error(dl, center, icon_size, c, f, th); break;
+                case toast_type_t::info:    draw_info(dl, center, icon_size, c, f, th); break;
             }
         }
 
@@ -214,11 +215,12 @@ namespace toast_notification
             }
         }
 
-        inline float compute_toast_height(const toast_t& t, ImFont* font, float font_size, float text_wrap_w)
+        inline float compute_toast_height(const toast_t& t, ImFont* font, float font_size,
+                                          float text_wrap_w, float scale)
         {
             ImVec2 ts = font->CalcTextSizeA(font_size, FLT_MAX, text_wrap_w, t.message.c_str());
-            float content_h = ts.y + PADDING * 2.0f;
-            float min_h = TOAST_HEIGHT;
+            float content_h = ts.y + PADDING * scale * 2.0f;
+            float min_h = TOAST_HEIGHT * scale;
             return content_h > min_h ? content_h : min_h;
         }
     }
@@ -284,12 +286,13 @@ namespace toast_notification
     {
         std::array<std::function<void()>, MAX_VISIBLE * 2> deferred_callbacks;
         std::size_t deferred_callback_count = 0;
-
+        std::vector<toast_t> active_toasts;
         {
-        std::lock_guard<std::mutex> lk(detail::s_mtx);
-
-        if (detail::s_toasts.empty())
-            return;
+            std::lock_guard<std::mutex> lk(detail::s_mtx);
+            if (detail::s_toasts.empty())
+                return;
+            active_toasts.swap(detail::s_toasts);
+        }
 
         ImGuiIO& io = ImGui::GetIO();
         float dt = io.DeltaTime;
@@ -298,6 +301,15 @@ namespace toast_notification
 
         const ImVec2 display = io.DisplaySize;
         ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const float ui_scale = (std::clamp)(globals::ui::dpi_scale, 0.75f, 2.5f);
+        const float side_margin = SIDE_MARGIN * ui_scale;
+        const float bottom_margin = BOTTOM_MARGIN * ui_scale;
+        const float padding = PADDING * ui_scale;
+        const float gap = GAP * ui_scale;
+        const float icon_box = ICON_BOX * ui_scale;
+        const float rounding = TOAST_ROUNDING * ui_scale;
+        const float toast_width = (std::min)(TOAST_WIDTH * ui_scale,
+            (std::max)(1.0f, display.x - side_margin * 2.0f));
 
         ImFont* font_msg    = aida::ui::fonts::body_em();
         ImFont* font_action = aida::ui::fonts::caption();
@@ -323,10 +335,10 @@ namespace toast_notification
         auto compute_action_btn_w = [&](const toast_t& t) -> float {
             if (!t.has_action) return 0.0f;
             ImVec2 lbl_size = font_action->CalcTextSizeA(font_size_action, FLT_MAX, 0.0f, t.action.label.c_str());
-            return lbl_size.x + 18.0f + 8.0f;
+            return lbl_size.x + 26.0f * ui_scale;
         };
 
-        for (auto it = detail::s_toasts.rbegin(); it != detail::s_toasts.rend(); ++it) {
+        for (auto it = active_toasts.rbegin(); it != active_toasts.rend(); ++it) {
             if (stack_count >= stack_target_y.size()) break;
             auto& t = *it;
             if (t.dismissing && t.fade_out <= 0.001f) {
@@ -336,10 +348,10 @@ namespace toast_notification
             }
 
             float btn_reserve = compute_action_btn_w(t);
-            float content_w = TOAST_WIDTH - PADDING * 2.0f - ICON_BOX - 8.0f - btn_reserve;
-            if (content_w < 80.0f) content_w = 80.0f;
+            float content_w = toast_width - padding * 2.0f - icon_box - 8.0f * ui_scale - btn_reserve;
+            if (content_w < 1.0f) content_w = 1.0f;
 
-            float h = detail::compute_toast_height(t, font_msg, font_size_msg, content_w);
+            float h = detail::compute_toast_height(t, font_msg, font_size_msg, content_w, ui_scale);
             stack_height[stack_count] = h;
 
             if (visible_index >= MAX_VISIBLE) {
@@ -347,30 +359,30 @@ namespace toast_notification
                 continue;
             }
 
-            float ty = display.y - BOTTOM_MARGIN - h;
+            float ty = display.y - bottom_margin - h;
             for (std::size_t p = 0; p < visible_index; ++p) {
                 const std::size_t stack_offset = p + 2;
                 if (stack_offset > stack_count + 1) break;
                 const std::size_t idx_above = stack_count + 1 - stack_offset;
-                ty -= stack_height[idx_above] + GAP;
+                ty -= stack_height[idx_above] + gap;
             }
             stack_target_y[stack_count++] = ty;
             ++visible_index;
         }
 
-        for (std::size_t i = 0; i < detail::s_toasts.size(); ++i) {
-            auto& t = detail::s_toasts[i];
+        for (std::size_t i = 0; i < active_toasts.size(); ++i) {
+            auto& t = active_toasts[i];
             const bool reduced_motion = aida::ui::reduced_motion_enabled();
 
-            std::size_t reverse_i = detail::s_toasts.size() - 1 - i;
+            std::size_t reverse_i = active_toasts.size() - 1 - i;
             float target_y = stack_target_y[reverse_i];
             float h = stack_height[reverse_i];
 
             float btn_reserve_render = compute_action_btn_w(t);
-            float wrap_w = TOAST_WIDTH - PADDING * 2.0f - ICON_BOX - 8.0f - btn_reserve_render;
-            if (wrap_w < 80.0f) wrap_w = 80.0f;
+            float wrap_w = toast_width - padding * 2.0f - icon_box - 8.0f * ui_scale - btn_reserve_render;
+            if (wrap_w < 1.0f) wrap_w = 1.0f;
 
-            float resting_x = display.x - SIDE_MARGIN - TOAST_WIDTH;
+            float resting_x = display.x - side_margin - toast_width;
 
             if (!t.initialized_position) {
                 t.current_x = reduced_motion ? resting_x : display.x + 12.0f;
@@ -395,7 +407,7 @@ namespace toast_notification
             }
 
             ImVec2 toast_tl_pre(t.current_x, t.current_y);
-            ImVec2 toast_br_pre(t.current_x + TOAST_WIDTH, t.current_y + h);
+            ImVec2 toast_br_pre(t.current_x + toast_width, t.current_y + h);
             bool is_hovered = !t.dismissing && !t.swipe_dismissing &&
                               mouse.x >= toast_tl_pre.x && mouse.x <= toast_br_pre.x &&
                               mouse.y >= toast_tl_pre.y && mouse.y <= toast_br_pre.y;
@@ -414,8 +426,8 @@ namespace toast_notification
                 }
                 if (mouse_released) {
                     if (t.drag_owned && t.was_dragging) {
-                        float threshold_px  = SWIPE_DISMISS_PX;
-                        float threshold_pct = TOAST_WIDTH * SWIPE_DISMISS_PCT;
+                        float threshold_px  = SWIPE_DISMISS_PX * ui_scale;
+                        float threshold_pct = toast_width * SWIPE_DISMISS_PCT;
                         float effective = threshold_px < threshold_pct ? threshold_px : threshold_pct;
                         if (t.swipe_offset > effective) {
                             t.swipe_dismissing = true;
@@ -494,7 +506,7 @@ namespace toast_notification
 
             float live_x = t.current_x + (t.swipe_dismissing ? 0.0f : t.swipe_offset);
             ImVec2 tl(live_x, t.current_y);
-            ImVec2 br(live_x + TOAST_WIDTH, t.current_y + h);
+            ImVec2 br(live_x + toast_width, t.current_y + h);
 
             float alpha = t.fade_out;
             if (t.swipe_dismissing) alpha *= t.dismiss_alpha_decay;
@@ -514,17 +526,17 @@ namespace toast_notification
             ImU32 sev_color = detail::severity_color(t.type);
             ImU32 sev_soft  = detail::severity_soft(t.type);
 
-            aida::ui::blur::render_drop_shadow(dl, tl, br, TOAST_ROUNDING, 3,
+            aida::ui::blur::render_drop_shadow(dl, tl, br, rounding, 3,
                                                 0.40f * alpha,
-                                                ImVec2(0.0f, 8.0f + t.hover_amount * 4.0f));
+                                                ImVec2(0.0f, (8.0f + t.hover_amount * 4.0f) * ui_scale));
 
-            aida::ui::blur::render_glass_fill(dl, tl, br, TOAST_ROUNDING, alpha);
+            aida::ui::blur::render_glass_fill(dl, tl, br, rounding, alpha);
 
             ImU32 surface_overlay = aida::ui::with_alpha(th.bg_overlay, alpha * (th.is_dark ? 0.16f : 0.10f));
-            dl->AddRectFilled(tl, br, surface_overlay, TOAST_ROUNDING);
+            dl->AddRectFilled(tl, br, surface_overlay, rounding);
 
             ImU32 sev_wash = detail::multiply_alpha(sev_soft, alpha * detail::severity_wash_alpha(t.type, th.is_dark));
-            dl->AddRectFilled(tl, br, sev_wash, TOAST_ROUNDING);
+            dl->AddRectFilled(tl, br, sev_wash, rounding);
 
             ImU32 highlight_base = th.is_dark ? th.text_primary : th.text_dim;
             ImU32 hi_top = aida::ui::with_alpha(highlight_base, alpha * (th.is_dark ? 0.10f : 0.06f));
@@ -532,17 +544,17 @@ namespace toast_notification
             dl->AddRectFilledMultiColor(tl, ImVec2(br.x, tl.y + h * 0.55f),
                                           hi_top, hi_top, hi_bot, hi_bot);
 
-            aida::ui::blur::render_glass_border(dl, tl, br, TOAST_ROUNDING, alpha, 1.0f);
+            aida::ui::blur::render_glass_border(dl, tl, br, rounding, alpha, ui_scale);
 
             ImU32 sev_border = detail::multiply_alpha(sev_color, alpha * 0.45f);
-            dl->AddRect(tl, br, sev_border, TOAST_ROUNDING, 0, 1.0f);
-            dl->AddRectFilled(tl, ImVec2(tl.x + 3.0f, br.y), detail::multiply_alpha(sev_color, alpha * 0.70f), 1.5f);
+            dl->AddRect(tl, br, sev_border, rounding, 0, ui_scale);
+            dl->AddRectFilled(tl, ImVec2(tl.x + 3.0f * ui_scale, br.y), detail::multiply_alpha(sev_color, alpha * 0.70f), 1.5f * ui_scale);
 
-            float icon_cx = tl.x + PADDING + ICON_BOX * 0.5f;
+            float icon_cx = tl.x + padding + icon_box * 0.5f;
             float icon_cy = tl.y + h * 0.5f;
             ImVec2 icon_center(icon_cx, icon_cy);
 
-            float ring_radius = ICON_BOX * 0.5f - 1.0f;
+            float ring_radius = icon_box * 0.5f - ui_scale;
             float progress = 1.0f;
             if (t.duration > 0.0001f) progress = remaining / t.duration;
             if (progress < 0.0f) progress = 0.0f;
@@ -551,17 +563,17 @@ namespace toast_notification
             ImU32 icon_bg = detail::multiply_alpha(sev_color, alpha * 0.16f);
             dl->AddCircleFilled(icon_center, ring_radius - 1.5f, icon_bg, 32);
 
-            detail::draw_progress_ring(dl, icon_center, ring_radius, 1.5f,
+            detail::draw_progress_ring(dl, icon_center, ring_radius, 1.5f * ui_scale,
                                          progress, sev_color, alpha);
 
-            detail::draw_severity_icon(dl, icon_center, t.type, sev_color, sev_soft, alpha);
+            detail::draw_severity_icon(dl, icon_center, t.type, sev_color, sev_soft, alpha, ui_scale);
 
-            float text_x = icon_cx + ICON_BOX * 0.5f + 10.0f;
+            float text_x = icon_cx + icon_box * 0.5f + 10.0f * ui_scale;
             float text_y = tl.y + (h - font_size_msg) * 0.5f;
 
             ImVec2 msg_size = font_msg->CalcTextSizeA(font_size_msg, FLT_MAX, wrap_w, t.message.c_str());
             if (msg_size.y > font_size_msg + 1.0f) {
-                text_y = tl.y + PADDING - 1.0f;
+                text_y = tl.y + padding - ui_scale;
             }
 
             ImU32 text_col_final = detail::multiply_alpha(text_primary, alpha);
@@ -572,9 +584,9 @@ namespace toast_notification
                 ImFont* af = font_action;
                 float af_size = font_size_action;
                 ImVec2 lbl_size = af->CalcTextSizeA(af_size, FLT_MAX, 0.0f, t.action.label.c_str());
-                float btn_w = lbl_size.x + 18.0f;
-                float btn_h = 24.0f;
-                ImVec2 btn_tl(br.x - PADDING - btn_w, tl.y + (h - btn_h) * 0.5f);
+                float btn_w = lbl_size.x + 18.0f * ui_scale;
+                float btn_h = 24.0f * ui_scale;
+                ImVec2 btn_tl(br.x - padding - btn_w, tl.y + (h - btn_h) * 0.5f);
                 ImVec2 btn_br(btn_tl.x + btn_w, btn_tl.y + btn_h);
 
                 bool btn_hovered = mouse.x >= btn_tl.x && mouse.x <= btn_br.x &&
@@ -601,8 +613,8 @@ namespace toast_notification
 
             bool close_hovered = false;
             if (!t.has_action) {
-                float close_size = 7.0f;
-                float close_pad  = 8.0f;
+                float close_size = 7.0f * ui_scale;
+                float close_pad  = 8.0f * ui_scale;
                 ImVec2 close_center(br.x - close_pad - close_size,
                                      tl.y + close_pad + close_size);
                 float close_alpha = alpha * (0.30f + 0.65f * t.hover_amount);
@@ -632,7 +644,7 @@ namespace toast_notification
             }
         }
 
-        for (auto& t : detail::s_toasts) {
+        for (auto& t : active_toasts) {
             if (t.action_clicked_this_frame && t.action.on_click) {
                 if (deferred_callback_count < deferred_callbacks.size())
                     deferred_callbacks[deferred_callback_count++] = std::move(t.action.on_click);
@@ -644,13 +656,27 @@ namespace toast_notification
             }
         }
 
-        detail::s_toasts.erase(
-            std::remove_if(detail::s_toasts.begin(), detail::s_toasts.end(),
+        active_toasts.erase(
+            std::remove_if(active_toasts.begin(), active_toasts.end(),
                             [](const toast_t& t) {
                                 return (t.dismissing && t.fade_out <= 0.001f) ||
                                        (t.swipe_dismissing && t.dismiss_alpha_decay <= 0.001f);
                             }),
-            detail::s_toasts.end());
+            active_toasts.end());
+        {
+            std::lock_guard<std::mutex> lk(detail::s_mtx);
+            for (auto& incoming : detail::s_toasts) {
+                const bool duplicate = std::any_of(active_toasts.begin(), active_toasts.end(),
+                    [&incoming](const toast_t& active) {
+                        return active.message == incoming.message &&
+                            active.elapsed >= 0.0f && active.elapsed < DEDUP_WINDOW;
+                    });
+                if (!duplicate)
+                    active_toasts.push_back(std::move(incoming));
+            }
+            detail::s_toasts = std::move(active_toasts);
+            while (detail::s_toasts.size() > MAX_VISIBLE * std::size_t{2})
+                detail::s_toasts.erase(detail::s_toasts.begin());
         }
 
         for (std::size_t i = 0; i < deferred_callback_count; ++i)

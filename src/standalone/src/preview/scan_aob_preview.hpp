@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,8 +35,11 @@ struct signature_t {
 	float quality_score = 0.f;
 };
 
+enum class export_format_t : std::uint8_t { json, yara, header };
+
 struct state_t {
 	std::vector<signature_t> saved_signatures;
+	std::atomic<std::uint64_t> catalog_generation{1};
 	signature_t current;
 	std::mutex mutex;
 	std::atomic<bool> generating{false};
@@ -218,6 +222,7 @@ inline void save_current(const std::shared_ptr<state_t>& state)
 	std::lock_guard<std::mutex> lock(state->mutex);
 	if (state->current.bytes.empty()) return;
 	state->saved_signatures.push_back(state->current);
+	state->catalog_generation.fetch_add(1, std::memory_order_acq_rel);
 	aida::preview::scan::record("aob.save", state->current.name);
 }
 
@@ -236,37 +241,6 @@ inline void optimize_signature(std::uint32_t, signature_t& signature)
 	signature.quality_score = compute_quality_score(signature);
 }
 
-inline void export_signatures_json(const std::shared_ptr<state_t>& state, const std::string&)
-{
-	aida::preview::scan::record("aob.export.json", std::to_string(state ? state->saved_signatures.size() : 0));
-}
-
-inline void export_signatures_yara(const std::shared_ptr<state_t>& state, const std::string&)
-{
-	aida::preview::scan::record("aob.export.yara", std::to_string(state ? state->saved_signatures.size() : 0));
-}
-
-inline void export_signatures_header(const std::shared_ptr<state_t>& state, const std::string&)
-{
-	aida::preview::scan::record("aob.export.header", std::to_string(state ? state->saved_signatures.size() : 0));
-}
-
-inline void save_signatures_to_disk(const disasm_view::workspace_context_t&,
-	const std::shared_ptr<state_t>& state)
-{
-	aida::preview::scan::record("aob.persist", std::to_string(state ? state->saved_signatures.size() : 0));
-}
-
-inline void load_signatures_from_disk(const disasm_view::workspace_context_t&,
-	const std::shared_ptr<state_t>& state)
-{
-	if (!state) return;
-	std::lock_guard<std::mutex> lock(state->mutex);
-	if (state->saved_signatures.empty() && !state->current.bytes.empty())
-		state->saved_signatures.push_back(state->current);
-	aida::preview::scan::record("aob.restore", std::to_string(state->saved_signatures.size()));
-}
-
 struct comparison_result_t {
 	std::string name;
 	std::uint64_t original_address = 0;
@@ -276,8 +250,14 @@ struct comparison_result_t {
 };
 
 inline std::vector<comparison_result_t> compare_signatures_against_process(
-	std::uint32_t, const std::vector<signature_t>& signatures)
+	std::uint32_t, const std::vector<signature_t>& signatures,
+	const std::shared_ptr<std::atomic<bool>>& cancellation,
+	const std::function<bool()>&, std::string& error)
 {
+	if (cancellation && cancellation->load(std::memory_order_acquire)) {
+		error = "AOB comparison cancelled";
+		return {};
+	}
 	std::vector<comparison_result_t> results;
 	results.reserve(signatures.size());
 	for (const auto& signature : signatures)

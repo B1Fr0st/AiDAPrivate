@@ -1,11 +1,11 @@
 #pragma once
 
 #include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"
 
-#include "fonts.hpp"
 #include "application_view_registry.hpp"
+#include "design_system.hpp"
 #include "theme.hpp"
-#include "ui_anim.hpp"
 
 #include "../session/analysis_session.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -47,8 +49,10 @@ struct state_t {
     std::string filename;
     completion_action_t action = completion_action_t::none;
     std::atomic<bool> completion_applied{false};
+    std::atomic<bool> cancellation_requested{false};
     std::atomic<float> visual_progress{0.f};
     std::atomic<float> visual_alpha{0.f};
+    std::chrono::steady_clock::time_point tracked_at = std::chrono::steady_clock::now();
 };
 
 inline std::mutex& registry_mutex()
@@ -127,9 +131,7 @@ inline float progress_for(const analysis_session::session_summary_t& summary)
             summary.pdb_progress_percent))) / 100.0f;
     }
     const auto workspace = analysis_session::workspace_for_session_id(summary.id);
-    if (!workspace) return summary.load_state == analysis_session::session_load_state_t::opening
-        ? 0.05f
-        : 0.f;
+    if (!workspace) return -1.f;
     const auto progress = workspace->progress();
     if (summary.load_state == analysis_session::session_load_state_t::ready) return 1.f;
     if (progress.total_bytes != 0) {
@@ -142,7 +144,7 @@ inline float progress_for(const analysis_session::session_summary_t& summary)
             static_cast<long double>(progress.completed_units) /
             static_cast<long double>(progress.total_units)));
     }
-    return 0.12f;
+    return -1.f;
 }
 
 inline std::string label_for(const analysis_session::session_summary_t& summary)
@@ -305,47 +307,107 @@ inline void render()
     if (alpha < 0.005f) return;
     const float target_progress = detail::progress_for(summary);
     float progress = state->visual_progress.load(std::memory_order_acquire);
-    progress += (target_progress - progress) * (std::min)(delta * 9.f, 1.f);
+    if (target_progress >= 0.f) {
+        if (progress < 0.f) progress = target_progress;
+        else progress += (target_progress - progress) * (std::min)(delta * 9.f, 1.f);
+    }
+    else
+        progress = -1.f;
     state->visual_progress.store(progress, std::memory_order_release);
-    const auto& theme = aida::ui::resolved();
-    const ImVec2 viewport = ImGui::GetIO().DisplaySize;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    if (!viewport) return;
+    ImVec2 region_position = viewport->WorkPos;
+    ImVec2 region_size = viewport->WorkSize;
+#if defined(IMGUI_HAS_DOCK)
+    if (ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(ImHashStr("AiDA.RootDockSpace.v1"));
+        central && central->Size.x > 1.f && central->Size.y > 1.f) {
+        region_position = central->Pos;
+        region_size = central->Size;
+    } else
+#endif
+    {
+        const float scale = viewport->DpiScale > 0.f ? viewport->DpiScale : 1.f;
+        const auto shell = aida::ui::shell_metrics(scale);
+        const float chrome = shell.title_h + shell.menu_h;
+        const float status = 24.f * scale;
+        region_position.y += chrome;
+        region_size.y = (std::max)(1.f, region_size.y - chrome - status);
+    }
     ImDrawList* draw = ImGui::GetForegroundDrawList();
-    draw->AddRectFilled(ImVec2(0, 0), viewport,
+    draw->AddRectFilled(region_position,
+        ImVec2(region_position.x + region_size.x, region_position.y + region_size.y),
         IM_COL32(0, 0, 0, static_cast<int>(150.f * alpha)));
-    const ImVec2 minimum((viewport.x - 460.f) * 0.5f, (viewport.y - 190.f) * 0.5f);
-    const ImVec2 maximum(minimum.x + 460.f, minimum.y + 190.f);
-    draw->AddRectFilled(minimum, maximum,
-        aida::ui::with_alpha(theme.bg_elevated, alpha * 0.98f), 12.f);
-    draw->AddRect(minimum, maximum,
-        aida::ui::with_alpha(theme.border_strong, alpha), 12.f, 0, 1.2f);
-    ui_anim::render_spinner(draw, minimum.x + 44.f, minimum.y + 82.f, 18.f, 3.f,
-        aida::ui::with_alpha(theme.accent_u32, alpha),
-        static_cast<float>(ImGui::GetTime()));
-    const char* title = summary.pdb_loading
-        ? "Loading debug symbols..."
-        : summary.load_state == analysis_session::session_load_state_t::failed
-        ? "Analysis failed"
-        : current_phase() == phase_t::loading
-            ? "Loading binary..."
-            : "Analyzing binary...";
-    ImFont* body = aida::ui::fonts::body_strong();
-    draw->AddText(body, 16.f, ImVec2(minimum.x + 88.f, minimum.y + 28.f),
-        aida::ui::with_alpha(theme.text_primary, alpha), title);
-    ImFont* caption = aida::ui::fonts::caption();
-    draw->AddText(caption, 12.f, ImVec2(minimum.x + 88.f, minimum.y + 53.f),
-        aida::ui::with_alpha(theme.text_dim, alpha), state->filename.c_str());
-    const float bar_x = minimum.x + 88.f;
-    const float bar_y = minimum.y + 88.f;
-    const float bar_width = maximum.x - bar_x - 28.f;
-    draw->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_width, bar_y + 4.f),
-        aida::ui::with_alpha(theme.panel_header, alpha), 2.f);
-    draw->AddRectFilled(ImVec2(bar_x, bar_y),
-        ImVec2(bar_x + bar_width * (std::max)(0.f, (std::min)(1.f, progress)), bar_y + 4.f),
-        aida::ui::with_alpha(theme.accent_u32, alpha), 2.f);
-    const std::string label = detail::label_for(summary);
-    draw->AddText(caption, 11.5f, ImVec2(bar_x, bar_y + 16.f),
-        aida::ui::with_alpha(summary.error ? theme.error : theme.text_secondary, alpha),
-        label.c_str());
+    const float scale = viewport->DpiScale > 0.f ? viewport->DpiScale : 1.f;
+    const float horizontal_margin = aida::ui::scale_px(16.f, scale);
+    const float vertical_margin = aida::ui::scale_px(12.f, scale);
+    const ImVec2 card_size(
+        (std::max)(1.f, (std::min)(aida::ui::scale_px(620.f, scale), region_size.x - horizontal_margin * 2.f)),
+        (std::max)(1.f, (std::min)(aida::ui::scale_px(300.f, scale), region_size.y - vertical_margin * 2.f)));
+    const ImVec2 card_position(
+        region_position.x + (region_size.x - card_size.x) * 0.5f,
+        region_position.y + (region_size.y - card_size.y) * 0.5f);
+    const bool failed = summary.load_state == analysis_session::session_load_state_t::failed;
+    const bool cancelled = summary.error && summary.error->cancellation;
+    const phase_t phase = current_phase();
+    const bool owner_cancellable = !failed && !state->cancellation_requested.load(std::memory_order_acquire) &&
+        (phase == phase_t::loading || phase == phase_t::awaiting_analysis || phase == phase_t::loading_pdb);
+    const char* title = cancelled ? "Analysis cancelled" : failed ? "Analysis failed" :
+        summary.pdb_loading ? "Loading debug symbols" :
+        phase == phase_t::awaiting_pdb_decision ? "Debug symbols require a decision" :
+        phase == phase_t::loading ? "Loading binary" :
+        phase == phase_t::finalizing ? "Finalizing analysis" : "Analyzing binary";
+    std::string label = state->cancellation_requested.load(std::memory_order_acquire)
+        ? "Cancellation requested; waiting for the analysis owner to confirm a terminal state."
+        : detail::label_for(summary);
+    aida::ui::design::action_t actions[2]{};
+    std::size_t action_count = 0;
+    if (failed) {
+        actions[action_count++] = {"loading.view-details", "View Details", "Details",
+            "Open persistent diagnostics for this failure", nullptr, nullptr,
+            aida::ui::components::button_kind_t::secondary, true, true, true};
+    } else if (owner_cancellable) {
+        actions[action_count++] = {"loading.cancel", "Cancel Analysis", "Cancel",
+            "Request cancellation from the active analysis owner", nullptr,
+            "The session remains active until the owner confirms cancellation.",
+            aida::ui::components::button_kind_t::destructive, true, false, true};
+    }
+    aida::ui::design::state_presentation_t presentation;
+    presentation.stable_id = "loading-binary.state";
+    presentation.state = failed ? aida::ui::design::view_state_t::error
+                                : aida::ui::design::view_state_t::loading;
+    presentation.title = title;
+    presentation.message = label.c_str();
+    presentation.target = state->filename.c_str();
+    presentation.stage = detail::phase_name(phase);
+    const std::string diagnostic_id = summary.error ? summary.error->stable_code() : std::string();
+    presentation.diagnostic_id = diagnostic_id.empty() ? nullptr : diagnostic_id.c_str();
+    presentation.progress = progress;
+    presentation.elapsed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - state->tracked_at).count();
+    presentation.actions = actions;
+    presentation.action_count = action_count;
+
+    ImGui::SetNextWindowPos(card_position, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(card_size, ImGuiCond_Always);
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    ImGui::Begin("Analysis progress###aida.loading-binary", nullptr, flags);
+    const auto result = aida::ui::design::render_state(presentation, card_size);
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    if (result.invoked && result.id) {
+        if (std::strcmp(result.id, "loading.cancel") == 0) {
+            if (cancel_queued_load("human_overlay"))
+                state->cancellation_requested.store(true, std::memory_order_release);
+        } else if (std::strcmp(result.id, "loading.view-details") == 0) {
+            static_cast<void>(aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("view.diagnostics")));
+        }
+    }
 }
 
 }

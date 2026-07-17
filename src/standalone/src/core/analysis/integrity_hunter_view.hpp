@@ -4,6 +4,7 @@
 #include "ui_anim.hpp"
 #include "imgui/imgui.h"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview_platform.hpp"
 #else
@@ -241,6 +242,7 @@ inline void render(float, float, float width, float height,
 	int start_row = static_cast<int>(st.scroll_y / row_h);
 	if (start_row < 0) start_row = 0;
 
+	bool pointer_context = false;
 	for (int i = start_row; i < total_rows && i < start_row + visible_rows + 1; ++i) {
 		float ry = hy + static_cast<float>(i - start_row) * row_h;
 		if (ry > table_top + table_h) break;
@@ -308,19 +310,21 @@ inline void render(float, float, float width, float height,
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 			st.selected_node = i;
 			st.selected_rip = node.reader_rip;
-			ImGui::OpenPopup("##ih_ctx");
+			pointer_context = true;
 		}
 	}
 
-	if (ImGui::BeginPopup("##ih_ctx")) {
-		int live_idx = -1;
+	const bool keyboard_context = st.selected_rip != 0 &&
+		ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+		(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+			(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+	if (pointer_context || keyboard_context) {
 		integrity_hunter::integrity_node_t sel_node{};
 		bool have_sel = false;
 		{
 			std::lock_guard<std::mutex> lk(ih.mutex);
 			for (size_t k = 0; k < ih.nodes.size(); ++k) {
 				if (ih.nodes[k].reader_rip == st.selected_rip) {
-					live_idx = static_cast<int>(k);
 					sel_node = ih.nodes[k];
 					have_sel = true;
 					break;
@@ -329,32 +333,100 @@ inline void render(float, float, float width, float height,
 		}
 
 		if (have_sel) {
-			if (!sel_node.neutralized) {
-				if (ImGui::MenuItem("Neutralize")) {
-					integrity_hunter::neutralize(live_idx);
-				}
-			} else {
-				if (ImGui::MenuItem("Restore Original")) {
-					integrity_hunter::restore(live_idx);
-				}
-			}
-
-			if (ImGui::MenuItem("Go to Disassembly")) {
-				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-				disasm_view::goto_address(sel_node.reader_rip, workspace_context);
-			}
-
-			if (ImGui::MenuItem("Decompile Reader")) {
-				uint64_t entry = disasm_view::enclosing_function_start(sel_node.reader_rip, workspace_context);
-				if (entry == 0) entry = sel_node.reader_rip;
-				diag::log_tagged_critical_fmt("dec_ui", "integrity_reader_dispatched addr=0x%llX entry=0x%llX",
-					static_cast<unsigned long long>(sel_node.reader_rip),
-					static_cast<unsigned long long>(entry));
-				pseudocode_view::request_decompile(workspace_context, entry, false);
-			}
+			aida::ui::application_ui::retained_entity_context_t retained;
+			retained.owner_id = "memory.integrity.reader";
+			retained.entity_id = std::to_string(sel_node.reader_rip);
+			retained.entity_generation = ih.generation.load(std::memory_order_acquire);
+			retained.active_view = aida::ui::stable_view_id_t("view.memory.integrity");
+			const std::uint64_t reader_rip = sel_node.reader_rip;
+			const std::uint64_t generation = retained.entity_generation;
+			retained.validate_identity = [reader_rip, generation] {
+				auto& state = integrity_hunter::g_state;
+				if (state.generation.load(std::memory_order_acquire) != generation)
+					return aida::ui::capability_state_t::unavailable(
+						"The hunt generation changed; select the reader again");
+				std::lock_guard<std::mutex> lock(state.mutex);
+				const auto found = std::find_if(state.nodes.begin(), state.nodes.end(),
+					[reader_rip](const auto& node) { return node.reader_rip == reader_rip; });
+				return found != state.nodes.end()
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(
+						"The retained reader is no longer present in the active hunt");
+			};
+			auto add_action = [&retained](const char* id, bool enabled,
+				const char* reason, auto invoke) {
+				aida::ui::application_ui::retained_entity_action_t action;
+				action.action_id = id;
+				action.capability = enabled
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(reason);
+				action.invoke = std::move(invoke);
+				retained.actions.push_back(std::move(action));
+			};
+			add_action("memory.integrity.reader.neutralize", !sel_node.neutralized,
+				"This reader is already neutralized", [reader_rip] {
+					auto& state = integrity_hunter::g_state;
+					int index = -1;
+					{
+						std::lock_guard<std::mutex> lock(state.mutex);
+						for (std::size_t candidate = 0; candidate < state.nodes.size(); ++candidate)
+							if (state.nodes[candidate].reader_rip == reader_rip) {
+								index = static_cast<int>(candidate);
+								break;
+							}
+					}
+					if (index < 0)
+						return aida::ui::action_handler_result_t::failed(
+							"The integrity reader disappeared before neutralization");
+					integrity_hunter::neutralize(index);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_action("memory.integrity.reader.restore", sel_node.neutralized,
+				"This reader has not been neutralized", [reader_rip] {
+					auto& state = integrity_hunter::g_state;
+					int index = -1;
+					{
+						std::lock_guard<std::mutex> lock(state.mutex);
+						for (std::size_t candidate = 0; candidate < state.nodes.size(); ++candidate)
+							if (state.nodes[candidate].reader_rip == reader_rip) {
+								index = static_cast<int>(candidate);
+								break;
+							}
+					}
+					if (index < 0)
+						return aida::ui::action_handler_result_t::failed(
+							"The integrity reader disappeared before restoration");
+					integrity_hunter::restore(index);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			const bool workspace_available = static_cast<bool>(workspace_context);
+			add_action("memory.integrity.reader.follow_disassembly", workspace_available,
+				"No analysis workspace is selected", [reader_rip, workspace_context] {
+					aida::ui::application_views::open_or_focus(
+						aida::ui::stable_view_id_t("document.disassembly"));
+					disasm_view::goto_address(reader_rip, workspace_context);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add_action("memory.integrity.reader.decompile", workspace_available,
+				"No analysis workspace is selected", [reader_rip, workspace_context] {
+					uint64_t entry = disasm_view::enclosing_function_start(reader_rip, workspace_context);
+					if (entry == 0) entry = reader_rip;
+					diag::log_tagged_critical_fmt("dec_ui", "integrity_reader_dispatched addr=0x%llX entry=0x%llX",
+						static_cast<unsigned long long>(reader_rip),
+						static_cast<unsigned long long>(entry));
+					pseudocode_view::request_decompile(workspace_context, entry, false);
+					return aida::ui::action_handler_result_t::completed();
+				});
+			aida::ui::application_ui::open_retained_entity_context_menu(
+				std::move(retained), pointer_context
+					? aida::ui::context_menu_open_origin_t::pointer
+					: ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+					? aida::ui::context_menu_open_origin_t::menu_key
+					: aida::ui::context_menu_open_origin_t::shift_f10);
 		}
-		ImGui::EndPopup();
 	}
+	aida::ui::application_ui::render_retained_entity_context_menu(
+		"memory.integrity.reader");
 
 	if (total_rows == 0) {
 		const char* empty_desc = hunting

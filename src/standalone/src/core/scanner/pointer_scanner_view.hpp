@@ -2,8 +2,14 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "imgui/imgui.h"
@@ -12,6 +18,13 @@
 #include "memory_scanner.hpp"
 #include "../debugger/debugger_view.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
+#include "../ui/task_center.hpp"
+#include "../infra/executor.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../ui/ui_thread_dispatcher.hpp"
+#endif
 #include "disasm_view.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "function_index.hpp"
@@ -39,30 +52,161 @@ struct chain_anim_t {
 	float reveal = 0.f;
 	float step_flash[16] = {};
 	int   hover_step = -1;
-	uint64_t cached_addr[16] = {};
-	bool     cached_valid[16] = {};
-	float    cache_age = 0.f;
 };
 
 struct view_state_t {
 	std::unordered_map<int, chain_anim_t> chain_anims;
 	int   last_selected = -1;
 	float anim_clock = 0.f;
+	std::string context_chain;
+	std::uint64_t map_fingerprint = 0;
+	std::uint64_t result_fingerprint = 0;
+	std::uint64_t map_generation = 1;
+	std::uint64_t result_generation = 1;
+	bool observed_map_building = false;
+	bool observed_scanning = false;
 };
 
 inline view_state_t g_view;
 
 namespace detail {
 
+enum class resolution_status_t : std::uint8_t {
+	idle,
+	queued,
+	running,
+	ready,
+	failed,
+	cancelled,
+	stale
+};
+
+struct resolution_entry_t {
+	resolution_status_t status = resolution_status_t::idle;
+	std::vector<std::uint64_t> addresses;
+	std::string error;
+	std::uint32_t pid = 0;
+	std::uint64_t workspace_generation = 0;
+	std::uint64_t map_generation = 0;
+	std::uint64_t result_generation = 0;
+	std::uint64_t serial = 0;
+	std::uint64_t touch = 0;
+	std::shared_ptr<std::atomic<bool>> cancellation;
+};
+
+struct resolution_store_t {
+	std::mutex mutex;
+	std::unordered_map<std::string, resolution_entry_t> entries;
+	std::atomic<std::uint64_t> serial{0};
+	std::atomic<std::uint64_t> touch{0};
+	std::atomic<std::uint64_t> current_map_generation{1};
+	std::atomic<std::uint64_t> current_result_generation{1};
+};
+
+inline resolution_store_t g_resolutions;
+
+inline std::uint64_t mix_identity(std::uint64_t hash, std::uint64_t value) {
+	hash ^= value;
+	return hash * 1099511628211ULL;
+}
+
+inline std::uint64_t mix_identity(std::uint64_t hash, const std::string& value) {
+	for (const char character : value)
+		hash = mix_identity(hash, static_cast<unsigned char>(character));
+	return hash;
+}
+
+inline std::uint64_t chain_identity_value(const pointer_scanner::pointer_chain_t& chain) {
+	std::uint64_t hash = 1469598103934665603ULL;
+	hash = mix_identity(hash, static_cast<std::uint64_t>(chain.module_index + 1));
+	hash = mix_identity(hash, chain.module_name);
+	hash = mix_identity(hash, chain.base_offset);
+	hash = mix_identity(hash, chain.is_static ? 1ULL : 0ULL);
+	for (const auto offset : chain.offsets)
+		hash = mix_identity(hash, static_cast<std::uint64_t>(offset));
+	return hash;
+}
+
+inline std::string chain_identity_key(const pointer_scanner::pointer_chain_t& chain) {
+	char encoded[24]{};
+	std::snprintf(encoded, sizeof(encoded), "%016llX",
+		static_cast<unsigned long long>(chain_identity_value(chain)));
+	return encoded;
+}
+
+inline std::uint64_t map_fingerprint() {
+	auto& state = pointer_scanner::g_state;
+	std::lock_guard<std::mutex> lock(state.map_mutex);
+	std::uint64_t hash = 1469598103934665603ULL;
+	hash = mix_identity(hash, state.last_map_diagnostics.pid);
+	hash = mix_identity(hash, state.last_map_diagnostics.duration_ms);
+	hash = mix_identity(hash, static_cast<std::uint64_t>(state.map_entry_count));
+	for (const auto& module : state.cached_modules) {
+		hash = mix_identity(hash, module.base);
+		hash = mix_identity(hash, module.size);
+		hash = mix_identity(hash, module.name);
+	}
+	return hash;
+}
+
+inline std::uint64_t result_fingerprint() {
+	auto& state = pointer_scanner::g_state;
+	std::lock_guard<std::mutex> lock(state.results_mutex);
+	std::uint64_t hash = 1469598103934665603ULL;
+	hash = mix_identity(hash, static_cast<std::uint64_t>(state.results.size()));
+	if (!state.results.empty()) {
+		hash = mix_identity(hash, chain_identity_value(state.results.front()));
+		hash = mix_identity(hash, chain_identity_value(state.results.back()));
+	}
+	return hash;
+}
+
+inline void observe_generations() {
+	auto& state = pointer_scanner::g_state;
+	const bool building = state.map_building.load(std::memory_order_acquire);
+	const bool scanning = state.scanning.load(std::memory_order_acquire);
+	const std::uint64_t map_value = map_fingerprint();
+	const std::uint64_t result_value = result_fingerprint();
+	if (g_view.map_fingerprint != map_value || (g_view.observed_map_building && !building)) {
+		g_view.map_fingerprint = map_value;
+		++g_view.map_generation;
+		g_resolutions.current_map_generation.store(g_view.map_generation, std::memory_order_release);
+	}
+	if (g_view.result_fingerprint != result_value || (g_view.observed_scanning && !scanning)) {
+		g_view.result_fingerprint = result_value;
+		++g_view.result_generation;
+		g_resolutions.current_result_generation.store(g_view.result_generation, std::memory_order_release);
+	}
+	g_view.observed_map_building = building;
+	g_view.observed_scanning = scanning;
+}
+
+inline bool checked_apply_offset(std::uint64_t address, std::int64_t offset,
+	std::uint64_t& output) {
+	const std::uint64_t magnitude = offset < 0
+		? static_cast<std::uint64_t>(-(offset + 1)) + 1
+		: static_cast<std::uint64_t>(offset);
+	if (offset < 0) {
+		if (address < magnitude)
+			return false;
+		output = address - magnitude;
+		return true;
+	}
+	if (address > (std::numeric_limits<std::uint64_t>::max)() - magnitude)
+		return false;
+	output = address + magnitude;
+	return true;
+}
+
+inline bool context_key_pressed() {
+	return ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+		(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
+}
+
 inline uint64_t offset_magnitude(int64_t offset) {
 	return offset < 0
 		? static_cast<uint64_t>(-(offset + 1)) + 1
 		: static_cast<uint64_t>(offset);
-}
-
-inline uint64_t apply_offset(uint64_t address, int64_t offset) {
-	const uint64_t magnitude = offset_magnitude(offset);
-	return offset < 0 ? address - magnitude : address + magnitude;
 }
 
 inline std::string format_offset(int64_t off) {
@@ -72,32 +216,264 @@ inline std::string format_offset(int64_t off) {
 	return buf;
 }
 
-inline uint64_t resolve_step_address(const pointer_scanner::pointer_chain_t& chain, int step) {
-	auto& st = pointer_scanner::g_state;
-	uint64_t base_addr = 0;
-	if (chain.is_static && chain.module_index >= 0 &&
-		static_cast<size_t>(chain.module_index) < st.cached_modules.size()) {
-		base_addr = st.cached_modules[static_cast<size_t>(chain.module_index)].base + chain.base_offset;
-	} else {
-		base_addr = chain.base_offset;
+inline std::optional<std::uint64_t> chain_base_address(
+	const pointer_scanner::pointer_chain_t& chain) {
+	auto& state = pointer_scanner::g_state;
+	std::lock_guard<std::mutex> lock(state.map_mutex);
+	if (!chain.is_static)
+		return chain.base_offset == 0 ? std::optional<std::uint64_t>{} : chain.base_offset;
+	if (chain.module_index < 0 ||
+		static_cast<std::size_t>(chain.module_index) >= state.cached_modules.size())
+		return {};
+	const auto module_base = state.cached_modules[static_cast<std::size_t>(chain.module_index)].base;
+	if (module_base > (std::numeric_limits<std::uint64_t>::max)() - chain.base_offset)
+		return {};
+	return module_base + chain.base_offset;
+}
+
+inline void prune_resolution_cache_locked() {
+	constexpr std::size_t maximum_entries = 256;
+	while (g_resolutions.entries.size() > maximum_entries) {
+		auto oldest = g_resolutions.entries.end();
+		for (auto iterator = g_resolutions.entries.begin();
+			iterator != g_resolutions.entries.end(); ++iterator) {
+			if (iterator->second.status == resolution_status_t::queued ||
+				iterator->second.status == resolution_status_t::running)
+				continue;
+			if (oldest == g_resolutions.entries.end() ||
+				iterator->second.touch < oldest->second.touch)
+				oldest = iterator;
+		}
+		if (oldest == g_resolutions.entries.end())
+			break;
+		g_resolutions.entries.erase(oldest);
 	}
-	if (step <= 0) return base_addr;
-	uint64_t current = base_addr;
-	for (int i = 0; i < step && static_cast<size_t>(i) < chain.offsets.size(); ++i) {
-		const size_t offset_index = static_cast<size_t>(i);
+}
+
+inline bool request_chain_resolution(const disasm_view::workspace_context_t& context,
+	const pointer_scanner::pointer_chain_t& chain) {
+	if (!context.workspace || !context.workspace->identity().process() || chain.offsets.size() > 64)
+		return false;
+	const auto base = chain_base_address(chain);
+	if (!base)
+		return false;
+	const std::uint32_t pid = context.workspace->identity().process()->pid;
+	const std::uint64_t workspace_generation = context.workspace->generation();
+	const std::uint64_t map_generation = g_view.map_generation;
+	const std::uint64_t result_generation = g_view.result_generation;
+	const std::string key = chain_identity_key(chain);
+	const std::uint64_t serial = g_resolutions.serial.fetch_add(1,
+		std::memory_order_acq_rel) + 1;
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	{
+		std::lock_guard<std::mutex> lock(g_resolutions.mutex);
+		auto existing = g_resolutions.entries.find(key);
+		if (existing != g_resolutions.entries.end() && existing->second.pid == pid &&
+			existing->second.workspace_generation == workspace_generation &&
+			existing->second.map_generation == map_generation &&
+			existing->second.result_generation == result_generation &&
+			(existing->second.status == resolution_status_t::queued ||
+			 existing->second.status == resolution_status_t::running ||
+			 existing->second.status == resolution_status_t::ready)) {
+			existing->second.touch = g_resolutions.touch.fetch_add(1,
+				std::memory_order_acq_rel) + 1;
+			return true;
+		}
+		if (existing != g_resolutions.entries.end() && existing->second.cancellation)
+			existing->second.cancellation->store(true, std::memory_order_release);
+		auto& entry = g_resolutions.entries[key];
+		entry = {};
+		entry.status = resolution_status_t::queued;
+		entry.pid = pid;
+		entry.workspace_generation = workspace_generation;
+		entry.map_generation = map_generation;
+		entry.result_generation = result_generation;
+		entry.serial = serial;
+		entry.touch = g_resolutions.touch.fetch_add(1, std::memory_order_acq_rel) + 1;
+		entry.cancellation = cancellation;
+		prune_resolution_cache_locked();
+	}
+	const std::string task_id = "pointer.resolve." + key + "." + std::to_string(serial);
+	aida::ui::task_center::task_registration_t registration;
+	registration.id = task_id;
+	registration.source = "pointer_scanner";
+	registration.owner = "Pointer Scanner";
+	registration.owner_view = "view.memory.pointers";
+	registration.owner_action = "Resolve pointer chain";
+	registration.target = "PID " + std::to_string(pid);
+	registration.label = "Resolve pointer chain";
+	registration.stage = "Queued exact dereference sequence";
+	registration.affected_entity = pointer_scanner::chain_to_string(chain);
+	registration.cancellation_is_safe = true;
+	registration.callbacks.cancel = [cancellation] {
+		bool expected = false;
+		return cancellation->compare_exchange_strong(expected, true,
+			std::memory_order_acq_rel);
+	};
+	if (!aida::ui::task_center::register_task(std::move(registration))) {
+		std::lock_guard<std::mutex> lock(g_resolutions.mutex);
+		auto found = g_resolutions.entries.find(key);
+		if (found != g_resolutions.entries.end() && found->second.serial == serial) {
+			found->second.status = resolution_status_t::failed;
+			found->second.error = "Task Center rejected ownership of the pointer resolution";
+		}
+		return false;
+	}
+	auto workspace = context.workspace;
+	auto offsets = chain.offsets;
+	auto addresses = std::make_shared<std::vector<std::uint64_t>>();
+	auto error = std::make_shared<std::string>();
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "pointer_scanner";
+	submission.label = "pointer.resolve_chain";
+	submission.thread_class = "bounded_task";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 4;
+	submission.target_pid = pid;
+	submission.generation = workspace_generation;
+	submission.cancel_hook = [cancellation] {
+		cancellation->store(true, std::memory_order_release);
+	};
+	submission.body = [workspace, offsets = std::move(offsets), addresses, error,
+		cancellation, task_id, key, base = *base, pid, workspace_generation,
+		map_generation, result_generation, serial]() {
+		{
+			std::lock_guard<std::mutex> lock(g_resolutions.mutex);
+			auto found = g_resolutions.entries.find(key);
+			if (found != g_resolutions.entries.end() && found->second.serial == serial)
+				found->second.status = resolution_status_t::running;
+		}
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::running, 0.05f,
+			"Resolving pointer hops"));
+		addresses->reserve(offsets.size() + 1);
+		addresses->push_back(base);
+		std::uint64_t current = base;
+		for (std::size_t index = 0; index < offsets.size(); ++index) {
+			if (cancellation->load(std::memory_order_acquire)) {
+				*error = "Pointer resolution was cancelled";
+				break;
+			}
+			const auto process = workspace ? workspace->identity().process() : std::nullopt;
+			if (!workspace || workspace->closing() || workspace->closed() ||
+				workspace->generation() != workspace_generation || !process || process->pid != pid) {
+				*error = "Workspace or target changed before the next pointer hop";
+				break;
+			}
+			std::uint64_t pointer = 0;
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-		current = apply_offset(
-			current ^ (0x1000ULL + static_cast<std::uint64_t>(i) * 0x230ULL),
-			chain.offsets[offset_index]);
+			pointer = current ^ (0x1000ULL + static_cast<std::uint64_t>(index) * 0x230ULL);
 #else
-		std::vector<uint8_t> buf;
-		if (!driver_bridge::read_memory(current, 8, buf) || buf.size() < 8) return current;
-		uint64_t ptr = 0;
-		std::memcpy(&ptr, buf.data(), 8);
-		current = apply_offset(ptr, chain.offsets[offset_index]);
+			std::vector<std::uint8_t> bytes;
+			if (!driver_bridge::read_memory_for(pid, current, sizeof(pointer), bytes) ||
+				bytes.size() != sizeof(pointer)) {
+				*error = "Unreadable pointer at hop " + std::to_string(index + 1) +
+					" (exact 8-byte read failed)";
+				break;
+			}
+			std::memcpy(&pointer, bytes.data(), sizeof(pointer));
 #endif
+			if (!checked_apply_offset(pointer, offsets[index], current) || current == 0) {
+				*error = "Pointer arithmetic overflow or null result at hop " +
+					std::to_string(index + 1);
+				break;
+			}
+			addresses->push_back(current);
+		}
+		if (cancellation->load(std::memory_order_acquire) && error->empty())
+			*error = "Pointer resolution was cancelled";
+		auto publish = [workspace, addresses, error, cancellation, task_id, key, pid,
+			workspace_generation, map_generation, result_generation, serial]() {
+			const auto process = workspace ? workspace->identity().process() : std::nullopt;
+			const bool current = workspace && !workspace->closing() && !workspace->closed() &&
+				workspace->generation() == workspace_generation && process && process->pid == pid &&
+				g_resolutions.current_map_generation.load(std::memory_order_acquire) == map_generation &&
+				g_resolutions.current_result_generation.load(std::memory_order_acquire) == result_generation;
+			std::lock_guard<std::mutex> lock(g_resolutions.mutex);
+			auto found = g_resolutions.entries.find(key);
+			if (found == g_resolutions.entries.end() || found->second.serial != serial)
+				return;
+			if (!current) {
+				found->second.status = resolution_status_t::stale;
+				found->second.error = "Target, map, results, or workspace generation changed";
+				static_cast<void>(aida::ui::task_center::update_task(task_id,
+					aida::ui::task_center::task_state_t::cancelled, 1.0f,
+					"Discarded stale pointer resolution", found->second.error));
+				return;
+			}
+			found->second.addresses = std::move(*addresses);
+			found->second.error = *error;
+			if (cancellation->load(std::memory_order_acquire))
+				found->second.status = resolution_status_t::cancelled;
+			else if (!error->empty())
+				found->second.status = resolution_status_t::failed;
+			else
+				found->second.status = resolution_status_t::ready;
+			static_cast<void>(aida::ui::task_center::update_task(task_id,
+				found->second.status == resolution_status_t::ready
+					? aida::ui::task_center::task_state_t::completed
+					: found->second.status == resolution_status_t::cancelled
+						? aida::ui::task_center::task_state_t::cancelled
+						: aida::ui::task_center::task_state_t::failed,
+				1.0f, found->second.status == resolution_status_t::ready
+					? "Pointer chain resolved" : "Pointer chain did not resolve",
+				found->second.status == resolution_status_t::ready
+					? std::to_string(found->second.addresses.size() - 1) + " hops"
+					: found->second.error));
+		};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		publish();
+#else
+		if (!aida::ui_thread::post(std::move(publish), "pointer_scanner",
+				"publish_pointer_resolution", "worker_completion")) {
+			std::lock_guard<std::mutex> lock(g_resolutions.mutex);
+			auto found = g_resolutions.entries.find(key);
+			if (found != g_resolutions.entries.end() && found->second.serial == serial) {
+				found->second.status = resolution_status_t::failed;
+				found->second.error = "UI dispatcher rejected pointer-resolution publication";
+			}
+			static_cast<void>(aida::ui::task_center::update_task(task_id,
+				aida::ui::task_center::task_state_t::failed, 1.0f,
+				"UI publication rejected", "The resolved chain was not published"));
+		}
+#endif
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		std::lock_guard<std::mutex> lock(g_resolutions.mutex);
+		auto found = g_resolutions.entries.find(key);
+		if (found != g_resolutions.entries.end() && found->second.serial == serial) {
+			found->second.status = resolution_status_t::failed;
+			found->second.error = "Worker queue rejected pointer resolution: " + submitted.reject_reason;
+		}
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::failed, 1.0f,
+			"Worker queue rejected", submitted.reject_reason));
+		return false;
 	}
-	return current;
+	return true;
+}
+
+inline std::optional<std::uint64_t> resolved_step_address(
+	const pointer_scanner::pointer_chain_t& chain, int step,
+	resolution_status_t* status = nullptr, std::string* error = nullptr) {
+	if (step < 0)
+		return {};
+	const std::string key = chain_identity_key(chain);
+	std::lock_guard<std::mutex> lock(g_resolutions.mutex);
+	auto found = g_resolutions.entries.find(key);
+	if (found == g_resolutions.entries.end()) {
+		if (status) *status = resolution_status_t::idle;
+		return {};
+	}
+	found->second.touch = g_resolutions.touch.fetch_add(1, std::memory_order_acq_rel) + 1;
+	if (status) *status = found->second.status;
+	if (error) *error = found->second.error;
+	if ((found->second.status != resolution_status_t::ready &&
+		 found->second.status != resolution_status_t::failed) ||
+		static_cast<std::size_t>(step) >= found->second.addresses.size())
+		return {};
+	return found->second.addresses[static_cast<std::size_t>(step)];
 }
 
 inline void render_step_box(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 fill, ImU32 border,
@@ -228,10 +604,10 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		bool hov = ImGui::IsItemHovered();
 		if (hov) hover_step = 0;
 		if (clk) {
-			uint64_t addr = resolve_step_address(chain, 0);
-			if (addr != 0) {
+			const auto addr = chain_base_address(chain);
+			if (addr) {
 				const auto context = disasm_view::capture_selected_workspace();
-				if (hex_view::read_live_memory(context, addr, 256))
+				if (hex_view::request_live_memory(context, *addr, 256))
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
 			}
 		}
@@ -290,12 +666,12 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 		bool hov = ImGui::IsItemHovered();
 		if (hov) hover_step = step_idx;
 		if (clk) {
-			uint64_t addr = resolve_step_address(chain, step_idx);
-			if (addr != 0) {
-				const auto context = disasm_view::capture_selected_workspace();
-				if (hex_view::read_live_memory(context, addr, 256))
+			const auto context = disasm_view::capture_selected_workspace();
+			if (const auto addr = resolved_step_address(chain, step_idx)) {
+				if (hex_view::request_live_memory(context, *addr, 256))
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-			}
+			} else
+				request_chain_resolution(context, chain);
 		}
 		ImGui::PopID();
 
@@ -329,20 +705,21 @@ inline void render_chain_diagram(ImDrawList* dl, float ox, float oy, float w, fl
 	}
 
 	anim.hover_step = hover_step;
-	anim.cache_age += dt;
-	if (anim.cache_age > 0.5f) {
-		anim.cache_age = 0.f;
-		for (int i = 0; i < 16; ++i) anim.cached_valid[i] = false;
-	}
 	if (hover_step >= 0) {
-		int idx = hover_step & 15;
-		if (!anim.cached_valid[idx]) {
-			anim.cached_addr[idx] = resolve_step_address(chain, hover_step);
-			anim.cached_valid[idx] = true;
-		}
-		uint64_t addr = anim.cached_addr[idx];
-		char tip[96];
-		snprintf(tip, sizeof(tip), "Resolved: 0x%llX", static_cast<unsigned long long>(addr));
+		resolution_status_t status = resolution_status_t::idle;
+		std::string error;
+		const auto address = hover_step == 0 ? chain_base_address(chain)
+			: resolved_step_address(chain, hover_step, &status, &error);
+		char tip[192]{};
+		if (address)
+			snprintf(tip, sizeof(tip), "Resolved: 0x%llX",
+				static_cast<unsigned long long>(*address));
+		else if (status == resolution_status_t::queued || status == resolution_status_t::running)
+			snprintf(tip, sizeof(tip), "Resolving in background...");
+		else if (!error.empty())
+			snprintf(tip, sizeof(tip), "Unavailable: %s", error.c_str());
+		else
+			snprintf(tip, sizeof(tip), "Select the chain to resolve its hops.");
 		ImVec2 mp = ImGui::GetMousePos();
 		ImVec2 ts = ImGui::CalcTextSize(tip);
 		ImVec2 tp(mp.x + 16.f, mp.y - ts.y - 8.f);
@@ -370,6 +747,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		seeded = true;
 	}
 #endif
+	detail::observe_generations();
 	ImDrawList* dl = ImGui::GetWindowDrawList();
 	ImVec2 wp = ImGui::GetWindowPos();
 	float a = alpha;
@@ -696,8 +1074,11 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ImGui::BeginChild("##ptr_results", ImVec2(table_w, body_h), false,
 	                   ImGuiWindowFlags_NoScrollbar);
 
-	std::lock_guard<std::mutex> lk(st.results_mutex);
-	const size_t total = st.results.size();
+	size_t total = 0;
+	{
+		std::lock_guard<std::mutex> lock(st.results_mutex);
+		total = st.results.size();
+	}
 	int visible_count = static_cast<int>(body_h / row_h);
 	const size_t visible_rows = visible_count > 0 ? static_cast<size_t>(visible_count) : 0;
 
@@ -717,10 +1098,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	if (start_row < 0) start_row = 0;
 	const size_t start_index = static_cast<size_t>(start_row);
 	const size_t rendered_row_count = visible_rows + 2;
+	std::vector<std::pair<size_t, pointer_scanner::pointer_chain_t>> visible_chains;
+	{
+		std::lock_guard<std::mutex> lock(st.results_mutex);
+		const size_t current_total = st.results.size();
+		const size_t end_index = (std::min)(current_total, start_index + rendered_row_count);
+		visible_chains.reserve(end_index > start_index ? end_index - start_index : 0);
+		for (size_t index = start_index; index < end_index; ++index)
+			visible_chains.emplace_back(index, st.results[index]);
+		total = current_total;
+	}
 	bool open_chain_context = false;
+	auto chain_context_origin = aida::ui::context_menu_open_origin_t::pointer;
 
-	for (size_t i = start_index; i < total && i - start_index < rendered_row_count; ++i) {
-		auto& chain = st.results[i];
+	for (auto& [i, chain] : visible_chains) {
 		const int visible_row = static_cast<int>(i - start_index);
 		float ry = body_y + static_cast<float>(visible_row) * row_h
 			- (st.scroll_y - static_cast<float>(start_row) * row_h);
@@ -748,20 +1139,20 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hovered && ImGui::IsMouseClicked(0)) {
 			st.selected_result = static_cast<int>(i);
+			detail::request_chain_resolution(disasm_view::capture_selected_workspace(), chain);
 			memory_interaction::runtime_t runtime;
 			runtime.driver_loaded = driver_bridge::is_loaded();
 			runtime.live_attached = driver_bridge::attached_pid() != 0;
 			runtime.target_pid = driver_bridge::attached_pid();
-			std::uint64_t base = chain.base_offset;
-			if (chain.is_static && chain.module_index >= 0 &&
-				static_cast<std::size_t>(chain.module_index) < st.cached_modules.size())
-				base += st.cached_modules[static_cast<std::size_t>(chain.module_index)].base;
+			const std::uint64_t base = detail::chain_base_address(chain).value_or(0);
 			memory_interaction::select(memory_interaction::capture_pointer_chain(runtime,
 				base, static_cast<std::uint64_t>(chain.offsets.size()), static_cast<int>(i),
 				pointer_scanner::chain_to_string(chain)));
 		}
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 			st.selected_result = static_cast<int>(i);
+			view.context_chain = pointer_scanner::chain_to_string(chain);
+			detail::request_chain_resolution(disasm_view::capture_selected_workspace(), chain);
 			open_chain_context = true;
 		}
 
@@ -813,13 +1204,41 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		ImGui::SetCursorScreenPos(ImVec2(rx, ry + (row_h - 18.f) * 0.5f));
 		ImGui::PushID(static_cast<int>(i) + 32768);
-		aida::ui::pill_kind(chain.validated ? "valid" : "?",
-			chain.validated ? aida::ui::components::pill_kind_t::success
+		detail::resolution_status_t row_resolution = detail::resolution_status_t::idle;
+		static_cast<void>(detail::resolved_step_address(chain,
+			static_cast<int>(chain.offsets.size()), &row_resolution));
+		const bool row_valid = chain.validated ||
+			row_resolution == detail::resolution_status_t::ready;
+		aida::ui::pill_kind(row_valid ? "valid" :
+			(row_resolution == detail::resolution_status_t::queued ||
+			 row_resolution == detail::resolution_status_t::running) ? "busy" : "?",
+			row_valid ? aida::ui::components::pill_kind_t::success
 			                : aida::ui::components::pill_kind_t::neutral,
 			aida::ui::size_t_::sm, true);
 		ImGui::PopID();
 	}
 
+	auto capture_selected_chain = [&]() -> std::optional<pointer_scanner::pointer_chain_t> {
+		if (st.selected_result < 0)
+			return {};
+		std::lock_guard<std::mutex> lock(st.results_mutex);
+		const auto index = static_cast<std::size_t>(st.selected_result);
+		if (index >= st.results.size())
+			return {};
+		return st.results[index];
+	};
+	auto selected_chain = capture_selected_chain();
+	const bool chain_keyboard_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+		detail::context_key_pressed() && selected_chain.has_value();
+	if (chain_keyboard_context) {
+		view.context_chain = pointer_scanner::chain_to_string(*selected_chain);
+		detail::request_chain_resolution(disasm_view::capture_selected_workspace(),
+			*selected_chain);
+		open_chain_context = true;
+		chain_context_origin = ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+			? aida::ui::context_menu_open_origin_t::menu_key
+			: aida::ui::context_menu_open_origin_t::shift_f10;
+	}
 	ImGui::EndChild();
 	ImGui::PopStyleColor();
 
@@ -846,66 +1265,175 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			aida::ui::empty_state::render(ImVec2(table_x, body_y), ImVec2(table_w, body_h), cfg);
 		}
 	}
-	if (open_chain_context)
-		ImGui::OpenPopup("Pointer Chain Actions##context");
-	if (ImGui::BeginPopup("Pointer Chain Actions##context")) {
-		if (st.selected_result >= 0 &&
-			static_cast<std::size_t>(st.selected_result) < st.results.size()) {
-			auto& chain = st.results[static_cast<std::size_t>(st.selected_result)];
+	if (open_chain_context) {
+		selected_chain = capture_selected_chain();
+		if (selected_chain) {
+			const auto chain = *selected_chain;
 			const std::string chain_text = pointer_scanner::chain_to_string(chain);
-			const std::uint64_t base = detail::resolve_step_address(chain, 0);
-			const std::uint64_t resolved = detail::resolve_step_address(chain,
-				static_cast<int>(chain.offsets.size()));
-			ImGui::TextDisabled("%s", chain.is_static ? "Static pointer chain" : "Dynamic pointer chain");
-			ImGui::Separator();
-			if (ImGui::MenuItem("Copy chain"))
+			const bool current = chain_text == view.context_chain;
+			const auto base_value = detail::chain_base_address(chain);
+			detail::resolution_status_t resolution_status = detail::resolution_status_t::idle;
+			std::string resolution_error;
+			const auto resolved_value = detail::resolved_step_address(chain,
+				static_cast<int>(chain.offsets.size()), &resolution_status, &resolution_error);
+			const std::uint64_t base = base_value.value_or(0);
+			const std::uint64_t resolved = resolved_value.value_or(0);
+			const auto workspace = disasm_view::capture_selected_workspace();
+			const auto workspace_generation = workspace.workspace ? workspace.workspace->generation() : 0;
+			const auto map_generation = view.map_generation;
+			const auto result_generation = view.result_generation;
+			const auto target_pid = driver_bridge::attached_pid();
+			aida::ui::application_ui::retained_entity_context_t retained;
+			retained.owner_id = "memory.pointer.chain";
+			retained.entity_id = detail::chain_identity_key(chain);
+			retained.entity_generation = result_generation;
+			retained.active_view = aida::ui::stable_view_id_t("view.memory.pointers");
+			retained.validate_identity = [chain, chain_text, workspace, workspace_generation,
+				map_generation, result_generation, target_pid]() {
+				if (!workspace.workspace || workspace.workspace->generation() != workspace_generation)
+					return aida::ui::capability_state_t::unavailable("The pointer workspace generation changed.");
+				if (driver_bridge::attached_pid() != target_pid || g_view.map_generation != map_generation ||
+					g_view.result_generation != result_generation)
+					return aida::ui::capability_state_t::unavailable("The target, pointer map, or results changed.");
+				std::lock_guard<std::mutex> lock(pointer_scanner::g_state.results_mutex);
+				const bool exists = std::any_of(pointer_scanner::g_state.results.begin(),
+					pointer_scanner::g_state.results.end(), [&](const auto& item) {
+						return pointer_scanner::chain_to_string(item) == chain_text;
+					});
+				return exists ? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable("The selected pointer chain is no longer published.");
+			};
+			auto add = [&](const char* id, bool enabled, const char* reason, auto invoke) {
+				retained.actions.push_back({id, enabled ? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(reason), invoke});
+			};
+			add("memory.pointer.copy_chain", current, "The selected chain is stale.", [chain_text]() {
 				ImGui::SetClipboardText(chain_text.c_str());
-			if (ImGui::MenuItem("Copy C++ resolver")) {
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.pointer.copy_cpp", current, "The selected chain is stale.", [chain]() {
 				const std::string cpp = pointer_scanner::export_chain_cpp(chain);
 				ImGui::SetClipboardText(cpp.c_str());
-			}
-			if (ImGui::MenuItem("Copy base address", nullptr, false, base != 0)) {
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.pointer.copy_base", current && base != 0,
+				!current ? "The selected chain is stale." : "The chain has no resolved base address.", [base]() {
 				char address[24];
 				std::snprintf(address, sizeof(address), "0x%016llX",
 					static_cast<unsigned long long>(base));
 				ImGui::SetClipboardText(address);
-			}
-			if (ImGui::MenuItem("Copy resolved address", nullptr, false, resolved != 0)) {
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.pointer.copy_resolved", current && resolved != 0,
+				!current ? "The selected chain is stale." : "The chain has no resolved final address.", [resolved]() {
 				char address[24];
 				std::snprintf(address, sizeof(address), "0x%016llX",
 					static_cast<unsigned long long>(resolved));
 				ImGui::SetClipboardText(address);
-			}
-			ImGui::Separator();
-			if (ImGui::MenuItem("Open base in Disassembly", nullptr, false, base != 0)) {
-				disasm_view::goto_address(base, disasm_view::capture_selected_workspace());
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.pointer.open_base_disassembly", current && base != 0,
+				!current ? "The selected chain is stale." : "The chain has no resolved base address.", [base, workspace]() {
+				disasm_view::goto_address(base, workspace);
 				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-			}
-			if (ImGui::MenuItem("Open resolved address in Hex", nullptr, false,
-				resolved != 0 && driver_bridge::attached_pid() != 0)) {
-				const auto workspace = disasm_view::capture_selected_workspace();
-				if (hex_view::read_live_memory(workspace, resolved, 256))
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.pointer.open_resolved_hex", current && resolved != 0 && target_pid != 0,
+				!current ? "The selected chain is stale." : resolved == 0
+					? "The chain has no resolved final address." : "Attach to the target process first.", [workspace, resolved]() {
+				if (hex_view::request_live_memory(workspace, resolved, 256))
 					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-			}
-			if (ImGui::MenuItem("Add resolved address to Address List", nullptr, false,
-				resolved != 0 && driver_bridge::attached_pid() != 0))
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.pointer.add_address", current && resolved != 0 && target_pid != 0,
+				!current ? "The selected chain is stale." : resolved == 0
+					? "The chain has no resolved final address." : "Attach to the target process first.", [resolved, chain_text]() {
 				memory_scanner::add_address(resolved, chain_text,
 					memory_scanner::value_type_t::int64_val);
-			if (ImGui::MenuItem("Stage patch at resolved address...", nullptr, false,
-				resolved != 0 && driver_bridge::attached_pid() != 0)) {
+				return aida::ui::action_handler_result_t::completed();
+			});
+			add("memory.pointer.stage_patch", current && resolved != 0 && target_pid != 0,
+				!current ? "The selected chain is stale." : resolved == 0
+					? "The chain has no resolved final address." : "Attach to the target process first.", [resolved]() {
 				std::string error;
-				if (debugger_view::stage_patch_review(resolved, 1,
-					"Staged from pointer chain", &error))
+				const bool staged = debugger_view::stage_patch_review(resolved, 1,
+					"Staged from pointer chain", &error);
+				if (staged)
 					aida::ui::application_views::open_or_focus(
 						aida::ui::stable_view_id_t("view.debug.patches"));
+				return staged ? aida::ui::action_handler_result_t::completed()
+					: aida::ui::action_handler_result_t::failed(error.empty()
+						? "The patch review could not be staged." : error);
+			});
+			add("memory.pointer.validate", current && target_pid != 0,
+				!current ? "The selected chain is stale." : "Attach to the target process first.", [workspace, chain]() {
+				detail::request_chain_resolution(workspace, chain);
+				return aida::ui::action_handler_result_t::completed();
+			});
+			char base_text[24]{};
+			char resolved_text[24]{};
+			std::snprintf(base_text, sizeof(base_text), "0x%016llX",
+				static_cast<unsigned long long>(base));
+			std::snprintf(resolved_text, sizeof(resolved_text), "0x%016llX",
+				static_cast<unsigned long long>(resolved));
+			aida::automation_ui::entity_evidence::snapshot_t evidence;
+			evidence.workspace_id = "pid:" + std::to_string(target_pid);
+			evidence.source_view_id = "view.memory.pointers";
+			evidence.source_kind = "pointer_chain";
+			evidence.entity_id = retained.entity_id;
+			evidence.display_label = "Pointer chain to " + std::string(resolved_text);
+			evidence.excerpt = "PID: " + std::to_string(target_pid) +
+				"\nMap generation: " + std::to_string(map_generation) +
+				"\nResult generation: " + std::to_string(result_generation) +
+				"\nBase: " + base_text + "\nResolved: " + resolved_text +
+				"\nChain: " + chain_text;
+			evidence.address = resolved != 0 ? resolved : base;
+			evidence.revision = map_generation;
+			evidence.generation = result_generation;
+			evidence.sensitive = true;
+			evidence.return_to_source = [chain_text, workspace, workspace_generation,
+				map_generation, result_generation, target_pid](std::string& reason) {
+			if (!workspace.workspace || workspace.workspace->generation() != workspace_generation ||
+				driver_bridge::attached_pid() != target_pid ||
+				g_view.map_generation != map_generation ||
+				g_view.result_generation != result_generation) {
+				reason = "The target, pointer map, results, or workspace generation changed; capture the chain again.";
+				return false;
 			}
-			ImGui::Separator();
-			if (ImGui::MenuItem("Validate this chain", nullptr, false,
-				driver_bridge::attached_pid() != 0))
-				chain.validated = pointer_scanner::validate_chain(chain);
+			{
+				std::lock_guard<std::mutex> lock(pointer_scanner::g_state.results_mutex);
+				const auto found = std::find_if(pointer_scanner::g_state.results.begin(),
+					pointer_scanner::g_state.results.end(), [&](const auto& item) {
+						return pointer_scanner::chain_to_string(item) == chain_text;
+					});
+				if (found == pointer_scanner::g_state.results.end()) {
+					reason = "The retained pointer chain is no longer published; capture it again.";
+					return false;
+				}
+				pointer_scanner::g_state.selected_result = static_cast<int>(
+					std::distance(pointer_scanner::g_state.results.begin(), found));
+				g_view.context_chain = chain_text;
+			}
+			const auto opened = aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.memory.pointers"));
+			if (!opened.ok()) {
+				reason = opened.detail;
+				return false;
+			}
+			reason.clear();
+			return true;
+		};
+			aida::automation_ui::entity_evidence::append_actions(retained,
+				std::move(evidence), current && target_pid != 0
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(!current
+						? "The retained pointer chain changed; select it again."
+						: "Attach to the retained target process before handing off pointer evidence."));
+			aida::ui::application_ui::open_retained_entity_context_menu(
+				std::move(retained), chain_context_origin);
 		}
-		ImGui::EndPopup();
 	}
+	aida::ui::application_ui::render_retained_entity_context_menu("memory.pointer.chain");
 
 	float det_x = table_x;
 	float det_y = cfg_y + list_h;
@@ -917,12 +1445,14 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImVec2(det_x + det_w, det_y + detail_h),
 		aida::ui::with_alpha(t.panel_bg, a));
 
-	if (st.selected_result >= 0 && static_cast<size_t>(st.selected_result) < total) {
-		auto& chain = st.results[static_cast<size_t>(st.selected_result)];
+	selected_chain = capture_selected_chain();
+	if (selected_chain) {
+		auto& chain = *selected_chain;
 		auto& anim = view.chain_anims[st.selected_result];
 		if (view.last_selected != st.selected_result) {
 			anim.reveal = 0.f;
 			view.last_selected = st.selected_result;
+			detail::request_chain_resolution(disasm_view::capture_selected_workspace(), chain);
 		}
 
 		dl->AddText(aida::ui::fonts::body_em(), 13.f,
@@ -946,12 +1476,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::SetCursorScreenPos(ImVec2(bx + 200.f, det_y + 8.f));
 			if (aida::ui::button("Goto Base", aida::ui::button_kind_t::primary,
 					aida::ui::size_t_::sm)) {
-				uint64_t addr = 0;
-				if (chain.is_static && chain.module_index >= 0 &&
-				    static_cast<size_t>(chain.module_index) < st.cached_modules.size())
-					addr = st.cached_modules[static_cast<size_t>(chain.module_index)].base + chain.base_offset;
-				else
-					addr = chain.base_offset;
+				const uint64_t addr = detail::chain_base_address(chain).value_or(0);
 				if (addr != 0) {
 					disasm_view::goto_address(addr,
 						disasm_view::capture_selected_workspace());

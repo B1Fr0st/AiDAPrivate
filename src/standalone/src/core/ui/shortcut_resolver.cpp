@@ -16,7 +16,11 @@ constexpr std::uint32_t k_maximum_chord_timeout_ms = 5000;
 
 bool valid_stroke(ImGuiKeyChord stroke) noexcept {
     const auto key = stroke & ~ImGuiMod_Mask_;
-    return key != ImGuiKey_None;
+    return key >= ImGuiKey_Tab && key < ImGuiKey_GamepadStart &&
+           key != ImGuiKey_LeftCtrl && key != ImGuiKey_RightCtrl &&
+           key != ImGuiKey_LeftShift && key != ImGuiKey_RightShift &&
+           key != ImGuiKey_LeftAlt && key != ImGuiKey_RightAlt &&
+           key != ImGuiKey_LeftSuper && key != ImGuiKey_RightSuper;
 }
 
 bool scopes_can_overlap(const shortcut_binding_t& lhs,
@@ -92,6 +96,22 @@ shortcut_registration_result_t shortcut_resolver_t::register_binding(
         return {shortcut_registration_error_t::duplicate_binding,
                 "Shortcut binding ID is already registered"};
     bindings_.emplace(binding.id, std::move(binding));
+    ++revision_;
+    return {};
+}
+
+shortcut_registration_result_t shortcut_resolver_t::replace_binding(
+    shortcut_binding_t binding,
+    const application_action_registry_t& actions) {
+    auto validation = validate(binding, actions);
+    if (!validation.ok())
+        return validation;
+    const auto found = bindings_.find(binding.id);
+    if (found == bindings_.end())
+        return {shortcut_registration_error_t::invalid_binding_id,
+            "Shortcut binding is not registered"};
+    found->second = std::move(binding);
+    pending_.reset();
     ++revision_;
     return {};
 }
@@ -335,8 +355,6 @@ std::vector<shortcut_conflict_t> shortcut_resolver_t::conflicts() const {
             if (!right->second.enabled ||
                 !(left->second.sequence == right->second.sequence) ||
                 left->second.action == right->second.action ||
-                left->second.source != right->second.source ||
-                left->second.priority != right->second.priority ||
                 !scopes_can_overlap(left->second, right->second) ||
                 !policies_can_overlap(left->second, right->second))
                 continue;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <memory>
@@ -7,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <atomic>
 
 #include "imgui.h"
 #include "aob_generator.hpp"
@@ -19,8 +21,13 @@
 #include "../anti-tamper/webhook.hpp"
 #include "../helpers/diag_log.hpp"
 #include "../infra/executor.hpp"
+#include "../ui/task_center.hpp"
+#include "../ui/ui_thread_dispatcher.hpp"
+#include "scanner_async_io.hpp"
 #endif
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
 #include "../ui/clock.hpp"
@@ -42,16 +49,56 @@ enum class format_tab_t : int {
 	COUNT
 };
 
+enum class operation_terminal_t : std::uint8_t {
+	idle,
+	queued,
+	running,
+	succeeded,
+	failed,
+	cancelled,
+	stale
+};
+
+struct operation_status_t {
+	operation_terminal_t terminal = operation_terminal_t::idle;
+	std::string message;
+	std::string path;
+};
+
 struct state_t {
 	float scroll_y = 0.f;
 	float target_scroll_y = 0.f;
 	bool  scrollbar_dragging = false;
 	float scrollbar_drag_offset = 0.f;
 	int   selected_saved = -1;
+	std::uint64_t context_address = 0;
+	std::string context_name;
 	format_tab_t active_format = format_tab_t::standard;
+	std::mutex operation_mutex;
+	operation_status_t export_status;
+	operation_status_t catalog_status;
+	operation_status_t comparison_status;
+	std::atomic<bool> export_pending{false};
+	std::atomic<bool> catalog_pending{false};
+	std::atomic<bool> comparison_pending{false};
+	std::atomic<bool> export_dispatch_failed{false};
+	std::atomic<bool> catalog_dispatch_failed{false};
+	std::atomic<bool> comparison_dispatch_failed{false};
+	std::atomic<std::uint64_t> export_serial{0};
+	std::atomic<std::uint64_t> catalog_serial{0};
+	std::atomic<std::uint64_t> comparison_serial{0};
+	aob_generator::export_format_t last_export_format = aob_generator::export_format_t::json;
+	std::string last_export_path;
+	bool last_catalog_save = true;
 };
 
 inline state_t g_state;
+
+inline bool context_key_pressed()
+{
+	return ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+		(ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
+}
 
 inline std::mutex& workspace_view_states_mutex()
 {
@@ -98,7 +145,7 @@ inline void open_saved_in_hex(const disasm_view::workspace_context_t& context,
 	std::uint64_t address)
 {
 	if (context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
-		hex_view::read_live_memory(context, address, 256);
+		hex_view::request_live_memory(context, address, 256);
 		return;
 	}
 	hex_view::activate(context);
@@ -180,6 +227,575 @@ inline void render_format_segmented(float x, float y, float& width_used, format_
 	width_used = total_w;
 }
 
+inline void set_operation_status(const std::shared_ptr<state_t>& state,
+	operation_status_t state_t::* member, operation_terminal_t terminal,
+	std::string message, std::string path = {})
+{
+	if (!state) return;
+	std::lock_guard<std::mutex> lock(state->operation_mutex);
+	auto& status = state.get()->*member;
+	status.terminal = terminal;
+	status.message = std::move(message);
+	status.path = std::move(path);
+}
+
+inline bool workspace_matches(const std::shared_ptr<aida::analysis::analysis_workspace_t>& workspace,
+	const std::string& binary_id, std::uint64_t workspace_generation,
+	std::uint64_t publication_generation, std::uint32_t pid)
+{
+	if (!workspace || workspace->closing() || workspace->closed() ||
+		workspace->identity().binary_id().to_hex() != binary_id ||
+		workspace->generation() != workspace_generation) return false;
+	const auto publication = workspace->analysis_publication();
+	if (!publication || publication->generation != publication_generation) return false;
+	const auto process = workspace->identity().process();
+	return pid == 0 ? !process : process && process->pid == pid;
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+inline std::atomic<std::uint64_t> operation_sequence{1};
+
+inline std::string register_operation(const char* action, const char* label,
+	const std::string& target, const std::shared_ptr<std::atomic<bool>>& cancellation,
+	const std::shared_ptr<std::atomic<std::uint8_t>>& commit_gate = {})
+{
+	const std::string id = "scanner.aob.operation." +
+		std::to_string(operation_sequence.fetch_add(1, std::memory_order_acq_rel));
+	aida::ui::task_center::task_registration_t registration;
+	registration.id = id;
+	registration.source = "human";
+	registration.owner = "AOB Generator";
+	registration.owner_view = "view.memory.aob";
+	registration.owner_action = action;
+	registration.target = target;
+	registration.label = label;
+	registration.stage = "Queued";
+	registration.progress = -1.0f;
+	registration.cancellation_is_safe = static_cast<bool>(cancellation);
+	if (cancellation) registration.callbacks.cancel = [cancellation, commit_gate] {
+		if (commit_gate) {
+			std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+			if (!commit_gate->compare_exchange_strong(expected_gate,
+				scanner_async_io::operation_cancelled, std::memory_order_acq_rel,
+				std::memory_order_acquire)) return false;
+		}
+		bool expected = false;
+		return cancellation->compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+	};
+	registration.callbacks.focus = [] {
+		static_cast<void>(aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.memory.aob")));
+	};
+	return aida::ui::task_center::register_task(std::move(registration)) ? id : std::string();
+}
+
+inline void finish_operation(const std::string& task_id, operation_terminal_t terminal,
+	const std::string& stage, const std::string& summary)
+{
+	if (task_id.empty()) return;
+	auto task_state = aida::ui::task_center::task_state_t::failed;
+	if (terminal == operation_terminal_t::succeeded)
+		task_state = aida::ui::task_center::task_state_t::completed;
+	else if (terminal == operation_terminal_t::cancelled || terminal == operation_terminal_t::stale)
+		task_state = aida::ui::task_center::task_state_t::cancelled;
+	static_cast<void>(aida::ui::task_center::update_task(task_id, task_state, 1.0f,
+		stage, summary));
+}
+#endif
+
+inline void reconcile_dispatch_failures(const std::shared_ptr<state_t>& state)
+{
+	if (!state) return;
+	if (state->export_dispatch_failed.exchange(false, std::memory_order_acq_rel))
+		set_operation_status(state, &state_t::export_status, operation_terminal_t::failed,
+			"UI dispatcher rejected AOB export completion");
+	if (state->catalog_dispatch_failed.exchange(false, std::memory_order_acq_rel))
+		set_operation_status(state, &state_t::catalog_status, operation_terminal_t::failed,
+			"UI dispatcher rejected AOB catalog completion");
+	if (state->comparison_dispatch_failed.exchange(false, std::memory_order_acq_rel))
+		set_operation_status(state, &state_t::comparison_status, operation_terminal_t::failed,
+			"UI dispatcher rejected AOB comparison completion");
+}
+
+inline void request_export(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<aob_generator::state_t>& generator,
+	const std::shared_ptr<state_t>& state, aob_generator::export_format_t format,
+	std::string requested_path)
+{
+	if (!context.workspace || !context.publication || !generator || !state) return;
+	bool expected = false;
+	if (!state->export_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	const std::uint64_t serial = state->export_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+	std::vector<aob_generator::signature_t> signatures;
+	std::uint64_t catalog_generation = 0;
+	{
+		std::lock_guard<std::mutex> lock(generator->mutex);
+		signatures = generator->saved_signatures;
+		catalog_generation = generator->catalog_generation.load(std::memory_order_acquire);
+	}
+	state->last_export_format = format;
+	state->last_export_path = requested_path;
+	set_operation_status(state, &state_t::export_status, operation_terminal_t::queued,
+		"Queued immutable AOB export", requested_path);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(serial);
+	static_cast<void>(catalog_generation);
+	const char* receipt = format == aob_generator::export_format_t::json ? "aob.export.json" :
+		format == aob_generator::export_format_t::yara ? "aob.export.yara" : "aob.export.header";
+	aida::preview::scan::record(receipt, context.workspace->identity().binary_id().to_hex() + ":" +
+		std::to_string(signatures.size()));
+	set_operation_status(state, &state_t::export_status, operation_terminal_t::succeeded,
+		"Studio receipt recorded for immutable AOB export", requested_path);
+	state->export_pending.store(false, std::memory_order_release);
+#else
+	const auto workspace = context.workspace;
+	const std::string binary_id = workspace->identity().binary_id().to_hex();
+	const std::uint64_t workspace_generation = workspace->generation();
+	const std::uint64_t publication_generation = context.publication->generation;
+	const auto process = workspace->identity().process();
+	const std::uint32_t pid = process ? process->pid : 0;
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	auto commit_gate = std::make_shared<std::atomic<std::uint8_t>>(
+		scanner_async_io::operation_reversible);
+	const std::string task_id = register_operation("scanner.aob.export", "Export AOB signatures",
+		binary_id, cancellation, commit_gate);
+	if (task_id.empty()) {
+		state->export_pending.store(false, std::memory_order_release);
+		set_operation_status(state, &state_t::export_status, operation_terminal_t::failed,
+			"Task Center rejected AOB export ownership", requested_path);
+		return;
+	}
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "scanner.aob";
+	submission.label = "scanner.aob.export";
+	submission.thread_class = "bounded_task";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 3;
+	submission.target_pid = pid;
+	submission.generation = publication_generation;
+	submission.cancel_hook = [cancellation, commit_gate] {
+		std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+		if (commit_gate->compare_exchange_strong(expected_gate, scanner_async_io::operation_cancelled,
+			std::memory_order_acq_rel, std::memory_order_acquire))
+			cancellation->store(true, std::memory_order_release);
+	};
+	submission.body = [workspace, generator, state, signatures = std::move(signatures), format,
+		requested_path = std::move(requested_path), cancellation, task_id, binary_id,
+		workspace_generation, publication_generation, pid, catalog_generation, serial,
+		commit_gate]() mutable {
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::running, 0.1f, "Serializing bounded AOB catalog"));
+		static_cast<void>(aida::ui_thread::post([state, serial] {
+			if (state->export_serial.load(std::memory_order_acquire) == serial &&
+				state->export_pending.load(std::memory_order_acquire))
+				set_operation_status(state, &state_t::export_status, operation_terminal_t::running,
+					"Serializing bounded AOB export");
+		}, "scanner.aob", "publish_export_running", "worker_progress"));
+		std::string output;
+		std::string error;
+		bool serialized = aob_generator::serialize_catalog(signatures, format, output, error, cancellation);
+		std::string path = requested_path;
+		if (serialized && path.empty()) {
+			const std::string cache = aob_generator::get_aob_cache_dir();
+			if (!cache.empty()) {
+				const std::string extension = format == aob_generator::export_format_t::json ? ".json" :
+					format == aob_generator::export_format_t::yara ? ".yar" : ".hpp";
+				path = (std::filesystem::path(cache).parent_path() /
+					("aob_export" + extension)).string();
+			}
+			if (path.empty()) { serialized = false; error = "APPDATA is unavailable for AOB export"; }
+		}
+		auto current = [workspace, generator, binary_id, workspace_generation,
+			publication_generation, pid, catalog_generation] {
+			return workspace_matches(workspace, binary_id, workspace_generation,
+				publication_generation, pid) &&
+				generator->catalog_generation.load(std::memory_order_acquire) == catalog_generation;
+		};
+		scanner_async_io::result_t write;
+		if (serialized && current())
+			write = scanner_async_io::atomic_replace(path, output, true, cancellation, current, commit_gate);
+		else if (serialized)
+			write.error = "AOB workspace, target, publication, or catalog generation changed";
+		const bool cancelled = scanner_async_io::cancellation_requested(cancellation) || write.cancelled;
+		const bool stale = !cancelled && !current();
+		const bool success = serialized && write.success && !stale;
+		if (!success && error.empty()) error = write.error;
+		const operation_terminal_t terminal = success ? operation_terminal_t::succeeded :
+			cancelled ? operation_terminal_t::cancelled : stale ? operation_terminal_t::stale :
+			operation_terminal_t::failed;
+		auto publish = [state, serial, terminal, error = std::move(error), path]() mutable {
+			if (state->export_serial.load(std::memory_order_acquire) != serial) return;
+			set_operation_status(state, &state_t::export_status, terminal,
+				terminal == operation_terminal_t::succeeded ? "AOB export committed atomically" : error, path);
+			state->export_pending.store(false, std::memory_order_release);
+		};
+		finish_operation(task_id, terminal, success ? "AOB export complete" : "AOB export did not commit",
+			success ? path : error);
+		if (!aida::ui_thread::post(std::move(publish), "scanner.aob", "publish_export", "worker_completion")) {
+			state->export_pending.store(false, std::memory_order_release);
+			state->export_dispatch_failed.store(true, std::memory_order_release);
+			finish_operation(task_id, operation_terminal_t::failed, "UI publication rejected",
+				"AOB export completion was not published");
+		}
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		state->export_pending.store(false, std::memory_order_release);
+		set_operation_status(state, &state_t::export_status, operation_terminal_t::failed,
+			"Worker queue rejected AOB export: " + submitted.reject_reason, state->last_export_path);
+		finish_operation(task_id, operation_terminal_t::failed, "Worker queue rejected", submitted.reject_reason);
+	}
+#endif
+}
+
+inline void request_catalog(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<aob_generator::state_t>& generator,
+	const std::shared_ptr<state_t>& state, bool save)
+{
+	if (!context.workspace || !context.publication || !generator || !state) return;
+	bool expected = false;
+	if (!state->catalog_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	const std::uint64_t serial = state->catalog_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+	state->last_catalog_save = save;
+	std::vector<aob_generator::signature_t> signatures;
+	std::uint64_t catalog_generation = 0;
+	{
+		std::lock_guard<std::mutex> lock(generator->mutex);
+		signatures = generator->saved_signatures;
+		catalog_generation = generator->catalog_generation.load(std::memory_order_acquire);
+	}
+	set_operation_status(state, &state_t::catalog_status, operation_terminal_t::queued,
+		save ? "Queued saved-signature catalog commit" : "Queued saved-signature catalog load");
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(serial);
+	static_cast<void>(catalog_generation);
+	if (!save && signatures.empty()) {
+		std::lock_guard<std::mutex> lock(generator->mutex);
+		if (!generator->current.bytes.empty()) generator->saved_signatures.push_back(generator->current);
+		generator->catalog_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+	aida::preview::scan::record(save ? "aob.catalog.save" : "aob.catalog.load",
+		context.workspace->identity().binary_id().to_hex());
+	set_operation_status(state, &state_t::catalog_status, operation_terminal_t::succeeded,
+		save ? "Studio saved-catalog receipt recorded" : "Studio catalog fixture published");
+	state->catalog_pending.store(false, std::memory_order_release);
+#else
+	const auto workspace = context.workspace;
+	const std::string binary_id = workspace->identity().binary_id().to_hex();
+	const std::uint64_t workspace_generation = workspace->generation();
+	const std::uint64_t publication_generation = context.publication->generation;
+	const auto process = workspace->identity().process();
+	const std::uint32_t pid = process ? process->pid : 0;
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	auto commit_gate = std::make_shared<std::atomic<std::uint8_t>>(
+		scanner_async_io::operation_reversible);
+	const std::string task_id = register_operation(save ? "scanner.aob.catalog.save" : "scanner.aob.catalog.load",
+		save ? "Save AOB signature catalog" : "Load AOB signature catalog", binary_id,
+		cancellation, commit_gate);
+	if (task_id.empty()) {
+		state->catalog_pending.store(false, std::memory_order_release);
+		set_operation_status(state, &state_t::catalog_status, operation_terminal_t::failed,
+			"Task Center rejected AOB catalog ownership");
+		return;
+	}
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "scanner.aob";
+	submission.label = save ? "scanner.aob.catalog.save" : "scanner.aob.catalog.load";
+	submission.thread_class = "bounded_task";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 3;
+	submission.target_pid = pid;
+	submission.generation = publication_generation;
+	submission.cancel_hook = [cancellation, commit_gate] {
+		std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+		if (commit_gate->compare_exchange_strong(expected_gate, scanner_async_io::operation_cancelled,
+			std::memory_order_acq_rel, std::memory_order_acquire))
+			cancellation->store(true, std::memory_order_release);
+	};
+	submission.body = [workspace, generator, state, signatures = std::move(signatures), save,
+		cancellation, task_id, binary_id, workspace_generation, publication_generation,
+		pid, catalog_generation, serial, commit_gate]() mutable {
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::running, 0.1f,
+			save ? "Serializing saved AOB catalog" : "Reading and validating saved AOB catalog"));
+		static_cast<void>(aida::ui_thread::post([state, serial, save] {
+			if (state->catalog_serial.load(std::memory_order_acquire) == serial &&
+				state->catalog_pending.load(std::memory_order_acquire))
+				set_operation_status(state, &state_t::catalog_status, operation_terminal_t::running,
+					save ? "Serializing saved AOB catalog" : "Reading and validating saved AOB catalog");
+		}, "scanner.aob", "publish_catalog_running", "worker_progress"));
+		const std::string directory = aob_generator::get_aob_cache_dir();
+		const std::string path = directory.empty() ? std::string() :
+			(directory + "\\" + binary_id + ".json");
+		auto current = [workspace, generator, binary_id, workspace_generation,
+			publication_generation, pid, catalog_generation] {
+			return workspace_matches(workspace, binary_id, workspace_generation,
+				publication_generation, pid) &&
+				generator->catalog_generation.load(std::memory_order_acquire) == catalog_generation;
+		};
+		std::string error;
+		bool success = false;
+		bool cancelled = false;
+		std::vector<aob_generator::signature_t> staged;
+		std::uint64_t maximum_id = 0;
+		if (path.empty()) {
+			error = "APPDATA is unavailable for the AOB saved catalog";
+		} else if (save) {
+			std::string output;
+			if (aob_generator::serialize_catalog(signatures, aob_generator::export_format_t::json,
+				output, error, cancellation) && current()) {
+				auto write = scanner_async_io::atomic_replace(path, output, true, cancellation, current, commit_gate);
+				success = write.success;
+				cancelled = write.cancelled;
+				if (!success && error.empty()) error = write.error;
+			} else if (error.empty()) {
+				error = "AOB catalog changed before saved-catalog commit";
+			}
+		} else {
+			std::string input;
+			auto read = scanner_async_io::read_bounded(path, aob_generator::max_catalog_file_bytes,
+				cancellation, input);
+			cancelled = read.cancelled;
+			if (read.success && current())
+				success = aob_generator::parse_catalog(input, staged, maximum_id, error, cancellation);
+			else if (!read.success) error = read.error;
+			else error = "AOB catalog changed before saved-catalog validation";
+		}
+		cancelled = cancelled || scanner_async_io::cancellation_requested(cancellation);
+		const bool stale = !cancelled && !current();
+		if (stale) { success = false; error = "AOB workspace, target, publication, or catalog generation changed"; }
+		const operation_terminal_t terminal = success ? operation_terminal_t::succeeded :
+			cancelled ? operation_terminal_t::cancelled : stale ? operation_terminal_t::stale :
+			operation_terminal_t::failed;
+		auto publish = [workspace, generator, state, save, staged = std::move(staged), maximum_id,
+			task_id, binary_id, workspace_generation, publication_generation, pid,
+			catalog_generation, serial, terminal, error = std::move(error), path, commit_gate]() mutable {
+			if (state->catalog_serial.load(std::memory_order_acquire) != serial) return;
+			operation_terminal_t final_terminal = terminal;
+			std::string final_error = error;
+			if (terminal == operation_terminal_t::succeeded && !save) {
+				std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+				if (!commit_gate->compare_exchange_strong(expected_gate,
+					scanner_async_io::operation_committing, std::memory_order_acq_rel,
+					std::memory_order_acquire)) {
+					final_terminal = expected_gate == scanner_async_io::operation_cancelled
+						? operation_terminal_t::cancelled : operation_terminal_t::failed;
+					final_error = "AOB catalog load was cancelled before publication";
+				} else if (!workspace_matches(workspace, binary_id, workspace_generation,
+					publication_generation, pid) ||
+					generator->catalog_generation.load(std::memory_order_acquire) != catalog_generation) {
+					final_terminal = operation_terminal_t::stale;
+					final_error = "AOB catalog changed before atomic publication";
+				} else {
+					std::lock_guard<std::mutex> lock(generator->mutex);
+					generator->saved_signatures = std::move(staged);
+					generator->catalog_generation.fetch_add(1, std::memory_order_acq_rel);
+					std::uint64_t next = aob_generator::g_next_signature_id.load(std::memory_order_acquire);
+					while (maximum_id >= next && !aob_generator::g_next_signature_id.compare_exchange_weak(
+						next, maximum_id + 1, std::memory_order_acq_rel)) {}
+				}
+			}
+			set_operation_status(state, &state_t::catalog_status, final_terminal,
+				final_terminal == operation_terminal_t::succeeded
+					? (save ? "Saved-signature catalog committed atomically" :
+						"Validated saved-signature catalog published atomically") : final_error, path);
+			state->catalog_pending.store(false, std::memory_order_release);
+			finish_operation(task_id, final_terminal,
+				final_terminal == operation_terminal_t::succeeded ? "AOB catalog complete" : "AOB catalog failed",
+				final_terminal == operation_terminal_t::succeeded ? path : final_error);
+		};
+		if (!aida::ui_thread::post(std::move(publish), "scanner.aob", "publish_catalog", "worker_completion")) {
+			state->catalog_pending.store(false, std::memory_order_release);
+			state->catalog_dispatch_failed.store(true, std::memory_order_release);
+			finish_operation(task_id, operation_terminal_t::failed, "UI publication rejected",
+				"AOB catalog completion was not published");
+		}
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		state->catalog_pending.store(false, std::memory_order_release);
+		set_operation_status(state, &state_t::catalog_status, operation_terminal_t::failed,
+			"Worker queue rejected AOB catalog operation: " + submitted.reject_reason);
+		finish_operation(task_id, operation_terminal_t::failed, "Worker queue rejected", submitted.reject_reason);
+	}
+#endif
+}
+
+inline void request_comparison(const disasm_view::workspace_context_t& context,
+	const std::shared_ptr<aob_generator::state_t>& generator,
+	const std::shared_ptr<state_t>& state)
+{
+	if (!context.workspace || !context.publication || !generator || !state) return;
+	const auto process = context.workspace->identity().process();
+	if (!process || process->pid == 0) {
+		set_operation_status(state, &state_t::comparison_status, operation_terminal_t::failed,
+			"Attach a live process before comparing signatures");
+		return;
+	}
+	bool expected = false;
+	if (!state->comparison_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+	const std::uint64_t serial = state->comparison_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
+	std::vector<aob_generator::signature_t> signatures;
+	std::uint64_t catalog_generation = 0;
+	{
+		std::lock_guard<std::mutex> lock(generator->mutex);
+		signatures = generator->saved_signatures;
+		catalog_generation = generator->catalog_generation.load(std::memory_order_acquire);
+	}
+	if (signatures.empty()) {
+		state->comparison_pending.store(false, std::memory_order_release);
+		set_operation_status(state, &state_t::comparison_status, operation_terminal_t::failed,
+			"Save at least one signature before comparing");
+		return;
+	}
+	set_operation_status(state, &state_t::comparison_status, operation_terminal_t::queued,
+		"Queued immutable AOB comparison");
+	const auto workspace = context.workspace;
+	const std::string binary_id = workspace->identity().binary_id().to_hex();
+	const std::uint64_t workspace_generation = workspace->generation();
+	const std::uint64_t publication_generation = context.publication->generation;
+	const std::uint32_t pid = process->pid;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(serial);
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	auto current = [workspace, generator, binary_id, workspace_generation,
+		publication_generation, pid, catalog_generation] {
+		return workspace_matches(workspace, binary_id, workspace_generation,
+			publication_generation, pid) &&
+			generator->catalog_generation.load(std::memory_order_acquire) == catalog_generation;
+	};
+	std::string error;
+	auto results = aob_generator::compare_signatures_against_process(
+		pid, signatures, cancellation, current, error);
+	if (current() && results.size() == signatures.size()) {
+		std::lock_guard<std::mutex> lock(generator->mutex);
+		for (std::size_t index = 0; index < results.size(); ++index) {
+			auto found = std::find_if(generator->saved_signatures.begin(), generator->saved_signatures.end(),
+				[id = signatures[index].id](const auto& item) { return item.id == id; });
+			if (found == generator->saved_signatures.end()) continue;
+			found->unique = results[index].still_found;
+			found->uniqueness_count = results[index].match_count;
+			found->quality_score = aob_generator::compute_quality_score(*found);
+		}
+		generator->catalog_generation.fetch_add(1, std::memory_order_acq_rel);
+		aida::preview::scan::record("aob.compare", binary_id + ":" + std::to_string(results.size()));
+		set_operation_status(state, &state_t::comparison_status, operation_terminal_t::succeeded,
+			"Studio comparison fixture published");
+	} else {
+		set_operation_status(state, &state_t::comparison_status, operation_terminal_t::failed,
+			error.empty() ? "Studio comparison fixture was rejected" : error);
+	}
+	state->comparison_pending.store(false, std::memory_order_release);
+#else
+	auto cancellation = std::make_shared<std::atomic<bool>>(false);
+	auto commit_gate = std::make_shared<std::atomic<std::uint8_t>>(
+		scanner_async_io::operation_reversible);
+	const std::string task_id = register_operation("scanner.aob.compare", "Compare AOB signatures",
+		binary_id, cancellation, commit_gate);
+	if (task_id.empty()) {
+		state->comparison_pending.store(false, std::memory_order_release);
+		set_operation_status(state, &state_t::comparison_status, operation_terminal_t::failed,
+			"Task Center rejected AOB comparison ownership");
+		return;
+	}
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "scanner.aob";
+	submission.label = "scanner.aob.compare";
+	submission.thread_class = "scanner_sweep";
+	submission.domain = aida::infra::executor::domain_t::long_running;
+	submission.priority = 2;
+	submission.target_pid = pid;
+	submission.generation = publication_generation;
+	submission.cancel_hook = [cancellation, commit_gate] {
+		std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+		if (commit_gate->compare_exchange_strong(expected_gate, scanner_async_io::operation_cancelled,
+			std::memory_order_acq_rel, std::memory_order_acquire))
+			cancellation->store(true, std::memory_order_release);
+	};
+	submission.body = [workspace, generator, state, signatures = std::move(signatures), cancellation,
+		task_id, binary_id, workspace_generation, publication_generation, pid,
+		catalog_generation, serial, commit_gate]() mutable {
+		static_cast<void>(aida::ui::task_center::update_task(task_id,
+			aida::ui::task_center::task_state_t::running, -1.0f, "Comparing signatures against live memory"));
+		static_cast<void>(aida::ui_thread::post([state, serial] {
+			if (state->comparison_serial.load(std::memory_order_acquire) == serial &&
+				state->comparison_pending.load(std::memory_order_acquire))
+				set_operation_status(state, &state_t::comparison_status, operation_terminal_t::running,
+					"Comparing signatures against live memory");
+		}, "scanner.aob", "publish_comparison_running", "worker_progress"));
+		auto current = [workspace, generator, binary_id, workspace_generation,
+			publication_generation, pid, catalog_generation] {
+			return workspace_matches(workspace, binary_id, workspace_generation,
+				publication_generation, pid) &&
+				generator->catalog_generation.load(std::memory_order_acquire) == catalog_generation;
+		};
+		std::string error;
+		auto results = aob_generator::compare_signatures_against_process(
+			pid, signatures, cancellation, current, error);
+		const bool cancelled = scanner_async_io::cancellation_requested(cancellation);
+		const bool stale = !cancelled && !current();
+		const bool success = !stale && !cancelled && error.empty() && results.size() == signatures.size();
+		const operation_terminal_t terminal = success ? operation_terminal_t::succeeded :
+			cancelled ? operation_terminal_t::cancelled : stale ? operation_terminal_t::stale :
+			operation_terminal_t::failed;
+		auto publish = [workspace, generator, state, signatures = std::move(signatures),
+			results = std::move(results), task_id, binary_id, workspace_generation,
+			publication_generation, pid, catalog_generation, serial, terminal,
+			error = std::move(error), commit_gate]() mutable {
+			if (state->comparison_serial.load(std::memory_order_acquire) != serial) return;
+			operation_terminal_t final_terminal = terminal;
+			std::string final_error = error;
+			if (terminal == operation_terminal_t::succeeded) {
+				std::uint8_t expected_gate = scanner_async_io::operation_reversible;
+				if (!commit_gate->compare_exchange_strong(expected_gate,
+					scanner_async_io::operation_committing, std::memory_order_acq_rel,
+					std::memory_order_acquire)) {
+					final_terminal = expected_gate == scanner_async_io::operation_cancelled
+						? operation_terminal_t::cancelled : operation_terminal_t::failed;
+					final_error = "AOB comparison was cancelled before publication";
+				} else if (!workspace_matches(workspace, binary_id, workspace_generation,
+					publication_generation, pid) ||
+					generator->catalog_generation.load(std::memory_order_acquire) != catalog_generation) {
+					final_terminal = operation_terminal_t::stale;
+					final_error = "AOB comparison target or catalog changed before publication";
+				} else {
+					std::lock_guard<std::mutex> lock(generator->mutex);
+					for (std::size_t index = 0; index < results.size(); ++index) {
+						auto found = std::find_if(generator->saved_signatures.begin(), generator->saved_signatures.end(),
+							[id = signatures[index].id](const auto& item) { return item.id == id; });
+						if (found == generator->saved_signatures.end()) continue;
+						found->unique = results[index].still_found;
+						found->uniqueness_count = results[index].match_count;
+						found->quality_score = aob_generator::compute_quality_score(*found);
+					}
+					generator->catalog_generation.fetch_add(1, std::memory_order_acq_rel);
+				}
+			}
+			set_operation_status(state, &state_t::comparison_status, final_terminal,
+				final_terminal == operation_terminal_t::succeeded
+					? "AOB comparison published atomically" : final_error);
+			state->comparison_pending.store(false, std::memory_order_release);
+			finish_operation(task_id, final_terminal,
+				final_terminal == operation_terminal_t::succeeded ? "AOB comparison complete" : "AOB comparison failed",
+				final_terminal == operation_terminal_t::succeeded ? binary_id : final_error);
+		};
+		if (!aida::ui_thread::post(std::move(publish), "scanner.aob", "publish_comparison", "worker_completion")) {
+			state->comparison_pending.store(false, std::memory_order_release);
+			state->comparison_dispatch_failed.store(true, std::memory_order_release);
+			finish_operation(task_id, operation_terminal_t::failed, "UI publication rejected",
+				"AOB comparison completion was not published");
+		}
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		state->comparison_pending.store(false, std::memory_order_release);
+		set_operation_status(state, &state_t::comparison_status, operation_terminal_t::failed,
+			"Worker queue rejected AOB comparison: " + submitted.reject_reason);
+		finish_operation(task_id, operation_terminal_t::failed, "Worker queue rejected", submitted.reject_reason);
+	}
+#endif
+}
+
 }
 
 inline void render(float pos_x, float pos_y, float width, float height,
@@ -201,6 +817,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::EndChild();
 		return;
 	}
+	detail::reconcile_dispatch_failures(view_state);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 	if (generator_state->last_request_addr == 0) {
 		std::snprintf(generator_state->name_input, sizeof(generator_state->name_input), "%s", "decrypt_dispatch");
@@ -617,59 +1234,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		{
 			float bx = cx;
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
+			const bool export_pending = st.export_pending.load(std::memory_order_acquire);
 			if (aida::ui::button("Export JSON", aida::ui::button_kind_t::ghost,
-					aida::ui::size_t_::sm)) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				aob_generator::export_signatures_json(generator_state, {});
-#else
-				char* appdata = nullptr;
-				std::size_t elen = 0;
-				_dupenv_s(&appdata, &elen, "APPDATA");
-				if (appdata) {
-					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.json";
-					free(appdata);
-					diag::log_tagged_fmt("aob", "export_json path='%s'", path.c_str());
-					aob_generator::export_signatures_json(generator_state, path);
-				}
-#endif
-			}
+					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), export_pending))
+				detail::request_export(context, generator_state, view_state,
+					aob_generator::export_format_t::json, {});
 			bx += 110.f;
 
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Export YARA", aida::ui::button_kind_t::ghost,
-					aida::ui::size_t_::sm)) {
-				diag::log_tagged("aob", "export_yara_clicked");
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				aob_generator::export_signatures_yara(generator_state, {});
-#else
-				char* appdata = nullptr;
-				std::size_t elen = 0;
-				_dupenv_s(&appdata, &elen, "APPDATA");
-				if (appdata) {
-					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\aob_export.yar";
-					free(appdata);
-					aob_generator::export_signatures_yara(generator_state, path);
-				}
-#endif
-			}
+					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), export_pending))
+				detail::request_export(context, generator_state, view_state,
+					aob_generator::export_format_t::yara, {});
 			bx += 110.f;
 
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Export Header", aida::ui::button_kind_t::ghost,
-					aida::ui::size_t_::sm)) {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				aob_generator::export_signatures_header(generator_state, {});
-#else
-				char* appdata = nullptr;
-				std::size_t elen = 0;
-				_dupenv_s(&appdata, &elen, "APPDATA");
-				if (appdata) {
-					std::string path = std::string(appdata) + "\\AiDA\\Standalone\\signatures.hpp";
-					free(appdata);
-					aob_generator::export_signatures_header(generator_state, path);
-				}
-#endif
-			}
+					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), export_pending))
+				detail::request_export(context, generator_state, view_state,
+					aob_generator::export_format_t::header, {});
 			cy += 30.f;
 
 			bx = cx;
@@ -678,66 +1261,60 @@ inline void render(float pos_x, float pos_y, float width, float height,
 				context.workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot
 				? context.workspace->identity().process() : std::nullopt;
 			const std::uint32_t compare_pid = compare_process ? compare_process->pid : 0;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const bool compare_pending = st.comparison_pending.load(std::memory_order_acquire);
 			bool attached_cmp = compare_pid != 0;
-#else
-			bool attached_cmp = driver_bridge::is_loaded() && compare_pid != 0;
-#endif
 			if (aida::ui::button("Compare", aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !attached_cmp)) {
-				std::vector<aob_generator::signature_t> sigs_copy;
-				{
-					std::lock_guard<std::mutex> lk(gen.mutex);
-					sigs_copy = gen.saved_signatures;
-				}
+					aida::ui::size_t_::sm, ImVec2(0.f, 0.f), !attached_cmp || compare_pending)) {
 				anti_tamper::webhook::write_log("scan_audit",
 					"[scan_audit] aob compare invoked");
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-				auto results = aob_generator::compare_signatures_against_process(compare_pid, sigs_copy);
-				std::lock_guard<std::mutex> lk(generator_state->mutex);
-				auto& saved = generator_state->saved_signatures;
-				for (std::size_t ri = 0; ri < results.size() && ri < saved.size() && ri < sigs_copy.size(); ++ri) {
-					if (saved[ri].id != sigs_copy[ri].id) continue;
-					saved[ri].unique = results[ri].still_found;
-					saved[ri].uniqueness_count = results[ri].match_count;
-					saved[ri].quality_score = aob_generator::compute_quality_score(saved[ri]);
-				}
-#else
-				aida::infra::executor::submission_t sub;
-				sub.owner_subsystem = "scanner";
-				sub.label = "scanner.aob_compare";
-				sub.thread_class = "scanner_sweep";
-				sub.domain = aida::infra::executor::domain_t::long_running;
-				sub.priority = 2;
-				sub.target_pid = compare_pid;
-				sub.body = [compare_pid, sigs_copy, generator_state]() mutable {
-					auto results = aob_generator::compare_signatures_against_process(compare_pid, sigs_copy);
-					std::lock_guard<std::mutex> lk(generator_state->mutex);
-					auto& saved = generator_state->saved_signatures;
-					for (std::size_t ri = 0; ri < results.size() && ri < saved.size() && ri < sigs_copy.size(); ++ri) {
-						if (saved[ri].id != sigs_copy[ri].id) continue;
-						saved[ri].unique = results[ri].still_found;
-						saved[ri].uniqueness_count = results[ri].match_count;
-						saved[ri].quality_score = aob_generator::compute_quality_score(saved[ri]);
-					}
-				};
-				if (!aida::infra::executor::submit(std::move(sub)).submitted)
-					diag::log_tagged("aob", "compare worker_queue_rejected");
-#endif
+				detail::request_comparison(context, generator_state, view_state);
 			}
 			bx += 90.f;
 
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Save Disk", aida::ui::button_kind_t::ghost,
-					aida::ui::size_t_::sm)) {
-				aob_generator::save_signatures_to_disk(context, generator_state);
-			}
+					aida::ui::size_t_::sm, ImVec2(0.f, 0.f),
+					st.catalog_pending.load(std::memory_order_acquire)))
+				detail::request_catalog(context, generator_state, view_state, true);
 			bx += 96.f;
 
 			ImGui::SetCursorScreenPos(ImVec2(bx, cy));
 			if (aida::ui::button("Load Disk", aida::ui::button_kind_t::ghost,
-					aida::ui::size_t_::sm)) {
-				aob_generator::load_signatures_from_disk(context, generator_state);
+					aida::ui::size_t_::sm, ImVec2(0.f, 0.f),
+					st.catalog_pending.load(std::memory_order_acquire)))
+				detail::request_catalog(context, generator_state, view_state, false);
+			cy += 28.f;
+			operation_status_t export_status;
+			operation_status_t catalog_status;
+			operation_status_t comparison_status;
+			{
+				std::lock_guard<std::mutex> lock(st.operation_mutex);
+				export_status = st.export_status;
+				catalog_status = st.catalog_status;
+				comparison_status = st.comparison_status;
+			}
+			const operation_status_t* visible_status = comparison_status.terminal != operation_terminal_t::idle
+				? &comparison_status : catalog_status.terminal != operation_terminal_t::idle
+				? &catalog_status : export_status.terminal != operation_terminal_t::idle ? &export_status : nullptr;
+			if (visible_status) {
+				ImGui::SetCursorScreenPos(ImVec2(cx, cy));
+				ImGui::TextDisabled("%s", visible_status->message.c_str());
+				const bool retryable = visible_status->terminal == operation_terminal_t::failed ||
+					visible_status->terminal == operation_terminal_t::cancelled ||
+					visible_status->terminal == operation_terminal_t::stale;
+				if (retryable) {
+					ImGui::SetCursorScreenPos(ImVec2(ox + left_w - 72.f, cy - 4.f));
+					if (aida::ui::button("Retry", aida::ui::button_kind_t::secondary,
+							aida::ui::size_t_::sm)) {
+						if (visible_status == &comparison_status)
+							detail::request_comparison(context, generator_state, view_state);
+						else if (visible_status == &catalog_status)
+							detail::request_catalog(context, generator_state, view_state, st.last_catalog_save);
+						else
+							detail::request_export(context, generator_state, view_state,
+								st.last_export_format, st.last_export_path);
+					}
+				}
 			}
 		}
 	} else {
@@ -770,8 +1347,8 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	ui_anim::handle_scroll_input(st.target_scroll_y, 0.f, std::max(0.f, content_h - saved_h), row_h);
 	ui_anim::smooth_scroll(st.scroll_y, st.target_scroll_y, 12.f, dt);
 
-	int ctx_saved_idx = -1;
 	bool ctx_saved_open = false;
+	auto ctx_saved_origin = aida::ui::context_menu_open_origin_t::pointer;
 
 	ImGui::PushClipRect(ImVec2(rx, ry), ImVec2(rx + right_w, oy + h - 8.f), true);
 
@@ -799,12 +1376,17 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
 			st.selected_saved = (selected ? -1 : static_cast<int>(i));
+			if (!selected) {
+				st.context_address = saved_copy[i].address;
+				st.context_name = saved_copy[i].name;
+			}
 		}
 
 		if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-			ctx_saved_idx = static_cast<int>(i);
 			ctx_saved_open = true;
-			st.selected_saved = ctx_saved_idx;
+			st.selected_saved = static_cast<int>(i);
+			st.context_address = saved_copy[i].address;
+			st.context_name = saved_copy[i].name;
 		}
 
 		auto& sig = saved_copy[i];
@@ -853,55 +1435,175 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::PopID();
 		}
 	}
+	if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && context_key_pressed() &&
+		st.selected_saved >= 0) {
+		ctx_saved_open = true;
+		ctx_saved_origin = ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+			? aida::ui::context_menu_open_origin_t::menu_key
+			: aida::ui::context_menu_open_origin_t::shift_f10;
+	}
 
 	ImGui::PopClipRect();
 
-	if (ctx_saved_open) ImGui::OpenPopup("##aob_saved_ctx");
-
-	ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::with_alpha(t.bg_overlay, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::with_alpha(t.border_subtle, 1.f));
-	ImGui::PushStyleColor(ImGuiCol_Text, aida::ui::with_alpha(t.text_primary, 1.f));
-	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.f);
-	if (ImGui::BeginPopup("##aob_saved_ctx")) {
-		if (ctx_saved_idx >= 0 && static_cast<std::size_t>(ctx_saved_idx) < saved_copy.size()) {
-			auto& csig = saved_copy[static_cast<std::size_t>(ctx_saved_idx)];
-			if (ImGui::MenuItem("Open in Disassembly")) {
-				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
-				disasm_view::goto_address(csig.address, context);
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] aob saved ctx open_disasm");
+	if (ctx_saved_open) {
+		const auto current_signature = std::find_if(saved_copy.begin(), saved_copy.end(), [&](const auto& signature) {
+			return signature.address == st.context_address && signature.name == st.context_name;
+		});
+		if (current_signature != saved_copy.end()) {
+			const auto signature = *current_signature;
+			const auto workspace = context.workspace;
+			const auto generation = context.publication ? context.publication->generation : 0;
+			aida::ui::application_ui::retained_entity_context_t retained;
+			retained.owner_id = "memory.aob.saved";
+			retained.entity_id = signature.name + "@" + std::to_string(signature.address);
+			retained.entity_generation = generation;
+			retained.active_view = aida::ui::stable_view_id_t("view.memory.aob");
+			retained.validate_identity = [workspace, generator_state, generation, signature]() {
+				if (!workspace) return aida::ui::capability_state_t::unavailable("The AOB workspace was closed.");
+				const auto publication = workspace->analysis_publication();
+				if (!publication || publication->generation != generation)
+					return aida::ui::capability_state_t::unavailable("The analysis publication changed; reopen the menu.");
+				std::lock_guard<std::mutex> lock(generator_state->mutex);
+				const bool current = std::any_of(generator_state->saved_signatures.begin(),
+					generator_state->saved_signatures.end(), [&](const auto& item) {
+						return item.address == signature.address && item.name == signature.name && item.bytes == signature.bytes;
+					});
+				return current ? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable("The selected signature changed or was removed.");
+			};
+			auto add = [&](const char* id, bool enabled, const char* reason, auto invoke) {
+				retained.actions.push_back({id, enabled ? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(reason), invoke});
+			};
+			add("memory.entity.open_disassembly", signature.address != 0,
+				"The saved signature has no mapped address.", [signature, context]() {
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
+					disasm_view::goto_address(signature.address, context);
+					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx open_disasm");
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add("memory.entity.open_hex", signature.address != 0,
+				"The saved signature has no mapped address.", [signature, context]() {
+					detail::open_saved_in_hex(context, signature.address);
+					aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
+					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx open_hex");
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add("memory.aob.copy_pattern", !signature.bytes.empty(),
+				"The saved signature has no retained pattern bytes.", [signature]() {
+					const std::string text = aob_generator::format_signature(signature);
+					ImGui::SetClipboardText(text.c_str());
+					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx copy_pattern");
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add("memory.aob.copy_ida_pattern", !signature.bytes.empty(),
+				"The saved signature has no retained pattern bytes.", [signature]() {
+					const std::string text = aob_generator::format_ida_signature(signature);
+					ImGui::SetClipboardText(text.c_str());
+					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx copy_ida");
+					return aida::ui::action_handler_result_t::completed();
+				});
+			add("memory.entity.copy_address", signature.address != 0,
+				"The saved signature has no mapped address.", [signature]() {
+					char address[24]{};
+					std::snprintf(address, sizeof(address), "0x%llX", static_cast<unsigned long long>(signature.address));
+					ImGui::SetClipboardText(address);
+					anti_tamper::webhook::write_log("scan_audit", "[scan_audit] aob saved ctx copy_address");
+					return aida::ui::action_handler_result_t::completed();
+				});
+			char evidence_address[24]{};
+			std::snprintf(evidence_address, sizeof(evidence_address), "0x%016llX",
+				static_cast<unsigned long long>(signature.address));
+			constexpr std::size_t k_evidence_pattern_bytes = 1024U;
+			const std::size_t evidence_byte_count = (std::min)(signature.bytes.size(),
+				k_evidence_pattern_bytes);
+			std::string evidence_pattern;
+			evidence_pattern.reserve(evidence_byte_count * 3U);
+			char encoded_byte[4]{};
+			for (std::size_t index = 0; index < evidence_byte_count; ++index) {
+				if (index != 0) evidence_pattern.push_back(' ');
+				if (signature.bytes[index].wildcard) evidence_pattern += "??";
+				else {
+					std::snprintf(encoded_byte, sizeof(encoded_byte), "%02X",
+						signature.bytes[index].value);
+					evidence_pattern += encoded_byte;
+				}
 			}
-			if (ImGui::MenuItem("Open in Hex")) {
-				detail::open_saved_in_hex(context, csig.address);
-				aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] aob saved ctx open_hex");
+			std::uint64_t signature_identity_hash = 1469598103934665603ULL;
+			for (const auto& byte : signature.bytes) {
+				signature_identity_hash ^= byte.value;
+				signature_identity_hash *= 1099511628211ULL;
+				signature_identity_hash ^= byte.wildcard ? 1U : 0U;
+				signature_identity_hash *= 1099511628211ULL;
 			}
-			ImGui::Separator();
-			if (ImGui::MenuItem("Copy Pattern")) {
-				std::string s = aob_generator::format_signature(csig);
-				ImGui::SetClipboardText(s.c_str());
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] aob saved ctx copy_pattern");
+			const auto signature_id = signature.id;
+			const auto signature_address = signature.address;
+			const auto signature_name = signature.name;
+			aida::automation_ui::entity_evidence::snapshot_t evidence;
+			evidence.workspace_id = workspace->identity().binary_id().to_hex();
+			evidence.source_view_id = "view.memory.aob";
+			evidence.source_kind = "aob_signature";
+			evidence.entity_id = retained.entity_id;
+			evidence.display_label = signature.name;
+			evidence.excerpt = "Name: " + signature.name + "\nAddress: " +
+				evidence_address + "\nPattern: " + evidence_pattern +
+				"\nByte count: " + std::to_string(signature.bytes.size()) +
+				"\nUniqueness count: " + std::to_string(signature.uniqueness_count);
+			evidence.address = signature.address;
+			evidence.revision = generation;
+			evidence.generation = generation;
+			evidence.truncated = evidence_byte_count != signature.bytes.size();
+			evidence.return_to_source = [workspace, generator_state, view_state,
+				generation, signature_id, signature_address, signature_name,
+				signature_identity_hash](std::string& reason) {
+			const auto publication = workspace ? workspace->analysis_publication() : nullptr;
+			if (!publication || publication->generation != generation) {
+				reason = "The AOB analysis publication changed; capture the signature again.";
+				return false;
 			}
-			if (ImGui::MenuItem("Copy IDA Pattern")) {
-				std::string s = aob_generator::format_ida_signature(csig);
-				ImGui::SetClipboardText(s.c_str());
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] aob saved ctx copy_ida");
+			{
+				std::lock_guard<std::mutex> lock(generator_state->mutex);
+				const auto found = std::find_if(generator_state->saved_signatures.begin(),
+					generator_state->saved_signatures.end(), [&](const auto& item) {
+						if (item.id != signature_id || item.address != signature_address ||
+							item.name != signature_name) return false;
+						std::uint64_t current_hash = 1469598103934665603ULL;
+						for (const auto& byte : item.bytes) {
+							current_hash ^= byte.value;
+							current_hash *= 1099511628211ULL;
+							current_hash ^= byte.wildcard ? 1U : 0U;
+							current_hash *= 1099511628211ULL;
+						}
+						return current_hash == signature_identity_hash;
+					});
+				if (found == generator_state->saved_signatures.end()) {
+					reason = "The retained AOB signature changed or was removed; capture it again.";
+					return false;
+				}
+				view_state->selected_saved = static_cast<int>(
+					std::distance(generator_state->saved_signatures.begin(), found));
+				view_state->context_address = signature_address;
+				view_state->context_name = signature_name;
 			}
-			if (ImGui::MenuItem("Copy Address")) {
-				char abuf[24];
-				snprintf(abuf, sizeof(abuf), "0x%llX", static_cast<unsigned long long>(csig.address));
-				ImGui::SetClipboardText(abuf);
-				anti_tamper::webhook::write_log("scan_audit",
-					"[scan_audit] aob saved ctx copy_address");
+			const auto opened = aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.memory.aob"));
+			if (!opened.ok()) {
+				reason = opened.detail;
+				return false;
 			}
+			reason.clear();
+			return true;
+		};
+			aida::automation_ui::entity_evidence::append_actions(retained,
+				std::move(evidence), !signature.bytes.empty()
+					? aida::ui::capability_state_t::available()
+					: aida::ui::capability_state_t::unavailable(
+						"The retained AOB signature has no pattern bytes."));
+			aida::ui::application_ui::open_retained_entity_context_menu(
+				std::move(retained), ctx_saved_origin);
 		}
-		ImGui::EndPopup();
 	}
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor(3);
+	aida::ui::application_ui::render_retained_entity_context_menu("memory.aob.saved");
 
 	if (saved_copy.empty()) {
 		aida::ui::empty_state::config_t cfg;

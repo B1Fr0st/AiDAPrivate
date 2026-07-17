@@ -3,7 +3,9 @@
 #include "../analysis/workspace/analysis_workspace.hpp"
 
 #include <atomic>
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -53,11 +55,33 @@ struct mutation_state_t {
     std::string error;
 };
 
+enum class metadata_line_kind_t : std::uint8_t {
+    blank = 0,
+    comment,
+    banner,
+    directive,
+    keyword
+};
+
+enum class static_patch_mode_t : std::uint8_t {
+    bytes = 0,
+    nop_fill = 1,
+    assembly = 2
+};
+
+struct metadata_line_t {
+    std::string text;
+    metadata_line_kind_t kind = metadata_line_kind_t::comment;
+};
+
 struct state_t {
     addr_format_t addr_format = addr_format_t::va;
     bool show_bytes = true;
     std::optional<std::uint64_t> display_image_base;
     bool banner_selected_all = false;
+    std::size_t banner_selected_line = 0;
+    std::uint64_t metadata_signature = 0;
+    std::vector<metadata_line_t> metadata_lines;
     int active_section = -1;
     std::optional<aida::analysis::address_t> selection;
     float target_scroll_y = 0.0f;
@@ -85,6 +109,23 @@ struct state_t {
     std::string export_error;
     std::string export_status;
     std::atomic<std::uint32_t> pending_mutations{0};
+    bool static_patch_open = false;
+    bool static_patch_focus_input = false;
+    static_patch_mode_t static_patch_mode = static_patch_mode_t::bytes;
+    aida::analysis::address_t static_patch_address;
+    std::uint64_t static_patch_extent = 0;
+    std::uint64_t static_patch_generation = 0;
+    std::uint64_t static_patch_analysis_revision = 0;
+    std::uint64_t static_patch_overlay_revision = 0;
+    bool static_patch_existing = false;
+    std::uint64_t static_patch_existing_size = 0;
+    std::vector<std::uint8_t> static_patch_original;
+    std::vector<std::uint8_t> static_patch_proposed;
+    std::array<char, 196609> static_patch_input{};
+    std::array<char, 256> static_patch_description{};
+    std::string static_patch_error;
+    std::string static_patch_parse_error;
+    std::string static_patch_status;
     std::mutex mutex;
 };
 
@@ -130,21 +171,52 @@ void request_format_range(const workspace_context_t& context,
 std::optional<formatted_instruction_t> formatted_instruction(
     const workspace_context_t& context, aida::analysis::entity_id_t instruction_id);
 
+using overlay_completion_t = std::function<void(bool, std::string)>;
+
 bool queue_comment(const workspace_context_t& context,
                    const aida::analysis::address_t& address,
-                   std::string text);
+                   std::string text,
+                   std::optional<std::uint64_t> required_generation = {},
+                   std::optional<std::uint64_t> required_analysis_revision = {},
+                   std::optional<std::uint64_t> required_overlay_revision = {},
+                   overlay_completion_t completion = {});
 bool queue_rename(const workspace_context_t& context,
                   const aida::analysis::address_t& address,
-                  std::string name);
+                  std::string name,
+                  std::optional<std::uint64_t> required_generation = {},
+                  std::optional<std::uint64_t> required_analysis_revision = {},
+                  std::optional<std::uint64_t> required_overlay_revision = {},
+                  overlay_completion_t completion = {});
 bool queue_bookmark(const workspace_context_t& context,
                     const aida::analysis::address_t& address,
                     std::string label);
 bool queue_patch(const workspace_context_t& context,
                  const aida::analysis::address_t& address,
                  std::vector<std::uint8_t> bytes);
+bool open_static_patch_review(const workspace_context_t& context,
+                              const aida::analysis::address_t& address,
+                              std::uint64_t extent,
+                              static_patch_mode_t mode,
+                              std::string* error = nullptr);
+bool open_exact_static_patch_review(const workspace_context_t& context,
+                                    const aida::analysis::address_t& address,
+                                    const std::vector<std::uint8_t>& expected_before,
+                                    const std::vector<std::uint8_t>& reviewed_after,
+                                    const std::string& provenance,
+                                    std::uint64_t expected_generation,
+                                    std::uint64_t expected_analysis_revision,
+                                    std::uint64_t expected_overlay_revision,
+                                    std::string* error = nullptr);
+bool open_selected_patch_review(static_patch_mode_t mode,
+                                std::string* error = nullptr);
+void render_static_patch_workflow();
 bool queue_type_application(const workspace_context_t& context,
                             const aida::analysis::address_t& address,
-                            std::string type);
+                            std::string type,
+                            std::optional<std::uint64_t> required_generation = {},
+                            std::optional<std::uint64_t> required_analysis_revision = {},
+                            std::optional<std::uint64_t> required_overlay_revision = {},
+                            overlay_completion_t completion = {});
 bool queue_type_declaration(const workspace_context_t& context,
                             std::string declaration);
 bool queue_type_declaration_and_application(
@@ -153,6 +225,8 @@ bool queue_type_declaration_and_application(
     std::string declaration,
     std::string canonical_type);
 mutation_state_t mutation_state(const workspace_context_t& context);
+bool queue_overlay_undo(const workspace_context_t& context);
+bool queue_overlay_redo(const workspace_context_t& context);
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b,
@@ -161,6 +235,10 @@ void render(float pos_x, float pos_y, float width, float height,
 void goto_address(std::uint64_t address, const workspace_context_t& context);
 void goto_address(const aida::analysis::address_t& address,
                   const workspace_context_t& context);
+bool request_goto(const workspace_context_t& context);
+bool request_rebase(const workspace_context_t& context, std::string* error = nullptr);
+bool request_listing_export(const workspace_context_t& context,
+                            std::string* error = nullptr);
 void select_address(std::uint64_t address, const workspace_context_t& context,
                     bool record_history = true);
 void select_address(const aida::analysis::address_t& address,

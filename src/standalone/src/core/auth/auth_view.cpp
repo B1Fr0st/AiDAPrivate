@@ -37,6 +37,7 @@
 #include "provider_transforms.hpp"
 #endif
 #include "standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 namespace aida::settings_overlay {
 	std::string consume_pending_provider_focus();
@@ -2221,9 +2222,9 @@ namespace auth_view {
 									profile->model = model_id;
 									g_sa_settings.sync_legacy_fields_from_active_profile();
 								}
-								settings_saved = g_sa_settings.save();
+								settings_saved = aida::settings_persistence::commit_lifecycle(
+									g_sa_settings, persistence_error);
 								if (!settings_saved) {
-									persistence_error = settings_sa_t::last_error();
 									g_sa_settings = std::move(settings_before);
 									rollback_succeeded = had_previous
 										? aida::auth::store::set(captured_id, previous)
@@ -2566,6 +2567,7 @@ namespace auth_view {
 						ImGui::PushID(m->id.c_str());
 						if (ImGui::Selectable(label, is_sel)) {
 							bool saved = false;
+							std::string persistence_error;
 							{
 								std::lock_guard<std::recursive_mutex> settings_lock(
 									sa_settings_detail::io_mutex());
@@ -2577,7 +2579,8 @@ namespace auth_view {
 									prof->model = m->id;
 									g_sa_settings.sync_legacy_fields_from_active_profile();
 								}
-								saved = g_sa_settings.save();
+								saved = aida::settings_persistence::commit_lifecycle(
+									g_sa_settings, persistence_error);
 								if (!saved)
 									g_sa_settings = std::move(settings_before);
 							}
@@ -2588,7 +2591,9 @@ namespace auth_view {
 								evt.model_id = m->id;
 								aida::events::publish(aida::events::event_model_changed, evt);
 							} else {
-								toast_notification::push("Unable to save default model", toast_notification::toast_type_t::error);
+								toast_notification::push(persistence_error.empty()
+									? "Unable to save default model" : persistence_error,
+									toast_notification::toast_type_t::error);
 							}
 						}
 						if (is_sel) ImGui::SetItemDefaultFocus();

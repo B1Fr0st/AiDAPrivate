@@ -39,6 +39,8 @@ action_surface_t surface_for_source(action_invocation_source_t source) noexcept 
     switch (source) {
         case action_invocation_source_t::application_menu:
             return action_surface_t::application_menu;
+        case action_invocation_source_t::activity_bar:
+            return action_surface_t::accessibility;
         case action_invocation_source_t::toolbar:
             return action_surface_t::toolbar;
         case action_invocation_source_t::command_palette:

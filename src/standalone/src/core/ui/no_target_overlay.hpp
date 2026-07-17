@@ -16,8 +16,6 @@
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
 #endif
-#include "../debugger/spawn_target_dialog.hpp"
-
 #include <string>
 
 extern HWND g_hwnd;
@@ -114,7 +112,8 @@ namespace aida::ui::no_target_overlay {
 		}
 		if (action == action_t::run_target) {
 			diag::log_tagged_critical("file_dialog", "no_target_overlay.run_clicked");
-			spawn_target_dialog::request_open();
+			aida::ui::application_ui::execute_action("debugger.launch",
+				aida::ui::action_invocation_source_t::toolbar);
 		}
 	}
 

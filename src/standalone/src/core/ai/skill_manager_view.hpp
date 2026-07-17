@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cfloat>
 #include <cstddef>
@@ -10,9 +9,6 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
-#include <map>
-#include <memory>
-#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -29,19 +25,19 @@
 #include "agent_registry.hpp"
 #include "chat_render.hpp"
 #include "skills.hpp"
+#include "skill_manager_service.hpp"
 #include "toast_notification.hpp"
 #include "ui_anim.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview.hpp"
-#include "../../preview/ui_task_executor.hpp"
-#else
-#include "../infra/executor.hpp"
 #endif
 #include "../ui/avatar.hpp"
 #include "../ui/blur_layer.hpp"
 #include "../ui/brand.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
+#include "../ui/application_ui_runtime.hpp"
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/motion.hpp"
@@ -64,29 +60,6 @@ namespace skill_manager {
 	};
 
 
-	struct remote_fetch_result_t {
-		std::string                                 url;
-		bool                                        completed = false;
-		bool                                        success   = false;
-		std::string                                 error;
-		::aida::skills::remote_index_t              index;
-	};
-
-	struct install_request_t {
-		std::string url;
-		std::string name;
-		std::atomic<bool> completed{false};
-		std::atomic<bool> success{false};
-		std::string error;
-	};
-
-
-	inline std::mutex& state_mutex()
-	{
-		static std::mutex m;
-		return m;
-	}
-
 	struct row_anim_t
 	{
 		aida::ui::hover_state_t hover;
@@ -94,26 +67,23 @@ namespace skill_manager {
 
 	struct view_state_t {
 		bool                                                       initialized = false;
-		std::atomic<bool>                                          shutdown_flag{false};
 		std::string                                                last_error;
 		source_tab_t                                               active_tab = source_tab_t::built_in;
 		std::string                                                selected_skill_name;
 		char                                                       search_buf[256] = {};
 		char                                                       add_url_buf[1024] = {};
 		std::string                                                agent_filter;
-		std::map<std::string, remote_fetch_result_t>               remote_cache;
-		std::map<std::string, std::shared_ptr<install_request_t>>  install_pending;
-		std::set<std::string>                                      pending_uninstall;
+		std::string                                                pending_uninstall_skill;
+		std::uint64_t                                              pending_uninstall_generation = 0;
+		bool                                                       uninstall_dialog_requested = false;
 		bool                                                       preview_rendered = true;
 		int                                                        detail_preview_tab = 0;
 		float                                                      list_split = 0.32f;
 		float                                                      detail_split = 0.40f;
 		int                                                        last_skill_count = 0;
 		int64_t                                                    last_indexed_unix = 0;
-		std::string                                                cached_skill_name;
-		std::string                                                cached_skill_body;
-		std::vector<std::string>                                   cached_skill_hints;
-		bool                                                       refreshing = false;
+		std::uint64_t                                              observed_service_generation = 0;
+		std::string                                                requested_resolve_name;
 		std::unordered_map<std::string, row_anim_t>                row_anims;
 		float                                                      tab_underline_x = 0.f;
 		float                                                      tab_underline_w = 0.f;
@@ -132,28 +102,12 @@ namespace skill_manager {
 
 	inline const std::string& last_error()
 	{
-		std::lock_guard<std::mutex> lk(state_mutex());
 		return state().last_error;
 	}
 
 	inline void set_error(const std::string& msg)
 	{
-		std::lock_guard<std::mutex> lk(state_mutex());
 		state().last_error = msg;
-	}
-
-	inline bool submit_skill_task(const char* label,
-	                              aida::infra::executor::domain_t domain,
-	                              std::function<void()> body)
-	{
-		aida::infra::executor::submission_t sub;
-		sub.owner_subsystem = "ai_skill_manager";
-		sub.label = label;
-		sub.thread_class = "bounded_task";
-		sub.domain = domain;
-		sub.priority = 3;
-		sub.body = std::move(body);
-		return aida::infra::executor::submit(std::move(sub)).submitted;
 	}
 
 
@@ -229,23 +183,25 @@ namespace skill_manager {
 	inline std::vector<::aida::skills::skill_metadata_t> snapshot_filtered_for_view(
 		source_tab_t tab,
 		const std::string& filter_lower,
-		const std::string& agent_filter)
+		const std::string& agent_filter,
+		const aida::skill_manager_service::snapshot_ptr& publication)
 	{
-		std::vector<::aida::skills::skill_metadata_t> base;
-		if (!agent_filter.empty()) {
-			const auto ptrs = ::aida::skills::available_for_agent(agent_filter);
-			base.reserve(ptrs.size());
-			for (const auto* p : ptrs) {
-				if (p) base.push_back(*p);
-			}
-		} else {
-			base = ::aida::skills::all();
-		}
-
 		std::vector<::aida::skills::skill_metadata_t> out;
-		out.reserve(base.size());
-		for (const auto& m : base) {
+		if (!publication) return out;
+		out.reserve(publication->skills.size());
+		const auto* agent = agent_filter.empty() ? nullptr : ::aida::agent::get(agent_filter);
+		for (const auto& m : publication->skills) {
 			if (classify_skill(m) != tab) continue;
+			if (!agent_filter.empty()) {
+				if (publication->disabled.count(m.name) > 0) continue;
+				if (!m.agent_slugs.empty() && std::find(m.agent_slugs.begin(),
+					m.agent_slugs.end(), agent_filter) == m.agent_slugs.end()) continue;
+				if (agent != nullptr &&
+					(::aida::agent::evaluate_ruleset(agent->permissions, "skill", m.name) ==
+						::aida::agent::permission_rule_t::action_t::deny ||
+					 ::aida::agent::evaluate_ruleset(agent->permissions, "skill_path", m.file_path) ==
+						::aida::agent::permission_rule_t::action_t::deny)) continue;
+			}
 			if (!filter_lower.empty()) {
 				const std::string n = lower_copy(m.name);
 				const std::string d = lower_copy(m.description);
@@ -258,159 +214,28 @@ namespace skill_manager {
 		return out;
 	}
 
-
-	inline void start_remote_fetch(const std::string& url)
+	inline bool service_request(bool accepted, const std::string& error)
 	{
-		const bool posted = submit_skill_task(
-			"skill_manager.remote_fetch",
-			aida::infra::executor::domain_t::external_tool,
-			[url]() {
-			::aida::skills::remote_index_t idx;
-			std::string err;
-			const bool ok = ::aida::skills::fetch_remote_index(url, idx, 10000);
-			if (!ok) err = ::aida::skills::last_error();
-
-			std::lock_guard<std::mutex> lk(state_mutex());
-			auto& cache = state().remote_cache[url];
-			cache.url       = url;
-			cache.completed = true;
-			cache.success   = ok;
-			cache.error     = err;
-			cache.index     = std::move(idx);
-		});
-		if (!posted) {
-			std::lock_guard<std::mutex> lk(state_mutex());
-			auto& cache = state().remote_cache[url];
-			cache.url = url;
-			cache.completed = true;
-			cache.success = false;
-			cache.error = "failed to schedule remote skill index fetch";
-		}
+		if (accepted) return true;
+		toast_notification::push(error.empty() ? "Skills operation was rejected" : error,
+			toast_notification::toast_type_t::error, 5.f);
+		return false;
 	}
 
-	inline void start_install(const std::string& url, const std::string& name)
+	inline void request_reindex()
 	{
-		auto rec = std::make_shared<install_request_t>();
-		rec->url  = url;
-		rec->name = name;
-		{
-			std::lock_guard<std::mutex> lk(state_mutex());
-			state().install_pending[name] = rec;
-		}
-		const bool posted = submit_skill_task(
-			"skill_manager.install_remote",
-			aida::infra::executor::domain_t::external_tool,
-			[rec]() {
-			const bool ok = ::aida::skills::install_remote_skill(rec->url, rec->name);
-			if (!ok) rec->error = ::aida::skills::last_error();
-			rec->success.store(ok);
-			rec->completed.store(true);
-		});
-		if (!posted) {
-			rec->error = "failed to schedule remote skill install";
-			rec->success.store(false);
-			rec->completed.store(true);
-		}
-	}
-
-	inline void start_reindex()
-	{
-		state().refreshing = true;
-		const bool posted = submit_skill_task(
-			"skill_manager.reindex",
-			aida::infra::executor::domain_t::general,
-			[]() {
-			::aida::skills::reindex();
-			{
-				std::lock_guard<std::mutex> lk(state_mutex());
-				state().last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
-				state().refreshing = false;
-			}
-			toast_notification::push("Skills re-indexed",
-				toast_notification::toast_type_t::info, 2.5f);
-		});
-		if (!posted) {
-			state().refreshing = false;
-			toast_notification::push("Skills re-index failed",
-				toast_notification::toast_type_t::error, 4.0f);
-		}
-	}
-
-
-	inline void ensure_selected_cached()
-	{
-		std::string sel;
-		{
-			std::lock_guard<std::mutex> lk(state_mutex());
-			sel = state().selected_skill_name;
-			if (sel.empty()) {
-				state().cached_skill_name.clear();
-				state().cached_skill_body.clear();
-				state().cached_skill_hints.clear();
-				return;
-			}
-			if (state().cached_skill_name == sel) return;
-		}
-		const auto resolved = ::aida::skills::resolve(sel);
-		const auto hints = ::aida::skills::placeholder_hints_for(resolved.instructions);
-		std::lock_guard<std::mutex> lk(state_mutex());
-		state().cached_skill_name = sel;
-		state().cached_skill_body = resolved.instructions;
-		state().cached_skill_hints = hints;
-	}
-
-	inline void poll_pending_installs()
-	{
-		std::vector<std::shared_ptr<install_request_t>> done;
-		{
-			std::lock_guard<std::mutex> lk(state_mutex());
-			auto& pending = state().install_pending;
-			for (auto it = pending.begin(); it != pending.end(); ) {
-				if (it->second->completed.load()) {
-					done.push_back(it->second);
-					it = pending.erase(it);
-				} else {
-					++it;
-				}
-			}
-		}
-		for (const auto& r : done) {
-			if (r->success.load()) {
-				toast_notification::push("Installed skill: " + r->name,
-					toast_notification::toast_type_t::info, 4.0f);
-				::aida::skills::reindex();
-			} else {
-				toast_notification::push("Install failed: " + truncate_text(r->error, 200),
-					toast_notification::toast_type_t::error, 6.0f);
-			}
-		}
-	}
-
-	inline void poll_pending_remote_fetches()
-	{
-		std::vector<remote_fetch_result_t> snapshots;
-		{
-			std::lock_guard<std::mutex> lk(state_mutex());
-			for (auto& kv : state().remote_cache) {
-				if (kv.second.completed && !kv.second.error.empty()) {
-					snapshots.push_back(kv.second);
-					kv.second.error.clear();
-				}
-			}
-		}
-		for (const auto& s : snapshots) {
-			toast_notification::push("Index fetch failed: " + truncate_text(s.error, 200),
-				toast_notification::toast_type_t::error, 5.0f);
-		}
+		std::string error;
+		const bool accepted = aida::skill_manager_service::request_reindex(&error);
+		service_request(accepted, error);
 	}
 
 
 	inline void initialize()
 	{
-		std::lock_guard<std::mutex> lk(state_mutex());
 		auto& s = state();
 		if (s.initialized) return;
 		s.initialized = true;
+		aida::skill_manager_service::begin_frame();
 		s.active_tab = source_tab_t::built_in;
 		s.selected_skill_name.clear();
 		s.list_split = 0.32f;
@@ -420,13 +245,11 @@ namespace skill_manager {
 
 	inline void shutdown()
 	{
-		std::lock_guard<std::mutex> lk(state_mutex());
 		auto& s = state();
-		s.shutdown_flag.store(true);
 		s.initialized = false;
-		s.remote_cache.clear();
-		s.install_pending.clear();
-		s.pending_uninstall.clear();
+		s.pending_uninstall_skill.clear();
+		s.pending_uninstall_generation = 0;
+		s.uninstall_dialog_requested = false;
 		s.row_anims.clear();
 	}
 
@@ -458,7 +281,6 @@ namespace skill_manager {
 			std::memcpy(search_local, st.search_buf, sizeof(search_local));
 			if (aida::ui::input_text("##sm_search", search_local, sizeof(search_local),
 					"Filter skills", false, ImVec2(full_w, ctl_h))) {
-				std::lock_guard<std::mutex> lk(state_mutex());
 				std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
 			}
 
@@ -487,13 +309,15 @@ namespace skill_manager {
 				ImGui::SameLine(0.f, gap);
 			else
 				ImGui::SetCursorScreenPos(ImVec2(root_x + pad, row2_y + ctl_h + 6.f));
-			bool refreshing_local = st.refreshing;
+			const auto publication = aida::skill_manager_service::snapshot();
+			bool refreshing_local = publication && publication->state ==
+				aida::skill_manager_service::operation_state_t::loading;
 			if (aida::ui::button("Refresh##sm",
 					aida::ui::button_kind_t::secondary,
 					aida::ui::size_t_::sm,
 					ImVec2(compact_refresh_w, ctl_h),
 					false, nullptr, refreshing_local)) {
-				start_reindex();
+				request_reindex();
 			}
 
 			const float row3_y = row2_y + (stack_all ? (ctl_h + 6.f) * 2.f : ctl_h + 6.f);
@@ -514,16 +338,11 @@ namespace skill_manager {
 					ImVec2(compact_add_w, ctl_h))) {
 				std::string url(st.add_url_buf);
 				if (!url.empty()) {
-					if (::aida::skills::add_remote_url(url)) {
-						toast_notification::push("Remote URL added",
-							toast_notification::toast_type_t::info, 3.0f);
+					std::string error;
+					const bool accepted = aida::skill_manager_service::request_add_remote_url(url, &error);
+					if (service_request(accepted, error)) {
 						std::memset(st.add_url_buf, 0, sizeof(st.add_url_buf));
 						st.active_tab = source_tab_t::remote;
-						start_remote_fetch(url);
-					} else {
-						toast_notification::push("Add URL failed: " +
-							truncate_text(::aida::skills::last_error(), 160),
-							toast_notification::toast_type_t::error, 5.0f);
 					}
 				}
 			}
@@ -536,7 +355,6 @@ namespace skill_manager {
 		std::memcpy(search_local, st.search_buf, sizeof(search_local));
 		if (aida::ui::input_text("##sm_search", search_local, sizeof(search_local),
 				"Filter skills", false, ImVec2(search_w, ctl_h))) {
-			std::lock_guard<std::mutex> lk(state_mutex());
 			std::memcpy(st.search_buf, search_local, sizeof(st.search_buf));
 		}
 
@@ -561,13 +379,15 @@ namespace skill_manager {
 		ImGui::PopItemWidth();
 
 		ImGui::SameLine(0.f, gap);
-		bool refreshing_local = st.refreshing;
+		const auto publication = aida::skill_manager_service::snapshot();
+		bool refreshing_local = publication && publication->state ==
+			aida::skill_manager_service::operation_state_t::loading;
 		if (aida::ui::button("Refresh##sm",
 				aida::ui::button_kind_t::secondary,
 				aida::ui::size_t_::sm,
 				ImVec2(refresh_w, ctl_h),
 				false, nullptr, refreshing_local)) {
-			start_reindex();
+			request_reindex();
 		}
 
 		float url_w = url_w_full;
@@ -593,16 +413,11 @@ namespace skill_manager {
 				ImVec2(addurl_w, ctl_h))) {
 			std::string url(st.add_url_buf);
 			if (!url.empty()) {
-				if (::aida::skills::add_remote_url(url)) {
-					toast_notification::push("Remote URL added",
-						toast_notification::toast_type_t::info, 3.0f);
+				std::string error;
+				const bool accepted = aida::skill_manager_service::request_add_remote_url(url, &error);
+				if (service_request(accepted, error)) {
 					std::memset(st.add_url_buf, 0, sizeof(st.add_url_buf));
 					st.active_tab = source_tab_t::remote;
-					start_remote_fetch(url);
-				} else {
-					toast_notification::push("Add URL failed: " +
-						truncate_text(::aida::skills::last_error(), 160),
-						toast_notification::toast_type_t::error, 5.0f);
 				}
 			}
 		}
@@ -763,6 +578,9 @@ namespace skill_manager {
 	inline void render_left_column(float x, float y, float w, float h, float dt)
 	{
 		auto& st = state();
+		const auto publication = aida::skill_manager_service::snapshot();
+		const bool operation_pending = publication && publication->state ==
+			aida::skill_manager_service::operation_state_t::loading;
 		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
 		render_tab_strip(x, y, w, dt);
@@ -779,18 +597,10 @@ namespace skill_manager {
 			ImGuiWindowFlags_NoSavedSettings);
 
 		const std::string filter_lower = lower_copy(std::string(st.search_buf));
-		std::string agent_snapshot;
-		{
-			std::lock_guard<std::mutex> lk(state_mutex());
-			agent_snapshot = st.agent_filter;
-		}
-		auto filtered = snapshot_filtered_for_view(st.active_tab, filter_lower, agent_snapshot);
-
-		std::set<std::string> disabled_snapshot;
-		{
-			const auto disabled_list = ::aida::skills::list_disabled();
-			for (const auto& n : disabled_list) disabled_snapshot.insert(n);
-		}
+		auto filtered = snapshot_filtered_for_view(st.active_tab, filter_lower,
+			st.agent_filter, publication);
+		const std::set<std::string> empty_disabled;
+		const auto& disabled_snapshot = publication ? publication->disabled : empty_disabled;
 
 		auto* dl = ImGui::GetWindowDrawList();
 		const float row_h = 76.f;
@@ -815,11 +625,7 @@ namespace skill_manager {
 			const bool sel = (st.selected_skill_name == m.name);
 			const bool en = (disabled_snapshot.count(m.name) == 0);
 
-			row_anim_t* ra = nullptr;
-			{
-				std::lock_guard<std::mutex> lk(state_mutex());
-				ra = &st.row_anims[m.name];
-			}
+			row_anim_t* ra = &st.row_anims[m.name];
 
 			ImGui::PushID(m.name.c_str());
 			ImGui::SetNextItemAllowOverlap();
@@ -827,9 +633,13 @@ namespace skill_manager {
 			bool hov = ImGui::IsItemHovered();
 			bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 			bool right   = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-			bool keyboard_context = sel && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-				(ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-				 (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
+			const bool menu_key_context = sel &&
+				ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+				ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+			const bool shift_f10_context = !menu_key_context && sel &&
+				ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+				ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+			const bool keyboard_context = menu_key_context || shift_f10_context;
 			ImGui::PopID();
 
 			float hov_v = ra->hover.tick(hov, dt, aida::motion::spring::playful);
@@ -842,9 +652,14 @@ namespace skill_manager {
 			ImGui::SetCursorScreenPos(ImVec2(tog_x, tog_y));
 			ImGui::PushID((std::string("tog_") + m.name).c_str());
 			bool en_local = en;
+			ImGui::BeginDisabled(operation_pending);
 			if (aida::ui::toggle_switch("##en", &en_local, aida::ui::size_t_::sm)) {
-				::aida::skills::set_enabled(m.name, en_local);
+				std::string error;
+				const bool accepted = aida::skill_manager_service::request_set_enabled(
+					m.name, en_local, &error);
+				service_request(accepted, error);
 			}
+			ImGui::EndDisabled();
 			ImGui::PopID();
 			(void)th;
 
@@ -853,40 +668,90 @@ namespace skill_manager {
 				mp.y >= tog_y - 4.f && mp.y <= tog_y + 24.f);
 			if (clicked && !on_toggle) {
 				st.selected_skill_name = m.name;
-			}
-			if (right || keyboard_context) ImGui::OpenPopup("##sm_row_ctx");
-
-			if (ImGui::BeginPopup("##sm_row_ctx")) {
-				if (ImGui::MenuItem("Copy Skill Name")) ImGui::SetClipboardText(m.name.c_str());
-				if (ImGui::MenuItem("Copy Skill Path")) ImGui::SetClipboardText(m.file_path.c_str());
-				ImGui::Separator();
-				if (ImGui::MenuItem("Open file")) open_path_in_shell(m.file_path, true);
-				if (ImGui::MenuItem("Reload")) ::aida::skills::reindex();
-				if (ImGui::MenuItem(en ? "Disable" : "Enable")) {
-					::aida::skills::set_enabled(m.name, !en);
+				if (!publication || publication->resolved_name != m.name) {
+					std::string error;
+					const bool accepted = aida::skill_manager_service::request_resolve(m.name, &error);
+					if (service_request(accepted, error)) st.requested_resolve_name = m.name;
 				}
-				if (m.source == "remote") {
-					if (ImGui::MenuItem("Delete")) {
-						if (::aida::skills::uninstall_remote_skill(m.name)) {
-							toast_notification::push("Uninstalled: " + m.name,
-								toast_notification::toast_type_t::info, 3.0f);
-							if (st.selected_skill_name == m.name)
-								st.selected_skill_name.clear();
-						} else {
-							toast_notification::push("Uninstall failed: " +
-								truncate_text(::aida::skills::last_error(), 180),
-								toast_notification::toast_type_t::error, 5.0f);
-						}
-					}
-				} else {
-					ImGui::BeginDisabled();
-					ImGui::MenuItem("Delete");
-					ImGui::EndDisabled();
-					if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-						ImGui::SetTooltip("Built-in and local skills are source-managed; only installed remote skills can be uninstalled here");
-				}
-				ImGui::EndPopup();
 			}
+			if (right || keyboard_context) {
+				aida::ui::application_ui::retained_entity_context_t context;
+				context.owner_id = "ai.skill.catalog";
+				context.entity_id = m.name;
+				context.entity_generation = publication ? publication->generation : 0;
+				context.active_view = aida::ui::stable_view_id_t("view.ai.skills");
+				const auto retained_name = m.name;
+				const auto retained_path = m.file_path;
+				const auto retained_source = m.source;
+				const auto retained_generation = publication ? publication->generation : 0;
+				context.validate_identity = [retained_name, retained_path, retained_generation] {
+					const auto live = aida::skill_manager_service::snapshot();
+					const auto* current = aida::skill_manager_service::find(live, retained_name);
+					return live && live->generation == retained_generation && current &&
+							current->file_path == retained_path
+						? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable(
+							"The skill catalog changed; select the skill again");
+				};
+				const auto add = [&context](const char* id, bool enabled,
+						const char* reason,
+						std::function<aida::ui::action_handler_result_t()> invoke) {
+					aida::ui::application_ui::retained_entity_action_t action;
+					action.action_id = id;
+					action.capability = enabled
+						? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable(reason);
+					action.invoke = std::move(invoke);
+					context.actions.push_back(std::move(action));
+				};
+				add("ai.skill.copy_name", true, "", [retained_name] {
+					ImGui::SetClipboardText(retained_name.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.skill.copy_path", !retained_path.empty(),
+					"This skill has no source path", [retained_path] {
+					ImGui::SetClipboardText(retained_path.c_str());
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.skill.open_file", !retained_path.empty(),
+					"This skill has no source path", [retained_path] {
+					open_path_in_shell(retained_path, true);
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.skill.reload", !operation_pending,
+					"Wait for the active skill operation to finish", [] {
+					request_reindex();
+					return aida::ui::action_handler_result_t::completed();
+				});
+				add("ai.skill.toggle_enabled", !operation_pending,
+					"Wait for the active skill operation to finish", [retained_name, en] {
+					std::string error;
+					const bool accepted = aida::skill_manager_service::request_set_enabled(
+						retained_name, !en, &error);
+					return accepted ? aida::ui::action_handler_result_t::completed()
+						: aida::ui::action_handler_result_t::failed(error.empty()
+							? "The skill state change was rejected" : error);
+				});
+				add("ai.skill.uninstall_review", retained_source == "remote" && !operation_pending,
+					retained_source == "remote"
+						? "Wait for the active skill operation to finish"
+						: "Built-in and local skills are source-managed; only installed remote skills can be uninstalled here",
+					[retained_name, retained_generation] {
+						auto& live_state = state();
+						live_state.pending_uninstall_skill = retained_name;
+						live_state.pending_uninstall_generation = retained_generation;
+						live_state.uninstall_dialog_requested = true;
+						return aida::ui::action_handler_result_t::completed();
+					});
+				aida::ui::application_ui::open_retained_entity_context_menu(
+					std::move(context), right
+						? aida::ui::context_menu_open_origin_t::pointer
+						: menu_key_context
+						? aida::ui::context_menu_open_origin_t::menu_key
+						: aida::ui::context_menu_open_origin_t::shift_f10);
+			}
+			aida::ui::application_ui::render_retained_entity_context_menu(
+				"ai.skill.catalog");
 			ImGui::PopID();
 
 			ImGui::SetCursorScreenPos(ImVec2(sp.x, sp.y + row_h + row_gap));
@@ -908,7 +773,8 @@ namespace skill_manager {
 
 			ImGui::Dummy(ImVec2(0.f, 22.f));
 
-			const auto urls = ::aida::skills::list_remote_urls();
+			const std::vector<std::string> empty_urls;
+			const auto& urls = publication ? publication->remote_urls : empty_urls;
 			if (urls.empty()) {
 				const ImVec2 cs = ImGui::GetCursorScreenPos();
 				dl2->AddText(aida::ui::fonts::caption(), 14.f,
@@ -937,58 +803,47 @@ namespace skill_manager {
 				if (aida::ui::button("Fetch",
 						aida::ui::button_kind_t::secondary,
 						aida::ui::size_t_::sm,
-						ImVec2(60.f, 28.f))) {
-					start_remote_fetch(u);
+						ImVec2(60.f, 28.f), false, nullptr, operation_pending)) {
+					std::string error;
+					const bool accepted = aida::skill_manager_service::request_fetch_remote(u, &error);
+					service_request(accepted, error);
 				}
 				ImGui::SameLine(0.f, 4.f);
 				if (aida::ui::button("Remove",
 						aida::ui::button_kind_t::ghost,
 						aida::ui::size_t_::sm,
-						ImVec2(70.f, 28.f))) {
-					if (::aida::skills::remove_remote_url(u)) {
-						toast_notification::push("Removed remote URL",
-							toast_notification::toast_type_t::info, 3.0f);
-					} else {
-						toast_notification::push("Remove failed: " +
-							truncate_text(::aida::skills::last_error(), 160),
-							toast_notification::toast_type_t::error, 4.0f);
-					}
+						ImVec2(70.f, 28.f), false, nullptr, operation_pending)) {
+					std::string error;
+					const bool accepted = aida::skill_manager_service::request_remove_remote_url(u, &error);
+					service_request(accepted, error);
 				}
 
 				ImGui::SetCursorScreenPos(ImVec2(cs.x, cs.y + (compact_remote_row ? 58.f : 28.f)));
 
-				bool have_index = false;
-				remote_fetch_result_t snap;
-				{
-					std::lock_guard<std::mutex> lk(state_mutex());
-					auto it = state().remote_cache.find(u);
-					if (it != state().remote_cache.end()) {
-						snap = it->second;
-						have_index = snap.completed && snap.success;
-					}
+				const aida::skills::remote_index_t* remote_index = nullptr;
+				if (publication) {
+					const auto index_it = publication->remote_indices.find(u);
+					if (index_it != publication->remote_indices.end()) remote_index = &index_it->second;
 				}
-				if (have_index) {
-					for (const auto& e : snap.index.entries) {
+				if (remote_index) {
+					for (const auto& e : remote_index->entries) {
 						ImGui::PushID(e.name.c_str());
 						const ImVec2 ec = ImGui::GetCursorScreenPos();
 						dl2->AddText(aida::ui::fonts::caption(), 13.f,
 							ImVec2(ec.x + 16.f, ec.y + 2.f),
 							th.text_secondary, e.name.c_str());
 						ImGui::SetCursorScreenPos(ImVec2(ec.x + row_w_inner - 80.f, ec.y));
-						std::shared_ptr<install_request_t> req;
-						{
-							std::lock_guard<std::mutex> lk(state_mutex());
-							auto it2 = state().install_pending.find(e.name);
-							if (it2 != state().install_pending.end()) req = it2->second;
-						}
-						if (req) {
+						if (operation_pending && publication->operation == "Install remote skill") {
 							ImGui::TextUnformatted("Installing...");
 						} else {
 							if (aida::ui::button("Install",
 									aida::ui::button_kind_t::primary,
 									aida::ui::size_t_::sm,
-									ImVec2(74.f, 28.f))) {
-								start_install(u, e.name);
+									ImVec2(74.f, 28.f), false, nullptr, operation_pending)) {
+								std::string error;
+								const bool accepted = aida::skill_manager_service::request_install(
+									u, e.name, &error);
+								service_request(accepted, error);
 							}
 						}
 						ImGui::SetCursorScreenPos(ImVec2(ec.x, ec.y + 22.f));
@@ -1015,6 +870,9 @@ namespace skill_manager {
 	inline void render_middle_column(float x, float y, float w, float h,
 		const ::aida::skills::skill_metadata_t* meta, float alpha)
 	{
+		const auto publication = aida::skill_manager_service::snapshot();
+		const bool operation_pending = publication && publication->state ==
+			aida::skill_manager_service::operation_state_t::loading;
 		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
 		ImGui::BeginChild("##sm_detail_pane", ImVec2(w, h), true,
@@ -1082,12 +940,15 @@ namespace skill_manager {
 		}
 		if (!stack_skill_actions)
 			ImGui::SameLine(0.f, 6.f);
-		const bool en = ::aida::skills::is_enabled(meta->name);
+		const bool en = !publication || publication->disabled.count(meta->name) == 0;
 		if (aida::ui::button(en ? "Disable" : "Enable",
 				en ? aida::ui::button_kind_t::ghost : aida::ui::button_kind_t::primary,
 				aida::ui::size_t_::sm,
-				ImVec2(skill_action_w, 24.f))) {
-			::aida::skills::set_enabled(meta->name, !en);
+				ImVec2(skill_action_w, 24.f), false, nullptr, operation_pending)) {
+			std::string error;
+			const bool accepted = aida::skill_manager_service::request_set_enabled(
+				meta->name, !en, &error);
+			service_request(accepted, error);
 		}
 
 		float chip_y = cy + (stack_skill_actions ? 116.f : 60.f);
@@ -1118,11 +979,9 @@ namespace skill_manager {
 		dl->AddText(aida::ui::fonts::body_em(), 14.f,
 			ImVec2(cs.x + 12.f, ph_y), th.text_secondary, "Placeholder hints:");
 
-		std::vector<std::string> hints;
-		{
-			std::lock_guard<std::mutex> lk(state_mutex());
-			hints = state().cached_skill_hints;
-		}
+		const std::vector<std::string> empty_hints;
+		const auto& hints = publication && publication->resolved_name == meta->name
+			? publication->resolved_hints : empty_hints;
 		float hx = cs.x + 12.f;
 		float hy = ph_y + 22.f;
 		if (hints.empty()) {
@@ -1148,6 +1007,7 @@ namespace skill_manager {
 		const ::aida::skills::skill_metadata_t* meta, float alpha)
 	{
 		auto& st = state();
+		const auto publication = aida::skill_manager_service::snapshot();
 		const auto& th = aida::ui::resolved();
 		ImGui::SetCursorScreenPos(ImVec2(x, y));
 		ImGui::BeginChild("##sm_preview_pane", ImVec2(w, h), true,
@@ -1172,11 +1032,8 @@ namespace skill_manager {
 			return;
 		}
 
-		std::string body;
-		{
-			std::lock_guard<std::mutex> lk(state_mutex());
-			body = state().cached_skill_body;
-		}
+		const std::string body = publication && publication->resolved_name == meta->name
+			? publication->resolved_body : std::string{};
 
 		auto* idl = ImGui::GetWindowDrawList();
 		const ImVec2 ic = ImGui::GetCursorScreenPos();
@@ -1209,10 +1066,39 @@ namespace skill_manager {
 	{
 		auto& st = state();
 		if (!st.initialized) initialize();
-
-		poll_pending_installs();
-		poll_pending_remote_fetches();
-		ensure_selected_cached();
+		aida::skill_manager_service::begin_frame();
+		const auto publication = aida::skill_manager_service::snapshot();
+		if (publication && publication->generation != st.observed_service_generation) {
+			st.observed_service_generation = publication->generation;
+			if (publication->state == aida::skill_manager_service::operation_state_t::failed) {
+				st.requested_resolve_name.clear();
+				st.last_error = publication->detail;
+				toast_notification::push(publication->detail,
+					toast_notification::toast_type_t::error, 5.f);
+			} else if (publication->state ==
+				aida::skill_manager_service::operation_state_t::succeeded) {
+				st.last_error.clear();
+				st.last_indexed_unix = static_cast<int64_t>(std::time(nullptr));
+				if (!publication->operation.empty())
+					toast_notification::push(publication->detail,
+						toast_notification::toast_type_t::info, 3.5f);
+			}
+			if (!st.selected_skill_name.empty() &&
+				!aida::skill_manager_service::find(publication, st.selected_skill_name))
+				st.selected_skill_name.clear();
+		}
+		if (publication && !st.selected_skill_name.empty() &&
+			publication->resolved_name != st.selected_skill_name &&
+			publication->state != aida::skill_manager_service::operation_state_t::loading &&
+			st.requested_resolve_name != st.selected_skill_name) {
+			std::string error;
+			const bool accepted = aida::skill_manager_service::request_resolve(
+				st.selected_skill_name, &error);
+			if (service_request(accepted, error))
+				st.requested_resolve_name = st.selected_skill_name;
+		}
+		if (publication && publication->resolved_name == st.requested_resolve_name)
+			st.requested_resolve_name.clear();
 
 		const float dt = aida::ui::clock::dt();
 		const float alpha = 1.0f;
@@ -1235,6 +1121,15 @@ namespace skill_manager {
 			root_w < 520.f
 				? "Manage reusable analysis workflows."
 				: "Discover, filter, inspect, and manage reusable analysis workflows.");
+		if (publication && publication->state ==
+			aida::skill_manager_service::operation_state_t::loading)
+			root_dl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(root_x + 12.f, root_y + 43.f), aida::ui::resolved().info,
+				publication->operation.c_str());
+		else if (!st.last_error.empty())
+			root_dl->AddText(aida::ui::fonts::caption(), 12.f,
+				ImVec2(root_x + 12.f, root_y + 43.f), aida::ui::resolved().error,
+				st.last_error.c_str());
 
 		const float header_h = 54.f;
 		const float toolbar_h = 34.f;
@@ -1251,7 +1146,8 @@ namespace skill_manager {
 			return;
 		}
 
-		std::vector<::aida::skills::skill_metadata_t> all_for_lookup = ::aida::skills::all();
+		const std::vector<::aida::skills::skill_metadata_t> empty_skills;
+		const auto& all_for_lookup = publication ? publication->skills : empty_skills;
 		const ::aida::skills::skill_metadata_t* meta = nullptr;
 		if (!st.selected_skill_name.empty()) {
 			meta = find_meta_in_list(all_for_lookup, st.selected_skill_name);
@@ -1316,6 +1212,49 @@ namespace skill_manager {
 				render_right_column(root_x + pad, pane_y, stack_w, pane_h, meta, alpha);
 		}
 		ImGui::PopStyleColor(2);
+
+		if (st.uninstall_dialog_requested) {
+			aida::ui::design::open_dialog("skills.remote.uninstall", "Uninstall Remote Skill");
+			st.uninstall_dialog_requested = false;
+		}
+		if (aida::ui::design::begin_dialog("skills.remote.uninstall", "Uninstall Remote Skill",
+				ImVec2(520.f, 270.f), ImVec2(360.f, 230.f))) {
+			const bool skill_available = !st.pending_uninstall_skill.empty() &&
+				find_meta_in_list(all_for_lookup, st.pending_uninstall_skill) != nullptr;
+			const std::string target = skill_available
+				? st.pending_uninstall_skill : std::string("the selected remote skill");
+			aida::ui::design::confirmation_t confirmation;
+			confirmation.verb = "Uninstall";
+			confirmation.target = target.c_str();
+			confirmation.scope = "The installed remote skill and its local managed files";
+			confirmation.effect = "Removes this remote skill from AiDA and makes it unavailable to agents.";
+			confirmation.reversibility = "Reinstall the skill from its remote source to recover it.";
+			confirmation.prerequisite = skill_available ? nullptr :
+				"The selected remote skill is no longer installed; refresh the skill catalog.";
+			confirmation.confirm_label = "Uninstall Skill";
+			confirmation.destructive = true;
+			confirmation.confirm_enabled = skill_available;
+			const auto result = aida::ui::design::confirmation_dialog(
+				"skills.remote.uninstall.confirmation", confirmation);
+			if (result.confirmed && skill_available) {
+				const std::string skill_name = st.pending_uninstall_skill;
+				std::string error;
+				const bool accepted = aida::skill_manager_service::request_uninstall(
+					skill_name, st.pending_uninstall_generation, &error);
+				if (service_request(accepted, error)) {
+					if (st.selected_skill_name == skill_name)
+						st.selected_skill_name.clear();
+					st.pending_uninstall_skill.clear();
+					st.pending_uninstall_generation = 0;
+					ImGui::CloseCurrentPopup();
+				}
+			} else if (result.cancelled) {
+				st.pending_uninstall_skill.clear();
+				st.pending_uninstall_generation = 0;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::EndPopup();
+		}
 
 		ImGui::EndChild();
 	}

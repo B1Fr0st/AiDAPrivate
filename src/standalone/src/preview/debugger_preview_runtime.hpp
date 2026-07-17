@@ -101,9 +101,9 @@ inline void initialize_fixture() {
 		{8132, 6420, 8, 2, 0x00007FFDA111C4E0}
 	};
 	state.breakpoints = {
-		{0x00007FF7A4C16A32, debugger_engine::bp_type_t::software, debugger_engine::bp_state_t::enabled, -1, 1, "license_gate", "rax == 1", "authorization branch", 4, 0x75, false, false, true, "", 0, 0, false, true, ""},
-		{0x00007FF7A4C1B420, debugger_engine::bp_type_t::hardware_execute, debugger_engine::bp_state_t::enabled, 0, 1, "decrypt_stage", "", "", 1, 0, false, false, false, "", 0, 0, false, true, ""},
-		{0x00007FF7A4C208F0, debugger_engine::bp_type_t::hardware_write, debugger_engine::bp_state_t::disabled, 1, 8, "iat_write", "", "", 0, 0, false, false, false, "", 0, 0, false, true, ""}
+		{0x00007FF7A4C16A32, debugger_engine::bp_type_t::software, debugger_engine::bp_state_t::enabled, -1, 1, "license_gate", "rax == 1", "authorization branch", 4, 0x75, false, false, true, "", 0, 0, false, true, "", "", "", 0, 0},
+		{0x00007FF7A4C1B420, debugger_engine::bp_type_t::hardware_execute, debugger_engine::bp_state_t::enabled, 0, 1, "decrypt_stage", "", "", 1, 0, false, false, false, "", 0, 0, false, true, "", "", "", 0, 0},
+		{0x00007FF7A4C208F0, debugger_engine::bp_type_t::hardware_write, debugger_engine::bp_state_t::disabled, 1, 8, "iat_write", "", "", 0, 0, false, false, false, "", 0, 0, false, true, "", "", "", 0, 0}
 	};
 	state.call_stack = {
 		{0x00007FF7A4C16A32, 0x00007FF7A4C16B14, 0x00007FF7A4C00000, 0x001A0000, "sample.exe", "C:/Samples/sample.exe", "validate_license", 0x16A32, 0x00007FF7A4C169D0, 0x62, "pdb", "resolved"},
@@ -240,7 +240,7 @@ inline bool set_register(const std::string& name, std::uint64_t value) {
 	aida::preview::debugger::record("set_register", name + "=" + std::to_string(value));
 	return true;
 }
-inline int add_breakpoint(std::uint64_t address, bp_type_t type, const std::string& name, const std::string& condition, int size) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.push_back({address, type, bp_state_t::enabled, -1, size, name, condition, "", 0, 0, false, false, false, "", 0, 0, false, true, ""}); aida::preview::debugger::record("add_breakpoint", std::to_string(address)); return static_cast<int>(g_state.breakpoints.size() - 1); }
+inline int add_breakpoint(std::uint64_t address, bp_type_t type, const std::string& name, const std::string& condition, int size) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.push_back({address, type, bp_state_t::enabled, -1, size, name, condition, "", 0, 0, false, false, false, "", 0, 0, false, true, "", "", "", 0, 0}); aida::preview::debugger::record("add_breakpoint", std::to_string(address)); return static_cast<int>(g_state.breakpoints.size() - 1); }
 inline bool remove_breakpoint(int index) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; g_state.breakpoints.erase(g_state.breakpoints.begin() + index); aida::preview::debugger::record("remove_breakpoint", std::to_string(index)); return true; }
 inline bool toggle_breakpoint(int index) { std::lock_guard<std::mutex> lock(g_state.bp_mutex); if (index < 0 || index >= static_cast<int>(g_state.breakpoints.size())) return false; auto& state = g_state.breakpoints[static_cast<std::size_t>(index)].state; state = state == bp_state_t::disabled ? bp_state_t::enabled : bp_state_t::disabled; aida::preview::debugger::record("toggle_breakpoint", std::to_string(index)); return true; }
 inline void clear_all_breakpoints() { std::lock_guard<std::mutex> lock(g_state.bp_mutex); g_state.breakpoints.clear(); aida::preview::debugger::record("clear_breakpoints"); }

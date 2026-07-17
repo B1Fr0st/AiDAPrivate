@@ -1,4 +1,5 @@
 #include "context_menu_renderer.hpp"
+#include "application_ui_runtime.hpp"
 
 #include "imgui/imgui.h"
 #include "../../preview/studio_semantics.hpp"
@@ -47,7 +48,7 @@ context_menu_render_result_t render_context_menu_popup(
             const std::string semantic_id = aida::preview::semantics::stable_id(
                 "aida.context", request.menu.value() + "." + action.action.value());
             aida::preview::semantics::register_last_item(
-                semantic_id, "context-menu-action");
+                semantic_id, "context-menu-action", false, !action.enabled);
 #endif
             if (!action.enabled) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
@@ -66,6 +67,8 @@ context_menu_render_result_t render_context_menu_popup(
             result.execution = presenter.execute(request, action.action, invocation);
             result.action = action.action;
             result.executed = result.execution.executed();
+            application_ui::publish_action_execution_failure(action.action.c_str(),
+                result.execution, action_invocation_source_t::context_menu);
             if (!action.close_menu_on_execute)
                 ImGui::OpenPopup(popup_id);
         }

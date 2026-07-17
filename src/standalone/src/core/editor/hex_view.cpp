@@ -9,8 +9,15 @@
 #endif
 #include "../ui/components.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
 #include "../ui/metrics.hpp"
+#include "../ui/task_center.hpp"
 #include "../ui/theme.hpp"
+#include "../infra/executor.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../ui/ui_thread_dispatcher.hpp"
+#endif
 
 #include "imgui/imgui.h"
 
@@ -61,6 +68,12 @@ struct state_t {
     std::vector<std::uint64_t> search_matches;
     std::string search_last_query;
     bool search_last_hex = true;
+    std::uint64_t context_offset = 0;
+    std::uint64_t context_generation = 0;
+    std::uint64_t context_overlay_revision = 0;
+    std::uint8_t context_value = 0;
+    bool context_live = false;
+    bool context_valid = false;
 };
 
 enum class source_kind_t : std::uint8_t {
@@ -85,6 +98,10 @@ struct workspace_hex_state_t final : aida::analysis::workspace_lifecycle_partici
     std::shared_ptr<aida::analysis::cancellation_source_t> search_cancellation;
     std::atomic<std::uint64_t> search_serial{1};
     std::atomic<bool> searching{false};
+    std::atomic<bool> live_loading{false};
+    std::atomic<std::uint64_t> live_request_serial{0};
+    std::atomic<std::uint64_t> live_dispatch_failure_serial{0};
+    std::shared_ptr<std::atomic<bool>> live_cancellation;
     std::atomic<bool> cancelled{false};
     std::atomic<std::uint32_t> pending_jobs{0};
     std::mutex drain_mutex;
@@ -149,6 +166,9 @@ void workspace_hex_state_t::request_cancel() noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         search = search_cancellation;
         search_cancellation.reset();
+        if (live_cancellation)
+            live_cancellation->store(true, std::memory_order_release);
+        live_cancellation.reset();
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
         patch = patch_job;
         search_task = search_job;
@@ -159,6 +179,8 @@ void workspace_hex_state_t::request_cancel() noexcept {
         window_size = 0;
         live_bytes.clear();
     }
+    live_loading.store(false, std::memory_order_release);
+    live_request_serial.fetch_add(1, std::memory_order_acq_rel);
     if (search)
         search->request_cancel();
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -735,6 +757,11 @@ void copy_selection(const disasm_view::workspace_context_t& context,
     ImGui::SetClipboardText(text.c_str());
 }
 
+bool context_key_pressed() {
+    return ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
+        (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
+}
+
 }
 
 void activate(const disasm_view::workspace_context_t& context) {
@@ -742,6 +769,11 @@ void activate(const disasm_view::workspace_context_t& context) {
     if (!state)
         return;
     std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->live_cancellation)
+        state->live_cancellation->store(true, std::memory_order_release);
+    state->live_cancellation.reset();
+    state->live_request_serial.fetch_add(1, std::memory_order_acq_rel);
+    state->live_loading.store(false, std::memory_order_release);
     state->source_kind = source_kind_t::workspace_provider;
     state->live_bytes.clear();
     state->live_base = 0;
@@ -757,8 +789,32 @@ void activate(const disasm_view::workspace_context_t& context) {
     state->error.clear();
 }
 
-bool read_live_memory(const disasm_view::workspace_context_t& context,
-                      std::uint64_t address, std::size_t size) {
+bool focus_address(const disasm_view::workspace_context_t& context,
+                   const aida::analysis::address_t& address,
+                   std::string* error) {
+    auto state = state_for(context);
+    if (!state) {
+        if (error) *error = "The selected workspace has no hex provider.";
+        return false;
+    }
+    const auto offset = disasm_view::provider_offset(context, address);
+    if (!offset || *offset >= context.workspace->provider().size() ||
+        *offset > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())) {
+        if (error) *error = "The selected address has no mapped file or provider offset.";
+        return false;
+    }
+    activate(context);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->scroll_to_offset = *offset;
+    state->ui.sel_start = static_cast<std::int64_t>(*offset);
+    state->ui.sel_end = static_cast<std::int64_t>(*offset);
+    state->error.clear();
+    if (error) error->clear();
+    return true;
+}
+
+bool request_live_memory(const disasm_view::workspace_context_t& context,
+                         std::uint64_t address, std::size_t size) {
     auto state = state_for(context);
     if (!state)
         return false;
@@ -770,32 +826,155 @@ bool read_live_memory(const disasm_view::workspace_context_t& context,
         return false;
     }
     const std::uint32_t pid = context.workspace->identity().process()->pid;
-    std::vector<std::uint8_t> bytes;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    bytes = aida::preview::hex::live_memory(pid, address, size);
-    if (bytes.size() != size) {
-#else
-    if (!driver_bridge::read_memory_for(pid, address, size, bytes) || bytes.size() != size) {
-#endif
+    const std::uint64_t generation = context.workspace->generation();
+    const std::uint64_t serial = state->live_request_serial.fetch_add(1,
+        std::memory_order_acq_rel) + 1;
+    auto cancellation = std::make_shared<std::atomic<bool>>(false);
+    const std::string task_id = "hex.live." + context.workspace->identity().binary_id().to_hex() +
+        "." + std::to_string(serial);
+    {
         std::lock_guard<std::mutex> lock(state->mutex);
-        state->error = "IO_FAILURE: bounded live-memory read failed";
+        if (state->live_cancellation)
+            state->live_cancellation->store(true, std::memory_order_release);
+        state->live_cancellation = cancellation;
+        state->source_kind = source_kind_t::live_memory;
+        state->live_bytes.clear();
+        state->live_base = address;
+        state->ui.base_addr = address;
+        state->ui.source_name = context.workspace->identity().bin_name() + " memory";
+        state->ui.active = true;
+        state->ui.sel_start = -1;
+        state->ui.sel_end = -1;
+        state->window = {};
+        state->window_size = 0;
+        state->patches.clear();
+        state->error.clear();
+    }
+    state->live_loading.store(true, std::memory_order_release);
+
+    aida::ui::task_center::task_registration_t registration;
+    registration.id = task_id;
+    registration.source = "hex_view";
+    registration.owner = "Hex Editor";
+    registration.owner_view = "document.hex";
+    registration.owner_action = "Open live memory";
+    registration.target = "PID " + std::to_string(pid);
+    registration.label = "Read live memory";
+    registration.stage = "Queued bounded read";
+    char range_label[80]{};
+    std::snprintf(range_label, sizeof(range_label), "0x%016llX (%zu bytes)",
+        static_cast<unsigned long long>(address), size);
+    registration.affected_entity = range_label;
+    registration.cancellation_is_safe = true;
+    registration.callbacks.cancel = [cancellation] {
+        bool expected = false;
+        return cancellation->compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel);
+    };
+    if (!aida::ui::task_center::register_task(std::move(registration))) {
+        cancellation->store(true, std::memory_order_release);
+        state->live_loading.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = "TASK_OWNERSHIP_FAILURE: Task Center rejected the live-memory read";
         return false;
     }
-    if (!state_matches(context, state))
+
+    auto result = std::make_shared<std::vector<std::uint8_t>>();
+    auto failure = std::make_shared<std::string>();
+    auto workspace = context.workspace;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "hex_view";
+    submission.label = "hex.live_memory.read";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 4;
+    submission.target_pid = pid;
+    submission.generation = generation;
+    submission.cancel_hook = [cancellation] {
+        cancellation->store(true, std::memory_order_release);
+    };
+    submission.body = [state, workspace, cancellation, result, failure, task_id,
+        pid, address, size, generation, serial]() {
+        static_cast<void>(aida::ui::task_center::update_task(task_id,
+            aida::ui::task_center::task_state_t::running, 0.1f,
+            "Reading exact bounded range"));
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        pending_job_t pending(state);
+#endif
+        if (cancellation->load(std::memory_order_acquire)) {
+            *failure = "CANCELLED: live-memory read was cancelled";
+        } else {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            *result = aida::preview::hex::live_memory(pid, address, size);
+            if (result->size() != size)
+                *failure = "IO_FAILURE: Studio fixture did not provide the exact requested byte count";
+#else
+            if (!driver_bridge::read_memory_for(pid, address, size, *result) ||
+                result->size() != size)
+                *failure = "IO_FAILURE: bounded live-memory read failed or returned a partial range";
+#endif
+        }
+        if (cancellation->load(std::memory_order_acquire) && failure->empty())
+            *failure = "CANCELLED: live-memory read was cancelled";
+        auto publish = [state, workspace, cancellation, result, failure, task_id,
+            pid, address, generation, serial]() {
+            const auto process = workspace ? workspace->identity().process() : std::nullopt;
+            const bool current = workspace && !workspace->closing() && !workspace->closed() &&
+                workspace->generation() == generation && process && process->pid == pid &&
+                state->live_request_serial.load(std::memory_order_acquire) == serial &&
+                !state->cancelled.load(std::memory_order_acquire);
+            if (!current) {
+                if (state->live_request_serial.load(std::memory_order_acquire) == serial)
+                    state->live_loading.store(false, std::memory_order_release);
+                static_cast<void>(aida::ui::task_center::update_task(task_id,
+                    aida::ui::task_center::task_state_t::cancelled, 1.0f,
+                    "Discarded stale publication", "Workspace, target, or request changed"));
+                return;
+            }
+            state->live_loading.store(false, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (cancellation->load(std::memory_order_acquire) || !failure->empty()) {
+                state->error = failure->empty() ? "CANCELLED: live-memory read was cancelled" : *failure;
+                static_cast<void>(aida::ui::task_center::update_task(task_id,
+                    cancellation->load(std::memory_order_acquire)
+                        ? aida::ui::task_center::task_state_t::cancelled
+                        : aida::ui::task_center::task_state_t::failed,
+                    1.0f, "Live-memory read did not publish", state->error));
+                return;
+            }
+            state->live_bytes = std::move(*result);
+            state->live_base = address;
+            state->error.clear();
+            static_cast<void>(aida::ui::task_center::update_task(task_id,
+                aida::ui::task_center::task_state_t::completed, 1.0f,
+                "Exact range published", std::to_string(state->live_bytes.size()) + " bytes"));
+        };
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        publish();
+#else
+        if (!aida::ui_thread::post(std::move(publish), "hex_view",
+                "publish_live_memory", "worker_completion")) {
+            state->live_dispatch_failure_serial.store(serial, std::memory_order_release);
+            state->live_loading.store(false, std::memory_order_release);
+            static_cast<void>(aida::ui::task_center::update_task(task_id,
+                aida::ui::task_center::task_state_t::failed, 1.0f,
+                "UI publication rejected", "The UI dispatcher rejected the completed read"));
+        }
+#endif
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        cancellation->store(true, std::memory_order_release);
+        state->live_loading.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->error = "QUEUE_REJECTED: " + submitted.reject_reason;
+        }
+        static_cast<void>(aida::ui::task_center::update_task(task_id,
+            aida::ui::task_center::task_state_t::failed, 1.0f,
+            "Worker queue rejected", submitted.reject_reason));
         return false;
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->source_kind = source_kind_t::live_memory;
-    state->live_bytes = std::move(bytes);
-    state->live_base = address;
-    state->ui.base_addr = address;
-    state->ui.source_name = context.workspace->identity().bin_name() + " memory";
-    state->ui.active = true;
-    state->ui.sel_start = -1;
-    state->ui.sel_end = -1;
-    state->window = {};
-    state->window_size = 0;
-    state->patches.clear();
-    state->error.clear();
+    }
     return true;
 }
 
@@ -846,6 +1025,13 @@ void render(float, float, float width, float height,
     auto state = state_for(context);
     if (!state)
         return;
+    const std::uint64_t dispatch_failure = state->live_dispatch_failure_serial.exchange(
+        0, std::memory_order_acq_rel);
+    if (dispatch_failure != 0 &&
+        dispatch_failure == state->live_request_serial.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = "PUBLICATION_REJECTED: the UI dispatcher rejected the completed live-memory read";
+    }
     bool provider_source = false;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -1026,6 +1212,11 @@ void render(float, float, float width, float height,
         std::lock_guard<std::mutex> lock(state->mutex);
         error = state->error;
     }
+    const bool live_loading = state->live_loading.load(std::memory_order_acquire);
+    if (live_loading)
+        aida::ui::inline_notice("hex_live_loading", "Reading live memory",
+            "The exact bounded range is being read in the background. The previous snapshot is not reused.",
+            aida::ui::status_kind_t::info);
     if (!error.empty())
         aida::ui::inline_notice("hex_error", "Hex view unavailable", error.c_str(),
             aida::ui::status_kind_t::error);
@@ -1059,7 +1250,8 @@ void render(float, float, float width, float height,
     }
     if (byte_count == 0) {
         aida::ui::compact_empty_state("hex_source_empty", "No bytes available",
-            live_source ? "The selected memory snapshot does not contain readable bytes."
+            live_source && live_loading ? "Reading the selected live-memory range..."
+                        : live_source ? "The selected memory snapshot does not contain readable bytes."
                         : "The workspace provider has not published readable bytes.",
             nullptr, ImVec2(0.0f, 152.0f));
         ImGui::EndChild();
@@ -1087,6 +1279,8 @@ void render(float, float, float width, float height,
     const float row_height = (std::max)(aida::ui::metrics::table::compact_row_h,
         ImGui::GetTextLineHeightWithSpacing());
     clipper.Begin(row_count, row_height);
+    bool open_hex_context = false;
+    auto hex_context_origin = aida::ui::context_menu_open_origin_t::pointer;
     while (clipper.Step()) {
         const std::uint64_t begin = static_cast<std::uint64_t>(clipper.DisplayStart) * 16;
         const std::uint64_t end = (std::min)(byte_count,
@@ -1168,14 +1362,22 @@ void render(float, float, float width, float height,
                 }
                 if (patched)
                     ImGui::PopStyleColor();
-                if (ImGui::BeginPopupContextItem("##hex_actions")) {
-                    if (ImGui::MenuItem("Copy byte"))
-                        ImGui::SetClipboardText(encoded);
-                    if (!live_source && ImGui::MenuItem("Patch to 00")) {
-                        if (auto typed = normalized_address_for_file_offset(context, offset))
-                            disasm_view::queue_patch(context, *typed, {0});
-                    }
-                    ImGui::EndPopup();
+                const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                const bool keyboard_context = ImGui::IsItemFocused() && context_key_pressed();
+                if (pointer_context || keyboard_context) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->ui.sel_start = state->ui.sel_end = static_cast<std::int64_t>(offset);
+                    state->ui.context_offset = offset;
+                    state->ui.context_generation = context.publication ? context.publication->generation : 0;
+                    state->ui.context_overlay_revision = context.workspace->overlay_revision();
+                    state->ui.context_value = value;
+                    state->ui.context_live = live_source;
+                    state->ui.context_valid = true;
+                    open_hex_context = true;
+                    if (keyboard_context)
+                        hex_context_origin = ImGui::IsKeyPressed(ImGuiKey_Menu, false)
+                            ? aida::ui::context_menu_open_origin_t::menu_key
+                            : aida::ui::context_menu_open_origin_t::shift_f10;
                 }
                 ImGui::PopID();
                 ascii.push_back(value >= 0x20 && value <= 0x7E ? static_cast<char>(value) : '.');
@@ -1184,6 +1386,209 @@ void render(float, float, float width, float height,
             ImGui::TextUnformatted(ascii.c_str());
         }
     }
+    if (open_hex_context) {
+        state_t snapshot;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            snapshot.context_offset = state->ui.context_offset;
+            snapshot.context_generation = state->ui.context_generation;
+            snapshot.context_overlay_revision = state->ui.context_overlay_revision;
+            snapshot.context_value = state->ui.context_value;
+            snapshot.context_live = state->ui.context_live;
+            snapshot.context_valid = state->ui.context_valid;
+            snapshot.sel_start = state->ui.sel_start;
+            snapshot.sel_end = state->ui.sel_end;
+        }
+        const bool generation_current = snapshot.context_valid && context.publication &&
+            snapshot.context_generation == context.publication->generation;
+        const bool overlay_current = snapshot.context_live ||
+            snapshot.context_overlay_revision == context.workspace->overlay_revision();
+        const bool current = generation_current && overlay_current && snapshot.context_offset < byte_count;
+        const std::uint64_t selection_size = snapshot.sel_start >= 0 && snapshot.sel_end >= 0
+            ? static_cast<std::uint64_t>((std::max)(snapshot.sel_start, snapshot.sel_end) -
+                (std::min)(snapshot.sel_start, snapshot.sel_end)) + 1U : 0U;
+        const std::uint64_t display_address = snapshot.context_live
+            ? live_base + snapshot.context_offset
+            : display_address_for_file_offset(context, snapshot.context_offset).value_or(snapshot.context_offset);
+        const auto typed = snapshot.context_live
+            ? disasm_view::typed_address(context, display_address)
+            : normalized_address_for_file_offset(context, snapshot.context_offset);
+        const std::uint64_t selection_begin = snapshot.sel_start >= 0 && snapshot.sel_end >= 0
+            ? static_cast<std::uint64_t>((std::min)(snapshot.sel_start, snapshot.sel_end))
+            : snapshot.context_offset;
+        const auto patch_address = snapshot.context_live
+            ? std::optional<aida::analysis::address_t>{}
+            : normalized_address_for_file_offset(context, selection_begin);
+        const bool can_stage_overlay = current && !snapshot.context_live && typed.has_value();
+        const bool can_stage_selection = current && !snapshot.context_live &&
+            patch_address.has_value() && selection_size != 0 && selection_size <= 64U * 1024U;
+        const auto context_pid = snapshot.context_live ? get_attached_pid() : 0UL;
+        aida::ui::application_ui::retained_entity_context_t retained;
+        retained.owner_id = "hex.byte";
+        retained.entity_id = std::to_string(snapshot.context_offset);
+        retained.entity_generation = snapshot.context_generation;
+        retained.active_view = aida::ui::stable_view_id_t("document.hex");
+        retained.validate_identity = [state, context, snapshot, byte_count, context_pid]() {
+            if (!context.publication || context.publication->generation != snapshot.context_generation)
+                return aida::ui::capability_state_t::unavailable("The analysis publication changed; reopen the menu.");
+            if (snapshot.context_live && get_attached_pid() != context_pid)
+                return aida::ui::capability_state_t::unavailable("The live Hex target process changed; reopen the menu.");
+            if (!snapshot.context_live && context.workspace->overlay_revision() != snapshot.context_overlay_revision)
+                return aida::ui::capability_state_t::unavailable("The overlay revision changed; reopen the menu.");
+            if (snapshot.context_offset >= byte_count)
+                return aida::ui::capability_state_t::unavailable("The selected byte is outside the current source.");
+            std::lock_guard<std::mutex> lock(state->mutex);
+            const bool same = state->ui.context_valid && state->ui.context_offset == snapshot.context_offset &&
+                state->ui.context_generation == snapshot.context_generation &&
+                state->ui.sel_start == snapshot.sel_start && state->ui.sel_end == snapshot.sel_end;
+            return same ? aida::ui::capability_state_t::available()
+                : aida::ui::capability_state_t::unavailable("The byte selection changed; reopen the menu.");
+        };
+        auto add = [&](const char* id, bool enabled, const char* reason, auto invoke) {
+            retained.actions.push_back({id, enabled ? aida::ui::capability_state_t::available()
+                : aida::ui::capability_state_t::unavailable(reason), invoke});
+        };
+        add("hex.copy_byte", current, "The byte selection is stale; select it again.", [snapshot]() {
+            char encoded[4]{};
+            std::snprintf(encoded, sizeof(encoded), "%02X", snapshot.context_value);
+            ImGui::SetClipboardText(encoded);
+            return aida::ui::action_handler_result_t::completed();
+        });
+        add("hex.copy_selection", current && selection_size != 0 && selection_size <= (1ULL << 20),
+            !current ? "The byte selection is stale; select it again."
+                : selection_size > (1ULL << 20) ? "Clipboard selection is limited to 1 MiB."
+                : "No current byte range is selected.", [context, state]() {
+                copy_selection(context, state);
+                return aida::ui::action_handler_result_t::completed();
+            });
+        add("hex.copy_address", current, "The byte selection is stale.", [display_address]() {
+            char address[24]{};
+            std::snprintf(address, sizeof(address), "0x%016llX",
+                static_cast<unsigned long long>(display_address));
+            ImGui::SetClipboardText(address);
+            return aida::ui::action_handler_result_t::completed();
+        });
+        add("hex.open_disassembly", current && typed.has_value(),
+            !current ? "The byte selection is stale; select it again."
+                : "The selected byte has no current mapped analysis address.", [typed, context]() {
+                disasm_view::goto_address(*typed, context);
+                aida::ui::application_views::open_or_focus(
+                    aida::ui::stable_view_id_t("document.disassembly"));
+                return aida::ui::action_handler_result_t::completed();
+            });
+        add("hex.stage_zero_overlay", can_stage_overlay,
+            !current ? "The byte selection is stale; select it again."
+                : snapshot.context_live ? "Live memory writes require the reviewed Patches view."
+                : "The selected byte has no current mapped analysis address.", [typed, context]() {
+                if (!typed)
+                    return aida::ui::action_handler_result_t::failed(
+                        "The retained byte no longer has a mapped workspace address.");
+                std::string error;
+                if (!disasm_view::open_static_patch_review(context, *typed, 1,
+                        disasm_view::static_patch_mode_t::bytes, &error))
+                    return aida::ui::action_handler_result_t::failed(error);
+                std::lock_guard<std::mutex> lock(context.view->mutex);
+                context.view->static_patch_input.fill('\0');
+                context.view->static_patch_input[0] = '0';
+                context.view->static_patch_input[1] = '0';
+                context.view->static_patch_proposed.assign(1, 0);
+                context.view->static_patch_parse_error.clear();
+                return aida::ui::action_handler_result_t::completed();
+            });
+        add("hex.stage_patch_overlay", can_stage_selection,
+            !current ? "The byte selection is stale; select it again."
+                : snapshot.context_live ? "Live memory writes require the reviewed Debugger Patches view."
+                : selection_size > 64U * 1024U ? "Interactive overlay review is limited to 64 KiB."
+                : "Select a fully mapped provider-backed byte range.",
+            [patch_address, selection_size, context]() {
+                if (!patch_address)
+                    return aida::ui::action_handler_result_t::failed(
+                        "The retained selection no longer has a mapped workspace address.");
+                std::string error;
+                return disasm_view::open_static_patch_review(context, *patch_address,
+                    selection_size, disasm_view::static_patch_mode_t::bytes, &error)
+                    ? aida::ui::action_handler_result_t::completed()
+                    : aida::ui::action_handler_result_t::failed(error);
+            });
+        add("hex.stage_nop_overlay", can_stage_selection,
+            !current ? "The byte selection is stale; select it again."
+                : snapshot.context_live ? "Live memory writes require the reviewed Debugger Patches view."
+                : selection_size > 64U * 1024U ? "Interactive overlay review is limited to 64 KiB."
+                : "Select a fully mapped provider-backed byte range.",
+            [patch_address, selection_size, context]() {
+                if (!patch_address)
+                    return aida::ui::action_handler_result_t::failed(
+                        "The retained selection no longer has a mapped workspace address.");
+                std::string error;
+                return disasm_view::open_static_patch_review(context, *patch_address,
+                    selection_size, disasm_view::static_patch_mode_t::nop_fill, &error)
+                    ? aida::ui::action_handler_result_t::completed()
+                    : aida::ui::action_handler_result_t::failed(error);
+            });
+        char display_address_text[24]{};
+        char byte_text[4]{};
+        std::snprintf(display_address_text, sizeof(display_address_text), "0x%016llX",
+            static_cast<unsigned long long>(display_address));
+        std::snprintf(byte_text, sizeof(byte_text), "%02X", snapshot.context_value);
+        aida::automation_ui::entity_evidence::snapshot_t evidence;
+        evidence.workspace_id = snapshot.context_live
+            ? "pid:" + std::to_string(context_pid)
+            : context.workspace->identity().binary_id().to_hex();
+        evidence.source_view_id = "document.hex";
+        evidence.source_kind = snapshot.context_live ? "live_hex_byte" : "static_hex_byte";
+        evidence.entity_id = retained.entity_id;
+        evidence.display_label = std::string("Hex byte ") + display_address_text;
+        evidence.excerpt = "Source: " + std::string(snapshot.context_live
+            ? "live process" : "static analysis") +
+            "\nAddress: " + display_address_text +
+            "\nFile/source offset: " + std::to_string(snapshot.context_offset) +
+            "\nValue: " + byte_text +
+            "\nSelection bytes: " + std::to_string(selection_size) +
+            "\nOverlay revision: " + std::to_string(snapshot.context_overlay_revision) +
+            "\nPublication generation: " + std::to_string(snapshot.context_generation);
+        evidence.address = display_address;
+        evidence.revision = snapshot.context_overlay_revision;
+        evidence.generation = snapshot.context_generation;
+        evidence.sensitive = snapshot.context_live;
+        evidence.return_to_source = [state, context, snapshot, byte_count,
+            context_pid](std::string& reason) {
+            if (!context.publication || context.publication->generation != snapshot.context_generation ||
+                (!snapshot.context_live &&
+                    context.workspace->overlay_revision() != snapshot.context_overlay_revision) ||
+                (snapshot.context_live && get_attached_pid() != context_pid) ||
+                snapshot.context_offset >= byte_count) {
+                reason = "The Hex source, publication, or overlay changed; capture the byte again.";
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->ui.sel_start = snapshot.sel_start;
+                state->ui.sel_end = snapshot.sel_end;
+                state->ui.context_offset = snapshot.context_offset;
+                state->ui.context_generation = snapshot.context_generation;
+                state->ui.context_overlay_revision = snapshot.context_overlay_revision;
+                state->ui.context_value = snapshot.context_value;
+                state->ui.context_live = snapshot.context_live;
+                state->ui.context_valid = true;
+            }
+            const auto opened = aida::ui::application_views::open_or_focus(
+                aida::ui::stable_view_id_t("document.hex"));
+            if (!opened.ok()) {
+                reason = opened.detail;
+                return false;
+            }
+            reason.clear();
+            return true;
+        };
+        aida::automation_ui::entity_evidence::append_actions(retained,
+            std::move(evidence), current
+                ? aida::ui::capability_state_t::available()
+                : aida::ui::capability_state_t::unavailable(
+                    "The retained Hex byte or its publication changed; select it again."));
+        aida::ui::application_ui::open_retained_entity_context_menu(
+            std::move(retained), hex_context_origin);
+    }
+    aida::ui::application_ui::render_retained_entity_context_menu("hex.byte");
     ImGui::EndChild();
     ImGui::PopStyleColor();
     ImGui::EndChild();

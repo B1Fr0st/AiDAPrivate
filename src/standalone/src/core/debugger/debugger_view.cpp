@@ -13,6 +13,7 @@
 #include "debugger_view.hpp"
 #include "debugger_engine.hpp"
 #include "debugger_interaction_context.hpp"
+#include "source_debug_service.hpp"
 #include "spawn_target_dialog.hpp"
 #include "standalone_driver.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -26,7 +27,13 @@
 #include "memory_map_view.hpp"
 #include "../scanner/memory_interaction_context.hpp"
 #include "../ui/application_view_registry.hpp"
+#include "../ui/application_ui_runtime.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/task_center.hpp"
+#include "../ai/entity_evidence_handoff.hpp"
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+#include "../ui/ui_thread_dispatcher.hpp"
+#endif
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "thread_view.hpp"
 #endif
@@ -56,6 +63,7 @@
 #include "toast_notification.hpp"
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../session/analysis_session.hpp"
 #include "../analysis/stealth_engine.hpp"
@@ -66,6 +74,7 @@
 #include "imgui_internal.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cfloat>
@@ -76,11 +85,147 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cmath>
+#include <exception>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace debugger_view {
+
+namespace {
+
+std::atomic<bool> g_execution_command_pending{false};
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+std::atomic<bool> g_target_mutation_pending{false};
+#endif
+
+struct code_cave_result_t {
+	std::uint64_t address = 0;
+	std::size_t size = 0;
+	std::string module;
+};
+
+struct code_cave_publication_t {
+	std::uint64_t generation = 0;
+	std::uint32_t target_pid = 0;
+	std::uint64_t target_stop_generation = 0;
+	std::vector<code_cave_result_t> results;
+	std::string detail;
+};
+
+struct code_cave_search_state_t {
+	std::atomic<bool> pending{false};
+	char module_filter[128] = {};
+	char minimum_size[16] = "32";
+	int selected = -1;
+	bool open = false;
+	std::uint64_t visible_generation = 0;
+	std::string dialog_error;
+};
+
+code_cave_search_state_t g_code_cave_search;
+std::atomic<std::uint64_t> g_code_cave_publication_sequence{1};
+std::shared_ptr<const code_cave_publication_t> g_code_cave_publication =
+	std::make_shared<const code_cave_publication_t>();
+
+bool dispatch_patch_panel_command(patch_panel_command_t command, std::string* error);
+
+template <typename Fn>
+bool post_debugger_ui(Fn&& fn, const char* label) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	fn();
+	static_cast<void>(label);
+	return true;
+#else
+	return aida::ui_thread::post(std::forward<Fn>(fn), "debugger", label,
+		"worker_completion");
+#endif
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+const char* execution_command_label(execution_command_t command) {
+	switch (command) {
+		case execution_command_t::launch: return "Launch target";
+		case execution_command_t::run_continue: return "Continue target";
+		case execution_command_t::pause: return "Pause target";
+		case execution_command_t::step_over: return "Step over";
+		case execution_command_t::step_into: return "Step into";
+		case execution_command_t::step_out: return "Step out";
+		case execution_command_t::stop: return "Stop target";
+		case execution_command_t::restart: return "Restart target";
+		case execution_command_t::detach: return "Detach target";
+		case execution_command_t::toggle_breakpoint_at_instruction_pointer:
+			return "Toggle instruction-pointer breakpoint";
+	}
+	return "Debugger command";
+}
+#endif
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+bool write_file_atomic_exact(const std::string& destination,
+	const void* bytes, std::size_t size, std::string& error) {
+	if (destination.empty() || (bytes == nullptr && size != 0)) {
+		error = "Invalid export destination or payload";
+		return false;
+	}
+	const std::filesystem::path final_path(destination);
+	const std::filesystem::path temporary = final_path.wstring() + L".aida-tmp-" +
+		std::to_wstring(GetCurrentProcessId()) + L"-" +
+		std::to_wstring(GetTickCount64());
+	HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+		FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		error = "Could not create the temporary export file (Win32 " +
+			std::to_string(GetLastError()) + ")";
+		return false;
+	}
+	const auto* cursor = static_cast<const std::uint8_t*>(bytes);
+	std::size_t remaining = size;
+	bool ok = true;
+	while (remaining != 0) {
+		const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 1U << 20U));
+		DWORD written = 0;
+		if (!WriteFile(file, cursor, chunk, &written, nullptr) || written != chunk) {
+			error = "The export write was incomplete (Win32 " +
+				std::to_string(GetLastError()) + ")";
+			ok = false;
+			break;
+		}
+		cursor += written;
+		remaining -= written;
+	}
+	if (ok && !FlushFileBuffers(file)) {
+		error = "The export could not be flushed to disk (Win32 " +
+			std::to_string(GetLastError()) + ")";
+		ok = false;
+	}
+	CloseHandle(file);
+	if (ok && !MoveFileExW(temporary.c_str(), final_path.c_str(),
+		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+		error = "The completed export could not replace its destination (Win32 " +
+			std::to_string(GetLastError()) + ")";
+		ok = false;
+	}
+	if (!ok)
+		static_cast<void>(DeleteFileW(temporary.c_str()));
+	return ok;
+}
+#else
+bool write_file_atomic_exact(const std::string& destination,
+	const void*, std::size_t size, std::string& error) {
+	if (destination.empty()) {
+		error = "Preview export destination is empty";
+		return false;
+	}
+	aida::preview::debugger::record("atomic_export",
+		destination + ":" + std::to_string(size));
+	return true;
+}
+#endif
+
+}
 
 void register_debugger_task(const aida::infra::executor::submit_result_t& submitted,
 	const char* owner_view, const char* owner_action, const char* label,
@@ -99,10 +244,44 @@ void register_debugger_task(const aida::infra::executor::submit_result_t& submit
 	registration.cancellation_is_safe = cancellable;
 	const std::string focus_view = registration.owner_view;
 	registration.callbacks.focus = [focus_view]() {
-		aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(focus_view));
+		static_cast<void>(post_debugger_ui([focus_view]() {
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(focus_view));
+		}, "task_focus"));
 	};
 	static_cast<void>(aida::ui::task_center::register_executor_job(
 		submitted.task_id, std::move(registration)));
+}
+
+static void refresh_patch_stage_parse_cache() {
+	auto& ui = g_ui;
+	ui.patch_stage_parsed_bytes.clear();
+	ui.patch_stage_parse_valid = false;
+	const char* cursor = ui.patch_stage_bytes_buf;
+	while (*cursor != '\0') {
+		while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n')
+			++cursor;
+		if (*cursor == '\0') break;
+		if (cursor[1] == '\0' ||
+			!std::isxdigit(static_cast<unsigned char>(cursor[0])) ||
+			!std::isxdigit(static_cast<unsigned char>(cursor[1]))) {
+			ui.patch_stage_parsed_bytes.clear();
+			return;
+		}
+		char token[3] = {cursor[0], cursor[1], '\0'};
+		ui.patch_stage_parsed_bytes.push_back(
+			static_cast<std::uint8_t>(std::strtoul(token, nullptr, 16)));
+		cursor += 2;
+		if (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' &&
+			*cursor != '\r' && *cursor != '\n') {
+			ui.patch_stage_parsed_bytes.clear();
+			return;
+		}
+		if (ui.patch_stage_parsed_bytes.size() > 4096U) {
+			ui.patch_stage_parsed_bytes.clear();
+			return;
+		}
+	}
+	ui.patch_stage_parse_valid = !ui.patch_stage_parsed_bytes.empty();
 }
 
 bool stage_patch_review(std::uint64_t address, std::uint64_t extent,
@@ -118,9 +297,74 @@ bool stage_patch_review(std::uint64_t address, std::uint64_t extent,
 	g_ui.patch_stage_address = address;
 	g_ui.patch_stage_extent = extent;
 	g_ui.patch_stage_bytes_buf[0] = '\0';
+	g_ui.patch_stage_parsed_bytes.clear();
+	g_ui.patch_stage_parse_valid = false;
+	g_ui.patch_stage_exact = false;
+	g_ui.patch_stage_expected_pid = 0;
+	g_ui.patch_stage_expected_stop_generation = 0;
+	g_ui.patch_stage_expected_before.clear();
 	std::snprintf(g_ui.patch_stage_description_buf,
 		sizeof(g_ui.patch_stage_description_buf), "%s", description.c_str());
 	g_ui.patch_stage_open = true;
+	return true;
+}
+
+bool stage_exact_patch_review(std::uint64_t address,
+	const std::vector<std::uint8_t>& expected_before,
+	const std::vector<std::uint8_t>& reviewed_after,
+	std::uint32_t expected_pid,
+	const std::string& description, std::string* error) {
+	if (expected_before.empty() || reviewed_after.empty() ||
+		expected_before.size() != reviewed_after.size() || reviewed_after.size() > 4096U) {
+		if (error) *error = "An exact patch review requires matching before/after ranges from 1 to 4096 bytes.";
+		return false;
+	}
+	if (expected_pid == 0 || !driver_bridge::is_loaded() ||
+		driver_bridge::attached_pid() != expected_pid) {
+		if (error) *error = "The proposal process is no longer the attached live patch target.";
+		return false;
+	}
+	if (!stage_patch_review(address, reviewed_after.size(), description, error))
+		return false;
+	const std::string bytes = code_patcher::format_bytes(reviewed_after);
+	std::snprintf(g_ui.patch_stage_bytes_buf, sizeof(g_ui.patch_stage_bytes_buf), "%s",
+		bytes.c_str());
+	refresh_patch_stage_parse_cache();
+	g_ui.patch_stage_exact = true;
+	g_ui.patch_stage_expected_pid = expected_pid;
+	g_ui.patch_stage_expected_before = expected_before;
+	g_ui.active_tab = sub_tab_t::patches;
+	return true;
+}
+
+bool stage_nop_review(std::uint64_t address, std::uint64_t extent,
+	std::string* error) {
+	if (extent == 0 || extent > 4096) {
+		if (error) *error = "NOP review requires a selected instruction range from 1 to 4096 bytes.";
+		return false;
+	}
+	if (!stage_patch_review(address, extent, "Reviewed NOP fill", error))
+		return false;
+	std::string bytes;
+	bytes.reserve(static_cast<std::size_t>(extent) * 3U);
+	for (std::uint64_t index = 0; index < extent; ++index) {
+		if (index != 0) bytes.push_back(' ');
+		bytes.append("90");
+	}
+	std::snprintf(g_ui.patch_stage_bytes_buf, sizeof(g_ui.patch_stage_bytes_buf), "%s",
+		bytes.c_str());
+	refresh_patch_stage_parse_cache();
+	return true;
+}
+
+bool stage_breakpoint_definition(std::uint64_t address, std::string* error) {
+	if (address == 0) {
+		if (error) *error = "The selected item has no usable address.";
+		return false;
+	}
+	std::snprintf(g_ui.add_bp_addr_buf, sizeof(g_ui.add_bp_addr_buf), "%llX",
+		static_cast<unsigned long long>(address));
+	g_ui.active_tab = sub_tab_t::breakpoints;
 	return true;
 }
 
@@ -359,6 +603,8 @@ inline bool draw_row_bg(ImDrawList* dl, float x, float y, float w, float h,
 }
 
 execution_capability_t execution_capability(execution_command_t command) {
+	if (g_execution_command_pending.load(std::memory_order_acquire))
+		return {false, "Another debugger execution command is still pending"};
 	const std::uint32_t pid = driver_bridge::attached_pid();
 	const auto status = debugger_engine::g_state.status.load(std::memory_order_acquire);
 	const bool attached = pid != 0;
@@ -412,16 +658,183 @@ bool execute_command(execution_command_t command, std::string* error) {
 		return fail(capability.disabled_reason ? capability.disabled_reason : "Debugger command is unavailable");
 
 	const std::uint32_t pid = driver_bridge::attached_pid();
+	const auto request_launch_dialog = [] {
+		const auto context = disasm_view::capture_selected_workspace();
+		const std::string path = context.workspace
+			? context.workspace->identity().normalized_source_path() : std::string{};
+		if (!path.empty())
+			spawn_target_dialog::request_open(path);
+		else
+			spawn_target_dialog::request_open();
+	};
+	if (command == execution_command_t::launch ||
+		(command == execution_command_t::run_continue && pid == 0)) {
+		if (!spawn_target_dialog::is_open())
+			request_launch_dialog();
+		return true;
+	}
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	bool expected = false;
+	if (!g_execution_command_pending.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel))
+		return fail("Another debugger execution command is still pending");
+	const std::uint64_t generation = debugger_interaction::current_stop_generation();
+	struct command_result_t {
+		bool ok = false;
+		bool restart = false;
+		debugger_engine::dbg_status_t final_status = debugger_engine::dbg_status_t::idle;
+		std::string error;
+	};
+	auto result = std::make_shared<command_result_t>();
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "debugger";
+	submission.label = execution_command_label(command);
+	submission.thread_class = "debugger_target_control";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.target_pid = pid;
+	submission.generation = generation;
+	submission.ui_access_policy = "post_completion_only";
+	submission.failure_policy = "fail_closed";
+	submission.body = [command, pid, generation, result]() {
+		auto fail_worker = [&](std::string detail) {
+			result->error = std::move(detail);
+		};
+		if (driver_bridge::attached_pid() != pid ||
+			debugger_interaction::current_stop_generation() != generation) {
+			fail_worker("The target changed before the debugger command started");
+		} else {
+			switch (command) {
+				case execution_command_t::run_continue:
+					result->ok = debugger_engine::run_target();
+					break;
+				case execution_command_t::pause:
+					result->ok = debugger_engine::pause_target();
+					break;
+				case execution_command_t::step_over:
+					result->ok = debugger_engine::step_over();
+					break;
+				case execution_command_t::step_into:
+					result->ok = debugger_engine::step_into();
+					break;
+				case execution_command_t::step_out:
+					result->ok = debugger_engine::step_out();
+					break;
+				case execution_command_t::stop:
+				case execution_command_t::restart: {
+					HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+					if (process == nullptr) {
+						fail_worker("Windows denied access to terminate the target");
+						break;
+					}
+					const BOOL terminated = TerminateProcess(process, 0xDEADu);
+					const DWORD terminate_error = terminated ? ERROR_SUCCESS : GetLastError();
+					if (terminated)
+						static_cast<void>(WaitForSingleObject(process, 2000));
+					CloseHandle(process);
+					if (!terminated) {
+						char detail[96];
+						std::snprintf(detail, sizeof(detail),
+							"Target termination failed (Win32 %lu)",
+							static_cast<unsigned long>(terminate_error));
+						fail_worker(detail);
+						break;
+					}
+					stealth_engine::disable_for_detach(pid,
+						command == execution_command_t::restart
+							? "debugger_view.command_restart"
+							: "debugger_view.command_stop");
+					driver_bridge::detach();
+					if (driver_bridge::attached_pid() != 0) {
+						fail_worker("The target exited but the driver attachment did not clear");
+						break;
+					}
+					result->ok = true;
+					result->restart = command == execution_command_t::restart;
+					result->final_status = debugger_engine::dbg_status_t::terminated;
+					break;
+				}
+				case execution_command_t::detach:
+					stealth_engine::disable_for_detach(pid, "debugger_view.command_detach");
+					driver_bridge::detach();
+					if (driver_bridge::attached_pid() != 0)
+						fail_worker("The driver did not confirm target detachment");
+					else {
+						result->ok = true;
+						result->final_status = debugger_engine::dbg_status_t::idle;
+					}
+					break;
+				case execution_command_t::toggle_breakpoint_at_instruction_pointer: {
+					const std::uint64_t rip = debugger_engine::cached_registers().rip;
+					auto snapshot = debugger_engine::snapshot_breakpoints();
+					int existing = -1;
+					for (std::size_t index = 0; index < snapshot.size(); ++index) {
+						if (!snapshot[index].is_internal && snapshot[index].address == rip &&
+							snapshot[index].type == debugger_engine::bp_type_t::software) {
+							existing = static_cast<int>(index);
+							break;
+						}
+					}
+					result->ok = existing >= 0 ? debugger_engine::remove_breakpoint(existing)
+						: debugger_engine::add_breakpoint(rip) >= 0;
+					break;
+				}
+				case execution_command_t::launch:
+					break;
+			}
+			if (!result->ok && result->error.empty()) {
+				result->error = debugger_engine::last_error();
+				if (result->error.empty())
+					result->error = "The debugger engine rejected the command";
+			}
+		}
+		const bool posted = post_debugger_ui([result]() {
+			if (result->ok) {
+				if (result->final_status == debugger_engine::dbg_status_t::terminated ||
+					result->final_status == debugger_engine::dbg_status_t::idle)
+					debugger_engine::g_state.status.store(result->final_status,
+						std::memory_order_release);
+				debugger_interaction::advance_stop_generation();
+				if (result->restart && !spawn_target_dialog::is_open()) {
+					const auto context = disasm_view::capture_selected_workspace();
+					const std::string path = context.workspace
+						? context.workspace->identity().normalized_source_path() : std::string{};
+					if (path.empty()) spawn_target_dialog::request_open();
+					else spawn_target_dialog::request_open(path);
+				}
+			} else {
+				toast_notification::push(result->error,
+					toast_notification::toast_type_t::error);
+			}
+			g_execution_command_pending.store(false, std::memory_order_release);
+		}, "execution_completion");
+		if (!posted) {
+			g_execution_command_pending.store(false, std::memory_order_release);
+			throw std::runtime_error("Debugger command completion could not be published to the UI thread");
+		}
+		if (!result->ok)
+			throw std::runtime_error(result->error.empty()
+				? "Debugger command failed" : result->error);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		g_execution_command_pending.store(false, std::memory_order_release);
+		return fail("The debugger executor rejected the command: " + submitted.reject_reason);
+	}
+	register_debugger_task(submitted, "view.debug.cpu", "debugger.execution",
+		execution_command_label(command), false);
+	return true;
+#else
 	bool ok = false;
 	switch (command) {
 		case execution_command_t::launch:
 			if (!spawn_target_dialog::is_open())
-				spawn_target_dialog::request_open();
+				request_launch_dialog();
 			return true;
 		case execution_command_t::run_continue:
 			if (pid == 0) {
 				if (!spawn_target_dialog::is_open())
-					spawn_target_dialog::request_open();
+					request_launch_dialog();
 				return true;
 			}
 			ok = debugger_engine::run_target();
@@ -469,7 +882,7 @@ bool execute_command(execution_command_t command, std::string* error) {
 				std::memory_order_release);
 			debugger_interaction::advance_stop_generation();
 			if (command == execution_command_t::restart && !spawn_target_dialog::is_open())
-				spawn_target_dialog::request_open();
+				request_launch_dialog();
 			return true;
 		}
 		case execution_command_t::detach:
@@ -503,6 +916,73 @@ bool execute_command(execution_command_t command, std::string* error) {
 	}
 	debugger_interaction::advance_stop_generation();
 	return true;
+#endif
+}
+
+execution_capability_t patch_panel_capability(patch_panel_command_t command) {
+	if (command == patch_panel_command_t::stage)
+		return debugger_engine::cached_registers().rip != 0
+			? execution_capability_t{true, nullptr}
+			: execution_capability_t{false, "No current instruction address is available"};
+	if (command == patch_panel_command_t::find_code_caves) {
+		if (!driver_bridge::is_loaded() || driver_bridge::attached_pid() == 0)
+			return {false, "Attach a live target before searching for code caves"};
+		if (debugger_engine::g_state.status.load(std::memory_order_acquire) !=
+			debugger_engine::dbg_status_t::paused)
+			return {false, "Pause the attached target before searching for code caves"};
+		return g_code_cave_search.pending.load(std::memory_order_acquire)
+			? execution_capability_t{false, "A code-cave search is already running"}
+			: execution_capability_t{true, nullptr};
+	}
+	const auto snapshot = code_patcher::published_snapshot();
+	if (!snapshot)
+		return {false, "The immutable Patches publication is unavailable"};
+	if (code_patcher::g_state.publication_failure_generation.load(
+			std::memory_order_acquire) != 0)
+		return {false, "The Patches publication could not be refreshed; preserve the authoritative patch state and retry after memory pressure clears"};
+	switch (command) {
+		case patch_panel_command_t::stage:
+		case patch_panel_command_t::find_code_caves:
+			break;
+		case patch_panel_command_t::revert_all:
+			if (snapshot->total_count == 0)
+				return {false, "No patch definitions are available"};
+			return snapshot->total_count <= 65536U
+				? execution_capability_t{true, nullptr}
+				: execution_capability_t{false, "The patch set exceeds the 65,536-entry review bound"};
+		case patch_panel_command_t::save_patchset:
+			if (snapshot->total_count == 0)
+				return {false, "No patch definitions are available"};
+			return snapshot->total_count <= 4096U
+				? execution_capability_t{true, nullptr}
+				: execution_capability_t{false, "The patch set exceeds the 4,096-entry export bound"};
+	}
+	return {false, "Unknown Patches panel action"};
+}
+
+bool execute_patch_panel_command(patch_panel_command_t command, std::string* error) {
+	const auto capability = patch_panel_capability(command);
+	if (!capability.enabled) {
+		if (error) *error = capability.disabled_reason ? capability.disabled_reason
+			: "The Patches panel action is unavailable";
+		return false;
+	}
+	const bool was_open = aida::ui::application_views::is_open(
+		aida::ui::stable_view_id_t("view.debug.patches"));
+	const auto opened = aida::ui::application_views::open_or_focus(
+		aida::ui::stable_view_id_t("view.debug.patches"));
+	if (!opened.ok()) {
+		if (error) *error = opened.detail.empty()
+			? "The canonical Patches view could not be opened"
+			: opened.detail;
+		return false;
+	}
+	if (dispatch_patch_panel_command(command, error))
+		return true;
+	if (!was_open)
+		static_cast<void>(aida::ui::application_views::close(
+			aida::ui::stable_view_id_t("view.debug.patches")));
+	return false;
 }
 
 namespace {
@@ -515,24 +995,37 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 	bool running = (status == debugger_engine::dbg_status_t::running);
 	bool paused  = (status == debugger_engine::dbg_status_t::paused
 	             || status == debugger_engine::dbg_status_t::stepping);
-	bool idle    = (status == debugger_engine::dbg_status_t::idle
-	             || status == debugger_engine::dbg_status_t::terminated);
-	bool attached = driver_bridge::attached_pid() != 0;
+	const bool command_pending = g_execution_command_pending.load(std::memory_order_acquire);
 
-	const char* run_tooltip = attached
-		? "Run / Continue (F5)"
-		: "Launch target binary... (F5)";
-
-	toolbar_btn_t btns[TOOLBAR_BTN_COUNT] = {
-		{ run_tooltip,              0, (attached && (idle || paused)) || !attached, true  },
-		{ "Pause (F6)",             1, attached && running,         false },
-		{ "Step Over (F10)",        2, attached && paused,          false },
-		{ "Step Into (F11)",        3, attached && paused,          false },
-		{ "Step Out (Shift+F11)",   4, attached && paused,          false },
-		{ "Stop / Terminate (Shift+F5)", 5, attached,               false },
-		{ "Restart (Ctrl+Shift+F5)", 6, attached,                   false },
-		{ "Detach (Ctrl+F2)",       7, attached,                    false },
+	static constexpr const char* action_ids[TOOLBAR_BTN_COUNT] = {
+		"debugger.run_continue", "debugger.pause", "debugger.step_over",
+		"debugger.step_into", "debugger.step_out", "debugger.stop",
+		"debugger.restart", "debugger.detach"
 	};
+	std::array<aida::ui::application_ui::action_presentation_t, TOOLBAR_BTN_COUNT> presentations;
+	std::array<std::string, TOOLBAR_BTN_COUNT> tooltips;
+	toolbar_btn_t btns[TOOLBAR_BTN_COUNT]{};
+	for (int i = 0; i < TOOLBAR_BTN_COUNT; ++i) {
+		presentations[static_cast<std::size_t>(i)] =
+			aida::ui::application_ui::present_action(action_ids[i]);
+		const auto& presentation = presentations[static_cast<std::size_t>(i)];
+		tooltips[static_cast<std::size_t>(i)] = presentation.label;
+		if (!presentation.shortcut.empty()) {
+			tooltips[static_cast<std::size_t>(i)].append(" (");
+			tooltips[static_cast<std::size_t>(i)].append(presentation.shortcut);
+			tooltips[static_cast<std::size_t>(i)].push_back(')');
+		}
+		if (!presentation.enabled && !presentation.disabled_reason.empty()) {
+			tooltips[static_cast<std::size_t>(i)].append("\n");
+			tooltips[static_cast<std::size_t>(i)].append(presentation.disabled_reason);
+		}
+		btns[i] = {tooltips[static_cast<std::size_t>(i)].c_str(), i,
+			presentation.enabled && !command_pending, i == 0};
+	}
+	if (command_pending) {
+		for (auto& button : btns)
+			button.enabled = false;
+	}
 
 	float total_w = static_cast<float>(TOOLBAR_BTN_COUNT) * TOOLBAR_BTN_W
 	              + static_cast<float>(TOOLBAR_BTN_COUNT - 1) * TOOLBAR_BTN_GAP
@@ -623,25 +1116,8 @@ inline void draw_run_toolbar(ImDrawList* dl, float ox, float oy, float alpha) {
 		}
 
 		if (clicked) {
-			static constexpr execution_command_t commands[TOOLBAR_BTN_COUNT] = {
-				execution_command_t::run_continue,
-				execution_command_t::pause,
-				execution_command_t::step_over,
-				execution_command_t::step_into,
-				execution_command_t::step_out,
-				execution_command_t::stop,
-				execution_command_t::restart,
-				execution_command_t::detach
-			};
-			std::string error;
-			const bool ok = execute_command(commands[i], &error);
-			diag::log_tagged_critical_fmt("debugger",
-				"toolbar_command command=%d ok=%d pid=%u status=%d error='%s'",
-				static_cast<int>(commands[i]), ok ? 1 : 0,
-				static_cast<unsigned>(driver_bridge::attached_pid()),
-				static_cast<int>(status), error.c_str());
-			if (!ok)
-				toast_notification::push(error, toast_notification::toast_type_t::error);
+			static_cast<void>(aida::ui::application_ui::execute_action(action_ids[i],
+				aida::ui::action_invocation_source_t::toolbar));
 		}
 	}
 
@@ -692,17 +1168,17 @@ inline bool jump_to_disasm(uint64_t addr) {
 
 inline bool jump_to_hex(uint64_t addr, size_t bytes) {
 	if (addr == 0) return false;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	aida::preview::debugger::record("jump_to_hex", std::to_string(addr) + ":" + std::to_string(bytes));
-	aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-	return true;
-#else
 	const auto context = disasm_view::capture_selected_workspace();
-	if (!hex_view::read_live_memory(context, addr, bytes))
+	if (!context.workspace || !context.workspace->identity().process() ||
+		bytes == 0 || bytes > (64ULL << 20))
+		return false;
+	if (!hex_view::request_live_memory(context, addr, bytes))
 		return false;
 	aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.hex"));
-	return true;
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	aida::preview::debugger::record("jump_to_hex", std::to_string(addr) + ":" + std::to_string(bytes));
 #endif
+	return true;
 }
 
 inline void copy_to_clipboard(const char* s) {
@@ -724,8 +1200,105 @@ enum class pending_context_mutation_t : uint8_t {
 	apply_patch,
 	revert_patch,
 	revert_all_patches,
-	remove_patch
+	remove_patch,
+	remove_watch,
+	remove_bookmark
 };
+
+struct mutation_result_t {
+	bool ok = false;
+	bool verified = false;
+	std::string detail;
+};
+
+bool queue_debugger_mutation(const char* label, const char* action,
+	debugger_interaction::context_t context,
+	std::function<mutation_result_t()> operation,
+	bool advance_generation = true) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	static_cast<void>(label);
+	static_cast<void>(action);
+	static_cast<void>(context);
+	const auto result = operation();
+	toast_notification::push(result.verified ? "Debugger mutation verified."
+		: result.detail.empty() ? "Debugger mutation failed or readback did not match."
+			: result.detail,
+		result.verified ? toast_notification::toast_type_t::success
+			: toast_notification::toast_type_t::error);
+	if (result.verified && advance_generation)
+		debugger_interaction::advance_stop_generation();
+	return result.verified;
+#else
+	bool expected = false;
+	if (!g_target_mutation_pending.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel)) {
+		toast_notification::push("Another live-target mutation is still pending.",
+			toast_notification::toast_type_t::warning);
+		return false;
+	}
+	auto result = std::make_shared<mutation_result_t>();
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "debugger";
+	submission.label = label;
+	submission.thread_class = "debugger_target_mutation";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.target_pid = context.target_pid;
+	submission.generation = context.stop_generation;
+	submission.ui_access_policy = "post_completion_only";
+	submission.failure_policy = "fail_closed";
+	submission.body = [context, result, operation = std::move(operation), advance_generation]() mutable {
+		if (context.target_pid != 0 &&
+			(driver_bridge::attached_pid() != context.target_pid ||
+			 debugger_interaction::current_stop_generation() != context.stop_generation)) {
+			result->detail = "The target or selected stop changed before the mutation started.";
+		} else {
+			try {
+				*result = operation();
+			} catch (const std::exception& exception) {
+				result->detail = exception.what();
+			} catch (...) {
+				result->detail = "The debugger mutation failed with an unknown exception.";
+			}
+		}
+		const bool posted = post_debugger_ui([context, result, advance_generation]() {
+			if (result->verified && advance_generation)
+				debugger_interaction::advance_stop_generation();
+			const std::string message = result->verified ? "Debugger mutation verified."
+				: result->detail.empty() ? "Debugger mutation failed or readback did not match."
+					: result->detail;
+			toast_notification::push(message,
+				result->verified ? toast_notification::toast_type_t::success
+					: toast_notification::toast_type_t::error);
+			diag::log_tagged_critical_fmt("debugger_context",
+				"async_mutation pid=%u generation=%llu address=0x%llx index=%d ok=%d verified=%d detail='%s'",
+				static_cast<unsigned>(context.target_pid),
+				static_cast<unsigned long long>(context.stop_generation),
+				static_cast<unsigned long long>(context.address), context.index,
+				result->ok ? 1 : 0, result->verified ? 1 : 0, result->detail.c_str());
+			g_target_mutation_pending.store(false, std::memory_order_release);
+		}, "mutation_completion");
+		if (!posted) {
+			if (result->verified && advance_generation)
+				debugger_interaction::advance_stop_generation();
+			g_target_mutation_pending.store(false, std::memory_order_release);
+			throw std::runtime_error("Debugger mutation completion could not be published to the UI thread");
+		}
+		if (!result->verified)
+			throw std::runtime_error(result->detail.empty()
+				? "Debugger mutation failed or readback did not match" : result->detail);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		g_target_mutation_pending.store(false, std::memory_order_release);
+		toast_notification::push("The debugger executor rejected the mutation: " +
+			submitted.reject_reason, toast_notification::toast_type_t::error);
+		return false;
+	}
+	register_debugger_task(submitted, "view.debug.cpu", action, label, false);
+	return true;
+#endif
+}
 
 template <typename T>
 struct render_snapshot_cache_t {
@@ -784,21 +1357,211 @@ pending_context_mutation_t g_pending_context_mutation = pending_context_mutation
 debugger_interaction::context_t g_pending_context;
 bool g_pending_context_mutation_open = false;
 
+enum class context_retention_t : std::uint8_t {
+	current,
+	stale,
+	busy
+};
+
+context_retention_t context_item_retention(const debugger_interaction::context_t& context);
+
+std::string g_consumed_debugger_action;
+
+const char* debugger_action_id(const char* label) {
+	if (std::strcmp(label, "Open in Disassembly") == 0) return "debugger.entity.open_disassembly";
+	if (std::strcmp(label, "Open in Hex View") == 0) return "debugger.entity.open_hex";
+	if (std::strcmp(label, "Run to Here") == 0) return "debugger.instruction.run_to";
+	if (std::strcmp(label, "Toggle Breakpoint") == 0) return "debugger.instruction.toggle_breakpoint";
+	if (std::strcmp(label, "Set RIP to Here...") == 0) return "debugger.instruction.set_rip";
+	if (std::strcmp(label, "Edit Register...") == 0) return "debugger.register.edit";
+	if (std::strcmp(label, "Set to Zero...") == 0) return "debugger.register.zero";
+	if (std::strcmp(label, "Enable / Disable") == 0) return "debugger.breakpoint.toggle_enabled";
+	if (std::strcmp(label, "Edit Breakpoint...") == 0) return "debugger.breakpoint.edit";
+	if (std::strcmp(label, "Delete Breakpoint") == 0) return "debugger.breakpoint.delete";
+	if (std::strcmp(label, "Change Protection...") == 0) return "debugger.memory.change_protection";
+	if (std::strcmp(label, "Dump Region...") == 0) return "debugger.memory.dump";
+	if (std::strcmp(label, "Suspend Thread") == 0) return "debugger.thread.suspend";
+	if (std::strcmp(label, "Resume Thread") == 0) return "debugger.thread.resume";
+	if (std::strcmp(label, "Terminate Thread...") == 0) return "debugger.thread.terminate";
+	if (std::strcmp(label, "Close Handle...") == 0) return "debugger.handle.close";
+	if (std::strcmp(label, "Apply Patch...") == 0) return "debugger.patch.apply";
+	if (std::strcmp(label, "Revert Patch...") == 0) return "debugger.patch.revert";
+	if (std::strcmp(label, "Remove Patch...") == 0) return "debugger.patch.remove";
+	return "";
+}
+
+static aida::ui::application_ui::retained_entity_context_t
+build_debugger_entity_actions(const debugger_interaction::context_t& context) {
+	aida::ui::application_ui::retained_entity_context_t retained;
+	retained.owner_id = "debugger.entity";
+	retained.entity_id = std::to_string(static_cast<int>(context.kind)) + ":" +
+		std::to_string(context.address) + ":" + std::to_string(context.index);
+	retained.entity_generation = context.stop_generation;
+	const char* owner_view = "view.debug.cpu";
+	switch (context.kind) {
+		case debugger_interaction::kind_t::breakpoint: owner_view = "view.debug.breakpoints"; break;
+		case debugger_interaction::kind_t::memory_region: owner_view = "view.debug.memory_map"; break;
+		case debugger_interaction::kind_t::stack_frame: owner_view = "view.debug.call_stack"; break;
+		case debugger_interaction::kind_t::thread: owner_view = "view.debug.threads"; break;
+		case debugger_interaction::kind_t::module: owner_view = "view.debug.modules"; break;
+		case debugger_interaction::kind_t::trace_record: owner_view = "view.debug.trace"; break;
+		case debugger_interaction::kind_t::handle: owner_view = "view.debug.handles"; break;
+		case debugger_interaction::kind_t::patch: owner_view = "view.debug.patches"; break;
+		case debugger_interaction::kind_t::watch: owner_view = "view.debug.watches"; break;
+		case debugger_interaction::kind_t::string_value: owner_view = "view.debug.strings"; break;
+		case debugger_interaction::kind_t::bookmark: owner_view = "view.debug.bookmarks"; break;
+		default: break;
+	}
+	retained.active_view = aida::ui::stable_view_id_t(owner_view);
+	retained.validate_identity = [context]() {
+		const auto retention = context_item_retention(context);
+		if (retention == context_retention_t::busy)
+			return aida::ui::capability_state_t::unavailable("Debugger state is updating; retry when the refresh completes.");
+		if (retention != context_retention_t::current || !debugger_interaction::is_current(context))
+			return aida::ui::capability_state_t::unavailable("The selected debugger entity or stop generation changed.");
+		return aida::ui::capability_state_t::available();
+	};
+	auto add = [&](const char* id, bool enabled, const char* reason) {
+		retained.actions.push_back({id, enabled ? aida::ui::capability_state_t::available()
+			: aida::ui::capability_state_t::unavailable(reason),
+			[]() { return aida::ui::action_handler_result_t::completed(); }});
+	};
+	auto add_capability = [&](const char* id, debugger_interaction::capability_t requested) {
+		const auto evaluated = debugger_interaction::evaluate(requested, context);
+		add(id, evaluated.enabled, evaluated.disabled_reason ? evaluated.disabled_reason : "The debugger action is unavailable.");
+	};
+	add("debugger.entity.copy_address", context.address != 0 || context.value != 0,
+		"The selected item has no resolved address.");
+	if (!context.primary_text.empty()) add("debugger.entity.copy_primary", true, "");
+	add_capability("debugger.entity.open_disassembly", debugger_interaction::capability_t::follow_disassembly);
+	add_capability("debugger.entity.open_hex", debugger_interaction::capability_t::follow_memory);
+	switch (context.kind) {
+		case debugger_interaction::kind_t::instruction:
+			add_capability("debugger.instruction.run_to", debugger_interaction::capability_t::run_to_address);
+			add_capability("debugger.instruction.toggle_breakpoint", debugger_interaction::capability_t::toggle_breakpoint);
+			add_capability("debugger.instruction.set_rip", debugger_interaction::capability_t::set_instruction_pointer);
+			if (context.value != 0) add("debugger.instruction.follow_branch", true, "");
+			break;
+		case debugger_interaction::kind_t::register_value:
+			add("debugger.register.copy_decimal", true, "");
+			add_capability("debugger.register.edit", debugger_interaction::capability_t::edit_register);
+			add_capability("debugger.register.zero", debugger_interaction::capability_t::edit_register);
+			break;
+		case debugger_interaction::kind_t::stack_slot:
+			add("debugger.stack.copy_qword", true, ""); break;
+		case debugger_interaction::kind_t::breakpoint:
+			add_capability("debugger.breakpoint.toggle_enabled", debugger_interaction::capability_t::toggle_breakpoint);
+			add_capability("debugger.breakpoint.edit", debugger_interaction::capability_t::edit_breakpoint);
+			add_capability("debugger.breakpoint.delete", debugger_interaction::capability_t::remove_breakpoint);
+			break;
+		case debugger_interaction::kind_t::memory_region:
+			add_capability("debugger.memory.change_protection", debugger_interaction::capability_t::change_memory_protection);
+			add_capability("debugger.memory.dump", debugger_interaction::capability_t::dump_memory); break;
+		case debugger_interaction::kind_t::thread:
+			add_capability("debugger.thread.suspend", debugger_interaction::capability_t::suspend_thread);
+			add_capability("debugger.thread.resume", debugger_interaction::capability_t::resume_thread);
+			add_capability("debugger.thread.terminate", debugger_interaction::capability_t::terminate_thread); break;
+		case debugger_interaction::kind_t::handle:
+			add_capability("debugger.handle.close", debugger_interaction::capability_t::close_handle); break;
+		case debugger_interaction::kind_t::patch:
+			add_capability("debugger.patch.apply", debugger_interaction::capability_t::apply_patch);
+			add_capability("debugger.patch.revert", debugger_interaction::capability_t::revert_patch);
+			add_capability("debugger.patch.remove", debugger_interaction::capability_t::remove_patch); break;
+		case debugger_interaction::kind_t::module:
+			add_capability("debugger.module.unload", debugger_interaction::capability_t::unload_module); break;
+		case debugger_interaction::kind_t::watch:
+			if (!context.secondary_text.empty()) add("debugger.entity.copy_secondary", true, "");
+			add("debugger.watch.remove", true, ""); break;
+		case debugger_interaction::kind_t::string_value:
+			if (!context.secondary_text.empty()) add("debugger.entity.copy_secondary", true, ""); break;
+		case debugger_interaction::kind_t::bookmark:
+			add("debugger.bookmark.remove", true, ""); break;
+		default: break;
+	}
+	const char* evidence_kind = "debugger_entity";
+	switch (context.kind) {
+		case debugger_interaction::kind_t::instruction: evidence_kind = "debugger_instruction"; break;
+		case debugger_interaction::kind_t::register_value: evidence_kind = "debugger_register"; break;
+		case debugger_interaction::kind_t::stack_slot: evidence_kind = "debugger_stack_slot"; break;
+		case debugger_interaction::kind_t::breakpoint: evidence_kind = "debugger_breakpoint"; break;
+		case debugger_interaction::kind_t::memory_region: evidence_kind = "debugger_memory_region"; break;
+		case debugger_interaction::kind_t::stack_frame: evidence_kind = "debugger_call_stack_frame"; break;
+		case debugger_interaction::kind_t::thread: evidence_kind = "debugger_thread"; break;
+		case debugger_interaction::kind_t::module: evidence_kind = "debugger_module"; break;
+		case debugger_interaction::kind_t::trace_record: evidence_kind = "debugger_trace_record"; break;
+		case debugger_interaction::kind_t::handle: evidence_kind = "debugger_handle"; break;
+		case debugger_interaction::kind_t::patch: evidence_kind = "debugger_patch"; break;
+		case debugger_interaction::kind_t::watch: evidence_kind = "debugger_watch"; break;
+		case debugger_interaction::kind_t::string_value: evidence_kind = "debugger_string"; break;
+		case debugger_interaction::kind_t::bookmark: evidence_kind = "debugger_bookmark"; break;
+		default: break;
+	}
+	char address_text[24]{};
+	char value_text[24]{};
+	std::snprintf(address_text, sizeof(address_text), "0x%016llX",
+		static_cast<unsigned long long>(context.address));
+	std::snprintf(value_text, sizeof(value_text), "0x%016llX",
+		static_cast<unsigned long long>(context.value));
+	aida::automation_ui::entity_evidence::snapshot_t evidence;
+	evidence.workspace_id = "pid:" + std::to_string(context.target_pid);
+	evidence.source_view_id = owner_view;
+	evidence.source_kind = evidence_kind;
+	evidence.entity_id = retained.entity_id;
+	evidence.display_label = context.primary_text.empty() ? evidence_kind : context.primary_text;
+	evidence.excerpt = "PID: " + std::to_string(context.target_pid) +
+		"\nStop generation: " + std::to_string(context.stop_generation) +
+		"\nThread: " + std::to_string(context.thread_id) +
+		"\nAddress: " + address_text + "\nValue: " + value_text +
+		"\nExtent: " + std::to_string(context.extent) +
+		"\nPrimary: " + context.primary_text +
+		"\nSecondary: " + context.secondary_text;
+	evidence.address = context.address;
+	evidence.revision = context.stop_generation;
+	evidence.generation = context.stop_generation;
+	evidence.sensitive = true;
+	evidence.return_to_source = [context, owner_view](std::string& reason) {
+		if (context_item_retention(context) != context_retention_t::current ||
+			!debugger_interaction::is_current(context)) {
+			reason = "The debugger target or stop generation changed; capture the entity again.";
+			return false;
+		}
+		debugger_interaction::select(context);
+		const auto opened = aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t(owner_view));
+		if (!opened.ok()) {
+			reason = opened.detail;
+			return false;
+		}
+		reason.clear();
+		return true;
+	};
+	aida::automation_ui::entity_evidence::append_actions(retained, std::move(evidence),
+		context.target_pid != 0 && context.kind != debugger_interaction::kind_t::none
+			? aida::ui::capability_state_t::available()
+			: aida::ui::capability_state_t::unavailable(
+				"A retained stopped debugger target entity is required for evidence handoff."));
+	return retained;
+}
+
+void open_debugger_entity_actions(const debugger_interaction::context_t& context,
+	aida::ui::context_menu_open_origin_t origin) {
+	aida::ui::application_ui::open_retained_entity_context_menu(
+		build_debugger_entity_actions(context), origin);
+}
+
 inline void select_context(debugger_interaction::context_t context, bool open_popup) {
 	debugger_interaction::select(std::move(context));
 	if (open_popup)
-		ImGui::OpenPopup("Debugger Item Actions##context");
+		open_debugger_entity_actions(debugger_interaction::selected(),
+			aida::ui::context_menu_open_origin_t::pointer);
 }
 
 inline bool context_menu_item(const char* label, const char* shortcut,
 	debugger_interaction::capability_t capability,
 	const debugger_interaction::context_t& context) {
 	const auto result = debugger_interaction::evaluate(capability, context);
-	const bool activated = ImGui::MenuItem(label, shortcut, false, result.enabled);
-	if (!result.enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
-		result.disabled_reason && *result.disabled_reason)
-		ImGui::SetTooltip("%s", result.disabled_reason);
-	return activated;
+	static_cast<void>(shortcut);
+	return result.enabled && g_consumed_debugger_action == debugger_action_id(label);
 }
 
 inline void request_context_mutation(pending_context_mutation_t mutation,
@@ -866,6 +1629,14 @@ void render_context_mutation_confirmation() {
 			consequence = "Any active patch will be verified reverted before its definition is removed.";
 			capability = debugger_interaction::capability_t::remove_patch;
 			break;
+		case pending_context_mutation_t::remove_watch:
+			scope = "the selected watch definition";
+			consequence = "The watch will be removed from the debugger workspace; target memory is not modified.";
+			break;
+		case pending_context_mutation_t::remove_bookmark:
+			scope = "the selected debugger bookmark";
+			consequence = "The bookmark will be removed from the debugger workspace; target memory is not modified.";
+			break;
 		case pending_context_mutation_t::none:
 			break;
 	}
@@ -877,95 +1648,136 @@ void render_context_mutation_confirmation() {
 	if (context.thread_id != 0)
 		ImGui::Text("Thread: %u", static_cast<unsigned>(context.thread_id));
 	const auto gate = debugger_interaction::evaluate(capability, context);
-	if (!gate.enabled)
+	const auto retention = context_item_retention(context);
+	const bool retained = retention == context_retention_t::current;
+	if (retention == context_retention_t::busy)
+		ImGui::TextWrapped("Unavailable: debugger state is updating; retry when the current refresh completes.");
+	else if (!retained)
+		ImGui::TextWrapped("Unavailable: the selected debugger item changed; select a current row.");
+	else if (!gate.enabled)
 		ImGui::TextWrapped("Unavailable: %s", gate.disabled_reason);
 	ImGui::Separator();
 
-	if (!gate.enabled)
+	if (!gate.enabled || !retained)
 		ImGui::BeginDisabled();
 	if (ImGui::Button("Confirm", ImVec2(140.f, 0.f))) {
-		bool ok = false;
-		bool verified = false;
-		switch (g_pending_context_mutation) {
-			case pending_context_mutation_t::set_instruction_pointer:
-				ok = debugger_engine::set_register("rip", context.address);
-				debugger_engine::request_refresh(0);
-				verified = ok && debugger_engine::get_registers().rip == context.address;
-				break;
-			case pending_context_mutation_t::terminate_thread:
-				ok = driver_bridge::terminate_thread(context.thread_id, 0xDEADu);
-				verified = ok;
-				break;
-			case pending_context_mutation_t::close_handle:
-				ok = driver_bridge::close_process_handle(context.target_pid, context.value);
-				verified = ok;
-				break;
-			case pending_context_mutation_t::apply_patch:
-			case pending_context_mutation_t::revert_patch:
-			case pending_context_mutation_t::remove_patch: {
-				code_patcher::patch_entry_t patch;
-				bool found = false;
-				{
-					std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
-					if (context.index >= 0 &&
-						context.index < static_cast<int>(code_patcher::g_state.patches.size())) {
-						patch = code_patcher::g_state.patches[static_cast<size_t>(context.index)];
-						found = patch.address == context.address;
+		const auto mutation = g_pending_context_mutation;
+		const bool advances = mutation != pending_context_mutation_t::remove_watch &&
+			mutation != pending_context_mutation_t::remove_bookmark;
+		static_cast<void>(queue_debugger_mutation("Apply reviewed debugger mutation",
+			"debugger.context_mutation", context, [mutation, context]() {
+			mutation_result_t result;
+			switch (mutation) {
+				case pending_context_mutation_t::set_instruction_pointer:
+					result.ok = debugger_engine::set_register("rip", context.address);
+					debugger_engine::request_refresh(0);
+					result.verified = result.ok &&
+						debugger_engine::get_registers().rip == context.address;
+					break;
+				case pending_context_mutation_t::terminate_thread:
+					result.ok = driver_bridge::terminate_thread(context.thread_id, 0xDEADu);
+					result.verified = result.ok;
+					break;
+				case pending_context_mutation_t::close_handle:
+					result.ok = driver_bridge::close_process_handle(context.target_pid, context.value);
+					result.verified = result.ok;
+					break;
+				case pending_context_mutation_t::apply_patch:
+				case pending_context_mutation_t::revert_patch:
+				case pending_context_mutation_t::remove_patch: {
+					code_patcher::patch_entry_t patch;
+					if (context.value == 0 || code_patcher::g_state.generation.load(
+							std::memory_order_acquire) != context.value) {
+						result.detail = "The patch set changed after review; reopen the action.";
+						break;
 					}
+					{
+						std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
+						if (context.index < 0 || context.index >=
+							static_cast<int>(code_patcher::g_state.patches.size())) {
+							result.detail = "The selected patch no longer exists.";
+							break;
+						}
+						patch = code_patcher::g_state.patches[static_cast<size_t>(context.index)];
+					}
+					if (patch.address != context.address) {
+						result.detail = "The selected patch changed before execution.";
+						break;
+					}
+					if (mutation == pending_context_mutation_t::apply_patch) {
+						result.ok = code_patcher::apply_patch(context.index);
+						result.verified = result.ok && verify_patch_bytes(patch, true);
+						if (result.ok && !result.verified)
+							static_cast<void>(code_patcher::revert_patch(context.index));
+					} else if (mutation == pending_context_mutation_t::revert_patch) {
+						result.ok = code_patcher::revert_patch(context.index);
+						result.verified = result.ok && verify_patch_bytes(patch, false);
+					} else {
+						result.ok = code_patcher::remove_patch_exact(context.index,
+							patch.address, patch.patched_bytes);
+						result.verified = result.ok && verify_patch_bytes(patch, false);
+					}
+					break;
 				}
-				if (found && g_pending_context_mutation == pending_context_mutation_t::apply_patch) {
-					ok = code_patcher::apply_patch(context.index);
-					verified = ok && verify_patch_bytes(patch, true);
-					if (ok && !verified)
-						code_patcher::revert_patch(context.index);
-				} else if (found) {
-					ok = code_patcher::revert_patch(context.index);
-					verified = ok && verify_patch_bytes(patch, false);
-					if (verified && g_pending_context_mutation == pending_context_mutation_t::remove_patch)
-						ok = verified = code_patcher::remove_patch(context.index);
+				case pending_context_mutation_t::revert_all_patches: {
+					std::vector<code_patcher::patch_entry_t> patches;
+					if (context.value == 0 || code_patcher::g_state.generation.load(
+							std::memory_order_acquire) != context.value) {
+						result.detail = "The patch set changed after review; reopen Revert All.";
+						break;
+					}
+					{
+						std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
+						if (code_patcher::g_state.patches.size() > 65536U) {
+							result.detail = "The patch set exceeds the 65,536-entry safety bound.";
+							break;
+						}
+						patches = code_patcher::g_state.patches;
+					}
+					result.ok = result.verified = true;
+					for (size_t remaining = patches.size(); remaining > 0; --remaining) {
+						const size_t index = remaining - 1;
+						if (!patches[index].active) continue;
+						const bool reverted = code_patcher::revert_patch(static_cast<int>(index));
+						const bool readback = reverted && verify_patch_bytes(patches[index], false);
+						result.ok = result.ok && reverted;
+						result.verified = result.verified && readback;
+					}
+					break;
 				}
-				break;
+				case pending_context_mutation_t::remove_watch: {
+					std::lock_guard<std::mutex> lock(debugger_engine::g_state.watch_mutex);
+					if (context.index < 0 || context.index >=
+						static_cast<int>(debugger_engine::g_state.watches.size())) break;
+					const auto& watch = debugger_engine::g_state.watches[static_cast<size_t>(context.index)];
+					const std::string& expression = watch.persistent_expression.empty()
+						? watch.expression : watch.persistent_expression;
+					if (expression != context.primary_text) break;
+					debugger_engine::g_state.watches.erase(
+						debugger_engine::g_state.watches.begin() + context.index);
+					debugger_engine::g_state.watches_generation.fetch_add(1, std::memory_order_release);
+					result.ok = result.verified = true;
+					break;
+				}
+				case pending_context_mutation_t::remove_bookmark: {
+					std::lock_guard<std::mutex> lock(debugger_engine::g_state.anno_mutex);
+					const auto found = std::find(debugger_engine::g_state.bookmarks.begin(),
+						debugger_engine::g_state.bookmarks.end(), context.address);
+					if (found == debugger_engine::g_state.bookmarks.end()) break;
+					debugger_engine::g_state.bookmarks.erase(found);
+					result.ok = result.verified = true;
+					break;
+				}
+				case pending_context_mutation_t::none:
+					break;
 			}
-			case pending_context_mutation_t::revert_all_patches: {
-				std::vector<code_patcher::patch_entry_t> patches;
-				{
-					std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
-					patches = code_patcher::g_state.patches;
-				}
-				ok = true;
-				verified = true;
-				for (size_t remaining = patches.size(); remaining > 0; --remaining) {
-					const size_t index = remaining - 1;
-					if (!patches[index].active)
-						continue;
-					const bool reverted = code_patcher::revert_patch(static_cast<int>(index));
-					const bool readback = reverted && verify_patch_bytes(patches[index], false);
-					ok = ok && reverted;
-					verified = verified && readback;
-				}
-				break;
-			}
-			case pending_context_mutation_t::none:
-				break;
-		}
-		if (verified)
-			debugger_interaction::advance_stop_generation();
-		toast_notification::push(verified ? "Debugger mutation verified."
-			: "Debugger mutation failed or readback did not match.",
-			verified ? toast_notification::toast_type_t::success
-				: toast_notification::toast_type_t::error);
-		diag::log_tagged_critical_fmt("debugger_context",
-			"mutation=%d pid=%u generation=%llu address=0x%llx index=%d ok=%d verified=%d",
-			static_cast<int>(g_pending_context_mutation),
-			static_cast<unsigned>(context.target_pid),
-			static_cast<unsigned long long>(context.stop_generation),
-			static_cast<unsigned long long>(context.address), context.index,
-			ok ? 1 : 0, verified ? 1 : 0);
+			return result;
+		}, advances));
 		g_pending_context_mutation = pending_context_mutation_t::none;
 		g_pending_context = {};
 		ImGui::CloseCurrentPopup();
 	}
-	if (!gate.enabled)
+	if (!gate.enabled || !retained)
 		ImGui::EndDisabled();
 	ImGui::SameLine();
 	if (ImGui::Button("Cancel", ImVec2(140.f, 0.f))) {
@@ -998,10 +1810,74 @@ bool context_belongs_to_pane(debugger_interaction::kind_t kind, sub_tab_t pane) 
 			return pane == sub_tab_t::handles;
 		case debugger_interaction::kind_t::patch:
 			return pane == sub_tab_t::patches;
+		case debugger_interaction::kind_t::watch:
+			return pane == sub_tab_t::watches;
+		case debugger_interaction::kind_t::string_value:
+			return pane == sub_tab_t::strings;
+		case debugger_interaction::kind_t::bookmark:
+			return pane == sub_tab_t::bookmarks;
 		case debugger_interaction::kind_t::none:
 			return false;
 	}
 	return false;
+}
+
+context_retention_t context_item_retention(const debugger_interaction::context_t& context) {
+	switch (context.kind) {
+		case debugger_interaction::kind_t::watch: {
+			std::unique_lock<std::mutex> lock(debugger_engine::g_state.watch_mutex,
+				std::try_to_lock);
+			if (!lock.owns_lock())
+				return context_retention_t::busy;
+			if (context.index < 0 || context.index >= static_cast<int>(debugger_engine::g_state.watches.size()))
+				return context_retention_t::stale;
+			const auto& watch = debugger_engine::g_state.watches[static_cast<std::size_t>(context.index)];
+			const std::string& expression = watch.persistent_expression.empty()
+				? watch.expression : watch.persistent_expression;
+			return expression == context.primary_text
+				? context_retention_t::current : context_retention_t::stale;
+		}
+		case debugger_interaction::kind_t::string_value: {
+			std::unique_lock<std::mutex> lock(debugger_engine::g_state.strings_mutex,
+				std::try_to_lock);
+			if (!lock.owns_lock())
+				return context_retention_t::busy;
+			const bool retained = std::any_of(debugger_engine::g_state.strings.begin(), debugger_engine::g_state.strings.end(),
+				[&](const debugger_engine::string_ref_t& item) {
+					return item.address == context.address && item.value == context.primary_text;
+				});
+			return retained ? context_retention_t::current : context_retention_t::stale;
+		}
+		case debugger_interaction::kind_t::bookmark: {
+			std::unique_lock<std::mutex> lock(debugger_engine::g_state.anno_mutex,
+				std::try_to_lock);
+			if (!lock.owns_lock())
+				return context_retention_t::busy;
+			const bool retained = std::find(debugger_engine::g_state.bookmarks.begin(),
+				debugger_engine::g_state.bookmarks.end(), context.address) !=
+				debugger_engine::g_state.bookmarks.end();
+			return retained ? context_retention_t::current : context_retention_t::stale;
+		}
+		case debugger_interaction::kind_t::patch: {
+			if (context.value == 0 || code_patcher::g_state.generation.load(
+					std::memory_order_acquire) != context.value)
+				return context_retention_t::stale;
+			if (context.index < 0)
+				return context_retention_t::current;
+			std::unique_lock<std::mutex> lock(code_patcher::g_state.mtx, std::try_to_lock);
+			if (!lock.owns_lock())
+				return context_retention_t::busy;
+			if (context.index >= static_cast<int>(code_patcher::g_state.patches.size()))
+				return context_retention_t::stale;
+			const auto& patch = code_patcher::g_state.patches[static_cast<std::size_t>(context.index)];
+			return patch.address == context.address &&
+				patch.patched_bytes.size() == context.extent &&
+				patch.description == context.primary_text
+				? context_retention_t::current : context_retention_t::stale;
+		}
+		default:
+			return context_retention_t::current;
+	}
 }
 
 void render_selected_context_menu(sub_tab_t pane) {
@@ -1011,34 +1887,28 @@ void render_selected_context_menu(sub_tab_t pane) {
 		context_belongs_to_pane(g_pending_context.kind, pane);
 	if (!selected_here && !pending_here)
 		return;
-	if (selected_here && debugger_interaction::context_key_pressed() &&
-		context.kind != debugger_interaction::kind_t::none) {
-		switch (context.kind) {
-			case debugger_interaction::kind_t::register_value:
-			case debugger_interaction::kind_t::stack_slot:
-			case debugger_interaction::kind_t::instruction:
-				ImGui::OpenPopup("Debugger Item Actions##context");
-				break;
-			case debugger_interaction::kind_t::memory_region:
-				ImGui::OpenPopup("Debugger Item Actions##context");
-				break;
-			default:
-				ImGui::OpenPopup("Debugger Item Actions##context");
-				break;
-		}
-	}
-	if (selected_here && ImGui::BeginPopup("Debugger Item Actions##context")) {
+	const bool menu_key = selected_here && ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+	const bool shift_f10 = selected_here && ImGui::GetIO().KeyShift &&
+		ImGui::IsKeyPressed(ImGuiKey_F10, false);
+	if ((menu_key || shift_f10) && context.kind != debugger_interaction::kind_t::none)
+		open_debugger_entity_actions(context, menu_key
+			? aida::ui::context_menu_open_origin_t::menu_key
+			: aida::ui::context_menu_open_origin_t::shift_f10);
+	aida::ui::application_ui::render_retained_entity_context_menu("debugger.entity");
+	const std::string entity_id = std::to_string(static_cast<int>(context.kind)) + ":" +
+		std::to_string(context.address) + ":" + std::to_string(context.index);
+	g_consumed_debugger_action = aida::ui::application_ui::consume_retained_entity_action(
+		"debugger.entity", entity_id.c_str());
+	if (selected_here && !g_consumed_debugger_action.empty()) {
 		const uint64_t memory_value = context.value != 0 ? context.value : context.address;
 		const uint64_t navigation_address =
 			(context.kind == debugger_interaction::kind_t::register_value ||
 			 context.kind == debugger_interaction::kind_t::stack_slot)
 				? context.value : context.address;
-		if (context_menu_item("Copy address", "Ctrl+C",
-			debugger_interaction::capability_t::copy, context))
+		if (g_consumed_debugger_action == "debugger.entity.copy_address")
 			copy_addr_to_clipboard(context.address != 0 ? context.address : context.value);
-		if (!context.primary_text.empty() && ImGui::MenuItem("Copy label"))
+		if (g_consumed_debugger_action == "debugger.entity.copy_primary")
 			copy_to_clipboard(context.primary_text.c_str());
-		ImGui::Separator();
 		if (context_menu_item("Open in Disassembly", nullptr,
 			debugger_interaction::capability_t::follow_disassembly, context) && navigation_address != 0)
 			jump_to_disasm(navigation_address);
@@ -1048,36 +1918,40 @@ void render_selected_context_menu(sub_tab_t pane) {
 
 		switch (context.kind) {
 			case debugger_interaction::kind_t::instruction:
-				ImGui::Separator();
 				if (context_menu_item("Run to Here", nullptr,
-					debugger_interaction::capability_t::run_to_address, context)) {
-					if (debugger_engine::run_to_address(context.address, false))
-						debugger_interaction::advance_stop_generation();
-				}
+					debugger_interaction::capability_t::run_to_address, context))
+					static_cast<void>(queue_debugger_mutation("Run to address",
+						"debugger.run_to_address", context, [context]() {
+							mutation_result_t result;
+							result.ok = result.verified =
+								debugger_engine::run_to_address(context.address, false);
+							return result;
+						}));
 				if (context_menu_item("Toggle Breakpoint", "F9",
-					debugger_interaction::capability_t::toggle_breakpoint, context)) {
-					auto snapshot = debugger_engine::snapshot_breakpoints();
-					int found = -1;
-					for (size_t i = 0; i < snapshot.size(); ++i)
-						if (!snapshot[i].is_internal && snapshot[i].address == context.address) {
-							found = static_cast<int>(i);
-							break;
-						}
-					const bool changed = found >= 0
-						? debugger_engine::remove_breakpoint(found)
-						: debugger_engine::add_breakpoint(context.address) >= 0;
-					if (changed)
-						debugger_interaction::advance_stop_generation();
-				}
+					debugger_interaction::capability_t::toggle_breakpoint, context))
+					static_cast<void>(queue_debugger_mutation("Toggle breakpoint",
+						"debugger.breakpoint_toggle", context, [context]() {
+							mutation_result_t result;
+							auto snapshot = debugger_engine::snapshot_breakpoints();
+							int found = -1;
+							for (size_t i = 0; i < snapshot.size(); ++i)
+								if (!snapshot[i].is_internal && snapshot[i].address == context.address) {
+									found = static_cast<int>(i);
+									break;
+								}
+							result.ok = result.verified = found >= 0
+								? debugger_engine::remove_breakpoint(found)
+								: debugger_engine::add_breakpoint(context.address) >= 0;
+							return result;
+						}));
 				if (context_menu_item("Set RIP to Here...", nullptr,
 					debugger_interaction::capability_t::set_instruction_pointer, context))
 					request_context_mutation(pending_context_mutation_t::set_instruction_pointer, context);
-				if (context.value != 0 && ImGui::MenuItem("Follow Branch Target"))
+				if (g_consumed_debugger_action == "debugger.instruction.follow_branch")
 					jump_to_disasm(context.value);
 				break;
 			case debugger_interaction::kind_t::register_value:
-				ImGui::Separator();
-				if (ImGui::MenuItem("Copy decimal")) {
+				if (g_consumed_debugger_action == "debugger.register.copy_decimal") {
 					char decimal[32];
 					std::snprintf(decimal, sizeof(decimal), "%llu",
 						static_cast<unsigned long long>(context.value));
@@ -1100,16 +1974,18 @@ void render_selected_context_menu(sub_tab_t pane) {
 				}
 				break;
 			case debugger_interaction::kind_t::stack_slot:
-				ImGui::Separator();
-				if (ImGui::MenuItem("Copy qword value"))
+				if (g_consumed_debugger_action == "debugger.stack.copy_qword")
 					copy_addr_to_clipboard(context.value);
 				break;
 			case debugger_interaction::kind_t::breakpoint:
-				ImGui::Separator();
 				if (context_menu_item("Enable / Disable", nullptr,
-					debugger_interaction::capability_t::toggle_breakpoint, context) &&
-					debugger_engine::toggle_breakpoint(context.index))
-					debugger_interaction::advance_stop_generation();
+					debugger_interaction::capability_t::toggle_breakpoint, context))
+					static_cast<void>(queue_debugger_mutation("Toggle breakpoint state",
+						"debugger.breakpoint_enable", context, [context]() {
+							mutation_result_t result;
+							result.ok = result.verified = debugger_engine::toggle_breakpoint(context.index);
+							return result;
+						}));
 				if (context_menu_item("Edit Breakpoint...", nullptr,
 					debugger_interaction::capability_t::edit_breakpoint, context)) {
 					auto breakpoints = debugger_engine::snapshot_breakpoints();
@@ -1126,12 +2002,15 @@ void render_selected_context_menu(sub_tab_t pane) {
 					}
 				}
 				if (context_menu_item("Delete Breakpoint", "Delete",
-					debugger_interaction::capability_t::remove_breakpoint, context) &&
-					debugger_engine::remove_breakpoint(context.index))
-					debugger_interaction::advance_stop_generation();
+					debugger_interaction::capability_t::remove_breakpoint, context))
+					static_cast<void>(queue_debugger_mutation("Delete breakpoint",
+						"debugger.breakpoint_delete", context, [context]() {
+							mutation_result_t result;
+							result.ok = result.verified = debugger_engine::remove_breakpoint(context.index);
+							return result;
+						}));
 				break;
 			case debugger_interaction::kind_t::memory_region:
-				ImGui::Separator();
 				if (context_menu_item("Change Protection...", nullptr,
 					debugger_interaction::capability_t::change_memory_protection, context)) {
 					debugger_engine::memory_region_t region{};
@@ -1142,7 +2021,9 @@ void render_selected_context_menu(sub_tab_t pane) {
 						memory_map_view::g_ui.change_protect_old = region.protect;
 						memory_map_view::g_ui.change_protect_context = context;
 						memory_map_view::g_ui.change_protect_open = true;
-					}
+					} else toast_notification::push(
+						"Memory map is updating; retry Change Protection in a moment.",
+						toast_notification::toast_type_t::warning);
 				}
 				if (context_menu_item("Dump Region...", nullptr,
 					debugger_interaction::capability_t::dump_memory, context)) {
@@ -1162,44 +2043,84 @@ void render_selected_context_menu(sub_tab_t pane) {
 					static const char filter[] = "Binary (*.bin)\0*.bin\0All files (*.*)\0*.*\0\0";
 					if (win32_dialog::show_save_file_dialog(g_hwnd, "Dump Region", filter, "bin",
 						path, sizeof(path), "debugger_context.dump_region")) {
-						std::vector<uint8_t> bytes;
-						if (driver_bridge::read_memory(context.address,
-							static_cast<size_t>(capped_size), bytes) && bytes.size() == capped_size) {
-							std::ofstream output(path, std::ios::binary | std::ios::trunc);
-							if (output.is_open())
-								output.write(reinterpret_cast<const char*>(bytes.data()),
-									static_cast<std::streamsize>(bytes.size()));
-							if (!output.good())
-								toast_notification::push("Region dump write failed.", toast_notification::toast_type_t::error);
-						} else {
-							toast_notification::push("Region dump read failed.", toast_notification::toast_type_t::error);
-						}
+						auto result = std::make_shared<mutation_result_t>();
+						const std::string destination(path);
+						aida::infra::executor::submission_t submission;
+						submission.owner_subsystem = "debugger";
+						submission.label = "Dump memory region";
+						submission.thread_class = "debugger_export";
+						submission.domain = aida::infra::executor::domain_t::feature_worker;
+						submission.priority = 2;
+						submission.target_pid = context.target_pid;
+						submission.generation = context.stop_generation;
+						submission.ui_access_policy = "post_completion_only";
+						submission.failure_policy = "fail_closed";
+						submission.body = [context, capped_size, destination, result]() {
+							if (driver_bridge::attached_pid() != context.target_pid ||
+								debugger_interaction::current_stop_generation() != context.stop_generation) {
+								result->detail = "The target changed before the region dump started.";
+							} else {
+								std::vector<uint8_t> bytes;
+								result->ok = driver_bridge::read_memory(context.address,
+									static_cast<size_t>(capped_size), bytes) && bytes.size() == capped_size;
+								if (!result->ok)
+									result->detail = "Region dump read failed or returned a partial result.";
+								else
+									result->verified = write_file_atomic_exact(destination, bytes.data(),
+										bytes.size(), result->detail);
+							}
+							const bool posted = post_debugger_ui([result]() {
+								toast_notification::push(result->verified ? "Memory region dumped."
+									: result->detail, result->verified
+										? toast_notification::toast_type_t::success
+										: toast_notification::toast_type_t::error);
+							}, "region_dump_completion");
+							if (!posted)
+								throw std::runtime_error("Region-dump completion could not be published to the UI thread");
+							if (!result->verified)
+								throw std::runtime_error(result->detail.empty()
+									? "Region dump failed" : result->detail);
+						};
+						const auto submitted = aida::infra::executor::submit(std::move(submission));
+						if (!submitted.submitted)
+							toast_notification::push("Region dump queue rejected the task: " +
+								submitted.reject_reason, toast_notification::toast_type_t::error);
+						else
+							register_debugger_task(submitted, "view.debug.memory_map",
+								"debugger.dump_region", "Dump memory region", false);
 					}
 #endif
 				}
 				break;
 			case debugger_interaction::kind_t::thread:
-				ImGui::Separator();
 				if (context_menu_item("Suspend Thread", nullptr,
-					debugger_interaction::capability_t::suspend_thread, context) &&
-					driver_bridge::suspend_thread(context.thread_id, nullptr))
-					debugger_interaction::advance_stop_generation();
+					debugger_interaction::capability_t::suspend_thread, context))
+					static_cast<void>(queue_debugger_mutation("Suspend thread",
+						"debugger.thread_suspend", context, [context]() {
+							mutation_result_t result;
+							result.ok = result.verified =
+								driver_bridge::suspend_thread(context.thread_id, nullptr);
+							return result;
+						}));
 				if (context_menu_item("Resume Thread", nullptr,
-					debugger_interaction::capability_t::resume_thread, context) &&
-					driver_bridge::resume_thread(context.thread_id, nullptr))
-					debugger_interaction::advance_stop_generation();
+					debugger_interaction::capability_t::resume_thread, context))
+					static_cast<void>(queue_debugger_mutation("Resume thread",
+						"debugger.thread_resume", context, [context]() {
+							mutation_result_t result;
+							result.ok = result.verified =
+								driver_bridge::resume_thread(context.thread_id, nullptr);
+							return result;
+						}));
 				if (context_menu_item("Terminate Thread...", nullptr,
 					debugger_interaction::capability_t::terminate_thread, context))
 					request_context_mutation(pending_context_mutation_t::terminate_thread, context);
 				break;
 			case debugger_interaction::kind_t::handle:
-				ImGui::Separator();
 				if (context_menu_item("Close Handle...", nullptr,
 					debugger_interaction::capability_t::close_handle, context))
 					request_context_mutation(pending_context_mutation_t::close_handle, context);
 				break;
 			case debugger_interaction::kind_t::patch:
-				ImGui::Separator();
 				if (context_menu_item("Apply Patch...", nullptr,
 					debugger_interaction::capability_t::apply_patch, context))
 					request_context_mutation(pending_context_mutation_t::apply_patch, context);
@@ -1211,15 +2132,28 @@ void render_selected_context_menu(sub_tab_t pane) {
 					request_context_mutation(pending_context_mutation_t::remove_patch, context);
 				break;
 			case debugger_interaction::kind_t::module:
-				ImGui::Separator();
-				context_menu_item("Unload Module", nullptr,
-					debugger_interaction::capability_t::unload_module, context);
+				break;
+			case debugger_interaction::kind_t::watch:
+				if (g_consumed_debugger_action == "debugger.entity.copy_secondary")
+					copy_to_clipboard(context.secondary_text.c_str());
+				if (g_consumed_debugger_action == "debugger.watch.remove")
+					request_context_mutation(pending_context_mutation_t::remove_watch, context);
+				break;
+			case debugger_interaction::kind_t::string_value:
+				if (!context.secondary_text.empty()) {
+					if (g_consumed_debugger_action == "debugger.entity.copy_secondary")
+						copy_to_clipboard(context.secondary_text.c_str());
+				}
+				break;
+			case debugger_interaction::kind_t::bookmark:
+				if (g_consumed_debugger_action == "debugger.bookmark.remove")
+					request_context_mutation(pending_context_mutation_t::remove_bookmark, context);
 				break;
 			default:
 				break;
 		}
-		ImGui::EndPopup();
 	}
+	g_consumed_debugger_action.clear();
 	render_context_mutation_confirmation();
 }
 
@@ -1340,7 +2274,8 @@ static void render_tab_bar(ImDrawList* dl, float ox, float oy, float w, float a)
 		{ "Modules",     "Mod", sub_tab_t::modules },
 		{ "Patches",     "Pat", sub_tab_t::patches },
 		{ "SEH",         "SEH", sub_tab_t::seh_chain },
-		{ "CFG",         "CFG", sub_tab_t::cfg }
+		{ "CFG",         "CFG", sub_tab_t::cfg },
+		{ "Source",      "Src", sub_tab_t::source }
 	};
 	static const int visible_tab_count = static_cast<int>(sizeof(visible_tabs) / sizeof(visible_tabs[0]));
 
@@ -1603,6 +2538,7 @@ bool is_visible_sub_tab(sub_tab_t tab) {
 		case sub_tab_t::patches:
 		case sub_tab_t::seh_chain:
 		case sub_tab_t::cfg:
+		case sub_tab_t::source:
 			return true;
 		case sub_tab_t::COUNT:
 			return false;
@@ -1901,6 +2837,348 @@ static void render_cpu_disasm_slice(ImDrawList* dl, float x, float y, float w, f
 
 	ImGui::EndChild();
 	ImGui::PopID();
+}
+
+static void render_source_debug(ImDrawList* dl, float x, float y, float w, float h,
+	float alpha) {
+	auto& ui = g_ui;
+	const auto& t = aida::ui::resolved();
+	const auto published = source_debug_service::snapshot();
+	const bool has_current = published && published->current.valid;
+	const bool has_source = has_current &&
+		(published->current.source_state == source_debug_service::source_state_t::available ||
+			(published->current.source_state == source_debug_service::source_state_t::truncated &&
+				!published->current.excerpt.empty()));
+	const bool operation_pending = published && published->operation_pending;
+	auto report = [](bool accepted, const std::string& error,
+		const char* accepted_text) {
+		if (accepted) {
+			toast_notification::push(accepted_text,
+				toast_notification::toast_type_t::info);
+		} else {
+			toast_notification::push(error.empty() ? "The source-debug action was rejected" : error,
+				toast_notification::toast_type_t::error);
+		}
+	};
+	auto make_source_actions = [published](const source_debug_service::definition_t& definition) {
+		aida::ui::application_ui::retained_entity_context_t retained;
+		if (!published) return retained;
+		retained.owner_id = "debugger.source.breakpoint";
+		retained.entity_id = definition.id;
+		retained.entity_generation = published->generation;
+		retained.active_view = aida::ui::stable_view_id_t("view.debug.source");
+		retained.validate_identity = [id = definition.id, generation = published->generation]() {
+			const auto current = source_debug_service::snapshot();
+			if (!current || current->generation != generation)
+				return aida::ui::capability_state_t::unavailable("The source-debug publication changed; reopen the menu.");
+			const bool exists = std::any_of(current->definitions.begin(), current->definitions.end(),
+				[&](const auto& item) { return item.id == id; });
+			return exists ? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable("The source breakpoint was removed.");
+		};
+		auto add = [&](const char* id, bool enabled, const char* reason) {
+			retained.actions.push_back({id, enabled ? aida::ui::capability_state_t::available()
+				: aida::ui::capability_state_t::unavailable(reason),
+				[]() { return aida::ui::action_handler_result_t::completed(); }});
+		};
+		add("debugger.source.open", !definition.file_path.empty(), "The source breakpoint has no file path.");
+		add("debugger.source.open_disassembly", !definition.locations.empty(), "The source breakpoint has no bound address.");
+		add("debugger.source.copy_location", !definition.file_path.empty(), "The source breakpoint has no file path.");
+		add("debugger.source.copy_address", !definition.locations.empty(), "The source breakpoint has no bound address.");
+		add("debugger.source.rebind_all", !published->operation_pending, "A source-debug operation is already running.");
+		add("debugger.source.remove", !published->operation_pending, "A source-debug operation is already running.");
+		return retained;
+	};
+	auto open_source_actions = [&make_source_actions](
+		const source_debug_service::definition_t& definition,
+		aida::ui::context_menu_open_origin_t origin) {
+		auto retained = make_source_actions(definition);
+		if (!retained.owner_id.empty())
+			aida::ui::application_ui::open_retained_entity_context_menu(
+				std::move(retained), origin);
+	};
+
+	draw_glass_card(dl, ImVec2(x, y), ImVec2(x + w, y + h), 8.f, alpha);
+	const float pad = 8.f;
+	const float toolbar_h = 34.f;
+	ImGui::SetCursorScreenPos(ImVec2(x + pad, y + 3.f));
+	ImGui::PushID("source_debug_toolbar");
+	std::string action_error;
+	if (aida::ui::button("Open Source", aida::ui::button_kind_t::primary,
+		aida::ui::size_t_::sm, ImVec2(100.f, 28.f), !has_source)) {
+		action_error.clear();
+		report(source_debug_service::request_open_current_source(&action_error),
+			action_error, "Opened the exact stopped source location");
+	}
+	ImGui::SameLine(0.f, 5.f);
+	if (aida::ui::button("Open Assembly", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(110.f, 28.f), !has_current)) {
+		action_error.clear();
+		report(source_debug_service::request_open_current_disassembly(&action_error),
+			action_error, "Synchronized the disassembly view");
+	}
+	ImGui::SameLine(0.f, 5.f);
+	if (aida::ui::button("Toggle BP  F9", aida::ui::button_kind_t::secondary,
+		aida::ui::size_t_::sm, ImVec2(108.f, 28.f), !has_current || operation_pending)) {
+		action_error.clear();
+		report(source_debug_service::request_toggle(published->current.file_path,
+			published->current.line, &action_error), action_error,
+			"Queued the source-breakpoint update");
+	}
+	ImGui::SameLine(0.f, 5.f);
+	if (aida::ui::button("Rebind", aida::ui::button_kind_t::ghost,
+		aida::ui::size_t_::sm, ImVec2(76.f, 28.f), operation_pending)) {
+		action_error.clear();
+		report(source_debug_service::request_rebind(&action_error), action_error,
+			"Queued exact PDB source rebinding");
+	}
+	ImGui::PopID();
+
+	const float status_y = y + toolbar_h;
+	const float status_h = 46.f;
+	dl->AddRectFilled(ImVec2(x + pad, status_y), ImVec2(x + w - pad, status_y + status_h),
+		with_a(t.bg_elevated, alpha * 0.82f), 4.f);
+	ImFont* code_font = aida::ui::fonts::code();
+	if (!code_font) code_font = ImGui::GetFont();
+	ImFont* body_font = aida::ui::fonts::body();
+	if (!body_font) body_font = ImGui::GetFont();
+	const float code_size = aida::ui::fonts::size_or(code_font, 13.f);
+	const float body_size = aida::ui::fonts::size_or(body_font, 13.f);
+	std::string location_text = "No stopped source location";
+	std::string location_detail = published
+		? (published->error.empty() ? published->current.detail : published->error)
+		: "Source debugger is initializing";
+	ImU32 state_color = t.text_dim;
+	if (has_current) {
+		location_text = published->current.file_path + ":" +
+			std::to_string(published->current.line) + "  " + published->current.module_name;
+		location_detail = published->current.detail;
+		state_color = published->current.source_state ==
+			source_debug_service::source_state_t::truncated ? t.warning
+			: (has_source ? t.success : t.warning);
+	}
+	if (operation_pending) {
+		location_detail = published->operation_label.empty()
+			? "Source-debug operation is running" : published->operation_label;
+		state_color = t.info;
+	} else if (published && !published->error.empty()) {
+		location_detail = published->error;
+		state_color = t.error;
+	}
+	dl->AddCircleFilled(ImVec2(x + pad + 10.f, status_y + 14.f), 4.f,
+		with_a(state_color, alpha));
+	dl->AddText(code_font, code_size, ImVec2(x + pad + 20.f, status_y + 6.f),
+		with_a(t.text_primary, alpha), location_text.c_str());
+	dl->AddText(body_font, body_size, ImVec2(x + pad + 20.f, status_y + 25.f),
+		with_a(state_color, alpha), location_detail.c_str());
+
+	const float definitions_h = std::clamp(h * 0.31f, 145.f, 245.f);
+	const float top_y = status_y + status_h + 7.f;
+	const float definitions_y = y + h - definitions_h;
+	const float top_h = std::max(70.f, definitions_y - top_y - 7.f);
+	const bool side_by_side = w >= 820.f;
+	const float source_w = side_by_side ? std::floor((w - pad * 3.f) * 0.46f) : w - pad * 2.f;
+	const float source_h = side_by_side ? top_h : std::max(64.f, top_h * 0.48f);
+	const float source_x = x + pad;
+	const float source_y = top_y;
+	const float disasm_x = side_by_side ? source_x + source_w + pad : source_x;
+	const float disasm_y = side_by_side ? top_y : source_y + source_h + pad;
+	const float disasm_w = side_by_side ? w - (disasm_x - x) - pad : source_w;
+	const float disasm_h = side_by_side ? top_h : std::max(60.f, top_h - source_h - pad);
+
+	draw_glass_card(dl, ImVec2(source_x, source_y),
+		ImVec2(source_x + source_w, source_y + source_h), 6.f, alpha);
+	draw_panel_header(dl, source_x, source_y, source_w, "SOURCE CONTEXT", alpha);
+	const float excerpt_y = source_y + HEADER_H + 2.f;
+	const float excerpt_h = std::max(1.f, source_h - HEADER_H - 4.f);
+	ImGui::SetCursorScreenPos(ImVec2(source_x + 2.f, excerpt_y));
+	ImGui::PushID("source_debug_excerpt");
+	if (ImGui::BeginChild("##excerpt", ImVec2(source_w - 4.f, excerpt_h), false,
+		ImGuiWindowFlags_HorizontalScrollbar)) {
+		if (has_source && !published->current.excerpt.empty()) {
+			for (const auto& line : published->current.excerpt) {
+				ImGui::PushID(static_cast<int>(line.line));
+				if (line.current) {
+					const ImVec2 row_pos = ImGui::GetCursorScreenPos();
+					dl->AddRectFilled(row_pos,
+						ImVec2(row_pos.x + std::max(source_w - 8.f, ImGui::GetContentRegionAvail().x),
+							row_pos.y + 20.f), with_a(t.accent_glow, alpha * 0.36f), 3.f);
+				}
+				ImGui::PushFont(code_font);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+					with_a(line.current ? t.accent_hover : t.text_dim, alpha)),
+					"%5u", static_cast<unsigned>(line.line));
+				ImGui::SameLine(0.f, 10.f);
+				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+					with_a(t.text_primary, alpha)), "%s", line.text.c_str());
+				ImGui::PopFont();
+				ImGui::PopID();
+			}
+		} else {
+			ImGui::Dummy(ImVec2(4.f, 6.f));
+			ImGui::TextDisabled("%s", location_detail.c_str());
+		}
+	}
+	ImGui::EndChild();
+	ImGui::PopID();
+
+	const std::uint64_t assembly_address = has_current ? published->current.address : 0;
+	render_cpu_disasm_slice(dl, disasm_x, disasm_y, disasm_w, disasm_h,
+		assembly_address, alpha);
+
+	const float definitions_x = x + pad;
+	const float definitions_w = w - pad * 2.f;
+	draw_glass_card(dl, ImVec2(definitions_x, definitions_y),
+		ImVec2(definitions_x + definitions_w, y + h - pad), 6.f, alpha);
+	draw_panel_header(dl, definitions_x, definitions_y, definitions_w,
+		"PERSISTENT SOURCE BREAKPOINTS", alpha);
+	const float table_y = definitions_y + HEADER_H + 2.f;
+	const float table_h = std::max(1.f, y + h - pad - table_y - 2.f);
+	ImGui::SetCursorScreenPos(ImVec2(definitions_x + 2.f, table_y));
+	ImGui::PushID("source_debug_definitions");
+	bool table_focused = false;
+	if (ImGui::BeginChild("##definitions", ImVec2(definitions_w - 4.f, table_h), false)) {
+		table_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+		const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+			ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+		if (ImGui::BeginTable("##source_bp_table", 5, flags)) {
+			ImGui::TableSetupScrollFreeze(0, 1);
+			ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 76.f);
+			ImGui::TableSetupColumn("File : line", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+			ImGui::TableSetupColumn("Locations", ImGuiTableColumnFlags_WidthFixed, 74.f);
+			ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150.f);
+			ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch, 0.66f);
+			ImGui::TableHeadersRow();
+			const int count = published ? static_cast<int>(published->definitions.size()) : 0;
+			ImGuiListClipper clipper;
+			clipper.Begin(count, 22.f);
+			while (clipper.Step()) {
+				for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+					const auto& definition = published->definitions[static_cast<size_t>(i)];
+					ImGui::PushID(i);
+					ImGui::TableNextRow(ImGuiTableRowFlags_None, 22.f);
+					ImGui::TableSetColumnIndex(0);
+					ImU32 definition_color = t.warning;
+					if (definition.state == source_debug_service::binding_state_t::bound)
+						definition_color = t.success;
+					else if (definition.state == source_debug_service::binding_state_t::error ||
+						definition.state == source_debug_service::binding_state_t::stale)
+						definition_color = t.error;
+					ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(with_a(definition_color, alpha)),
+						"%s", source_debug_service::binding_state_label(definition.state));
+					ImGui::TableSetColumnIndex(1);
+					const std::string file_line = definition.file_path + ":" +
+						std::to_string(definition.line);
+					const bool selected = ui.source_definition_selected == i;
+					if (ImGui::Selectable(file_line.c_str(), selected,
+						ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick,
+						ImVec2(0.f, 20.f))) {
+						ui.source_definition_selected = i;
+						if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+							action_error.clear();
+							report(source_debug_service::request_open_source(definition.file_path,
+								definition.line, &action_error), action_error,
+								"Opened the source breakpoint location");
+						}
+					}
+					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+						ui.source_definition_selected = i;
+						open_source_actions(definition,
+							aida::ui::context_menu_open_origin_t::pointer);
+					}
+					ImGui::TableSetColumnIndex(2);
+					ImGui::Text("%zu", definition.locations.size());
+					ImGui::TableSetColumnIndex(3);
+					if (definition.locations.empty()) ImGui::TextDisabled("unresolved");
+					else ImGui::Text("0x%016" PRIX64, definition.locations.front().address);
+					ImGui::TableSetColumnIndex(4);
+					ImGui::TextUnformatted(definition.detail.c_str());
+					ImGui::PopID();
+				}
+			}
+			clipper.End();
+			ImGui::EndTable();
+		}
+		if (!published || published->definitions.empty()) {
+			ImGui::Dummy(ImVec2(4.f, 8.f));
+			ImGui::TextDisabled("Press F9 on a path-backed source line to create a persistent breakpoint.");
+		}
+		const bool source_remove_key = ImGui::IsKeyPressed(ImGuiKey_Delete, false);
+		const bool source_menu_key = ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+		const bool source_shift_f10 = ImGui::GetIO().KeyShift &&
+			ImGui::IsKeyPressed(ImGuiKey_F10, false);
+		if (published && ui.source_definition_selected >= 0 &&
+			ui.source_definition_selected < static_cast<int>(published->definitions.size()) &&
+			(source_remove_key || source_menu_key || source_shift_f10)) {
+			const auto& definition = published->definitions[
+				static_cast<size_t>(ui.source_definition_selected)];
+			if (source_menu_key)
+				open_source_actions(definition, aida::ui::context_menu_open_origin_t::menu_key);
+			else if (source_shift_f10)
+				open_source_actions(definition, aida::ui::context_menu_open_origin_t::shift_f10);
+			else {
+				auto retained = make_source_actions(definition);
+				if (!retained.owner_id.empty())
+					static_cast<void>(aida::ui::application_ui::execute_retained_entity_action(
+						"debugger.source.remove",
+						aida::ui::action_invocation_source_t::shortcut, retained));
+			}
+		}
+		aida::ui::application_ui::render_retained_entity_context_menu(
+			"debugger.source.breakpoint");
+		std::string source_action;
+		if (published && ui.source_definition_selected >= 0 &&
+			ui.source_definition_selected < static_cast<int>(published->definitions.size()))
+			source_action = aida::ui::application_ui::consume_retained_entity_action(
+				"debugger.source.breakpoint", published->definitions[
+					static_cast<size_t>(ui.source_definition_selected)].id.c_str());
+		if (!source_action.empty()) {
+			if (published && ui.source_definition_selected >= 0 &&
+				ui.source_definition_selected < static_cast<int>(published->definitions.size())) {
+				const auto& definition = published->definitions[
+					static_cast<size_t>(ui.source_definition_selected)];
+				if (source_action == "debugger.source.open") {
+					action_error.clear();
+					report(source_debug_service::request_open_source(definition.file_path,
+						definition.line, &action_error), action_error,
+						"Opened the source breakpoint location");
+				}
+				if (source_action == "debugger.source.open_disassembly") {
+					const auto context = disasm_view::capture_selected_workspace();
+					if (context) {
+						disasm_view::goto_address(definition.locations.front().address, context);
+						static_cast<void>(aida::ui::application_views::open_or_focus(
+							aida::ui::stable_view_id_t("document.disassembly")));
+					} else {
+						toast_notification::push("Open the matching analysis workspace first.",
+							toast_notification::toast_type_t::warning);
+					}
+				}
+				if (source_action == "debugger.source.copy_location")
+					ImGui::SetClipboardText((definition.file_path + ":" +
+						std::to_string(definition.line)).c_str());
+				if (source_action == "debugger.source.copy_address") {
+					char address[24]{};
+					std::snprintf(address, sizeof(address), "0x%016" PRIX64,
+						definition.locations.front().address);
+					ImGui::SetClipboardText(address);
+				}
+				if (source_action == "debugger.source.rebind_all") {
+					action_error.clear();
+					report(source_debug_service::request_rebind(&action_error), action_error,
+						"Queued exact PDB source rebinding");
+				}
+				if (source_action == "debugger.source.remove") {
+					action_error.clear();
+					report(source_debug_service::request_remove(definition.id, &action_error),
+						action_error, "Queued source-breakpoint removal");
+				}
+			}
+		}
+	}
+	ImGui::EndChild();
+	ImGui::PopID();
+	static_cast<void>(table_focused);
 }
 
 static void render_cpu_stack_view(ImDrawList* dl, float x, float y, float w, float h,
@@ -2395,28 +3673,21 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 			if (ImGui::Button("Apply", ImVec2(110.f, 0.f))) {
 				uint64_t new_val = parse_hex_address(ui.cpu_edit_value_buf);
 				std::string lname = cpu_view_detail::lowercase_reg_name(er.name);
-				bool ok = debugger_engine::set_register(lname, new_val);
-				diag::log_tagged_critical_fmt("cpu_view",
-					"edit_modal_apply name=%s new=0x%llx ok=%d err='%s'",
-					lname.c_str(),
-					static_cast<unsigned long long>(new_val),
-					ok ? 1 : 0,
-					debugger_engine::last_error().c_str());
-				anti_tamper::webhook::write_log("dbg_audit", ok
-					? "[dbg_audit] cpu reg_edit ok=1"
-					: "[dbg_audit] cpu reg_edit fail reason=set_register_failed");
-				const bool readback_ok = ok &&
-					resolve_register_token(lname, debugger_engine::get_registers()) == new_val;
-				if (!ok || !readback_ok) {
-					toast_notification::push("Edit register failed: " +
-						(ok ? std::string("readback mismatch") : debugger_engine::last_error()),
-						toast_notification::toast_type_t::error);
-				} else {
-					debugger_interaction::advance_stop_generation();
-					debugger_engine::invalidate_cache();
-					toast_notification::push("Register updated.",
-						toast_notification::toast_type_t::info);
-				}
+				const auto edit_context = ui.cpu_edit_context;
+				static_cast<void>(queue_debugger_mutation("Edit register",
+					"debugger.register_edit", edit_context,
+					[lname, new_val]() {
+						mutation_result_t result;
+						result.ok = debugger_engine::set_register(lname, new_val);
+						result.verified = result.ok && resolve_register_token(lname,
+							debugger_engine::get_registers()) == new_val;
+						if (!result.verified)
+							result.detail = result.ok ? "Register readback did not match."
+								: "Edit register failed: " + debugger_engine::last_error();
+						else
+							debugger_engine::invalidate_cache();
+						return result;
+					}));
 				ui.cpu_edit_reg_idx = -1;
 				ImGui::CloseCurrentPopup();
 			}
@@ -2578,53 +3849,62 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 					uint64_t size_copy = dump_target.size;
 					std::string path_copy = path_buf;
 					std::string name_copy = dump_target.name;
+					const std::uint32_t target_pid = driver_bridge::attached_pid();
+					const std::uint64_t target_generation =
+						debugger_interaction::current_stop_generation();
+					auto result = std::make_shared<mutation_result_t>();
 					aida::infra::executor::submission_t sub;
 					sub.owner_subsystem = "debugger";
-					sub.label = "debugger.module_dump";
+					sub.label = "Dump selected module";
 					sub.thread_class = "debugger_dump";
 					sub.domain = aida::infra::executor::domain_t::feature_worker;
 					sub.priority = 2;
-					sub.target_pid = driver_bridge::attached_pid();
-					sub.body = [base_copy, size_copy, path_copy, name_copy]() {
+					sub.target_pid = target_pid;
+					sub.generation = target_generation;
+					sub.ui_access_policy = "post_completion_only";
+					sub.failure_policy = "fail_closed";
+					sub.body = [base_copy, size_copy, path_copy, name_copy,
+						target_pid, target_generation, result]() {
 						std::vector<uint8_t> buf;
-						bool read_ok = driver_bridge::read_memory(base_copy,
-							static_cast<size_t>(size_copy), buf);
-						bool write_ok = false;
-						if (read_ok && !buf.empty()) {
-							std::ofstream ofs(path_copy,
-								std::ios::binary | std::ios::trunc);
-							if (ofs.is_open()) {
-								ofs.write(reinterpret_cast<const char*>(buf.data()),
-									static_cast<std::streamsize>(buf.size()));
-								ofs.close();
-								write_ok = true;
-							}
+						if (driver_bridge::attached_pid() != target_pid ||
+							debugger_interaction::current_stop_generation() != target_generation)
+							result->detail = "The target changed before the module dump started.";
+						else {
+							result->ok = driver_bridge::read_memory(base_copy,
+								static_cast<size_t>(size_copy), buf) && buf.size() == size_copy;
+							if (!result->ok)
+								result->detail = "Module dump read failed or returned a partial result.";
+							else
+								result->verified = write_file_atomic_exact(path_copy, buf.data(),
+									buf.size(), result->detail);
 						}
 						diag::log_tagged_critical_fmt("modules",
 							"modules_dump name='%s' base=0x%llx size=%llu read=%d write=%d path='%s'",
 							name_copy.c_str(),
 							static_cast<unsigned long long>(base_copy),
 							static_cast<unsigned long long>(size_copy),
-							read_ok ? 1 : 0,
-							write_ok ? 1 : 0,
+							result->ok ? 1 : 0,
+							result->verified ? 1 : 0,
 							path_copy.c_str());
-						anti_tamper::webhook::write_log("dbg_audit", write_ok
+						anti_tamper::webhook::write_log("dbg_audit", result->verified
 							? "[dbg_audit] modules dump ok=1"
 							: "[dbg_audit] modules dump fail reason=read_or_write_failed");
-						if (write_ok) {
-							char msg[MAX_PATH + 96];
-							std::snprintf(msg, sizeof(msg),
-								"Dumped %llu bytes from %s to %s",
-								static_cast<unsigned long long>(buf.size()),
-								name_copy.c_str(), path_copy.c_str());
-							toast_notification::push(msg,
-								toast_notification::toast_type_t::info);
-						} else {
-							toast_notification::push("Module dump failed.",
-								toast_notification::toast_type_t::error);
-						}
+						const bool posted = post_debugger_ui([result, count = buf.size(), name_copy]() {
+							const std::string message = result->verified
+								? "Dumped " + std::to_string(count) + " bytes from " + name_copy
+								: result->detail.empty() ? "Module dump failed." : result->detail;
+							toast_notification::push(message, result->verified
+								? toast_notification::toast_type_t::success
+								: toast_notification::toast_type_t::error);
+						}, "module_dump_completion");
+						if (!posted)
+							throw std::runtime_error("Module-dump completion could not be published to the UI thread");
+						if (!result->verified)
+							throw std::runtime_error(result->detail.empty()
+								? "Module dump failed" : result->detail);
 					};
-					if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+					const auto submitted = aida::infra::executor::submit(std::move(sub));
+					if (!submitted.submitted) {
 						diag::log_tagged_critical_fmt("modules",
 							"modules_dump_post_failed name='%s' base=0x%llx size=%llu path='%s'",
 							name_copy.c_str(),
@@ -2633,7 +3913,9 @@ static void render_modules_overlay(ImDrawList* dl, float ox, float oy, float w, 
 							path_copy.c_str());
 						toast_notification::push("Module dump queue rejected the task.",
 							toast_notification::toast_type_t::error);
-					}
+					} else
+						register_debugger_task(submitted, "view.debug.modules",
+							"debugger.module_dump", "Dump selected module", false);
 				}
 			}
 		}
@@ -2748,20 +4030,18 @@ static void render_breakpoint_actions(float ox, float oy, float w) {
 			ui.add_bp_addr_buf,
 			static_cast<unsigned long long>(addr));
 		if (addr != 0) {
-			int idx = debugger_engine::add_breakpoint(addr,
-				debugger_engine::bp_type_t::software, "", "", 1);
-			diag::log_tagged_critical_fmt("bp",
-				"bp_add_sw addr=0x%llx idx=%d err='%s'",
-				static_cast<unsigned long long>(addr),
-				idx,
-				debugger_engine::last_error().c_str());
-			if (idx < 0) {
-				toast_notification::push("Add SW BP failed: " +
-					debugger_engine::last_error(),
-					toast_notification::toast_type_t::error);
-			} else {
+			const auto context = debugger_interaction::capture(
+				debugger_interaction::kind_t::breakpoint, addr);
+			if (queue_debugger_mutation("Add software breakpoint",
+				"debugger.breakpoint_add_software", context, [addr]() {
+					mutation_result_t result;
+					result.ok = result.verified = debugger_engine::add_breakpoint(addr,
+						debugger_engine::bp_type_t::software, "", "", 1) >= 0;
+					if (!result.ok) result.detail = "Add software breakpoint failed: " +
+						debugger_engine::last_error();
+					return result;
+				}))
 				ui.add_bp_addr_buf[0] = '\0';
-			}
 		} else {
 			toast_notification::push(
 				"Enter a hexadecimal address (e.g. 0x140001234).",
@@ -2780,20 +4060,18 @@ static void render_breakpoint_actions(float ox, float oy, float w) {
 			ui.add_bp_addr_buf,
 			static_cast<unsigned long long>(addr));
 		if (addr != 0) {
-			int idx = debugger_engine::add_breakpoint(addr,
-				debugger_engine::bp_type_t::hardware_execute, "", "", 1);
-			diag::log_tagged_critical_fmt("bp",
-				"bp_add_hw_exec addr=0x%llx idx=%d err='%s'",
-				static_cast<unsigned long long>(addr),
-				idx,
-				debugger_engine::last_error().c_str());
-			if (idx < 0) {
-				toast_notification::push("Add HW BP failed: " +
-					debugger_engine::last_error(),
-					toast_notification::toast_type_t::error);
-			} else {
+			const auto context = debugger_interaction::capture(
+				debugger_interaction::kind_t::breakpoint, addr);
+			if (queue_debugger_mutation("Add hardware execute breakpoint",
+				"debugger.breakpoint_add_hardware", context, [addr]() {
+					mutation_result_t result;
+					result.ok = result.verified = debugger_engine::add_breakpoint(addr,
+						debugger_engine::bp_type_t::hardware_execute, "", "", 1) >= 0;
+					if (!result.ok) result.detail = "Add hardware breakpoint failed: " +
+						debugger_engine::last_error();
+					return result;
+				}))
 				ui.add_bp_addr_buf[0] = '\0';
-			}
 		} else {
 			toast_notification::push(
 				"Enter a hexadecimal address (e.g. 0x140001234).",
@@ -2806,12 +4084,15 @@ static void render_breakpoint_actions(float ox, float oy, float w) {
 		aida::ui::button_kind_t::destructive,
 		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
 	if (clear_clicked) {
-		size_t before_n = debugger_engine::snapshot_breakpoints().size();
-		debugger_engine::clear_all_breakpoints();
-		diag::log_tagged_critical_fmt("bp",
-			"bp_clear_all removed=%zu", before_n);
-		toast_notification::push("Cleared all breakpoints.",
-			toast_notification::toast_type_t::info);
+		const auto context = debugger_interaction::capture(
+			debugger_interaction::kind_t::breakpoint);
+		static_cast<void>(queue_debugger_mutation("Clear all breakpoints",
+			"debugger.breakpoint_clear_all", context, []() {
+				mutation_result_t result;
+				debugger_engine::clear_all_breakpoints();
+				result.ok = result.verified = debugger_engine::snapshot_breakpoints().empty();
+				return result;
+			}));
 	}
 
 	ImGui::PopID();
@@ -3026,24 +4307,17 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 				!breakpoint_remove_gate.enabled);
 			ImGui::PopID();
 			if (bp_del_clicked) {
-				uint64_t addr_log = bp.address;
-				bool ok = debugger_engine::remove_breakpoint(i);
-				diag::log_tagged_critical_fmt("bp",
-					"bp_remove_row idx=%d addr=0x%llx ok=%d err='%s'",
-					i,
-					static_cast<unsigned long long>(addr_log),
-					ok ? 1 : 0,
-					debugger_engine::last_error().c_str());
-				anti_tamper::webhook::write_log("dbg_audit", ok
-					? "[dbg_audit] bp delete ok=1"
-					: "[dbg_audit] bp delete fail reason=remove_failed");
-				if (!ok) {
-					toast_notification::push("Delete failed: " +
-						debugger_engine::last_error(),
-						toast_notification::toast_type_t::error);
-				} else if (ui.bp_panel.selected == i) {
+				static_cast<void>(queue_debugger_mutation("Delete breakpoint",
+					"debugger.breakpoint_delete", breakpoint_context,
+					[i]() {
+						mutation_result_t result;
+						result.ok = result.verified = debugger_engine::remove_breakpoint(i);
+						if (!result.ok) result.detail = "Delete breakpoint failed: " +
+							debugger_engine::last_error();
+						return result;
+					}));
+				if (ui.bp_panel.selected == i)
 					ui.bp_panel.selected = -1;
-				}
 			}
 
 			if (clicked) {
@@ -3053,19 +4327,14 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 					0, static_cast<uint64_t>(bp.size), bp.name, bp.condition), false);
 			}
 			if (dclicked && breakpoint_toggle_gate.enabled) {
-				diag::log_tagged_fmt("bp",
-					"bp_toggle idx=%d addr=0x%llx",
-					i,
-					static_cast<unsigned long long>(bp.address));
-				bool ok = debugger_engine::toggle_breakpoint(i);
-				diag::log_tagged_fmt("bp",
-					"bp_toggle_done idx=%d ok=%d err='%s'",
-					i,
-					ok ? 1 : 0,
-					debugger_engine::last_error().c_str());
-				anti_tamper::webhook::write_log("dbg_audit", ok
-					? "[dbg_audit] bp toggle ok=1"
-					: "[dbg_audit] bp toggle fail reason=toggle_failed");
+				static_cast<void>(queue_debugger_mutation("Toggle breakpoint state",
+					"debugger.breakpoint_toggle", breakpoint_context, [i]() {
+						mutation_result_t result;
+						result.ok = result.verified = debugger_engine::toggle_breakpoint(i);
+						if (!result.ok) result.detail = "Toggle breakpoint failed: " +
+							debugger_engine::last_error();
+						return result;
+					}));
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
 				select_context(debugger_interaction::capture(
@@ -3115,29 +4384,25 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 			ImGui::Checkbox("Auto-continue after log", &ui.bp_edit_auto_continue);
 			ImGui::Separator();
 			if (ImGui::Button("Apply", ImVec2(110.f, 0.f))) {
-				bool ok_cond = debugger_engine::set_breakpoint_condition(
-					ui.bp_edit_idx, ui.bp_edit_condition_buf);
-				bool ok_log = debugger_engine::set_breakpoint_log(
-					ui.bp_edit_idx, ui.bp_edit_log_buf, ui.bp_edit_auto_continue);
-				diag::log_tagged_critical_fmt("bp",
-					"bp_edit_apply idx=%d cond_ok=%d log_ok=%d cond='%s' log='%s' auto=%d",
-					ui.bp_edit_idx,
-					ok_cond ? 1 : 0,
-					ok_log ? 1 : 0,
-					ui.bp_edit_condition_buf,
-					ui.bp_edit_log_buf,
-					ui.bp_edit_auto_continue ? 1 : 0);
-				anti_tamper::webhook::write_log("dbg_audit", (ok_cond && ok_log)
-					? "[dbg_audit] bp edit_apply ok=1"
-					: "[dbg_audit] bp edit_apply fail reason=engine_rejected");
-				if (!ok_cond || !ok_log) {
-					toast_notification::push(
-						"Edit failed: " + debugger_engine::last_error(),
-						toast_notification::toast_type_t::error);
-				} else {
-					toast_notification::push("Breakpoint updated.",
-						toast_notification::toast_type_t::info);
-				}
+				const int edit_index = ui.bp_edit_idx;
+				const std::string condition(ui.bp_edit_condition_buf);
+				const std::string log_text(ui.bp_edit_log_buf);
+				const bool auto_continue = ui.bp_edit_auto_continue;
+				const auto context = debugger_interaction::capture(
+					debugger_interaction::kind_t::breakpoint, bp_edit.address, 0, edit_index);
+				static_cast<void>(queue_debugger_mutation("Edit breakpoint",
+					"debugger.breakpoint_edit", context,
+					[edit_index, condition, log_text, auto_continue]() {
+						mutation_result_t result;
+						const bool condition_ok = debugger_engine::set_breakpoint_condition(
+							edit_index, condition);
+						const bool log_ok = condition_ok && debugger_engine::set_breakpoint_log(
+							edit_index, log_text, auto_continue);
+						result.ok = result.verified = condition_ok && log_ok;
+						if (!result.ok) result.detail = "Edit breakpoint failed: " +
+							debugger_engine::last_error();
+						return result;
+					}));
 				ui.bp_edit_idx = -1;
 				ImGui::CloseCurrentPopup();
 			}
@@ -3211,22 +4476,49 @@ static void render_callstack(ImDrawList* dl, float ox, float oy, float w, float 
 		if (!busy && now_ms - last > 500) {
 			bool expected = false;
 			if (s_in_flight.compare_exchange_strong(expected, true)) {
+				const std::uint32_t target_pid = driver_bridge::attached_pid();
+				const std::uint64_t target_generation =
+					debugger_interaction::current_stop_generation();
 				aida::infra::executor::submission_t sub;
 				sub.owner_subsystem = "debugger";
 				sub.label = "debugger.call_stack_refresh";
 				sub.thread_class = "debugger_refresh";
 				sub.domain = aida::infra::executor::domain_t::feature_worker;
 				sub.priority = 3;
-				sub.target_pid = driver_bridge::attached_pid();
-				sub.body = [now_ms]() {
-					debugger_engine::get_call_stack();
-					s_last_refresh_ms.store(now_ms, std::memory_order_release);
+				sub.target_pid = target_pid;
+				sub.generation = target_generation;
+				sub.body = [now_ms, target_pid, target_generation]() {
+					try {
+						const std::uint64_t publication_generation =
+							debugger_engine::g_state.call_stack_generation.load(std::memory_order_acquire);
+						if (driver_bridge::attached_pid() == target_pid &&
+							debugger_interaction::current_stop_generation() == target_generation) {
+							static_cast<void>(debugger_engine::get_call_stack());
+							if (driver_bridge::attached_pid() != target_pid ||
+								debugger_interaction::current_stop_generation() != target_generation) {
+								std::lock_guard<std::mutex> lock(debugger_engine::g_state.stack_mutex);
+								if (debugger_engine::g_state.call_stack_generation.load(
+										std::memory_order_acquire) == publication_generation + 1U) {
+									debugger_engine::g_state.call_stack.clear();
+									debugger_engine::g_state.call_stack_generation.fetch_add(
+										1U, std::memory_order_release);
+								}
+							} else {
+								s_last_refresh_ms.store(now_ms, std::memory_order_release);
+							}
+						}
+					} catch (...) {
+						s_in_flight.store(false, std::memory_order_release);
+						throw;
+					}
 					s_in_flight.store(false, std::memory_order_release);
 				};
-				if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+				const auto submitted = aida::infra::executor::submit(std::move(sub));
+				if (!submitted.submitted) {
 					diag::log_tagged("debugger", "call_stack_refresh_post_failed");
 					s_in_flight.store(false, std::memory_order_release);
-				}
+				} else register_debugger_task(submitted, "view.debug.call_stack",
+					"debugger.call_stack_refresh", "Refresh call stack", false);
 			}
 		}
 	}
@@ -3549,16 +4841,13 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 				aida::ui::size_t_::sm, ImVec2(thread_btn_w, btn_h), !suspend_gate.enabled);
 			ImGui::PopID();
 			if (susp) {
-				uint32_t prev = 0;
-				bool ok = driver_bridge::suspend_thread(th.tid, &prev);
-				diag::log_tagged_fmt("debugger",
-					"thread_suspend tid=%u ok=%d prev_count=%u",
-					static_cast<unsigned>(th.tid),
-					ok ? 1 : 0,
-					static_cast<unsigned>(prev));
-				anti_tamper::webhook::write_log("dbg_audit", ok
-					? "[dbg_audit] threads suspend ok=1"
-					: "[dbg_audit] threads suspend fail reason=driver_suspend_failed");
+				static_cast<void>(queue_debugger_mutation("Suspend thread",
+					"debugger.thread_suspend", thread_context, [tid = th.tid]() {
+						mutation_result_t result;
+						std::uint32_t previous = 0;
+						result.ok = result.verified = driver_bridge::suspend_thread(tid, &previous);
+						return result;
+					}));
 			}
 
 			ImGui::SetCursorScreenPos(ImVec2(actions_x + thread_btn_w + btn_g, btn_y));
@@ -3568,16 +4857,13 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 				aida::ui::size_t_::sm, ImVec2(thread_btn_w, btn_h), !resume_gate.enabled);
 			ImGui::PopID();
 			if (res) {
-				uint32_t prev = 0;
-				bool ok = driver_bridge::resume_thread(th.tid, &prev);
-				diag::log_tagged_fmt("debugger",
-					"thread_resume tid=%u ok=%d prev_count=%u",
-					static_cast<unsigned>(th.tid),
-					ok ? 1 : 0,
-					static_cast<unsigned>(prev));
-				anti_tamper::webhook::write_log("dbg_audit", ok
-					? "[dbg_audit] threads resume ok=1"
-					: "[dbg_audit] threads resume fail reason=driver_resume_failed");
+				static_cast<void>(queue_debugger_mutation("Resume thread",
+					"debugger.thread_resume", thread_context, [tid = th.tid]() {
+						mutation_result_t result;
+						std::uint32_t previous = 0;
+						result.ok = result.verified = driver_bridge::resume_thread(tid, &previous);
+						return result;
+					}));
 			}
 
 			ImGui::SetCursorScreenPos(ImVec2(actions_x + (thread_btn_w + btn_g) * 2.f, btn_y));
@@ -3657,41 +4943,22 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		if (!terminate_gate.enabled)
 			ImGui::BeginDisabled();
 		if (ImGui::Button("Terminate", ImVec2(130.f, 0.f))) {
-			uint32_t target_tid = ui.thread_kill_tid;
-			SetLastError(ERROR_SUCCESS);
-			bool ok = driver_bridge::terminate_thread(target_tid, 0xDEADu);
-			bool readback_ok = false;
-			if (ok) {
-				auto threads = driver_bridge::enumerate_threads();
-				readback_ok = std::none_of(threads.begin(), threads.end(),
-					[target_tid](const auto& thread) { return thread.tid == target_tid; });
-			}
-			DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
-			std::string kernel_reason;
-			const bool kernel_ready = driver_bridge::using_kernel_driver() &&
-				driver_bridge::kernel_session_available(&kernel_reason) &&
-				driver_bridge::dynamic_ioctls_ready();
-			diag::log_tagged_critical_fmt("debugger",
-				"thread_kill tid=%u term_ok=%d readback_ok=%d gle=%lu kernel_ready=%d reason=%s status=%s last_error=%s method=kernel_driver",
-				static_cast<unsigned>(target_tid),
-				ok ? 1 : 0,
-				readback_ok ? 1 : 0,
-				static_cast<unsigned long>(gle),
-				kernel_ready ? 1 : 0,
-				kernel_reason.empty() ? "<empty>" : kernel_reason.c_str(),
-				driver_bridge::status().c_str(),
-				driver_bridge::last_error().c_str());
-			anti_tamper::webhook::write_log("dbg_audit", ok
-				? "[dbg_audit] threads kill ok=1"
-				: "[dbg_audit] threads kill fail reason=kernel_thread_terminate_failed");
-			if (ok && readback_ok) {
-				toast_notification::push("Thread terminated.",
-					toast_notification::toast_type_t::info);
-			} else {
-				toast_notification::push(ok ? "Thread termination could not be verified."
-					: "Kernel thread termination failed.",
-					toast_notification::toast_type_t::error);
-			}
+			const std::uint32_t target_tid = ui.thread_kill_tid;
+			const auto context = ui.thread_kill_context;
+			static_cast<void>(queue_debugger_mutation("Terminate thread",
+				"debugger.thread_terminate", context, [target_tid]() {
+					mutation_result_t result;
+					result.ok = driver_bridge::terminate_thread(target_tid, 0xDEADu);
+					if (result.ok) {
+						auto current_threads = driver_bridge::enumerate_threads();
+						result.verified = std::none_of(current_threads.begin(), current_threads.end(),
+							[target_tid](const auto& thread) { return thread.tid == target_tid; });
+					}
+					if (!result.verified)
+						result.detail = result.ok ? "Thread termination could not be verified."
+							: "Kernel thread termination failed: " + driver_bridge::last_error();
+					return result;
+				}));
 			ui.thread_kill_idx = -1;
 			ui.thread_kill_tid = 0;
 			ImGui::CloseCurrentPopup();
@@ -3855,16 +5122,25 @@ static void render_watches(ImDrawList* dl, float ox, float oy, float w, float h,
 			ImGui::PopID();
 			if (rm) {
 				diag::log_tagged_fmt("watches",
-					"watch_remove idx=%d expr='%s'",
+					"watch_remove_review idx=%d expr='%s'",
 					i, w_entry.expression.c_str());
-				debugger_engine::remove_watch(i);
+				request_context_mutation(pending_context_mutation_t::remove_watch,
+					debugger_interaction::capture(debugger_interaction::kind_t::watch,
+						ok ? resolved : 0, 0, i, 0, 0, display_expression, value_text));
 			}
 
-			if (clicked) ui.watch_panel.selected = i;
+			if (clicked) {
+				ui.watch_panel.selected = i;
+				select_context(debugger_interaction::capture(
+					debugger_interaction::kind_t::watch, ok ? resolved : 0, 0, i,
+					0, 0, display_expression, value_text), false);
+			}
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ok && resolved != 0)
 				jump_to_hex(resolved, 256);
-			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && ok)
-				copy_addr_to_clipboard(resolved);
+			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+				select_context(debugger_interaction::capture(
+					debugger_interaction::kind_t::watch, ok ? resolved : 0, 0, i,
+					0, 0, display_expression, value_text), true);
 		}
 	}
 	clipper.End();
@@ -3915,22 +5191,23 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f),
 		!tracing && !trace_can_start);
 	if (start_clicked) {
-		if (tracing) {
-			diag::log_tagged_critical_fmt("trace",
-				"trace_stop_request prev_count=%zu",
-				st.trace_log.size());
-			debugger_engine::stop_trace();
-			anti_tamper::webhook::write_log("dbg_audit",
-				"[dbg_audit] trace stop ok=1");
-		} else {
-			diag::log_tagged_critical_fmt("trace",
-				"trace_start_request max_depth=%d",
-				st.trace_max_depth);
-			bool ok = debugger_engine::start_trace();
-			anti_tamper::webhook::write_log("dbg_audit", ok
-				? "[dbg_audit] trace start ok=1"
-				: "[dbg_audit] trace start fail reason=engine_rejected");
-		}
+		const auto context = debugger_interaction::capture(
+			debugger_interaction::kind_t::trace_record);
+		static_cast<void>(queue_debugger_mutation(tracing ? "Stop trace" : "Start trace",
+			tracing ? "debugger.trace_stop" : "debugger.trace_start", context,
+			[tracing]() {
+				mutation_result_t result;
+				if (tracing) {
+					debugger_engine::stop_trace();
+					result.ok = result.verified =
+						!debugger_engine::g_state.tracing.load(std::memory_order_acquire);
+				} else {
+					result.ok = debugger_engine::start_trace();
+					result.verified = result.ok &&
+						debugger_engine::g_state.tracing.load(std::memory_order_acquire);
+				}
+				return result;
+			}, false));
 	}
 	ImGui::SameLine(0.f, btn_gap);
 	bool clear_clicked = aida::ui::button("Clear",
@@ -3938,17 +5215,19 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
 	if (clear_clicked) {
 		size_t before = 0;
-		{
-			std::lock_guard<std::mutex> lk(st.trace_mutex);
+		std::unique_lock<std::mutex> trace_lock(st.trace_mutex, std::try_to_lock);
+		if (trace_lock.owns_lock()) {
 			before = st.trace_log.size();
 			st.trace_log.clear();
 			st.trace_generation.fetch_add(1, std::memory_order_release);
 			st.trace_dropped.store(0, std::memory_order_release);
-		}
-		diag::log_tagged_fmt("trace",
-			"trace_clear removed=%zu", before);
-		anti_tamper::webhook::write_log("dbg_audit",
-			"[dbg_audit] trace clear ok=1");
+			trace_lock.unlock();
+			diag::log_tagged_fmt("trace", "trace_clear removed=%zu", before);
+			anti_tamper::webhook::write_log("dbg_audit",
+				"[dbg_audit] trace clear ok=1");
+		} else
+			toast_notification::push("Trace is updating; retry Clear in a moment.",
+				toast_notification::toast_type_t::warning);
 	}
 	ImGui::SameLine(0.f, btn_gap);
 	bool export_clicked = aida::ui::button("Export",
@@ -3986,46 +5265,85 @@ static void render_trace(ImDrawList* dl, float ox, float oy, float w, float h, f
 				submission.cancel_hook = [cancelled]() {
 					cancelled->store(true, std::memory_order_release);
 				};
-				submission.body = [path, cancelled]() {
-					std::vector<debugger_engine::trace_record_t> trace_copy;
-					{
-						std::lock_guard<std::mutex> lock(debugger_engine::g_state.trace_mutex);
-						trace_copy = debugger_engine::g_state.trace_log;
-					}
-					if (cancelled->load(std::memory_order_acquire))
-						return;
-					std::ofstream stream(path, std::ios::trunc);
-					if (!stream.is_open()) {
-						diag::log_tagged_critical_fmt("trace", "trace_export_failed path='%s' reason=open", path.c_str());
-						return;
-					}
-					stream << "index,address,rip,rax,rcx,rdx,rsp,disasm\n";
+				auto export_result = std::make_shared<mutation_result_t>();
+				submission.body = [path, cancelled, export_result]() {
+					auto publish = [export_result]() {
+						return post_debugger_ui([export_result]() {
+							toast_notification::push(export_result->verified ? "Trace export completed."
+								: export_result->detail,
+								export_result->verified ? toast_notification::toast_type_t::success
+									: toast_notification::toast_type_t::error);
+						}, "trace_export_completion");
+					};
 					std::size_t written = 0;
-					for (const auto& record : trace_copy) {
-						if ((written & 0x3ffU) == 0U && cancelled->load(std::memory_order_acquire)) {
-							stream.close();
-							std::error_code remove_error;
-							std::filesystem::remove(path, remove_error);
-							return;
+					try {
+						std::vector<debugger_engine::trace_record_t> trace_copy;
+						{
+							std::lock_guard<std::mutex> lock(debugger_engine::g_state.trace_mutex);
+							const auto& source = debugger_engine::g_state.trace_log;
+							if (source.size() > 50000U)
+								export_result->detail = "Trace exceeds the 50,000-record export bound.";
+							else {
+								std::size_t text_bytes = 0;
+								for (const auto& record : source) {
+									text_bytes += record.disasm_text.size();
+									if (text_bytes > 64U * 1024U * 1024U) {
+										export_result->detail = "Trace text exceeds the 64 MiB export bound.";
+										break;
+									}
+								}
+								if (export_result->detail.empty()) trace_copy = source;
+							}
 						}
-						char line[512];
-						std::snprintf(line, sizeof(line),
-							"%d,0x%016llX,0x%016llX,0x%016llX,0x%016llX,0x%016llX,0x%016llX,",
-							record.index,
-							static_cast<unsigned long long>(record.address),
-							static_cast<unsigned long long>(record.regs.rip),
-							static_cast<unsigned long long>(record.regs.rax),
-							static_cast<unsigned long long>(record.regs.rcx),
-							static_cast<unsigned long long>(record.regs.rdx),
-							static_cast<unsigned long long>(record.regs.rsp));
-						stream << line;
-						for (const char character : record.disasm_text)
-							stream.put(character == ',' || character == '"' || character == '\n' || character == '\r' ? ' ' : character);
-						stream.put('\n');
-						++written;
+						if (cancelled->load(std::memory_order_acquire))
+							export_result->detail = "Trace export cancelled.";
+						if (export_result->detail.empty()) {
+							std::string csv;
+							csv.reserve(std::min<std::size_t>(64U * 1024U * 1024U,
+								trace_copy.size() * 160U + 64U));
+							csv.append("index,address,rip,rax,rcx,rdx,rsp,disasm\n");
+							for (const auto& record : trace_copy) {
+								if ((written & 0x3ffU) == 0U && cancelled->load(std::memory_order_acquire)) {
+									export_result->detail = "Trace export cancelled.";
+									break;
+								}
+								char line[512];
+								std::snprintf(line, sizeof(line),
+									"%d,0x%016llX,0x%016llX,0x%016llX,0x%016llX,0x%016llX,0x%016llX,",
+									record.index,
+									static_cast<unsigned long long>(record.address),
+									static_cast<unsigned long long>(record.regs.rip),
+									static_cast<unsigned long long>(record.regs.rax),
+									static_cast<unsigned long long>(record.regs.rcx),
+									static_cast<unsigned long long>(record.regs.rdx),
+									static_cast<unsigned long long>(record.regs.rsp));
+								csv.append(line);
+								for (const char character : record.disasm_text)
+									csv.push_back(character == ',' || character == '"' || character == '\n' || character == '\r' ? ' ' : character);
+								csv.push_back('\n');
+								if (csv.size() > 128U * 1024U * 1024U) {
+									export_result->detail = "Encoded trace exceeds the 128 MiB export bound.";
+									break;
+								}
+								++written;
+							}
+							if (export_result->detail.empty())
+								export_result->ok = export_result->verified = write_file_atomic_exact(
+									path, csv.data(), csv.size(), export_result->detail);
+						}
+					} catch (const std::exception& exception) {
+						export_result->detail = std::string("Trace export failed: ") + exception.what();
+					} catch (...) {
+						export_result->detail = "Trace export failed with an unknown error.";
 					}
-					stream.close();
-					diag::log_tagged_critical_fmt("trace", "trace_export count=%zu path='%s'", written, path.c_str());
+					if (!export_result->verified && export_result->detail.empty())
+						export_result->detail = "Trace export failed.";
+					diag::log_tagged_critical_fmt("trace", "trace_export count=%zu ok=%d path='%s'",
+						written, export_result->verified ? 1 : 0, path.c_str());
+					if (!publish())
+						throw std::runtime_error("Trace-export completion could not be published to the UI thread");
+					if (!export_result->verified)
+						throw std::runtime_error(export_result->detail);
 				};
 				const auto result = aida::infra::executor::submit(std::move(submission));
 				if (!result.submitted)
@@ -4341,13 +5659,20 @@ static void render_strings(ImDrawList* dl, float ox, float oy, float w, float h,
 				dl->AddText(body_font, body_font_size, ImVec2(ox + w - 150.f, ry + 5.f),
 				            with_a(t.text_dim, a), sr.module_name.c_str());
 
-			if (clicked) ui.strings_panel.selected = i;
+			if (clicked) {
+				ui.strings_panel.selected = i;
+				select_context(debugger_interaction::capture(
+					debugger_interaction::kind_t::string_value, sr.address, 0, i,
+					0, sr.value.size(), sr.value, sr.module_name), false);
+			}
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 				diag::log_tagged_fmt("dbg_view", "strings double-click: jump to hex addr=0x%llX value='%.32s'", (unsigned long long)sr.address, sr.value.c_str());
 				jump_to_hex(sr.address, 256);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				copy_addr_to_clipboard(sr.address);
+				select_context(debugger_interaction::capture(
+					debugger_interaction::kind_t::string_value, sr.address, 0, i,
+					0, sr.value.size(), sr.value, sr.module_name), true);
 		}
 	}
 	clipper.End();
@@ -4431,11 +5756,20 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 			static_cast<unsigned long long>(addr),
 			ui.add_bookmark_label_buf);
 		if (addr != 0) {
-			debugger_engine::toggle_bookmark(addr);
-			if (ui.add_bookmark_label_buf[0])
-				debugger_engine::set_label(addr, ui.add_bookmark_label_buf);
-			ui.add_bookmark_buf[0] = '\0';
-			ui.add_bookmark_label_buf[0] = '\0';
+			const std::string label(ui.add_bookmark_label_buf);
+			const auto context = debugger_interaction::capture(
+				debugger_interaction::kind_t::bookmark, addr, 0, -1, 0, 0, label);
+			if (queue_debugger_mutation("Add bookmark", "debugger.bookmark_add",
+				context, [addr, label]() {
+					mutation_result_t result;
+					debugger_engine::toggle_bookmark(addr);
+					if (!label.empty()) debugger_engine::set_label(addr, label);
+					result.ok = result.verified = true;
+					return result;
+				}, false)) {
+				ui.add_bookmark_buf[0] = '\0';
+				ui.add_bookmark_label_buf[0] = '\0';
+			}
 		} else {
 			toast_notification::push(
 				"Enter a hexadecimal address (e.g. 0x140001234).",
@@ -4451,14 +5785,16 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 		draw_table_header(dl, ox, table_y, w, cols, 4, a);
 	}
 
-	std::vector<uint64_t> snapshot;
-	std::map<uint64_t, std::string> labels_snapshot;
-	{
-		std::lock_guard<std::mutex> lk(st.anno_mutex);
+	static std::vector<uint64_t> snapshot;
+	static std::map<uint64_t, std::string> labels_snapshot;
+	std::unique_lock<std::mutex> annotation_lock(st.anno_mutex, std::try_to_lock);
+	if (annotation_lock.owns_lock() && st.bookmarks.size() <= 65536U &&
+		st.labels.size() <= 65536U) {
 		snapshot = st.bookmarks;
-		for (auto& kv : st.labels)
-			labels_snapshot[kv.first] = kv.second.text;
+		labels_snapshot.clear();
+		for (auto& kv : st.labels) labels_snapshot[kv.first] = kv.second.text;
 	}
+	if (annotation_lock.owns_lock()) annotation_lock.unlock();
 	int total_n = static_cast<int>(snapshot.size());
 	float content_y = table_y + HEADER_H;
 	float visible_h = h - bar_h - HEADER_H;
@@ -4505,6 +5841,7 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 			if (it != labels_snapshot.end())
 				dl->AddText(body_font, body_font_size, ImVec2(ox + 246.f, ry + 7.f),
 				            with_a(t.text_primary, a), it->second.c_str());
+			const std::string bookmark_label = it != labels_snapshot.end() ? it->second : std::string();
 
 			float btn_x = ox + w - 84.f;
 			float btn_w = 64.f;
@@ -4517,18 +5854,27 @@ static void render_bookmarks(ImDrawList* dl, float ox, float oy, float w, float 
 			ImGui::PopID();
 			if (rm) {
 				diag::log_tagged_fmt("bookmarks",
-					"bookmark_remove addr=0x%llx",
+					"bookmark_remove_review addr=0x%llx",
 					static_cast<unsigned long long>(addr));
-				debugger_engine::toggle_bookmark(addr);
+				request_context_mutation(pending_context_mutation_t::remove_bookmark,
+					debugger_interaction::capture(debugger_interaction::kind_t::bookmark,
+						addr, 0, i, 0, 0, bookmark_label));
 			}
 
-			if (clicked) ui.bookmark_panel.selected = i;
+			if (clicked) {
+				ui.bookmark_panel.selected = i;
+				select_context(debugger_interaction::capture(
+					debugger_interaction::kind_t::bookmark, addr, 0, i,
+					0, 0, bookmark_label), false);
+			}
 			if (dclicked) {
 				diag::log_tagged_fmt("dbg_view", "bookmark double-click: jump to addr=0x%llX", (unsigned long long)addr);
 				jump_to_disasm(addr);
 			}
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
-				copy_addr_to_clipboard(addr);
+				select_context(debugger_interaction::capture(
+					debugger_interaction::kind_t::bookmark, addr, 0, i,
+					0, 0, bookmark_label), true);
 		}
 	}
 	clipper.End();
@@ -4580,8 +5926,14 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		sub.thread_class = "debugger_refresh";
 		sub.domain = aida::infra::executor::domain_t::feature_worker;
 		sub.priority = 3;
-		sub.target_pid = driver_bridge::attached_pid();
-		sub.body = []() {
+		const std::uint32_t target_pid = driver_bridge::attached_pid();
+		const std::uint64_t target_generation = debugger_interaction::current_stop_generation();
+		sub.target_pid = target_pid;
+		sub.generation = target_generation;
+		sub.body = [target_pid, target_generation]() {
+			if (driver_bridge::attached_pid() != target_pid ||
+				debugger_interaction::current_stop_generation() != target_generation)
+				return;
 			debugger_engine::enumerate_handles();
 			size_t n = 0;
 			{
@@ -4592,8 +5944,12 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 			diag::log_tagged_fmt("handles",
 				"handles_enumerate_done count=%zu", n);
 		};
-		if (!aida::infra::executor::submit(std::move(sub)).submitted)
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted)
 			diag::log_tagged("handles", "handles_enumerate_post_failed");
+		else
+			register_debugger_task(submitted, "view.debug.handles",
+				"debugger.handles_enumerate", "Enumerate target handles", false);
 	}
 	ImGui::PopID();
 
@@ -4749,45 +6105,19 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		if (!close_gate.enabled)
 			ImGui::BeginDisabled();
 		if (ImGui::Button("Close Handle", ImVec2(140.f, 0.f))) {
-			uint64_t value = ui.handle_close_value;
-			uint32_t target_pid = driver_bridge::attached_pid();
-			SetLastError(ERROR_SUCCESS);
-			bool ok = driver_bridge::close_process_handle(target_pid, value);
-			DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
-			std::string kernel_reason;
-			const bool kernel_ready = driver_bridge::using_kernel_driver() &&
-				driver_bridge::kernel_session_available(&kernel_reason) &&
-				driver_bridge::dynamic_ioctls_ready();
-			diag::log_tagged_critical_fmt("handles",
-				"handles_close pid=%u handle=0x%llx ok=%d gle=%lu kernel_ready=%d reason=%s status=%s last_error=%s method=kernel_driver",
-				static_cast<unsigned>(target_pid),
-				static_cast<unsigned long long>(value),
-				ok ? 1 : 0,
-				static_cast<unsigned long>(gle),
-				kernel_ready ? 1 : 0,
-				kernel_reason.empty() ? "<empty>" : kernel_reason.c_str(),
-				driver_bridge::status().c_str(),
-				driver_bridge::last_error().c_str());
-			anti_tamper::webhook::write_log("dbg_audit", ok
-				? "[dbg_audit] handles close ok=1"
-				: "[dbg_audit] handles close fail reason=kernel_handle_close_failed");
-			if (ok) {
-				toast_notification::push("Handle closed in target.",
-					toast_notification::toast_type_t::info);
-				aida::infra::executor::submission_t sub;
-				sub.owner_subsystem = "debugger";
-				sub.label = "debugger.handles_refresh_after_close";
-				sub.thread_class = "debugger_refresh";
-				sub.domain = aida::infra::executor::domain_t::feature_worker;
-				sub.priority = 3;
-				sub.target_pid = target_pid;
-				sub.body = []() { debugger_engine::enumerate_handles(); };
-				if (!aida::infra::executor::submit(std::move(sub)).submitted)
-					diag::log_tagged("handles", "handles_refresh_after_close_post_failed");
-			} else {
-				toast_notification::push("Kernel handle close failed.",
-					toast_notification::toast_type_t::error);
-			}
+			const std::uint64_t value = ui.handle_close_value;
+			const auto context = ui.handle_close_context;
+			static_cast<void>(queue_debugger_mutation("Close target handle",
+				"debugger.handle_close", context, [context, value]() {
+					mutation_result_t result;
+					result.ok = driver_bridge::close_process_handle(context.target_pid, value);
+					result.verified = result.ok;
+					if (result.ok)
+						debugger_engine::enumerate_handles();
+					else
+						result.detail = "Kernel handle close failed: " + driver_bridge::last_error();
+					return result;
+				}));
 			ui.handle_close_idx = -1;
 			ui.handle_close_value = 0;
 			ui.handle_close_type.clear();
@@ -4809,22 +6139,421 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 }
 
 
+static bool request_code_cave_search() {
+	if (g_code_cave_search.pending.load(std::memory_order_acquire)) return false;
+	const std::size_t minimum = static_cast<std::size_t>(
+		std::strtoull(g_code_cave_search.minimum_size, nullptr, 10));
+	if (minimum == 0 || minimum > (1U << 20U)) {
+		g_code_cave_search.dialog_error =
+			"Code-cave minimum must be between 1 byte and 1 MiB.";
+		toast_notification::push(g_code_cave_search.dialog_error,
+			toast_notification::toast_type_t::warning);
+		return false;
+	}
+	const std::string filter(g_code_cave_search.module_filter);
+	const std::uint32_t target_pid = driver_bridge::attached_pid();
+	const std::uint64_t target_generation = debugger_interaction::current_stop_generation();
+	if (target_pid == 0 || debugger_engine::g_state.status.load(
+			std::memory_order_acquire) != debugger_engine::dbg_status_t::paused) {
+		g_code_cave_search.dialog_error = "Attach a paused debugger target before searching for code caves.";
+		return false;
+	}
+	g_code_cave_search.dialog_error.clear();
+	g_code_cave_search.pending.store(true, std::memory_order_release);
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "debugger";
+	submission.label = "Find code caves";
+	submission.thread_class = "debugger_memory_scan";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 3;
+	submission.target_pid = target_pid;
+	submission.generation = target_generation;
+	submission.ui_access_policy = "post_completion_only";
+	submission.failure_policy = "fail_closed";
+	submission.body = [minimum, filter, target_pid, target_generation]() {
+		struct pending_reset_t {
+			~pending_reset_t() {
+				g_code_cave_search.pending.store(false, std::memory_order_release);
+			}
+		} pending_reset;
+		std::vector<code_cave_result_t> results;
+		std::string error;
+		bool terminal_failure = false;
+		try {
+			if (driver_bridge::attached_pid() != target_pid ||
+				debugger_engine::g_state.status.load(std::memory_order_acquire) !=
+					debugger_engine::dbg_status_t::paused ||
+				debugger_interaction::current_stop_generation() != target_generation) {
+				error = "The target changed before code-cave discovery started.";
+				terminal_failure = true;
+			} else {
+				auto modules = driver_bridge::enumerate_modules();
+				std::uint64_t scan_bytes = 0;
+				for (const auto& module : modules) {
+					if (!filter.empty()) {
+						std::string candidate = module.name;
+						std::string needle = filter;
+						std::transform(candidate.begin(), candidate.end(), candidate.begin(),
+							[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+						std::transform(needle.begin(), needle.end(), needle.begin(),
+							[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+						if (candidate.find(needle) == std::string::npos) continue;
+					}
+					constexpr std::uint64_t scan_limit = 512ULL * 1024ULL * 1024ULL;
+					if (module.size > scan_limit - scan_bytes) {
+						error = "Matching modules exceed the 512 MiB code-cave scan bound; narrow the module filter.";
+						break;
+					}
+					scan_bytes += module.size;
+					const auto caves = code_patcher::find_code_caves(module.base, module.size, minimum);
+					for (const auto& cave : caves) {
+						if (results.size() >= 10000U) {
+							error = "Code-cave results were truncated at 10,000 entries.";
+							break;
+						}
+						results.push_back({cave.address, static_cast<std::size_t>(cave.size), cave.module_name});
+					}
+					if (results.size() >= 10000U) break;
+				}
+			}
+		} catch (const std::exception& exception) {
+			error = std::string("Code-cave discovery failed: ") + exception.what();
+			terminal_failure = true;
+		} catch (...) {
+			error = "Code-cave discovery failed with an unknown error.";
+			terminal_failure = true;
+		}
+		if (driver_bridge::attached_pid() != target_pid ||
+			debugger_engine::g_state.status.load(std::memory_order_acquire) !=
+				debugger_engine::dbg_status_t::paused ||
+			debugger_interaction::current_stop_generation() != target_generation) {
+			results.clear();
+			error = "The target changed before code-cave discovery completed.";
+			terminal_failure = true;
+		}
+		try {
+			auto publication = std::make_shared<code_cave_publication_t>();
+			publication->generation = g_code_cave_publication_sequence.fetch_add(
+				1, std::memory_order_acq_rel);
+			publication->target_pid = target_pid;
+			publication->target_stop_generation = target_generation;
+			publication->results = std::move(results);
+			publication->detail = error;
+			std::atomic_store_explicit(&g_code_cave_publication,
+				std::shared_ptr<const code_cave_publication_t>(std::move(publication)),
+				std::memory_order_release);
+		} catch (const std::exception& exception) {
+			error = std::string("Code-cave result publication failed: ") + exception.what();
+			terminal_failure = true;
+		} catch (...) {
+			error = "Code-cave result publication failed with an unknown error.";
+			terminal_failure = true;
+		}
+		bool posted = false;
+		try {
+			posted = post_debugger_ui([detail = error]() {
+				if (!detail.empty())
+					toast_notification::push(detail, toast_notification::toast_type_t::warning);
+			}, "code_cave_completion");
+		} catch (const std::exception& exception) {
+			error = std::string("Code-cave completion publication failed: ") + exception.what();
+			terminal_failure = true;
+		} catch (...) {
+			error = "Code-cave completion publication failed with an unknown error.";
+			terminal_failure = true;
+		}
+		if (!posted) {
+			if (error.empty())
+				error = "Code-cave completion could not be published to the UI thread.";
+			terminal_failure = true;
+		}
+		if (terminal_failure)
+			throw std::runtime_error(error.empty()
+				? "Code-cave discovery failed without a diagnostic." : error);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		g_code_cave_search.pending.store(false, std::memory_order_release);
+		g_code_cave_search.dialog_error = "Code-cave search queue rejected the task: " +
+			submitted.reject_reason;
+		toast_notification::push(g_code_cave_search.dialog_error,
+			toast_notification::toast_type_t::error);
+		return false;
+	}
+	register_debugger_task(submitted, "view.debug.patches", "debugger.code_caves",
+		"Find code caves", false);
+	return true;
+}
+
+static bool request_patchset_save(std::string* error) {
+	char path_buf[MAX_PATH] = "patches.json";
+	static const char k_patchset_filter[] =
+		"JSON (*.json)\0*.json\0Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+	if (!win32_dialog::show_save_file_dialog(g_hwnd, "Save Patchset",
+			k_patchset_filter, "json", path_buf, sizeof(path_buf),
+			"debugger_view::patches_save"))
+		return true;
+	const std::string destination(path_buf);
+	auto cancelled = std::make_shared<std::atomic<bool>>(false);
+	auto save_result = std::make_shared<mutation_result_t>();
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "debugger";
+	submission.label = "Save patchset";
+	submission.thread_class = "debugger_export";
+	submission.domain = aida::infra::executor::domain_t::diagnostics;
+	submission.priority = 3;
+	submission.cancel_hook = [cancelled]() {
+		cancelled->store(true, std::memory_order_release);
+	};
+	submission.ui_access_policy = "post_completion_only";
+	submission.body = [destination, cancelled, save_result]() {
+		std::vector<code_patcher::patch_entry_t> patches;
+		{
+			std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
+			if (code_patcher::g_state.patches.size() > 4096U)
+				save_result->detail = "Patchset exceeds the 4,096-entry export bound.";
+			else
+				patches = code_patcher::g_state.patches;
+		}
+		if (save_result->detail.empty() && patches.empty())
+			save_result->detail = "No patches to save.";
+		std::string encoded;
+		if (save_result->detail.empty()) {
+			encoded = "{\n  \"patches\": [\n";
+			for (size_t i = 0; i < patches.size(); ++i) {
+				if ((i & 0x3fU) == 0U && cancelled->load(std::memory_order_acquire)) {
+					save_result->detail = "Patchset export cancelled.";
+					break;
+				}
+				const auto& p = patches[i];
+				char line[256];
+				std::snprintf(line, sizeof(line),
+					"    {\n      \"index\": %zu,\n"
+					"      \"address\": \"0x%016llX\",\n"
+					"      \"timestamp\": %lld,\n"
+					"      \"active\": %s,\n"
+					"      \"description\": \"",
+					i, static_cast<unsigned long long>(p.address),
+					static_cast<long long>(p.timestamp), p.active ? "true" : "false");
+				encoded.append(line);
+				for (char c : p.description) {
+					if (c == '"' || c == '\\') encoded.push_back('\\');
+					encoded.push_back(c == '\n' || c == '\r' ? ' ' : c);
+				}
+				encoded.append("\",\n      \"original\": \"");
+				encoded.append(code_patcher::format_bytes(p.original_bytes));
+				encoded.append("\",\n      \"patched\": \"");
+				encoded.append(code_patcher::format_bytes(p.patched_bytes));
+				encoded.append("\"\n    }");
+				if (i + 1 < patches.size()) encoded.push_back(',');
+				encoded.push_back('\n');
+				if (encoded.size() > 16U * 1024U * 1024U) {
+					save_result->detail = "Encoded patchset exceeds the 16 MiB export bound.";
+					break;
+				}
+			}
+			if (save_result->detail.empty()) encoded.append("  ]\n}\n");
+		}
+		if (save_result->detail.empty())
+			save_result->ok = save_result->verified = write_file_atomic_exact(destination,
+				encoded.data(), encoded.size(), save_result->detail);
+		const bool posted = post_debugger_ui([save_result, count = patches.size()]() {
+			toast_notification::push(save_result->verified
+				? "Saved " + std::to_string(count) + " patches." : save_result->detail,
+				save_result->verified ? toast_notification::toast_type_t::success
+					: toast_notification::toast_type_t::error);
+		}, "patchset_save_completion");
+		if (!posted)
+			throw std::runtime_error("Patchset-export completion could not be published to the UI thread");
+		if (!save_result->verified)
+			throw std::runtime_error(save_result->detail.empty()
+				? "Patchset export failed" : save_result->detail);
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
+		if (error) *error = "Patchset export queue rejected the task: " + submitted.reject_reason;
+		return false;
+	}
+	register_debugger_task(submitted, "view.debug.patches", "debugger.patchset_save",
+		"Save patchset", true);
+	return true;
+}
+
+bool dispatch_patch_panel_command(patch_panel_command_t command, std::string* error) {
+	const auto snapshot = code_patcher::published_snapshot();
+	if (!snapshot) {
+		if (error) *error = "The immutable Patches publication is unavailable";
+		return false;
+	}
+	switch (command) {
+		case patch_panel_command_t::stage: {
+			const auto registers = debugger_engine::cached_registers();
+			return stage_patch_review(registers.rip, 0, "Manual debugger patch", error);
+		}
+		case patch_panel_command_t::find_code_caves:
+			g_code_cave_search.open = true;
+			return true;
+		case patch_panel_command_t::revert_all:
+			request_context_mutation(pending_context_mutation_t::revert_all_patches,
+				debugger_interaction::capture(debugger_interaction::kind_t::patch,
+					0, snapshot->generation));
+			return true;
+		case patch_panel_command_t::save_patchset:
+			return request_patchset_save(error);
+	}
+	if (error) *error = "Unknown Patches panel action";
+	return false;
+}
+
+static void render_code_cave_dialog() {
+	if (g_code_cave_search.open) {
+		aida::ui::design::open_dialog("debugger.code_caves", "Find Code Caves");
+		g_code_cave_search.open = false;
+	}
+	if (!aida::ui::design::begin_dialog("debugger.code_caves", "Find Code Caves",
+			ImVec2(760.f, 620.f), ImVec2(420.f, 360.f))) return;
+	const auto publication = std::atomic_load_explicit(
+		&g_code_cave_publication, std::memory_order_acquire);
+	static const code_cave_publication_t empty_publication;
+	const auto& snapshot = publication ? *publication : empty_publication;
+	if (snapshot.generation != g_code_cave_search.visible_generation) {
+		g_code_cave_search.visible_generation = snapshot.generation;
+		g_code_cave_search.selected = -1;
+		g_code_cave_search.dialog_error.clear();
+	}
+	const bool pending = g_code_cave_search.pending.load(std::memory_order_acquire);
+	const bool target_current = snapshot.target_pid != 0 &&
+		driver_bridge::attached_pid() == snapshot.target_pid &&
+		debugger_interaction::current_stop_generation() == snapshot.target_stop_generation &&
+		debugger_engine::g_state.status.load(std::memory_order_acquire) ==
+			debugger_engine::dbg_status_t::paused;
+	const auto dialog_metrics = aida::ui::design::metrics();
+	const float body_height = (std::max)(120.f,
+		ImGui::GetContentRegionAvail().y - dialog_metrics.dialog_footer_height);
+	ImGui::BeginChild("##code_cave_body", ImVec2(0.f, body_height), false,
+		ImGuiWindowFlags_AlwaysVerticalScrollbar);
+	ImGui::TextWrapped("Discover bounded 00/CC filler runs in loaded modules. Every result retains the exact process and debugger stop generation that produced it.");
+	ImGui::SetNextItemWidth((std::min)(aida::ui::scale_px(360.f, dialog_metrics.scale),
+		ImGui::GetContentRegionAvail().x));
+	ImGui::InputTextWithHint("Module filter##caves", "module name (optional)",
+		g_code_cave_search.module_filter, sizeof(g_code_cave_search.module_filter));
+	ImGui::SetNextItemWidth((std::min)(aida::ui::scale_px(180.f, dialog_metrics.scale),
+		ImGui::GetContentRegionAvail().x));
+	ImGui::InputText("Minimum bytes##caves", g_code_cave_search.minimum_size,
+		sizeof(g_code_cave_search.minimum_size), ImGuiInputTextFlags_CharsDecimal);
+	if (pending) ImGui::BeginDisabled();
+	if (aida::ui::button(pending ? "Searching..." : "Search",
+			aida::ui::button_kind_t::primary, aida::ui::size_t_::sm,
+			ImVec2(aida::ui::scale_px(120.f, dialog_metrics.scale), 0.f)))
+		static_cast<void>(request_code_cave_search());
+	if (pending) ImGui::EndDisabled();
+	if (snapshot.generation != 0)
+		ImGui::TextDisabled("PID %u  |  stop generation %llu  |  publication %llu",
+			snapshot.target_pid,
+			static_cast<unsigned long long>(snapshot.target_stop_generation),
+			static_cast<unsigned long long>(snapshot.generation));
+	if (snapshot.generation != 0 && !target_current)
+		aida::ui::inline_notice("code_cave_stale", "Code-cave results are stale",
+			"The attached process or debugger stop generation changed. Search again before staging a patch review.",
+			aida::ui::status_kind_t::warning);
+	if (!snapshot.detail.empty())
+		aida::ui::inline_notice("code_cave_detail", "Code-cave search detail",
+			snapshot.detail.c_str(), aida::ui::status_kind_t::warning);
+	if (!g_code_cave_search.dialog_error.empty())
+		aida::ui::inline_notice("code_cave_error", "Code-cave workflow error",
+			g_code_cave_search.dialog_error.c_str(), aida::ui::status_kind_t::error);
+	ImGui::Separator();
+	ImGui::Text("Results: %zu", snapshot.results.size());
+	const float table_height = (std::max)(aida::ui::scale_px(120.f, dialog_metrics.scale),
+		ImGui::GetContentRegionAvail().y);
+	if (ImGui::BeginTable("##code_cave_results", 3,
+			ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+			ImGuiTableFlags_Resizable, ImVec2(-1.f, table_height))) {
+		ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,
+			aida::ui::scale_px(180.f, dialog_metrics.scale));
+		ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed,
+			aida::ui::scale_px(90.f, dialog_metrics.scale));
+		ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthStretch);
+		ImGui::TableHeadersRow();
+		ImGuiListClipper clipper;
+		clipper.Begin(static_cast<int>(snapshot.results.size()));
+		while (clipper.Step())
+			for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+				const auto& cave = snapshot.results[static_cast<std::size_t>(index)];
+				ImGui::TableNextRow();
+				ImGui::TableSetColumnIndex(0);
+				char label[64];
+				std::snprintf(label, sizeof(label), "0x%016llX##cave%d",
+					static_cast<unsigned long long>(cave.address), index);
+				if (ImGui::Selectable(label, g_code_cave_search.selected == index,
+					ImGuiSelectableFlags_SpanAllColumns))
+					g_code_cave_search.selected = index;
+				ImGui::TableSetColumnIndex(1);
+				ImGui::Text("%zu", cave.size);
+				ImGui::TableSetColumnIndex(2);
+				ImGui::TextUnformatted(cave.module.c_str());
+			}
+		ImGui::EndTable();
+	}
+	ImGui::EndChild();
+	const bool has_selection = g_code_cave_search.selected >= 0 &&
+		g_code_cave_search.selected < static_cast<int>(snapshot.results.size());
+	const auto footer = aida::ui::design::dialog_footer("code_cave_footer",
+		"Stage Patch Review", has_selection && target_current && !pending, false, "Close");
+	if (footer.confirmed) {
+		const auto current = std::atomic_load_explicit(
+			&g_code_cave_publication, std::memory_order_acquire);
+		if (!current || current->generation != snapshot.generation ||
+			current->target_pid != snapshot.target_pid ||
+			current->target_stop_generation != snapshot.target_stop_generation ||
+			driver_bridge::attached_pid() != snapshot.target_pid ||
+			debugger_interaction::current_stop_generation() != snapshot.target_stop_generation ||
+			debugger_engine::g_state.status.load(std::memory_order_acquire) !=
+				debugger_engine::dbg_status_t::paused ||
+			g_code_cave_search.selected < 0 ||
+			g_code_cave_search.selected >= static_cast<int>(current->results.size())) {
+			g_code_cave_search.dialog_error =
+				"The exact process, stop generation, publication, or selected cave changed before staging.";
+		} else {
+			const auto& cave = current->results[
+				static_cast<std::size_t>(g_code_cave_search.selected)];
+			std::string error;
+			if (stage_patch_review(cave.address, cave.size,
+					"Code cave patch in " + cave.module, &error)) {
+				g_ui.patch_stage_expected_pid = current->target_pid;
+				g_ui.patch_stage_expected_stop_generation =
+					current->target_stop_generation;
+				g_code_cave_search.dialog_error.clear();
+				ImGui::CloseCurrentPopup();
+			} else {
+				g_code_cave_search.dialog_error = error.empty()
+					? "The exact code-cave patch review could not be staged." : std::move(error);
+			}
+		}
+	}
+	if (footer.cancelled) {
+		g_code_cave_search.dialog_error.clear();
+		ImGui::CloseCurrentPopup();
+	}
+	ImGui::EndPopup();
+}
+
 static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h, float a) {
 	auto& ui = g_ui;
 	const auto& t = aida::ui::resolved();
 	(void)t;
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	{
-		std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
-		if (code_patcher::g_state.patches.empty()) {
-			code_patcher::g_state.patches = {
-				{0x00007FF7A4C16A32, {0x75, 0x14}, {0x90, 0x90}, "Bypass conditional branch", true, 1720946700},
-				{0x00007FF7A4C1B420, {0x48, 0x85, 0xC0}, {0xB0, 0x01, 0x90}, "Force decrypt success", false, 1720946760},
-				{0x00007FF7A4C208F0, {0x74, 0x05}, {0xEB, 0x05}, "Follow unpacked path", true, 1720946820}
-			};
-		}
-	}
-#endif
+	const auto snapshot = code_patcher::published_snapshot();
+	static const code_patcher::patch_snapshot_t empty_patch_snapshot;
+	const auto& publication = snapshot ? *snapshot : empty_patch_snapshot;
+	const auto& patch_rows = publication.rows;
+	const std::uint64_t snapshot_generation = publication.generation;
+	const std::uint64_t publication_failure_generation =
+		code_patcher::g_state.publication_failure_generation.load(std::memory_order_acquire);
+	if (!snapshot || publication_failure_generation != 0)
+		aida::ui::inline_notice("debugger_patch_publication_failure",
+			"Patch list publication unavailable",
+			"The authoritative patch state was preserved, but the immutable UI snapshot could not be refreshed. Patch actions remain disabled until a later publication succeeds.",
+			aida::ui::status_kind_t::error);
 
 	{
 		static bool s_logged_once = false;
@@ -4836,137 +6565,105 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	}
 
 	float bar_h = 40.f;
-	float btn_gap = 6.f;
 	ImGui::SetCursorScreenPos(ImVec2(ox + 8.f, oy + 2.f));
-	ImGui::PushID("##patches_actions");
-
-	bool apply_sel_clicked = aida::ui::button("Apply Selected",
-		aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (apply_sel_clicked && ui.patches_panel.selected >= 0) {
-		const int selected = ui.patches_panel.selected;
-		std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
-		if (selected < static_cast<int>(code_patcher::g_state.patches.size())) {
-			const auto& patch = code_patcher::g_state.patches[static_cast<size_t>(selected)];
-			request_context_mutation(pending_context_mutation_t::apply_patch,
+	const bool selected_available = ui.patches_panel.selected >= 0 &&
+		ui.patches_panel.selected < static_cast<int>(patch_rows.size());
+	static aida::ui::application_ui::retained_entity_context_t selected_patch_context;
+	static debugger_interaction::context_t selected_patch_debugger_context;
+	static std::uint64_t selected_patch_context_generation = 0;
+	static std::uint64_t selected_patch_stop_generation = 0;
+	static std::uint32_t selected_patch_target_pid = 0;
+	static int selected_patch_context_index = -1;
+	if (selected_available) {
+		const auto& selected_patch =
+			patch_rows[static_cast<std::size_t>(ui.patches_panel.selected)];
+		const std::uint64_t stop_generation =
+			debugger_interaction::current_stop_generation();
+		const std::uint32_t target_pid = driver_bridge::attached_pid();
+		if (selected_patch_context_generation != snapshot_generation ||
+			selected_patch_stop_generation != stop_generation ||
+			selected_patch_target_pid != target_pid ||
+			selected_patch_context_index != ui.patches_panel.selected) {
+			selected_patch_debugger_context =
 				debugger_interaction::capture(debugger_interaction::kind_t::patch,
-					patch.address, 0, selected, 0,
-					static_cast<uint64_t>(patch.patched_bytes.size()), patch.description));
+					selected_patch.address, snapshot_generation, ui.patches_panel.selected, 0,
+					static_cast<std::uint64_t>(selected_patch.patched_size),
+					selected_patch.description);
+			selected_patch_context =
+				build_debugger_entity_actions(selected_patch_debugger_context);
+			selected_patch_context_generation = snapshot_generation;
+			selected_patch_stop_generation = stop_generation;
+			selected_patch_target_pid = target_pid;
+			selected_patch_context_index = ui.patches_panel.selected;
+		}
+	} else {
+		selected_patch_context_generation = 0;
+		selected_patch_stop_generation = 0;
+		selected_patch_target_pid = 0;
+		selected_patch_context_index = -1;
+	}
+	static constexpr const char* patch_action_ids[] = {
+		"debugger.patch.apply", "debugger.patch.stage", "debugger.patch.find_caves",
+		"debugger.patch.revert_all", "debugger.patch.remove", "debugger.patch.save_set"
+	};
+	std::array<aida::ui::application_ui::action_presentation_t, std::size(patch_action_ids)>
+		patch_presentations;
+	std::array<std::string, std::size(patch_action_ids)> patch_tooltips;
+	for (std::size_t index = 0; index < std::size(patch_action_ids); ++index) {
+		const bool retained_selection_action = index == 0 || index == 4;
+		patch_presentations[index] = retained_selection_action && selected_available
+			? aida::ui::application_ui::present_retained_entity_action(
+				patch_action_ids[index], selected_patch_context)
+			: aida::ui::application_ui::present_action(patch_action_ids[index]);
+		patch_tooltips[index] = patch_presentations[index].description;
+		if (!patch_presentations[index].enabled &&
+			!patch_presentations[index].disabled_reason.empty()) {
+			patch_tooltips[index].append("\n");
+			patch_tooltips[index].append(patch_presentations[index].disabled_reason);
 		}
 	}
-	ImGui::SameLine(0.f, btn_gap);
-	if (aida::ui::button("Stage Patch...", aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f))) {
-		const auto registers = debugger_engine::cached_registers();
-		std::string ignored;
-		if (!stage_patch_review(registers.rip, 0, "Manual debugger patch", &ignored))
-			toast_notification::push(ignored.c_str(), toast_notification::toast_type_t::warning, 4.f);
+	const aida::ui::design::action_t patch_actions[] = {
+		{patch_action_ids[0], "Apply Selected", "Apply", patch_tooltips[0].c_str(),
+			patch_presentations[0].shortcut.c_str(),
+			"Writes the selected bytes to the attached process after confirmation and readback.",
+			aida::ui::button_kind_t::primary,
+			selected_available && patch_presentations[0].enabled, true, true},
+		{patch_action_ids[1], "Stage Patch...", "Stage", patch_tooltips[1].c_str(),
+			patch_presentations[1].shortcut.c_str(), nullptr,
+			aida::ui::button_kind_t::secondary, patch_presentations[1].enabled, false, true},
+		{patch_action_ids[2], "Find Caves...", "Caves", patch_tooltips[2].c_str(),
+			patch_presentations[2].shortcut.c_str(), nullptr,
+			aida::ui::button_kind_t::secondary, patch_presentations[2].enabled, false, true},
+		{patch_action_ids[3], "Revert All", "Revert", patch_tooltips[3].c_str(),
+			patch_presentations[3].shortcut.c_str(),
+			"Restores captured original bytes only after explicit confirmation and readback.",
+			aida::ui::button_kind_t::destructive, patch_presentations[3].enabled, false, true},
+		{patch_action_ids[4], "Remove Selected", "Remove", patch_tooltips[4].c_str(),
+			patch_presentations[4].shortcut.c_str(), nullptr,
+			aida::ui::button_kind_t::secondary,
+			selected_available && patch_presentations[4].enabled, false, true},
+		{patch_action_ids[5], "Save Patchset", "Save", patch_tooltips[5].c_str(),
+			patch_presentations[5].shortcut.c_str(), nullptr,
+			aida::ui::button_kind_t::secondary, patch_presentations[5].enabled, false, true}
+	};
+	const auto patch_action = aida::ui::design::render_toolbar(
+		"debugger.patches.actions", patch_actions, std::size(patch_actions),
+		(std::max)(1.f, w - 16.f));
+	const std::string_view invoked = patch_action.invoked && patch_action.id
+		? std::string_view(patch_action.id) : std::string_view();
+	if (!invoked.empty()) {
+		const bool retained_selection_action = invoked == "debugger.patch.apply" ||
+			invoked == "debugger.patch.remove";
+		if (retained_selection_action && selected_available)
+			debugger_interaction::select(selected_patch_debugger_context);
+		const auto result = retained_selection_action && selected_available
+			? aida::ui::application_ui::execute_retained_entity_action(
+				patch_action.id, aida::ui::action_invocation_source_t::toolbar,
+				selected_patch_context)
+			: aida::ui::application_ui::execute_action(patch_action.id,
+				aida::ui::action_invocation_source_t::toolbar);
+		static_cast<void>(result);
 	}
-	ImGui::SameLine(0.f, btn_gap);
-
-	bool revert_all_clicked = aida::ui::button("Revert All",
-		aida::ui::button_kind_t::destructive,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (revert_all_clicked) {
-		request_context_mutation(pending_context_mutation_t::revert_all_patches,
-			debugger_interaction::capture(debugger_interaction::kind_t::patch));
-	}
-	ImGui::SameLine(0.f, btn_gap);
-
-	bool remove_sel_clicked = aida::ui::button("Remove Selected",
-		aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (remove_sel_clicked && ui.patches_panel.selected >= 0) {
-		const int selected = ui.patches_panel.selected;
-		std::lock_guard<std::mutex> lock(code_patcher::g_state.mtx);
-		if (selected < static_cast<int>(code_patcher::g_state.patches.size())) {
-			const auto& patch = code_patcher::g_state.patches[static_cast<size_t>(selected)];
-			request_context_mutation(pending_context_mutation_t::remove_patch,
-				debugger_interaction::capture(debugger_interaction::kind_t::patch,
-					patch.address, 0, selected, 0,
-					static_cast<uint64_t>(patch.patched_bytes.size()), patch.description));
-		}
-	}
-	ImGui::SameLine(0.f, btn_gap);
-
-	bool save_set_clicked = aida::ui::button("Save Patchset",
-		aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::sm, ImVec2(0.f, bar_h - 8.f));
-	if (save_set_clicked) {
-		std::vector<code_patcher::patch_entry_t> sn;
-		{
-			std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
-			sn = code_patcher::g_state.patches;
-		}
-		if (sn.empty()) {
-			toast_notification::push("No patches to save.",
-				toast_notification::toast_type_t::warning);
-			anti_tamper::webhook::write_log("dbg_audit",
-				"[dbg_audit] patches save fail reason=empty");
-		} else {
-			char path_buf[MAX_PATH] = "patches.json";
-			static const char k_patchset_filter[] =
-				"JSON (*.json)\0*.json\0Text (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
-			if (win32_dialog::show_save_file_dialog(g_hwnd,
-					"Save Patchset",
-					k_patchset_filter,
-					"json",
-					path_buf, sizeof(path_buf),
-					"debugger_view::patches_save")) {
-				std::ofstream ofs(path_buf, std::ios::trunc);
-				if (ofs.is_open()) {
-					ofs << "{\n  \"patches\": [\n";
-					for (size_t i = 0; i < sn.size(); ++i) {
-						const auto& p = sn[i];
-						char line[256];
-						std::snprintf(line, sizeof(line),
-							"    {\n      \"index\": %zu,\n"
-							"      \"address\": \"0x%016llX\",\n"
-							"      \"timestamp\": %lld,\n"
-							"      \"active\": %s,\n"
-							"      \"description\": \"",
-							i,
-							static_cast<unsigned long long>(p.address),
-							static_cast<long long>(p.timestamp),
-							p.active ? "true" : "false");
-						ofs << line;
-						for (char c : p.description) {
-							if (c == '"' || c == '\\') ofs.put('\\');
-							if (c == '\n' || c == '\r') ofs.put(' ');
-							else ofs.put(c);
-						}
-						ofs << "\",\n      \"original\": \""
-							<< code_patcher::format_bytes(p.original_bytes)
-							<< "\",\n      \"patched\": \""
-							<< code_patcher::format_bytes(p.patched_bytes)
-							<< "\"\n    }";
-						if (i + 1 < sn.size()) ofs << ",";
-						ofs << "\n";
-					}
-					ofs << "  ]\n}\n";
-					ofs.close();
-					diag::log_tagged_critical_fmt("patches",
-						"patches_save_set count=%zu path='%s'",
-						sn.size(), path_buf);
-					anti_tamper::webhook::write_log("dbg_audit",
-						"[dbg_audit] patches save ok=1");
-					char msg[MAX_PATH + 64];
-					std::snprintf(msg, sizeof(msg),
-						"Saved %zu patches to %s",
-						sn.size(), path_buf);
-					toast_notification::push(msg,
-						toast_notification::toast_type_t::info);
-				} else {
-					anti_tamper::webhook::write_log("dbg_audit",
-						"[dbg_audit] patches save fail reason=open_failed");
-					toast_notification::push("Failed to open patchset file.",
-						toast_notification::toast_type_t::error);
-				}
-			}
-		}
-	}
-	ImGui::PopID();
-
 	float table_y = oy + bar_h;
 	{
 		ui_anim::table_col_t cols[] = {
@@ -4976,12 +6673,7 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 		draw_table_header(dl, ox, table_y, w, cols, 6, a);
 	}
 
-	std::vector<code_patcher::patch_entry_t> snapshot;
-	{
-		std::lock_guard<std::mutex> plk(code_patcher::g_state.mtx);
-		snapshot = code_patcher::g_state.patches;
-	}
-	int total_n = static_cast<int>(snapshot.size());
+	int total_n = static_cast<int>(patch_rows.size());
 	float content_y = table_y + HEADER_H;
 	float visible_h = h - bar_h - HEADER_H;
 
@@ -5002,7 +6694,7 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	while (clipper.Step()) {
 		for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
 			float ry = content_y + static_cast<float>(i) * ROW_HEIGHT - ImGui::GetScrollY();
-			auto& p = snapshot[static_cast<size_t>(i)];
+			const auto& p = patch_rows[static_cast<size_t>(i)];
 			bool sel = (ui.patches_panel.selected == i);
 
 			ImGui::SetCursorScreenPos(ImVec2(ox, ry));
@@ -5021,28 +6713,23 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 			dl->AddText(code_font, code_font_size, ImVec2(ox + 36.f, ry + 5.f),
 			            with_a(t.text_address, a), abuf);
 
-			std::string oh = code_patcher::format_bytes(p.original_bytes);
-			std::string ph = code_patcher::format_bytes(p.patched_bytes);
-			if (oh.size() > 22) oh = oh.substr(0, 22) + "...";
-			if (ph.size() > 22) ph = ph.substr(0, 22) + "...";
-
-			ImVec2 osz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, oh.c_str());
+			ImVec2 osz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, p.original.c_str());
 			float bx = ox + 200.f;
 			float by = ry + 3.f;
 			dl->AddRectFilled(ImVec2(bx - 4.f, by),
 			                  ImVec2(bx + osz.x + 8.f, by + 16.f),
 			                  with_a(t.text_dim, a * 0.18f), 4.f);
 			dl->AddText(code_font, code_font_size, ImVec2(bx, ry + 5.f),
-			            with_a(t.text_secondary, a), oh.c_str());
+			            with_a(t.text_secondary, a), p.original.c_str());
 
-			ImVec2 psz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, ph.c_str());
+			ImVec2 psz = code_font->CalcTextSizeA(code_font_size, FLT_MAX, 0.f, p.patched.c_str());
 			float bx2 = ox + 400.f;
 			ImU32 pc = p.active ? t.success : t.warning;
 			dl->AddRectFilled(ImVec2(bx2 - 4.f, by),
 			                  ImVec2(bx2 + psz.x + 8.f, by + 16.f),
 			                  with_a(pc, a * 0.20f), 4.f);
 			dl->AddText(code_font, code_font_size, ImVec2(bx2, ry + 5.f),
-			            with_a(pc, a), ph.c_str());
+			            with_a(pc, a), p.patched.c_str());
 
 			dl->AddText(body_font, body_font_size, ImVec2(ox + 600.f, ry + 5.f),
 			            with_a(t.text_primary, a), p.description.c_str());
@@ -5076,35 +6763,35 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 						? pending_context_mutation_t::revert_patch
 						: pending_context_mutation_t::apply_patch,
 					debugger_interaction::capture(debugger_interaction::kind_t::patch,
-						p.address, 0, i, 0,
-						static_cast<uint64_t>(p.patched_bytes.size()), p.description));
+						p.address, snapshot_generation, i, 0,
+						static_cast<uint64_t>(p.patched_size), p.description));
 			}
 
 			if (clicked) {
 				ui.patches_panel.selected = i;
 				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::patch, p.address, 0, i, 0,
-					static_cast<uint64_t>(p.patched_bytes.size()), p.description), false);
+					debugger_interaction::kind_t::patch, p.address, snapshot_generation, i, 0,
+					static_cast<uint64_t>(p.patched_size), p.description), false);
 				memory_interaction::runtime_t runtime;
 				runtime.driver_loaded = driver_bridge::is_loaded();
 				runtime.live_attached = driver_bridge::attached_pid() != 0;
 				runtime.target_pid = driver_bridge::attached_pid();
 				memory_interaction::select(memory_interaction::capture_patch(runtime,
-					p.address, static_cast<std::uint64_t>(p.patched_bytes.size()), i,
+					p.address, static_cast<std::uint64_t>(p.patched_size), i,
 					p.description));
 			}
 			if (hov && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
 				jump_to_disasm(p.address);
 			if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
 				select_context(debugger_interaction::capture(
-					debugger_interaction::kind_t::patch, p.address, 0, i, 0,
-					static_cast<uint64_t>(p.patched_bytes.size()), p.description), true);
+					debugger_interaction::kind_t::patch, p.address, snapshot_generation, i, 0,
+					static_cast<uint64_t>(p.patched_size), p.description), true);
 				memory_interaction::runtime_t runtime;
 				runtime.driver_loaded = driver_bridge::is_loaded();
 				runtime.live_attached = driver_bridge::attached_pid() != 0;
 				runtime.target_pid = driver_bridge::attached_pid();
 				memory_interaction::select(memory_interaction::capture_patch(runtime,
-					p.address, static_cast<std::uint64_t>(p.patched_bytes.size()), i,
+					p.address, static_cast<std::uint64_t>(p.patched_size), i,
 					p.description));
 			}
 		}
@@ -5114,13 +6801,14 @@ static void render_patches(ImDrawList* dl, float ox, float oy, float w, float h,
 	ImGui::EndChild();
 	ImGui::PopID();
 
-	if (snapshot.empty()) {
+	if (patch_rows.empty()) {
 		aida::ui::empty_state::config_t es;
 		es.glyph = aida::ui::empty_state::glyph_t::flask;
 		es.title = "No patches applied";
 		es.body  = "Use the patcher to modify the target's code.";
 		aida::ui::empty_state::render(ImVec2(ox, content_y), ImVec2(w, visible_h), es);
 	}
+	render_code_cave_dialog();
 }
 
 static const char* debugger_status_label(debugger_engine::dbg_status_t status) {
@@ -5169,6 +6857,7 @@ static const char* debugger_tab_label(sub_tab_t tab) {
 		case sub_tab_t::patches: return "Patches";
 		case sub_tab_t::seh_chain: return "SEH";
 		case sub_tab_t::cfg: return "CFG";
+		case sub_tab_t::source: return "Source / Assembly";
 		case sub_tab_t::COUNT: return "Debugger";
 	}
 	return "Debugger";
@@ -5218,6 +6907,74 @@ static void render_debugger_status_bar(ImVec2 pos, float width,
 	ImGui::PopStyleVar();
 }
 
+
+execution_capability_t address_mutation_capability(std::uint64_t address,
+	bool toggle_breakpoint, std::uint32_t expected_pid) {
+	if (g_target_mutation_pending.load(std::memory_order_acquire))
+		return {false, "Another live-target mutation is still pending"};
+	const auto context = debugger_interaction::capture(
+		debugger_interaction::kind_t::instruction, address);
+	if (expected_pid == 0)
+		return {false, "The analysis selection is not owned by a live process workspace"};
+	if (context.target_pid != expected_pid)
+		return {false, "Attach the debugger to the process that owns this analysis workspace"};
+	const auto result = debugger_interaction::evaluate(toggle_breakpoint
+		? debugger_interaction::capability_t::toggle_breakpoint
+		: debugger_interaction::capability_t::run_to_address, context);
+	return {result.enabled, result.disabled_reason};
+}
+
+bool queue_run_to_address(std::uint64_t address, std::uint32_t expected_pid,
+	std::string* error) {
+	const auto capability = address_mutation_capability(address, false, expected_pid);
+	if (!capability.enabled) {
+		if (error) *error = capability.disabled_reason
+			? capability.disabled_reason : "Run to cursor is unavailable";
+		return false;
+	}
+	const auto context = debugger_interaction::capture(
+		debugger_interaction::kind_t::instruction, address);
+	const bool queued = queue_debugger_mutation("Run to cursor",
+		"analysis.debug.run_to_cursor", context, [context]() {
+			mutation_result_t result;
+			result.ok = result.verified =
+				debugger_engine::run_to_address(context.address, false);
+			return result;
+		});
+	if (!queued && error) *error = "The debugger mutation queue rejected Run to Cursor";
+	return queued;
+}
+
+bool queue_toggle_breakpoint(std::uint64_t address, std::uint32_t expected_pid,
+	std::string* error) {
+	const auto capability = address_mutation_capability(address, true, expected_pid);
+	if (!capability.enabled) {
+		if (error) *error = capability.disabled_reason
+			? capability.disabled_reason : "Breakpoint toggle is unavailable";
+		return false;
+	}
+	const auto context = debugger_interaction::capture(
+		debugger_interaction::kind_t::instruction, address);
+	const bool queued = queue_debugger_mutation("Toggle breakpoint at analysis cursor",
+		"analysis.debug.breakpoint", context, [context]() {
+			mutation_result_t result;
+			auto snapshot = debugger_engine::snapshot_breakpoints();
+			int found = -1;
+			for (std::size_t index = 0; index < snapshot.size(); ++index) {
+				if (!snapshot[index].is_internal &&
+					snapshot[index].address == context.address) {
+					found = static_cast<int>(index);
+					break;
+				}
+			}
+			result.ok = result.verified = found >= 0
+				? debugger_engine::remove_breakpoint(found)
+				: debugger_engine::add_breakpoint(context.address) >= 0;
+			return result;
+		});
+	if (!queued && error) *error = "The debugger mutation queue rejected the breakpoint toggle";
+	return queued;
+}
 
 void render(float pos_x, float pos_y, float width, float height,
 			float alpha, float accent_r, float accent_g, float accent_b) {
@@ -5335,7 +7092,8 @@ void render(float pos_x, float pos_y, float width, float height,
 		ui.active_tab != sub_tab_t::memory_map &&
 		ui.active_tab != sub_tab_t::modules &&
 		ui.active_tab != sub_tab_t::seh_chain &&
-		ui.active_tab != sub_tab_t::cfg;
+		ui.active_tab != sub_tab_t::cfg &&
+		ui.active_tab != sub_tab_t::source;
 	float panel_offset = 0.f;
 	if (tab_uses_toolbar) {
 		draw_run_toolbar(dl, ox, toolbar_y, alpha);
@@ -5412,6 +7170,9 @@ void render(float pos_x, float pos_y, float width, float height,
 				content_alpha, t.accent.x, t.accent.y, t.accent.z);
 			break;
 		}
+		case sub_tab_t::source:
+			render_source_debug(dl, panel_x, panel_y, panel_w, panel_h, content_alpha);
+			break;
 		default:
 			break;
 	}
@@ -5423,63 +7184,7 @@ void render(float pos_x, float pos_y, float width, float height,
 		driver_bridge::attached_pid(), analysis_session::has_active_target());
 
 	ImGui::EndChild();
-
-	spawn_target_dialog::render();
-	spawn_target_dialog::result_t spawn_result;
-	if (spawn_target_dialog::consume_result(spawn_result) && spawn_result.accepted) {
-		run_target::launch_options_t opts = spawn_result.launch_options;
-		opts.exe_path    = std::move(spawn_result.exe_path);
-		opts.args        = std::move(spawn_result.args);
-		opts.working_dir = std::move(spawn_result.working_dir);
-		aida::infra::executor::submission_t sub;
-		sub.owner_subsystem = "debugger";
-		sub.label = "debugger.spawn_attach";
-		sub.thread_class = "debugger_launch";
-		sub.domain = aida::infra::executor::domain_t::feature_worker;
-		sub.priority = 2;
-		sub.body = [opts]() {
-			uint32_t new_pid = 0;
-			run_target::launch_result_t lr{};
-			bool ok = debugger_engine::spawn_and_attach_target(opts, &new_pid, &lr);
-			std::wstring sandbox_dir_snapshot = lr.sandbox_dir;
-			if (opts.isolation == run_target::isolation_t::windows_sandbox) {
-				run_target::cleanup(lr);
-			} else if (lr.thread_handle != 0) {
-				CloseHandle(reinterpret_cast<HANDLE>(lr.thread_handle));
-				lr.thread_handle = 0;
-			}
-			if (!sandbox_dir_snapshot.empty()) {
-				spawn_target_dialog::detail::last_sandbox_dir() = sandbox_dir_snapshot;
-			}
-			if (!ok) {
-				const std::string& err = debugger_engine::last_error();
-				std::string msg = "Launch failed: ";
-				msg += err.empty() ? "(no detail)" : err;
-				toast_notification::push(msg,
-					toast_notification::toast_type_t::error);
-			} else if (opts.isolation == run_target::isolation_t::windows_sandbox) {
-				toast_notification::push(
-					"Launched interactive malware lab VM.",
-					toast_notification::toast_type_t::success);
-			} else {
-				char ok_msg[160];
-				std::snprintf(ok_msg, sizeof(ok_msg),
-					"Host launch started PID %u (iso=%d)",
-					static_cast<unsigned>(new_pid),
-					static_cast<int>(opts.isolation));
-				toast_notification::push(ok_msg,
-					toast_notification::toast_type_t::success);
-			}
-		};
-	const auto submitted = aida::infra::executor::submit(std::move(sub));
-	if (!submitted.submitted)
-			toast_notification::push("Launch queue rejected the task.",
-				toast_notification::toast_type_t::error);
-	else
-		register_debugger_task(submitted, "view.debug.cpu", "debugger.launch",
-			"Launch and attach debugger target");
 	}
-}
 
 void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b,
@@ -5520,7 +7225,8 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 		const float status_h = show_status ? aida::ui::metrics::status_bar::height : 0.f;
 		const bool has_controls = show_execution_controls &&
 			pane != sub_tab_t::memory_map && pane != sub_tab_t::modules &&
-			pane != sub_tab_t::seh_chain && pane != sub_tab_t::cfg;
+			pane != sub_tab_t::seh_chain && pane != sub_tab_t::cfg &&
+			pane != sub_tab_t::source;
 		const float controls_h = has_controls ? TOOLBAR_H : 0.f;
 		const float gap = has_controls ? aida::ui::metrics::spacing::xs : 0.f;
 		const float body_h = std::max(1.f, size.y - status_h - controls_h - gap);
@@ -5588,6 +7294,9 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 					theme.accent.x, theme.accent.y, theme.accent.z);
 				break;
 			}
+			case sub_tab_t::source:
+				render_source_debug(dl, origin.x, body_y, size.x, body_h, alpha);
+				break;
 			case sub_tab_t::COUNT:
 				break;
 		}
@@ -5600,11 +7309,16 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 	ImGui::EndChild();
 	ImGui::PopID();
 
-	if (ui.patch_stage_open && !ImGui::IsPopupOpen("Stage Patch Review##debugger"))
-		ImGui::OpenPopup("Stage Patch Review##debugger");
-	ImGui::SetNextWindowSize(ImVec2(620.f, 330.f), ImGuiCond_Appearing);
-	if (ImGui::BeginPopupModal("Stage Patch Review##debugger", &ui.patch_stage_open,
-		ImGuiWindowFlags_NoResize)) {
+	if (ui.patch_stage_open &&
+		!ImGui::IsPopupOpen("Stage Patch Review###debugger_patch_stage"))
+		aida::ui::design::open_dialog("debugger_patch_stage", "Stage Patch Review");
+	if (aida::ui::design::begin_dialog("debugger_patch_stage", "Stage Patch Review",
+			ImVec2(620.f, 420.f), ImVec2(420.f, 300.f))) {
+		const auto dialog_metrics = aida::ui::design::metrics();
+		const float body_height = (std::max)(120.f,
+			ImGui::GetContentRegionAvail().y - dialog_metrics.dialog_footer_height);
+		ImGui::BeginChild("##patch_stage_body", ImVec2(0.f, body_height), false,
+			ImGuiWindowFlags_AlwaysVerticalScrollbar);
 		ImGui::TextUnformatted("Review a patch definition");
 		ImGui::TextDisabled("This stages an inactive definition. It does not write target memory.");
 		ImGui::Separator();
@@ -5613,67 +7327,102 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 			ImGui::Text("Selected range: %" PRIu64 " bytes", ui.patch_stage_extent);
 		ImGui::TextUnformatted("Replacement bytes (hex)");
 		ImGui::SetNextItemWidth(-1.f);
-		ImGui::InputTextWithHint("##patch_stage_bytes", "90 90 90",
-			ui.patch_stage_bytes_buf, sizeof(ui.patch_stage_bytes_buf));
+		if (ImGui::InputTextWithHint("##patch_stage_bytes", "90 90 90",
+				ui.patch_stage_bytes_buf, sizeof(ui.patch_stage_bytes_buf)))
+			refresh_patch_stage_parse_cache();
 		ImGui::TextUnformatted("Description");
 		ImGui::SetNextItemWidth(-1.f);
 		ImGui::InputText("##patch_stage_description", ui.patch_stage_description_buf,
 			sizeof(ui.patch_stage_description_buf));
 
-		std::vector<std::uint8_t> parsed;
-		bool valid = true;
-		const char* cursor = ui.patch_stage_bytes_buf;
-		while (*cursor != '\0') {
-			while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') ++cursor;
-			if (*cursor == '\0') break;
-			if (!std::isxdigit(static_cast<unsigned char>(cursor[0])) ||
-				!std::isxdigit(static_cast<unsigned char>(cursor[1]))) {
-				valid = false;
-				break;
-			}
-			char token[3] = {cursor[0], cursor[1], '\0'};
-			parsed.push_back(static_cast<std::uint8_t>(std::strtoul(token, nullptr, 16)));
-			cursor += 2;
-			if (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' &&
-				*cursor != '\r' && *cursor != '\n') {
-				valid = false;
-				break;
-			}
-			if (parsed.size() > 4096) {
-				valid = false;
-				break;
-			}
-		}
-		valid = valid && !parsed.empty();
+		bool valid = ui.patch_stage_parse_valid;
 		if (!valid && ui.patch_stage_bytes_buf[0] != '\0')
 			ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
 				"Enter complete two-digit hex bytes separated by whitespace (maximum 4096 bytes).");
-		if (ui.patch_stage_extent != 0 && valid && parsed.size() != ui.patch_stage_extent)
+		if (ui.patch_stage_extent != 0 && valid &&
+			ui.patch_stage_parsed_bytes.size() > ui.patch_stage_extent) {
+			valid = false;
+			ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
+				"Replacement bytes exceed the retained selected range.");
+		} else if (ui.patch_stage_extent != 0 && valid &&
+			ui.patch_stage_parsed_bytes.size() < ui.patch_stage_extent)
 			ImGui::TextColored(ImVec4(1.f, 0.72f, 0.25f, 1.f),
-				"Replacement length differs from the selected range; review before staging.");
-
-		const bool target_ready = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+				"Replacement bytes cover only part of the retained selected range; review before staging.");
+		if (ui.patch_stage_exact && valid &&
+			ui.patch_stage_parsed_bytes.size() != ui.patch_stage_expected_before.size()) {
+			valid = false;
+			ImGui::TextColored(ImVec4(1.f, 0.45f, 0.35f, 1.f),
+				"The reviewed replacement must preserve the exact proposal byte range.");
+		}
+		const bool target_ready = driver_bridge::is_loaded() &&
+			driver_bridge::attached_pid() != 0 &&
+			(ui.patch_stage_expected_pid == 0 ||
+			 driver_bridge::attached_pid() == ui.patch_stage_expected_pid) &&
+			(ui.patch_stage_expected_stop_generation == 0 ||
+			 debugger_interaction::current_stop_generation() ==
+				ui.patch_stage_expected_stop_generation);
 		if (!target_ready)
-			ImGui::TextDisabled("Attach a live target through the verified driver bridge to stage this definition.");
-		if (!valid || !target_ready) ImGui::BeginDisabled();
-		if (ImGui::Button("Stage Inactive", ImVec2(150.f, 0.f))) {
-			const int index = code_patcher::create_patch(ui.patch_stage_address, parsed,
-				ui.patch_stage_description_buf);
-			if (index >= 0) {
-				ui.patches_panel.selected = index;
+			ImGui::TextDisabled("The reviewed live target or debugger stop is unavailable; cancel and capture a new patch review.");
+		ImGui::EndChild();
+
+		const auto footer = aida::ui::design::dialog_footer("debugger_patch_stage_footer",
+			"Stage Inactive", valid && target_ready, false, "Cancel");
+		if (footer.confirmed) {
+			const std::uint64_t address = ui.patch_stage_address;
+			const std::uint64_t extent = ui.patch_stage_extent;
+			const std::string description(ui.patch_stage_description_buf);
+			const bool exact = ui.patch_stage_exact;
+			const std::uint32_t expected_pid = ui.patch_stage_expected_pid;
+			const auto expected_before = ui.patch_stage_expected_before;
+			const auto parsed = ui.patch_stage_parsed_bytes;
+			const auto context = debugger_interaction::capture(
+				debugger_interaction::kind_t::instruction, address, 0, -1, 0,
+				extent == 0 ? static_cast<std::uint64_t>(parsed.size()) : extent,
+				description);
+			const bool queued = queue_debugger_mutation("Capture patch rollback bytes",
+				"debugger.patch_stage", context,
+				[address, parsed, description, exact, expected_pid, expected_before]() mutable {
+					mutation_result_t result;
+					const int index = exact
+						? code_patcher::create_patch_exact(address, expected_before,
+							parsed, expected_pid, description)
+						: code_patcher::create_patch(address, parsed, description);
+					result.ok = result.verified = index >= 0;
+					if (!result.verified)
+						result.detail = "Unable to capture exact rollback bytes; no patch was staged.";
+					else {
+						const bool posted = post_debugger_ui([index]() {
+							g_ui.patches_panel.selected = index;
+							aida::ui::application_views::open_or_focus(
+								aida::ui::stable_view_id_t("view.debug.patches"));
+						}, "patch_stage_selection");
+						if (!posted) {
+							static_cast<void>(code_patcher::remove_patch(index));
+							result.ok = result.verified = false;
+							result.detail = "Patch staging could not publish its reviewed definition.";
+						}
+					}
+					return result;
+				}, false);
+			if (queued) {
 				ui.patch_stage_open = false;
+				ui.patch_stage_exact = false;
+				ui.patch_stage_expected_pid = 0;
+				ui.patch_stage_expected_stop_generation = 0;
+				ui.patch_stage_expected_before.clear();
+				ui.patch_stage_parsed_bytes.clear();
+				ui.patch_stage_parse_valid = false;
 				ImGui::CloseCurrentPopup();
-				toast_notification::push("Patch staged for review; target memory is unchanged.",
-					toast_notification::toast_type_t::success, 4.f);
-			} else {
-				toast_notification::push("Unable to read the target bytes; no patch was staged.",
-					toast_notification::toast_type_t::error, 5.f);
 			}
 		}
-		if (!valid || !target_ready) ImGui::EndDisabled();
-		ImGui::SameLine();
-		if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
+		if (footer.cancelled) {
 			ui.patch_stage_open = false;
+			ui.patch_stage_exact = false;
+			ui.patch_stage_expected_pid = 0;
+			ui.patch_stage_expected_stop_generation = 0;
+			ui.patch_stage_expected_before.clear();
+			ui.patch_stage_parsed_bytes.clear();
+			ui.patch_stage_parse_valid = false;
 			ImGui::CloseCurrentPopup();
 		}
 		ImGui::EndPopup();
@@ -5708,57 +7457,59 @@ void render_execution_controls(float pos_x, float pos_y, float width, float heig
 				size.x, status, driver_bridge::attached_pid(), driver_bridge::attached_pid() != 0);
 	}
 	ImGui::EndChild();
+	}
+
+void render_global_target_dialog() {
 	spawn_target_dialog::render();
 	spawn_target_dialog::result_t spawn_result;
-	if (spawn_target_dialog::consume_result(spawn_result) && spawn_result.accepted) {
-		run_target::launch_options_t options = spawn_result.launch_options;
-		options.exe_path = std::move(spawn_result.exe_path);
-		options.args = std::move(spawn_result.args);
-		options.working_dir = std::move(spawn_result.working_dir);
-		aida::infra::executor::submission_t submission;
-		submission.owner_subsystem = "debugger";
-		submission.label = "debugger.spawn_attach";
-		submission.thread_class = "debugger_launch";
-		submission.domain = aida::infra::executor::domain_t::feature_worker;
-		submission.priority = 2;
-		submission.body = [options]() {
-			uint32_t new_pid = 0;
-			run_target::launch_result_t result{};
-			const bool ok = debugger_engine::spawn_and_attach_target(options, &new_pid, &result);
-			const std::wstring sandbox_dir = result.sandbox_dir;
-			if (options.isolation == run_target::isolation_t::windows_sandbox)
-				run_target::cleanup(result);
-			else if (result.thread_handle != 0) {
-				CloseHandle(reinterpret_cast<HANDLE>(result.thread_handle));
-				result.thread_handle = 0;
-			}
-			if (!sandbox_dir.empty())
-				spawn_target_dialog::detail::last_sandbox_dir() = sandbox_dir;
-			if (!ok) {
-				const std::string& error = debugger_engine::last_error();
-				toast_notification::push("Launch failed: " +
-					(error.empty() ? std::string("(no detail)") : error),
-					toast_notification::toast_type_t::error);
-			} else if (options.isolation == run_target::isolation_t::windows_sandbox) {
-				toast_notification::push("Launched interactive malware lab VM.",
-					toast_notification::toast_type_t::success);
-			} else {
-				char message[160];
-				std::snprintf(message, sizeof(message), "Host launch started PID %u (iso=%d)",
-					static_cast<unsigned>(new_pid), static_cast<int>(options.isolation));
-				toast_notification::push(message, toast_notification::toast_type_t::success);
-			}
-		};
-		const auto submitted = aida::infra::executor::submit(std::move(submission));
-		if (!submitted.submitted)
-			toast_notification::push("Launch queue rejected the task.",
+	if (!spawn_target_dialog::consume_result(spawn_result) || !spawn_result.accepted)
+		return;
+	run_target::launch_options_t options = spawn_result.launch_options;
+	options.exe_path = std::move(spawn_result.exe_path);
+	options.args = std::move(spawn_result.args);
+	options.working_dir = std::move(spawn_result.working_dir);
+	aida::infra::executor::submission_t submission;
+	submission.owner_subsystem = "debugger";
+	submission.label = "debugger.spawn_attach";
+	submission.thread_class = "debugger_launch";
+	submission.domain = aida::infra::executor::domain_t::feature_worker;
+	submission.priority = 2;
+	submission.body = [options]() {
+		uint32_t new_pid = 0;
+		run_target::launch_result_t result{};
+		const bool ok = debugger_engine::spawn_and_attach_target(options, &new_pid, &result);
+		const std::wstring sandbox_dir = result.sandbox_dir;
+		if (options.isolation == run_target::isolation_t::windows_sandbox)
+			run_target::cleanup(result);
+		else if (result.thread_handle != 0) {
+			CloseHandle(reinterpret_cast<HANDLE>(result.thread_handle));
+			result.thread_handle = 0;
+		}
+		if (!sandbox_dir.empty())
+			spawn_target_dialog::detail::last_sandbox_dir() = sandbox_dir;
+		if (!ok) {
+			const std::string& error = debugger_engine::last_error();
+			toast_notification::push("Launch failed: " +
+				(error.empty() ? std::string("(no detail)") : error),
 				toast_notification::toast_type_t::error);
-		else
-			register_debugger_task(submitted, "view.debug.cpu", "debugger.launch",
-				"Launch and attach debugger target");
+		} else if (options.isolation == run_target::isolation_t::windows_sandbox) {
+			toast_notification::push("Launched interactive malware lab VM.",
+				toast_notification::toast_type_t::success);
+		} else {
+			char message[160];
+			std::snprintf(message, sizeof(message), "Host launch started PID %u (iso=%d)",
+				static_cast<unsigned>(new_pid), static_cast<int>(options.isolation));
+			toast_notification::push(message, toast_notification::toast_type_t::success);
+		}
+	};
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted)
+		toast_notification::push("Launch queue rejected the task.",
+			toast_notification::toast_type_t::error);
+	else
+		register_debugger_task(submitted, "view.debug.cpu", "debugger.launch",
+			"Launch and attach debugger target");
 	}
-}
-
 #define AIDA_DEBUGGER_PANE_WRAPPER(name, pane_value) \
 	void name(float pos_x, float pos_y, float width, float height, float alpha, \
 		float accent_r, float accent_g, float accent_b) { \
@@ -5779,6 +7530,7 @@ AIDA_DEBUGGER_PANE_WRAPPER(render_modules_pane, sub_tab_t::modules)
 AIDA_DEBUGGER_PANE_WRAPPER(render_patches_pane, sub_tab_t::patches)
 AIDA_DEBUGGER_PANE_WRAPPER(render_seh_pane, sub_tab_t::seh_chain)
 AIDA_DEBUGGER_PANE_WRAPPER(render_cfg_pane, sub_tab_t::cfg)
+AIDA_DEBUGGER_PANE_WRAPPER(render_source_pane, sub_tab_t::source)
 
 #undef AIDA_DEBUGGER_PANE_WRAPPER
 

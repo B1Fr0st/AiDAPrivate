@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -10,24 +9,6 @@ namespace aida {
 namespace workbench {
 namespace {
 
-constexpr std::uint32_t k_min_left_rail_pixels = 40;
-constexpr std::uint32_t k_max_left_rail_pixels = 96;
-constexpr std::uint32_t k_min_navigator_pixels = 160;
-constexpr std::uint32_t k_max_navigator_pixels = 720;
-constexpr std::uint32_t k_min_inspector_pixels = 200;
-constexpr std::uint32_t k_max_inspector_pixels = 720;
-constexpr std::uint32_t k_min_bottom_panel_pixels = 120;
-constexpr std::uint32_t k_max_bottom_panel_pixels = 560;
-constexpr std::uint32_t k_min_tab_strip_pixels = 24;
-constexpr std::uint32_t k_max_tab_strip_pixels = 64;
-constexpr std::uint32_t k_min_toolbar_pixels = 24;
-constexpr std::uint32_t k_max_toolbar_pixels = 64;
-constexpr std::uint32_t k_min_splitter_pixels = 2;
-constexpr std::uint32_t k_max_splitter_pixels = 12;
-constexpr std::uint32_t k_min_document_width_pixels = 320;
-constexpr std::uint32_t k_max_document_width_pixels = 4096;
-constexpr std::uint32_t k_min_document_height_pixels = 200;
-constexpr std::uint32_t k_max_document_height_pixels = 4096;
 constexpr std::uint64_t k_fnv_offset_basis = 14695981039346656037ULL;
 constexpr std::uint64_t k_fnv_prime = 1099511628211ULL;
 
@@ -69,31 +50,9 @@ bool valid_navigation_origin(navigation_origin_t origin) noexcept
     return origin <= navigation_origin_t::mcp;
 }
 
-bool valid_split_node_kind(split_node_kind_t kind) noexcept
-{
-    return kind <= split_node_kind_t::branch;
-}
-
-bool valid_split_orientation(split_orientation_t orientation) noexcept
-{
-    return orientation <= split_orientation_t::vertical;
-}
-
 bool valid_panel_kind(panel_kind_t kind) noexcept
 {
     return kind <= panel_kind_t::custom;
-}
-
-std::uint32_t clamp_dimension(std::uint32_t value, std::uint32_t minimum,
-                              std::uint32_t maximum) noexcept
-{
-    return value < minimum ? minimum : (value > maximum ? maximum : value);
-}
-
-std::uint16_t clamp_ratio(std::uint16_t value) noexcept
-{
-    return value < k_split_ratio_min_basis_points ? k_split_ratio_min_basis_points :
-        (value > k_split_ratio_max_basis_points ? k_split_ratio_max_basis_points : value);
 }
 
 bool navigation_event_equal(const navigation_event_t& lhs, const navigation_event_t& rhs)
@@ -129,32 +88,12 @@ bool view_dto_equal(const view_persistence_dto_t& lhs, const view_persistence_dt
            lhs.focused == rhs.focused;
 }
 
-bool split_node_equal(const split_node_dto_t& lhs, const split_node_dto_t& rhs) noexcept
-{
-    return lhs.id == rhs.id && lhs.kind == rhs.kind && lhs.orientation == rhs.orientation &&
-           lhs.ratio_basis_points == rhs.ratio_basis_points && lhs.view == rhs.view &&
-           lhs.first == rhs.first && lhs.second == rhs.second;
-}
-
 bool panel_dto_equal(const panel_state_dto_t& lhs, const panel_state_dto_t& rhs)
 {
     return lhs.id == rhs.id && lhs.workspace == rhs.workspace && lhs.kind == rhs.kind &&
            lhs.visible == rhs.visible && lhs.pinned == rhs.pinned &&
-           lhs.extent_pixels == rhs.extent_pixels && lhs.selected_document == rhs.selected_document &&
+           lhs.selected_document == rhs.selected_document &&
            lhs.state_token == rhs.state_token && lhs.revision == rhs.revision;
-}
-
-bool layout_equal(const fixed_layout_constraints_t& lhs,
-                  const fixed_layout_constraints_t& rhs) noexcept
-{
-    return lhs.left_rail_pixels == rhs.left_rail_pixels &&
-           lhs.navigator_pixels == rhs.navigator_pixels &&
-           lhs.inspector_pixels == rhs.inspector_pixels &&
-           lhs.bottom_panel_pixels == rhs.bottom_panel_pixels &&
-           lhs.tab_strip_pixels == rhs.tab_strip_pixels && lhs.toolbar_pixels == rhs.toolbar_pixels &&
-           lhs.splitter_pixels == rhs.splitter_pixels &&
-           lhs.minimum_document_width_pixels == rhs.minimum_document_width_pixels &&
-           lhs.minimum_document_height_pixels == rhs.minimum_document_height_pixels;
 }
 
 bool event_vector_equal(const std::vector<navigation_event_t>& lhs,
@@ -195,37 +134,10 @@ bool valid_panel_text(const panel_state_dto_t& panel) noexcept
     return panel.state_token.size() <= k_max_panel_state_bytes;
 }
 
-bool panel_extent_matches(const panel_state_dto_t& panel,
-                          const fixed_layout_constraints_t& layout) noexcept
-{
-    switch (panel.kind) {
-        case panel_kind_t::navigator:
-            return panel.extent_pixels == layout.navigator_pixels;
-        case panel_kind_t::inspector:
-            return panel.extent_pixels == layout.inspector_pixels;
-        case panel_kind_t::output:
-        case panel_kind_t::diagnostics:
-        case panel_kind_t::bookmarks:
-        case panel_kind_t::progress:
-            return panel.extent_pixels == layout.bottom_panel_pixels;
-        case panel_kind_t::custom:
-            return panel.extent_pixels == 0 ||
-                   (panel.extent_pixels >= k_min_bottom_panel_pixels &&
-                    panel.extent_pixels <= k_max_document_height_pixels);
-    }
-    return false;
-}
-
 void hash_byte(std::uint64_t& hash, std::uint8_t value) noexcept
 {
     hash ^= value;
     hash *= k_fnv_prime;
-}
-
-void hash_u16(std::uint64_t& hash, std::uint16_t value) noexcept
-{
-    hash_byte(hash, static_cast<std::uint8_t>(value));
-    hash_byte(hash, static_cast<std::uint8_t>(value >> 8U));
 }
 
 void hash_u32(std::uint64_t& hash, std::uint32_t value) noexcept
@@ -360,12 +272,9 @@ bool persistence_dto_equal(const workbench_persistence_dto_t& lhs,
     if (canonical_lhs.schema_version != canonical_rhs.schema_version ||
         canonical_lhs.workspace != canonical_rhs.workspace ||
         canonical_lhs.revision != canonical_rhs.revision ||
-        !layout_equal(canonical_lhs.layout, canonical_rhs.layout) ||
-        canonical_lhs.split_tree.root != canonical_rhs.split_tree.root ||
         canonical_lhs.active_document != canonical_rhs.active_document ||
         canonical_lhs.documents.size() != canonical_rhs.documents.size() ||
         canonical_lhs.views.size() != canonical_rhs.views.size() ||
-        canonical_lhs.split_tree.nodes.size() != canonical_rhs.split_tree.nodes.size() ||
         canonical_lhs.panels.size() != canonical_rhs.panels.size() ||
         !history_equal(canonical_lhs.history, canonical_rhs.history)) {
         return false;
@@ -377,12 +286,6 @@ bool persistence_dto_equal(const workbench_persistence_dto_t& lhs,
     for (std::size_t index = 0; index < canonical_lhs.views.size(); ++index) {
         if (!view_dto_equal(canonical_lhs.views[index], canonical_rhs.views[index]))
             return false;
-    }
-    for (std::size_t index = 0; index < canonical_lhs.split_tree.nodes.size(); ++index) {
-        if (!split_node_equal(canonical_lhs.split_tree.nodes[index],
-                              canonical_rhs.split_tree.nodes[index])) {
-            return false;
-        }
     }
     for (std::size_t index = 0; index < canonical_lhs.panels.size(); ++index) {
         if (!panel_dto_equal(canonical_lhs.panels[index], canonical_rhs.panels[index]))
@@ -501,248 +404,17 @@ workbench_error_t validate_navigation_event(const navigation_event_t& event)
     return validate_workspace_navigation_event(event);
 }
 
-workbench_error_t validate_split_tree(const split_tree_dto_t& tree,
-                                      const std::vector<view_persistence_dto_t>& views)
-{
-    if (tree.nodes.empty())
-        return tree.root.valid() ? error(workbench_error_code_t::invalid_split_tree) : workbench_error_t{};
-    if (!tree.root.valid() || tree.nodes.size() > k_max_split_nodes_per_workspace)
-        return error(workbench_error_code_t::invalid_split_tree, tree.root.value);
-
-    std::unordered_map<std::uint64_t, std::size_t> indices;
-    indices.reserve(tree.nodes.size());
-    for (std::size_t index = 0; index < tree.nodes.size(); ++index) {
-        const auto& node = tree.nodes[index];
-        if (!node.id.valid() || !valid_split_node_kind(node.kind) ||
-            !valid_split_orientation(node.orientation) || !indices.emplace(node.id.value, index).second) {
-            return error(workbench_error_code_t::duplicate_identifier, node.id.value);
-        }
-        if (node.kind == split_node_kind_t::leaf) {
-            if (!node.view.valid() || node.first.valid() || node.second.valid() ||
-                node.orientation != split_orientation_t::horizontal ||
-                node.ratio_basis_points != k_split_ratio_default_basis_points)
-                return error(workbench_error_code_t::invalid_split_tree, node.id.value);
-        } else if (node.view.valid() || !node.first.valid() || !node.second.valid() ||
-                   node.first == node.second ||
-                   node.ratio_basis_points < k_split_ratio_min_basis_points ||
-                   node.ratio_basis_points > k_split_ratio_max_basis_points) {
-            return error(workbench_error_code_t::invalid_split_tree, node.id.value);
-        }
-    }
-    const auto root = indices.find(tree.root.value);
-    if (root == indices.end())
-        return error(workbench_error_code_t::invalid_split_tree, tree.root.value);
-
-    std::vector<std::uint32_t> parents(tree.nodes.size(), 0);
-    for (std::size_t index = 0; index < tree.nodes.size(); ++index) {
-        const auto& node = tree.nodes[index];
-        if (node.kind != split_node_kind_t::branch)
-            continue;
-        for (const auto child_id : {node.first, node.second}) {
-            const auto child = indices.find(child_id.value);
-            if (child == indices.end())
-                return error(workbench_error_code_t::invalid_split_tree, child_id.value);
-            if (++parents[child->second] != 1)
-                return error(workbench_error_code_t::invalid_split_tree, child_id.value);
-        }
-    }
-    if (parents[root->second] != 0)
-        return error(workbench_error_code_t::invalid_split_tree, tree.root.value);
-    for (std::size_t index = 0; index < parents.size(); ++index) {
-        if (index != root->second && parents[index] != 1)
-            return error(workbench_error_code_t::invalid_split_tree, tree.nodes[index].id.value);
-    }
-
-    std::unordered_set<std::uint64_t> known_views;
-    known_views.reserve(views.size());
-    for (const auto& view : views)
-        known_views.insert(view.id.value);
-    std::unordered_set<std::uint64_t> leaf_views;
-    leaf_views.reserve(tree.nodes.size());
-    std::vector<std::size_t> pending{root->second};
-    std::vector<bool> reached(tree.nodes.size(), false);
-    while (!pending.empty()) {
-        const auto index = pending.back();
-        pending.pop_back();
-        if (reached[index])
-            return error(workbench_error_code_t::invalid_split_tree, tree.nodes[index].id.value);
-        reached[index] = true;
-        const auto& node = tree.nodes[index];
-        if (node.kind == split_node_kind_t::leaf) {
-            if (known_views.find(node.view.value) == known_views.end() ||
-                !leaf_views.insert(node.view.value).second) {
-                return error(workbench_error_code_t::invalid_split_tree, node.view.value);
-            }
-            continue;
-        }
-        pending.push_back(indices.at(node.first.value));
-        pending.push_back(indices.at(node.second.value));
-    }
-    for (std::size_t index = 0; index < reached.size(); ++index) {
-        if (!reached[index])
-            return error(workbench_error_code_t::invalid_split_tree, tree.nodes[index].id.value);
-    }
-    return {};
-}
-
-workbench_error_t validate_split_tree(const split_tree_dto_t& tree,
-                                      const std::vector<view_persistence_dto_t>& views,
-                                      const fixed_layout_constraints_t& constraints,
-                                      layout_extent_t document_extent)
-{
-    const auto layout_result = validate_fixed_layout_constraints(constraints);
-    if (!layout_result)
-        return layout_result;
-    const auto topology_result = validate_split_tree(tree, views);
-    if (!topology_result || tree.nodes.empty())
-        return topology_result;
-
-    std::unordered_map<std::uint64_t, std::size_t> indices;
-    indices.reserve(tree.nodes.size());
-    for (std::size_t index = 0; index < tree.nodes.size(); ++index)
-        indices.emplace(tree.nodes[index].id.value, index);
-
-    struct pending_extent_t {
-        std::size_t index = 0;
-        layout_extent_t extent;
-    };
-
-    std::vector<pending_extent_t> pending{{indices.at(tree.root.value), document_extent}};
-    while (!pending.empty()) {
-        const auto current = pending.back();
-        pending.pop_back();
-        const auto& node = tree.nodes[current.index];
-        if (node.kind == split_node_kind_t::leaf) {
-            if (current.extent.width_pixels < constraints.minimum_document_width_pixels ||
-                current.extent.height_pixels < constraints.minimum_document_height_pixels) {
-                return error(workbench_error_code_t::invalid_split_tree, node.id.value);
-            }
-            continue;
-        }
-
-        const auto split_axis = node.orientation == split_orientation_t::horizontal
-            ? current.extent.width_pixels : current.extent.height_pixels;
-        if (split_axis <= constraints.splitter_pixels)
-            return error(workbench_error_code_t::invalid_split_tree, node.id.value);
-
-        const auto distributable = static_cast<std::uint64_t>(split_axis - constraints.splitter_pixels);
-        const auto first_axis = static_cast<std::uint32_t>(
-            distributable * node.ratio_basis_points / 10000U);
-        const auto second_axis = static_cast<std::uint32_t>(distributable - first_axis);
-        auto first_extent = current.extent;
-        auto second_extent = current.extent;
-        if (node.orientation == split_orientation_t::horizontal) {
-            first_extent.width_pixels = first_axis;
-            second_extent.width_pixels = second_axis;
-        } else {
-            first_extent.height_pixels = first_axis;
-            second_extent.height_pixels = second_axis;
-        }
-        pending.push_back({indices.at(node.first.value), first_extent});
-        pending.push_back({indices.at(node.second.value), second_extent});
-    }
-    return {};
-}
-
-void normalize_split_tree(split_tree_dto_t& tree) noexcept
-{
-    for (auto& node : tree.nodes) {
-        if (node.kind == split_node_kind_t::branch) {
-            node.ratio_basis_points = clamp_ratio(node.ratio_basis_points);
-        } else if (node.kind == split_node_kind_t::leaf) {
-            node.orientation = split_orientation_t::horizontal;
-            node.ratio_basis_points = k_split_ratio_default_basis_points;
-        }
-    }
-    std::sort(tree.nodes.begin(), tree.nodes.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.id < rhs.id;
-    });
-}
-
-void normalize_fixed_layout_constraints(fixed_layout_constraints_t& constraints) noexcept
-{
-    constraints.left_rail_pixels = clamp_dimension(constraints.left_rail_pixels,
-                                                   k_min_left_rail_pixels,
-                                                   k_max_left_rail_pixels);
-    constraints.navigator_pixels = clamp_dimension(constraints.navigator_pixels,
-                                                   k_min_navigator_pixels,
-                                                   k_max_navigator_pixels);
-    constraints.inspector_pixels = clamp_dimension(constraints.inspector_pixels,
-                                                   k_min_inspector_pixels,
-                                                   k_max_inspector_pixels);
-    constraints.bottom_panel_pixels = clamp_dimension(constraints.bottom_panel_pixels,
-                                                      k_min_bottom_panel_pixels,
-                                                      k_max_bottom_panel_pixels);
-    constraints.tab_strip_pixels = clamp_dimension(constraints.tab_strip_pixels,
-                                                   k_min_tab_strip_pixels,
-                                                   k_max_tab_strip_pixels);
-    constraints.toolbar_pixels = clamp_dimension(constraints.toolbar_pixels,
-                                                 k_min_toolbar_pixels,
-                                                 k_max_toolbar_pixels);
-    constraints.splitter_pixels = clamp_dimension(constraints.splitter_pixels,
-                                                  k_min_splitter_pixels,
-                                                  k_max_splitter_pixels);
-    constraints.minimum_document_width_pixels = clamp_dimension(
-        constraints.minimum_document_width_pixels, k_min_document_width_pixels,
-        k_max_document_width_pixels);
-    constraints.minimum_document_height_pixels = clamp_dimension(
-        constraints.minimum_document_height_pixels, k_min_document_height_pixels,
-        k_max_document_height_pixels);
-}
-
-workbench_error_t validate_fixed_layout_constraints(const fixed_layout_constraints_t& constraints)
-{
-    const auto in_range = [](std::uint32_t value, std::uint32_t minimum, std::uint32_t maximum) noexcept {
-        return value >= minimum && value <= maximum;
-    };
-    return in_range(constraints.left_rail_pixels, k_min_left_rail_pixels, k_max_left_rail_pixels) &&
-           in_range(constraints.navigator_pixels, k_min_navigator_pixels, k_max_navigator_pixels) &&
-           in_range(constraints.inspector_pixels, k_min_inspector_pixels, k_max_inspector_pixels) &&
-           in_range(constraints.bottom_panel_pixels, k_min_bottom_panel_pixels,
-                    k_max_bottom_panel_pixels) &&
-           in_range(constraints.tab_strip_pixels, k_min_tab_strip_pixels, k_max_tab_strip_pixels) &&
-           in_range(constraints.toolbar_pixels, k_min_toolbar_pixels, k_max_toolbar_pixels) &&
-           in_range(constraints.splitter_pixels, k_min_splitter_pixels, k_max_splitter_pixels) &&
-           in_range(constraints.minimum_document_width_pixels, k_min_document_width_pixels,
-                    k_max_document_width_pixels) &&
-           in_range(constraints.minimum_document_height_pixels, k_min_document_height_pixels,
-                    k_max_document_height_pixels)
-        ? workbench_error_t{} : error(workbench_error_code_t::invalid_layout);
-}
-
-layout_extent_t minimum_layout_extent(const fixed_layout_constraints_t& constraints) noexcept
-{
-    return {
-        constraints.left_rail_pixels + constraints.navigator_pixels + constraints.inspector_pixels +
-            constraints.minimum_document_width_pixels + constraints.splitter_pixels * 2U,
-        constraints.toolbar_pixels + constraints.tab_strip_pixels +
-            constraints.minimum_document_height_pixels + constraints.bottom_panel_pixels +
-            constraints.splitter_pixels
-    };
-}
-
-bool layout_extent_satisfies(const fixed_layout_constraints_t& constraints,
-                             layout_extent_t available) noexcept
-{
-    const auto minimum = minimum_layout_extent(constraints);
-    return available.width_pixels >= minimum.width_pixels &&
-           available.height_pixels >= minimum.height_pixels;
-}
-
 workbench_error_t validate_persistence_dto(const workbench_persistence_dto_t& dto)
 {
     if (dto.schema_version != k_workbench_contract_schema_version || !dto.workspace.valid() ||
         !dto.revision.valid()) {
         return error(workbench_error_code_t::invalid_persistence);
     }
-    const auto layout_result = validate_fixed_layout_constraints(dto.layout);
-    if (!layout_result)
-        return layout_result;
     if (dto.documents.size() > k_max_documents_per_workspace ||
         dto.views.size() > k_max_views_per_workspace || dto.panels.size() > k_max_panels_per_workspace) {
         return error(workbench_error_code_t::invalid_persistence);
     }
-    if (dto.documents.empty() || !dto.active_document.valid())
+    if (dto.documents.empty() || dto.views.empty() || !dto.active_document.valid())
         return error(workbench_error_code_t::invalid_persistence, dto.active_document.value);
 
     std::unordered_set<std::uint64_t> document_ids;
@@ -791,10 +463,12 @@ workbench_error_t validate_persistence_dto(const workbench_persistence_dto_t& dt
         if (focused_views > 1)
             return error(workbench_error_code_t::invalid_view, view.id.value);
     }
-    const auto split_result = validate_split_tree(dto.split_tree, dto.views);
-    if (!split_result)
-        return split_result;
-
+    if (focused_views != 1)
+        return error(workbench_error_code_t::invalid_view);
+    const auto focused = std::find_if(dto.views.begin(), dto.views.end(),
+        [](const auto& view) { return view.focused; });
+    if (focused == dto.views.end() || focused->document != dto.active_document)
+        return error(workbench_error_code_t::invalid_persistence, dto.active_document.value);
     std::unordered_set<std::uint64_t> panel_ids;
     panel_ids.reserve(dto.panels.size());
     for (const auto& panel : dto.panels) {
@@ -805,7 +479,6 @@ workbench_error_t validate_persistence_dto(const workbench_persistence_dto_t& dt
         if (panel.workspace != dto.workspace)
             return error(workbench_error_code_t::workspace_mismatch, panel.id.value);
         if (panel.revision.value > dto.revision.value ||
-            !panel_extent_matches(panel, dto.layout) ||
             (panel.selected_document.valid() && !find_document(dto.documents, panel.selected_document)) ||
             !panel_ids.insert(panel.id.value).second) {
             return error(workbench_error_code_t::invalid_panel, panel.id.value);
@@ -836,8 +509,6 @@ workbench_error_t validate_persistence_dto(const workbench_persistence_dto_t& dt
 
 workbench_error_t normalize_persistence_dto(workbench_persistence_dto_t& dto)
 {
-    normalize_fixed_layout_constraints(dto.layout);
-    normalize_split_tree(dto.split_tree);
     dto.history.capacity = dto.history.capacity == 0 ? k_default_history_capacity :
         (dto.history.capacity > k_max_history_capacity ? k_max_history_capacity : dto.history.capacity);
     std::sort(dto.documents.begin(), dto.documents.end(), [](const auto& lhs, const auto& rhs) {
@@ -845,9 +516,6 @@ workbench_error_t normalize_persistence_dto(workbench_persistence_dto_t& dto)
             return true;
         if (document_identity_less(rhs.identity, lhs.identity))
             return false;
-        return lhs.id < rhs.id;
-    });
-    std::sort(dto.views.begin(), dto.views.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.id < rhs.id;
     });
     std::sort(dto.panels.begin(), dto.panels.end(), [](const auto& lhs, const auto& rhs) {
@@ -931,26 +599,6 @@ persistence_fingerprint_t persistence_fingerprint(const workbench_persistence_dt
     hash_u32(hash, canonical.schema_version);
     hash_u64(hash, canonical.workspace.value);
     hash_u64(hash, canonical.revision.value);
-    hash_u32(hash, canonical.layout.left_rail_pixels);
-    hash_u32(hash, canonical.layout.navigator_pixels);
-    hash_u32(hash, canonical.layout.inspector_pixels);
-    hash_u32(hash, canonical.layout.bottom_panel_pixels);
-    hash_u32(hash, canonical.layout.tab_strip_pixels);
-    hash_u32(hash, canonical.layout.toolbar_pixels);
-    hash_u32(hash, canonical.layout.splitter_pixels);
-    hash_u32(hash, canonical.layout.minimum_document_width_pixels);
-    hash_u32(hash, canonical.layout.minimum_document_height_pixels);
-    hash_u64(hash, canonical.split_tree.root.value);
-    hash_u64(hash, static_cast<std::uint64_t>(canonical.split_tree.nodes.size()));
-    for (const auto& node : canonical.split_tree.nodes) {
-        hash_u64(hash, node.id.value);
-        hash_byte(hash, static_cast<std::uint8_t>(node.kind));
-        hash_byte(hash, static_cast<std::uint8_t>(node.orientation));
-        hash_u16(hash, node.ratio_basis_points);
-        hash_u64(hash, node.view.value);
-        hash_u64(hash, node.first.value);
-        hash_u64(hash, node.second.value);
-    }
     hash_u64(hash, static_cast<std::uint64_t>(canonical.documents.size()));
     for (const auto& document : canonical.documents) {
         hash_u64(hash, document.id.value);
@@ -979,7 +627,6 @@ persistence_fingerprint_t persistence_fingerprint(const workbench_persistence_dt
         hash_byte(hash, static_cast<std::uint8_t>(panel.kind));
         hash_bool(hash, panel.visible);
         hash_bool(hash, panel.pinned);
-        hash_u32(hash, panel.extent_pixels);
         hash_u64(hash, panel.selected_document.value);
         hash_string(hash, panel.state_token);
         hash_u64(hash, panel.revision.value);

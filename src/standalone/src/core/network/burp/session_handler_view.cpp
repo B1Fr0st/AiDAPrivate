@@ -30,6 +30,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -44,7 +45,10 @@ namespace {
 
 struct view_state_t
 {
-    bool         initialized = false;
+    std::atomic<bool> initialized{false};
+    std::atomic<bool> initialization_requested{false};
+    std::atomic<std::uint64_t> created_macro_id{0};
+    std::atomic<std::uint64_t> created_rule_id{0};
 
     char         new_macro_name[128] = {};
     char         new_step_label[128] = {};
@@ -87,6 +91,20 @@ view_state_t& s()
 const char* extract_from_combo[] = { "resp_body", "resp_headers", "resp_url" };
 const char* match_combo[]        = { "url_regex", "response_status", "response_regex" };
 
+void queue_macro_update(session_handler::macro_t macro)
+{
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "burp.session_handler_view";
+    submission.label = "session_handler.update_macro";
+    submission.thread_class = "bounded_task";
+    submission.domain = aida::infra::executor::domain_t::external_tool;
+    submission.priority = 3;
+    submission.body = [macro = std::move(macro)]() mutable {
+        session_handler::update_macro(std::move(macro));
+    };
+    static_cast<void>(aida::infra::executor::submit(std::move(submission)));
+}
+
 }
 
 void render(float pos_x, float pos_y, float width, float height,
@@ -96,11 +114,26 @@ void render(float pos_x, float pos_y, float width, float height,
     const auto& th = aida::ui::resolved();
     auto& st = s();
 
-    if (!st.initialized) {
-        session_handler::initialize();
-        st.initialized = true;
-        ::diag::log_tagged("session_v", "render_first_init");
+    if (!st.initialized.load(std::memory_order_acquire) &&
+        !st.initialization_requested.exchange(true, std::memory_order_acq_rel)) {
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.session_handler_view";
+        submission.label = "session_handler.initialize";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::external_tool;
+        submission.priority = 3;
+        submission.body = []() {
+            session_handler::initialize();
+            s().initialized.store(true, std::memory_order_release);
+            s().initialization_requested.store(false, std::memory_order_release);
+        };
+        if (!aida::infra::executor::submit(std::move(submission)).submitted)
+            st.initialization_requested.store(false, std::memory_order_release);
     }
+    const std::uint64_t created_macro = st.created_macro_id.exchange(0, std::memory_order_acq_rel);
+    if (created_macro != 0) st.selected_macro_id = created_macro;
+    const std::uint64_t created_rule = st.created_rule_id.exchange(0, std::memory_order_acq_rel);
+    if (created_rule != 0) st.selected_rule_id = created_rule;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##burp_sh_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
@@ -160,10 +193,17 @@ void render(float pos_x, float pos_y, float width, float height,
     if (aida::ui::button("Create macro", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
         session_handler::macro_t m;
         m.name = st.new_macro_name;
-        const uint64_t id = session_handler::add_macro(m);
-        ::diag::log_tagged_fmt("session_v", "macro_created id=%llu name='%s'",
-            static_cast<unsigned long long>(id), m.name.c_str());
-        st.selected_macro_id = id;
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.session_handler_view";
+        submission.label = "session_handler.add_macro";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::external_tool;
+        submission.priority = 3;
+        submission.body = [m = std::move(m)]() mutable {
+            const std::uint64_t id = session_handler::add_macro(std::move(m));
+            if (id != 0) s().created_macro_id.store(id, std::memory_order_release);
+        };
+        static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         st.new_macro_name[0] = '\0';
         std::strncpy(st.edit_macro_name, "", sizeof(st.edit_macro_name) - 1);
     }
@@ -171,7 +211,15 @@ void render(float pos_x, float pos_y, float width, float height,
     if (st.selected_macro_id != 0 &&
         aida::ui::button("Delete macro", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
         ::diag::log_tagged_fmt("session_v", "macro_deleted id=%llu", static_cast<unsigned long long>(st.selected_macro_id));
-        session_handler::remove_macro(st.selected_macro_id);
+        const std::uint64_t id = st.selected_macro_id;
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.session_handler_view";
+        submission.label = "session_handler.remove_macro";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::external_tool;
+        submission.priority = 3;
+        submission.body = [id]() { session_handler::remove_macro(id); };
+        static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         st.selected_macro_id = 0;
     }
 
@@ -223,7 +271,17 @@ void render(float pos_x, float pos_y, float width, float height,
         r.replace_in_headers = st.new_rule_repl_headers;
         r.replace_in_body = st.new_rule_repl_body;
         r.active = true;
-        session_handler::add_rule(r);
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.session_handler_view";
+        submission.label = "session_handler.add_rule";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::external_tool;
+        submission.priority = 3;
+        submission.body = [r = std::move(r)]() mutable {
+            const std::uint64_t id = session_handler::add_rule(std::move(r));
+            if (id != 0) s().created_rule_id.store(id, std::memory_order_release);
+        };
+        static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         ::diag::log_tagged_fmt("session_v", "rule_added name='%s' match=%d macro_id=%llu",
             r.name.c_str(), st.new_rule_match, static_cast<unsigned long long>(r.macro_id));
         st.new_rule_name[0] = '\0';
@@ -233,7 +291,15 @@ void render(float pos_x, float pos_y, float width, float height,
     if (st.selected_rule_id != 0 &&
         aida::ui::button("Delete rule", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
         ::diag::log_tagged_fmt("session_v", "rule_deleted id=%llu", static_cast<unsigned long long>(st.selected_rule_id));
-        session_handler::remove_rule(st.selected_rule_id);
+        const std::uint64_t id = st.selected_rule_id;
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.session_handler_view";
+        submission.label = "session_handler.remove_rule";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::external_tool;
+        submission.priority = 3;
+        submission.body = [id]() { session_handler::remove_rule(id); };
+        static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         st.selected_rule_id = 0;
     }
 
@@ -259,7 +325,7 @@ void render(float pos_x, float pos_y, float width, float height,
             ::diag::log_tagged_fmt("session_v", "macro_rename id=%llu new_name='%s'",
                 static_cast<unsigned long long>(cur.id), st.edit_macro_name);
             cur.name = st.edit_macro_name;
-            session_handler::update_macro(cur);
+            queue_macro_update(cur);
         }
         ImGui::SameLine();
         if (aida::ui::button("Run macro now", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
@@ -319,7 +385,7 @@ void render(float pos_x, float pos_y, float width, float height,
                     static_cast<unsigned long long>(cur.id), idx);
                 const auto step_offset = static_cast<decltype(cur.steps)::difference_type>(idx);
                 cur.steps.erase(cur.steps.begin() + step_offset);
-                session_handler::update_macro(cur);
+                queue_macro_update(cur);
                 st.edit_step_index = -1;
             }
         }
@@ -363,7 +429,7 @@ void render(float pos_x, float pos_y, float width, float height,
                 step.extracts.push_back(e);
             }
             cur.steps.push_back(step);
-            session_handler::update_macro(cur);
+            queue_macro_update(cur);
             st.new_step_label[0] = '\0';
             st.new_step_host[0] = '\0';
             st.new_step_request[0] = '\0';

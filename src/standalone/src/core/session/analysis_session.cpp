@@ -260,6 +260,14 @@ std::shared_ptr<aida::analysis::analysis_workspace_t> active_workspace() {
                                   : value.sessions[value.active]->workspace;
 }
 
+bool try_active_workspace(std::shared_ptr<aida::analysis::analysis_workspace_t>& output) {
+	auto& value = state();
+	std::unique_lock lock(value.mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return false;
+	output = value.sessions.empty() ? nullptr : value.sessions[value.active]->workspace;
+	return true;
+}
+
 std::shared_ptr<aida::analysis::analysis_workspace_t>
 workspace_for_session(std::size_t index) {
     auto& value = state();

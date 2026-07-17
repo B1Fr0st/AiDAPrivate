@@ -9,6 +9,7 @@
 #include "components.hpp"
 #include "fonts.hpp"
 #include "toast_notification.hpp"
+#include "application_ui_runtime.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1639,18 +1640,31 @@ chat_render::render_result_t chat_render::render_rich_message(
                 ImGui::SetClipboardText(span.url.c_str());
                 copied_toast("Link copied");
             }
-            if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !span.url.empty()) {
-                char link_popup[64]; snprintf(link_popup, sizeof(link_popup), "##linkctx_%d_%d", msg_idx, span_idx);
-                ImGui::OpenPopup(link_popup);
-            }
-            char link_popup[64]; snprintf(link_popup, sizeof(link_popup), "##linkctx_%d_%d", msg_idx, span_idx);
-            if (ImGui::BeginPopup(link_popup)) {
-                if (ImGui::MenuItem("Copy Link")) {
-                    ImGui::SetClipboardText(span.url.c_str());
+            const std::string link_entity = std::to_string(msg_idx) + ":" +
+                std::to_string(span_idx) + ":" +
+                std::to_string(std::hash<std::string>{}(span.url));
+            if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+                !span.url.empty()) {
+                aida::ui::application_ui::retained_entity_context_t context;
+                context.owner_id = "chat.link";
+                context.entity_id = link_entity;
+                context.entity_generation = std::hash<std::string>{}(span.url);
+                context.active_view = aida::ui::stable_view_id_t("view.ai_chat");
+                const std::string url = span.url;
+                aida::ui::application_ui::retained_entity_action_t copy;
+                copy.action_id = "chat.link.copy";
+                copy.capability = aida::ui::capability_state_t::available();
+                copy.invoke = [url] {
+                    ImGui::SetClipboardText(url.c_str());
                     copied_toast("Link copied");
-                }
-                ImGui::EndPopup();
+                    return aida::ui::action_handler_result_t::completed();
+                };
+                context.actions.push_back(std::move(copy));
+                aida::ui::application_ui::open_retained_entity_context_menu(
+                    std::move(context),
+                    aida::ui::context_menu_open_origin_t::pointer);
             }
+            aida::ui::application_ui::render_retained_entity_context_menu("chat.link");
             break;
         }
 
@@ -1916,27 +1930,60 @@ chat_render::render_result_t chat_render::render_rich_message(
 
         result.height += btn_h + 12.f;
 
-        if (ImGui::IsMouseHoveringRect(card_a, card_b) &&
-            ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            char popid[48]; snprintf(popid, sizeof(popid), "##rmctx_%d", msg_idx);
-            ImGui::OpenPopup(popid);
-        }
-        char popid[48]; snprintf(popid, sizeof(popid), "##rmctx_%d", msg_idx);
-        if (ImGui::BeginPopup(popid)) {
-            if (ImGui::MenuItem("Copy Message")) {
+        const bool card_hovered = ImGui::IsMouseHoveringRect(card_a, card_b);
+        static int keyboard_message = -1;
+        if (card_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            keyboard_message = msg_idx;
+        const bool menu_key = keyboard_message == msg_idx &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool shift_f10 = keyboard_message == msg_idx &&
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+        const std::string message_entity = std::to_string(msg_idx) + ":" +
+            std::to_string(std::hash<std::string>{}(text));
+        if ((card_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) ||
+            menu_key || shift_f10) {
+            aida::ui::application_ui::retained_entity_context_t context;
+            context.owner_id = "chat.message";
+            context.entity_id = message_entity;
+            context.entity_generation = std::hash<std::string>{}(text);
+            context.active_view = aida::ui::stable_view_id_t("view.ai_chat");
+            const auto append = [&context](const char* id,
+                std::function<aida::ui::action_handler_result_t()> invoke) {
+                aida::ui::application_ui::retained_entity_action_t action;
+                action.action_id = id;
+                action.capability = aida::ui::capability_state_t::available();
+                action.invoke = std::move(invoke);
+                context.actions.push_back(std::move(action));
+            };
+            append("chat.message.copy", [text] {
                 ImGui::SetClipboardText(text.c_str());
-            }
-            if (ImGui::MenuItem("Edit Message")) {
-                result.action = action_t::edit_msg;
-            }
-            if (ImGui::MenuItem("Delete Message")) {
-                result.action = action_t::delete_msg;
-            }
-            if (ImGui::MenuItem("Retry From Here")) {
-                result.action = action_t::retry;
-            }
-            ImGui::EndPopup();
+                return aida::ui::action_handler_result_t::completed();
+            });
+            append("chat.message.edit", [] {
+                return aida::ui::action_handler_result_t::completed();
+            });
+            append("chat.message.delete", [] {
+                return aida::ui::action_handler_result_t::completed();
+            });
+            append("chat.message.retry", [] {
+                return aida::ui::action_handler_result_t::completed();
+            });
+            aida::ui::application_ui::open_retained_entity_context_menu(
+                std::move(context), shift_f10
+                    ? aida::ui::context_menu_open_origin_t::shift_f10
+                    : menu_key
+                    ? aida::ui::context_menu_open_origin_t::menu_key
+                    : aida::ui::context_menu_open_origin_t::pointer);
         }
+        aida::ui::application_ui::render_retained_entity_context_menu("chat.message");
+        const std::string executed =
+            aida::ui::application_ui::consume_retained_entity_action(
+                "chat.message", message_entity.c_str());
+        if (executed == "chat.message.edit") result.action = action_t::edit_msg;
+        else if (executed == "chat.message.delete") result.action = action_t::delete_msg;
+        else if (executed == "chat.message.retry") result.action = action_t::retry;
     }
 
     return result;

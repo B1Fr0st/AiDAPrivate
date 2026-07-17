@@ -19,15 +19,22 @@
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
+#include "../../infra/executor.hpp"
+#endif
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_services.hpp"
 #else
 #include "../../../helpers/diag_log.hpp"
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -65,7 +72,9 @@ struct view_state_t
     std::string     verify_result;
     std::vector<std::string> attack_results;
     uint64_t        active_crack_id = 0;
-    bool            initialized = false;
+    std::atomic<bool> initialized{false};
+    std::atomic<bool> initialization_requested{false};
+    std::atomic<std::uint64_t> started_crack_id{0};
 };
 
 view_state_t& s()
@@ -90,12 +99,25 @@ void render(float pos_x, float pos_y, float width, float height,
     const auto& th = aida::ui::resolved();
     auto& st = s();
 
-    if (!st.initialized) {
-        aida::burp::jwt_lab::initialize();
+    if (!st.initialized.load(std::memory_order_acquire) &&
+        !st.initialization_requested.exchange(true, std::memory_order_acq_rel)) {
         if (st.forge_alg_buf[0] == '\0') std::strncpy(st.forge_alg_buf, "HS256", sizeof(st.forge_alg_buf) - 1);
-        st.initialized = true;
-        diag::log_tagged("jwt_v", "render_first_init");
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.jwt_lab_view";
+        submission.label = "jwt_lab.initialize";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::external_tool;
+        submission.priority = 3;
+        submission.body = []() {
+            aida::burp::jwt_lab::initialize();
+            s().initialized.store(true, std::memory_order_release);
+            s().initialization_requested.store(false, std::memory_order_release);
+        };
+        if (!aida::infra::executor::submit(std::move(submission)).submitted)
+            st.initialization_requested.store(false, std::memory_order_release);
     }
+    const std::uint64_t started_crack = st.started_crack_id.exchange(0, std::memory_order_acq_rel);
+    if (started_crack != 0) st.active_crack_id = started_crack;
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##burp_jwt_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
@@ -277,14 +299,31 @@ void render(float pos_x, float pos_y, float width, float height,
             cfg.wordlist_id = st.wordlist_buf;
             cfg.concurrency = static_cast<size_t>(st.crack_concurrency);
             cfg.max_attempts = static_cast<size_t>(st.crack_max_attempts);
-            st.active_crack_id = aida::burp::jwt_lab::start_crack(cfg);
-            diag::log_tagged_fmt("burp", "jwt_crack_button id=%llu", static_cast<unsigned long long>(st.active_crack_id));
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.jwt_lab_view";
+            submission.label = "jwt_lab.start_crack";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [cfg = std::move(cfg)]() {
+                const std::uint64_t id = aida::burp::jwt_lab::start_crack(cfg);
+                if (id != 0) s().started_crack_id.store(id, std::memory_order_release);
+            };
+            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         }
         ImGui::SameLine();
         if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
             if (st.active_crack_id != 0) {
                 diag::log_tagged_fmt("jwt_v", "crack_stop id=%llu", static_cast<unsigned long long>(st.active_crack_id));
-                aida::burp::jwt_lab::crack_stop(st.active_crack_id);
+                const std::uint64_t id = st.active_crack_id;
+                aida::infra::executor::submission_t submission;
+                submission.owner_subsystem = "burp.jwt_lab_view";
+                submission.label = "jwt_lab.stop_crack";
+                submission.thread_class = "bounded_task";
+                submission.domain = aida::infra::executor::domain_t::external_tool;
+                submission.priority = 3;
+                submission.body = [id]() { aida::burp::jwt_lab::crack_stop(id); };
+                static_cast<void>(aida::infra::executor::submit(std::move(submission)));
             }
         }
 

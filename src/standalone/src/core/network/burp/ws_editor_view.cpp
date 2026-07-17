@@ -11,6 +11,7 @@
 #endif
 
 #include "ws_editor_view.hpp"
+#include "../network_view.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_routed.hpp"
 #else
@@ -35,6 +36,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -48,6 +50,33 @@ namespace ws_editor_view {
 namespace {
 
 state_t s_state;
+
+uint64_t artifact_hash(const std::vector<uint8_t>& bytes)
+{
+    uint64_t hash = 14695981039346656037ULL;
+    for (uint8_t value : bytes) { hash ^= value; hash *= 1099511628211ULL; }
+    hash ^= static_cast<uint64_t>(bytes.size());
+    hash *= 1099511628211ULL;
+    return hash == 0 ? 1 : hash;
+}
+
+network_view::artifact_identity_t artifact_identity(uint64_t connection_id,
+                                                     const ws_editor::ws_frame_log_t& frame)
+{
+    network_view::artifact_identity_t identity;
+    identity.kind = network_view::artifact_kind_t::websocket_editor_frame;
+    identity.id = "network.ws_editor." + std::to_string(connection_id) + "." + std::to_string(frame.id);
+    identity.parent_id = "network.ws_editor." + std::to_string(connection_id);
+    identity.source_view_id = "view.network.ws_editor";
+    identity.source_id = connection_id;
+    identity.timestamp = frame.ts_ms;
+    identity.revision = frame.id;
+    identity.content_size = frame.payload.size();
+    identity.content_hash = artifact_hash(frame.payload);
+    identity.label = std::string(frame.outbound ? "Outbound" : "Inbound") +
+        " WebSocket editor frame #" + std::to_string(frame.id);
+    return identity;
+}
 
 const char* g_scheme_items[] = { "ws", "wss" };
 const char* g_compose_modes[] = { "Text", "Binary hex", "Raw frame" };
@@ -112,6 +141,19 @@ const char* opcode_name(uint8_t op)
 }
 
 state_t& get_state() { return s_state; }
+
+bool resolve_retained_artifact(uint64_t connection_id, uint64_t frame_id,
+                               std::vector<uint8_t>& bytes, std::string& unavailable_reason)
+{
+    ws_editor::ws_frame_log_t frame;
+    if (!ws_editor::get_frame(connection_id, frame_id, frame)) {
+        unavailable_reason = "The WebSocket editor frame was cleared or rolled out of its bounded log.";
+        return false;
+    }
+    bytes = frame.payload;
+    unavailable_reason.clear();
+    return true;
+}
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
@@ -224,6 +266,7 @@ void render(float pos_x, float pos_y, float width, float height,
             ::diag::log_tagged_fmt("ws_v", "connection_selected idx=%zu id=%llu url=%s",
                 i, static_cast<unsigned long long>(c.id), c.url.c_str());
             s_state.selected_conn_index = static_cast<int>(i);
+            s_state.selected_frame_id = 0;
         }
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                            "    sent=%zu recv=%zu err=%s",
@@ -258,7 +301,15 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::SameLine();
         if (aida::ui::button("Clear log", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
             ::diag::log_tagged_fmt("ws_v", "clear_frames id=%llu", static_cast<unsigned long long>(cid));
-            ws_editor::clear_frames(cid);
+            ::aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.ws_view";
+            submission.label = "ws_editor.clear_frames";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [cid]() { ws_editor::clear_frames(cid); };
+            static_cast<void>(::aida::infra::executor::submit(std::move(submission)));
+            s_state.selected_frame_id = 0;
         }
         ImGui::SameLine();
         if (aida::ui::button("Ping", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
@@ -291,18 +342,52 @@ void render(float pos_x, float pos_y, float width, float height,
 
         float log_h = content_h * 0.55f;
         ImGui::BeginChild("##wse_log", ImVec2(right_w - 8.f, log_h), false);
-        auto fr = ws_editor::frames(cid, 0, 0);
         ImFont* mono = aida::ui::fonts::code();
         if (mono) ImGui::PushFont(mono);
-        for (const auto& f : fr) {
-            ImU32 col = f.outbound
-                ? aida::ui::with_alpha(th.warning, alpha)
-                : aida::ui::with_alpha(th.info, alpha);
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s op=%s len=%zu | %s",
-                f.outbound ? "OUT" : "IN ",
-                opcode_name(f.opcode),
-                f.payload.size(),
-                f.preview.c_str());
+        const size_t total_frames = ws_editor::frame_count(cid);
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(std::min<size_t>(total_frames, static_cast<size_t>(INT_MAX))));
+        while (clipper.Step()) {
+            const size_t start = static_cast<size_t>(clipper.DisplayStart);
+            auto visible_frames = ws_editor::frames(cid, start,
+                static_cast<size_t>(clipper.DisplayEnd - clipper.DisplayStart));
+            for (const auto& f : visible_frames) {
+                ImU32 col = f.outbound
+                    ? aida::ui::with_alpha(th.warning, alpha)
+                    : aida::ui::with_alpha(th.info, alpha);
+                char frame_label[512];
+                _snprintf_s(frame_label, sizeof(frame_label), _TRUNCATE,
+                    "%s op=%s len=%zu | %s",
+                    f.outbound ? "OUT" : "IN ", opcode_name(f.opcode), f.payload.size(),
+                    f.preview.c_str());
+                char stable_frame_id[64];
+                _snprintf_s(stable_frame_id, sizeof(stable_frame_id), _TRUNCATE, "ws_frame_%llu",
+                    static_cast<unsigned long long>(f.id));
+                ImGui::PushID(stable_frame_id);
+                const bool selected = s_state.selected_frame_id == f.id;
+                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                if (ImGui::Selectable(frame_label, selected)) s_state.selected_frame_id = f.id;
+                ImGui::PopStyleColor();
+                const bool pointer_context = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                const bool menu_key_context = ImGui::IsItemFocused() &&
+                    ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+                const bool shift_f10_context = !menu_key_context && ImGui::IsItemFocused() &&
+                    ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+                const bool keyboard_context = menu_key_context || shift_f10_context;
+                if (pointer_context) {
+                    s_state.selected_frame_id = f.id;
+                    network_view::open_exchange_context(artifact_identity(cid, f), {},
+                        network_view::exchange_context_origin_t::pointer);
+                }
+                if (keyboard_context) {
+                    s_state.selected_frame_id = f.id;
+                    network_view::open_exchange_context(artifact_identity(cid, f), {},
+                        menu_key_context
+                            ? network_view::exchange_context_origin_t::menu_key
+                            : network_view::exchange_context_origin_t::shift_f10);
+                }
+                ImGui::PopID();
+            }
         }
         if (mono) ImGui::PopFont();
         ImGui::EndChild();

@@ -272,22 +272,20 @@ static tool_result_t tool_write_file(const json& params)
     if (!parent.empty())
         fs::create_directories(parent, ec);
 
-    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-    if (!ofs.is_open())
-    {
-        diag::log_tagged_fmt("coding", "write_file open fail path='%.120s'", path.c_str());
-        return tool_result_t::error("Cannot create/open file: " + path);
+    std::string review_detail;
+    if (file_tabs::stage_external_proposal(path, content, "MCP write_file", review_detail)) {
+        diag::log_tagged_fmt("coding", "write_file review_required path='%.120s'", path.c_str());
+        return tool_result_t::ok(review_detail);
     }
-
-    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-    ofs.close();
+    const auto written = file_tabs::atomic_write_file(path, content);
+    if (!written.succeeded) {
+        diag::log_tagged_fmt("coding", "write_file atomic fail path='%.120s'", path.c_str());
+        return tool_result_t::error(written.detail);
+    }
     diag::log_tagged_fmt("coding", "write_file ok bytes=%zu path='%.120s'",
         content.size(), path.c_str());
 
-
-    if (code_editor::active && code_editor::filepath == path) {
-        code_editor::load(content, code_editor::filename, path);
-    }
+    file_tabs::accept_external_write(path, content);
 
 
     file_browser::needs_refresh = true;
@@ -379,20 +377,19 @@ static tool_result_t tool_edit_file(const json& params)
     content.replace(pos, old_text.size(), new_text);
 
 
-    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
-    if (!ofs.is_open())
-    {
-        diag::log_tagged_fmt("coding", "edit_file write fail path='%.120s'", path.c_str());
-        return tool_result_t::error("Cannot write file: " + path);
+    std::string review_detail;
+    if (file_tabs::stage_external_proposal(path, content, "MCP edit_file", review_detail)) {
+        diag::log_tagged_fmt("coding", "edit_file review_required path='%.120s'", path.c_str());
+        return tool_result_t::ok(review_detail);
     }
-    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-    ofs.close();
+    const auto written = file_tabs::atomic_write_file(path, content);
+    if (!written.succeeded) {
+        diag::log_tagged_fmt("coding", "edit_file atomic fail path='%.120s'", path.c_str());
+        return tool_result_t::error(written.detail);
+    }
     diag::log_tagged_fmt("coding", "edit_file ok path='%.120s'", path.c_str());
 
-
-    if (code_editor::active && code_editor::filepath == path) {
-        code_editor::load(content, code_editor::filename, path);
-    }
+    file_tabs::accept_external_write(path, content);
 
 
     int line_num = 1;

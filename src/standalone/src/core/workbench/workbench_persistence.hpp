@@ -16,13 +16,14 @@ class workspace_database_t;
 namespace aida {
 namespace workbench {
 
+inline constexpr std::uint32_t k_persistence_codec_schema_v10 = 10;
 inline constexpr std::uint32_t k_persistence_codec_schema_v9 = 9;
 inline constexpr std::uint32_t k_persistence_codec_schema_v8 = 8;
 inline constexpr std::size_t k_persistence_codec_max_serialized_bytes = 16U << 20;
 inline constexpr std::size_t k_persistence_codec_max_json_depth = 64;
 inline constexpr std::size_t k_persistence_codec_max_field_count = 65536;
 inline constexpr std::size_t k_persistence_codec_max_collection_elements =
-    static_cast<std::size_t>(k_max_split_nodes_per_workspace) +
+    8191U +
     static_cast<std::size_t>(k_max_documents_per_workspace) +
     static_cast<std::size_t>(k_max_views_per_workspace) +
     static_cast<std::size_t>(k_max_panels_per_workspace) +
@@ -31,6 +32,7 @@ inline constexpr std::size_t k_persistence_codec_max_envelope_bytes = 4096;
 
 static_assert(k_persistence_codec_max_collection_elements == 17663);
 
+constexpr const char* k_persistence_codec_kind_v10 = "workbench_persistence_v10";
 constexpr const char* k_persistence_codec_kind_v9 = "workbench_persistence_v9";
 constexpr const char* k_persistence_codec_kind_v8 = "workbench_persistence_v8";
 
@@ -72,6 +74,7 @@ struct persistence_envelope_t final {
     std::uint32_t schema = 0;
     std::string kind;
     bool is_v8_legacy = false;
+    bool is_v9_legacy = false;
 };
 
 enum class unknown_document_recovery_t : std::uint8_t {

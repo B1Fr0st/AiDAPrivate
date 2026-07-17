@@ -242,6 +242,7 @@ std::vector<provider_info_t> s_preview_providers = {
 
 bool fetch_and_cache(int) { return true; }
 bool load_cached_or_fetch(int) { return true; }
+std::int64_t cached_age_seconds() noexcept { return 18; }
 model_list_validation_t validate_provider_model_list_response(
     const std::string& provider_id, const std::string& body)
 {
@@ -293,6 +294,7 @@ model_list_validation_t validate_provider_model_list_response(
     return result;
 }
 bool initialize_async(int) { return true; }
+void cancel_initialize() noexcept {}
 const std::vector<provider_info_t>& list_providers() { return s_preview_providers; }
 
 const provider_info_t* get_provider(const std::string& id)

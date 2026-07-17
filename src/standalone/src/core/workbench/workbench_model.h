@@ -1,7 +1,6 @@
 #pragma once
 
 #include "document_registry.h"
-#include "split_tree.h"
 
 #include <memory>
 #include <string>
@@ -31,13 +30,11 @@ using workbench_snapshot_ptr_t = std::shared_ptr<const workbench_workspace_snaps
 enum class workbench_command_kind_t : std::uint8_t {
     open_document = 0,
     close_document = 1,
-    move_view = 2,
-    split_view = 3,
-    focus_view = 4,
-    set_synchronization = 5,
-    navigate = 6,
-    history_back = 7,
-    history_forward = 8
+    focus_view = 2,
+    set_synchronization = 3,
+    navigate = 4,
+    history_back = 5,
+    history_forward = 6
 };
 
 struct workbench_command_t {
@@ -47,10 +44,6 @@ struct workbench_command_t {
     document_id_t document;
     document_identity_t document_identity;
     view_id_t view;
-    view_id_t target_view;
-    view_id_t requested_view;
-    split_orientation_t orientation = split_orientation_t::horizontal;
-    std::uint16_t ratio_basis_points = k_split_ratio_default_basis_points;
     std::uint64_t synchronization_group = 0;
     view_synchronization_policy_t synchronization_policy =
         view_synchronization_policy_t::independent;
@@ -68,7 +61,6 @@ struct workbench_command_result_t {
     workbench_snapshot_ptr_t snapshot;
     document_id_t document;
     view_id_t view;
-    split_insert_result_t split;
     navigation_event_id_t navigation;
     bool changed = false;
 };

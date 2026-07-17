@@ -38,6 +38,8 @@ namespace {
 	std::atomic<std::uint64_t> s_init_generation{0};
 	std::atomic<std::uint64_t> s_init_task_id{0};
 	std::atomic<std::uint64_t> s_init_retry_after_ms{0};
+	std::atomic<int64_t> s_cached_age_seconds{-1};
+	std::atomic<std::uint64_t> s_cached_age_sample_ms{0};
 	constexpr std::uint64_t kInitializationDeadlineMs = 20000;
 	constexpr std::uint64_t kInitializationRetryDelayMs = 30000;
 
@@ -78,6 +80,13 @@ namespace {
 	void clear_error_locked()
 	{
 		s_last_error.clear();
+	}
+
+	void publish_cache_age(int64_t age) noexcept
+	{
+		s_cached_age_sample_ms.store(age >= 0 ? static_cast<std::uint64_t>(GetTickCount64()) : 0,
+			std::memory_order_relaxed);
+		s_cached_age_seconds.store(age, std::memory_order_release);
 	}
 
 	std::filesystem::path cache_path()
@@ -312,7 +321,7 @@ namespace {
 		return !out.empty();
 	}
 
-	int64_t cache_age_seconds()
+	int64_t cache_age_seconds_from_disk()
 	{
 		const auto path = cache_path();
 		std::error_code ec;
@@ -391,9 +400,11 @@ bool fetch_and_cache_impl(int timeout_ms,
 	publish_snapshot(std::move(providers), std::move(models));
 
 	if (!write_cache_file(res.body)) {
+		publish_cache_age(-1);
 		set_error("failed to write models cache file");
 		return true;
 	}
+	publish_cache_age(0);
 	return true;
 }
 
@@ -403,7 +414,8 @@ bool load_cached_or_fetch_impl(int max_age_seconds,
 	const auto path = cache_path();
 	std::error_code ec;
 	if (std::filesystem::exists(path, ec)) {
-		const int64_t age = cache_age_seconds();
+		const int64_t age = cache_age_seconds_from_disk();
+		publish_cache_age(age);
 		if (age >= 0 && age <= max_age_seconds) {
 			std::string body;
 			std::vector<provider_info_t> providers;
@@ -414,6 +426,8 @@ bool load_cached_or_fetch_impl(int max_age_seconds,
 				return true;
 			}
 		}
+	} else {
+		publish_cache_age(-1);
 	}
 
 	return fetch_and_cache_impl(10000, cancelled);
@@ -429,6 +443,22 @@ bool fetch_and_cache(int timeout_ms)
 bool load_cached_or_fetch(int max_age_seconds)
 {
 	return load_cached_or_fetch_impl(max_age_seconds, {});
+}
+
+int64_t cached_age_seconds() noexcept
+{
+	const int64_t age = s_cached_age_seconds.load(std::memory_order_acquire);
+	if (age < 0)
+		return -1;
+	const std::uint64_t sampled = s_cached_age_sample_ms.load(std::memory_order_acquire);
+	if (sampled == 0)
+		return age;
+	const std::uint64_t now = static_cast<std::uint64_t>(GetTickCount64());
+	const std::uint64_t elapsed = now >= sampled ? (now - sampled) / 1000U : 0;
+	const std::uint64_t maximum = static_cast<std::uint64_t>((std::numeric_limits<int64_t>::max)());
+	if (static_cast<std::uint64_t>(age) > maximum - elapsed)
+		return (std::numeric_limits<int64_t>::max)();
+	return age + static_cast<int64_t>(elapsed);
 }
 
 model_list_validation_t validate_provider_model_list_response(

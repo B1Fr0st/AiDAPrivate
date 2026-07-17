@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace aida {
 namespace burp {
@@ -22,6 +23,7 @@ struct state_t
     bool        verify_tls = true;
 
     int         selected_conn_index = -1;
+    uint64_t    selected_frame_id = 0;
     int         compose_mode_idx = 0;
     char        compose_text_buf[16384] = {};
     char        compose_hex_buf[16384] = {};
@@ -35,6 +37,8 @@ struct state_t
 };
 
 state_t& get_state();
+bool resolve_retained_artifact(uint64_t connection_id, uint64_t frame_id,
+                               std::vector<uint8_t>& bytes, std::string& unavailable_reason);
 
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b);

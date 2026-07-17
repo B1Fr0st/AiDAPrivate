@@ -7,10 +7,14 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdint>
+#include <cwchar>
 #include <cstring>
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -71,6 +75,37 @@ struct enum_def_t {
 	std::vector<enum_member_t> members;
 };
 
+enum class source_line_state_t : uint8_t {
+	not_requested = 0,
+	complete,
+	no_records,
+	unsupported,
+	truncated,
+	cancelled,
+	error
+};
+
+struct source_file_t {
+	std::string file_path;
+	std::string object_path;
+};
+
+struct source_line_t {
+	uint64_t rva = 0;
+	uint32_t line = 0;
+	uint32_t file_index = 0;
+};
+
+struct source_line_table_t {
+	uint64_t generation = 0;
+	source_line_state_t state = source_line_state_t::not_requested;
+	std::string detail;
+	std::vector<source_file_t> files;
+	std::vector<source_line_t> lines;
+	std::map<uint64_t, size_t> line_by_rva;
+	std::unordered_map<std::string, std::vector<size_t>> lines_by_file_line;
+};
+
 struct pdb_info_t {
 	std::string                        file_path;
 	std::string                        module_name;
@@ -81,6 +116,7 @@ struct pdb_info_t {
 	std::unordered_map<uint64_t, size_t>    symbol_by_rva;
 	std::unordered_map<std::string, size_t> struct_by_name;
 	std::unordered_map<uint32_t, size_t>    struct_by_ti;
+	std::shared_ptr<const source_line_table_t> source_lines;
 	bool loaded = false;
 };
 
@@ -117,6 +153,16 @@ struct TI_FINDCHILDREN_PARAMS_EX {
 	ULONG Count;
 	ULONG Start;
 	ULONG ChildId[1];
+};
+
+struct SRCCODEINFOW_EX {
+	DWORD   SizeOfStruct;
+	PVOID   Key;
+	DWORD64 ModBase;
+	WCHAR   Obj[MAX_PATH + 1];
+	WCHAR   FileName[MAX_PATH + 1];
+	DWORD   LineNumber;
+	DWORD64 Address;
 };
 #pragma pack(pop)
 
@@ -181,6 +227,8 @@ typedef BOOL (WINAPI *fn_SymGetTypeInfo)(HANDLE, DWORD64, ULONG,
     IMAGEHLP_SYMBOL_TYPE_INFO_E, void*);
 typedef BOOL (WINAPI *fn_SymEnumTypesW)(HANDLE, ULONG64,
     BOOL (CALLBACK*)(SYMBOL_INFOW_EX*, ULONG, void*), void*);
+typedef BOOL (WINAPI *fn_SymEnumLinesW)(HANDLE, ULONG64, PCWSTR, PCWSTR,
+	BOOL (CALLBACK*)(SRCCODEINFOW_EX*, void*), void*);
 
 struct dbghelp_api_t {
 	HMODULE                 hmod = nullptr;
@@ -194,6 +242,7 @@ struct dbghelp_api_t {
 	fn_SymEnumSymbolsExW    pSymEnumSymbolsExW = nullptr;
 	fn_SymGetTypeInfo       pSymGetTypeInfo = nullptr;
 	fn_SymEnumTypesW        pSymEnumTypesW = nullptr;
+	fn_SymEnumLinesW        pSymEnumLinesW = nullptr;
 
 	bool loaded = false;
 };
@@ -439,7 +488,8 @@ enum class dbghelp_inner_phase_t : uint32_t {
 	sym_import_udt = 8,
 	sym_import_enum = 9,
 	sym_unload_module = 10,
-	sym_cleanup = 11
+	sym_cleanup = 11,
+	sym_enum_lines = 12
 };
 
 inline const char* dbghelp_inner_phase_name(dbghelp_inner_phase_t phase)
@@ -457,6 +507,7 @@ inline const char* dbghelp_inner_phase_name(dbghelp_inner_phase_t phase)
 		case dbghelp_inner_phase_t::sym_import_enum: return "sym_import_enum";
 		case dbghelp_inner_phase_t::sym_unload_module: return "sym_unload_module";
 		case dbghelp_inner_phase_t::sym_cleanup: return "sym_cleanup";
+		case dbghelp_inner_phase_t::sym_enum_lines: return "sym_enum_lines";
 	}
 	return "unknown";
 }
@@ -471,6 +522,7 @@ inline uint32_t dbghelp_inner_phase_default_deadline_ms(dbghelp_inner_phase_t ph
 		case dbghelp_inner_phase_t::set_options: return 5000;
 		case dbghelp_inner_phase_t::sym_load_module: return 30000;
 		case dbghelp_inner_phase_t::sym_enum_symbols: return 30000;
+		case dbghelp_inner_phase_t::sym_enum_lines: return 30000;
 		case dbghelp_inner_phase_t::sym_enum_types: return 20000;
 		case dbghelp_inner_phase_t::sym_import_udt: return 45000;
 		case dbghelp_inner_phase_t::sym_import_enum: return 30000;
@@ -1193,6 +1245,7 @@ inline bool resolve_dbghelp_exports(HMODULE hmod, const char* source, uint64_t a
 	candidate.pSymEnumSymbolsExW = reinterpret_cast<fn_SymEnumSymbolsExW>(gp("SymEnumSymbolsExW"));
 	candidate.pSymGetTypeInfo    = reinterpret_cast<fn_SymGetTypeInfo>(gp("SymGetTypeInfo"));
 	candidate.pSymEnumTypesW     = reinterpret_cast<fn_SymEnumTypesW>(gp("SymEnumTypesW"));
+	candidate.pSymEnumLinesW     = reinterpret_cast<fn_SymEnumLinesW>(gp("SymEnumLinesW"));
 
 	if (!candidate.pSymInitializeW || !candidate.pSymCleanup || !candidate.pSymLoadModuleExW ||
 	    !candidate.pSymUnloadModule64 || !candidate.pSymEnumSymbolsExW || !candidate.pSymGetTypeInfo) {
@@ -1223,6 +1276,12 @@ inline bool resolve_dbghelp_exports(HMODULE hmod, const char* source, uint64_t a
 	}
 
 	candidate.loaded = true;
+	diag::log_tagged_fmt("pdb",
+		"load_dbghelp_optional_exports source=%s attempt=%llu enumtypes=%d enumlines=%d",
+		source ? source : "<empty>",
+		static_cast<unsigned long long>(attempt),
+		candidate.pSymEnumTypesW ? 1 : 0,
+		candidate.pSymEnumLinesW ? 1 : 0);
 	detail.clear();
 	return true;
 }
@@ -1727,8 +1786,10 @@ inline std::string wstr_to_utf8(const wchar_t* ws)
 	if (!ws || !*ws) return {};
 	int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
 	if (len <= 0) return {};
-	std::string out(len - 1, '\0');
-	WideCharToMultiByte(CP_UTF8, 0, ws, -1, out.data(), len, nullptr, nullptr);
+	std::string out(static_cast<size_t>(len), '\0');
+	if (WideCharToMultiByte(CP_UTF8, 0, ws, -1, out.data(), len, nullptr, nullptr) != len)
+		return {};
+	out.resize(static_cast<size_t>(len - 1));
 	return out;
 }
 
@@ -1737,8 +1798,10 @@ inline std::wstring utf8_to_wstr(const std::string& s)
 	if (s.empty()) return {};
 	int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
 	if (len <= 0) return {};
-	std::wstring out(len - 1, L'\0');
-	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), len);
+	std::wstring out(static_cast<size_t>(len), L'\0');
+	if (MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), len) != len)
+		return {};
+	out.resize(static_cast<size_t>(len - 1));
 	return out;
 }
 
@@ -1849,6 +1912,134 @@ inline BOOL CALLBACK sym_enum_callback(SYMBOL_INFOW_EX* pSymInfo, ULONG symSize,
 
 	c->symbols->push_back(std::move(sym));
 	return TRUE;
+}
+
+inline std::string source_path_key(std::string value)
+{
+	if (value.empty() || value.find('\0') != std::string::npos)
+		return {};
+	value = std::filesystem::path(value).lexically_normal().generic_string();
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+		return static_cast<char>(std::tolower(ch));
+	});
+	return value;
+}
+
+inline std::string source_file_line_key(const std::string& path_key, uint32_t line)
+{
+	if (path_key.empty() || line == 0)
+		return {};
+	return path_key + "\n" + std::to_string(line);
+}
+
+struct source_line_enum_ctx_t {
+	DWORD64 mod_base = 0;
+	std::atomic<bool>* cancel = nullptr;
+	std::shared_ptr<source_line_table_t> table;
+	std::unordered_map<std::string, uint32_t> file_by_key;
+	size_t utf8_bytes = 0;
+	bool cancelled = false;
+	bool truncated = false;
+	bool invalid_record = false;
+	bool callback_exception = false;
+	std::string error;
+};
+
+inline BOOL source_line_enum_callback_impl(SRCCODEINFOW_EX* info, void* context)
+{
+	auto* ctx = static_cast<source_line_enum_ctx_t*>(context);
+	if (!ctx || !ctx->table || !info) return FALSE;
+	if (ctx->cancel && ctx->cancel->load(std::memory_order_acquire)) {
+		ctx->cancelled = true;
+		return FALSE;
+	}
+	constexpr size_t k_max_source_lines = 1024ULL * 1024ULL;
+	constexpr size_t k_max_source_files = 65536ULL;
+	constexpr size_t k_max_source_utf8_bytes = 128ULL * 1024ULL * 1024ULL;
+	if (ctx->table->lines.size() >= k_max_source_lines) {
+		ctx->truncated = true;
+		return FALSE;
+	}
+	if (info->SizeOfStruct < sizeof(SRCCODEINFOW_EX) || info->ModBase != ctx->mod_base ||
+		info->Address < info->ModBase || info->LineNumber == 0 ||
+		!std::wmemchr(info->FileName, L'\0', MAX_PATH + 1) ||
+		!std::wmemchr(info->Obj, L'\0', MAX_PATH + 1)) {
+		ctx->invalid_record = true;
+		ctx->error = "DbgHelp returned an invalid source-line record";
+		return FALSE;
+	}
+	const std::string file_path = wstr_to_utf8(info->FileName);
+	const std::string object_path = wstr_to_utf8(info->Obj);
+	const std::string file_key = source_path_key(file_path);
+	if (file_path.empty() || file_key.empty()) {
+		ctx->invalid_record = true;
+		ctx->error = "DbgHelp returned a source-line record with an invalid UTF-8 file path";
+		return FALSE;
+	}
+	uint32_t file_index = 0;
+	auto existing = ctx->file_by_key.find(file_key);
+	if (existing == ctx->file_by_key.end()) {
+		if (ctx->table->files.size() >= k_max_source_files ||
+			file_path.size() > k_max_source_utf8_bytes - ctx->utf8_bytes ||
+			object_path.size() > k_max_source_utf8_bytes - ctx->utf8_bytes - file_path.size()) {
+			ctx->truncated = true;
+			return FALSE;
+		}
+		file_index = static_cast<uint32_t>(ctx->table->files.size());
+		ctx->utf8_bytes += file_path.size() + object_path.size();
+		ctx->table->files.push_back({file_path, object_path});
+		ctx->file_by_key.emplace(file_key, file_index);
+	} else {
+		file_index = existing->second;
+	}
+	ctx->table->lines.push_back({
+		static_cast<uint64_t>(info->Address - info->ModBase),
+		static_cast<uint32_t>(info->LineNumber), file_index});
+	return TRUE;
+}
+
+inline BOOL CALLBACK source_line_enum_callback(SRCCODEINFOW_EX* info, void* context)
+{
+	auto* ctx = static_cast<source_line_enum_ctx_t*>(context);
+	try {
+		return source_line_enum_callback_impl(info, context);
+	} catch (...) {
+		if (ctx) ctx->callback_exception = true;
+	}
+	return FALSE;
+}
+
+inline void finalize_source_line_table(source_line_enum_ctx_t& ctx)
+{
+	auto& table = *ctx.table;
+	constexpr size_t k_max_source_index_utf8_bytes = 128ULL * 1024ULL * 1024ULL;
+	size_t source_index_utf8_bytes = 0;
+	std::sort(table.lines.begin(), table.lines.end(), [](const auto& left, const auto& right) {
+		if (left.rva != right.rva) return left.rva < right.rva;
+		if (left.file_index != right.file_index) return left.file_index < right.file_index;
+		return left.line < right.line;
+	});
+	table.lines.erase(std::unique(table.lines.begin(), table.lines.end(), [](const auto& left, const auto& right) {
+		return left.rva == right.rva && left.file_index == right.file_index && left.line == right.line;
+	}), table.lines.end());
+	for (size_t index = 0; index < table.lines.size(); ++index) {
+		const auto& line = table.lines[index];
+		if (line.file_index >= table.files.size()) continue;
+		table.line_by_rva.try_emplace(line.rva, index);
+		const auto key = source_file_line_key(
+			source_path_key(table.files[line.file_index].file_path), line.line);
+		if (key.empty()) continue;
+		auto found = table.lines_by_file_line.find(key);
+		if (found == table.lines_by_file_line.end()) {
+			if (key.size() > k_max_source_index_utf8_bytes - source_index_utf8_bytes) {
+				ctx.truncated = true;
+				continue;
+			}
+			source_index_utf8_bytes += key.size();
+			found = table.lines_by_file_line.emplace(key, std::vector<size_t>{}).first;
+		}
+		found->second.push_back(index);
+	}
 }
 
 struct type_enum_ctx_t {
@@ -2337,6 +2528,73 @@ inline bool parse_pdb(const std::string& pdb_path,
 		out.symbols.size(),
 		enum_symbols_gle,
 		static_cast<unsigned long long>(GetTickCount64() - phase_start));
+
+	auto source_table = std::make_shared<source_line_table_t>();
+	source_table->generation = parse_generation;
+	detail::source_line_enum_ctx_t source_ctx;
+	source_ctx.mod_base = modBase;
+	source_ctx.cancel = cancel;
+	source_ctx.table = source_table;
+	if (!g_api.pSymEnumLinesW) {
+		source_table->state = source_line_state_t::unsupported;
+		source_table->detail = "The loaded DbgHelp does not export SymEnumLinesW";
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_SymEnumLines_missing generation=%llu pid=%lu tid=%lu",
+			static_cast<unsigned long long>(parse_generation), pid, tid);
+	} else if (cancel && cancel->load(std::memory_order_acquire)) {
+		source_table->state = source_line_state_t::cancelled;
+		source_table->detail = "Source-line extraction was cancelled before enumeration";
+	} else {
+		phase_start = GetTickCount64();
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_SymEnumLines_begin generation=%llu pid=%lu tid=%lu modBase=0x%llX",
+			static_cast<unsigned long long>(parse_generation), pid, tid,
+			static_cast<unsigned long long>(modBase));
+		set_inner_phase(dbghelp_inner_phase_t::sym_enum_lines, parse_generation, tid);
+		SetLastError(ERROR_SUCCESS);
+		const BOOL enum_lines_ok = g_api.pSymEnumLinesW(hFakeProc, modBase, nullptr, nullptr,
+			detail::source_line_enum_callback, &source_ctx);
+		const DWORD enum_lines_gle = GetLastError();
+		clear_inner_phase(parse_generation, tid);
+		try {
+			detail::finalize_source_line_table(source_ctx);
+		} catch (...) {
+			source_ctx.callback_exception = true;
+			source_table->line_by_rva.clear();
+			source_table->lines_by_file_line.clear();
+		}
+		if (source_ctx.cancelled) {
+			source_table->state = source_line_state_t::cancelled;
+			source_table->detail = "Source-line extraction was cancelled during enumeration";
+		} else if (source_ctx.truncated) {
+			source_table->state = source_line_state_t::truncated;
+			source_table->detail = "Source-line extraction reached the 1,048,576-line, 65,536-file, 128 MiB path-data, or 128 MiB file-line index bound";
+		} else if (source_ctx.callback_exception) {
+			source_table->state = source_line_state_t::error;
+			source_table->detail = "Source-line enumeration failed while processing a DbgHelp callback";
+		} else if (source_ctx.invalid_record) {
+			source_table->state = source_line_state_t::error;
+			source_table->detail = source_ctx.error;
+		} else if (!enum_lines_ok && enum_lines_gle != ERROR_SUCCESS) {
+			source_table->state = source_line_state_t::error;
+			source_table->detail = "SymEnumLinesW failed with Win32 error " +
+				std::to_string(enum_lines_gle);
+		} else if (source_table->lines.empty()) {
+			source_table->state = source_line_state_t::no_records;
+			source_table->detail = "The PDB contains no enumerable source-line records";
+		} else {
+			source_table->state = source_line_state_t::complete;
+			source_table->detail = "Source-line records loaded";
+		}
+		diag::log_tagged_fmt("pdb",
+			"parse_pdb_SymEnumLines_end generation=%llu pid=%lu tid=%lu ok=%d state=%u files=%zu lines=%zu gle=%lu elapsed_ms=%llu detail='%s'",
+			static_cast<unsigned long long>(parse_generation), pid, tid,
+			enum_lines_ok ? 1 : 0, static_cast<unsigned>(source_table->state),
+			source_table->files.size(), source_table->lines.size(), enum_lines_gle,
+			static_cast<unsigned long long>(GetTickCount64() - phase_start),
+			source_table->detail.c_str());
+	}
+	out.source_lines = std::shared_ptr<const source_line_table_t>(std::move(source_table));
 
 	if (progress) progress->store(0.4f);
 	if (cancel && cancel->load()) {
@@ -3071,6 +3329,22 @@ inline bool parse_pdb(const std::string& pdb_path,
 		out.struct_by_name.emplace(out.structs[index].name, index);
 		out.struct_by_ti.emplace(out.structs[index].type_index, index);
 	}
+	auto source_table = std::make_shared<source_line_table_t>();
+	source_table->generation = 1;
+	source_table->state = source_line_state_t::complete;
+	source_table->detail = "Deterministic Studio preview source-line fixture";
+	source_table->files = {{"C:/AiDA/Preview/sample.cpp", "sample.obj"}};
+	source_table->lines = {
+		{0x1180, 12, 0}, {0x1188, 13, 0}, {0x12C0, 28, 0},
+		{0x12D0, 29, 0}, {0x14A0, 47, 0}
+	};
+	for (size_t index = 0; index < source_table->lines.size(); ++index) {
+		const auto& line = source_table->lines[index];
+		source_table->line_by_rva.try_emplace(line.rva, index);
+		source_table->lines_by_file_line[
+			"c:/aida/preview/sample.cpp\n" + std::to_string(line.line)].push_back(index);
+	}
+	out.source_lines = std::shared_ptr<const source_line_table_t>(std::move(source_table));
 	out.loaded = true;
 	preview_last_error_text().clear();
 	if (progress)

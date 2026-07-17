@@ -99,6 +99,9 @@ public:
     shortcut_registration_result_t register_binding(
         shortcut_binding_t binding,
         const application_action_registry_t& actions);
+    shortcut_registration_result_t replace_binding(
+        shortcut_binding_t binding,
+        const application_action_registry_t& actions);
 
     shortcut_resolution_t feed(ImGuiKeyChord stroke,
                                bool repeated,

@@ -2031,7 +2031,8 @@ function Get-WorkbenchSurface([string]$ContractsPath, [string]$ShellPath,
         '{"schema_version", std::to_string(dto.schema_version)}',
         '{"revision", std::to_string(dto.revision.value)}',
         '{"active_document", std::to_string(dto.active_document.value)}',
-        '{"split_tree", split_tree_json(dto.split_tree)}',
+        'json payload_json_v10(const workbench_persistence_dto_t& dto)',
+        '{"views", std::move(views)}',
         '{"panels", std::move(panels)}',
         'navigation_event_json(event)'
     ) 'workbench persistence codec'

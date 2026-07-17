@@ -21,8 +21,6 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
@@ -44,8 +42,6 @@
 #include "zydis_disasm.hpp"
 #include "../analysis/workspace/workspace_types.hpp"
 #include "../helpers/diag_log.hpp"
-
-#include <nlohmann/json.hpp>
 
 namespace crypto_scanner {
 
@@ -1044,21 +1040,6 @@ inline void scan_process(const process_scan_config_t& cfg)
 
 		g_state.scanning.store(false);
 	};
-	const bool run_inline = cfg.range_base != 0 && cfg.range_size != 0 && cfg.range_size <= 16ull * 1024ull * 1024ull;
-	if (run_inline) {
-		try {
-			worker();
-		} catch (const std::exception& ex) {
-			diag::log_tagged_fmt("crypto_scan", "scan_process inline_exception err='%s'", ex.what());
-			g_state.progress.store(1.f);
-			g_state.scanning.store(false);
-		} catch (...) {
-			diag::log_tagged("crypto_scan", "scan_process inline_exception err='<unknown>'");
-			g_state.progress.store(1.f);
-			g_state.scanning.store(false);
-		}
-		return;
-	}
 	detail::launch_scan_worker("scan_process", std::move(worker));
 }
 
@@ -1449,143 +1430,6 @@ inline void remove_custom_signature(int index)
 		diag::log_tagged_fmt("crypto_scan", "remove_custom_signature out_of_range index=%d size=%zu",
 			index, g_state.custom_sigs.size());
 	}
-}
-
-inline void export_results_json(const std::string& path)
-{
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-
-	nlohmann::json j;
-	nlohmann::json hits = nlohmann::json::array();
-	for (auto& r : g_state.results) {
-		nlohmann::json h;
-		h["signature"] = r.signature_name;
-		h["algorithm"] = r.algorithm;
-		h["category"] = category_name(r.category);
-		h["address"] = r.address;
-		h["module"] = r.module_name;
-		h["offset"] = r.module_offset;
-		nlohmann::json refs = nlohmann::json::array();
-		for (auto addr : r.referencing_functions) refs.push_back(addr);
-		h["references"] = refs;
-		hits.push_back(h);
-	}
-	j["hits"] = hits;
-
-	nlohmann::json ent = nlohmann::json::array();
-	for (auto& e : g_state.entropy_map) {
-		nlohmann::json er;
-		er["address"] = e.address;
-		er["entropy"] = e.entropy;
-		er["module"] = e.module_name;
-		ent.push_back(er);
-	}
-	j["entropy_regions"] = ent;
-
-	std::ofstream ofs(path);
-	if (ofs.is_open()) {
-		ofs << j.dump(2);
-		diag::log_tagged_fmt("crypto_scan", "export_results_json ok path='%s' hits=%zu entropy=%zu",
-			path.c_str(), g_state.results.size(), g_state.entropy_map.size());
-	} else {
-		diag::log_tagged_fmt("crypto_scan", "export_results_json failed path='%s'", path.c_str());
-	}
-}
-
-inline void export_results_csv(const std::string& path)
-{
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-
-	std::ofstream ofs(path);
-	if (!ofs.is_open()) {
-		diag::log_tagged_fmt("crypto_scan", "export_results_csv failed path='%s'", path.c_str());
-		return;
-	}
-
-	ofs << "Type,Name,Algorithm,Address,Module,Offset,References\n";
-	for (auto& r : g_state.results) {
-		char buf[512];
-		std::snprintf(buf, sizeof(buf), "Signature,%s,%s,0x%llX,%s,0x%llX,%zu\n",
-			r.signature_name.c_str(), r.algorithm.c_str(),
-			static_cast<unsigned long long>(r.address),
-			r.module_name.c_str(),
-			static_cast<unsigned long long>(r.module_offset),
-			r.referencing_functions.size());
-		ofs << buf;
-	}
-	for (auto& e : g_state.entropy_map) {
-		char buf[256];
-		std::snprintf(buf, sizeof(buf), "Entropy,%.3f,,0x%llX,%s,,\n",
-			e.entropy, static_cast<unsigned long long>(e.address), e.module_name.c_str());
-		ofs << buf;
-	}
-	diag::log_tagged_fmt("crypto_scan", "export_results_csv ok path='%s' hits=%zu entropy=%zu",
-		path.c_str(), g_state.results.size(), g_state.entropy_map.size());
-}
-
-inline void save_custom_signatures()
-{
-	const char* appdata = std::getenv("APPDATA");
-	if (!appdata) return;
-	std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_custom_sigs.json";
-
-	std::error_code ec;
-	std::filesystem::create_directories(std::string(appdata) + "\\AiDA\\Standalone", ec);
-
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	nlohmann::json j = nlohmann::json::array();
-	for (auto& s : g_state.custom_sigs) {
-		nlohmann::json js;
-		js["name"] = s.name;
-		js["algorithm"] = s.algorithm;
-		js["description"] = s.description;
-		js["category"] = static_cast<int>(s.category);
-		std::string hex;
-		for (auto b : s.pattern) {
-			char hx[4];
-			std::snprintf(hx, sizeof(hx), "%02X", b);
-			hex += hx;
-		}
-		js["pattern_hex"] = hex;
-		j.push_back(js);
-	}
-
-	std::ofstream ofs(path);
-	if (ofs.is_open()) ofs << j.dump(2);
-}
-
-inline void load_custom_signatures()
-{
-	const char* appdata = std::getenv("APPDATA");
-	if (!appdata) return;
-	std::string path = std::string(appdata) + "\\AiDA\\Standalone\\crypto_custom_sigs.json";
-
-	std::ifstream ifs(path);
-	if (!ifs.is_open()) return;
-
-	try {
-		nlohmann::json j;
-		ifs >> j;
-		if (!j.is_array()) return;
-
-		std::lock_guard<std::mutex> lk(g_state.mutex);
-		for (auto& js : j) {
-			custom_signature_t sig;
-			sig.name = js.value("name", std::string{});
-			sig.algorithm = js.value("algorithm", std::string{});
-			sig.description = js.value("description", std::string{});
-			sig.category = static_cast<crypto_category_t>(js.value("category", 0));
-
-			std::string hex = js.value("pattern_hex", std::string{});
-			for (size_t k = 0; k + 2 <= hex.size(); k += 2) {
-				uint8_t byte = static_cast<uint8_t>(std::strtoul(hex.substr(k, 2).c_str(), nullptr, 16));
-				sig.pattern.push_back(byte);
-			}
-
-			if (!sig.name.empty() && !sig.pattern.empty())
-				g_state.custom_sigs.push_back(std::move(sig));
-		}
-	} catch (...) {}
 }
 
 }

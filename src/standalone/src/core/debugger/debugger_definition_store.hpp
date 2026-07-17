@@ -3,11 +3,7 @@
 #include "debugger_engine.hpp"
 #include "standalone_driver.hpp"
 #include "../settings/standalone_settings.hpp"
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-#include "../infra/executor.hpp"
-#else
-#include "../../preview/ui_task_executor.hpp"
-#endif
+#include "../settings/settings_persistence_service.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../session/analysis_session.hpp"
 #include "../helpers/diag_log.hpp"
@@ -182,21 +178,9 @@ inline void schedule_settings_save(std::string payload) {
 			return;
 		g_sa_settings.debugger_definitions_json = std::move(payload);
 	}
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	aida::infra::executor::submission_t submission;
-	submission.owner_subsystem = "debugger";
-	submission.label = "debugger.persist_definitions";
-	submission.thread_class = "settings_persistence";
-	submission.domain = aida::infra::executor::domain_t::feature_worker;
-	submission.priority = 5;
-	submission.body = []() {
-		if (!g_sa_settings.save())
-			diag::log_tagged_fmt("debugger_persistence", "definition_save_failed detail='%s'",
-				g_sa_settings.last_error().c_str());
-	};
-	if (!aida::infra::executor::submit(std::move(submission)).submitted)
+	if (!aida::settings_persistence::accepted(
+			aida::settings_persistence::request_save(g_sa_settings)))
 		diag::log_tagged("debugger_persistence", "definition_save_queue_rejected");
-#endif
 }
 
 inline void load_target(const std::string& target_key,
@@ -290,7 +274,7 @@ inline void save_target(const std::string& target_key,
 	for (const auto& breakpoint : debugger_engine::snapshot_breakpoints()) {
 		if (breakpoints.size() >= k_max_definitions)
 			break;
-		if (breakpoint.is_internal)
+		if (breakpoint.is_internal || !breakpoint.source_definition_id.empty())
 			continue;
 		module_binding_t binding;
 		if (breakpoint.persistent_definition && !breakpoint.definition_module.empty())
@@ -338,10 +322,10 @@ inline void save_target(const std::string& target_key,
 		watches.push_back(std::move(item));
 	}
 
-	root["targets"][target_key] = {
-		{"breakpoints", std::move(breakpoints)},
-		{"watches", std::move(watches)}
-	};
+	auto& target = root["targets"][target_key];
+	if (!target.is_object()) target = nlohmann::json::object();
+	target["breakpoints"] = std::move(breakpoints);
+	target["watches"] = std::move(watches);
 	schedule_settings_save(root.dump());
 }
 

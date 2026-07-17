@@ -3,8 +3,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
+#include "conversation_evidence_store.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -48,7 +51,8 @@ bool is_process_attached();
 std::string get_attached_process_name();
 unsigned long get_attached_pid();
 
-void chat_handle_agent_shortcuts();
+bool chat_toggle_agent_picker(std::string& error);
+bool chat_toggle_plan_build_agent(std::string& error);
 void chat_render_agent_pill(float anchor_x, float anchor_y, float alpha);
 float chat_agent_pill_width();
 void chat_render_model_pill(float anchor_x, float anchor_y, float alpha);
@@ -154,13 +158,75 @@ struct editor_proposal_snapshot_t {
     std::string id;
     message_identity_t source;
     std::string target_document_id;
+    std::uint64_t target_document_numeric_id = 0;
+    std::uint64_t base_document_revision = 0;
     std::uint64_t base_content_hash = 0;
     std::uint64_t generation = 0;
+    std::uint64_t reviewed_generation = 0;
+    std::uint64_t reviewed_content_hash = 0;
+    int reviewed_pending_hunks = 0;
     bool pending = false;
     bool applying = false;
     bool applied = false;
     bool rejected = false;
     bool stale = false;
+    std::string detail;
+};
+
+enum class reverse_engineering_proposal_kind_t : std::uint8_t {
+    none = 0,
+    analysis_rename,
+    analysis_comment,
+    analysis_type,
+    static_patch,
+    live_patch,
+    network_request_edit,
+    network_replay_staging
+};
+
+enum class reverse_engineering_proposal_state_t : std::uint8_t {
+    none = 0,
+    queued,
+    running,
+    valid,
+    applying,
+    staged_review,
+    applied,
+    stale,
+    error,
+    rejected
+};
+
+struct reverse_engineering_proposal_snapshot_t {
+    std::string id;
+    message_identity_t source;
+    reverse_engineering_proposal_kind_t kind = reverse_engineering_proposal_kind_t::none;
+    std::string kind_label;
+    std::string target_id;
+    std::string target_label;
+    std::string before_value;
+    std::string after_value;
+    std::string provenance;
+    std::string rationale;
+    std::string consequence;
+    std::string reversibility;
+    std::string target_view_id;
+    std::string rollback_action_id;
+    std::uint64_t generation = 0;
+    std::uint64_t expected_generation = 0;
+    std::uint64_t expected_revision = 0;
+    std::uint64_t expected_overlay_revision = 0;
+    std::uint64_t operation_id = 0;
+    reverse_engineering_proposal_state_t state =
+        reverse_engineering_proposal_state_t::none;
+    bool pending = false;
+    bool applying = false;
+    bool review_staged = false;
+    bool applied = false;
+    bool rejected = false;
+    bool stale = false;
+    bool terminal_readback = false;
+    std::string disabled_reason;
     std::string detail;
 };
 
@@ -206,7 +272,14 @@ tool_approval_snapshot_t tool_approval_snapshot();
 action_result_t respond_to_tool_approval(std::uint64_t identity, bool approve);
 surface_capabilities_t surface_capabilities();
 std::string register_evidence(evidence_envelope_t envelope);
-std::vector<evidence_envelope_t> evidence_snapshot();
+void register_evidence_source_return(const std::string& evidence_id,
+    std::function<bool(std::string&)> navigate);
+std::shared_ptr<const std::vector<evidence_envelope_t>> evidence_snapshot();
+std::vector<aida::conversation_store::evidence_t> persisted_evidence_snapshot(
+    const std::string& session_id);
+bool persisted_evidence_session_loaded(const std::string& session_id);
+void apply_persisted_evidence(const std::string& session_id,
+    std::vector<aida::conversation_store::evidence_t> evidence);
 bool queue_evidence_for_chat(const std::string& evidence_id, std::string& reason);
 bool queue_evidence_for_agent(const std::string& evidence_id, std::string& reason);
 bool navigate_to_evidence_source(const std::string& evidence_id, std::string& reason);
@@ -215,5 +288,8 @@ void render_chat_view(float width, float height);
 action_result_t stage_editor_proposal(const message_identity_t& source,
                                       const std::string& proposed_content);
 editor_proposal_snapshot_t editor_proposal_snapshot();
+action_result_t stage_reverse_engineering_proposal(const message_identity_t& source);
+std::shared_ptr<const reverse_engineering_proposal_snapshot_t>
+reverse_engineering_proposal_snapshot();
 
 }

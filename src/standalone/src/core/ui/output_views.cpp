@@ -1,10 +1,16 @@
 #include "output_views.hpp"
 
 #include "application_ui_runtime.hpp"
+#include "design_system.hpp"
+#include "programming_tasks.hpp"
+#include "task_center.hpp"
 #include "terminal_view.hpp"
+#include "ui_thread_dispatcher.hpp"
 #include "../../helpers/globals.h"
 #include "../../helpers/helpers.h"
+#include "../infra/executor.hpp"
 #include "../settings/standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/shell_preview.hpp"
 #else
@@ -13,14 +19,20 @@
 #endif
 
 #include "imgui/imgui.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
 #include <deque>
-#include <fstream>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -41,6 +53,22 @@ struct view_state_t {
     bool terminal_start_attempted = false;
     std::string terminal_start_error;
     int terminal_last_render_frame = -2;
+    std::vector<terminal_view::profile_t> terminal_profiles;
+    int terminal_profile = 0;
+    std::array<char, 1024> terminal_cwd{};
+    std::array<char, 256> terminal_search{};
+    bool terminal_search_visible = false;
+    bool terminal_focus_search = false;
+    bool terminal_select_requested = false;
+    bool terminal_restored = false;
+    std::uint64_t terminal_persistence_generation = 0;
+    std::uint64_t terminal_settings_generation = 0;
+    bool terminal_persistence_in_flight = false;
+    std::string terminal_persistence_payload;
+    std::string terminal_persistence_profile;
+    std::string terminal_persistence_cwd;
+    std::string terminal_persistence_error;
+    std::string applied_task_output_channel;
 };
 
 view_state_t& state() {
@@ -56,10 +84,179 @@ bool terminal_tab(bottom_tab_t tab) noexcept {
     return tab == bottom_tab_t::terminal;
 }
 
+std::string narrow(const std::wstring& value) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    return std::string(value.begin(), value.end());
+#else
+    if (value.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string result(static_cast<std::size_t>(size), '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), result.data(), size, nullptr, nullptr) != size)
+        return {};
+    return result;
+#endif
+}
+
+std::wstring widen(const std::string& value) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    return std::wstring(value.begin(), value.end());
+#else
+    if (value.empty()) return {};
+    const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (size <= 0) return {};
+    std::wstring result(static_cast<std::size_t>(size), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+            static_cast<int>(value.size()), result.data(), size) != size)
+        return {};
+    return result;
+#endif
+}
+
+void ensure_terminal_profiles() {
+    auto& view = state();
+    if (!view.terminal_profiles.empty()) return;
+    view.terminal_profiles = terminal_view::available_profiles(g_sa_settings.terminal_shell);
+    if (view.terminal_profiles.empty()) return;
+    const auto selected = std::find_if(view.terminal_profiles.begin(), view.terminal_profiles.end(),
+        [](const terminal_view::profile_t& profile) {
+            return profile.id == g_sa_settings.terminal_profile_id;
+        });
+    view.terminal_profile = selected == view.terminal_profiles.end() ? 0 :
+        static_cast<int>(std::distance(view.terminal_profiles.begin(), selected));
+    const std::size_t count = (std::min)(g_sa_settings.terminal_default_cwd.size(),
+        view.terminal_cwd.size() - 1);
+    std::memcpy(view.terminal_cwd.data(), g_sa_settings.terminal_default_cwd.data(), count);
+    view.terminal_cwd[count] = '\0';
+}
+
+terminal_view::TerminalSession* create_selected_terminal() {
+    ensure_terminal_profiles();
+    auto& view = state();
+    if (view.terminal_profile < 0 ||
+        view.terminal_profile >= static_cast<int>(view.terminal_profiles.size())) {
+        view.terminal_start_error = "No available terminal profile is selected";
+        return nullptr;
+    }
+    const auto& profile = view.terminal_profiles[static_cast<std::size_t>(view.terminal_profile)];
+    const std::wstring cwd = widen(view.terminal_cwd.data());
+    auto* session = globals::terminal_mgr.create_terminal(profile.command.c_str(),
+        cwd.empty() ? nullptr : cwd.c_str(), profile.id.c_str(), profile.label.c_str());
+    if (!session) {
+        view.terminal_start_error = globals::terminal_mgr.last_error;
+        return nullptr;
+    }
+    session->max_lines = (std::clamp)(g_sa_settings.terminal_scrollback, 1000, 100000);
+    view.terminal_start_error.clear();
+    return session;
+}
+
+void schedule_terminal_persistence();
+
+void persist_terminal_state() {
+    auto& manager = globals::terminal_mgr;
+    nlohmann::json root = nlohmann::json::object();
+    root["version"] = 1;
+    root["active"] = manager.active_tab;
+    root["secondary"] = manager.secondary_tab;
+    root["split"] = manager.split_mode == terminal_view::split_mode_t::vertical ? "vertical" :
+        manager.split_mode == terminal_view::split_mode_t::horizontal ? "horizontal" : "none";
+    root["sessions"] = nlohmann::json::array();
+    for (const auto* session : manager.sessions) {
+        if (!session) continue;
+        root["sessions"].push_back({
+            {"profile", session->profile_id},
+            {"cwd", narrow(session->cwd)}
+        });
+    }
+    auto& view = state();
+    view.terminal_persistence_payload = root.dump();
+    view.terminal_persistence_profile = view.terminal_profiles.empty() || view.terminal_profile < 0 ||
+        view.terminal_profile >= static_cast<int>(view.terminal_profiles.size())
+        ? std::string{} : view.terminal_profiles[static_cast<std::size_t>(view.terminal_profile)].id;
+    view.terminal_persistence_cwd = view.terminal_cwd.data();
+    ++view.terminal_persistence_generation;
+    schedule_terminal_persistence();
+}
+
+void schedule_terminal_persistence() {
+    auto& view = state();
+    if (view.terminal_persistence_in_flight) return;
+    const std::string payload = view.terminal_persistence_payload;
+    const std::string profile = view.terminal_persistence_profile;
+    const std::string cwd = view.terminal_persistence_cwd;
+    g_sa_settings.terminal_sessions_json = payload;
+    g_sa_settings.terminal_profile_id = profile;
+    g_sa_settings.terminal_default_cwd = cwd;
+    std::uint64_t settings_generation = 0;
+    const auto requested = aida::settings_persistence::request_save(g_sa_settings,
+        &settings_generation);
+    if (aida::settings_persistence::accepted(requested)) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        view.terminal_persistence_in_flight = false;
+        view.terminal_persistence_error.clear();
+#else
+        view.terminal_persistence_in_flight = true;
+        view.terminal_settings_generation = settings_generation;
+#endif
+    } else {
+        view.terminal_persistence_in_flight = false;
+        view.terminal_persistence_error =
+            "Terminal session persistence could not capture an immutable settings snapshot";
+    }
+}
+
+void restore_terminal_state() {
+    auto& view = state();
+    if (view.terminal_restored) return;
+    view.terminal_restored = true;
+    ensure_terminal_profiles();
+    if (!g_sa_settings.terminal_restore_sessions || g_sa_settings.terminal_sessions_json.empty())
+        return;
+    try {
+        const auto root = nlohmann::json::parse(g_sa_settings.terminal_sessions_json);
+        if (!root.is_object() || root.value("version", 0) != 1 ||
+            !root.contains("sessions") || !root["sessions"].is_array())
+            return;
+        std::size_t restored = 0;
+        for (const auto& record : root["sessions"]) {
+            if (!record.is_object() || restored >= 12) break;
+            const std::string profile_id = record.value("profile", std::string{});
+            const auto profile = std::find_if(view.terminal_profiles.begin(), view.terminal_profiles.end(),
+                [&](const terminal_view::profile_t& item) { return item.id == profile_id; });
+            if (profile == view.terminal_profiles.end()) continue;
+            const std::wstring cwd = widen(record.value("cwd", std::string{}));
+            if (auto* session = globals::terminal_mgr.create_terminal(profile->command.c_str(),
+                    cwd.empty() ? nullptr : cwd.c_str(), profile->id.c_str(),
+                    profile->label.c_str())) {
+                session->max_lines = (std::clamp)(g_sa_settings.terminal_scrollback, 1000, 100000);
+                ++restored;
+            }
+        }
+        if (globals::terminal_mgr.sessions.empty()) return;
+        globals::terminal_mgr.active_tab = (std::clamp)(root.value("active", 0), 0,
+            static_cast<int>(globals::terminal_mgr.sessions.size()) - 1);
+        const std::string split = root.value("split", std::string("none"));
+        const int secondary = root.value("secondary", -1);
+        if (secondary >= 0 && secondary < static_cast<int>(globals::terminal_mgr.sessions.size()) &&
+            secondary != globals::terminal_mgr.active_tab) {
+            globals::terminal_mgr.secondary_tab = secondary;
+            globals::terminal_mgr.split_mode = split == "vertical"
+                ? terminal_view::split_mode_t::vertical : split == "horizontal"
+                ? terminal_view::split_mode_t::horizontal : terminal_view::split_mode_t::none;
+        }
+    } catch (const std::exception& error) {
+        view.terminal_persistence_error = error.what();
+    }
+}
+
 const char* label(bottom_tab_t tab) noexcept {
     switch (tab) {
     case bottom_tab_t::output: return "Output";
-    case bottom_tab_t::mcp_log: return "MCP Log";
+    case bottom_tab_t::mcp_log: return "MCP Activity";
     case bottom_tab_t::driver_log: return "Driver Log";
     case bottom_tab_t::sandbox_log: return "Sandbox Log";
     case bottom_tab_t::terminal: return "Terminal";
@@ -97,9 +294,8 @@ void log_lock_busy(const char* operation, bottom_tab_t tab) {
 
 bool snapshot_text(bottom_tab_t tab, std::string& text) {
     text.clear();
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (terminal_tab(tab)) {
-        auto* terminal = globals::terminal_mgr.current();
+        auto* terminal = globals::terminal_mgr.focused();
         if (!terminal)
             return false;
         if (!terminal_view::try_copy_all_text(*terminal, text)) {
@@ -108,7 +304,6 @@ bool snapshot_text(bottom_tab_t tab, std::string& text) {
         }
         return true;
     }
-#endif
     std::deque<std::string> lines;
     if (!output_log::try_snapshot_all(tab, lines)) {
         log_lock_busy("log_snapshot_all", tab);
@@ -119,6 +314,8 @@ bool snapshot_text(bottom_tab_t tab, std::string& text) {
         bytes += line.size() + 1;
     text.reserve(bytes);
     for (const auto& line : lines) {
+        if (tab == bottom_tab_t::output && !programming_tasks::output_line_visible(line))
+            continue;
         text.append(line);
         text.push_back('\n');
     }
@@ -145,28 +342,59 @@ bool context_key_pressed() {
         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false));
 }
 
-void render_toolbar(bottom_tab_t tab) {
+void render_toolbar(bottom_tab_t tab, const char* stable_scope) {
     const auto invoke = [tab](const char* action) {
         application_ui::execute_output_action(static_cast<int>(tab), action,
             action_invocation_source_t::toolbar);
     };
+    const auto metrics = design::metrics();
+    const float available = (std::max)(1.0f, ImGui::GetContentRegionAvail().x);
+    const bool supports_search = supports_filter(tab);
+    const bool wide = supports_search && available >= 620.0f * metrics.scale;
     const bool content = has_content(tab);
-    ImGui::BeginDisabled(!content);
-    if (ImGui::Button("Copy All")) invoke("output.copy_all");
-    ImGui::SameLine();
-    if (ImGui::Button("Select All")) invoke("output.select_all");
-    ImGui::SameLine();
-    if (ImGui::Button("Clear")) invoke("output.clear");
-    ImGui::SameLine();
-    if (ImGui::Button("Export...")) invoke("output.export");
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    bool follow = follows_tail(tab);
-    if (ImGui::Checkbox("Follow tail", &follow))
-        invoke("output.follow");
-    if (supports_filter(tab)) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth((std::max)(120.0f, ImGui::GetContentRegionAvail().x));
+    const bool follow = follows_tail(tab);
+    const char* follow_label = follow ? "Following" : "Follow tail";
+    const char* follow_compact = follow ? "Follow: on" : "Follow: off";
+    const design::action_t actions[] = {
+        {"output.copy_all", "Copy All", "Copy", "Copy all output text", "Ctrl+C", nullptr,
+            components::button_kind_t::secondary, content, false, true},
+        {"output.select_all", "Select All", "Select", "Select all output text", "Ctrl+A", nullptr,
+            components::button_kind_t::secondary, content, false, true},
+        {"output.clear", "Clear", "Clear", "Clear this output buffer", nullptr,
+            "Clears the visible output buffer", components::button_kind_t::secondary,
+            content, false, true},
+        {"output.export", "Export...", "Export", "Export all output to a file", nullptr, nullptr,
+            components::button_kind_t::secondary, content, false, true},
+        {"output.follow", follow_label, follow_compact,
+            follow ? "Stop following new output" : "Follow new output as it arrives", nullptr, nullptr,
+            components::button_kind_t::ghost, true, false, true},
+        {"output.filter", "Filter...", "Filter", "Focus the output filter", "Ctrl+F", nullptr,
+            components::button_kind_t::ghost, supports_search, false, supports_search && !wide}
+    };
+    const float toolbar_height = metrics.control_height + 4.0f * metrics.scale;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+        ImVec2(0.0f, 2.0f * metrics.scale));
+    ImGui::BeginChild("##output_toolbar", ImVec2(available, toolbar_height), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoSavedSettings);
+    const float filter_width = wide
+        ? (std::min)(260.0f * metrics.scale, available * 0.34f) : 0.0f;
+    const float action_width = wide
+        ? (std::max)(metrics.control_height,
+            available - filter_width - metrics.spacing_sm) : available;
+    const auto result = design::render_toolbar(stable_scope, actions,
+        sizeof(actions) / sizeof(actions[0]), action_width);
+    if (result.invoked && result.id) {
+        if (std::strcmp(result.id, "output.filter") == 0)
+            state().focus_filter[index(tab)] = true;
+        else
+            invoke(result.id);
+    }
+    if (wide) {
+        ImGui::SameLine(0.0f, metrics.spacing_sm);
+        ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(),
+            ImGui::GetWindowContentRegionMax().x - filter_width));
+        ImGui::SetNextItemWidth(filter_width);
         const auto slot = index(tab);
         if (state().focus_filter[slot]) {
             ImGui::SetKeyboardFocusHere();
@@ -174,8 +402,32 @@ void render_toolbar(bottom_tab_t tab) {
         }
         ImGui::InputTextWithHint("##output_filter", "Filter output",
             state().filters[slot].data(), state().filters[slot].size());
+        design::tooltip_for_last_item("Filter visible output", "Ctrl+F");
+        design::draw_focus_ring_for_last_item();
     }
-    ImGui::Separator();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    if (!wide && supports_search) {
+        const auto slot = index(tab);
+        if (state().focus_filter[slot])
+            ImGui::OpenPopup("##output_filter_popup");
+        ImGui::SetNextWindowSize(ImVec2(320.0f * metrics.scale, 0.0f), ImGuiCond_Appearing);
+        if (ImGui::BeginPopup("##output_filter_popup")) {
+            ImGui::TextUnformatted("Filter output");
+            ImGui::SetNextItemWidth(-1.0f);
+            if (state().focus_filter[slot]) {
+                ImGui::SetKeyboardFocusHere();
+                state().focus_filter[slot] = false;
+            }
+            ImGui::InputTextWithHint("##output_filter", "Type to filter visible entries",
+                state().filters[slot].data(), state().filters[slot].size());
+            design::draw_focus_ring_for_last_item();
+            ImGui::EndPopup();
+        }
+    }
+    const ImVec2 line = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddLine(line,
+        ImVec2(line.x + available, line.y), ImGui::GetColorU32(ImGuiCol_Border));
 }
 
 void render_log(bottom_tab_t tab) {
@@ -195,13 +447,19 @@ void render_log(bottom_tab_t tab) {
 #endif
     std::size_t total = state().totals[slot];
     bool snapshot_changed = false;
-    if (!output_log::try_snapshot_tail_if_changed(tab, output_log::MAX_RENDER_LINES,
-            state().versions[slot], state().snapshots[slot], &total, &snapshot_changed)) {
+    const bool snapshot_available = output_log::try_snapshot_tail_if_changed(
+        tab, output_log::MAX_RENDER_LINES, state().versions[slot],
+        state().snapshots[slot], &total, &snapshot_changed);
+    if (!snapshot_available) {
         log_lock_busy("log_snapshot", tab);
     } else {
         state().totals[slot] = total;
     }
     const auto& snapshot = state().snapshots[slot];
+    const std::string task_channel = tab == bottom_tab_t::output
+        ? programming_tasks::selected_output_channel() : std::string{};
+    const bool channel_changed = tab == bottom_tab_t::output &&
+        state().applied_task_output_channel != task_channel;
     const bool filter_changed = state().applied_filter_inputs[slot] != state().filters[slot].data();
     if (filter_changed) {
         state().applied_filter_inputs[slot] = state().filters[slot].data();
@@ -210,29 +468,53 @@ void render_log(bottom_tab_t tab) {
             state().applied_filters[slot].begin(),
             [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
     }
-    if (snapshot_changed || filter_changed) {
+    if (channel_changed) state().applied_task_output_channel = task_channel;
+    if (snapshot_changed || filter_changed || channel_changed) {
         const auto& normalized_filter = state().applied_filters[slot];
         auto& filtered = state().filtered_indices[slot];
         filtered.clear();
         filtered.reserve(snapshot.size());
         for (std::size_t line_index = 0; line_index < snapshot.size(); ++line_index)
-            if (contains_case_insensitive(snapshot[line_index], normalized_filter))
+            if ((tab != bottom_tab_t::output ||
+                    programming_tasks::output_line_visible(snapshot[line_index])) &&
+                contains_case_insensitive(snapshot[line_index], normalized_filter))
                 filtered.push_back(line_index);
     }
     const auto& visible = state().filtered_indices[slot];
     if (snapshot.empty()) {
-        ImGui::TextDisabled("No %s entries yet.", label(tab));
+        const char* message = "Analysis, file, automation, and IDE diagnostics appear here as work runs.";
         if (tab == bottom_tab_t::mcp_log)
-            ImGui::TextWrapped("MCP request and tool activity will appear here when the local MCP service is active.");
+            message = "MCP requests and tool activity appear here when the local MCP service is active.";
         else if (tab == bottom_tab_t::driver_log)
-            ImGui::TextWrapped("Driver diagnostics will appear here after a driver-backed operation reports status.");
+            message = "Driver diagnostics appear here after a driver-backed operation reports status.";
         else if (tab == bottom_tab_t::sandbox_log)
-            ImGui::TextWrapped("Sandbox execution and isolation diagnostics will appear here when a sandbox task runs.");
-        else
-            ImGui::TextWrapped("Analysis, file, automation, and IDE diagnostics will appear here as work runs.");
+            message = "Sandbox execution and isolation diagnostics appear here when a sandbox task runs.";
+        const design::state_presentation_t presentation{
+            snapshot_available ? "output.empty" : "output.loading",
+            snapshot_available ? design::view_state_t::empty : design::view_state_t::loading,
+            snapshot_available ? "No output yet" : "Reading output",
+            snapshot_available ? message : "The output buffer is busy. AiDA will retry without discarding existing data.",
+            label(tab), snapshot_available ? nullptr : "Waiting for the output buffer",
+            nullptr, nullptr, snapshot_available ? "Output appears automatically; no refresh is required." : nullptr,
+            -1.0f, 0.0, false, nullptr, 0};
+        design::render_state(presentation, ImGui::GetContentRegionAvail());
     } else if (visible.empty()) {
-        ImGui::TextDisabled("No entries match the current filter.");
+        const bool channel_empty = tab == bottom_tab_t::output && !task_channel.empty() &&
+            state().filters[slot][0] == '\0';
+        const design::state_presentation_t presentation{
+            "output.no-results", design::view_state_t::empty,
+            channel_empty ? "No output in this channel" : "No matching output",
+            channel_empty ? "The selected task channel has no retained entries."
+                : "No entries match the current filter.",
+            channel_empty ? task_channel.c_str() : state().filters[slot].data(),
+            nullptr, nullptr, nullptr,
+            channel_empty ? "Select All Output or run the configuration again."
+                : "Clear or broaden the filter to restore hidden entries.", -1.0f, 0.0,
+            false, nullptr, 0};
+        design::render_state(presentation, ImGui::GetContentRegionAvail());
     } else {
+        ImGui::BeginChild("##output_scroll", ImGui::GetContentRegionAvail(), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings);
         ImGui::PushFont(aida::ui::fonts::code());
         const float line_height = ImGui::GetTextLineHeightWithSpacing();
         const bool near_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - line_height * 2.0f;
@@ -251,14 +533,246 @@ void render_log(bottom_tab_t tab) {
                 ImVec2(position.x + size.x, position.y + size.y),
                 ImGui::GetColorU32(ImGuiCol_NavHighlight), 0.0f, 0, 2.0f);
         }
+        ImGui::EndChild();
     }
 }
 
-void render_terminal() {
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-    render_log(bottom_tab_t::terminal);
-#else
+void render_terminal_input(terminal_view::TerminalSession& terminal) {
+    if (!terminal.focused) return;
+    auto& io = ImGui::GetIO();
+    if (io.WantTextInput) return;
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
+        state().terminal_select_all = true;
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+        if (state().terminal_select_all) {
+            copy_all(bottom_tab_t::terminal);
+            state().terminal_select_all = false;
+        } else {
+            terminal_view::send_input(terminal, "\x03", 1);
+        }
+        return;
+    }
+    if (!io.KeyCtrl && !io.KeyAlt)
+        for (int index = 0; index < io.InputQueueCharacters.Size; ++index) {
+            const std::uint32_t character = static_cast<std::uint32_t>(io.InputQueueCharacters[index]);
+            if (character < 32 || character > 0x10ffff ||
+                (character >= 0xd800 && character <= 0xdfff))
+                continue;
+            char encoded[4]{};
+            std::size_t length = 0;
+            if (character < 0x80) {
+                encoded[0] = static_cast<char>(character);
+                length = 1;
+            } else if (character < 0x800) {
+                encoded[0] = static_cast<char>(0xc0 | (character >> 6));
+                encoded[1] = static_cast<char>(0x80 | (character & 0x3f));
+                length = 2;
+            } else if (character < 0x10000) {
+                encoded[0] = static_cast<char>(0xe0 | (character >> 12));
+                encoded[1] = static_cast<char>(0x80 | ((character >> 6) & 0x3f));
+                encoded[2] = static_cast<char>(0x80 | (character & 0x3f));
+                length = 3;
+            } else {
+                encoded[0] = static_cast<char>(0xf0 | (character >> 18));
+                encoded[1] = static_cast<char>(0x80 | ((character >> 12) & 0x3f));
+                encoded[2] = static_cast<char>(0x80 | ((character >> 6) & 0x3f));
+                encoded[3] = static_cast<char>(0x80 | (character & 0x3f));
+                length = 4;
+            }
+            terminal_view::send_input(terminal, encoded, length);
+        }
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false)) terminal_view::send_input(terminal, "\r", 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) terminal_view::send_input(terminal, "\x7f", 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) terminal_view::send_input(terminal, "\t", 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) terminal_view::send_input(terminal, "\x1b", 1);
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false)) terminal_view::send_input(terminal, "\x1b[A", 3);
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) terminal_view::send_input(terminal, "\x1b[B", 3);
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) terminal_view::send_input(terminal, "\x1b[C", 3);
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) terminal_view::send_input(terminal, "\x1b[D", 3);
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) terminal_view::send_input(terminal, "\x1b[H", 3);
+    if (ImGui::IsKeyPressed(ImGuiKey_End, false)) terminal_view::send_input(terminal, "\x1b[F", 3);
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) terminal_view::send_input(terminal, "\x1b[3~", 4);
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) terminal_view::send_input(terminal, "\x04", 1);
+    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) terminal_view::send_input(terminal, "\x1a", 1);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || (!io.KeyCtrl && io.InputQueueCharacters.Size > 0))
+        state().terminal_select_all = false;
+}
+
+void render_terminal_pane(terminal_view::TerminalSession& terminal, const ImVec2& size) {
+    ImGui::PushID(static_cast<int>(terminal.id));
+    const auto& theme = aida::ui::resolved();
+    terminal_view::render_terminal(terminal, size,
+        aida::ui::with_alpha(theme.bg_base, 0.9f), theme.accent_u32);
+    render_terminal_input(terminal);
+    ImGui::PopID();
+}
+
+void render_terminal_search(terminal_view::TerminalSession& terminal) {
+    auto& view = state();
+    if (!view.terminal_search_visible) return;
+    if (view.terminal_focus_search) {
+        ImGui::SetKeyboardFocusHere();
+        view.terminal_focus_search = false;
+    }
+    const float scale = design::metrics().scale;
+    const bool compact = ImGui::GetContentRegionAvail().x < aida::ui::scale_px(520.0f, scale);
+    ImGui::SetNextItemWidth(compact ? ImGui::GetContentRegionAvail().x :
+        (std::max)(aida::ui::scale_px(100.0f, scale),
+            ImGui::GetContentRegionAvail().x - aida::ui::scale_px(210.0f, scale)));
+    const bool submitted = ImGui::InputTextWithHint("##terminal_search", "Search terminal output",
+        view.terminal_search.data(), view.terminal_search.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+    terminal_view::refresh_search(terminal, view.terminal_search.data());
+    if (submitted)
+        terminal_view::move_search_match(terminal, ImGui::GetIO().KeyShift ? -1 : 1);
+    if (!compact) ImGui::SameLine();
+    if (ImGui::SmallButton("Previous")) terminal_view::move_search_match(terminal, -1);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Next")) terminal_view::move_search_match(terminal, 1);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d/%zu", terminal.active_search_match < 0 ? 0 :
+        terminal.active_search_match + 1, terminal.search_matches.size());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Close") || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        view.terminal_search_visible = false;
+        terminal.search_query.clear();
+        terminal.search_matches.clear();
+        terminal.active_search_match = -1;
+    }
+}
+
+void render_terminal_session_bar() {
     auto& manager = globals::terminal_mgr;
+    auto& view = state();
+    int close_index = -1;
+    bool active_changed = false;
+    if (ImGui::BeginTabBar("##terminal_sessions",
+            ImGuiTabBarFlags_AutoSelectNewTabs | ImGuiTabBarFlags_FittingPolicyScroll)) {
+        for (int index = 0; index < static_cast<int>(manager.sessions.size()); ++index) {
+            auto* terminal = manager.sessions[static_cast<std::size_t>(index)];
+            if (!terminal) continue;
+            bool open = true;
+            std::string label = terminal->title;
+            if (!terminal->alive.load(std::memory_order_acquire)) {
+                const auto code = terminal->exit_code.load(std::memory_order_acquire);
+                label += code == std::numeric_limits<std::uint32_t>::max()
+                    ? " [stopped]" : " [exit " + std::to_string(code) + "]";
+            }
+            const ImGuiTabItemFlags flags = view.terminal_select_requested &&
+                manager.active_tab == index ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem((label + "###terminal." + std::to_string(terminal->id)).c_str(),
+                    &open, flags)) {
+                active_changed = active_changed || manager.active_tab != index;
+                manager.active_tab = index;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s\nCommand: %s\nLaunch directory: %s",
+                    terminal->profile_label.c_str(), narrow(terminal->command).c_str(),
+                    terminal->cwd.empty() ? "Inherited" : narrow(terminal->cwd).c_str());
+            }
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Middle)) open = false;
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                active_changed = active_changed || manager.active_tab != index;
+                manager.active_tab = index;
+                application_ui::open_output_context_menu(static_cast<int>(bottom_tab_t::terminal),
+                    context_menu_open_origin_t::pointer);
+            }
+            if (!open) close_index = index;
+        }
+        view.terminal_select_requested = false;
+        if (ImGui::TabItemButton("+", ImGuiTabItemFlags_Trailing))
+            ImGui::OpenPopup("##new_terminal_profile");
+        ImGui::EndTabBar();
+    }
+    if (close_index >= 0) {
+        manager.close_terminal(close_index);
+        persist_terminal_state();
+        active_changed = false;
+    }
+    if (active_changed) persist_terminal_state();
+    if (ImGui::BeginPopup("##new_terminal_profile")) {
+        ImGui::TextUnformatted("New terminal profile");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(360.0f);
+        ImGui::InputTextWithHint("##terminal_cwd", "Launch working directory (optional)",
+            view.terminal_cwd.data(), view.terminal_cwd.size());
+        for (int index = 0; index < static_cast<int>(view.terminal_profiles.size()); ++index) {
+            const auto& profile = view.terminal_profiles[static_cast<std::size_t>(index)];
+            if (ImGui::Selectable(profile.label.c_str(), index == view.terminal_profile)) {
+                view.terminal_profile = index;
+                if (create_selected_terminal()) {
+                    view.terminal_select_requested = true;
+                    persist_terminal_state();
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", narrow(profile.command).c_str());
+        }
+        ImGui::EndPopup();
+    }
+    const float action_bar_height = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ScrollbarSize;
+    ImGui::BeginChild("##terminal_actions", ImVec2(0.0f, action_bar_height), false,
+        ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBackground);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 3.0f));
+    if (ImGui::SmallButton("New")) ImGui::OpenPopup("##new_terminal_profile");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Split Right"))
+        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
+            "terminal.split_vertical", action_invocation_source_t::toolbar);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Split Down"))
+        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
+            "terminal.split_horizontal", action_invocation_source_t::toolbar);
+    if (manager.split_mode != terminal_view::split_mode_t::none) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Unsplit"))
+            application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
+                "terminal.unsplit", action_invocation_source_t::toolbar);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Search"))
+        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
+            "terminal.search", action_invocation_source_t::toolbar);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Restart"))
+        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
+            "terminal.restart", action_invocation_source_t::toolbar);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Close"))
+        application_ui::execute_output_action(static_cast<int>(bottom_tab_t::terminal),
+            "terminal.close", action_invocation_source_t::toolbar);
+    ImGui::PopStyleVar();
+    if (!view.terminal_persistence_error.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Session layout not saved");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", view.terminal_persistence_error.c_str());
+    }
+    ImGui::EndChild();
+}
+
+void render_terminal() {
+    auto& view = state();
+    if (view.terminal_persistence_in_flight) {
+        const auto persistence = aida::settings_persistence::status();
+        if (persistence.committed_generation >= view.terminal_settings_generation) {
+            view.terminal_persistence_in_flight = false;
+            view.terminal_persistence_error.clear();
+            if (view.terminal_persistence_generation != 0 &&
+                view.terminal_persistence_payload != g_sa_settings.terminal_sessions_json)
+                schedule_terminal_persistence();
+        } else if (!persistence.pending && persistence.failed &&
+            persistence.generation >= view.terminal_settings_generation) {
+            view.terminal_persistence_in_flight = false;
+            view.terminal_persistence_error = persistence.error.empty()
+                ? "Terminal session layout could not be saved" : persistence.error;
+        }
+    }
+    auto& manager = globals::terminal_mgr;
+    manager.reap_retired_sessions();
+    restore_terminal_state();
     const int frame = ImGui::GetFrameCount();
     if (frame > state().terminal_last_render_frame + 1 && !manager.current()) {
         state().terminal_start_attempted = false;
@@ -267,66 +781,63 @@ void render_terminal() {
     state().terminal_last_render_frame = frame;
     if (!manager.current() && !state().terminal_start_attempted) {
         state().terminal_start_attempted = true;
-        std::wstring shell(g_sa_settings.terminal_shell.begin(), g_sa_settings.terminal_shell.end());
-        if (!manager.create_terminal(shell.c_str()))
-            state().terminal_start_error = "The configured terminal shell could not be started";
-        else
-            state().terminal_start_error.clear();
+        if (create_selected_terminal()) persist_terminal_state();
     }
     auto* terminal = manager.current();
     if (!terminal) {
-        ImGui::TextColored(ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "%s.",
-            state().terminal_start_error.empty() ? "Terminal session is not running" : state().terminal_start_error.c_str());
-        ImGui::TextWrapped("Verify the configured terminal shell path in Settings. AiDA will not fall back to an unconfigured shell.");
-        if (ImGui::Button("Retry configured shell")) {
+        const design::action_t retry{
+            "terminal.retry", "Retry configured shell", "Retry",
+            "Start the terminal using the configured shell path", nullptr, nullptr,
+            components::button_kind_t::primary, true, true, true};
+        const design::state_presentation_t presentation{
+            "terminal.unavailable", design::view_state_t::error,
+            state().terminal_start_error.empty() ? "Terminal unavailable" : "Terminal failed to start",
+            state().terminal_start_error.empty()
+                ? "The configured terminal session is not running."
+                : state().terminal_start_error.c_str(),
+            g_sa_settings.terminal_shell.c_str(), nullptr, nullptr, nullptr,
+            "Verify the terminal shell path in Settings. AiDA does not fall back to an unconfigured shell.",
+            -1.0f, 0.0, false, &retry, 1};
+        const auto result = design::render_state(presentation, ImGui::GetContentRegionAvail());
+        if (result.invoked) {
             state().terminal_start_attempted = true;
-            std::wstring shell(g_sa_settings.terminal_shell.begin(), g_sa_settings.terminal_shell.end());
-            if (!manager.create_terminal(shell.c_str()))
-                state().terminal_start_error = "The configured terminal shell could not be started";
-            else
-                state().terminal_start_error.clear();
+            if (create_selected_terminal()) persist_terminal_state();
         }
         return;
     }
-    const auto& theme = aida::ui::resolved();
-    const ImVec2 size = ImGui::GetContentRegionAvail();
-    terminal_view::render_terminal(*terminal, size,
-        aida::ui::with_alpha(theme.bg_base, 0.9f), theme.accent_u32);
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
-        auto& io = ImGui::GetIO();
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
-            state().terminal_select_all = true;
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-            if (state().terminal_select_all) {
-                copy_all(bottom_tab_t::terminal);
-                state().terminal_select_all = false;
-            } else {
-                terminal_view::send_input(*terminal, "\x03", 1);
-            }
-        } else {
-            for (int character_index = 0; character_index < io.InputQueueCharacters.Size; ++character_index) {
-                const ImWchar character = io.InputQueueCharacters[character_index];
-                if (character >= 32 && character < 127)
-                    terminal_view::send_key(*terminal, static_cast<char>(character));
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false)) terminal_view::send_input(*terminal, "\r", 1);
-            if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) terminal_view::send_input(*terminal, "\x7f", 1);
-            if (ImGui::IsKeyPressed(ImGuiKey_Tab, false)) terminal_view::send_input(*terminal, "\t", 1);
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) terminal_view::send_input(*terminal, "\x1b", 1);
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false)) terminal_view::send_input(*terminal, "\x1b[A", 3);
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) terminal_view::send_input(*terminal, "\x1b[B", 3);
-            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) terminal_view::send_input(*terminal, "\x1b[C", 3);
-            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) terminal_view::send_input(*terminal, "\x1b[D", 3);
-            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) terminal_view::send_input(*terminal, "\x1b[H", 3);
-            if (ImGui::IsKeyPressed(ImGuiKey_End, false)) terminal_view::send_input(*terminal, "\x1b[F", 3);
-            if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) terminal_view::send_input(*terminal, "\x1b[3~", 4);
-            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) terminal_view::send_input(*terminal, "\x04", 1);
-            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) terminal_view::send_input(*terminal, "\x1a", 1);
+    render_terminal_session_bar();
+    terminal = manager.current();
+    if (!terminal) return;
+    if (manager.secondary_tab == manager.active_tab) {
+        if (manager.sessions.size() > 1)
+            manager.secondary_tab = manager.active_tab == 0 ? 1 : 0;
+        else
+            manager.set_split(terminal_view::split_mode_t::none);
+    }
+    auto* search_terminal = manager.focused();
+    render_terminal_search(*(search_terminal ? search_terminal : terminal));
+    for (auto* session : manager.sessions)
+        if (session) session->focused = false;
+    auto* secondary = manager.secondary();
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    if (!secondary || manager.split_mode == terminal_view::split_mode_t::none) {
+        render_terminal_pane(*terminal, available);
+    } else if (manager.split_mode == terminal_view::split_mode_t::vertical) {
+        if (ImGui::BeginTable("##terminal_split_vertical", 2,
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+                available)) {
+            ImGui::TableNextColumn();
+            render_terminal_pane(*terminal, ImGui::GetContentRegionAvail());
+            ImGui::TableNextColumn();
+            render_terminal_pane(*secondary, ImGui::GetContentRegionAvail());
+            ImGui::EndTable();
         }
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || (!io.KeyCtrl && io.InputQueueCharacters.Size > 0))
-            state().terminal_select_all = false;
     } else {
-        state().terminal_select_all = false;
+        const float gap = ImGui::GetStyle().ItemSpacing.y;
+        const float first_height = (std::max)(1.0f, (available.y - gap) * 0.5f);
+        render_terminal_pane(*terminal, ImVec2(available.x, first_height));
+        render_terminal_pane(*secondary,
+            ImVec2(available.x, (std::max)(1.0f, available.y - first_height - gap)));
     }
     if (state().terminal_select_all) {
         const ImVec2 position = ImGui::GetWindowPos();
@@ -335,7 +846,6 @@ void render_terminal() {
             ImVec2(position.x + window_size.x, position.y + window_size.y),
             ImGui::GetColorU32(ImGuiCol_NavHighlight), 0.0f, 0, 2.0f);
     }
-#endif
 }
 
 }
@@ -354,9 +864,8 @@ operation_result_t copy_all(bottom_tab_t tab) {
 }
 
 operation_result_t clear(bottom_tab_t tab) {
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (terminal_tab(tab)) {
-        auto* terminal = globals::terminal_mgr.current();
+        auto* terminal = globals::terminal_mgr.focused();
         if (!terminal)
             return {false, "The terminal session is unavailable"};
         if (!terminal_view::try_clear_session(*terminal)) {
@@ -367,7 +876,6 @@ operation_result_t clear(bottom_tab_t tab) {
         state().selected_all[index(tab)] = false;
         return {true, {}};
     }
-#endif
     if (!output_log::try_clear(tab)) {
         log_lock_busy("log_clear", tab);
         return {false, "The output buffer is busy"};
@@ -393,9 +901,8 @@ operation_result_t select_all(bottom_tab_t tab) {
 }
 
 operation_result_t toggle_follow(bottom_tab_t tab) {
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (terminal_tab(tab)) {
-        auto* terminal = globals::terminal_mgr.current();
+        auto* terminal = globals::terminal_mgr.focused();
         if (!terminal)
             return {false, "The terminal session is unavailable"};
         terminal->auto_follow = !terminal->auto_follow;
@@ -403,7 +910,6 @@ operation_result_t toggle_follow(bottom_tab_t tab) {
             terminal->scroll_to_bottom = true;
         return {true, {}};
     }
-#endif
     bool follow = true;
     if (!output_log::try_is_auto_scroll(tab, follow) ||
         !output_log::try_set_auto_scroll(tab, !follow)) {
@@ -432,22 +938,216 @@ operation_result_t export_all(bottom_tab_t tab) {
     if (!win32_dialog::show_save_file_dialog(g_hwnd, "Export Output", filter, "log",
             path, sizeof(path), "output_view_export"))
         return {true, {}};
-    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-    if (!stream.is_open())
-        return {false, "The export destination could not be opened"};
-    stream.write(text.data(), static_cast<std::streamsize>(text.size()));
-    stream.flush();
-    return stream.good() ? operation_result_t{true, {}}
-        : operation_result_t{false, "The export could not be written completely"};
+    if (file_tabs::find_path_document(path) >= 0)
+        return {false, "Choose a destination that is not open in the code editor"};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    aida::preview::record(aida::preview::shell_action_t::save_file, path);
+    return {false, "Output export requires the native AiDA runtime"};
+#else
+    struct export_state_t {
+        std::string id;
+        std::string path;
+        std::string text;
+    };
+    static std::atomic<std::uint64_t> sequence{1};
+    auto export_state = std::make_shared<export_state_t>();
+    export_state->id = "output.export." + std::to_string(GetTickCount64()) + "." +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    export_state->path = path;
+    export_state->text = std::move(text);
+    task_center::task_registration_t registration;
+    registration.id = export_state->id;
+    registration.source = "output.export";
+    registration.owner = "Output Export";
+    registration.owner_view = terminal_tab(tab) ? "view.terminal" : "view.output";
+    registration.owner_action = "output.export";
+    registration.target = export_state->path;
+    registration.label = std::string("Export ") + label(tab);
+    registration.stage = "Queued for atomic file export";
+    registration.affected_entity = export_state->path;
+    registration.callbacks.focus = [tab] {
+        static_cast<void>(aida::ui_thread::post([tab] {
+            static_cast<void>(application_views::open_or_focus(stable_view_id_t(
+                terminal_tab(tab) ? "view.terminal" : "view.output")));
+        }, "output_export", "output_export_focus", "task_center_callback"));
+    };
+    registration.callbacks.open_log = registration.callbacks.focus;
+    if (!task_center::register_task(std::move(registration)))
+        return {false, "The Task Center rejected the output export"};
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "output_export";
+    submission.label = "output.atomic_export";
+    submission.thread_class = "bounded_file_io";
+    submission.domain = aida::infra::executor::domain_t::external_tool;
+    submission.session_id = export_state->id.c_str();
+    submission.target_id = export_state->path.c_str();
+    submission.diagnostic_id = export_state->id.c_str();
+    submission.ui_access_policy = "immutable_snapshots_only";
+    submission.failure_policy = "typed_diagnostic";
+    submission.shutdown_policy = "drain";
+    submission.body = [export_state] {
+        try {
+            static_cast<void>(task_center::update_task(export_state->id,
+                task_center::task_state_t::running, -1.0f, "Writing same-directory temporary file"));
+            const auto result = file_tabs::atomic_write_file(export_state->path, export_state->text);
+            export_state->text.clear();
+            export_state->text.shrink_to_fit();
+            if (result.succeeded) {
+                static_cast<void>(task_center::update_task(export_state->id,
+                    task_center::task_state_t::completed, 1.0f, "Finished",
+                    "Output exported atomically"));
+            } else {
+                static_cast<void>(task_center::update_task(export_state->id,
+                    task_center::task_state_t::failed, 1.0f, "Atomic export failed",
+                    result.detail, "diagnostic." + export_state->id));
+            }
+        } catch (const std::exception& exception) {
+            static_cast<void>(task_center::update_task(export_state->id,
+                task_center::task_state_t::failed, 1.0f, "Atomic export failed",
+                exception.what(), "diagnostic." + export_state->id));
+        } catch (...) {
+            static_cast<void>(task_center::update_task(export_state->id,
+                task_center::task_state_t::failed, 1.0f, "Atomic export failed",
+                "Unknown export failure", "diagnostic." + export_state->id));
+        }
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        static_cast<void>(task_center::update_task(export_state->id,
+            task_center::task_state_t::failed, 1.0f, "Executor rejected export",
+            submitted.reject_reason, "diagnostic." + export_state->id));
+        return {false, "The output export executor rejected the request: " + submitted.reject_reason};
+    }
+    return {true, "Output export queued"};
+#endif
+}
+
+operation_result_t terminal_new() {
+    if (!create_selected_terminal())
+        return {false, state().terminal_start_error};
+    state().terminal_select_requested = true;
+    state().terminal_start_attempted = true;
+    persist_terminal_state();
+    return {true, {}};
+}
+
+operation_result_t terminal_new_at(const std::string& working_directory) {
+    if (working_directory.empty())
+        return {false, "Select a workspace directory first"};
+    if (working_directory.size() >= state().terminal_cwd.size())
+        return {false, "The terminal working directory exceeds the 1023-byte UTF-8 limit"};
+    if (widen(working_directory).empty())
+        return {false, "The terminal working directory is not valid UTF-8"};
+    auto& view = state();
+    std::memcpy(view.terminal_cwd.data(), working_directory.data(), working_directory.size());
+    view.terminal_cwd[working_directory.size()] = '\0';
+    if (!create_selected_terminal())
+        return {false, view.terminal_start_error};
+    view.terminal_select_requested = true;
+    view.terminal_start_attempted = true;
+    persist_terminal_state();
+    return {true, {}};
+}
+
+operation_result_t terminal_close() {
+    auto& manager = globals::terminal_mgr;
+    const int index = manager.focused_index();
+    if (index < 0) return {false, "There is no active terminal session"};
+    manager.close_terminal(index);
+    state().terminal_select_all = false;
+    state().terminal_start_attempted = true;
+    persist_terminal_state();
+    return {true, {}};
+}
+
+operation_result_t terminal_restart() {
+    auto& manager = globals::terminal_mgr;
+    const int index = manager.focused_index();
+    if (index < 0) return {false, "There is no active terminal session"};
+    if (!manager.restart_terminal(index))
+        return {false, manager.last_error.empty() ? "The terminal session could not be restarted" : manager.last_error};
+    state().terminal_select_requested = true;
+    state().terminal_select_all = false;
+    return {true, {}};
+}
+
+operation_result_t terminal_next() {
+    if (!globals::terminal_mgr.cycle(1))
+        return {false, "There are no terminal sessions"};
+    state().terminal_select_requested = true;
+    persist_terminal_state();
+    return {true, {}};
+}
+
+operation_result_t terminal_previous() {
+    if (!globals::terminal_mgr.cycle(-1))
+        return {false, "There are no terminal sessions"};
+    state().terminal_select_requested = true;
+    persist_terminal_state();
+    return {true, {}};
+}
+
+operation_result_t set_terminal_split(terminal_view::split_mode_t mode) {
+    auto& manager = globals::terminal_mgr;
+    if (!manager.current()) return {false, "There is no active terminal session"};
+    if (manager.sessions.size() < 2 && !create_selected_terminal())
+        return {false, state().terminal_start_error};
+    if (!manager.set_split(mode))
+        return {false, "A second terminal session is required for a split"};
+    persist_terminal_state();
+    return {true, {}};
+}
+
+operation_result_t terminal_split_vertical() {
+    return set_terminal_split(terminal_view::split_mode_t::vertical);
+}
+
+operation_result_t terminal_split_horizontal() {
+    return set_terminal_split(terminal_view::split_mode_t::horizontal);
+}
+
+operation_result_t terminal_unsplit() {
+    auto& manager = globals::terminal_mgr;
+    if (manager.split_mode == terminal_view::split_mode_t::none)
+        return {false, "The terminal is not split"};
+    manager.set_split(terminal_view::split_mode_t::none);
+    persist_terminal_state();
+    return {true, {}};
+}
+
+operation_result_t terminal_focus_search() {
+    if (!globals::terminal_mgr.current())
+        return {false, "There is no active terminal session"};
+    state().terminal_search_visible = true;
+    state().terminal_focus_search = true;
+    return {true, {}};
+}
+
+operation_result_t terminal_paste() {
+    auto* terminal = globals::terminal_mgr.focused();
+    if (!terminal || !terminal->alive.load(std::memory_order_acquire))
+        return {false, "The active terminal process is not running"};
+    const char* clipboard = ImGui::GetClipboardText();
+    if (!clipboard || *clipboard == '\0')
+        return {false, "The clipboard has no text"};
+    std::size_t length = 0;
+    while (length < terminal_view::TerminalSession::MAX_INPUT_QUEUE_BYTES && clipboard[length] != '\0')
+        ++length;
+    if (length == terminal_view::TerminalSession::MAX_INPUT_QUEUE_BYTES)
+        return {false, "Clipboard text exceeds the terminal's 1 MiB input limit"};
+    terminal_view::send_input(*terminal, clipboard, length);
+    state().terminal_select_all = false;
+    return {true, {}};
 }
 
 bool has_content(bottom_tab_t tab) {
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (terminal_tab(tab)) {
-        auto* terminal = globals::terminal_mgr.current();
+        auto* terminal = globals::terminal_mgr.focused();
         return terminal && terminal->prev_line_count != 0;
     }
-#endif
+    if (tab == bottom_tab_t::output && !programming_tasks::selected_output_channel().empty())
+        return std::any_of(state().snapshots[index(tab)].begin(), state().snapshots[index(tab)].end(),
+            [](const std::string& line) { return programming_tasks::output_line_visible(line); });
     return !state().snapshots[index(tab)].empty();
 }
 
@@ -456,12 +1156,10 @@ bool supports_filter(bottom_tab_t tab) noexcept {
 }
 
 bool follows_tail(bottom_tab_t tab) {
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (terminal_tab(tab)) {
-        auto* terminal = globals::terminal_mgr.current();
+        auto* terminal = globals::terminal_mgr.focused();
         return terminal && terminal->auto_follow;
     }
-#endif
     bool enabled = true;
     if (!output_log::try_is_auto_scroll(tab, enabled))
         log_lock_busy("follow_state", tab);
@@ -469,30 +1167,46 @@ bool follows_tail(bottom_tab_t tab) {
 }
 
 bool source_available(bottom_tab_t tab) noexcept {
-#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (terminal_tab(tab))
         return globals::terminal_mgr.current() != nullptr;
-#else
-    static_cast<void>(tab);
-#endif
     return true;
 }
 
-void render(bottom_tab_t tab) {
+std::size_t terminal_session_count() noexcept {
+    return globals::terminal_mgr.sessions.size();
+}
+
+bool terminal_is_split() noexcept {
+    return globals::terminal_mgr.split_mode != terminal_view::split_mode_t::none;
+}
+
+void render(bottom_tab_t tab, std::string_view stable_view_id,
+    std::string_view stable_instance_key) {
     g_render_section = terminal_tab(tab) ? "registry_terminal" : "registry_output";
-    render_toolbar(tab);
-    ImGui::BeginChild("##output_content", ImGui::GetContentRegionAvail(), false,
-        ImGuiWindowFlags_NoBackground);
-    if (terminal_tab(tab))
+    std::string stable_scope(stable_view_id);
+    if (stable_scope.empty())
+        stable_scope = "view.output-unowned";
+    if (!stable_instance_key.empty()) {
+        stable_scope.append(".instance.");
+        stable_scope.append(stable_instance_key);
+    }
+    if (tab == bottom_tab_t::output)
+        programming_tasks::render_output_controls();
+    render_toolbar(tab, stable_scope.c_str());
+    if (terminal_tab(tab)) {
         render_terminal();
-    else
+    } else {
         render_log(tab);
+    }
     if (!terminal_tab(tab) && ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
         if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false))
             application_ui::execute_output_action(static_cast<int>(tab), "output.select_all",
                 action_invocation_source_t::shortcut);
         if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
             application_ui::execute_output_action(static_cast<int>(tab), "output.copy_all",
+                action_invocation_source_t::shortcut);
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false))
+            application_ui::execute_output_action(static_cast<int>(tab), "output.filter",
                 action_invocation_source_t::shortcut);
     }
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && context_key_pressed())
@@ -503,7 +1217,8 @@ void render(bottom_tab_t tab) {
         application_ui::open_output_context_menu(static_cast<int>(tab),
             context_menu_open_origin_t::pointer);
     application_ui::render_output_context_menu();
-    ImGui::EndChild();
+    if (tab == bottom_tab_t::output)
+        programming_tasks::render_modals();
 }
 
 }

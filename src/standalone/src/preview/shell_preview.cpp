@@ -4,6 +4,7 @@
 
 #include "../helpers/globals.h"
 #include "../helpers/helpers.h"
+#include "editor_preview_adapter.hpp"
 #include "../core/ui/clock.hpp"
 #include "../core/ui/application_view_registry.hpp"
 #include <algorithm>
@@ -19,6 +20,7 @@ namespace aida::preview
 	namespace
 	{
 		std::atomic<bool> initialized{false};
+		std::atomic<bool> desktop_focus_applied{false};
 		std::atomic<bool> fixture_ready{true};
 		shell_phase_t active_phase = shell_phase_t::ide;
 		std::vector<shell_receipt_t> action_receipts;
@@ -26,6 +28,46 @@ namespace aida::preview
 		std::uint32_t active_pid = 0;
 		std::string active_process_name;
 		shell_controls_t fixture_controls;
+
+		const char* legacy_preview_view_id(int value) noexcept
+		{
+			switch (static_cast<center_view_t>(value)) {
+				case center_view_t::code_editor: return "document.code";
+				case center_view_t::disassembly: return "document.disassembly";
+				case center_view_t::hex_view: return "document.hex";
+				case center_view_t::welcome: return "view.start_center";
+				case center_view_t::settings_view: return "view.settings";
+				case center_view_t::network_view: return "view.network.connections";
+				case center_view_t::memory_scanner: return "view.memory.value_scan";
+				case center_view_t::debugger_view: return "view.debug.cpu";
+				case center_view_t::pseudocode: return "document.pseudocode";
+				case center_view_t::struct_recon: return "view.types.struct_recon";
+				case center_view_t::crypto_scanner: return "view.memory.crypto";
+				case center_view_t::aob_generator: return "view.memory.aob";
+				case center_view_t::fuzzer_view: return "view.analysis.fuzzer";
+				case center_view_t::xref_browser: return "view.analysis.references";
+				case center_view_t::snapshot_diff: return "view.memory.snapshots";
+				case center_view_t::pointer_scanner: return "view.memory.pointers";
+				case center_view_t::decrypt_oracle: return "view.memory.decrypt";
+				case center_view_t::integrity_hunter: return "view.memory.integrity";
+				case center_view_t::symbolic_view: return "view.analysis.symbolic";
+				case center_view_t::taint_view: return "view.analysis.taint";
+				case center_view_t::deobfuscation_view: return "view.analysis.deobfuscation";
+				case center_view_t::stealth_view: return "view.analysis.protection";
+				case center_view_t::scan_hub: return "view.memory.value_scan";
+				case center_view_t::types_hub: return "view.types.structures";
+				case center_view_t::analysis_hub: return "view.analysis.symbolic";
+				case center_view_t::binary_map: return "view.analysis.binary_map";
+				case center_view_t::graph_view: return "document.graph";
+				case center_view_t::image_view: return "document.image";
+				case center_view_t::test_lab: return nullptr;
+				case center_view_t::workbench: return "document.disassembly";
+				case center_view_t::functions_panel: return "view.analysis.functions";
+				case center_view_t::xref_database: return "view.analysis.references";
+			}
+			return nullptr;
+		}
+
 		const std::vector<process_fixture_t> process_rows = {
 			{ 6248, "AiDA_TestTarget.exe", "C:/Preview/AiDA_TestTarget.exe", "AiDA Reverse Engineering Test Target" },
 			{ 7812, "notepad.exe", "C:/Windows/System32/notepad.exe", "analysis_notes.txt - Notepad" },
@@ -76,8 +118,16 @@ namespace aida::preview
 		license::checking = false;
 		license::activation_worker_active.store(false, std::memory_order_release);
 		license::check_failed = false;
-		if (initialized.exchange(true, std::memory_order_acq_rel))
+		if (initialized.exchange(true, std::memory_order_acq_rel)) {
+			if (!desktop_focus_applied.exchange(true, std::memory_order_acq_rel)) {
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.analysis.functions"));
+				aida::ui::application_views::open_or_focus(
+					aida::ui::stable_view_id_t("view.inspector"));
+				static_cast<void>(set_requested_view(fixture_controls, "document.disassembly"));
+			}
 			return;
+		}
 		globals::ui::command_palette_open = false;
 		globals::ui::command_palette_buf[0] = '\0';
 
@@ -85,7 +135,11 @@ namespace aida::preview
 			aida::ui::stable_view_id_t("view.project_explorer"));
 		aida::ui::application_views::open_or_focus(
 			aida::ui::stable_view_id_t("view.output"));
-		globals::ui::active_center_view = center_view_t::welcome;
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.analysis.functions"));
+		aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("view.inspector"));
+		static_cast<void>(set_requested_view(fixture_controls, "document.disassembly"));
 		globals::ui::breadcrumb_segments = { "AiDA", "sample.exe", ".text", "main" };
 		globals::ui::status_file_info = "sample.exe  x64  PE32+";
 		globals::ui::status_driver_info = "Preview fixture";
@@ -104,15 +158,30 @@ namespace aida::preview
 		file_browser::needs_refresh = false;
 
 		file_tabs::tabs.clear();
-		file_tabs::tabs.push_back({ "sample.cpp", "C:/Preview/ReverseEngineering/sample.cpp", "", true, false });
-		file_tabs::tabs.push_back({ "notes.md", "C:/Preview/ReverseEngineering/notes.md", "", true, true });
+		OpenTab sample_tab;
+		sample_tab.filename = "sample.cpp";
+		sample_tab.filepath = "C:/Preview/ReverseEngineering/sample.cpp";
+		sample_tab.buffer_loaded = true;
+		file_tabs::tabs.push_back(std::move(sample_tab));
+		OpenTab notes_tab;
+		notes_tab.filename = "notes.md";
+		notes_tab.filepath = "C:/Preview/ReverseEngineering/notes.md";
+		notes_tab.buffer_loaded = true;
+		notes_tab.dirty = true;
+		file_tabs::tabs.push_back(std::move(notes_tab));
 		file_tabs::active_tab = 0;
-		code_editor::filename = "sample.cpp";
-		code_editor::filepath = "C:/Preview/ReverseEngineering/sample.cpp";
 		const char* code = "int main() {\n    return analyze_target(\"sample.exe\");\n}\n";
-		code_editor::buffer.assign(code, code + std::strlen(code) + 1);
-		code_editor::active = true;
-		code_editor::dirty = false;
+		aida::preview::editor::load_fixture(code, "sample.cpp",
+			"C:/Preview/ReverseEngineering/sample.cpp");
+		if (!file_tabs::tabs.empty()) {
+			file_tabs::tabs.front().document_id =
+				aida::preview::editor::fixture_document_id;
+			file_tabs::tabs.front().buffer = code;
+			file_tabs::tabs.front().content_hash = file_tabs::content_fingerprint(code);
+			file_tabs::tabs.front().revision =
+				aida::preview::editor::fixture_revision;
+		}
+		file_tabs::normalize_document_identities();
 
 		g_chat_messages = {
 			chat_message("Analyze the entry point and identify anti-debug checks.", true, 1),
@@ -157,6 +226,52 @@ namespace aida::preview
 	shell_controls_t& controls()
 	{
 		return fixture_controls;
+	}
+
+	bool set_requested_view(shell_controls_t& target, std::string_view id)
+	{
+		if (id.empty() || id.size() >= target.requested_view_id.size() ||
+			id.find('\0') != std::string_view::npos)
+			return false;
+		const std::string candidate(id);
+		if (!aida::ui::is_valid_stable_id(candidate) ||
+			(candidate.rfind("view.", 0) != 0 && candidate.rfind("document.", 0) != 0) ||
+			!aida::ui::application_views::registry().find_descriptor(
+				aida::ui::stable_view_id_t(candidate)))
+			return false;
+		target.requested_view_id.fill('\0');
+		std::memcpy(target.requested_view_id.data(), id.data(), id.size());
+		target.center_view = -1;
+		target.revision = target.revision == UINT64_MAX ? 1 : target.revision + 1;
+		return true;
+	}
+
+	bool apply_requested_view(const shell_controls_t& source)
+	{
+		std::string candidate;
+		if (source.center_view >= 0) {
+			if (source.center_view > static_cast<int>(center_view_t::xref_database))
+				return false;
+			const char* legacy = legacy_preview_view_id(source.center_view);
+			if (!legacy)
+				return source.center_view == static_cast<int>(center_view_t::welcome);
+			candidate = legacy;
+		} else {
+			const auto terminator = std::find(source.requested_view_id.begin(),
+				source.requested_view_id.end(), '\0');
+			if (terminator == source.requested_view_id.end())
+				return false;
+			candidate.assign(source.requested_view_id.begin(), terminator);
+			if (candidate.empty())
+				return false;
+		}
+		if (!aida::ui::is_valid_stable_id(candidate) ||
+			(candidate.rfind("view.", 0) != 0 && candidate.rfind("document.", 0) != 0))
+			return false;
+		const aida::ui::stable_view_id_t id(candidate);
+		if (!aida::ui::application_views::registry().find_descriptor(id))
+			return false;
+		return aida::ui::application_views::open_or_focus(id).ok();
 	}
 
 	void set_phase(shell_phase_t value)
@@ -224,7 +339,8 @@ namespace aida::preview
 
 	void apply_open_file()
 	{
-		globals::ui::active_center_view = center_view_t::workbench;
+		static_cast<void>(aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("document.disassembly")));
 		globals::ui::breadcrumb_segments = { "AiDA", "sample.exe", ".text", "main" };
 		output_log::push(bottom_tab_t::output, "[preview] Opened sample.exe fixture");
 	}
@@ -238,7 +354,7 @@ namespace aida::preview
 
 	void apply_save_file()
 	{
-		code_editor::dirty = false;
+		aida::preview::editor::save_document();
 		if (file_tabs::active_tab >= 0 && static_cast<std::size_t>(file_tabs::active_tab) < file_tabs::tabs.size())
 			file_tabs::tabs[static_cast<std::size_t>(file_tabs::active_tab)].dirty = false;
 		output_log::push(bottom_tab_t::output, "[preview] Saved active document fixture");
@@ -283,7 +399,8 @@ namespace aida::preview
 	{
 		active_pid = process.pid;
 		active_process_name = process.name;
-		globals::ui::active_center_view = center_view_t::disassembly;
+		static_cast<void>(aida::ui::application_views::open_or_focus(
+			aida::ui::stable_view_id_t("document.disassembly")));
 		record(shell_action_t::attach_process, process.name);
 		output_log::push(bottom_tab_t::driver_log, "[preview] Attached deterministic process fixture " + process.name);
 	}

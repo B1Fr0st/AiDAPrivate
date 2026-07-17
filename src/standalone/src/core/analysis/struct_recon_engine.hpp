@@ -9,12 +9,17 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <Windows.h>
 
 #include "standalone_driver.hpp"
 #include "debugger_engine.hpp"
@@ -23,6 +28,7 @@
 #include "standalone_ai_client.hpp"
 #include "standalone_settings.hpp"
 #include "../infra/executor.hpp"
+#include "../ui/task_center.hpp"
 #include "../../helpers/diag_log.hpp"
 #include "imgui/imgui.h"
 
@@ -163,8 +169,12 @@ struct monitor_config_t {
 
 struct state_t {
 	reconstructed_struct_t current;
+	std::shared_ptr<const reconstructed_struct_t> publication =
+		std::make_shared<const reconstructed_struct_t>();
+	uint64_t current_revision = 0;
 	std::vector<access_record_t> access_log;
 	std::mutex  mutex;
+	std::mutex  persistence_mutex;
 	std::atomic<bool> monitoring{false};
 	std::atomic<bool> cancel{false};
 	std::atomic<float> progress{0.f};
@@ -177,9 +187,23 @@ struct state_t {
 	std::atomic<bool> ai_naming{false};
 	std::vector<reconstructed_struct_t> saved_structs;
 	bool disk_cache_loaded = false;
+	bool disk_cache_loading = false;
 };
 
 inline state_t g_state;
+
+inline void publish_current_locked()
+{
+	++g_state.current_revision;
+	std::atomic_store_explicit(&g_state.publication,
+		std::make_shared<const reconstructed_struct_t>(g_state.current),
+		std::memory_order_release);
+}
+
+inline std::shared_ptr<const reconstructed_struct_t> capture_current_snapshot()
+{
+	return std::atomic_load_explicit(&g_state.publication, std::memory_order_acquire);
+}
 
 inline bool is_valid_utf16_at(uint64_t addr, int& out_len);
 inline void detect_arrays(std::vector<struct_field_t>& fields);
@@ -1090,8 +1114,16 @@ inline void refine_types_from_accesses(std::vector<struct_field_t>& fields)
 
 inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, const std::string& name)
 {
-	if (g_state.monitoring.load()) return;
-	g_state.monitoring.store(true);
+	if (base_address == 0 || struct_size <= 0 || struct_size > 1024 * 1024) {
+		diag::log_tagged_fmt("struct_recon",
+			"reconstruct_request_rejected base=0x%llX size=%d",
+			static_cast<unsigned long long>(base_address), struct_size);
+		return;
+	}
+	bool expected = false;
+	if (!g_state.monitoring.compare_exchange_strong(expected, true,
+		std::memory_order_acq_rel))
+		return;
 	g_state.cancel.store(false);
 	g_state.progress.store(0.f);
 
@@ -1102,10 +1134,10 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 		result.name = name.empty() ? "struct_t" : name;
 
 		std::vector<uint8_t> data;
-		driver_bridge::read_memory(base_address, static_cast<size_t>(struct_size), data);
-		if (data.empty()) {
+		if (!driver_bridge::read_memory(base_address, static_cast<size_t>(struct_size), data) ||
+			data.size() != static_cast<size_t>(struct_size)) {
 			g_state.monitoring.store(false);
-			return;
+			throw std::runtime_error("The structure snapshot could not read the exact requested target range");
 		}
 
 		std::map<uint64_t, struct_field_t> field_map;
@@ -1178,20 +1210,22 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 		}
 
 		result.has_vtable = detail::has_proven_vtable_at_zero(result.fields);
+		if (g_state.cancel.load(std::memory_order_acquire)) {
+			g_state.progress.store(0.f);
+			g_state.monitoring.store(false);
+			return;
+		}
 
 		{
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.current = std::move(result);
 			g_state.active = true;
+			publish_current_locked();
 		}
 
 		g_state.progress.store(1.f);
 		g_state.monitoring.store(false);
 	};
-	if (struct_size > 0 && struct_size <= 4096) {
-		worker();
-		return;
-	}
 	aida::infra::executor::submission_t submission;
 	submission.owner_subsystem = "struct_recon";
 	submission.label = "struct_recon.reconstruct_from_snapshot";
@@ -1199,11 +1233,29 @@ inline void reconstruct_from_snapshot(uint64_t base_address, int struct_size, co
 	submission.domain = aida::infra::executor::domain_t::feature_worker;
 	submission.priority = 2;
 	submission.failure_policy = "reject_not_started";
+	submission.cancel_hook = []() { g_state.cancel.store(true, std::memory_order_release); };
 	submission.body = std::move(worker);
-	if (!aida::infra::executor::submit(std::move(submission)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(submission));
+	if (!submitted.submitted) {
 		g_state.progress.store(1.f);
 		g_state.monitoring.store(false);
+		return;
 	}
+	aida::ui::task_center::task_registration_t registration;
+	registration.owner = "analysis";
+	registration.owner_view = "view.types.struct_recon";
+	registration.owner_action = "types.reconstruct_snapshot";
+	registration.label = "Reconstruct structure snapshot";
+	registration.stage = "Queued";
+	registration.progress = -1.f;
+	registration.target = "Address " + std::to_string(base_address);
+	registration.cancellation_is_safe = true;
+	registration.callbacks.cancel = []() {
+		g_state.cancel.store(true, std::memory_order_release);
+		return true;
+	};
+	static_cast<void>(aida::ui::task_center::register_executor_job(
+		submitted.task_id, std::move(registration)));
 }
 
 namespace insn_analysis {
@@ -1587,6 +1639,7 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			std::lock_guard<std::mutex> lk(g_state.mutex);
 			g_state.current = result;
 			g_state.active = true;
+			publish_current_locked();
 		}
 		diag::log_tagged_fmt("struct_recon", "monitor_post_initial_result base=0x%llX fields=%zu has_vtable=%d elapsed_ms=%llu",
 			static_cast<unsigned long long>(base_address),
@@ -1953,6 +2006,7 @@ inline void monitor_with_hwbp(uint64_t base_address, int struct_size, const std:
 			g_state.current.has_vtable = detail::has_proven_vtable_at_zero(g_state.current.fields);
 
 			g_state.history.push_back(g_state.current);
+			publish_current_locked();
 			diag::log_tagged_fmt("struct_recon", "monitor_inference_state base=0x%llX fields=%zu access_log=%zu history=%zu has_vtable=%d",
 				static_cast<unsigned long long>(base_address),
 				g_state.current.fields.size(),
@@ -2187,6 +2241,7 @@ inline void ai_name_fields()
 					}
 				}
 			}
+			publish_current_locked();
 		}
 
 		g_state.ai_naming.store(false);
@@ -2244,19 +2299,40 @@ inline void detect_arrays(std::vector<struct_field_t>& fields)
 	}
 }
 
-inline void refresh_value_history()
+inline bool refresh_value_history(std::string& error)
 {
-	std::lock_guard<std::mutex> lk(g_state.mutex);
-	if (!g_state.active) return;
-
-	auto& s = g_state.current;
-	if (s.base_address == 0 || s.fields.empty()) return;
+	uint64_t revision = 0;
+	uint64_t base_address = 0;
+	int total_size = 0;
+	{
+		std::lock_guard<std::mutex> lk(g_state.mutex);
+		if (!g_state.active || g_state.current.base_address == 0 ||
+			g_state.current.total_size <= 0 || g_state.current.fields.empty())
+		{
+			error = "No active reconstructed structure owns a readable live range";
+			return false;
+		}
+		revision = g_state.current_revision;
+		base_address = g_state.current.base_address;
+		total_size = g_state.current.total_size;
+	}
 
 	std::vector<uint8_t> data;
-	driver_bridge::read_memory(s.base_address, static_cast<size_t>(s.total_size), data);
-	if (data.empty()) return;
+	if (!driver_bridge::read_memory(base_address, static_cast<size_t>(total_size), data) ||
+		data.size() != static_cast<size_t>(total_size)) {
+		error = "The exact reconstructed live range could not be read";
+		return false;
+	}
 
-	for (auto& f : s.fields) {
+	std::lock_guard<std::mutex> lk(g_state.mutex);
+	if (!g_state.active || g_state.current_revision != revision ||
+		g_state.current.base_address != base_address ||
+		g_state.current.total_size != total_size) {
+		error = "The structure revision changed before live values could be published";
+		return false;
+	}
+
+	for (auto& f : g_state.current.fields) {
 		if (f.offset + static_cast<uint64_t>(f.size) > data.size()) continue;
 
 		int elem_size = f.size;
@@ -2268,162 +2344,416 @@ inline void refresh_value_history()
 		std::memcpy(&val, data.data() + f.offset, static_cast<size_t>(read_sz));
 		f.value_history.push(val);
 
-		auto scored = detail::infer_type_scored(data.data() + f.offset, elem_size, s.base_address);
+		auto scored = detail::infer_type_scored(data.data() + f.offset, elem_size, base_address);
 		if (scored.score > f.type_confidence) {
 			f.type_confidence = scored.score;
 			if (scored.score >= 50.f && f.array_count <= 1)
 				f.type = scored.type;
 		}
 	}
+	publish_current_locked();
+	error.clear();
+	return true;
 }
 
-inline std::string get_struct_cache_dir()
+inline constexpr std::size_t max_persisted_structures = 1024;
+inline constexpr std::size_t max_persisted_fields = 65536;
+inline constexpr std::size_t max_persisted_vtable_entries = 4096;
+inline constexpr std::uint64_t max_persisted_file_bytes = 64ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint64_t max_persisted_catalog_bytes = 256ULL * 1024ULL * 1024ULL;
+
+inline std::filesystem::path get_struct_cache_dir()
 {
 	const char* appdata = std::getenv("APPDATA");
-	if (!appdata) return {};
-	return std::string(appdata) + "\\AiDA\\Standalone\\structs";
+	if (!appdata || !*appdata) return {};
+	return std::filesystem::path(appdata) / "AiDA" / "Standalone" / "structs";
 }
 
-inline void save_struct_to_disk(const reconstructed_struct_t& s)
+inline std::filesystem::path persisted_struct_path(const reconstructed_struct_t& structure)
 {
-	std::string dir = get_struct_cache_dir();
-	if (dir.empty()) return;
+	std::string prefix;
+	prefix.reserve(48);
+	for (const unsigned char character : structure.name) {
+		if (prefix.size() >= 48) break;
+		if ((character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '_' || character == '-')
+			prefix.push_back(static_cast<char>(character));
+		else if (!prefix.empty() && prefix.back() != '_')
+			prefix.push_back('_');
+	}
+	if (prefix.empty()) prefix = "structure";
+	std::uint64_t hash = 1469598103934665603ULL;
+	for (const unsigned char character : structure.name) {
+		hash ^= character;
+		hash *= 1099511628211ULL;
+	}
+	char suffix[24]{};
+	std::snprintf(suffix, sizeof(suffix), "_%016llx.json",
+		static_cast<unsigned long long>(hash));
+	return get_struct_cache_dir() / (prefix + suffix);
+}
 
-	std::error_code ec;
-	std::filesystem::create_directories(dir, ec);
-	if (ec) return;
-
-	nlohmann::json j;
-	j["name"] = s.name;
-	j["base_address"] = s.base_address;
-	j["total_size"] = s.total_size;
-	j["has_vtable"] = s.has_vtable;
-	j["vtable_address"] = s.vtable_address;
-
-	nlohmann::json jfields = nlohmann::json::array();
-	for (auto& f : s.fields) {
-		nlohmann::json jf;
-		jf["offset"] = f.offset;
-		jf["size"] = f.size;
-		jf["type"] = static_cast<int>(f.type);
-		jf["name"] = f.name;
-		jf["comment"] = f.comment;
-		jf["type_confidence"] = f.type_confidence;
-		jf["array_count"] = f.array_count;
-
-		if (!f.vtable_entries.empty()) {
-			nlohmann::json jvt = nlohmann::json::array();
-			for (auto& ve : f.vtable_entries) {
-				nlohmann::json jve;
-				jve["func_addr"] = ve.func_addr;
-				jve["index"] = ve.index;
-				jve["name"] = ve.name;
-				jvt.push_back(jve);
-			}
-			jf["vtable_entries"] = jvt;
+inline bool validate_persisted_structure(const reconstructed_struct_t& structure,
+	std::string& error)
+{
+	if (structure.name.empty() || structure.name.size() > 256) {
+		error = "The structure name must contain between 1 and 256 bytes";
+		return false;
+	}
+	if (structure.total_size <= 0 || structure.total_size > 1024 * 1024 ||
+		structure.fields.empty() || structure.fields.size() > max_persisted_fields) {
+		error = "The structure size or field count exceeds the persistence contract";
+		return false;
+	}
+	for (const auto& field : structure.fields) {
+		if (field.size <= 0 || field.offset > static_cast<std::uint64_t>(structure.total_size) ||
+			static_cast<std::uint64_t>(field.size) >
+				static_cast<std::uint64_t>(structure.total_size) - field.offset ||
+			field.name.empty() || field.name.size() > 256 || field.comment.size() > 4096 ||
+			field.array_count <= 0 || field.array_count > 1048576 ||
+			!std::isfinite(field.type_confidence) || field.type_confidence < 0.f ||
+			field.type_confidence > 100.f || static_cast<int>(field.type) < 0 ||
+			static_cast<int>(field.type) >= static_cast<int>(field_type_t::COUNT) ||
+			field.vtable_entries.size() > max_persisted_vtable_entries) {
+			error = "A structure field violates the bounded persistence contract";
+			return false;
 		}
-
-		jfields.push_back(jf);
+		for (const auto& entry : field.vtable_entries) {
+			if (entry.index < 0 || entry.name.size() > 256) {
+				error = "A virtual-table entry violates the bounded persistence contract";
+				return false;
+			}
+		}
 	}
-	j["fields"] = jfields;
-
-	std::string safe_name = s.name;
-	for (auto& c : safe_name) {
-		if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' ||
-		    c == '"' || c == '<' || c == '>' || c == '|' || c == ' ')
-			c = '_';
-	}
-
-	std::string path = dir + "\\" + safe_name + ".json";
-	std::ofstream ofs(path);
-	if (ofs.is_open()) {
-		ofs << j.dump(2);
-	}
+	error.clear();
+	return true;
 }
 
-inline void load_structs_from_disk()
+inline bool write_persisted_structure(const std::filesystem::path& destination,
+	const std::string& payload, std::string& error)
 {
-	if (g_state.disk_cache_loaded) return;
-	g_state.disk_cache_loaded = true;
+	if (payload.empty() || payload.size() > max_persisted_file_bytes) {
+		error = "The serialized structure exceeds the 64 MiB persistence limit";
+		return false;
+	}
+	const std::filesystem::path temporary = destination.wstring() + L".tmp-" +
+		std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+	HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		error = "The structure temporary file could not be created";
+		return false;
+	}
+	std::size_t written_total = 0;
+	bool ok = true;
+	while (written_total < payload.size()) {
+		const DWORD requested = static_cast<DWORD>((std::min)(payload.size() - written_total,
+			static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+		DWORD written = 0;
+		if (!WriteFile(file, payload.data() + written_total, requested, &written, nullptr) ||
+			written != requested) {
+			ok = false;
+			break;
+		}
+		written_total += written;
+	}
+	LARGE_INTEGER final_size{};
+	if (ok && (!FlushFileBuffers(file) || !GetFileSizeEx(file, &final_size) ||
+		final_size.QuadPart != static_cast<LONGLONG>(payload.size())))
+		ok = false;
+	if (!CloseHandle(file)) ok = false;
+	if (ok && !MoveFileExW(temporary.c_str(), destination.c_str(),
+		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		ok = false;
+	if (!ok) {
+		DeleteFileW(temporary.c_str());
+		error = "The structure file could not be written, flushed, verified and atomically replaced";
+		return false;
+	}
+	error.clear();
+	return true;
+}
 
-	std::string dir = get_struct_cache_dir();
-	if (dir.empty()) return;
-
+inline bool save_struct_to_disk(const reconstructed_struct_t& structure, std::string& error)
+{
+	std::lock_guard<std::mutex> persistence_lock(g_state.persistence_mutex);
+	if (!validate_persisted_structure(structure, error)) return false;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		const bool replacing = std::any_of(g_state.saved_structs.begin(),
+			g_state.saved_structs.end(), [&](const reconstructed_struct_t& item) {
+				return item.name == structure.name;
+			});
+		if (!replacing && g_state.saved_structs.size() >= max_persisted_structures) {
+			error = "The structure catalog already contains 1024 records";
+			return false;
+		}
+	}
+	const auto directory = get_struct_cache_dir();
+	if (directory.empty()) {
+		error = "The per-user structure persistence directory is unavailable";
+		return false;
+	}
 	std::error_code ec;
-	if (!std::filesystem::exists(dir, ec)) return;
+	std::filesystem::create_directories(directory, ec);
+	if (ec) {
+		error = "The per-user structure persistence directory could not be created";
+		return false;
+	}
+	nlohmann::json json;
+	json["version"] = 2;
+	json["name"] = structure.name;
+	json["base_address"] = structure.base_address;
+	json["total_size"] = structure.total_size;
+	json["has_vtable"] = structure.has_vtable;
+	json["vtable_address"] = structure.vtable_address;
+	json["fields"] = nlohmann::json::array();
+	for (const auto& field : structure.fields) {
+		nlohmann::json record{{"offset", field.offset}, {"size", field.size},
+			{"type", static_cast<int>(field.type)}, {"name", field.name},
+			{"comment", field.comment}, {"type_confidence", field.type_confidence},
+			{"array_count", field.array_count}};
+		if (!field.vtable_entries.empty()) {
+			record["vtable_entries"] = nlohmann::json::array();
+			for (const auto& entry : field.vtable_entries)
+				record["vtable_entries"].push_back({{"func_addr", entry.func_addr},
+					{"index", entry.index}, {"name", entry.name}});
+		}
+		json["fields"].push_back(std::move(record));
+	}
+	const std::string payload = json.dump(2);
+	if (!write_persisted_structure(persisted_struct_path(structure), payload, error))
+		return false;
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		auto found = std::find_if(g_state.saved_structs.begin(), g_state.saved_structs.end(),
+			[&](const reconstructed_struct_t& item) { return item.name == structure.name; });
+		if (found != g_state.saved_structs.end())
+			*found = structure;
+		else if (g_state.saved_structs.size() < max_persisted_structures)
+			g_state.saved_structs.push_back(structure);
+	}
+	error.clear();
+	return true;
+}
 
-	for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-		if (ec) break;
-		if (!entry.is_regular_file()) continue;
-		if (entry.path().extension() != ".json") continue;
-
-		std::ifstream ifs(entry.path());
-		if (!ifs.is_open()) continue;
-
-		auto j = nlohmann::json::parse(ifs, nullptr, false);
-		if (j.is_discarded()) continue;
-
-		reconstructed_struct_t s;
-		s.name = j.value("name", std::string("unnamed"));
-		s.base_address = j.value("base_address", uint64_t(0));
-		s.total_size = j.value("total_size", 0);
-		s.has_vtable = j.value("has_vtable", false);
-		s.vtable_address = j.value("vtable_address", uint64_t(0));
-
-		if (j.contains("fields") && j["fields"].is_array()) {
-			for (auto& jf : j["fields"]) {
-				struct_field_t f;
-				f.offset = jf.value("offset", uint64_t(0));
-				f.size = jf.value("size", 0);
-				f.type = static_cast<field_type_t>(jf.value("type", 0));
-				f.name = jf.value("name", std::string{});
-				f.comment = jf.value("comment", std::string{});
-				f.type_confidence = jf.value("type_confidence", 0.f);
-				f.array_count = jf.value("array_count", 1);
-
-				if (jf.contains("vtable_entries") && jf["vtable_entries"].is_array()) {
-					for (auto& jve : jf["vtable_entries"]) {
-						vtable_entry_t ve;
-						ve.func_addr = jve.value("func_addr", uint64_t(0));
-						ve.index = jve.value("index", 0);
-						ve.name = jve.value("name", std::string{});
-						f.vtable_entries.push_back(ve);
-					}
+inline bool parse_persisted_structure(const nlohmann::json& json,
+	reconstructed_struct_t& structure, std::string& error, int& format_version)
+{
+	format_version = 1;
+	if (json.is_object() && json.contains("version")) {
+		if (!json["version"].is_number_integer() || json["version"].get<int>() != 2) {
+			error = "A structure file uses an unsupported persistence version";
+			return false;
+		}
+		format_version = 2;
+	}
+	if (!json.is_object() || !json.contains("name") ||
+		!json["name"].is_string() || !json.contains("base_address") ||
+		!json["base_address"].is_number_unsigned() || !json.contains("total_size") ||
+		!json["total_size"].is_number_integer() || !json.contains("fields") ||
+		!json["fields"].is_array() || json["fields"].size() > max_persisted_fields) {
+		error = "A structure file has an unsupported or malformed root record";
+		return false;
+	}
+	structure = {};
+	const auto total_size = json["total_size"].get<std::int64_t>();
+	if (total_size <= 0 || total_size > 1024 * 1024) {
+		error = "A structure file contains an invalid total size";
+		return false;
+	}
+	structure.name = json["name"].get<std::string>();
+	structure.base_address = json["base_address"].get<std::uint64_t>();
+	structure.total_size = static_cast<int>(total_size);
+	if ((json.contains("has_vtable") && !json["has_vtable"].is_boolean()) ||
+		(json.contains("vtable_address") && !json["vtable_address"].is_number_unsigned())) {
+		error = "A structure file contains malformed virtual-table metadata";
+		return false;
+	}
+	structure.has_vtable = json.value("has_vtable", false);
+	structure.vtable_address = json.value("vtable_address", std::uint64_t{0});
+	for (const auto& record : json["fields"]) {
+		if (!record.is_object() || !record.contains("offset") || !record["offset"].is_number_unsigned() ||
+			!record.contains("size") || !record["size"].is_number_integer() ||
+			!record.contains("type") || !record["type"].is_number_integer() ||
+			!record.contains("name") || !record["name"].is_string() ||
+			!record.contains("comment") || !record["comment"].is_string() ||
+			!record.contains("type_confidence") || !record["type_confidence"].is_number() ||
+			!record.contains("array_count") || !record["array_count"].is_number_integer()) {
+			error = "A structure file contains a malformed field record";
+			return false;
+		}
+		struct_field_t field;
+		const auto field_size = record["size"].get<std::int64_t>();
+		const auto field_type = record["type"].get<std::int64_t>();
+		const auto array_count = record["array_count"].get<std::int64_t>();
+		if (field_size <= 0 || field_size > 1024 * 1024 || field_type < 0 ||
+			field_type >= static_cast<std::int64_t>(field_type_t::COUNT) ||
+			array_count <= 0 || array_count > 1048576) {
+			error = "A structure file contains an out-of-range field value";
+			return false;
+		}
+		field.offset = record["offset"].get<std::uint64_t>();
+		field.size = static_cast<int>(field_size);
+		field.type = static_cast<field_type_t>(field_type);
+		field.name = record["name"].get<std::string>();
+		field.comment = record["comment"].get<std::string>();
+		field.type_confidence = record["type_confidence"].get<float>();
+		field.array_count = static_cast<int>(array_count);
+		if (record.contains("vtable_entries")) {
+			if (!record["vtable_entries"].is_array() ||
+				record["vtable_entries"].size() > max_persisted_vtable_entries) {
+				error = "A structure file contains an oversized virtual-table record";
+				return false;
+			}
+			for (const auto& item : record["vtable_entries"]) {
+				if (!item.is_object() || !item.contains("func_addr") ||
+					!item["func_addr"].is_number_unsigned() || !item.contains("index") ||
+					!item["index"].is_number_integer() || !item.contains("name") ||
+					!item["name"].is_string()) {
+					error = "A structure file contains a malformed virtual-table entry";
+					return false;
 				}
-
-				s.fields.push_back(f);
+				field.vtable_entries.push_back({item["func_addr"].get<std::uint64_t>(),
+					item["index"].get<int>(), item["name"].get<std::string>()});
 			}
 		}
-		for (auto& f : s.fields)
-			detail::enforce_vtable_field_proof(f);
-		std::sort(s.fields.begin(), s.fields.end(),
-			[](const struct_field_t& a, const struct_field_t& b) { return a.offset < b.offset; });
-		s.has_vtable = detail::has_proven_vtable_at_zero(s.fields);
-		if (!s.has_vtable)
-			s.vtable_address = 0;
-
-		g_state.saved_structs.push_back(std::move(s));
+		structure.fields.push_back(std::move(field));
 	}
+	if (!validate_persisted_structure(structure, error)) return false;
+	for (auto& field : structure.fields) detail::enforce_vtable_field_proof(field);
+	std::sort(structure.fields.begin(), structure.fields.end(),
+		[](const struct_field_t& left, const struct_field_t& right) {
+			return left.offset < right.offset;
+		});
+	structure.has_vtable = detail::has_proven_vtable_at_zero(structure.fields);
+	if (!structure.has_vtable) structure.vtable_address = 0;
+	error.clear();
+	return true;
 }
 
-inline void delete_saved_struct(int index)
+inline bool load_structs_from_disk(std::string& error)
 {
-	if (index < 0 || index >= static_cast<int>(g_state.saved_structs.size())) return;
-
-	std::string dir = get_struct_cache_dir();
-	if (!dir.empty()) {
-		std::string safe_name = g_state.saved_structs[index].name;
-		for (auto& c : safe_name) {
-			if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' ||
-			    c == '"' || c == '<' || c == '>' || c == '|' || c == ' ')
-				c = '_';
+	std::lock_guard<std::mutex> persistence_lock(g_state.persistence_mutex);
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		if (g_state.disk_cache_loaded) {
+			error.clear();
+			return true;
 		}
-		std::string path = dir + "\\" + safe_name + ".json";
-		std::error_code ec;
-		std::filesystem::remove(path, ec);
+		if (g_state.disk_cache_loading) {
+			error = "A structure catalog load is already running";
+			return false;
+		}
+		g_state.disk_cache_loading = true;
 	}
-
-	g_state.saved_structs.erase(g_state.saved_structs.begin() + index);
+	const auto finish = [](bool loaded) {
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		g_state.disk_cache_loading = false;
+		if (loaded) g_state.disk_cache_loaded = true;
+	};
+	const auto directory = get_struct_cache_dir();
+	if (directory.empty()) {
+		error = "The per-user structure persistence directory is unavailable";
+		finish(false);
+		return false;
+	}
+	std::error_code ec;
+	if (!std::filesystem::exists(directory, ec)) {
+		if (ec) {
+			error = "The structure persistence directory could not be inspected";
+			finish(false);
+			return false;
+		}
+		finish(true);
+		error.clear();
+		return true;
+	}
+	struct loaded_structure_t {
+		reconstructed_struct_t structure;
+		int format_version = 1;
+	};
+	std::vector<loaded_structure_t> loaded;
+	std::uint64_t aggregate_bytes = 0;
+	std::size_t directory_entries = 0;
+	for (std::filesystem::directory_iterator iterator(directory, ec), end;
+		!ec && iterator != end; iterator.increment(ec)) {
+		if (++directory_entries > 4096) {
+			error = "The structure persistence directory exceeds 4096 entries";
+			finish(false);
+			return false;
+		}
+		if (!iterator->is_regular_file(ec) || ec || iterator->path().extension() != ".json")
+			continue;
+		const auto size = iterator->file_size(ec);
+		if (ec || size == 0 || size > max_persisted_file_bytes ||
+			aggregate_bytes > max_persisted_catalog_bytes - size) {
+			error = "A structure file or aggregate catalog exceeds its persistence bound";
+			finish(false);
+			return false;
+		}
+		aggregate_bytes += size;
+		std::ifstream input(iterator->path(), std::ios::binary);
+		if (!input) {
+			error = "A structure file could not be opened";
+			finish(false);
+			return false;
+		}
+		std::string payload(static_cast<std::size_t>(size), '\0');
+		input.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+		if (input.gcount() != static_cast<std::streamsize>(payload.size())) {
+			error = "A structure file completed with a short read";
+			finish(false);
+			return false;
+		}
+		const auto json = nlohmann::json::parse(payload, nullptr, false);
+		reconstructed_struct_t structure;
+		int format_version = 1;
+		if (json.is_discarded() || !parse_persisted_structure(json, structure, error,
+				format_version)) {
+			if (error.empty()) error = "A structure file contains malformed JSON";
+			finish(false);
+			return false;
+		}
+		auto duplicate = std::find_if(loaded.begin(), loaded.end(),
+			[&](const loaded_structure_t& item) {
+				return item.structure.name == structure.name;
+			});
+		if (duplicate == loaded.end()) {
+			if (loaded.size() >= max_persisted_structures) {
+				error = "The structure catalog exceeds 1024 unique records";
+				finish(false);
+				return false;
+			}
+			loaded.push_back({std::move(structure), format_version});
+		} else if (format_version > duplicate->format_version)
+			*duplicate = {std::move(structure), format_version};
+	}
+	if (ec) {
+		error = "The structure persistence directory could not be enumerated completely";
+		finish(false);
+		return false;
+	}
+	std::sort(loaded.begin(), loaded.end(), [](const auto& left, const auto& right) {
+		return left.structure.name < right.structure.name;
+	});
+	std::vector<reconstructed_struct_t> staging;
+	staging.reserve(loaded.size());
+	for (auto& item : loaded) staging.push_back(std::move(item.structure));
+	{
+		std::lock_guard<std::mutex> lock(g_state.mutex);
+		g_state.saved_structs = std::move(staging);
+		if (!g_state.saved_structs.empty()) {
+			g_state.current = g_state.saved_structs.front();
+			g_state.active = true;
+			publish_current_locked();
+		}
+		g_state.disk_cache_loading = false;
+		g_state.disk_cache_loaded = true;
+	}
+	error.clear();
+	return true;
 }
 
 inline void cancel()

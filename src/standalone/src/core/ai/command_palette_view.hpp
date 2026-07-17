@@ -22,6 +22,7 @@
 #include "transition.hpp"
 #include "toast_notification.hpp"
 #include "../ui/application_ui_runtime.hpp"
+#include "../ui/quick_open_view.hpp"
 #include "../../preview/studio_semantics.hpp"
 
 #include "../helpers/globals.h"
@@ -746,6 +747,9 @@ namespace command_palette {
 
 	inline void render()
 	{
+		quick_open::render();
+		if (globals::ui::quick_open_open)
+			return;
 		using namespace detail;
 		const auto& th = ui::resolved();
 

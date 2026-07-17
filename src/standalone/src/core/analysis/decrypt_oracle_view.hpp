@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,11 @@ struct local_state_t {
 	float anim_time = 0.f;
 	char  filter_buf[64] = {};
 	int   prev_result_count = 0;
+	std::shared_ptr<const std::vector<decrypt_oracle::decrypted_string_t>> summary_source;
+	int   summary_found = 0;
+	int   summary_strong = 0;
+	int   summary_total_length = 0;
+	double summary_average_confidence = 0.0;
 	std::unordered_map<uint64_t, row_anim_t> row_anims;
 };
 
@@ -65,6 +71,21 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	auto* dl = ImGui::GetWindowDrawList();
 	auto& st = s_state;
 	auto& oracle = decrypt_oracle::g_state;
+	const auto results_snapshot = decrypt_oracle::capture_results();
+	if (st.summary_source != results_snapshot) {
+		st.summary_source = results_snapshot;
+		st.summary_found = static_cast<int>(results_snapshot->size());
+		st.summary_strong = 0;
+		st.summary_total_length = 0;
+		st.summary_average_confidence = 0.0;
+		for (const auto& result : *results_snapshot) {
+			st.summary_average_confidence += result.confidence;
+			if (result.confidence >= 0.9f) ++st.summary_strong;
+			st.summary_total_length += result.length;
+		}
+		if (st.summary_found > 0)
+			st.summary_average_confidence /= static_cast<double>(st.summary_found);
+	}
 
 	ImVec2 wp = ImGui::GetWindowPos();
 	float cx = wp.x;
@@ -174,21 +195,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	float strip_y = cy + toolbar_h + 4.f;
 	{
-		std::vector<decrypt_oracle::decrypted_string_t> ss_copy;
-		{
-			std::lock_guard<std::mutex> lk(oracle.mutex);
-			ss_copy = oracle.results;
-		}
-		int found = static_cast<int>(ss_copy.size());
-		double avg_conf = 0.0;
-		int strong = 0;
-		int total_len = 0;
-		for (auto& r : ss_copy) {
-			avg_conf += r.confidence;
-			if (r.confidence >= 0.9f) strong++;
-			total_len += r.length;
-		}
-		if (found > 0) avg_conf /= static_cast<double>(found);
+		const int found = st.summary_found;
+		const double avg_conf = st.summary_average_confidence;
+		const int strong = st.summary_strong;
+		const int total_len = st.summary_total_length;
 
 		ImVec2 sa = ImVec2(cx + 8.f, strip_y);
 		ImVec2 sb = ImVec2(cx + width - 8.f, strip_y + strip_h - 8.f);
@@ -262,24 +272,23 @@ inline void render(float pos_x, float pos_y, float width, float height,
 	float conf_x = hx + col_func_w + col_offset_w + col_string_w;
 	hy += row_h;
 
-	std::vector<decrypt_oracle::decrypted_string_t> results_copy;
-	{
-		std::lock_guard<std::mutex> lk(oracle.mutex);
-		results_copy = oracle.results;
+	if (static_cast<int>(results_snapshot->size()) < st.prev_result_count) {
+		st.prev_result_count = 0;
+		st.row_anims.clear();
+		st.selected_row = -1;
 	}
-
-	if (static_cast<int>(results_copy.size()) > st.prev_result_count) {
-		for (int i = st.prev_result_count; i < static_cast<int>(results_copy.size()); ++i) {
-			uint64_t key = results_copy[static_cast<std::size_t>(i)].xref_addr;
+	if (static_cast<int>(results_snapshot->size()) > st.prev_result_count) {
+		for (int i = st.prev_result_count; i < static_cast<int>(results_snapshot->size()); ++i) {
+			uint64_t key = (*results_snapshot)[static_cast<std::size_t>(i)].xref_addr;
 			auto& ra = st.row_anims[key];
 			ra.spawned_at = st.anim_time;
 			ra.conf_anim.start(aida::motion::dur::lg, aida::motion::ease::out_cubic);
 		}
 	}
-	st.prev_result_count = static_cast<int>(results_copy.size());
+	st.prev_result_count = static_cast<int>(results_snapshot->size());
 
 	int visible_rows = static_cast<int>((table_h - row_h) / row_h);
-	int total_rows = static_cast<int>(results_copy.size());
+	int total_rows = static_cast<int>(results_snapshot->size());
 
 	if (ImGui::IsMouseHoveringRect(ImVec2(cx, table_top), ImVec2(cx + width, cy + height))) {
 		float wheel = ImGui::GetIO().MouseWheel;
@@ -299,7 +308,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		float ry = hy + static_cast<float>(i - start_row) * row_h;
 		if (ry > cy + height) break;
 
-		auto& r = results_copy[static_cast<std::size_t>(i)];
+		const auto& r = (*results_snapshot)[static_cast<std::size_t>(i)];
 		auto& ra = st.row_anims[r.xref_addr];
 		ra.conf_anim.tick(dt);
 

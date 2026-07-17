@@ -7,14 +7,15 @@
 #include "../infra/executor.hpp"
 #include "../../helpers/diag_log.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <regex>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,8 @@ struct search_state_t
     std::atomic<bool>             launch_pending{false};
     std::atomic<int>              files_scanned{0};
     std::atomic<int>              match_count{0};
+    std::atomic<std::uint64_t>    generation{0};
+    std::atomic<bool>             truncated{false};
 
 
     bool                          panel_open = false;
@@ -181,22 +184,28 @@ inline bool path_matches_aidaignore(const std::string& full_path,
     return false;
 }
 
-inline void search_worker(std::string root_dir, std::string query,
+inline void search_worker(std::vector<std::string> root_dirs, std::string query,
                           bool case_sensitive, bool whole_word, bool use_regex,
                           std::vector<std::string> include_globs,
-                          std::vector<std::string> exclude_globs)
+                          std::vector<std::string> exclude_globs,
+                          std::uint64_t generation)
 {
     auto& st = g_search;
+    if (generation != st.generation.load(std::memory_order_acquire))
+        return;
+    const auto cancelled = [&st, generation]() {
+        return st.cancel.load(std::memory_order_acquire) ||
+            generation != st.generation.load(std::memory_order_acquire);
+    };
     st.files_scanned.store(0);
     st.match_count.store(0);
+    st.truncated.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(st.results_mtx);
         st.results.clear();
         st.selected_idx = -1;
     }
 
-
-    auto aidaignore = load_aidaignore_patterns(root_dir);
 
     std::regex re;
     if (use_regex) {
@@ -205,10 +214,12 @@ inline void search_worker(std::string root_dir, std::string query,
             if (!case_sensitive) flags |= std::regex_constants::icase;
             re.assign(query, flags);
         } catch (const std::regex_error&) {
-            st.searching.store(false);
+            if (generation == st.generation.load(std::memory_order_acquire))
+                st.searching.store(false, std::memory_order_release);
             return;
         } catch (...) {
-            st.searching.store(false);
+            if (generation == st.generation.load(std::memory_order_acquire))
+                st.searching.store(false, std::memory_order_release);
             return;
         }
     }
@@ -219,13 +230,21 @@ inline void search_worker(std::string root_dir, std::string query,
         for (auto& ch : query_lower)
             ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
 
-    std::error_code ec;
-    auto end_it = std::filesystem::recursive_directory_iterator();
-    auto it = std::filesystem::recursive_directory_iterator(root_dir, ec);
-    while (it != end_it)
-    {
-        if (st.cancel.load(std::memory_order_acquire))
+    for (const auto& root_dir : root_dirs) {
+        if (cancelled()) break;
+        const auto aidaignore = load_aidaignore_patterns(root_dir);
+        std::error_code ec;
+        auto end_it = std::filesystem::recursive_directory_iterator();
+        auto it = std::filesystem::recursive_directory_iterator(root_dir,
+            std::filesystem::directory_options::skip_permission_denied, ec);
+        while (it != end_it)
+        {
+        if (cancelled())
             break;
+        if (st.files_scanned.load(std::memory_order_relaxed) >= 1000000) {
+            st.truncated.store(true, std::memory_order_release);
+            break;
+        }
 
         bool skip_iteration = false;
 
@@ -277,6 +296,13 @@ inline void search_worker(std::string root_dir, std::string query,
             continue;
         }
 
+        std::error_code size_error;
+        const auto source_size = std::filesystem::file_size(path, size_error);
+        if (size_error || source_size > 16ULL * 1024ULL * 1024ULL) {
+            it.increment(ec);
+            if (ec) break;
+            continue;
+        }
         std::ifstream ifs(path, std::ios::in);
         if (!ifs.is_open()) {
             it.increment(ec);
@@ -290,7 +316,7 @@ inline void search_worker(std::string root_dir, std::string query,
         int line_no = 0;
         while (std::getline(ifs, line)) {
             ++line_no;
-            if (st.cancel.load(std::memory_order_acquire))
+            if (cancelled())
                 break;
 
             if (use_regex) {
@@ -306,8 +332,10 @@ inline void search_worker(std::string root_dir, std::string query,
                     if (mr.line_text.size() > 512) mr.line_text.resize(512);
 
                     std::lock_guard<std::mutex> lk(st.results_mtx);
-                    st.results.push_back(std::move(mr));
-                    st.match_count.fetch_add(1, std::memory_order_relaxed);
+                    if (!cancelled() && st.results.size() < 50000) {
+                        st.results.push_back(std::move(mr));
+                        st.match_count.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             } else {
 
@@ -339,8 +367,10 @@ inline void search_worker(std::string root_dir, std::string query,
                         if (mr.line_text.size() > 512) mr.line_text.resize(512);
 
                         std::lock_guard<std::mutex> lk(st.results_mtx);
-                        st.results.push_back(std::move(mr));
-                        st.match_count.fetch_add(1, std::memory_order_relaxed);
+                        if (!cancelled() && st.results.size() < 50000) {
+                            st.results.push_back(std::move(mr));
+                            st.match_count.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
                     pos += needle.size();
                     if (needle.empty()) break;
@@ -348,26 +378,40 @@ inline void search_worker(std::string root_dir, std::string query,
             }
 
 
-            if (st.match_count.load(std::memory_order_relaxed) > 50000)
+            if (st.match_count.load(std::memory_order_relaxed) >= 50000)
+            {
+                st.truncated.store(true, std::memory_order_release);
                 break;
+            }
         }
-        if (st.match_count.load(std::memory_order_relaxed) > 50000)
+        if (st.match_count.load(std::memory_order_relaxed) >= 50000)
+        {
+            st.truncated.store(true, std::memory_order_release);
             break;
+        }
 
         it.increment(ec);
         if (ec) break;
+        }
+        if (st.truncated.load(std::memory_order_acquire) ||
+            st.match_count.load(std::memory_order_relaxed) >= 50000)
+            break;
     }
 
-    st.searching.store(false, std::memory_order_release);
+    if (generation == st.generation.load(std::memory_order_acquire))
+        st.searching.store(false, std::memory_order_release);
 }
 
 
-inline void start_search(const std::string& root_dir)
+inline void start_search(std::vector<std::string> root_dirs)
 {
     auto& st = g_search;
 
     std::string query(st.query_buf);
-    if (query.empty() || root_dir.empty())
+    root_dirs.erase(std::remove_if(root_dirs.begin(), root_dirs.end(),
+        [](const std::string& root) { return root.empty(); }), root_dirs.end());
+    if (root_dirs.size() > 8) root_dirs.resize(8);
+    if (query.empty() || root_dirs.empty())
         return;
 
     bool expected_pending = false;
@@ -377,7 +421,8 @@ inline void start_search(const std::string& root_dir)
     if (st.searching.load(std::memory_order_acquire))
         st.cancel.store(true, std::memory_order_release);
 
-    std::string root_dir_copy = root_dir;
+    const std::uint64_t generation = st.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+
     bool case_sensitive = st.case_sensitive;
     bool whole_word     = st.whole_word;
     bool use_regex      = st.use_regex;
@@ -390,27 +435,33 @@ inline void start_search(const std::string& root_dir)
     sub.thread_class = "bounded_task";
     sub.domain = aida::infra::executor::domain_t::feature_worker;
     sub.priority = 3;
-    sub.body = [root_dir_copy = std::move(root_dir_copy),
+    sub.generation = generation;
+    sub.body = [root_dirs = std::move(root_dirs),
                 query = std::move(query),
                 case_sensitive, whole_word, use_regex,
                 includes = std::move(includes),
-                excludes = std::move(excludes)]() mutable {
+                excludes = std::move(excludes), generation]() mutable {
         auto& s = g_search;
-        for (int i = 0; i < 500 && s.searching.load(std::memory_order_acquire); ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
+        if (generation != s.generation.load(std::memory_order_acquire))
+            return;
         s.cancel.store(false, std::memory_order_release);
         s.searching.store(true, std::memory_order_release);
         s.launch_pending.store(false, std::memory_order_release);
 
-        search_worker(std::move(root_dir_copy), std::move(query),
+        search_worker(std::move(root_dirs), std::move(query),
                       case_sensitive, whole_word, use_regex,
-                      std::move(includes), std::move(excludes));
+                      std::move(includes), std::move(excludes), generation);
     };
     if (!aida::infra::executor::submit(std::move(sub)).submitted) {
         st.launch_pending.store(false, std::memory_order_release);
+        st.searching.store(false, std::memory_order_release);
         diag::log_tagged("workspace_search", "start_search_post_failed");
     }
+}
+
+inline void start_search(const std::string& root_dir)
+{
+    start_search(std::vector<std::string>{root_dir});
 }
 
 

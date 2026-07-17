@@ -8,15 +8,11 @@
 namespace aida {
 namespace workbench {
 
-constexpr std::uint32_t k_workbench_contract_schema_version = 2;
-constexpr std::uint16_t k_split_ratio_min_basis_points = 500;
-constexpr std::uint16_t k_split_ratio_max_basis_points = 9500;
-constexpr std::uint16_t k_split_ratio_default_basis_points = 5000;
+constexpr std::uint32_t k_workbench_contract_schema_version = 3;
 constexpr std::uint32_t k_default_history_capacity = 128;
 constexpr std::uint32_t k_max_history_capacity = 1024;
 constexpr std::uint32_t k_max_documents_per_workspace = 4096;
 constexpr std::uint32_t k_max_views_per_workspace = 4096;
-constexpr std::uint32_t k_max_split_nodes_per_workspace = 8191;
 constexpr std::uint32_t k_max_panels_per_workspace = 256;
 constexpr std::uint32_t k_max_document_key_bytes = 1024;
 constexpr std::uint32_t k_max_document_title_bytes = 256;
@@ -35,12 +31,6 @@ struct document_id_t {
 };
 
 struct view_id_t {
-    std::uint64_t value = 0;
-
-    constexpr bool valid() const noexcept { return value != 0; }
-};
-
-struct split_node_id_t {
     std::uint64_t value = 0;
 
     constexpr bool valid() const noexcept { return value != 0; }
@@ -77,9 +67,6 @@ constexpr bool operator<(document_id_t lhs, document_id_t rhs) noexcept { return
 constexpr bool operator==(view_id_t lhs, view_id_t rhs) noexcept { return lhs.value == rhs.value; }
 constexpr bool operator!=(view_id_t lhs, view_id_t rhs) noexcept { return !(lhs == rhs); }
 constexpr bool operator<(view_id_t lhs, view_id_t rhs) noexcept { return lhs.value < rhs.value; }
-constexpr bool operator==(split_node_id_t lhs, split_node_id_t rhs) noexcept { return lhs.value == rhs.value; }
-constexpr bool operator!=(split_node_id_t lhs, split_node_id_t rhs) noexcept { return !(lhs == rhs); }
-constexpr bool operator<(split_node_id_t lhs, split_node_id_t rhs) noexcept { return lhs.value < rhs.value; }
 constexpr bool operator==(panel_instance_id_t lhs, panel_instance_id_t rhs) noexcept { return lhs.value == rhs.value; }
 constexpr bool operator!=(panel_instance_id_t lhs, panel_instance_id_t rhs) noexcept { return !(lhs == rhs); }
 constexpr bool operator<(panel_instance_id_t lhs, panel_instance_id_t rhs) noexcept { return lhs.value < rhs.value; }
@@ -97,7 +84,6 @@ enum class workbench_error_code_t : std::uint16_t {
     invalid_workspace,
     invalid_document,
     invalid_view,
-    invalid_split_tree,
     duplicate_identifier,
     workspace_mismatch,
     invalid_navigation,
@@ -173,16 +159,6 @@ enum class navigation_origin_t : std::uint8_t {
     adapter = 5,
     restore = 6,
     mcp = 7
-};
-
-enum class split_node_kind_t : std::uint8_t {
-    leaf = 0,
-    branch = 1
-};
-
-enum class split_orientation_t : std::uint8_t {
-    horizontal = 0,
-    vertical = 1
 };
 
 enum class panel_kind_t : std::uint8_t {
@@ -276,28 +252,12 @@ struct view_persistence_dto_t {
     bool focused = false;
 };
 
-struct split_node_dto_t {
-    split_node_id_t id;
-    split_node_kind_t kind = split_node_kind_t::leaf;
-    split_orientation_t orientation = split_orientation_t::horizontal;
-    std::uint16_t ratio_basis_points = k_split_ratio_default_basis_points;
-    view_id_t view;
-    split_node_id_t first;
-    split_node_id_t second;
-};
-
-struct split_tree_dto_t {
-    split_node_id_t root;
-    std::vector<split_node_dto_t> nodes;
-};
-
 struct panel_state_dto_t {
     panel_instance_id_t id;
     workspace_id_t workspace;
     panel_kind_t kind = panel_kind_t::navigator;
     bool visible = true;
     bool pinned = false;
-    std::uint32_t extent_pixels = 0;
     document_id_t selected_document;
     std::string state_token;
     workspace_revision_t revision;
@@ -310,29 +270,10 @@ struct navigation_history_dto_t {
     std::vector<navigation_event_t> forward;
 };
 
-struct fixed_layout_constraints_t {
-    std::uint32_t left_rail_pixels = 52;
-    std::uint32_t navigator_pixels = 280;
-    std::uint32_t inspector_pixels = 360;
-    std::uint32_t bottom_panel_pixels = 240;
-    std::uint32_t tab_strip_pixels = 32;
-    std::uint32_t toolbar_pixels = 36;
-    std::uint32_t splitter_pixels = 6;
-    std::uint32_t minimum_document_width_pixels = 320;
-    std::uint32_t minimum_document_height_pixels = 200;
-};
-
-struct layout_extent_t {
-    std::uint32_t width_pixels = 0;
-    std::uint32_t height_pixels = 0;
-};
-
 struct workbench_persistence_dto_t {
     std::uint32_t schema_version = k_workbench_contract_schema_version;
     workspace_id_t workspace;
     workspace_revision_t revision;
-    fixed_layout_constraints_t layout;
-    split_tree_dto_t split_tree;
     std::vector<document_persistence_dto_t> documents;
     document_id_t active_document;
     std::vector<view_persistence_dto_t> views;
@@ -454,22 +395,9 @@ workbench_error_t validate_workspace_view_context(const workspace_view_context_t
 workbench_error_t validate_view_context(const view_context_t& context);
 workbench_error_t validate_workspace_navigation_event(const workspace_navigation_event_t& event);
 workbench_error_t validate_navigation_event(const navigation_event_t& event);
-workbench_error_t validate_split_tree(const split_tree_dto_t& tree,
-                                      const std::vector<view_persistence_dto_t>& views);
-workbench_error_t validate_split_tree(const split_tree_dto_t& tree,
-                                      const std::vector<view_persistence_dto_t>& views,
-                                      const fixed_layout_constraints_t& constraints,
-                                      layout_extent_t document_extent);
-workbench_error_t validate_fixed_layout_constraints(const fixed_layout_constraints_t& constraints);
 workbench_error_t validate_persistence_dto(const workbench_persistence_dto_t& dto);
 
-void normalize_split_tree(split_tree_dto_t& tree) noexcept;
-void normalize_fixed_layout_constraints(fixed_layout_constraints_t& constraints) noexcept;
 workbench_error_t normalize_persistence_dto(workbench_persistence_dto_t& dto);
-
-layout_extent_t minimum_layout_extent(const fixed_layout_constraints_t& constraints) noexcept;
-bool layout_extent_satisfies(const fixed_layout_constraints_t& constraints,
-                             layout_extent_t available) noexcept;
 
 workbench_error_t next_workspace_revision(workspace_revision_t current,
                                           workspace_revision_t& output) noexcept;

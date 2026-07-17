@@ -22,12 +22,20 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/components.hpp"
+#include "../../ui/application_ui_runtime.hpp"
+#ifdef AIDA_IMGUI_STUDIO_PREVIEW
+#include "../../../preview/network_preview_executor.hpp"
+#else
+#include "../../infra/executor.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aida {
@@ -191,46 +199,82 @@ static void render_pane(const char* id, const std::vector<uint8_t>& data,
     }
 
     const uint64_t slot_id = is_a ? g_view_state.selected_a : g_view_state.selected_b;
-    const bool keyboard_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
-         (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
-    if ((ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) || keyboard_context)
-        ImGui::OpenPopupEx(ImHashStr(is_a ? "aida.network.comparer.a.context" : "aida.network.comparer.b.context"));
-    if (ImGui::BeginPopupEx(ImHashStr(is_a ? "aida.network.comparer.a.context" : "aida.network.comparer.b.context"),
-            ImGuiWindowFlags_AlwaysAutoResize)) {
+    const bool menu_key_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+    const bool shift_f10_context = !menu_key_context &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
+    const bool keyboard_context = menu_key_context || shift_f10_context;
+    const bool pointer_context = ImGui::IsWindowHovered() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+    if (pointer_context || keyboard_context) {
         aida::burp::comparer::slot_t current;
-        if (slot_id == 0 || !aida::burp::comparer::get_slot(slot_id, current)) {
-            ImGui::BeginDisabled();
-            ImGui::MenuItem("Comparer slot is stale");
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("The slot was removed or replaced; select a current slot");
-        } else {
-            if (ImGui::MenuItem("Copy Slot")) {
-                const std::string text = current.data.empty() ? std::string() :
-                    std::string(reinterpret_cast<const char*>(current.data.data()), current.data.size());
+        if (slot_id != 0 && aida::burp::comparer::get_slot(slot_id, current)) {
+            aida::ui::application_ui::retained_entity_context_t context;
+            context.owner_id = "network.comparer.slot";
+            context.entity_id = std::to_string(current.id);
+            context.entity_generation = current.created_ms;
+            context.active_view = aida::ui::stable_view_id_t("view.network.comparer");
+            const auto retained_id = current.id;
+            const auto retained_created = current.created_ms;
+            const auto retained_size = current.data.size();
+            context.validate_identity = [retained_id, retained_created, retained_size] {
+                aida::burp::comparer::slot_t live;
+                return aida::burp::comparer::get_slot(retained_id, live) &&
+                        live.created_ms == retained_created && live.data.size() == retained_size
+                    ? aida::ui::capability_state_t::available()
+                    : aida::ui::capability_state_t::unavailable(
+                        "The comparer slot was removed or replaced; select it again");
+            };
+            const auto add = [&context](const char* id, bool enabled, const char* reason,
+                    std::function<aida::ui::action_handler_result_t()> invoke) {
+                aida::ui::application_ui::retained_entity_action_t action;
+                action.action_id = id;
+                action.capability = enabled ? aida::ui::capability_state_t::available()
+                    : aida::ui::capability_state_t::unavailable(reason);
+                action.invoke = std::move(invoke);
+                context.actions.push_back(std::move(action));
+            };
+            const std::string text = current.data.empty() ? std::string() :
+                std::string(reinterpret_cast<const char*>(current.data.data()), current.data.size());
+            add("network.comparer.copy_slot", true, "", [text] {
                 ImGui::SetClipboardText(text.c_str());
-            }
-            if (ImGui::MenuItem("Use as A")) {
-                g_view_state.selected_a = current.id;
+                return aida::ui::action_handler_result_t::completed();
+            });
+            add("network.comparer.use_a", g_view_state.selected_a != current.id,
+                "This slot is already selected as comparer input A", [retained_id] {
+                g_view_state.selected_a = retained_id;
                 g_view_state.cached_valid = false;
-            }
-            if (ImGui::MenuItem("Use as B")) {
-                g_view_state.selected_b = current.id;
+                return aida::ui::action_handler_result_t::completed();
+            });
+            add("network.comparer.use_b", g_view_state.selected_b != current.id,
+                "This slot is already selected as comparer input B", [retained_id] {
+                g_view_state.selected_b = retained_id;
                 g_view_state.cached_valid = false;
-            }
-            if (ImGui::MenuItem("Swap A and B")) {
+                return aida::ui::action_handler_result_t::completed();
+            });
+            add("network.comparer.swap", g_view_state.selected_a != 0 &&
+                g_view_state.selected_b != 0,
+                "Select both comparer inputs before swapping them", [] {
                 std::swap(g_view_state.selected_a, g_view_state.selected_b);
                 g_view_state.cached_valid = false;
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Remove Slot Permanently...")) {
-                g_pending_remove_slot = current.id;
+                return aida::ui::action_handler_result_t::completed();
+            });
+            add("network.comparer.remove_review", true, "", [retained_id] {
+                g_pending_remove_slot = retained_id;
                 ImGui::OpenPopupEx(ImHashStr("aida.network.comparer.remove.confirm"));
-            }
+                return aida::ui::action_handler_result_t::completed();
+            });
+            aida::ui::application_ui::open_retained_entity_context_menu(
+                std::move(context), pointer_context
+                    ? aida::ui::context_menu_open_origin_t::pointer
+                    : menu_key_context
+                    ? aida::ui::context_menu_open_origin_t::menu_key
+                    : aida::ui::context_menu_open_origin_t::shift_f10);
         }
-        ImGui::EndPopup();
     }
+    aida::ui::application_ui::render_retained_entity_context_menu(
+        "network.comparer.slot");
     if (ImGui::BeginPopupEx(ImHashStr("aida.network.comparer.remove.confirm"), ImGuiWindowFlags_AlwaysAutoResize)) {
         aida::burp::comparer::slot_t current;
         if (g_pending_remove_slot == 0 || !aida::burp::comparer::get_slot(g_pending_remove_slot, current)) {
@@ -243,7 +287,14 @@ static void render_pane(const char* id, const std::vector<uint8_t>& data,
             ImGui::TextWrapped("Remove '%s' and its %zu bytes from the comparer? This cannot be undone.",
                 current.label.c_str(), current.data.size());
             if (ImGui::Button("Remove")) {
-                aida::burp::comparer::remove_slot(current.id);
+                aida::infra::executor::submission_t submission;
+                submission.owner_subsystem = "burp.comparer_view";
+                submission.label = "comparer.remove_slot";
+                submission.thread_class = "bounded_task";
+                submission.domain = aida::infra::executor::domain_t::external_tool;
+                submission.priority = 3;
+                submission.body = [id = current.id]() { aida::burp::comparer::remove_slot(id); };
+                static_cast<void>(aida::infra::executor::submit(std::move(submission)));
                 if (g_view_state.selected_a == current.id) g_view_state.selected_a = 0;
                 if (g_view_state.selected_b == current.id) g_view_state.selected_b = 0;
                 g_view_state.cached_valid = false;
@@ -297,7 +348,17 @@ void render(float pos_x, float pos_y, float width, float height,
         if (cb && cb[0]) {
             size_t n = strlen(cb);
             std::vector<uint8_t> data(cb, cb + n);
-            aida::burp::comparer::add_slot_from_bytes(g_view_state.add_label, data, "clipboard");
+            const std::string label = g_view_state.add_label;
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.comparer_view";
+            submission.label = "comparer.add_clipboard_slot";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [label, data = std::move(data)]() {
+                aida::burp::comparer::add_slot_from_bytes(label, data, "clipboard");
+            };
+            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
             ::diag::log_tagged_fmt("comparer_v", "paste_slot label='%s' bytes=%zu", g_view_state.add_label, n);
         }
     }
@@ -313,13 +374,31 @@ void render(float pos_x, float pos_y, float width, float height,
         if (g_view_state.add_file_path[0]) {
             ::diag::log_tagged_fmt("comparer_v", "add_file_slot label='%s' path='%s'",
                 g_view_state.add_label, g_view_state.add_file_path);
-            aida::burp::comparer::add_slot_from_file(g_view_state.add_label, g_view_state.add_file_path);
+            const std::string label = g_view_state.add_label;
+            const std::string path = g_view_state.add_file_path;
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.comparer_view";
+            submission.label = "comparer.add_file_slot";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [label, path]() {
+                aida::burp::comparer::add_slot_from_file(label, path);
+            };
+            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         }
     }
     ImGui::SameLine();
     if (aida::ui::button("Clear slots", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
         ::diag::log_tagged("comparer_v", "clear_slots");
-        aida::burp::comparer::clear_slots();
+        aida::infra::executor::submission_t submission;
+        submission.owner_subsystem = "burp.comparer_view";
+        submission.label = "comparer.clear_slots";
+        submission.thread_class = "bounded_task";
+        submission.domain = aida::infra::executor::domain_t::external_tool;
+        submission.priority = 3;
+        submission.body = []() { aida::burp::comparer::clear_slots(); };
+        static_cast<void>(aida::infra::executor::submit(std::move(submission)));
         g_view_state.selected_a = 0;
         g_view_state.selected_b = 0;
         g_view_state.cached_valid = false;
@@ -337,7 +416,17 @@ void render(float pos_x, float pos_y, float width, float height,
             size_t n = strlen(g_view_state.paste_buffer);
             std::vector<uint8_t> data(g_view_state.paste_buffer, g_view_state.paste_buffer + n);
             ::diag::log_tagged_fmt("comparer_v", "add_text_slot label='%s' bytes=%zu", g_view_state.add_label, n);
-            aida::burp::comparer::add_slot_from_bytes(g_view_state.add_label, data, "manual");
+            const std::string label = g_view_state.add_label;
+            aida::infra::executor::submission_t submission;
+            submission.owner_subsystem = "burp.comparer_view";
+            submission.label = "comparer.add_text_slot";
+            submission.thread_class = "bounded_task";
+            submission.domain = aida::infra::executor::domain_t::external_tool;
+            submission.priority = 3;
+            submission.body = [label, data = std::move(data)]() {
+                aida::burp::comparer::add_slot_from_bytes(label, data, "manual");
+            };
+            static_cast<void>(aida::infra::executor::submit(std::move(submission)));
             g_view_state.paste_buffer[0] = 0;
         }
     }

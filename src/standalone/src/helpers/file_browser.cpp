@@ -18,6 +18,7 @@
 #include "image_view.hpp"
 #include "analysis_session.hpp"
 #include "standalone_settings.hpp"
+#include "../core/settings/settings_persistence_service.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "diag_log.hpp"
 #endif
@@ -43,6 +44,7 @@
 #include <cctype>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <fstream>
 #include <sstream>
@@ -53,19 +55,173 @@
 #include <mutex>
 #include <optional>
 #include <cstring>
+#include <exception>
 
 namespace fs = std::filesystem;
 
 extern HWND g_hwnd;
 
+namespace {
+
+fs::path explorer_path_from_utf8(std::string_view value)
+{
+#if defined(__cpp_char8_t)
+	const auto* begin = reinterpret_cast<const char8_t*>(value.data());
+	return fs::path(std::u8string(begin, begin + value.size()));
+#else
+	return fs::u8path(value.begin(), value.end());
+#endif
+}
+
+std::string explorer_path_to_utf8(const fs::path& value)
+{
+	const auto encoded = value.generic_u8string();
+#if defined(__cpp_char8_t)
+	return std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+#else
+	return encoded;
+#endif
+}
+
+std::string normalized_explorer_path(const std::string& input)
+{
+	std::string value = explorer_path_to_utf8(
+		explorer_path_from_utf8(input).lexically_normal());
+	while (value.size() > 1 && value.back() == '/')
+		value.pop_back();
+	std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+		return static_cast<char>(std::tolower(character));
+	});
+	return value;
+}
+
+}
+
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+namespace {
+
+constexpr std::size_t k_explorer_entry_limit = 250000;
+constexpr std::size_t k_explorer_string_budget = 64ULL * 1024ULL * 1024ULL;
+constexpr std::size_t k_explorer_publish_batch = 512;
+
+struct explorer_index_control_t {
+    std::shared_ptr<std::atomic<bool>> cancelled;
+    std::shared_ptr<std::atomic<std::size_t>> pending_publications;
+    std::uint64_t task_id = 0;
+    std::uint64_t generation = 0;
+};
+
+explorer_index_control_t& explorer_index_control()
+{
+    static explorer_index_control_t value;
+    return value;
+}
+
+std::uint64_t explorer_identity(std::string_view value, std::uint64_t seed = 14695981039346656037ULL)
+{
+    std::uint64_t hash = seed;
+    for (const char character : value) {
+        hash ^= static_cast<unsigned char>(character);
+        hash *= 1099511628211ULL;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+bool publish_explorer_batch(std::uint64_t generation,
+    std::shared_ptr<const std::vector<FileBrowserEntry>> batch,
+    std::size_t directory_count, bool final, bool cancelled,
+    bool truncated, std::string error, std::string selected_path,
+    std::shared_ptr<std::unordered_set<std::string>> matched_selected_paths,
+    int matched_primary_index, std::string matched_primary_path,
+    std::string retained_anchor_path, std::uint64_t retained_selection_revision,
+    std::shared_ptr<std::atomic<std::size_t>> pending_publications)
+{
+    bool posted = false;
+    for (int attempt = 0; attempt < 100 && !posted; ++attempt) {
+        posted = aida::ui_thread::post(
+        [generation, batch, directory_count, final, cancelled,
+         truncated, error, selected_path, matched_selected_paths,
+         matched_primary_index, matched_primary_path,
+         retained_anchor_path, retained_selection_revision, pending_publications]() mutable {
+            struct publication_guard_t {
+                std::shared_ptr<std::atomic<std::size_t>> pending;
+                ~publication_guard_t() {
+                    if (pending) pending->fetch_sub(1, std::memory_order_acq_rel);
+                }
+            } publication_guard{pending_publications};
+            if (generation != file_browser::index_generation)
+                return;
+            if (batch) {
+                file_browser::entries.insert(file_browser::entries.end(),
+                    batch->begin(), batch->end());
+                if (file_browser::selected_idx < 0 && !selected_path.empty()) {
+                    for (std::size_t index = file_browser::entries.size() - batch->size();
+                         index < file_browser::entries.size(); ++index) {
+                        if (normalized_explorer_path(file_browser::entries[index].full_path) == selected_path) {
+                            file_browser::selected_idx = static_cast<int>(index);
+                            break;
+                        }
+                    }
+                }
+            }
+            file_browser::indexed_directory_count = directory_count;
+            file_browser::indexed_entry_count = file_browser::entries.size();
+            file_browser::index_truncated = truncated;
+            if (!error.empty())
+                file_browser::index_error = std::move(error);
+            if (final) {
+                file_browser::index_state = cancelled
+                    ? file_browser::index_state_t::cancelled
+                    : (file_browser::entries.empty() && !file_browser::index_error.empty()
+                        ? file_browser::index_state_t::error
+                        : file_browser::index_state_t::ready);
+                const bool selection_unchanged = file_browser::selection_revision ==
+                    retained_selection_revision;
+                if (matched_selected_paths && selection_unchanged)
+                    file_browser::selected_paths.swap(*matched_selected_paths);
+                if (selection_unchanged) {
+                    file_browser::selected_idx = matched_primary_index >= 0 &&
+                        static_cast<std::size_t>(matched_primary_index) < file_browser::entries.size()
+                        ? matched_primary_index : -1;
+                    file_browser::selection_anchor_path =
+                        file_browser::selected_paths.find(retained_anchor_path) !=
+                            file_browser::selected_paths.end()
+                        ? retained_anchor_path : matched_primary_path;
+                }
+                if (file_browser::selected_paths.size() < 100000)
+                    file_browser::selection_error.clear();
+                auto& control = explorer_index_control();
+                if (control.generation == generation)
+                    control.task_id = 0;
+            }
+        }, "file_browser", "index_snapshot", final ? "worker_final" : "worker_batch");
+        if (!posted)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!posted)
+    {
+        if (pending_publications)
+            pending_publications->fetch_sub(1, std::memory_order_acq_rel);
+        diag::log_tagged_fmt("file_browser",
+            "index_snapshot_dispatch_failed generation=%llu final=%d entries=%zu",
+            static_cast<unsigned long long>(generation), final ? 1 : 0,
+            batch ? batch->size() : 0U);
+    }
+    return posted;
+}
+
+}
+#endif
 
 void file_browser::refresh(const std::string& dir)
 {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    ++index_generation;
     if (!dir.empty())
         current_dir = dir;
     if (current_dir.empty())
         current_dir = "C:/Preview/ReverseEngineering";
+    roots = {current_dir};
     strncpy_s(path_buf, sizeof(path_buf), current_dir.c_str(), _TRUNCATE);
     if (entries.empty()) {
         entries = {
@@ -77,8 +233,40 @@ void file_browser::refresh(const std::string& dir)
         };
     }
     needs_refresh = false;
+    index_state = index_state_t::ready;
+    index_error.clear();
+    indexed_entry_count = entries.size();
     if (selected_idx >= static_cast<int>(entries.size()))
         selected_idx = -1;
+    const auto preview_key = [](const std::string& value) {
+        std::string key = explorer_path_to_utf8(
+            explorer_path_from_utf8(value).lexically_normal());
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+        return key;
+    };
+    std::unordered_set<std::string> live_paths;
+    for (const auto& entry : entries) live_paths.insert(preview_key(entry.full_path));
+    for (auto iterator = selected_paths.begin(); iterator != selected_paths.end();) {
+        if (live_paths.find(*iterator) == live_paths.end())
+            iterator = selected_paths.erase(iterator);
+        else
+            ++iterator;
+    }
+    if (selected_idx < 0 || selected_paths.find(preview_key(entries[
+            static_cast<std::size_t>(selected_idx)].full_path)) == selected_paths.end()) {
+        selected_idx = -1;
+        for (std::size_t index = 0; index < entries.size(); ++index)
+            if (selected_paths.find(preview_key(entries[index].full_path)) != selected_paths.end()) {
+                selected_idx = static_cast<int>(index);
+                break;
+            }
+    }
+    if (selected_paths.find(selection_anchor_path) == selected_paths.end())
+        selection_anchor_path = selected_idx >= 0
+            ? preview_key(entries[static_cast<std::size_t>(selected_idx)].full_path)
+            : std::string{};
     aida::preview::record(aida::preview::shell_action_t::open_folder, current_dir);
     return;
 #else
@@ -94,106 +282,462 @@ void file_browser::refresh(const std::string& dir)
         return;
 
     std::string root = dir;
-
-
-    if (root.empty() && current_dir.empty()) {
+    if (root.empty() && current_dir.empty() && roots.empty()) {
         char buf[MAX_PATH] = {};
         GetCurrentDirectoryA(MAX_PATH, buf);
         root = buf;
     }
-
-    if (!root.empty())
-        current_dir = root;
-
-    if (current_dir.empty()) return;
-
-
+    if (!root.empty()) {
+        roots = {fs::path(root).lexically_normal().string()};
+        expanded_paths.clear();
+        expanded_paths.insert(normalized_explorer_path(roots.front()));
+    }
+    else if (roots.empty() && !current_dir.empty()) {
+        roots = {fs::path(current_dir).lexically_normal().string()};
+        expanded_paths.insert(normalized_explorer_path(roots.front()));
+    }
+    if (roots.empty())
+        return;
+    current_dir = roots.front();
     strncpy_s(path_buf, sizeof(path_buf), current_dir.c_str(), _TRUNCATE);
 
+    for (const auto& entry : entries)
+        if (entry.is_dir && entry.expanded)
+            expanded_paths.insert(normalized_explorer_path(entry.full_path));
+    std::string selected_path = normalized_explorer_path(pending_reveal_path);
+    pending_reveal_path.clear();
+    if (selected_path.empty() && selected_idx >= 0 && static_cast<std::size_t>(selected_idx) < entries.size())
+        selected_path = normalized_explorer_path(entries[static_cast<std::size_t>(selected_idx)].full_path);
+    auto selected_keys = std::make_shared<const std::unordered_set<std::string>>(selected_paths);
+    if (!selected_path.empty() && selected_keys->find(selected_path) == selected_keys->end()) {
+        auto completed_keys = std::make_shared<std::unordered_set<std::string>>(*selected_keys);
+        completed_keys->insert(selected_path);
+        selected_keys = std::static_pointer_cast<const std::unordered_set<std::string>>(completed_keys);
+    }
+    const std::string retained_anchor_path = selection_anchor_path;
+    const std::uint64_t retained_selection_revision = selection_revision;
 
-    std::vector<std::string> expanded_paths;
-    for (auto& e : entries)
-        if (e.is_dir && e.expanded)
-            expanded_paths.push_back(e.full_path);
+    auto& control = explorer_index_control();
+    if (control.cancelled)
+        control.cancelled->store(true, std::memory_order_release);
+    if (control.task_id != 0)
+        aida::infra::executor::cancel(control.task_id);
+    control.cancelled = std::make_shared<std::atomic<bool>>(false);
+    control.pending_publications = std::make_shared<std::atomic<std::size_t>>(0);
+    control.generation = ++index_generation;
+    control.task_id = 0;
 
     entries.clear();
+    selected_idx = -1;
     needs_refresh = false;
+    index_state = index_state_t::loading;
+    index_error.clear();
+    indexed_directory_count = 0;
+    indexed_entry_count = 0;
+    index_truncated = false;
 
-    std::error_code dir_ec;
-    if (!fs::is_directory(fs::path(current_dir), dir_ec)) {
-        selected_idx = -1;
-        diag::log_tagged_fmt("file_browser",
-            "refresh_skipped_invalid_dir dir=%s ec=%d",
-            current_dir.c_str(), dir_ec.value());
-        return;
-    }
+    auto roots_copy = roots;
+    if (roots_copy.size() > 8)
+        roots_copy.resize(8);
+    const auto expanded_copy = expanded_paths;
+    const auto cancel = control.cancelled;
+    const auto pending_publications = control.pending_publications;
+    const std::uint64_t generation = control.generation;
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "file_browser";
+    submission.label = "file_browser.project_index";
+    submission.thread_class = "blocking_directory_io";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.generation = generation;
+    submission.cancel_hook = [cancel]() {
+        cancel->store(true, std::memory_order_release);
+    };
+    submission.body = [roots_copy, expanded_copy, cancel, pending_publications, generation,
+                       selected_path = std::move(selected_path), selected_keys,
+                       retained_anchor_path, retained_selection_revision]() mutable {
+        std::size_t directory_count = 0;
+        bool truncated = false;
+        auto matched_selected_paths = std::make_shared<std::unordered_set<std::string>>();
+        matched_selected_paths->reserve(selected_keys->size());
+        int matched_primary_index = -1;
+        std::string matched_primary_path;
+        try {
+        std::vector<FileBrowserEntry> batch;
+        batch.reserve(k_explorer_publish_batch);
+        std::size_t total_entries = 0;
+        std::size_t total_string_bytes = 0;
+        std::string errors;
+        const bool multiple_roots = roots_copy.size() > 1;
+        auto append_error = [&errors](const std::string& path, const std::string& detail) {
+            if (errors.size() >= 4096) return;
+            if (!errors.empty()) errors.append("; ");
+            errors.append(path).append(": ").append(detail);
+            if (errors.size() > 4096) errors.resize(4096);
+        };
 
-
-    struct local {
-        static void scan(const std::string& path, int depth,
-                         const std::vector<std::string>& expanded_set,
-                         std::vector<FileBrowserEntry>& out)
-        {
-            std::error_code ec;
-            std::vector<FileBrowserEntry> dirs, files;
-
-            for (auto& it : fs::directory_iterator(path, ec)) {
-                if (ec) break;
-                FileBrowserEntry e;
-                e.full_path = it.path().string();
-                e.name      = it.path().filename().string();
-                e.depth     = depth;
-
-
-                if (!e.name.empty() && e.name[0] == '.') continue;
-
-                if (it.is_directory(ec) && !ec) {
-                    e.is_dir = true;
-
-                    for (auto& ep : expanded_set)
-                        if (ep == e.full_path) { e.expanded = true; break; }
-                    dirs.push_back(std::move(e));
-                } else if (it.is_regular_file(ec) && !ec) {
-                    e.is_dir = false;
-                    files.push_back(std::move(e));
+        auto flush = [&](bool final) {
+            while (pending_publications->load(std::memory_order_acquire) >= 8 &&
+                   !cancel->load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            pending_publications->fetch_add(1, std::memory_order_acq_rel);
+            auto immutable = std::make_shared<const std::vector<FileBrowserEntry>>(std::move(batch));
+            const bool published = publish_explorer_batch(generation, std::move(immutable), directory_count,
+                final, cancel->load(std::memory_order_acquire), truncated,
+                final ? errors : std::string{}, selected_path,
+                final ? matched_selected_paths : nullptr,
+                final ? matched_primary_index : -1,
+                final ? matched_primary_path : std::string{},
+                retained_anchor_path, retained_selection_revision,
+                pending_publications);
+            batch.clear();
+            batch.reserve(k_explorer_publish_batch);
+            if (!published) {
+                cancel->store(true, std::memory_order_release);
+                append_error("Project index", "UI publication remained unavailable after bounded retries");
+            }
+            return published;
+        };
+        auto append = [&](FileBrowserEntry entry) {
+            const std::size_t bytes = entry.name.size() + entry.full_path.size();
+            if (total_entries >= k_explorer_entry_limit ||
+                total_string_bytes + bytes > k_explorer_string_budget) {
+                truncated = true;
+                return false;
+            }
+            total_string_bytes += bytes;
+            const std::string key = normalized_explorer_path(entry.full_path);
+            if (selected_keys->find(key) != selected_keys->end()) {
+                matched_selected_paths->insert(key);
+                if (matched_primary_index < 0 || key == selected_path) {
+                    matched_primary_index = static_cast<int>(total_entries);
+                    matched_primary_path = key;
                 }
             }
+            ++total_entries;
+            batch.push_back(std::move(entry));
+            if (batch.size() >= k_explorer_publish_batch && !flush(false))
+                return false;
+            return true;
+        };
 
-
-            std::sort(dirs.begin(), dirs.end(),
-                [](const FileBrowserEntry& a, const FileBrowserEntry& b)
-                { return _stricmp(a.name.c_str(), b.name.c_str()) < 0; });
-            std::sort(files.begin(), files.end(),
-                [](const FileBrowserEntry& a, const FileBrowserEntry& b)
-                { return _stricmp(a.name.c_str(), b.name.c_str()) < 0; });
-
-            for (auto& d : dirs) {
-                bool exp = d.expanded;
-                out.push_back(std::move(d));
-                if (exp)
-                    scan(out.back().full_path, depth + 1, expanded_set, out);
+        std::function<void(const std::string&, int, std::uint64_t, std::uint64_t)> scan;
+        scan = [&](const std::string& directory, int depth,
+                   std::uint64_t root_id, std::uint64_t parent_id) {
+            if (cancel->load(std::memory_order_acquire) || truncated)
+                return;
+            if (depth > 256) {
+                truncated = true;
+                append_error(directory, "maximum Explorer nesting depth (256) reached");
+                return;
             }
-            for (auto& f : files)
-                out.push_back(std::move(f));
+            ++directory_count;
+            std::error_code ec;
+            std::vector<FileBrowserEntry> directories;
+            std::vector<FileBrowserEntry> files;
+            std::size_t local_string_bytes = 0;
+            const std::size_t remaining_entries = k_explorer_entry_limit - total_entries;
+            const std::size_t remaining_string_bytes = k_explorer_string_budget - total_string_bytes;
+            fs::directory_iterator iterator(fs::path(directory),
+                fs::directory_options::skip_permission_denied, ec);
+            if (ec) {
+                append_error(directory, ec.message());
+                return;
+            }
+            const fs::directory_iterator end;
+            while (iterator != end) {
+                if (cancel->load(std::memory_order_acquire) || truncated)
+                    return;
+                const fs::directory_entry item = *iterator;
+                const std::string name = item.path().filename().string();
+                if (!name.empty() && name.front() != '.') {
+                    FileBrowserEntry entry;
+                    entry.full_path = item.path().lexically_normal().string();
+                    entry.name = name;
+                    entry.depth = depth;
+                    entry.root_id = root_id;
+                    entry.parent_id = parent_id;
+                    entry.generation = generation;
+                    const std::string key = normalized_explorer_path(entry.full_path);
+                    entry.entry_id = explorer_identity(key, root_id);
+                    const std::size_t entry_string_bytes = entry.name.size() + entry.full_path.size();
+                    if (directories.size() + files.size() >= remaining_entries ||
+                        local_string_bytes + entry_string_bytes > remaining_string_bytes) {
+                        truncated = true;
+                        break;
+                    }
+                    std::error_code type_error;
+                    const bool directory_entry = item.is_directory(type_error) && !type_error;
+                    const bool symlink_entry = directory_entry && item.is_symlink(type_error) && !type_error;
+                    if (directory_entry && !symlink_entry) {
+                        local_string_bytes += entry_string_bytes;
+                        entry.is_dir = true;
+                        entry.expanded = expanded_copy.find(key) != expanded_copy.end();
+                        directories.push_back(std::move(entry));
+                    } else if (item.is_regular_file(type_error) && !type_error) {
+                        local_string_bytes += entry_string_bytes;
+                        files.push_back(std::move(entry));
+                    }
+                }
+                iterator.increment(ec);
+                if (ec) {
+                    append_error(directory, ec.message());
+                    break;
+                }
+            }
+            const auto by_name = [](const FileBrowserEntry& left, const FileBrowserEntry& right) {
+                return _stricmp(left.name.c_str(), right.name.c_str()) < 0;
+            };
+            std::sort(directories.begin(), directories.end(), by_name);
+            std::sort(files.begin(), files.end(), by_name);
+            for (auto& child : directories) {
+                const bool expanded = child.expanded;
+                const std::string child_path = child.full_path;
+                const std::uint64_t child_id = child.entry_id;
+                if (!append(std::move(child))) return;
+                if (expanded)
+                    scan(child_path, depth + 1, root_id, child_id);
+            }
+            for (auto& child : files)
+                if (!append(std::move(child))) return;
+        };
+
+        for (const auto& root_path : roots_copy) {
+            if (cancel->load(std::memory_order_acquire) || truncated)
+                break;
+            const std::string root_key = normalized_explorer_path(root_path);
+            const std::uint64_t root_id = explorer_identity(root_key);
+            std::error_code root_error;
+            if (!fs::is_directory(fs::path(root_path), root_error) || root_error) {
+                append_error(root_path, root_error ? root_error.message() : "not a directory");
+                continue;
+            }
+            bool scan_root = true;
+            if (multiple_roots) {
+                FileBrowserEntry root_entry;
+                root_entry.name = fs::path(root_path).filename().string();
+                if (root_entry.name.empty()) root_entry.name = root_path;
+                root_entry.full_path = root_path;
+                root_entry.is_dir = true;
+                root_entry.expanded = expanded_copy.find(root_key) != expanded_copy.end();
+                scan_root = root_entry.expanded;
+                root_entry.depth = 0;
+                root_entry.root_id = root_id;
+                root_entry.entry_id = root_id;
+                root_entry.generation = generation;
+                root_entry.is_root = true;
+                if (!append(std::move(root_entry))) break;
+            }
+            if (scan_root)
+                scan(root_path, multiple_roots ? 1 : 0, root_id, multiple_roots ? root_id : 0);
+        }
+        flush(true);
+        } catch (const std::exception& exception) {
+            while (pending_publications->load(std::memory_order_acquire) >= 8 &&
+                   !cancel->load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            pending_publications->fetch_add(1, std::memory_order_acq_rel);
+            auto empty = std::make_shared<const std::vector<FileBrowserEntry>>();
+            publish_explorer_batch(generation, std::move(empty), directory_count, true,
+                cancel->load(std::memory_order_acquire), truncated,
+                std::string("Project index failed: ") + exception.what(), selected_path,
+                matched_selected_paths, matched_primary_index, matched_primary_path,
+                retained_anchor_path, retained_selection_revision,
+                pending_publications);
+        } catch (...) {
+            while (pending_publications->load(std::memory_order_acquire) >= 8 &&
+                   !cancel->load(std::memory_order_acquire))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            pending_publications->fetch_add(1, std::memory_order_acq_rel);
+            auto empty = std::make_shared<const std::vector<FileBrowserEntry>>();
+            publish_explorer_batch(generation, std::move(empty), directory_count, true,
+                cancel->load(std::memory_order_acquire), truncated,
+                "Project index failed with an unknown filesystem error.", selected_path,
+                matched_selected_paths, matched_primary_index, matched_primary_path,
+                retained_anchor_path, retained_selection_revision,
+                pending_publications);
         }
     };
-
-    try {
-        local::scan(current_dir, 0, expanded_paths, entries);
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted) {
+        index_state = index_state_t::error;
+        index_error = "The project index worker could not be scheduled: " + submitted.reject_reason;
+        control.cancelled.reset();
+        diag::log_tagged_fmt("file_browser", "index_submit_failed generation=%llu reason=%s",
+            static_cast<unsigned long long>(generation), submitted.reject_reason.c_str());
+        return;
     }
-    catch (const std::exception& ex) {
-        entries.clear();
-        needs_refresh = false;
-        diag::log_tagged_fmt("file_browser", "refresh_exception dir=%s err=%s",
-            current_dir.c_str(), ex.what());
-    }
-    catch (...) {
-        entries.clear();
-        needs_refresh = false;
-        diag::log_tagged_fmt("file_browser", "refresh_exception_unknown dir=%s",
-            current_dir.c_str());
-    }
+    control.task_id = submitted.task_id;
 #endif
+}
+
+bool file_browser::reveal_path(const std::string& path)
+{
+    if (path.empty() || roots.empty())
+        return false;
+    const fs::path candidate = explorer_path_from_utf8(path).lexically_normal();
+    const std::string candidate_key = normalized_explorer_path(
+        explorer_path_to_utf8(candidate));
+    bool inside_root = false;
+    for (const auto& root_value : roots) {
+        const fs::path root = explorer_path_from_utf8(root_value).lexically_normal();
+        const std::string root_key = normalized_explorer_path(explorer_path_to_utf8(root));
+        if (candidate_key == root_key || (candidate_key.size() > root_key.size() &&
+            candidate_key.compare(0, root_key.size(), root_key) == 0 &&
+            (candidate_key[root_key.size()] == '/' || candidate_key[root_key.size()] == '\\'))) {
+            inside_root = true;
+            fs::path parent = candidate.parent_path();
+            while (!parent.empty()) {
+                expanded_paths.insert(normalized_explorer_path(explorer_path_to_utf8(parent)));
+                if (normalized_explorer_path(explorer_path_to_utf8(parent)) == root_key)
+                    break;
+                const fs::path next = parent.parent_path();
+                if (next == parent)
+                    break;
+                parent = next;
+            }
+            break;
+        }
+    }
+    if (!inside_root)
+        return false;
+    pending_reveal_path = explorer_path_to_utf8(candidate);
+    selected_paths.clear();
+    selected_paths.insert(normalized_explorer_path(pending_reveal_path));
+    selection_anchor_path = normalized_explorer_path(pending_reveal_path);
+    selected_idx = -1;
+    ++selection_revision;
+    needs_refresh = true;
+    return true;
+}
+
+void file_browser::set_roots(std::vector<std::string> requested_roots)
+{
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    if (!requested_roots.empty())
+        refresh(requested_roots.front());
+#else
+    if (!aida::ui_thread::is_owner_thread()) {
+        const bool routed = aida::ui_thread::post(
+            [requested_roots = std::move(requested_roots)]() mutable {
+                file_browser::set_roots(std::move(requested_roots));
+            }, "file_browser", "set_roots", "entry");
+        if (!routed)
+            diag::log_tagged("file_browser", "set_roots denied reason=ui_affinity_route_failed");
+        return;
+    }
+    if (!aida::ui_thread::require_owner("file_browser", "set_roots", "entry"))
+        return;
+    std::vector<std::string> normalized;
+    std::unordered_set<std::string> seen;
+    normalized.reserve(requested_roots.size());
+    for (auto& root : requested_roots) {
+        if (normalized.size() >= 8) break;
+        if (root.empty()) continue;
+        root = fs::path(root).lexically_normal().string();
+        if (seen.insert(normalized_explorer_path(root)).second)
+            normalized.push_back(std::move(root));
+    }
+    roots = std::move(normalized);
+    std::unordered_set<std::string> retained_expansions;
+    retained_expansions.reserve((std::min)(expanded_paths.size() + roots.size(), k_explorer_entry_limit));
+    for (const auto& root : roots) {
+        const std::string key = normalized_explorer_path(root);
+        retained_expansions.insert(key);
+        const std::string prefix = key + "/";
+        for (const auto& expanded : expanded_paths) {
+            if (retained_expansions.size() >= k_explorer_entry_limit) break;
+            if (expanded.compare(0, prefix.size(), prefix) == 0)
+                retained_expansions.insert(expanded);
+        }
+    }
+    expanded_paths = std::move(retained_expansions);
+    current_dir = roots.empty() ? std::string{} : roots.front();
+    needs_refresh = true;
+#endif
+}
+
+bool file_browser::set_workspace_root(const std::string& path, std::string* error)
+{
+    try {
+        if (path.empty()) {
+            if (error) *error = "Select a folder before setting the workspace root";
+            return false;
+        }
+        if (path.size() > 32768) {
+            if (error) *error = "The selected workspace-root path exceeds the supported bound";
+            return false;
+        }
+        const std::string normalized = explorer_path_to_utf8(
+            explorer_path_from_utf8(path).lexically_normal());
+        if (normalized.empty()) {
+            if (error) *error = "The selected workspace-root path is invalid";
+            return false;
+        }
+        const std::vector<std::string> previous_roots = roots;
+        const std::string previous_setting = g_sa_settings.workspace.root_path;
+        selected_paths.clear();
+        selection_anchor_path.clear();
+        selection_error.clear();
+        selected_idx = -1;
+        ++selection_revision;
+        pending_reveal_path.clear();
+        refresh(normalized);
+        g_sa_settings.workspace.root_path = normalized;
+        const auto requested = aida::settings_persistence::request_save(g_sa_settings);
+        if (!aida::settings_persistence::accepted(requested)) {
+            g_sa_settings.workspace.root_path = previous_setting;
+            set_roots(previous_roots);
+            if (error) *error = "Settings persistence rejected the workspace-root transaction; the previous roots were restored";
+            return false;
+        }
+        if (error) error->clear();
+        return true;
+    } catch (const std::exception&) {
+        if (error) *error = "The selected workspace-root path is not valid UTF-8 or cannot be represented natively";
+        return false;
+    } catch (...) {
+        if (error) *error = "The selected workspace-root path could not be converted safely";
+        return false;
+    }
+}
+
+bool file_browser::binary_analysis_candidate(const std::string& path)
+{
+    if (path.empty()) return false;
+    std::string extension;
+    try {
+        extension = explorer_path_to_utf8(explorer_path_from_utf8(path).extension());
+    } catch (...) {
+        return false;
+    }
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    static constexpr const char* extensions[] = {
+        ".exe", ".dll", ".sys", ".efi", ".scr", ".cpl", ".ocx", ".ax",
+        ".drv", ".mui", ".tsp", ".node", ".bin", ".lib", ".obj", ".o",
+        ".a", ".so", ".dylib", ".elf", ".out", ".com", ".ko", ".kext",
+        ".dmp", ".pdb", ".rom", ".img", ".uefi", ".class", ".jar", ".pyc",
+        ".pyo", ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz",
+        ".cab", ".iso", ".apk", ".ipa"
+    };
+    return std::find(std::begin(extensions), std::end(extensions), extension) !=
+        std::end(extensions);
+}
+
+void file_browser::cancel_refresh()
+{
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    auto& control = explorer_index_control();
+    if (control.cancelled)
+        control.cancelled->store(true, std::memory_order_release);
+    if (control.task_id != 0)
+        aida::infra::executor::cancel(control.task_id);
+#endif
+    needs_refresh = false;
+    if (index_state == index_state_t::loading)
+        index_state = index_state_t::cancelled;
 }
 
 
@@ -204,6 +748,13 @@ void file_browser::toggle_dir(int idx)
     if (!ent.is_dir) return;
 
     ent.expanded = !ent.expanded;
+#if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    const std::string key = normalized_explorer_path(ent.full_path);
+    if (ent.expanded)
+        expanded_paths.insert(key);
+    else
+        expanded_paths.erase(key);
+#endif
     needs_refresh = true;
 }
 
@@ -647,11 +1198,7 @@ void open_path(const std::string& path)
     }
 
     if (ext_classify::is_text(ext)) {
-        std::ifstream ifs(path, std::ios::binary);
-        if (ifs.is_open()) {
-            std::ostringstream ss;
-            ss << ifs.rdbuf();
-            file_tabs::open_or_focus(path, fname, ss.str());
+        if (file_tabs::request_document_open(path, fname)) {
             aida::ui::application_views::open_or_focus(
                 aida::ui::stable_view_id_t("document.code"));
             diag::log_tagged_fmt("file_browser", "open_path -> code_editor path=%s", path.c_str());
@@ -661,12 +1208,8 @@ void open_path(const std::string& path)
             "open_path text open_failed path=%s", path.c_str());
     }
 
-    if (ext_classify::is_archive(ext)) {
-        code_editor::active = false;
-        code_editor::buffer.clear();
-        code_editor::filename.clear();
-        code_editor::filepath.clear();
-        async_hex_fallback(path, true);
+	if (ext_classify::is_archive(ext)) {
+		async_hex_fallback(path, true);
         diag::log_tagged_fmt("file_browser", "open_path -> hex_view archive path=%s", path.c_str());
         return;
     }
@@ -721,12 +1264,8 @@ void open_path(const std::string& path)
         std::strstr(err, "PE header") != nullptr ||
         std::strstr(err, "magic") != nullptr);
 
-    if (ext_classify::is_binary(ext) || err_says_not_pe) {
-        code_editor::active = false;
-        code_editor::buffer.clear();
-        code_editor::filename.clear();
-        code_editor::filepath.clear();
-        async_hex_fallback(path, false);
+	if (ext_classify::is_binary(ext) || err_says_not_pe) {
+		async_hex_fallback(path, false);
         diag::log_tagged_fmt("file_browser",
             "open_path -> hex_view fallback path=%s err=%s",
             path.c_str(), err ? err : "(null)");
@@ -1068,10 +1607,15 @@ struct watcher_t {
     std::mutex              mtx;
 };
 
-inline watcher_t& g_watcher()
+struct watcher_manager_t {
+    std::unordered_map<std::string, std::shared_ptr<watcher_t>> active;
+    std::vector<std::shared_ptr<watcher_t>> retiring;
+};
+
+inline watcher_manager_t& g_watchers()
 {
-    static watcher_t w;
-    return w;
+    static watcher_manager_t value;
+    return value;
 }
 
 inline uint64_t now_ms()
@@ -1084,27 +1628,12 @@ inline bool utf8_to_wide(const std::string& in, std::wstring& out)
     out.clear();
     int n = ::MultiByteToWideChar(CP_UTF8, 0, in.c_str(), -1, nullptr, 0);
     if (n <= 0) return false;
-    out.resize(static_cast<size_t>(n) - 1);
-    return ::MultiByteToWideChar(CP_UTF8, 0, in.c_str(), -1, out.data(), n) > 0;
-}
-
-inline bool directory_ready(const std::string& dir, DWORD& err)
-{
-    std::wstring wdir;
-    if (!utf8_to_wide(dir, wdir) || wdir.empty()) {
-        err = ERROR_INVALID_NAME;
+    out.resize(static_cast<size_t>(n));
+    if (::MultiByteToWideChar(CP_UTF8, 0, in.c_str(), -1, out.data(), n) <= 0) {
+        out.clear();
         return false;
     }
-    DWORD attrs = ::GetFileAttributesW(wdir.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
-        err = ::GetLastError();
-        return false;
-    }
-    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        err = ERROR_DIRECTORY;
-        return false;
-    }
-    err = ERROR_SUCCESS;
+    if (!out.empty() && out.back() == L'\0') out.pop_back();
     return true;
 }
 
@@ -1116,21 +1645,11 @@ inline void close_completed_wake_event_locked(watcher_t& w)
     }
 }
 
-inline void stop_watcher_locked(watcher_t& w)
+inline void request_stop(watcher_t& w)
 {
     if (!w.running.load(std::memory_order_acquire)) return;
     w.stop.store(true, std::memory_order_release);
     if (w.wake_event) ::SetEvent(w.wake_event);
-    for (int i = 0; i < 200 && !w.worker_done.load(std::memory_order_acquire); ++i)
-        ::Sleep(5);
-    w.running.store(false, std::memory_order_release);
-    w.stop.store(false, std::memory_order_release);
-    if (w.wake_event && w.worker_done.load(std::memory_order_acquire)) {
-        ::CloseHandle(w.wake_event);
-        w.wake_event = nullptr;
-    }
-    w.watched_dir.clear();
-    diag::log_tagged("file_browser_watcher", "stopped");
 }
 
 inline bool is_noise_basename(const std::wstring& bn)
@@ -1149,9 +1668,9 @@ inline bool is_noise_basename(const std::wstring& bn)
     return false;
 }
 
-inline void watcher_thread(std::string dir, HANDLE wake_event)
+inline void watcher_thread(std::shared_ptr<watcher_t> watcher, std::string dir, HANDLE wake_event)
 {
-    watcher_t& w = g_watcher();
+    watcher_t& w = *watcher;
 
     std::wstring wdir;
     if (!utf8_to_wide(dir, wdir) || wdir.empty()) {
@@ -1198,7 +1717,7 @@ inline void watcher_thread(std::string dir, HANDLE wake_event)
             h,
             buf.data(),
             kBufSize,
-            FALSE,
+            TRUE,
             FILE_NOTIFY_CHANGE_FILE_NAME |
             FILE_NOTIFY_CHANGE_DIR_NAME |
             FILE_NOTIFY_CHANGE_SIZE,
@@ -1261,65 +1780,100 @@ inline void watcher_thread(std::string dir, HANDLE wake_event)
     w.running.store(false, std::memory_order_release);
 }
 
-inline void ensure_running_for(const std::string& dir)
+inline void start_watcher(const std::shared_ptr<watcher_t>& watcher)
 {
-    watcher_t& w = g_watcher();
+    watcher_t& w = *watcher;
     std::lock_guard<std::mutex> lk(w.mtx);
-    if (w.running.load(std::memory_order_acquire) && w.watched_dir == dir) return;
-
     const uint64_t stamp_ms = now_ms();
+    if (w.running.load(std::memory_order_acquire)) return;
     const uint64_t retry_after_ms = w.retry_after_ms.load(std::memory_order_acquire);
-    if (w.watched_dir == dir && retry_after_ms != 0 && stamp_ms < retry_after_ms) return;
-
-    if (w.running.load(std::memory_order_acquire)) {
-        stop_watcher_locked(w);
-    }
+    if (retry_after_ms != 0 && stamp_ms < retry_after_ms) return;
     close_completed_wake_event_locked(w);
-    if (dir.empty()) return;
-
-    DWORD dir_err = ERROR_SUCCESS;
-    if (!directory_ready(dir, dir_err)) {
-        w.watched_dir = dir;
-        w.retry_after_ms.store(stamp_ms + 5000ull, std::memory_order_release);
-        diag::log_tagged_fmt("file_browser_watcher",
-            "invalid_dir err=%lu dir=%s",
-            static_cast<unsigned long>(dir_err), dir.c_str());
-        return;
-    }
-
     w.wake_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!w.wake_event) return;
     w.stop.store(false, std::memory_order_release);
     w.has_change.store(false, std::memory_order_release);
-    w.watched_dir = dir;
     HANDLE we = w.wake_event;
-    std::string cap = dir;
+    const std::string cap = w.watched_dir;
     w.worker_done.store(false, std::memory_order_release);
+    w.running.store(true, std::memory_order_release);
     aida::infra::executor::submission_t sub;
     sub.owner_subsystem = "file_browser_watcher";
     sub.label = "file_browser_watcher.watch";
     sub.thread_class = "long_lived_service";
     sub.domain = aida::infra::executor::domain_t::service;
     sub.priority = 3;
-    sub.body = [cap, we]() { watcher_thread(cap, we); };
+    sub.cancel_hook = [watcher]() {
+        request_stop(*watcher);
+    };
+    sub.body = [watcher, cap, we]() { watcher_thread(watcher, cap, we); };
     if (aida::infra::executor::submit(std::move(sub)).submitted) {
-        w.running.store(true, std::memory_order_release);
         w.retry_after_ms.store(0, std::memory_order_release);
-        diag::log_tagged_fmt("file_browser_watcher", "ensure_running_for dir=%s", dir.c_str());
+        diag::log_tagged_fmt("file_browser_watcher", "ensure_running_for dir=%s", cap.c_str());
     }
     else {
         if (w.wake_event) {
             ::CloseHandle(w.wake_event);
             w.wake_event = nullptr;
         }
-        w.watched_dir = dir;
         w.stop.store(false, std::memory_order_release);
         w.running.store(false, std::memory_order_release);
         w.worker_done.store(true, std::memory_order_release);
         w.retry_after_ms.store(stamp_ms + 5000ull, std::memory_order_release);
         diag::log_tagged_fmt("file_browser_watcher", "executor_submit_failed dir=%s",
-            dir.c_str());
+            cap.c_str());
     }
+}
+
+inline void ensure_running_for(const std::vector<std::string>& roots)
+{
+    auto& manager = g_watchers();
+    std::unordered_set<std::string> requested;
+    for (const auto& root : roots) {
+        if (requested.size() >= 8) break;
+        if (!root.empty()) requested.insert(normalized_explorer_path(root));
+    }
+
+    for (auto iterator = manager.active.begin(); iterator != manager.active.end();) {
+        if (requested.find(iterator->first) != requested.end()) {
+            ++iterator;
+            continue;
+        }
+        request_stop(*iterator->second);
+        manager.retiring.push_back(iterator->second);
+        iterator = manager.active.erase(iterator);
+    }
+    for (const auto& root : roots) {
+        if (root.empty()) continue;
+        const std::string key = normalized_explorer_path(root);
+        if (requested.find(key) == requested.end()) continue;
+        auto found = manager.active.find(key);
+        if (found == manager.active.end()) {
+            auto watcher = std::make_shared<watcher_t>();
+            watcher->watched_dir = root;
+            found = manager.active.emplace(key, std::move(watcher)).first;
+        }
+        start_watcher(found->second);
+    }
+    for (auto iterator = manager.retiring.begin(); iterator != manager.retiring.end();) {
+        auto& watcher = **iterator;
+        if (!watcher.worker_done.load(std::memory_order_acquire)) {
+            ++iterator;
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(watcher.mtx);
+        close_completed_wake_event_locked(watcher);
+        iterator = manager.retiring.erase(iterator);
+    }
+}
+
+inline bool consume_change()
+{
+    auto& manager = g_watchers();
+    bool changed = false;
+    for (const auto& item : manager.active)
+        changed = item.second->has_change.exchange(false, std::memory_order_acq_rel) || changed;
+    return changed;
 }
 
 }
@@ -1331,9 +1885,9 @@ void tick_watcher()
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     needs_refresh = false;
 #else
-    watcher_detail::ensure_running_for(current_dir);
-    watcher_detail::watcher_t& w = watcher_detail::g_watcher();
-    if (w.has_change.exchange(false, std::memory_order_acq_rel)) {
+    watcher_detail::ensure_running_for(roots.empty()
+        ? std::vector<std::string>{current_dir} : roots);
+    if (watcher_detail::consume_change()) {
         needs_refresh = true;
     }
 #endif

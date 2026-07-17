@@ -30,6 +30,7 @@
 #include "mcp_client.hpp"
 #include "mcp_marketplace.hpp"
 #include "standalone_settings.hpp"
+#include "../settings/settings_persistence_service.hpp"
 #include "toast_notification.hpp"
 
 #include "mcp_marketplace_view.hpp"
@@ -173,7 +174,7 @@ namespace settings_overlay {
 			g_sa_settings.editor_auto_complete     = true;
 			g_sa_settings.ghost_text_enabled       = true;
 			g_sa_settings.auto_save_enabled        = true;
-			g_sa_settings.save();
+			static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 		}
 
 
@@ -1361,7 +1362,7 @@ namespace settings_overlay {
 					for (const auto& cfg : configs)
 						mgr.add_server(cfg);
 					mgr.connect_all();
-					g_sa_settings.save();
+					static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 					s_dirty = false;
 					toast_notification::push("MCP server settings applied.",
 						toast_notification::toast_type_t::info);
@@ -1545,7 +1546,7 @@ namespace settings_overlay {
 				if (prev_idx != g_sa_settings.active_theme_idx) {
 					themes::active = std::clamp(g_sa_settings.active_theme_idx, 0, themes::count - 1);
 					themes::changed = true;
-					g_sa_settings.save();
+					static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 				}
 			}
 			ImGui::Dummy(ImVec2(0.f, 8.f));
@@ -1561,7 +1562,7 @@ namespace settings_overlay {
 						: aida::ui::design::density_t::compact,
 					g_sa_settings.ui_reduced_motion
 				});
-				g_sa_settings.save();
+				static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 			}
 			if (ImGui::Checkbox("Reduce interface motion##ui_reduced_motion",
 				&g_sa_settings.ui_reduced_motion)) {
@@ -1571,14 +1572,14 @@ namespace settings_overlay {
 						: aida::ui::design::density_t::compact,
 					g_sa_settings.ui_reduced_motion
 				});
-				g_sa_settings.save();
+				static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 			}
 			aida::ui::design::tooltip_for_last_item(
 				"Disable decorative transitions and animated progress where a static equivalent is available",
 				nullptr, nullptr);
 			if (ImGui::Checkbox("Show frame diagnostics in status bar##ui_diagnostics_mode",
 				&g_sa_settings.ui_diagnostics_mode))
-				g_sa_settings.save();
+				static_cast<void>(aida::settings_persistence::request_save(g_sa_settings));
 			ImGui::EndChild();
 			ImGui::PopStyleColor(2);
 			ImGui::EndChild();
@@ -1737,6 +1738,31 @@ namespace settings_overlay {
 		dl->AddText(aida::ui::fonts::h2(), 16.f,
 			ImVec2(wp.x + 44.f, wp.y + 11.f),
 			th.text_primary, "Settings");
+		const auto persistence = aida::settings_persistence::status();
+		const char* persistence_label = persistence.pending ? "Saving settings..." :
+			(persistence.failed ? "Settings save failed" :
+			(persistence.committed_generation != 0 ? "Settings saved" : ""));
+		if (persistence_label[0] != '\0' && ws.x >= 300.f) {
+			ImFont* status_font = aida::ui::fonts::caption();
+			if (!status_font)
+				status_font = ImGui::GetFont();
+			const float status_size = aida::ui::fonts::size_or(status_font, 12.f);
+			const ImVec2 text_size = status_font->CalcTextSizeA(status_size,
+				FLT_MAX, 0.f, persistence_label);
+			const ImVec2 text_pos(wp.x + ws.x - text_size.x - 12.f,
+				wp.y + (header_h - text_size.y) * 0.5f);
+			const ImU32 status_color = persistence.failed ? th.error :
+				(persistence.pending ? th.warning : th.success);
+			dl->AddText(status_font, status_size, text_pos, status_color,
+				persistence_label);
+			if (ImGui::IsMouseHoveringRect(text_pos,
+					ImVec2(text_pos.x + text_size.x, text_pos.y + text_size.y))) {
+				if (persistence.failed && !persistence.error.empty())
+					ImGui::SetTooltip("%s", persistence.error.c_str());
+				else if (!persistence.stage.empty())
+					ImGui::SetTooltip("%s", persistence.stage.c_str());
+			}
+		}
 
 		aida::ui::responsive::sidebar_policy_t side_pol;
 		side_pol.full_width = 184.f;

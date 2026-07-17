@@ -2464,6 +2464,24 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			int idx = struct_dissector::create_struct(params["name"].get<std::string>());
 			if (idx < 0)
 				return tool_result_t::error(OBFSTR("Failed to create struct."));
+			if (params.value("kind", std::string{"struct"}) == "union" &&
+				!struct_dissector::set_structure_kind(idx, struct_dissector::structure_kind_t::union_type)) {
+				std::string rollback_error;
+				struct_dissector::remove_structure(idx, rollback_error);
+				return tool_result_t::error(OBFSTR("Failed to configure union layout."));
+			}
+			if (params.contains("packing") && !struct_dissector::set_structure_packing(idx,
+				params["packing"].get<std::uint16_t>())) {
+				std::string rollback_error;
+				struct_dissector::remove_structure(idx, rollback_error);
+				return tool_result_t::error(OBFSTR("Invalid structure packing."));
+			}
+			if (params.contains("alignment") && !struct_dissector::set_structure_alignment(idx,
+				params["alignment"].get<std::uint16_t>())) {
+				std::string rollback_error;
+				struct_dissector::remove_structure(idx, rollback_error);
+				return tool_result_t::error(OBFSTR("Invalid structure alignment."));
+			}
 			{
 				std::lock_guard<std::mutex> lk(struct_dissector::g_state.mtx);
 				struct_dissector::g_state.active_struct = idx;
@@ -2504,14 +2522,31 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			else if (type_str == "utf16_string") ft = struct_dissector::field_type_t::utf16_string;
 			else if (type_str == "byte_array") ft = struct_dissector::field_type_t::byte_array;
 			else if (type_str == "padding") ft = struct_dissector::field_type_t::padding;
+			else if (type_str == "nested_struct") ft = struct_dissector::field_type_t::nested_struct;
 			else return tool_result_t::error(OBFSTR("Unknown field_type: ") + type_str);
+			if (ft == struct_dissector::field_type_t::nested_struct &&
+				(!params.contains("target_structure") || !params["target_structure"].is_string()))
+				return tool_result_t::error(OBFSTR("nested_struct requires 'target_structure'."));
 			struct_dissector::field_def_t fld;
 			fld.name = params["name"].get<std::string>();
-			fld.type = ft;
+			fld.type = ft == struct_dissector::field_type_t::nested_struct
+				? struct_dissector::field_type_t::byte_array : ft;
 			fld.offset = static_cast<uint32_t>(params["offset"].get<int>());
+			fld.size = params.value("size", static_cast<uint32_t>((std::max)(std::size_t{1}, struct_dissector::field_type_size(ft))));
+			fld.array_count = params.value("array_count", 1u);
+			fld.bit_offset = params.value("bit_offset", std::uint16_t{0});
+			fld.bit_width = params.value("bit_width", std::uint16_t{0});
+			fld.explicit_alignment = params.value("alignment", std::uint16_t{0});
+			fld.description = params.value("description", std::string{});
 			int fi = struct_dissector::add_field(si, fld);
 			if (fi < 0)
 				return tool_result_t::error(OBFSTR("Failed to add field."));
+			if (params.contains("target_structure") && params["target_structure"].is_string() &&
+				!struct_dissector::set_field_nested_target_by_name(si, fi,
+					params["target_structure"].get<std::string>(), ft == struct_dissector::field_type_t::pointer)) {
+				struct_dissector::remove_field(si, fi);
+				return tool_result_t::error(OBFSTR("Field was added, but its target structure was rejected."));
+			}
 			json result;
 			result["field_index"] = fi;
 			result["name"] = fld.name;
@@ -2543,12 +2578,25 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 				fj["offset"] = f.offset;
 				fj["type"] = struct_dissector::field_type_name(f.type);
 				fj["size"] = f.size;
+				fj["id"] = f.stable_id;
+				fj["array_count"] = f.array_count;
+				fj["target_structure_id"] = f.target_structure_id;
+				fj["enum_id"] = f.enum_id;
+				fj["referenced_type"] = f.referenced_type_name;
+				fj["bit_offset"] = f.bit_offset;
+				fj["bit_width"] = f.bit_width;
+				fj["alignment"] = f.explicit_alignment;
 				if (fi < struct_dissector::g_state.cached_values.size())
 					fj["value"] = struct_dissector::g_state.cached_values[fi].display_text;
 				fields_arr.push_back(std::move(fj));
 			}
 			json result;
 			result["name"] = sd.name;
+			result["id"] = sd.stable_id;
+			result["revision"] = sd.layout_revision;
+			result["kind"] = sd.kind == struct_dissector::structure_kind_t::union_type ? "union" : "struct";
+			result["packing"] = sd.packing;
+			result["alignment"] = sd.explicit_alignment;
 			result["base_address"] = sa_format_address(struct_dissector::g_state.base_address);
 			result["total_size"] = sd.total_size;
 			result["field_count"] = sd.fields.size();
@@ -2569,17 +2617,40 @@ void register_scanner_tools(mcp_standalone::server_t& srv) {
 			return tool_result_t::ok(code, result);
 		};
 
+	auto scanner_export_struct_schema = [](const json&) -> tool_result_t {
+		const std::string schema = struct_dissector::serialize_schema();
+		json result;
+		result["schema_version"] = 3;
+		result["schema"] = schema;
+		return tool_result_t::ok(OBFSTR("Structure schema exported."), result);
+	};
+
+	auto scanner_import_struct_schema = [](const json& params) -> tool_result_t {
+		if (!params.contains("schema") || !params["schema"].is_string())
+			return tool_result_t::error(OBFSTR("'schema' is required."));
+		std::string error;
+		if (!struct_dissector::deserialize_schema(params["schema"].get<std::string>(), error))
+			return tool_result_t::error(OBFSTR("Structure schema import failed: ") + error);
+		json result;
+		result["schema_version"] = 3;
+		result["schema"] = struct_dissector::serialize_schema();
+		return tool_result_t::ok(OBFSTR("Structure schema imported and validated."), result);
+	};
+
 	register_compat(srv, {OBFSTR("scanner_struct_manage"), OBFSTR("memory_scanner"),
-		OBFSTR("Manage scanner structure definitions. Actions: define, add_field, get, export_c."),
-		{{OBFSTR("action"), OBFSTR("string"), OBFSTR("define|add_field|get|export_c"), true},
+		OBFSTR("Manage scanner structure definitions. Actions: define, add_field, get, export_c, export_schema, import_schema."),
+		{{OBFSTR("action"), OBFSTR("string"), OBFSTR("define|add_field|get|export_c|export_schema|import_schema"), true},
 		 {OBFSTR("payload"), OBFSTR("object"), OBFSTR("Action-specific parameters; top-level action-specific fields are also accepted."), false}},
-		[scanner_define_struct, scanner_add_struct_field, scanner_get_struct, scanner_export_struct_c](const json& params) -> tool_result_t {
+		[scanner_define_struct, scanner_add_struct_field, scanner_get_struct, scanner_export_struct_c,
+			scanner_export_struct_schema, scanner_import_struct_schema](const json& params) -> tool_result_t {
 			const std::string action = compat_action_name(params);
 			const json p = compat_action_payload(params);
 			if (action == "define") return scanner_define_struct(p);
 			if (action == "add_field") return scanner_add_struct_field(p);
 			if (action == "get") return scanner_get_struct(p);
 			if (action == "export_c") return scanner_export_struct_c(p);
+			if (action == "export_schema") return scanner_export_struct_schema(p);
+			if (action == "import_schema") return scanner_import_struct_schema(p);
 			return compat_unknown_action("scanner_struct_manage", action);
 		}, false});
 

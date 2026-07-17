@@ -17,6 +17,10 @@
 #include "ui/fonts.hpp"
 #include "ui/ui_anim.hpp"
 #include "../ui/analysis_context_menu.hpp"
+#include "xref_db_view.hpp"
+#include "../disasm/pseudocode_view.hpp"
+#include "../disasm/rename_dialog.hpp"
+#include "../disasm/comment_dialog.hpp"
 #include "workspace/overlay_journal.hpp"
 #include "workspace/workspace_registry.hpp"
 #include "../session/analysis_session.hpp"
@@ -24,6 +28,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -53,9 +58,18 @@ namespace functions_panel {
 		bool        synthetic_name = true;
 	};
 
+	struct presentation_snapshot_t {
+		std::shared_ptr<const std::vector<function_entry_t>> entries;
+		std::vector<int> sorted_indices;
+		std::unordered_map<uint64_t, std::size_t> row_by_address;
+	};
+
 	struct view_state_t {
 		std::mutex                     mtx;
-		std::vector<function_entry_t>  entries;
+		std::shared_ptr<const std::vector<function_entry_t>> entries =
+			std::make_shared<const std::vector<function_entry_t>>();
+		std::shared_ptr<const presentation_snapshot_t> presentation =
+			std::make_shared<const presentation_snapshot_t>();
 		std::atomic<bool>              ready{false};
 		std::atomic<bool>              building{false};
 		std::atomic<bool>              cancel{false};
@@ -82,7 +96,6 @@ namespace functions_panel {
 		int                            sort_column = 0;
 		bool                           sort_ascending = true;
 		bool                           sort_dirty = false;
-		std::vector<int>               sorted_indices;
 	};
 
 	inline std::mutex& workspace_states_mutex() {
@@ -169,7 +182,11 @@ namespace functions_panel {
 			if (!publication || !publication->snapshot) {
 				if (workspace->target_kind() == aida::analysis::target_kind_t::live_snapshot) {
 					std::lock_guard<std::mutex> lock(state_handle->mtx);
-					state_handle->entries.clear();
+					state_handle->entries =
+						std::make_shared<const std::vector<function_entry_t>>();
+					state_handle->presentation =
+						std::make_shared<const presentation_snapshot_t>();
+					state_handle->filtered_indices.clear();
 					state_handle->cached_module_base = workspace->identity().image_base();
 					state_handle->cached_module_size = workspace->identity().module()
 						? static_cast<uint32_t>((std::min<std::uint64_t>)(
@@ -373,7 +390,11 @@ namespace functions_panel {
 						state_handle->building.store(false, std::memory_order_release);
 						return;
 					}
-					state_handle->entries = std::move(entries);
+					state_handle->entries =
+						std::make_shared<const std::vector<function_entry_t>>(std::move(entries));
+					state_handle->presentation =
+						std::make_shared<const presentation_snapshot_t>();
+					state_handle->filtered_indices.clear();
 					state_handle->cached_module_base = workspace->identity().image_base();
 					state_handle->cached_module_size = image ? image->image_size() : 0;
 					state_handle->cached_module_name = workspace->identity().bin_name();
@@ -383,12 +404,14 @@ namespace functions_panel {
 					state_handle->cached_symbol_revision = debug_symbol_revision;
 					state_handle->filter_dirty = true;
 					state_handle->sort_dirty = true;
-					state_handle->selected_row = -1;
-					state_handle->selected_addr = 0;
 				}
 				state_handle->ready.store(true, std::memory_order_release);
 				state_handle->building.store(false, std::memory_order_release);
 			};
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			auto preview_body = std::move(submission.body);
+			preview_body();
+#else
 			const auto submitted = aida::infra::executor::submit(std::move(submission));
 			if (!submitted.submitted) {
 				state_handle->building.store(false, std::memory_order_release);
@@ -397,6 +420,7 @@ namespace functions_panel {
 					workspace->identity().binary_id().to_hex().c_str(),
 					submitted.reject_reason.c_str());
 			}
+#endif
 		}
 
 		inline void launch_build_if_needed(view_state_t&)
@@ -406,68 +430,66 @@ namespace functions_panel {
 
 		inline void rebuild_filter(view_state_t& s) {
 			std::string current = to_lower_copy(s.filter_buf);
-			if (!s.filter_dirty && current == s.last_filter_lower) return;
-			s.last_filter_lower = current;
-			s.filter_dirty = false;
-			s.sort_dirty = true;
-
-			std::lock_guard<std::mutex> lk(s.mtx);
-			s.filtered_indices.clear();
-			s.filtered_indices.reserve(s.entries.size());
-
+			std::shared_ptr<const std::vector<function_entry_t>> entries;
+			{
+				std::lock_guard<std::mutex> lock(s.mtx);
+				if (!s.filter_dirty && current == s.last_filter_lower) return;
+				s.last_filter_lower = current;
+				s.filter_dirty = false;
+				entries = s.entries;
+			}
+			std::vector<int> filtered;
+			filtered.reserve(entries ? entries->size() : 0);
 			if (current.empty()) {
-				for (int i = 0; i < static_cast<int>(s.entries.size()); ++i) {
-					s.filtered_indices.push_back(i);
+				for (int index = 0; entries && index < static_cast<int>(entries->size()); ++index)
+					filtered.push_back(index);
+			} else {
+				std::string addr_query = current;
+				if (addr_query.size() > 2 && addr_query[0] == '0' && addr_query[1] == 'x')
+					addr_query = addr_query.substr(2);
+				char addr_buf[32];
+				for (int index = 0; entries && index < static_cast<int>(entries->size()); ++index) {
+					const auto& entry = (*entries)[static_cast<std::size_t>(index)];
+					std::snprintf(addr_buf, sizeof(addr_buf), "%llx",
+						static_cast<unsigned long long>(entry.address));
+					bool matched = std::strstr(addr_buf, addr_query.c_str()) != nullptr;
+					if (!matched)
+						matched = to_lower_copy(entry.name).find(current) != std::string::npos;
+					if (!matched && !entry.section.empty())
+						matched = to_lower_copy(entry.section).find(current) != std::string::npos;
+					if (matched) filtered.push_back(index);
 				}
-				return;
 			}
-
-			std::string addr_query = current;
-			if (addr_query.size() > 2 && addr_query[0] == '0' && addr_query[1] == 'x') {
-				addr_query = addr_query.substr(2);
-			}
-
-			char addr_buf[32];
-			for (int i = 0; i < static_cast<int>(s.entries.size()); ++i) {
-				const auto& e = s.entries[static_cast<std::size_t>(i)];
-				bool matched = false;
-
-				std::snprintf(addr_buf, sizeof(addr_buf), "%llx",
-					static_cast<unsigned long long>(e.address));
-				if (std::strstr(addr_buf, addr_query.c_str()) != nullptr) {
-					matched = true;
+			{
+				std::lock_guard<std::mutex> lock(s.mtx);
+				if (s.entries != entries) {
+					s.filter_dirty = true;
+					return;
 				}
-
-				if (!matched) {
-					std::string lname = to_lower_copy(e.name);
-					if (lname.find(current) != std::string::npos) matched = true;
-				}
-
-				if (!matched && !e.section.empty()) {
-					std::string lsec = to_lower_copy(e.section);
-					if (lsec.find(current) != std::string::npos) matched = true;
-				}
-
-				if (matched) s.filtered_indices.push_back(i);
+				s.filtered_indices = std::move(filtered);
+				s.sort_dirty = true;
 			}
 		}
 
 		inline void apply_sort(view_state_t& s) {
-			if (!s.sort_dirty) return;
-			s.sort_dirty = false;
-
-			std::lock_guard<std::mutex> lk(s.mtx);
-			s.sorted_indices = s.filtered_indices;
-
-			const int col = s.sort_column;
-			const bool asc = s.sort_ascending;
-			const auto& entries = s.entries;
-
-			auto cmp = [col, asc, &entries](int ia, int ib) {
-				const auto& a = entries[static_cast<size_t>(ia)];
-				const auto& b = entries[static_cast<size_t>(ib)];
+			std::shared_ptr<const std::vector<function_entry_t>> entries;
+			std::vector<int> sorted;
+			int column = 0;
+			bool ascending = true;
+			{
+				std::lock_guard<std::mutex> lock(s.mtx);
+				if (!s.sort_dirty) return;
+				s.sort_dirty = false;
+				entries = s.entries;
+				sorted = s.filtered_indices;
+				column = s.sort_column;
+				ascending = s.sort_ascending;
+			}
+			auto compare = [column, ascending, &entries](int left, int right) {
+				const auto& a = (*entries)[static_cast<std::size_t>(left)];
+				const auto& b = (*entries)[static_cast<std::size_t>(right)];
 				int c = 0;
-				switch (col) {
+				switch (column) {
 					case 0:
 						if (a.address < b.address) c = -1;
 						else if (a.address > b.address) c = 1;
@@ -500,10 +522,38 @@ namespace functions_panel {
 					if (a.address < b.address) c = -1;
 					else if (a.address > b.address) c = 1;
 				}
-				return asc ? (c < 0) : (c > 0);
+				return ascending ? (c < 0) : (c > 0);
 			};
-
-			std::sort(s.sorted_indices.begin(), s.sorted_indices.end(), cmp);
+			if (entries)
+				std::sort(sorted.begin(), sorted.end(), compare);
+			auto presentation = std::make_shared<presentation_snapshot_t>();
+			presentation->entries = entries;
+			presentation->sorted_indices = std::move(sorted);
+			presentation->row_by_address.reserve(presentation->sorted_indices.size());
+			for (std::size_t row = 0; row < presentation->sorted_indices.size(); ++row) {
+				const int source = presentation->sorted_indices[row];
+				if (entries && source >= 0 && source < static_cast<int>(entries->size()))
+					presentation->row_by_address.emplace(
+						(*entries)[static_cast<std::size_t>(source)].address, row);
+			}
+			{
+				std::lock_guard<std::mutex> lock(s.mtx);
+				if (s.entries != entries || s.sort_column != column ||
+					s.sort_ascending != ascending) {
+					s.sort_dirty = true;
+					return;
+				}
+				if (s.selected_addr != 0) {
+					const auto selected = presentation->row_by_address.find(s.selected_addr);
+					if (selected == presentation->row_by_address.end()) {
+						s.selected_row = -1;
+						s.selected_addr = 0;
+					} else {
+						s.selected_row = static_cast<int>(selected->second);
+					}
+				}
+				s.presentation = std::move(presentation);
+			}
 		}
 
 		inline void jump_to_disasm(uint64_t addr) {
@@ -529,6 +579,39 @@ namespace functions_panel {
 			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.graph"));
 		}
 
+		inline void open_in_pseudocode(uint64_t addr) {
+			if (addr == 0) return;
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
+			pseudocode_view::request_decompile(context, addr, false);
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.pseudocode"));
+		}
+
+		inline void rename_function(uint64_t addr) {
+			if (addr == 0) return;
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
+			disasm_view::select_address(addr, context);
+			rename_dialog::open(context,
+				aida::analysis::address_t{aida::analysis::address_space_id_t::virtual_address, addr});
+		}
+
+		inline void comment_function(uint64_t addr) {
+			if (addr == 0) return;
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
+			disasm_view::select_address(addr, context);
+			comment_dialog::open(context,
+				aida::analysis::address_t{aida::analysis::address_space_id_t::virtual_address, addr});
+		}
+
+		inline void open_in_view(uint64_t addr, const char* stable_id) {
+			if (addr == 0) return;
+			select_function(addr);
+			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t(stable_id));
+		}
+
 		inline void show_xrefs_to(uint64_t addr) {
 			if (addr == 0) return;
 			auto context = disasm_view::capture_workspace(render_workspace());
@@ -536,6 +619,18 @@ namespace functions_panel {
 			aida::ui::application_views::open_or_focus(aida::ui::stable_view_id_t("document.disassembly"));
 			disasm_view::goto_address(addr, context);
 			disasm_view::open_xrefs(addr, context);
+		}
+
+		inline void show_xrefs_direction(uint64_t addr, bool query_to) {
+			if (addr == 0) return;
+			auto context = disasm_view::capture_workspace(render_workspace());
+			if (!context) return;
+			const auto typed = disasm_view::typed_address(context, addr);
+			const auto xrefs = xref_db_view::state_for(context);
+			if (!typed || !xrefs) return;
+			xref_db_view::submit_query(context, xrefs, *typed, query_to);
+			aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("view.analysis.references"));
 		}
 
 		inline ImU32 alpha_u32(ImU32 c, float a) {
@@ -563,15 +658,13 @@ namespace functions_panel {
 
 	}
 
-	inline void render_impl(float x, float y, float w, float h) {
+	inline void render_impl(float, float, float w, float h) {
 		auto& s = state();
 		const auto& th = aida::ui::resolved();
 		const float dt = aida::ui::clock::dt();
 		s.row_anim_time += dt;
 
 		if (w < 120.f) {
-			ImGui::SetNextWindowPos(ImVec2(x, y));
-			ImGui::SetNextWindowSize(ImVec2(w, h));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
 			ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
 			ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(th.bg_base));
@@ -583,7 +676,7 @@ namespace functions_panel {
 				ImGuiWindowFlags_NoScrollbar |
 				ImGuiWindowFlags_NoScrollWithMouse |
 				ImGuiWindowFlags_NoBringToFrontOnFocus;
-			ImGui::Begin("##functions_panel_root", nullptr, narrow_flags);
+			ImGui::BeginChild("##functions_panel_content", ImVec2(w, h), false, narrow_flags);
 			ImDrawList* ndl = ImGui::GetWindowDrawList();
 			ImVec2 nwp = ImGui::GetWindowPos();
 			ImFont* ncap = aida::ui::fonts::caption();
@@ -593,18 +686,16 @@ namespace functions_panel {
 			ImVec2 nts = ncap->CalcTextSizeA(nfs, FLT_MAX, w - 8.f, nmsg);
 			ImVec2 npos = ImVec2(nwp.x + (w - nts.x) * 0.5f, nwp.y + (h - nts.y) * 0.5f);
 			ndl->AddText(ncap, nfs, npos, th.text_dim, nmsg);
-			ImGui::End();
+			ImGui::EndChild();
 			ImGui::PopStyleColor();
 			ImGui::PopStyleVar(2);
 			return;
 		}
 
-		const bool compact = (w < 340.f);
+		const bool compact = (w < 220.f);
 
 		detail::launch_build_if_needed(s);
 
-		ImGui::SetNextWindowPos(ImVec2(x, y));
-		ImGui::SetNextWindowSize(ImVec2(w, h));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(th.bg_base));
@@ -618,13 +709,13 @@ namespace functions_panel {
 			ImGuiWindowFlags_NoScrollWithMouse |
 			ImGuiWindowFlags_NoBringToFrontOnFocus;
 
-		ImGui::Begin("##functions_panel_root", nullptr, wflags);
+		ImGui::BeginChild("##functions_panel_content", ImVec2(w, h), false, wflags);
 
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		ImVec2 wp = ImGui::GetWindowPos();
 
-		const float header_h = 78.f;
-		const float pad = 10.f;
+		const float header_h = 62.f;
+		const float pad = 8.f;
 
 		ImVec2 hdr_a = ImVec2(wp.x, wp.y);
 		ImVec2 hdr_b = ImVec2(wp.x + w, wp.y + header_h);
@@ -645,7 +736,7 @@ namespace functions_panel {
 		const float fs_fp_base = aida::ui::components::detail::ui_fs();
 		const float title_fs = fs_fp_base * 1.10f;
 		const float title_x = wp.x + pad + 2.f;
-		const float title_y = wp.y + 8.f;
+		const float title_y = wp.y + 5.f;
 		dl->AddText(title_font, title_fs,
 			ImVec2(title_x, title_y),
 			th.text_primary, "Functions");
@@ -661,17 +752,15 @@ namespace functions_panel {
 		size_t shown_count = 0;
 		bool ready = s.ready.load(std::memory_order_acquire);
 		bool building = s.building.load(std::memory_order_acquire);
-		std::string module_name_local;
 		{
 			std::lock_guard<std::mutex> lk(s.mtx);
-			total_count = s.entries.size();
-			module_name_local = s.cached_module_name;
+			total_count = s.entries ? s.entries->size() : 0;
 		}
 
 		ImGui::PushFont(body_font);
 
-		const float input_y = 32.f;
-		const float input_h = 30.f;
+		const float input_y = 27.f;
+		const float input_h = 26.f;
 		const float input_w_max = w - pad * 2.f - 110.f;
 		float input_w = input_w_max;
 		if (input_w < 120.f) input_w = w - pad * 2.f;
@@ -695,6 +784,7 @@ namespace functions_panel {
 			"Filter functions...", false,
 			ImVec2(input_w, input_h));
 		if (filter_changed) {
+			std::lock_guard<std::mutex> lock(s.mtx);
 			s.filter_dirty = true;
 		}
 
@@ -717,34 +807,6 @@ namespace functions_panel {
 			dl->AddText(badge_font, bfs,
 				ImVec2(ba.x + 8.f, ba.y + (bh - bfs) * 0.5f),
 				text_on_badge, count_buf);
-		}
-
-		if (!module_name_local.empty()) {
-			std::string mod_display = module_name_local;
-			if (mod_display.size() > 48) {
-				mod_display.resize(48);
-				mod_display.append("\xe2\x80\xa6");
-			}
-			char sub_buf[256];
-			std::snprintf(sub_buf, sizeof(sub_buf), "Module: %s", mod_display.c_str());
-			float sub_avail = w - (pad + 2.f) * 2.f;
-			const float fs_sub = fs_fp_base * 0.85f;
-			ImVec2 sub_size = caption_font->CalcTextSizeA(fs_sub, FLT_MAX, 0.f, sub_buf);
-			if (sub_size.x > sub_avail && sub_avail > 24.f) {
-				std::string cut(sub_buf);
-				while (cut.size() > 4) {
-					cut.pop_back();
-					std::string probe = cut + "\xe2\x80\xa6";
-					ImVec2 ps = caption_font->CalcTextSizeA(fs_sub, FLT_MAX, 0.f, probe.c_str());
-					if (ps.x <= sub_avail) {
-						std::snprintf(sub_buf, sizeof(sub_buf), "%s", probe.c_str());
-						break;
-					}
-				}
-			}
-			dl->AddText(caption_font, fs_sub,
-				ImVec2(wp.x + pad + 2.f, wp.y + header_h - 18.f),
-				th.text_dim, sub_buf);
 		}
 
 		if (building) {
@@ -773,7 +835,7 @@ namespace functions_panel {
 			aida::ui::empty_state::render(cp, content_size, cfg);
 			ImGui::EndChild();
 			ImGui::PopFont();
-			ImGui::End();
+			ImGui::EndChild();
 			ImGui::PopStyleColor();
 			ImGui::PopStyleVar(2);
 			return;
@@ -791,7 +853,7 @@ namespace functions_panel {
 			aida::ui::empty_state::render(cp, content_size, cfg);
 			ImGui::EndChild();
 			ImGui::PopFont();
-			ImGui::End();
+			ImGui::EndChild();
 			ImGui::PopStyleColor();
 			ImGui::PopStyleVar(2);
 			return;
@@ -800,12 +862,14 @@ namespace functions_panel {
 		detail::rebuild_filter(s);
 		detail::apply_sort(s);
 
+		std::shared_ptr<const presentation_snapshot_t> row_view;
 		{
 			std::lock_guard<std::mutex> lk(s.mtx);
-			shown_count = s.sorted_indices.size();
+			row_view = s.presentation;
+			shown_count = row_view ? row_view->sorted_indices.size() : 0;
 		}
 
-		ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(8.f, 5.f));
+		ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(7.f, 3.f));
 		ImGui::PushStyleColor(ImGuiCol_TableHeaderBg, th.panel_header);
 		ImGui::PushStyleColor(ImGuiCol_TableBorderLight, th.border_subtle);
 		ImGui::PushStyleColor(ImGuiCol_TableBorderStrong, th.border_subtle);
@@ -820,7 +884,6 @@ namespace functions_panel {
 			ImGuiTableFlags_RowBg |
 			ImGuiTableFlags_BordersInnerV |
 			ImGuiTableFlags_ScrollY |
-			ImGuiTableFlags_NoSavedSettings |
 			ImGuiTableFlags_SizingStretchProp;
 
 		ImVec2 outer = ImVec2(content_size.x, content_size.y);
@@ -828,33 +891,23 @@ namespace functions_panel {
 		bool ctx_menu_request = false;
 
 		if (compact) {
-			std::vector<int> row_view;
-			{
-				std::lock_guard<std::mutex> lk(s.mtx);
-				row_view = s.sorted_indices;
-			}
-
 			ImGui::SetCursorScreenPos(content_pos);
 			ImGui::BeginChild("##fn_compact", content_size, false,
 				ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
 
 			ImDrawList* cdl = ImGui::GetWindowDrawList();
-			const float row_h = (std::max)(40.f, fs_fp_base * 2.55f);
+			const float row_h = (std::max)(34.f, fs_fp_base * 2.15f);
 
 			ImGuiListClipper clipper;
-			clipper.Begin(static_cast<int>(row_view.size()), row_h);
+			clipper.Begin(row_view ? static_cast<int>(row_view->sorted_indices.size()) : 0,
+				row_h);
 			while (clipper.Step()) {
 				for (int row_idx = clipper.DisplayStart; row_idx < clipper.DisplayEnd; ++row_idx) {
-					int entry_idx = row_view[static_cast<size_t>(row_idx)];
-
-					function_entry_t e;
-					{
-						std::lock_guard<std::mutex> lk(s.mtx);
-						if (entry_idx < 0 || entry_idx >= static_cast<int>(s.entries.size())) {
-							continue;
-						}
-						e = s.entries[static_cast<size_t>(entry_idx)];
-					}
+					const int entry_idx = row_view->sorted_indices[static_cast<std::size_t>(row_idx)];
+					if (!row_view->entries || entry_idx < 0 ||
+						entry_idx >= static_cast<int>(row_view->entries->size()))
+						continue;
+					const auto& e = (*row_view->entries)[static_cast<std::size_t>(entry_idx)];
 
 					ImGui::PushID(row_idx);
 
@@ -1023,37 +1076,33 @@ namespace functions_panel {
 					int col = sort_specs->Specs[0].ColumnIndex;
 					bool asc = sort_specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending;
 					if (col != s.sort_column || asc != s.sort_ascending) {
-						s.sort_column = col;
-						s.sort_ascending = asc;
-						s.sort_dirty = true;
+						{
+							std::lock_guard<std::mutex> lock(s.mtx);
+							s.sort_column = col;
+							s.sort_ascending = asc;
+							s.sort_dirty = true;
+						}
 						detail::apply_sort(s);
+						std::lock_guard<std::mutex> lock(s.mtx);
+						row_view = s.presentation;
+						shown_count = row_view ? row_view->sorted_indices.size() : 0;
 					}
 					sort_specs->SpecsDirty = false;
 				}
 			}
 
-			std::vector<int> row_view;
-			{
-				std::lock_guard<std::mutex> lk(s.mtx);
-				row_view = s.sorted_indices;
-			}
-
 			ImGuiListClipper clipper;
-			clipper.Begin(static_cast<int>(row_view.size()), 22.f);
+			clipper.Begin(row_view ? static_cast<int>(row_view->sorted_indices.size()) : 0,
+				20.f);
 			while (clipper.Step()) {
 				for (int row_idx = clipper.DisplayStart; row_idx < clipper.DisplayEnd; ++row_idx) {
-					int entry_idx = row_view[static_cast<size_t>(row_idx)];
+					const int entry_idx = row_view->sorted_indices[static_cast<std::size_t>(row_idx)];
+					if (!row_view->entries || entry_idx < 0 ||
+						entry_idx >= static_cast<int>(row_view->entries->size()))
+						continue;
+					const auto& e = (*row_view->entries)[static_cast<std::size_t>(entry_idx)];
 
-					function_entry_t e;
-					{
-						std::lock_guard<std::mutex> lk(s.mtx);
-						if (entry_idx < 0 || entry_idx >= static_cast<int>(s.entries.size())) {
-							continue;
-						}
-						e = s.entries[static_cast<size_t>(entry_idx)];
-					}
-
-					ImGui::TableNextRow(0, 22.f);
+					ImGui::TableNextRow(0, 20.f);
 					ImGui::TableSetColumnIndex(0);
 
 					bool is_selected = (s.selected_addr != 0 && s.selected_addr == e.address);
@@ -1066,7 +1115,7 @@ namespace functions_panel {
 						ImGuiSelectableFlags_SpanAllColumns |
 						ImGuiSelectableFlags_AllowDoubleClick |
 						ImGuiSelectableFlags_AllowItemOverlap,
-						ImVec2(0.f, 20.f)))
+						ImVec2(0.f, 18.f)))
 					{
 						s.selected_row = row_idx;
 						s.selected_addr = e.address;
@@ -1074,20 +1123,6 @@ namespace functions_panel {
 						if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
 							detail::jump_to_disasm(e.address);
 						}
-					}
-
-					if (ImGui::IsItemFocused() &&
-						(ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-						 ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)))
-					{
-						detail::jump_to_disasm(e.address);
-					}
-
-					if (is_selected && ImGui::IsKeyPressed(ImGuiKey_Space, false) &&
-						!ImGui::IsAnyItemActive() &&
-						!ImGui::GetIO().WantTextInput)
-					{
-						detail::open_in_graph(e.address);
 					}
 
 					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
@@ -1200,6 +1235,59 @@ namespace functions_panel {
 		ImGui::PopStyleColor(5);
 		ImGui::PopStyleVar();
 
+		function_entry_t selected_entry;
+		bool have_selected_entry = false;
+		if (s.selected_addr != 0 && row_view && row_view->entries) {
+			const auto selected = row_view->row_by_address.find(s.selected_addr);
+			if (selected != row_view->row_by_address.end() &&
+				selected->second < row_view->sorted_indices.size()) {
+				const int source = row_view->sorted_indices[selected->second];
+				if (source >= 0 && source < static_cast<int>(row_view->entries->size())) {
+					selected_entry = (*row_view->entries)[static_cast<std::size_t>(source)];
+					have_selected_entry = true;
+				}
+			}
+		}
+
+		const bool accepts_shortcuts = have_selected_entry &&
+			ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+			!ImGui::IsAnyItemActive() && !ImGui::GetIO().WantTextInput;
+		if (accepts_shortcuts) {
+			int navigation_delta = 0;
+			if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false)) navigation_delta = -1;
+			if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) navigation_delta = 1;
+			if (ImGui::IsKeyPressed(ImGuiKey_PageUp, false)) navigation_delta = -10;
+			if (ImGui::IsKeyPressed(ImGuiKey_PageDown, false)) navigation_delta = 10;
+			if (navigation_delta != 0 || ImGui::IsKeyPressed(ImGuiKey_Home, false) ||
+				ImGui::IsKeyPressed(ImGuiKey_End, false)) {
+				uint64_t next_address = 0;
+				int next_row = s.selected_row;
+				if (row_view && row_view->entries && !row_view->sorted_indices.empty()) {
+					const auto current = row_view->row_by_address.find(s.selected_addr);
+					std::ptrdiff_t position = current == row_view->row_by_address.end() ? 0 :
+						static_cast<std::ptrdiff_t>(current->second);
+					if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) position = 0;
+					else if (ImGui::IsKeyPressed(ImGuiKey_End, false))
+						position = static_cast<std::ptrdiff_t>(row_view->sorted_indices.size() - 1);
+					else position = (std::max<std::ptrdiff_t>)(0,
+						(std::min<std::ptrdiff_t>)(static_cast<std::ptrdiff_t>(row_view->sorted_indices.size() - 1),
+							position + navigation_delta));
+					next_row = static_cast<int>(position);
+					const int source = row_view->sorted_indices[static_cast<std::size_t>(position)];
+					if (source >= 0 && source < static_cast<int>(row_view->entries->size()))
+						next_address = (*row_view->entries)[static_cast<std::size_t>(source)].address;
+				}
+				if (next_address != 0) {
+					s.selected_row = next_row;
+					s.selected_addr = next_address;
+					detail::select_function(next_address);
+				}
+			}
+			if (ImGui::GetIO().KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_C, false) ||
+				ImGui::IsKeyPressed(ImGuiKey_Insert, false)))
+				ImGui::SetClipboardText(selected_entry.name.c_str());
+		}
+
 		aida::ui::context_menu_open_origin_t function_origin{};
 		const bool function_keyboard = s.selected_addr != 0 &&
 			ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
@@ -1212,6 +1300,7 @@ namespace functions_panel {
 			if (workspace) {
 				context_t menu;
 				menu.kind = menu_kind_t::function;
+				menu.entity_id = "function:" + std::to_string(target);
 				const auto generation = workspace->generation();
 				const auto revision = workspace->analysis_revision();
 				menu.generation = generation ^ (revision + 0x9E3779B97F4A7C15ull +
@@ -1222,6 +1311,13 @@ namespace functions_panel {
 					return current ^ (current_revision + 0x9E3779B97F4A7C15ull +
 						(current << 6u) + (current >> 2u));
 				};
+				menu.validate_identity = [&s, target]() {
+					std::lock_guard<std::mutex> lock(s.mtx);
+					return s.selected_addr == target
+						? aida::ui::capability_state_t::available()
+						: aida::ui::capability_state_t::unavailable(
+							"The selected function changed");
+				};
 				menu.actions["analysis.navigate.disassembly"].invoke = [target]() {
 					detail::jump_to_disasm(target);
 					return action_handler_result_t::completed();
@@ -1230,8 +1326,44 @@ namespace functions_panel {
 					detail::open_in_graph(target);
 					return action_handler_result_t::completed();
 				};
+				menu.actions["analysis.navigate.pseudocode"].invoke = [target]() {
+					detail::open_in_pseudocode(target);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.hex"].invoke = [target]() {
+					detail::open_in_view(target, "document.hex");
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.types"].invoke = [target]() {
+					detail::open_in_view(target, "view.types.inferred");
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.structures"].invoke = [target]() {
+					detail::open_in_view(target, "view.types.structures");
+					return action_handler_result_t::completed();
+				};
 				menu.actions["analysis.navigate.xrefs"].invoke = [target]() {
 					detail::show_xrefs_to(target);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.xrefs_from"].invoke = [target]() {
+					detail::show_xrefs_direction(target, false);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.callers"].invoke = [target]() {
+					detail::show_xrefs_direction(target, true);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.navigate.callees"].invoke = [target]() {
+					detail::show_xrefs_direction(target, false);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.modify.rename"].invoke = [target]() {
+					detail::rename_function(target);
+					return action_handler_result_t::completed();
+				};
+				menu.actions["analysis.modify.comment"].invoke = [target]() {
+					detail::comment_function(target);
 					return action_handler_result_t::completed();
 				};
 				char address[32]{};
@@ -1241,6 +1373,24 @@ namespace functions_panel {
 					ImGui::SetClipboardText(value.c_str());
 					return action_handler_result_t::completed();
 				};
+				menu.actions["analysis.copy.address_va"].invoke = [value = std::string(address)]() {
+					ImGui::SetClipboardText(value.c_str());
+					return action_handler_result_t::completed();
+				};
+				if (have_selected_entry) {
+					menu.actions["analysis.copy.name"].invoke = [value = selected_entry.name]() {
+						ImGui::SetClipboardText(value.c_str());
+						return action_handler_result_t::completed();
+					};
+					menu.actions["analysis.copy.text"].invoke = [value = selected_entry.name]() {
+						ImGui::SetClipboardText(value.c_str());
+						return action_handler_result_t::completed();
+					};
+					menu.actions["analysis.copy.line"].invoke = [value = std::string(address) + "\t" + selected_entry.name]() {
+						ImGui::SetClipboardText(value.c_str());
+						return action_handler_result_t::completed();
+					};
+				}
 				open(std::move(menu), ctx_menu_request
 					? aida::ui::context_menu_open_origin_t::pointer : function_origin);
 			}
@@ -1254,6 +1404,8 @@ namespace functions_panel {
 		ImGui::PopStyleColor(2);
 		ImGui::PopStyleVar(3);
 		aida::ui::analysis_context_menu::render();
+		rename_dialog::render();
+		comment_dialog::render();
 
 		if (ready && !building && total_count == 0) {
 			ImVec2 cp = ImVec2(wp.x + pad, wp.y + header_h + 8.f);
@@ -1276,7 +1428,7 @@ namespace functions_panel {
 
 		ImGui::PopFont();
 
-		ImGui::End();
+		ImGui::EndChild();
 		ImGui::PopStyleColor();
 		ImGui::PopStyleVar(2);
 	}

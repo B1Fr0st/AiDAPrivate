@@ -3202,6 +3202,7 @@ workspace_result_t<void> overlay_journal_t::reload_items() {
         items_ = std::move(items);
         revision_ = state.revision;
         history_cursor_ = state.cursor;
+        next_transaction_id_ = state.next_transaction;
         history_epoch_ = state.epoch;
     }
     return workspace_result_t<void>::success();
@@ -3768,6 +3769,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::transact(
             items_.swap(*next_items);
             revision_ = committed_state->revision;
             history_cursor_ = committed_state->cursor;
+            next_transaction_id_ = committed_state->next_transaction;
             history_epoch_ = committed_state->epoch;
             fixed_target_ = next_target;
         }
@@ -4301,6 +4303,7 @@ workspace_result_t<overlay_transaction_result_t> overlay_journal_t::history_acti
             items_.swap(*next_items);
             revision_ = committed_state->revision;
             history_cursor_ = committed_state->cursor;
+            next_transaction_id_ = committed_state->next_transaction;
             history_epoch_ = committed_state->epoch;
             fixed_target_ = next_target;
         }
@@ -4359,6 +4362,16 @@ overlay_snapshot_t overlay_journal_t::snapshot() const {
         [](const auto& lhs, const auto& rhs) {
             return lhs.first < rhs.first;
         });
+    return result;
+}
+
+overlay_history_snapshot_t overlay_journal_t::history_snapshot() const noexcept {
+    overlay_history_snapshot_t result;
+    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    result.revision = revision_;
+    result.history_cursor = history_cursor_;
+    result.next_transaction_id = next_transaction_id_;
+    result.history_epoch = history_epoch_;
     return result;
 }
 

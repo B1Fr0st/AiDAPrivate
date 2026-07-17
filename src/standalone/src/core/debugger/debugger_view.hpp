@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 #include "transition.hpp"
 #include "debugger_interaction_context.hpp"
 
@@ -18,6 +19,13 @@ enum class execution_command_t : std::uint8_t {
 	restart,
 	detach,
 	toggle_breakpoint_at_instruction_pointer
+};
+
+enum class patch_panel_command_t : std::uint8_t {
+	stage,
+	find_code_caves,
+	revert_all,
+	save_patchset
 };
 
 struct execution_capability_t {
@@ -40,6 +48,7 @@ enum class sub_tab_t : int {
 	patches,
 	seh_chain,
 	cfg,
+	source,
 	COUNT
 };
 
@@ -144,6 +153,7 @@ struct ui_state_t {
 	int      cpu_stack_selected = -1;
 	int      cpu_disasm_selected = -1;
 	uint64_t cpu_disasm_anchor_rip = 0;
+	int      source_definition_selected = -1;
 	int      bp_edit_idx = -1;
 	char     bp_edit_condition_buf[160] = {};
 	char     bp_edit_log_buf[160] = {};
@@ -170,6 +180,12 @@ struct ui_state_t {
 	std::uint64_t patch_stage_extent = 0;
 	char     patch_stage_bytes_buf[12288] = {};
 	char     patch_stage_description_buf[256] = {};
+	std::vector<std::uint8_t> patch_stage_parsed_bytes;
+	bool     patch_stage_parse_valid = false;
+	bool     patch_stage_exact = false;
+	std::uint32_t patch_stage_expected_pid = 0;
+	std::uint64_t patch_stage_expected_stop_generation = 0;
+	std::vector<std::uint8_t> patch_stage_expected_before;
 };
 
 inline ui_state_t g_ui;
@@ -185,10 +201,27 @@ void render_pane(sub_tab_t pane, float pos_x, float pos_y, float width, float he
 	bool show_execution_controls = false, bool show_status = false);
 void render_execution_controls(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b);
+void render_global_target_dialog();
 execution_capability_t execution_capability(execution_command_t command);
 bool execute_command(execution_command_t command, std::string* error = nullptr);
+execution_capability_t patch_panel_capability(patch_panel_command_t command);
+bool execute_patch_panel_command(patch_panel_command_t command, std::string* error = nullptr);
 bool stage_patch_review(std::uint64_t address, std::uint64_t extent,
 	const std::string& description, std::string* error = nullptr);
+bool stage_exact_patch_review(std::uint64_t address,
+	const std::vector<std::uint8_t>& expected_before,
+	const std::vector<std::uint8_t>& reviewed_after,
+	std::uint32_t expected_pid,
+	const std::string& description, std::string* error = nullptr);
+bool stage_nop_review(std::uint64_t address, std::uint64_t extent,
+	std::string* error = nullptr);
+bool stage_breakpoint_definition(std::uint64_t address, std::string* error = nullptr);
+execution_capability_t address_mutation_capability(std::uint64_t address,
+	bool toggle_breakpoint, std::uint32_t expected_pid = 0);
+bool queue_run_to_address(std::uint64_t address, std::uint32_t expected_pid,
+	std::string* error = nullptr);
+bool queue_toggle_breakpoint(std::uint64_t address, std::uint32_t expected_pid,
+	std::string* error = nullptr);
 
 void render_cpu_pane(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b);
@@ -217,6 +250,8 @@ void render_patches_pane(float pos_x, float pos_y, float width, float height,
 void render_seh_pane(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b);
 void render_cfg_pane(float pos_x, float pos_y, float width, float height,
+	float alpha, float accent_r, float accent_g, float accent_b);
+void render_source_pane(float pos_x, float pos_y, float width, float height,
 	float alpha, float accent_r, float accent_g, float accent_b);
 
 }

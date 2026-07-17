@@ -9,6 +9,7 @@
 #include "apply_diff.hpp"
 #include "apply_patch.hpp"
 #include "code_index.hpp"
+#include "../editor/programming_language_service.hpp"
 #include "checkpoints.hpp"
 #define AIDA_SKILLS_IMPLEMENTATION
 #include "skills.hpp"
@@ -57,10 +58,6 @@ std::mutex               g_followup_mtx;
 bool                     g_followup_pending = false;
 
 tool_repetition::detector_t g_repetition_detector;
-
-
-std::unique_ptr<code_index::manager_t> g_code_index;
-std::mutex                              g_code_index_mtx;
 
 
 std::unique_ptr<checkpoints::service_t> g_checkpoint_svc;
@@ -146,119 +143,28 @@ bool path_within_workspace(const std::string& canonical_path)
     return p_str.rfind(ws_str, 0) == 0;
 }
 
-std::vector<code_index::search_result_t> direct_codebase_search(const std::string& query, const std::string& directory, int top_k)
-{
-    std::vector<code_index::search_result_t> results;
-    if (query.empty())
-        return results;
-    std::string root = g_sa_settings.workspace.root_path.empty() ? file_browser::current_dir : g_sa_settings.workspace.root_path;
-    if (root.empty())
-        return results;
-
-    std::error_code ec;
-    fs::path root_path = fs::weakly_canonical(fs::path(root), ec);
-    if (ec)
-        root_path = fs::path(root);
-
-    fs::path search_path = root_path;
-    if (!directory.empty()) {
-        fs::path dir_path(directory);
-        if (dir_path.is_relative())
-            dir_path = root_path / dir_path;
-        std::error_code dir_ec;
-        fs::path canonical_dir = fs::weakly_canonical(dir_path, dir_ec);
-        if (!dir_ec)
-            search_path = canonical_dir;
-    }
-
-    std::string root_lc = root_path.string();
-    std::string search_lc = search_path.string();
-    std::transform(root_lc.begin(), root_lc.end(), root_lc.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    std::transform(search_lc.begin(), search_lc.end(), search_lc.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (search_lc.find(root_lc) != 0)
-        return results;
-
-    std::string lower_query = query;
-    std::transform(lower_query.begin(), lower_query.end(), lower_query.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    constexpr int max_files = 5000;
-    int files_scanned = 0;
-    for (auto it = fs::recursive_directory_iterator(search_path, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); ++it)
-    {
-        if (ec)
-            break;
-        if (static_cast<int>(results.size()) >= top_k)
-            break;
-        if (files_scanned >= max_files)
-            break;
-        std::error_code entry_ec;
-        if (it->is_directory(entry_ec)) {
-            std::string name = it->path().filename().string();
-            if (name == ".git" || name == ".vs" || name == "node_modules" || name == "__pycache__")
-                it.disable_recursion_pending();
-            continue;
-        }
-        if (!it->is_regular_file(entry_ec))
-            continue;
-        std::string ext = it->path().extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (!code_index::is_indexable_extension(ext))
-            continue;
-        auto file_size = it->file_size(entry_ec);
-        if (entry_ec || file_size > 2 * 1024 * 1024)
-            continue;
-        ++files_scanned;
-        std::ifstream ifs(it->path(), std::ios::binary);
-        if (!ifs.is_open())
-            continue;
-        std::string line;
-        int line_number = 0;
-        while (std::getline(ifs, line)) {
-            ++line_number;
-            std::string lower_line = line;
-            std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(),
-                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (lower_line.find(lower_query) == std::string::npos)
-                continue;
-            code_index::search_result_t result;
-            result.file_path = it->path().string();
-            result.line_number = line_number;
-            result.content = line.size() > 240 ? line.substr(0, 240) + "..." : line;
-            result.score = 0.01;
-            results.push_back(std::move(result));
-            if (static_cast<int>(results.size()) >= top_k)
-                break;
-        }
-    }
-    diag::log_tagged_fmt("workflow",
-        "codebase_search_direct root='%s' directory='%s' files=%d results=%zu query='%.80s'",
-        root_path.string().c_str(),
-        directory.c_str(),
-        files_scanned,
-        results.size(),
-        query.c_str());
-    return results;
-}
-
-tool_result_t codebase_results_response(const std::string& query, const std::vector<code_index::search_result_t>& results)
+tool_result_t codebase_results_response(const std::string& query,
+    const aida::editor::language_service::query_result_t& result)
 {
     json results_json = json::array();
-    for (const auto& r : results) {
+    for (const auto& location : result.locations) {
         results_json.push_back({
-            {"file", r.file_path},
-            {"line", r.line_number},
-            {"score", r.score},
-            {"content", r.content}
+            {"file", location.file_path},
+            {"line", location.line},
+            {"column", location.column},
+            {"match_length", location.match_length},
+            {"score", 1.0},
+            {"content", location.preview},
+            {"provider", result.provider_name},
+            {"index_generation", result.index_generation}
         });
     }
     return tool_result_t::ok(
-        "Found " + std::to_string(results.size()) + " results for: " + query,
-        json{{"results", results_json}});
+        "Found " + std::to_string(result.locations.size()) + " bounded lexical results for: " + query,
+        json{{"results", results_json}, {"provider", result.provider_name},
+             {"provider_generation", result.provider_generation},
+             {"index_generation", result.index_generation},
+             {"truncated", result.truncated}});
 }
 
 
@@ -833,46 +739,35 @@ tool_result_t handle_codebase_search(const json& params)
     if (query.empty())
         return tool_result_t::error("Query cannot be empty.");
 
-    std::unique_lock<std::mutex> lk(g_code_index_mtx);
-    if (!g_code_index) {
-        if (g_sa_settings.workspace.root_path.empty())
-            return tool_result_t::error("No workspace is open. Open a workspace first.");
-
-        g_code_index = std::make_unique<code_index::manager_t>(g_sa_settings.workspace.root_path);
-        g_code_index->start_indexing();
-        lk.unlock();
-        auto direct = direct_codebase_search(query, directory, 10);
-        if (!direct.empty())
-            return codebase_results_response(query, direct);
-        return tool_result_t::ok("Code index is being built. Please retry in a moment.");
+    const std::string root = active_workspace_root();
+    if (root.empty())
+        return tool_result_t::error("No workspace is open. Open a workspace first.");
+    aida::editor::language_service::synchronize_workspace(root);
+    aida::editor::language_service::query_t request;
+    request.kind = aida::editor::language_service::capability_kind_t::references;
+    request.document.file_path.clear();
+    request.document.language_id = "Plain Text";
+    request.text = query;
+    request.directory = directory;
+    request.maximum_results = 10;
+    std::atomic<bool> cancelled{false};
+    const auto result = aida::editor::language_service::execute_worker_query(
+        std::move(request), cancelled);
+    if (result.state == aida::editor::language_service::result_state_t::unavailable) {
+        const auto index_state = aida::editor::language_service::workspace_index_state();
+        if (index_state == code_index::index_state_t::indexing)
+            return tool_result_t::ok(
+                "Workspace Text Index is building. Retry after its Task Center job publishes a generation.",
+                json{{"provider", "Workspace Text Index"}, {"state", "indexing"}});
+        return tool_result_t::error(result.status);
     }
-
-    if (g_code_index->state() == code_index::index_state_t::indexing) {
-        auto partial_results = g_code_index->search(query, directory, 10);
-        size_t indexed_count = g_code_index->indexed_count();
-        lk.unlock();
-        if (!partial_results.empty())
-            return codebase_results_response(query, partial_results);
-        auto direct = direct_codebase_search(query, directory, 10);
-        if (!direct.empty())
-            return codebase_results_response(query, direct);
-        return tool_result_t::ok("Code index is still building. Please retry in a moment. " +
-                                std::to_string(indexed_count) + " documents indexed so far.");
-    }
-
-    auto results = g_code_index->search(query, directory, 10);
-    lk.unlock();
-    diag::log_tagged_fmt("workflow", "codebase_search results=%zu query='%.80s'",
-        results.size(), query.c_str());
-
-    if (results.empty()) {
-        auto direct = direct_codebase_search(query, directory, 10);
-        if (!direct.empty())
-            return codebase_results_response(query, direct);
-        return tool_result_t::ok("No results found for query: " + query);
-    }
-
-    return codebase_results_response(query, results);
+    if (result.state == aida::editor::language_service::result_state_t::error)
+        return tool_result_t::error(result.status);
+    diag::log_tagged_fmt("workflow",
+        "codebase_search provider=workspace_text_index generation=%llu results=%zu truncated=%d query='%.80s'",
+        static_cast<unsigned long long>(result.index_generation),
+        result.locations.size(), result.truncated ? 1 : 0, query.c_str());
+    return codebase_results_response(query, result);
 }
 
 
@@ -1210,14 +1105,16 @@ tool_result_t handle_run_slash_command(const json& params)
     }
 
     if (command == "index") {
-        std::lock_guard<std::mutex> lk(g_code_index_mtx);
-        if (!g_code_index) {
-            if (g_sa_settings.workspace.root_path.empty())
-                return tool_result_t::error("No workspace is open.");
-            g_code_index = std::make_unique<code_index::manager_t>(g_sa_settings.workspace.root_path);
-        }
-        g_code_index->start_indexing();
-        return tool_result_t::ok("Code index rebuild started.");
+        aida::editor::language_service::synchronize_workspace(active_workspace_root());
+        const std::uint64_t active_task =
+            aida::editor::language_service::workspace_index_task_id();
+        if (active_task != 0)
+            return tool_result_t::ok(
+                "Workspace Text Index is already running in Task Center.");
+        const auto rebuild = aida::editor::language_service::rebuild_workspace_index();
+        return rebuild.accepted
+            ? tool_result_t::ok("Workspace Text Index rebuild started in Task Center.")
+            : tool_result_t::error(rebuild.reason);
     }
 
     diag::log_tagged_fmt("workflow", "run_slash_command unknown cmd='%s'", command.c_str());
@@ -1297,27 +1194,14 @@ tool_repetition::detector_t& get_repetition_detector()
 void initialize_code_index(const std::string& workspace_root)
 {
     diag::log_tagged_fmt("workflow", "initialize_code_index root='%s'", workspace_root.c_str());
-    std::lock_guard<std::mutex> lk(g_code_index_mtx);
-    if (!g_code_index) {
-        g_code_index = std::make_unique<code_index::manager_t>(workspace_root);
-        g_code_index->start_indexing();
-        diag::log_tagged_fmt("workflow", "initialize_code_index started indexing");
-    } else {
-        diag::log_tagged_fmt("workflow", "initialize_code_index already initialized");
-    }
+    aida::editor::language_service::synchronize_workspace(workspace_root);
+    diag::log_tagged_fmt("workflow", "initialize_code_index shared_service_ready");
 }
 
 void shutdown_services()
 {
     diag::log_tagged_fmt("workflow", "shutdown_services entry");
-    {
-        std::lock_guard<std::mutex> lk(g_code_index_mtx);
-        if (g_code_index) {
-            diag::log_tagged_fmt("workflow", "shutdown_services stopping code index");
-            g_code_index->stop_indexing();
-            g_code_index.reset();
-        }
-    }
+    aida::editor::language_service::shutdown();
     {
         std::lock_guard<std::mutex> lk(g_checkpoint_mtx);
         if (g_checkpoint_svc) {

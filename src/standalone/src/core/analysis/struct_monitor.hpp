@@ -18,6 +18,7 @@
 #include "standalone_driver.hpp"
 #include "zydis_disasm.hpp"
 #include "../infra/executor.hpp"
+#include "../ui/task_center.hpp"
 #include "../../helpers/diag_log.hpp"
 
 namespace struct_monitor {
@@ -416,7 +417,19 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 						field.value_history.push(val);
 					}
 				}
+				struct_recon::publish_current_locked();
+			} else {
+				std::lock_guard<std::mutex> sr_lk(struct_recon::g_state.mutex);
+				struct_recon::publish_current_locked();
 			}
+		}
+
+		if (sess.using_polling) {
+			const auto final_sample_time = std::chrono::steady_clock::now();
+			const uint64_t timestamp = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					final_sample_time.time_since_epoch()).count());
+			record_polling_deltas(timestamp);
 		}
 
 		if (sess.using_page_guard && sess.pg_session_id != 0) {
@@ -431,7 +444,8 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 
 		g_state.active.store(false);
 	};
-	if (!aida::infra::executor::submit(std::move(sub)).submitted) {
+	const auto submitted = aida::infra::executor::submit(std::move(sub));
+	if (!submitted.submitted) {
 		if (sess.using_page_guard && sess.pg_session_id != 0)
 			page_guard_engine::g_pg_engine.uninstall(sess.pg_session_id);
 		if (sess.using_hwbp && sess.primary_tid != 0) {
@@ -444,15 +458,26 @@ inline void start(uint64_t base_address, int struct_size, const std::string& nam
 			static_cast<unsigned long long>(base_address),
 			struct_size,
 			pid);
+	} else if (submitted.task_id != 0) {
+		aida::ui::task_center::task_registration_t registration;
+		registration.owner = "analysis";
+		registration.owner_view = "view.types.struct_recon";
+		registration.owner_action = "types.live_monitor";
+		registration.target = "PID " + std::to_string(pid);
+		registration.label = "Monitor live structure accesses";
+		registration.stage = "Monitoring memory accesses";
+		registration.cancellation_is_safe = true;
+		registration.callbacks.cancel = [] {
+			g_state.stop_requested.store(true);
+			return true;
+		};
+		(void)aida::ui::task_center::register_executor_job(
+			submitted.task_id, std::move(registration));
 	}
 }
 
 inline void stop()
 {
-	auto now = std::chrono::steady_clock::now();
-	uint64_t timestamp = static_cast<uint64_t>(
-		std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
-	record_polling_deltas(timestamp);
 	g_state.stop_requested.store(true);
 }
 

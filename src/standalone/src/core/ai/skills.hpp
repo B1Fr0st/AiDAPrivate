@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -150,6 +151,16 @@ namespace aida {
 namespace skills {
 
 	namespace {
+		constexpr std::uintmax_t k_max_local_text_bytes = 8ull * 1024ull * 1024ull;
+		constexpr std::size_t k_max_skill_count = 512;
+		constexpr std::size_t k_max_skill_candidates = 4096;
+		constexpr std::size_t k_max_search_paths = 256;
+		constexpr std::size_t k_max_remote_urls = 64;
+		constexpr std::size_t k_max_remote_entries = 1024;
+		constexpr std::size_t k_max_remote_files = 128;
+		constexpr std::size_t k_max_index_bytes = 4ull * 1024ull * 1024ull;
+		constexpr std::size_t k_max_remote_file_bytes = 16ull * 1024ull * 1024ull;
+		constexpr std::size_t k_max_remote_install_bytes = 64ull * 1024ull * 1024ull;
 
 		std::mutex          s_error_mtx;
 		std::string         s_last_error;
@@ -241,28 +252,66 @@ namespace skills {
 
 		bool read_file_text(const std::filesystem::path& p, std::string& out)
 		{
+			std::error_code ec;
+			const auto size = std::filesystem::file_size(p, ec);
+			if (ec || size > k_max_local_text_bytes) {
+				set_error(ec ? "failed to inspect file: " + p.string()
+					: "file exceeds Skills size limit: " + p.string());
+				return false;
+			}
 			std::ifstream ifs(p, std::ios::binary);
 			if (!ifs) {
 				set_error("failed to open file: " + p.string());
 				return false;
 			}
-			std::ostringstream ss;
-			ss << ifs.rdbuf();
-			out = ss.str();
+			out.assign(static_cast<std::size_t>(size), '\0');
+			if (size > 0)
+				ifs.read(out.data(), static_cast<std::streamsize>(size));
+			if (!ifs || static_cast<std::uintmax_t>(ifs.gcount()) != size) {
+				set_error("short read from Skills file: " + p.string());
+				out.clear();
+				return false;
+			}
 			return true;
 		}
 
 		bool write_file_text(const std::filesystem::path& p, const std::string& data)
 		{
+			if (data.size() > k_max_local_text_bytes) {
+				set_error("Skills settings payload exceeds size limit");
+				return false;
+			}
 			std::error_code ec;
 			std::filesystem::create_directories(p.parent_path(), ec);
-			std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+			if (ec) {
+				set_error("failed to create Skills settings directory: " + ec.message());
+				return false;
+			}
+			static std::atomic<std::uint64_t> sequence{1};
+			const auto temp = p.parent_path() / (p.filename().string() + ".tmp." +
+				std::to_string(GetCurrentProcessId()) + "." +
+				std::to_string(sequence.fetch_add(1, std::memory_order_acq_rel)));
+			std::ofstream ofs(temp, std::ios::binary | std::ios::trunc);
 			if (!ofs) {
-				set_error("failed to write file: " + p.string());
+				set_error("failed to stage Skills settings");
 				return false;
 			}
 			ofs.write(data.data(), static_cast<std::streamsize>(data.size()));
-			return ofs.good();
+			ofs.flush();
+			if (!ofs.good()) {
+				ofs.close();
+				std::filesystem::remove(temp, ec);
+				set_error("failed to flush staged Skills settings");
+				return false;
+			}
+			ofs.close();
+			if (!MoveFileExW(temp.c_str(), p.c_str(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+				std::filesystem::remove(temp, ec);
+				set_error("failed to commit Skills settings");
+				return false;
+			}
+			return true;
 		}
 
 		bool write_file_bytes(const std::filesystem::path& p, const std::vector<char>& data)
@@ -455,7 +504,8 @@ namespace skills {
 			return cli;
 		}
 
-		bool http_get(const std::string& url, std::string& body_out, int timeout_ms)
+		bool http_get(const std::string& url, std::string& body_out, int timeout_ms,
+			std::size_t max_body_bytes)
 		{
 			std::string scheme, host, path;
 			int port = 0;
@@ -473,6 +523,10 @@ namespace skills {
 			}
 			if (res->status < 200 || res->status >= 300) {
 				set_error("http status " + std::to_string(res->status) + " for " + url);
+				return false;
+			}
+			if (res->body.size() > max_body_bytes) {
+				set_error("remote response exceeds Skills size limit for " + url);
 				return false;
 			}
 			body_out = res->body;
@@ -802,6 +856,10 @@ namespace skills {
 		for (const auto& existing : _search_paths) {
 			if (existing == path) return;
 		}
+		if (_search_paths.size() >= k_max_search_paths) {
+			set_error("Skills search path limit reached");
+			return;
+		}
 		_search_paths.push_back(path);
 	}
 
@@ -816,6 +874,8 @@ namespace skills {
 
 		std::map<std::string, skill_metadata_t> found;
 		std::error_code ec;
+		std::size_t candidates = 0;
+		bool bounded_failure = false;
 
 		for (const auto& base : paths) {
 			std::filesystem::path base_path(base);
@@ -827,10 +887,19 @@ namespace skills {
 			         std::filesystem::directory_options::skip_permission_denied, iter_ec);
 			     it != std::filesystem::recursive_directory_iterator(); ++it) {
 				if (iter_ec) { iter_ec.clear(); break; }
+				if (it.depth() >= 16 && it->is_directory(iter_ec)) {
+					it.disable_recursion_pending();
+					iter_ec.clear();
+					continue;
+				}
 				bool is_file = it->is_regular_file(iter_ec);
 				if (iter_ec) { iter_ec.clear(); is_file = false; }
 				if (!is_file) continue;
 				if (it->path().filename() != "SKILL.md") continue;
+				if (++candidates > k_max_skill_candidates) {
+					bounded_failure = true;
+					break;
+				}
 
 				std::string content;
 				if (!read_file_text(it->path(), content)) continue;
@@ -860,7 +929,16 @@ namespace skills {
 
 				if (found.find(meta.name) == found.end())
 					found.emplace(meta.name, std::move(meta));
+				if (found.size() > k_max_skill_count) {
+					bounded_failure = true;
+					break;
+				}
 			}
+			if (bounded_failure) break;
+		}
+		if (bounded_failure) {
+			set_error("Skills discovery exceeded bounded catalog limits");
+			return;
 		}
 
 		std::lock_guard<std::mutex> lk(_mtx);
@@ -1132,7 +1210,7 @@ namespace skills {
 		}
 
 		std::string body;
-		if (!http_get(index_url, body, timeout_ms)) return false;
+		if (!http_get(index_url, body, timeout_ms, k_max_index_bytes)) return false;
 
 		try {
 			auto root = nlohmann::json::parse(body);
@@ -1141,21 +1219,37 @@ namespace skills {
 				return false;
 			}
 			for (const auto& sj : root["skills"]) {
+				if (out.entries.size() >= k_max_remote_entries) {
+					set_error("remote index exceeds skill entry limit");
+					return false;
+				}
 				if (!sj.is_object()) continue;
 				remote_index_entry_t entry;
 				if (sj.contains("name") && sj["name"].is_string())
 					entry.name = sj["name"].get<std::string>();
-				if (entry.name.empty()) continue;
+				if (entry.name.empty() || entry.name.size() > 128 ||
+					sanitize_segment(entry.name) != entry.name) continue;
 				if (sj.contains("description") && sj["description"].is_string())
 					entry.description = sj["description"].get<std::string>();
 				bool has_skill_md = false;
 				if (sj.contains("files") && sj["files"].is_array()) {
 					for (const auto& fj : sj["files"]) {
+						if (entry.files.size() >= k_max_remote_files) {
+							set_error("remote skill exceeds file count limit: " + entry.name);
+							return false;
+						}
 						if (!fj.is_string()) continue;
 						const auto f = fj.get<std::string>();
-						if (f.empty()) continue;
-						entry.files.push_back(f);
-						if (f == "SKILL.md") has_skill_md = true;
+						const std::filesystem::path rel(f);
+						const auto normalized = rel.lexically_normal();
+						if (f.empty() || f.size() > 512 || rel.is_absolute() || rel.has_root_path() ||
+							f.find("://") != std::string::npos || normalized.empty() ||
+							*normalized.begin() == "..") {
+							set_error("remote skill contains an unsafe file path: " + entry.name);
+							return false;
+						}
+						entry.files.push_back(normalized.generic_string());
+						if (normalized.generic_string() == "SKILL.md") has_skill_md = true;
 					}
 				}
 				if (!has_skill_md) {
@@ -1197,25 +1291,81 @@ namespace skills {
 		}
 
 		const auto root_dir = remote_skill_dir(url, name);
-		if (!ensure_dir(root_dir)) return false;
+		if (!ensure_dir(root_dir.parent_path())) return false;
+		static std::atomic<std::uint64_t> install_sequence{1};
+		const auto suffix = std::to_string(GetCurrentProcessId()) + "." +
+			std::to_string(install_sequence.fetch_add(1, std::memory_order_acq_rel));
+		const auto staging_dir = root_dir.parent_path() /
+			("." + root_dir.filename().string() + ".stage." + suffix);
+		const auto backup_dir = root_dir.parent_path() /
+			("." + root_dir.filename().string() + ".backup." + suffix);
+		std::error_code ec;
+		std::filesystem::create_directories(staging_dir, ec);
+		if (ec) {
+			set_error("failed to create remote skill staging directory");
+			return false;
+		}
 
 		bool got_skill_md = false;
+		std::size_t total_bytes = 0;
 		for (const auto& file_rel : match->files) {
 			const std::string file_url = url_join(base + sanitize_segment(name) + "/", file_rel);
 			std::string body;
-			if (!http_get(file_url, body, 30000)) {
-				set_error("download failed: " + file_url);
+			if (!http_get(file_url, body, 30000, k_max_remote_file_bytes)) {
+				std::filesystem::remove_all(staging_dir, ec);
 				return false;
 			}
+			if (body.size() > k_max_remote_install_bytes - total_bytes) {
+				std::filesystem::remove_all(staging_dir, ec);
+				set_error("remote skill exceeds total install size limit");
+				return false;
+			}
+			total_bytes += body.size();
 			std::vector<char> bytes(body.begin(), body.end());
-			const auto out_path = root_dir / file_rel;
-			if (!write_file_bytes(out_path, bytes)) return false;
+			const auto out_path = staging_dir / std::filesystem::path(file_rel);
+			const auto normalized = out_path.lexically_normal();
+			const auto stage_prefix = staging_dir.lexically_normal().native();
+			const auto normalized_native = normalized.native();
+			if (normalized_native.size() <= stage_prefix.size() ||
+				normalized_native.compare(0, stage_prefix.size(), stage_prefix) != 0 ||
+				(normalized_native[stage_prefix.size()] != L'\\' &&
+				 normalized_native[stage_prefix.size()] != L'/')) {
+				std::filesystem::remove_all(staging_dir, ec);
+				set_error("remote skill path escaped its managed root");
+				return false;
+			}
+			if (!write_file_bytes(normalized, bytes)) {
+				std::filesystem::remove_all(staging_dir, ec);
+				return false;
+			}
 			if (file_rel == "SKILL.md") got_skill_md = true;
 		}
 		if (!got_skill_md) {
+			std::filesystem::remove_all(staging_dir, ec);
 			set_error("install completed but SKILL.md not present for: " + name);
 			return false;
 		}
+		const bool had_existing = std::filesystem::exists(root_dir, ec);
+		ec.clear();
+		if (had_existing) {
+			std::filesystem::rename(root_dir, backup_dir, ec);
+			if (ec) {
+				std::filesystem::remove_all(staging_dir, ec);
+				set_error("failed to stage the previous remote skill version");
+				return false;
+			}
+		}
+		std::filesystem::rename(staging_dir, root_dir, ec);
+		if (ec) {
+			if (had_existing) {
+				std::error_code restore_ec;
+				std::filesystem::rename(backup_dir, root_dir, restore_ec);
+			}
+			std::filesystem::remove_all(staging_dir, ec);
+			set_error("failed to commit the remote skill installation");
+			return false;
+		}
+		if (had_existing) std::filesystem::remove_all(backup_dir, ec);
 
 		auto& mgr = global();
 		mgr.add_search_path(skills_cache_root().string());
@@ -1265,12 +1415,20 @@ namespace skills {
 		std::lock_guard<std::mutex> lk(s_remote_mtx);
 		load_remote_urls_locked();
 		const auto trimmed = trim_copy(url);
-		if (trimmed.empty()) {
-			set_error("add_remote_url: empty url");
+		if (trimmed.empty() || trimmed.size() > 2048) {
+			set_error("remote URL is empty or exceeds the length limit");
 			return false;
 		}
+		std::string scheme, host, path;
+		int port = 0;
+		bool is_https = false;
+		if (!split_url(trimmed, scheme, host, port, path, is_https)) return false;
 		for (const auto& u : s_remote_urls) {
 			if (u == trimmed) return true;
+		}
+		if (s_remote_urls.size() >= k_max_remote_urls) {
+			set_error("remote URL limit reached");
+			return false;
 		}
 		s_remote_urls.push_back(trimmed);
 		if (!save_remote_urls_locked()) return false;

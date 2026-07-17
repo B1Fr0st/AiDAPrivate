@@ -84,6 +84,7 @@ namespace catalog {
 
 	bool fetch_and_cache(int timeout_ms = 10000);
 	bool load_cached_or_fetch(int max_age_seconds = 3600);
+	int64_t cached_age_seconds() noexcept;
 	model_list_validation_t validate_provider_model_list_response(
 		const std::string& provider_id, const std::string& body);
 	bool initialize_async(int max_age_seconds = 86400);

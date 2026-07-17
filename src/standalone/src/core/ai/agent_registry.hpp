@@ -59,6 +59,12 @@ namespace agent {
 		nlohmann::json                         options = nlohmann::json::object();
 	};
 
+	struct custom_catalog_snapshot_t
+	{
+		std::uint64_t generation = 0;
+		std::vector<agent_info_t> agents;
+	};
+
 	bool                              initialize();
 	const std::vector<agent_info_t>&  list();
 	std::vector<const agent_info_t*>  primary_agents();
@@ -70,6 +76,14 @@ namespace agent {
 	bool                              unregister_custom(const std::string& name);
 	bool                              save_custom_to_disk();
 	bool                              load_custom_from_disk();
+	custom_catalog_snapshot_t         custom_catalog_snapshot();
+	bool                              commit_custom_catalog(
+		std::uint64_t expected_generation,
+		const std::vector<agent_info_t>& agents,
+		std::string& error);
+	bool                              reload_custom_catalog(
+		std::uint64_t expected_generation,
+		std::string& error);
 	const std::string&                last_error();
 
 	const std::string&                active_agent_name();

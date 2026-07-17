@@ -60,6 +60,10 @@ context_menu_registration_result_t context_menu_catalog_t::validate(
             if (!item.label_override.empty() && !is_valid_display_label(item.label_override))
                 return {context_menu_status_t::invalid_descriptor,
                         "Context menu action label is invalid"};
+            if (!item.description_override.empty() &&
+                !is_valid_display_label(item.description_override))
+                return {context_menu_status_t::invalid_descriptor,
+                        "Context menu action description is invalid"};
             if (!action_ids.insert(item.action).second)
                 return {context_menu_status_t::invalid_descriptor,
                         "Context menu action is duplicated"};
@@ -143,13 +147,16 @@ context_menu_presentation_t context_menu_presenter_t::compose(
             context_menu_presented_action_t presented;
             presented.action = item.action;
             presented.label = item.label_override.empty() ? action->label : item.label_override;
-            presented.description = action->description;
+            presented.description = item.description_override.empty()
+                ? action->description
+                : item.description_override;
             presented.icon_semantic = item.icon_override.empty()
                 ? action->icon_semantic
                 : item.icon_override;
-            presented.shortcut_hint = shortcuts_
-                ? shortcuts_->effective_hint(item.action, context)
-                : std::string{};
+            presented.shortcut_hint = !item.shortcut_override.empty()
+                ? item.shortcut_override
+                : shortcuts_ ? shortcuts_->effective_hint(item.action, context)
+                             : std::string{};
             presented.disabled_reason = state.capability.disabled_reason;
             presented.consequence_summary = state.consequence_summary;
             presented.check_state = state.check_state;

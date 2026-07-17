@@ -11,6 +11,8 @@
 #endif
 
 #include "intruder_view.hpp"
+#include "../network_view.hpp"
+#include "burp_ui_operation.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_routed.hpp"
 #else
@@ -70,6 +72,10 @@ struct ui_state_t
           "\r\n";
     char                                    new_payload_set[8192] = "test1\ntest2\ntest3\n";
     std::vector<std::pair<size_t, size_t>>  new_positions;
+    aida::burp::ui_operation::state_t       operation;
+    std::uint64_t                           observed_operation_generation = 0;
+    std::atomic<std::uint64_t>              started_job_id{0};
+    intruder::status_t                      reviewed_clear;
 };
 
 ui_state_t& ui() { static ui_state_t s; return s; }
@@ -132,18 +138,176 @@ void shutdown()
 {
 }
 
+static ::network_view::artifact_identity_t response_identity(
+    const intruder::result_t& result, std::uint64_t started_ms)
+{
+    ::network_view::artifact_identity_t identity;
+    identity.id = "intruder." + std::to_string(result.job_id) + "." +
+        std::to_string(result.index) + ".response";
+    identity.parent_id = "intruder." + std::to_string(result.job_id) + "." +
+        std::to_string(result.index);
+    identity.source_view_id = "view.network.intruder";
+    identity.kind = ::network_view::artifact_kind_t::intruder_response;
+    identity.source_id = result.job_id;
+    identity.timestamp = started_ms;
+    identity.revision = result.index;
+    identity.content_size = result.response_raw.size();
+    identity.content_hash = ::network_view::artifact_content_hash(result.response_raw);
+    identity.label = "Intruder response #" + std::to_string(result.index);
+    return identity;
+}
+
+static bool same_status(const intruder::status_t& left, const intruder::status_t& right)
+{
+    return left.job_id == right.job_id && left.total == right.total && left.sent == right.sent &&
+        left.errors == right.errors && left.running == right.running &&
+        left.started_unix_ms == right.started_unix_ms &&
+        left.finished_unix_ms == right.finished_unix_ms;
+}
+
+static void submit_start(intruder::config_t config)
+{
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.intruder";
+    request.owner_view = "view.network.intruder";
+    request.owner_action = "network.intruder.start";
+    request.label = "Start Intruder attack";
+    request.target = config.host + ":" + std::to_string(config.port);
+    request.affected_entity = request.target;
+    request.execute = [config = std::move(config)]() mutable {
+        aida::burp::ui_operation::result_t result;
+        const std::uint64_t id = intruder::start(std::move(config));
+        result.success = id != 0;
+        result.message = result.success ? "Intruder attack started." : intruder::last_error();
+        if (id != 0) ui().started_job_id.store(id, std::memory_order_release);
+        return result;
+    };
+    static_cast<void>(ui().operation.submit(std::move(request)));
+}
+
+static void submit_stop(intruder::status_t reviewed)
+{
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.intruder";
+    request.owner_view = "view.network.intruder";
+    request.owner_action = "network.intruder.stop";
+    request.label = "Stop Intruder attack";
+    request.target = "Job " + std::to_string(reviewed.job_id);
+    request.affected_entity = request.target;
+    request.execute = [reviewed]() {
+        aida::burp::ui_operation::result_t result;
+        const auto current = intruder::status(reviewed.job_id);
+        if (current.job_id != reviewed.job_id || current.started_unix_ms != reviewed.started_unix_ms) {
+            result.message = "The Intruder job changed before stop; no job was stopped.";
+            return result;
+        }
+        result.success = intruder::stop(reviewed.job_id);
+        result.message = result.success ? "Intruder stop requested." : intruder::last_error();
+        return result;
+    };
+    static_cast<void>(ui().operation.submit(std::move(request)));
+}
+
+static void submit_clear(intruder::status_t reviewed)
+{
+    aida::burp::ui_operation::request_t request;
+    request.owner = "burp.intruder";
+    request.owner_view = "view.network.intruder";
+    request.owner_action = "network.intruder.clear";
+    request.label = "Clear Intruder job";
+    request.target = "Job " + std::to_string(reviewed.job_id);
+    request.affected_entity = request.target;
+    request.execute = [reviewed]() {
+        aida::burp::ui_operation::result_t result;
+        if (!same_status(intruder::status(reviewed.job_id), reviewed)) {
+            result.message = "The Intruder job changed after review; it was not cleared.";
+            return result;
+        }
+        result.success = intruder::clear(reviewed.job_id);
+        result.message = result.success ? "Intruder job cleared." : intruder::last_error();
+        return result;
+    };
+    static_cast<void>(ui().operation.submit(std::move(request)));
+}
+
+bool open_new_attack_with(const std::string& host, std::uint16_t port, bool use_tls,
+                          const std::string& raw_request, std::string& reason)
+{
+    if (host.empty() || port == 0 || raw_request.empty()) {
+        reason = "Intruder requires a host, port, and non-empty request.";
+        return false;
+    }
+    auto& st = ui();
+    std::lock_guard<std::mutex> lock(st.mtx);
+    std::snprintf(st.new_host, sizeof(st.new_host), "%s", host.c_str());
+    st.new_port = port;
+    st.new_tls = use_tls;
+    const std::size_t count = (std::min)(raw_request.size(), sizeof(st.new_request) - 1U);
+    std::memcpy(st.new_request, raw_request.data(), count);
+    st.new_request[count] = '\0';
+    st.new_positions.clear();
+    st.show_new_attack = true;
+    reason.clear();
+    return true;
+}
+
+bool resolve_retained_artifact(std::uint64_t job_id, std::uint64_t result_index,
+                               std::uint64_t started_ms, std::vector<std::uint8_t>& bytes,
+                               std::string& reason)
+{
+    const auto status = intruder::status(job_id);
+    if (status.job_id != job_id || status.started_unix_ms != started_ms) {
+        reason = "The Intruder job changed or is no longer retained.";
+        return false;
+    }
+    const auto rows = intruder::results(job_id, static_cast<std::size_t>(result_index), 1);
+    if (rows.size() != 1 || rows.front().index != result_index) {
+        reason = "The Intruder response is no longer retained.";
+        return false;
+    }
+    bytes = rows.front().response_raw;
+    reason.clear();
+    return true;
+}
+
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float accent_r, float accent_g, float accent_b)
 {
     (void)accent_r; (void)accent_g; (void)accent_b;
     const auto& th = aida::ui::resolved();
     auto& st = ui();
+    const auto operation_completion = st.operation.completion();
+    if (operation_completion && operation_completion->generation > st.observed_operation_generation) {
+        st.observed_operation_generation = operation_completion->generation;
+        const std::uint64_t started = st.started_job_id.exchange(0, std::memory_order_acq_rel);
+        if (started != 0) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            st.selected_job_id = started;
+            st.selected_result_index = -1;
+        }
+        if (operation_completion->result.success &&
+            operation_completion->result.message.find("cleared") != std::string::npos) {
+            std::lock_guard<std::mutex> lock(st.mtx);
+            if (st.selected_job_id == st.reviewed_clear.job_id)
+                st.selected_job_id = 0;
+        }
+    }
 
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##burp_intruder_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Intruder / Turbo");
+    if (st.operation.pending()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.info, alpha)),
+            "Operation running in Task Center");
+    } else if (operation_completion) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(
+            operation_completion->result.success ? th.success : th.error, alpha)),
+            "%s", operation_completion->result.message.c_str());
+    }
     ImGui::SameLine();
     if (aida::ui::button("New Attack", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
         std::lock_guard<std::mutex> lk(st.mtx);
@@ -196,20 +360,38 @@ void render(float pos_x, float pos_y, float width, float height,
             st.selected_result_index = -1;
         }
         ImGui::SameLine();
+        ImGui::BeginDisabled(st.operation.pending());
         if (j.running) {
             if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-                intruder::stop(j.job_id);
+                submit_stop(j);
             }
         } else {
             if (aida::ui::button("Clear", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
-                intruder::clear(j.job_id);
-                {
-                    std::lock_guard<std::mutex> lk(st.mtx);
-                    if (st.selected_job_id == j.job_id) st.selected_job_id = 0;
-                }
+                st.reviewed_clear = j;
+                ImGui::OpenPopup("Review Intruder job clearing");
             }
         }
+        ImGui::EndDisabled();
         ImGui::PopID();
+    }
+
+    if (ImGui::BeginPopupModal("Review Intruder job clearing", nullptr,
+        ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Clear Intruder job %llu and its %zu retained results?",
+            static_cast<unsigned long long>(st.reviewed_clear.job_id), st.reviewed_clear.sent);
+        ImGui::TextUnformatted("The exact reviewed job state will be revalidated before clearing.");
+        ImGui::BeginDisabled(st.operation.pending());
+        if (aida::ui::button("Clear job", aida::ui::button_kind_t::destructive,
+            aida::ui::size_t_::sm)) {
+            submit_clear(st.reviewed_clear);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (aida::ui::button("Cancel##intruder_clear", aida::ui::button_kind_t::secondary,
+            aida::ui::size_t_::sm))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
     }
 
     ImGui::EndChild();
@@ -267,6 +449,10 @@ void render(float pos_x, float pos_y, float width, float height,
             std::lock_guard<std::mutex> lk(st.mtx);
             sel_row = st.selected_result_index;
         }
+        const bool menu_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::IsKeyPressed(ImGuiKey_Menu, false);
+        const bool shift_f10_context = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false);
 
         for (auto& r : rows) {
             float ry = ImGui::GetCursorPosY();
@@ -282,10 +468,27 @@ void render(float pos_x, float pos_y, float width, float height,
                                   aida::ui::with_alpha(th.selection, alpha));
             }
             ImVec2 mouse = ImGui::GetMousePos();
-            if (mouse.x >= org.x && mouse.x < org.x + ImGui::GetWindowWidth()
-                && mouse.y >= abs_ry && mouse.y < abs_ry + row_h && ImGui::IsMouseClicked(0)) {
+            const bool hovered = mouse.x >= org.x && mouse.x < org.x + ImGui::GetWindowWidth() &&
+                mouse.y >= abs_ry && mouse.y < abs_ry + row_h;
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 std::lock_guard<std::mutex> lk(st.mtx);
                 st.selected_result_index = static_cast<int>(r.index);
+            }
+            const bool pointer_context = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+            const bool keyboard_context = static_cast<int>(r.index) == sel_row &&
+                (menu_context || shift_f10_context);
+            if (pointer_context || keyboard_context) {
+                {
+                    std::lock_guard<std::mutex> lk(st.mtx);
+                    st.selected_result_index = static_cast<int>(r.index);
+                }
+                const auto origin = pointer_context
+                    ? ::network_view::exchange_context_origin_t::pointer
+                    : shift_f10_context
+                        ? ::network_view::exchange_context_origin_t::shift_f10
+                        : ::network_view::exchange_context_origin_t::menu_key;
+                ::network_view::open_exchange_context(
+                    response_identity(r, s_info.started_unix_ms), {}, origin);
             }
             ImU32 txt = aida::ui::with_alpha(is_sel ? th.text_primary : th.text_secondary, alpha);
             char buf[64];
@@ -402,6 +605,7 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::InputTextMultiline("##na_ps", st.new_payload_set, sizeof(st.new_payload_set),
                                   ImVec2(770.f, 140.f));
 
+        ImGui::BeginDisabled(st.operation.pending());
         if (aida::ui::button("Launch", aida::ui::button_kind_t::primary, aida::ui::size_t_::md)) {
             intruder::config_t cfg;
             cfg.host = st.new_host;
@@ -428,17 +632,10 @@ void render(float pos_x, float pos_y, float width, float height,
             std::vector<std::string> payloads = split_lines(payload_text);
             cfg.payload_sets.push_back(std::move(payloads));
 
-            uint64_t id = intruder::start(std::move(cfg));
-            if (id != 0) {
-                std::lock_guard<std::mutex> lk(st.mtx);
-                st.selected_job_id = id;
-                st.selected_result_index = -1;
-                diag::log_tagged_fmt("burp", "intruder_start_job id=%llu host=%s port=%d tls=%d",
-                                     static_cast<unsigned long long>(id),
-                                     cfg.host.c_str(), cfg.port, st.new_tls ? 1 : 0);
-            }
+            submit_start(std::move(cfg));
             ImGui::CloseCurrentPopup();
         }
+        ImGui::EndDisabled();
         ImGui::SameLine();
         if (aida::ui::button("Cancel", aida::ui::button_kind_t::ghost, aida::ui::size_t_::md)) {
             ImGui::CloseCurrentPopup();

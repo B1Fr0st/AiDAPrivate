@@ -143,32 +143,10 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
 
     dto.views = {first_view, second_view};
 
-    split_node_dto_t first_leaf;
-    first_leaf.id = {101};
-    first_leaf.kind = split_node_kind_t::leaf;
-    first_leaf.view = first_view.id;
-
-    split_node_dto_t second_leaf;
-    second_leaf.id = {102};
-    second_leaf.kind = split_node_kind_t::leaf;
-    second_leaf.view = second_view.id;
-
-    split_node_dto_t root;
-    root.id = {103};
-    root.kind = split_node_kind_t::branch;
-    root.orientation = split_orientation_t::vertical;
-    root.ratio_basis_points = 6200;
-    root.first = first_leaf.id;
-    root.second = second_leaf.id;
-
-    dto.split_tree.root = root.id;
-    dto.split_tree.nodes = {root, second_leaf, first_leaf};
-
     panel_state_dto_t panel;
     panel.id = {401};
     panel.workspace = workspace;
     panel.kind = panel_kind_t::navigator;
-    panel.extent_pixels = dto.layout.navigator_pixels;
     panel.revision = dto.revision;
     panel.selected_document = first.id;
     panel.pinned = true;
@@ -179,7 +157,6 @@ workbench_persistence_dto_t make_workspace(workspace_id_t workspace)
     inspector.workspace = workspace;
     inspector.kind = panel_kind_t::inspector;
     inspector.visible = false;
-    inspector.extent_pixels = dto.layout.inspector_pixels;
     inspector.selected_document = second.id;
     inspector.state_token = "inspector:tab=types";
     inspector.revision = dto.revision;
@@ -233,7 +210,7 @@ std::filesystem::path unique_fixture_path(const char* suffix)
     auto root = std::filesystem::temp_directory_path(error);
     require(!error, "adapter: temporary directory lookup failed");
     root /= "AiDA";
-    root /= "workbench_persistence_v9";
+    root /= "workbench_persistence_v10";
     std::filesystem::create_directories(root, error);
     require(!error, "adapter: temporary directory creation failed");
     static std::atomic<std::uint64_t> counter{1};
@@ -288,7 +265,7 @@ void open_database_fixture(database_fixture_t& fixture)
         std::ofstream source(fixture.source_path,
                              std::ios::binary | std::ios::trunc);
         require(source.good(), "adapter: source fixture open failed");
-        const std::string bytes = "AiDA workbench persistence schema v9";
+        const std::string bytes = "AiDA workbench persistence schema v10";
         source.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         require(source.good(), "adapter: source fixture write failed");
     }
@@ -317,7 +294,7 @@ void open_database_fixture(database_fixture_t& fixture)
     analysis::workspace_database_options_t options;
     options.identity = identity.take_value();
     options.versions.engine_version = "workbench-persistence-harness";
-    options.versions.specification_version = "schema-v9";
+    options.versions.specification_version = "schema-v10";
     options.versions.analysis_settings_hash = "workbench-persistence-settings";
     options.candidate_operation_timeout_ms = 10000;
     auto opened = analysis::workspace_database_t::open(std::move(options));
@@ -326,18 +303,54 @@ void open_database_fixture(database_fixture_t& fixture)
     fixture.database_path = fixture.database->path();
 }
 
-std::string make_v8_payload(workspace_id_t workspace)
+std::string make_v9_payload(workspace_id_t workspace)
 {
     auto dto = make_workspace(workspace);
-    std::string v9_encoded;
-    const auto encode_result = workbench_persistence_codec_t::encode(dto, v9_encoded);
+    std::string current_encoded;
+    const auto encode_result = workbench_persistence_codec_t::encode(dto, current_encoded);
     if (!encode_result.ok())
-        throw std::runtime_error("v8 fixture: failed to encode source v9 DTO");
+        throw std::runtime_error("v9 fixture: failed to encode source DTO");
 
+    auto current = json::parse(current_encoded.begin(), current_encoded.end(), nullptr, false);
+    if (current.is_discarded() || !current.is_object())
+        throw std::runtime_error("v9 fixture: failed to parse current envelope");
+
+    auto payload = std::move(current["payload"]);
+    payload["schema_version"] = "2";
+    payload["layout"] = json{
+        {"left_rail_pixels", "52"}, {"navigator_pixels", "280"},
+        {"inspector_pixels", "360"}, {"bottom_panel_pixels", "240"},
+        {"tab_strip_pixels", "32"}, {"toolbar_pixels", "36"},
+        {"splitter_pixels", "6"}, {"minimum_document_width_pixels", "320"},
+        {"minimum_document_height_pixels", "200"}
+    };
+    payload["split_tree"] = json{
+        {"root", "103"},
+        {"nodes", json::array({
+            json{{"id", "103"}, {"kind", 1}, {"orientation", 1},
+                 {"ratio_basis_points", "6200"}, {"view", "0"},
+                 {"first", "102"}, {"second", "101"}},
+            json{{"id", "101"}, {"kind", 0}, {"orientation", 0},
+                 {"ratio_basis_points", "5000"}, {"view", "11"},
+                 {"first", "0"}, {"second", "0"}},
+            json{{"id", "102"}, {"kind", 0}, {"orientation", 0},
+                 {"ratio_basis_points", "5000"}, {"view", "12"},
+                 {"first", "0"}, {"second", "0"}}
+        })}
+    };
+    for (auto& panel : payload["panels"])
+        panel["extent_pixels"] = panel["kind"] == 0 ? "280" : "360";
+    return json{{"schema", k_persistence_codec_schema_v9},
+                {"kind", k_persistence_codec_kind_v9},
+                {"payload", std::move(payload)}}.dump();
+}
+
+std::string make_v8_payload(workspace_id_t workspace)
+{
+    const auto v9_encoded = make_v9_payload(workspace);
     auto v9 = json::parse(v9_encoded.begin(), v9_encoded.end(), nullptr, false);
     if (v9.is_discarded() || !v9.is_object())
         throw std::runtime_error("v8 fixture: failed to parse v9 envelope");
-
     auto payload = std::move(v9["payload"]);
     payload.erase("panels");
     payload.erase("split_tree");
@@ -354,11 +367,11 @@ std::string make_v8_payload(workspace_id_t workspace)
     return v8_envelope.dump();
 }
 
-std::string inject_unknown_kind(const std::string& v9_encoded, int doc_index)
+std::string inject_unknown_kind(const std::string& encoded, int doc_index)
 {
-    auto envelope = json::parse(v9_encoded.begin(), v9_encoded.end(), nullptr, false);
+    auto envelope = json::parse(encoded.begin(), encoded.end(), nullptr, false);
     if (envelope.is_discarded() || !envelope.is_object())
-        throw std::runtime_error("inject: failed to parse v9 envelope");
+        throw std::runtime_error("inject: failed to parse persistence envelope");
 
     auto& documents = envelope["payload"]["documents"];
     if (doc_index < 0) {
@@ -387,8 +400,8 @@ void verify_golden_round_trips()
     require(encode_result.ok(), "golden: encode must succeed");
     require(encode_result.fingerprint.value != 0,
             "golden: encode fingerprint must be non-zero");
-    require(encode_result.decoded_schema == k_persistence_codec_schema_v9,
-            "golden: encode schema must be v9");
+    require(encode_result.decoded_schema == k_persistence_codec_schema_v10,
+            "golden: encode schema must be v10");
     require(!encoded.empty(), "golden: encoded output must not be empty");
 
     workbench_persistence_dto_t decoded;
@@ -400,8 +413,8 @@ void verify_golden_round_trips()
             "golden: encode and decode fingerprints must match");
     require(member_fingerprint == encode_result.fingerprint,
             "golden: DTO member fingerprint must match encoded fingerprint");
-    require(decode_result.decoded_schema == k_persistence_codec_schema_v9,
-            "golden: decode schema must be v9");
+    require(decode_result.decoded_schema == k_persistence_codec_schema_v10,
+            "golden: decode schema must be v10");
 
     require(persistence_dto_equal(dto, decoded),
             "golden: DTOs must be equal after round trip");
@@ -415,8 +428,8 @@ void verify_golden_round_trips()
             "golden: view count must match");
     require(decoded.panels.size() == dto.panels.size(),
             "golden: panel count must match");
-    require(decoded.split_tree.nodes.size() == dto.split_tree.nodes.size(),
-            "golden: split tree node count must match");
+    require(decoded.views[0].id == dto.views[0].id && decoded.views[1].id == dto.views[1].id,
+            "golden: flat logical view order must survive round trip");
     require(decoded.documents.front().local_state.cursor.has_position &&
                 decoded.documents.front().local_state.selection.extent == 24,
             "golden: document local state must survive round trip");
@@ -513,24 +526,12 @@ void verify_untrusted_collection_bounds()
                    persistence_codec_code_t::corrupt_payload,
                    "bounds: panel count must be rejected before reserve");
 
-    auto excessive_split_nodes = source;
-    excessive_split_nodes["payload"]["split_tree"]["nodes"] = json::array();
-    for (std::size_t index = 0;
-         index <= static_cast<std::size_t>(k_max_split_nodes_per_workspace);
-         ++index) {
-        excessive_split_nodes["payload"]["split_tree"]["nodes"].push_back(
-            json::object());
-    }
-    decode_fixture(std::move(excessive_split_nodes),
-                   persistence_codec_code_t::oversized_payload,
-                   "bounds: split-node count must be rejected before reserve");
-
     auto excessive_aggregate = source;
     for (const char* field : {"array_budget_a", "array_budget_b",
                               "array_budget_c"}) {
         excessive_aggregate[field] = json::array();
         for (std::size_t index = 0;
-             index < static_cast<std::size_t>(k_max_split_nodes_per_workspace);
+             index < 8191U;
              ++index)
             excessive_aggregate[field].push_back(0);
     }
@@ -591,7 +592,7 @@ void verify_corrupt_and_oversized_payloads()
     require(workbench_persistence_codec_t::encode(dto, encoded).ok(),
             "corrupt: valid DTO must encode");
     require(!workbench_persistence_codec_t::is_corrupt(encoded),
-            "corrupt: valid v9 envelope must not be corrupt");
+            "corrupt: valid v10 envelope must not be corrupt");
 
     std::string v8_payload = make_v8_payload({5021});
     require(!workbench_persistence_codec_t::is_corrupt(v8_payload),
@@ -693,16 +694,8 @@ void verify_v8_default_creation()
             "v8: workspace must match");
     require(decoded.schema_version == k_workbench_contract_schema_version,
             "v8: schema_version must be upgraded to contract version");
-    require(decoded.split_tree.nodes.empty(),
-            "v8: split tree must be empty after upgrade");
     require(decoded.panels.empty(),
             "v8: panels must be empty after upgrade");
-    require(decoded.layout.splitter_pixels > 0,
-            "v8: layout must have normalized splitter_pixels");
-    require(decoded.layout.minimum_document_width_pixels > 0,
-            "v8: layout must have normalized minimum_document_width_pixels");
-    require(decoded.layout.minimum_document_height_pixels > 0,
-            "v8: layout must have normalized minimum_document_height_pixels");
     require(!decoded.documents.empty(),
             "v8: documents must not be empty after upgrade");
     require(!decoded.views.empty(),
@@ -751,6 +744,33 @@ void verify_v8_default_creation()
             "v8: envelope with extra fields must be rejected");
 }
 
+void verify_v9_geometry_migration()
+{
+    const workspace_id_t workspace{5031};
+    const auto legacy = make_v9_payload(workspace);
+    workbench_persistence_dto_t decoded;
+    const auto result = workbench_persistence_codec_t::decode(legacy, workspace, decoded);
+    require(result.ok() && result.decoded_schema == k_persistence_codec_schema_v9,
+            "v9 migration: bounded legacy envelope must decode");
+    require(decoded.schema_version == k_workbench_contract_schema_version &&
+                decoded.views.size() == 2 && decoded.views[0].id == view_id_t{12} &&
+                decoded.views[1].id == view_id_t{11},
+            "v9 migration: legacy leaf traversal must become stable logical view order");
+    require(decoded.active_document == document_id_t{1} && decoded.views[1].focused,
+            "v9 migration: active document and focused logical surface must survive");
+    std::string migrated;
+    require(workbench_persistence_codec_t::encode(decoded, migrated).ok(),
+            "v9 migration: migrated state must encode in the current schema");
+    const auto current = json::parse(migrated.begin(), migrated.end(), nullptr, false);
+    require(!current.is_discarded() && current["schema"] == k_persistence_codec_schema_v10 &&
+                !current["payload"].contains("split_tree") &&
+                !current["payload"].contains("layout"),
+            "v9 migration: obsolete geometry must never be written again");
+    for (const auto& panel : current["payload"]["panels"])
+        require(!panel.contains("extent_pixels"),
+                "v9 migration: panel pixel geometry must be discarded");
+}
+
 void verify_deterministic_normalization()
 {
     const workspace_id_t workspace{5040};
@@ -772,9 +792,6 @@ void verify_deterministic_normalization()
 
     auto shuffled = dto;
     std::reverse(shuffled.documents.begin(), shuffled.documents.end());
-    std::reverse(shuffled.views.begin(), shuffled.views.end());
-    std::reverse(shuffled.split_tree.nodes.begin(),
-                 shuffled.split_tree.nodes.end());
     std::reverse(shuffled.panels.begin(), shuffled.panels.end());
 
     persistence_codec_result_t result3;
@@ -785,6 +802,15 @@ void verify_deterministic_normalization()
             "deterministic: shuffled DTO must produce identical output after normalization");
     require(result3.fingerprint == result1.fingerprint,
             "deterministic: shuffled DTO must produce identical fingerprint");
+
+    auto reordered_views = dto;
+    std::reverse(reordered_views.views.begin(), reordered_views.views.end());
+    persistence_codec_result_t reordered_result;
+    const auto reordered_encoded = workbench_persistence_codec_t::normalize_and_encode(
+        reordered_views, reordered_result);
+    require(reordered_result.ok() && reordered_encoded != encoded1 &&
+                reordered_result.fingerprint != result1.fingerprint,
+            "deterministic: logical view order must remain persisted identity");
 
     workbench_persistence_dto_t decoded;
     persistence_fingerprint_t decode_fp;
@@ -1060,12 +1086,20 @@ void verify_envelope_peeking_and_edge_cases()
     auto envelope = workbench_persistence_codec_t::peek_envelope(encoded);
     require(envelope.has_value(),
             "peek: valid envelope must be detected");
-    require(envelope->schema == k_persistence_codec_schema_v9,
-            "peek: v9 schema must be detected");
-    require(envelope->kind == k_persistence_codec_kind_v9,
-            "peek: v9 kind must be detected");
+    require(envelope->schema == k_persistence_codec_schema_v10,
+            "peek: v10 schema must be detected");
+    require(envelope->kind == k_persistence_codec_kind_v10,
+            "peek: v10 kind must be detected");
     require(!envelope->is_v8_legacy,
-            "peek: v9 must not be v8 legacy");
+            "peek: v10 must not be v8 legacy");
+    require(!envelope->is_v9_legacy,
+            "peek: v10 must not be v9 legacy");
+
+    const auto v9_payload = make_v9_payload({5082});
+    const auto v9_envelope = workbench_persistence_codec_t::peek_envelope(v9_payload);
+    require(v9_envelope.has_value() && v9_envelope->is_v9_legacy &&
+                v9_envelope->schema == k_persistence_codec_schema_v9,
+            "peek: v9 must be flagged as legacy");
 
     std::string v8_payload = make_v8_payload({5081});
     auto v8_envelope = workbench_persistence_codec_t::peek_envelope(v8_payload);
@@ -1279,6 +1313,7 @@ bool run_workbench_persistence_harness(std::string& failure)
         verify_corrupt_and_oversized_payloads();
         verify_untrusted_collection_bounds();
         verify_v8_default_creation();
+        verify_v9_geometry_migration();
         verify_deterministic_normalization();
         verify_workspace_isolation();
         verify_unknown_document_recovery();

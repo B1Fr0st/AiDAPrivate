@@ -476,7 +476,7 @@ void verify_shell_models(workspace_handle_t& first,
 {
     require(context.analysis_workspace == first.workspace &&
                 context.navigator_tree && context.navigator_query &&
-                context.navigator_nav && context.document_host &&
+                context.navigator_nav &&
                 context.inspector_session && context.document_registry &&
                 context.disassembly_document && context.hex_document &&
                 context.pseudocode_document && context.graph_document &&
@@ -588,60 +588,20 @@ void verify_shell_models(workspace_handle_t& first,
             "production call graph document did not expose its function node");
 }
 
-void verify_host_and_navigation(
+void verify_navigation(
     workspace_handle_t& first,
     workbench_shell_workspace_context_t& context)
 {
-    workbench_command_result_t command_result;
-    document_host::document_host_dispatch_t split;
-    split.kind = document_host::document_host_dispatch_kind_t::toolbar;
-    split.toolbar_action =
-        document_host::document_host_toolbar_action_t::split_horizontal;
-    split.ratio_basis_points = 4300;
-    auto dispatched = workbench_shell_runtime_t::instance().dispatch_host_command(
-        first.workspace, split, command_result, context);
-    require(dispatched.ok() && command_result.changed &&
-                context.persistence.views.size() == 2,
-            "production horizontal split did not commit");
-
     auto activated = workbench_shell_runtime_t::instance().activate_document(
         first.workspace, document_kind_t::graph, std::nullopt, context);
     require(activated.ok() && active_document(context) &&
                 active_document(context)->identity.kind == document_kind_t::graph,
             "production graph document did not activate");
-    split = {};
-    split.kind = document_host::document_host_dispatch_kind_t::toolbar;
-    split.toolbar_action =
-        document_host::document_host_toolbar_action_t::split_vertical;
-    split.ratio_basis_points = 5700;
-    dispatched = workbench_shell_runtime_t::instance().dispatch_host_command(
-        first.workspace, split, command_result, context);
-    require(dispatched.ok() && command_result.changed &&
-                context.persistence.views.size() == 3,
-            "production vertical split did not commit");
-
     activated = workbench_shell_runtime_t::instance().activate_document(
         first.workspace, document_kind_t::hex, std::nullopt, context);
     require(activated.ok() && active_document(context) &&
                 active_document(context)->identity.kind == document_kind_t::hex,
             "production hex document did not activate");
-
-    document_host::document_host_layout_request_t layout;
-    layout.client_extent = {1600, 1000};
-    layout.dpi = 144;
-    layout.average_character_width_pixels = 9;
-    document_host::document_host_chrome_t chrome;
-    const auto composed = context.document_host->compose(
-        context.workspace, layout, chrome);
-    require(composed.ok() &&
-                document_host::validate_document_host_chrome(chrome).ok() &&
-                chrome.leaves.size() == 3 &&
-                chrome.navigator_bounds.width != 0 &&
-                chrome.inspector_bounds.width != 0 &&
-                std::all_of(chrome.source_assertions.begin(),
-                            chrome.source_assertions.end(),
-                            [](const auto& assertion) { return assertion.passed; }),
-            "production document host violated split/chrome source assertions");
 
     selection_context_t selection;
     selection.kind = selection_kind_t::range;
@@ -664,16 +624,6 @@ void verify_host_and_navigation(
                 !context.persistence.history.back.empty() && inspected &&
                 inspected->selection.address == 0x1001,
             "production navigation did not synchronize document/history/inspector state");
-
-    document_host::document_host_dispatch_t stale;
-    stale.kind = document_host::document_host_dispatch_kind_t::split_horizontal;
-    stale.workspace = context.workspace;
-    stale.expected_revision = workspace_revision_t{
-        context.persistence.revision.value - 1U};
-    const auto stale_result = context.document_host->dispatch(stale);
-    require(stale_result.error.code == workbench_error_code_t::revision_mismatch &&
-                !stale_result.changed,
-            "production document host accepted a stale revision");
 
     constexpr const char* first_entity = "cli:100663297@0";
     constexpr const char* second_entity = "jvm:1@0";
@@ -852,14 +802,6 @@ void verify_persist_close_reopen(
                 restored.persistence.revision.value >= expected_revision,
             "production close/reopen did not restore workbench state");
 
-    document_host::document_host_chrome_t chrome;
-    const auto composed = restored.document_host->compose(
-        restored.workspace, {{1600, 1000}, 96, 8}, chrome);
-    require(composed.ok() && chrome.leaves.size() == expected_view_count &&
-                std::all_of(chrome.source_assertions.begin(),
-                            chrome.source_assertions.end(),
-                            [](const auto& assertion) { return assertion.passed; }),
-            "restored workbench split layout was not executable");
     close_workspace(reopened);
 }
 
@@ -878,7 +820,7 @@ void verify_lifecycle()
         .attach_analysis_workspace(first.workspace, first_context);
     require(attached.ok(), "first production workspace did not attach");
     verify_shell_models(first, first_context);
-    verify_host_and_navigation(first, first_context);
+    verify_navigation(first, first_context);
 
     const auto next_generation = first.workspace->begin_new_generation();
     require(next_generation.has_value() && next_generation.value() == 2,

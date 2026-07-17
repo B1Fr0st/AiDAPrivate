@@ -512,6 +512,8 @@ static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
 static bool                     g_SwapChainOccluded = false;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
+static std::atomic<UINT>        g_PendingFontDpi{0};
+static std::atomic<UINT>        g_AppliedFontDpi{0};
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 static ID3D11BlendState* blend_state = nullptr;
 static HICON g_aidaWindowIcon = nullptr;
@@ -4570,9 +4572,7 @@ static void show_mcp_posture_refuse_ui_and_exit(const anti_tamper::mcp_posture::
 __declspec(noinline) static DWORD cpp_render_title(helpers* h, uint64_t frame_number, ImGuiErrorRecoveryState* imgui_state_backup)
 {
     try {
-        aida::ui::ide_shell::render_compatibility_host([](void* context) {
-            static_cast<helpers*>(context)->render_title();
-        }, h);
+        h->render_title();
     } catch (const std::exception& e) {
         ImGui::ErrorRecoveryTryToRecoverState(imgui_state_backup);
         diag::log_tagged_critical_fmt("render",
@@ -7723,6 +7723,7 @@ int main(int, char**)
         GetCurrentThreadId(),
         static_cast<unsigned long long>(GetTickCount64()));
     rebuild_fonts(globals::ui::dpi_scale);
+    g_AppliedFontDpi.store(GetDpiForWindow(hwnd), std::memory_order_release);
     startup_log_critical_fmt("rebuild_fonts_post ui400=0x%llX code400=0x%llX",
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_ui_400)),
         static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(g_font_code_400)));
@@ -8944,6 +8945,23 @@ int main(int, char**)
             last_cursor_valid = true;
         }
         last_cursor_over = cursor_over_aida_pre;
+
+        const UINT pending_font_dpi = g_PendingFontDpi.exchange(0, std::memory_order_acq_rel);
+        const UINT applied_font_dpi = g_AppliedFontDpi.load(std::memory_order_acquire);
+        if (pending_font_dpi != 0 && pending_font_dpi != applied_font_dpi) {
+            const std::uint64_t dpi_rebuild_started = static_cast<std::uint64_t>(GetTickCount64());
+            const float pending_scale = static_cast<float>(pending_font_dpi) / 96.0f;
+            globals::ui::dpi_scale = pending_scale;
+            aida::ui::set_dpi_scale(pending_scale);
+            aida_tracer::mark_render_phase("dpi_font_rebuild");
+            rebuild_fonts(pending_scale);
+            aida::ui::apply_imgui_style(aida::ui::resolved());
+            g_AppliedFontDpi.store(pending_font_dpi, std::memory_order_release);
+            diag::log_tagged_fmt("dpi",
+                "font_rebuild_applied dpi=%u scale=%.3f elapsed_ms=%llu",
+                pending_font_dpi, pending_scale,
+                static_cast<unsigned long long>(static_cast<std::uint64_t>(GetTickCount64()) - dpi_rebuild_started));
+        }
 
         if (frame_number < 5)
             crash_log_write("dx11_new_frame");
@@ -10359,9 +10377,9 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             suggested->right - suggested->left,
             suggested->bottom - suggested->top,
             SWP_NOZORDER | SWP_NOACTIVATE);
-        aida_tracer::set_wndproc_state("dpichanged_rebuild_fonts", hWnd, msg, wParam, lParam);
-        rebuild_fonts(globals::ui::dpi_scale);
-        aida::ui::apply_imgui_style(aida::ui::resolved());
+        if (dpi != 0 && dpi != g_AppliedFontDpi.load(std::memory_order_acquire))
+            g_PendingFontDpi.store(dpi, std::memory_order_release);
+        ::InvalidateRect(hWnd, nullptr, FALSE);
         return finish("dpichanged", 0);
     }
     case WM_SETTINGCHANGE:
