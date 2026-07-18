@@ -24,6 +24,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
+#include "../../ui/design_system.hpp"
 #include "../../ui/ui_anim.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_services.hpp"
@@ -375,21 +376,23 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::PopID();
     }
 
-    if (ImGui::BeginPopupModal("Review Intruder job clearing", nullptr,
-        ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Clear Intruder job %llu and its %zu retained results?",
-            static_cast<unsigned long long>(st.reviewed_clear.job_id), st.reviewed_clear.sent);
-        ImGui::TextUnformatted("The exact reviewed job state will be revalidated before clearing.");
-        ImGui::BeginDisabled(st.operation.pending());
-        if (aida::ui::button("Clear job", aida::ui::button_kind_t::destructive,
-            aida::ui::size_t_::sm)) {
+    if (aida::ui::design::begin_dialog_exact("Review Intruder job clearing",
+        ImVec2(540.f, 280.f), ImVec2(420.f, 230.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Clear job");
+        if (aida::ui::design::begin_dialog_body("intruder_job_clear_body", footer)) {
+            ImGui::Text("Clear Intruder job %llu and its %zu retained results?",
+                static_cast<unsigned long long>(st.reviewed_clear.job_id), st.reviewed_clear.sent);
+            ImGui::TextWrapped("The exact reviewed job state will be revalidated before clearing.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "intruder_job_clear_footer", "Clear job",
+            st.reviewed_clear.job_id != 0 && !st.operation.pending(), true);
+        if (result.confirmed) {
             submit_clear(st.reviewed_clear);
             ImGui::CloseCurrentPopup();
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel##intruder_clear", aida::ui::button_kind_t::secondary,
-            aida::ui::size_t_::sm))
+        if (result.cancelled)
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -566,47 +569,46 @@ void render(float pos_x, float pos_y, float width, float height,
         std::lock_guard<std::mutex> lk(st.mtx);
         st.show_new_attack = false;
     }
-    ImVec2 center = ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f);
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(800.f, 620.f), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("Intruder - New Attack", nullptr, ImGuiWindowFlags_NoSavedSettings)) {
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Host:");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(280.f);
-        ImGui::InputText("##na_host", st.new_host, sizeof(st.new_host));
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "Port:");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(80.f);
-        ImGui::InputInt("##na_port", &st.new_port);
-        ImGui::SameLine();
-        ImGui::Checkbox("TLS##na_tls", &st.new_tls);
-
-        const char* attack_modes[] = { "sniper", "battering_ram", "pitchfork", "clusterbomb", "turbo", "race" };
-        const char* engine_modes[] = { "http1_serial", "http1_pipelined", "http1_pooled", "http2_multiplexed", "http2_single_packet" };
-        ImGui::Combo("Attack mode##na_am", &st.new_attack_mode, attack_modes, 6);
-        ImGui::Combo("Engine mode##na_em", &st.new_engine_mode, engine_modes, 5);
-        ImGui::InputInt("Concurrency##na_c", &st.new_concurrency);
-        ImGui::InputInt("Throttle RPS (0=unbounded)##na_r", &st.new_rps_cap);
-        ImGui::InputInt("Total cap (0=all)##na_t", &st.new_total_cap);
-        ImGui::InputInt("Timeout ms##na_to", &st.new_timeout_ms);
-        if (st.new_attack_mode == 5) {
-            ImGui::InputInt("Race gate size##na_rg", &st.new_race_gate);
-            ImGui::InputInt("Race warmup##na_rw", &st.new_race_warmup);
+    if (aida::ui::design::begin_dialog_exact("Intruder - New Attack",
+        ImVec2(800.f, 620.f), ImVec2(560.f, 420.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Launch");
+        if (aida::ui::design::begin_dialog_body("intruder_new_attack_body", footer)) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Host:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(280.f);
+            ImGui::InputText("##na_host", st.new_host, sizeof(st.new_host));
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)), "Port:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80.f);
+            ImGui::InputInt("##na_port", &st.new_port);
+            ImGui::SameLine();
+            ImGui::Checkbox("TLS##na_tls", &st.new_tls);
+            const char* attack_modes[] = { "sniper", "battering_ram", "pitchfork", "clusterbomb", "turbo", "race" };
+            const char* engine_modes[] = { "http1_serial", "http1_pipelined", "http1_pooled", "http2_multiplexed", "http2_single_packet" };
+            ImGui::Combo("Attack mode##na_am", &st.new_attack_mode, attack_modes, 6);
+            ImGui::Combo("Engine mode##na_em", &st.new_engine_mode, engine_modes, 5);
+            ImGui::InputInt("Concurrency##na_c", &st.new_concurrency);
+            ImGui::InputInt("Throttle RPS (0=unbounded)##na_r", &st.new_rps_cap);
+            ImGui::InputInt("Total cap (0=all)##na_t", &st.new_total_cap);
+            ImGui::InputInt("Timeout ms##na_to", &st.new_timeout_ms);
+            if (st.new_attack_mode == 5) {
+                ImGui::InputInt("Race gate size##na_rg", &st.new_race_gate);
+                ImGui::InputInt("Race warmup##na_rw", &st.new_race_warmup);
+            }
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                               "Request template (mark positions with $...$):");
+            ImGui::InputTextMultiline("##na_req", st.new_request, sizeof(st.new_request),
+                                      ImVec2(ImGui::GetContentRegionAvail().x, 180.f));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
+                               "Payload set (one per line):");
+            ImGui::InputTextMultiline("##na_ps", st.new_payload_set, sizeof(st.new_payload_set),
+                                      ImVec2(ImGui::GetContentRegionAvail().x, 140.f));
         }
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                           "Request template (mark positions with $...$):");
-        ImGui::InputTextMultiline("##na_req", st.new_request, sizeof(st.new_request),
-                                  ImVec2(770.f, 180.f));
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                           "Payload set (one per line):");
-        ImGui::InputTextMultiline("##na_ps", st.new_payload_set, sizeof(st.new_payload_set),
-                                  ImVec2(770.f, 140.f));
-
-        ImGui::BeginDisabled(st.operation.pending());
-        if (aida::ui::button("Launch", aida::ui::button_kind_t::primary, aida::ui::size_t_::md)) {
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "intruder_new_attack_footer", "Launch", !st.operation.pending(), false);
+        if (result.confirmed) {
             intruder::config_t cfg;
             cfg.host = st.new_host;
             cfg.port = static_cast<uint16_t>(st.new_port);
@@ -635,9 +637,7 @@ void render(float pos_x, float pos_y, float width, float height,
             submit_start(std::move(cfg));
             ImGui::CloseCurrentPopup();
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::ghost, aida::ui::size_t_::md)) {
+        if (result.cancelled) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();

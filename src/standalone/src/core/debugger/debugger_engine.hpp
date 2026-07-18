@@ -131,6 +131,14 @@ struct watch_entry_t {
 	bool        definition_resolved = true;
 };
 
+struct expression_evaluation_t {
+	bool succeeded = false;
+	uint64_t value = 0;
+	std::string rendered_value;
+	std::string type;
+	std::string error;
+};
+
 
 struct trace_record_t {
 	uint64_t       address = 0;
@@ -368,6 +376,9 @@ std::vector<memory_region_t> get_memory_map();
 int  add_watch(const std::string& expression);
 bool remove_watch(int index);
 void refresh_watches();
+expression_evaluation_t evaluate_expression(const std::string& expression);
+bool publish_watch_evaluation(int index, const std::string& expected_expression,
+	const expression_evaluation_t& evaluation);
 
 
 bool start_trace(int max_records = 50000);

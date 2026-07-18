@@ -287,6 +287,10 @@ bool can_redo();
 bool can_paste();
 bool has_selection();
 
+std::string selected_text(std::size_t maximum_bytes = 64U * 1024U);
+bool selected_range(int& start_line, int& start_column,
+    int& end_line, int& end_column);
+
 std::string last_error();
 std::uint64_t document_content_fingerprint();
 

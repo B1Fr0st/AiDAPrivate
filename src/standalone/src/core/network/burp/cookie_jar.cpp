@@ -17,6 +17,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#include "../../ui/design_system.hpp"
 #include "../../infra/event_bus.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_executor.hpp"
@@ -32,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cfloat>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -896,20 +898,33 @@ void render(float pos_x, float pos_y, float width, float height,
     if (st.show_edit) {
         ImGui::OpenPopup("Edit cookie##burp_cookie_edit");
     }
-    if (ImGui::BeginPopupModal("Edit cookie##burp_cookie_edit", &st.show_edit, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::InputText("Host",     st.edit_host,    sizeof(st.edit_host));
-        ImGui::InputText("Name",     st.edit_name,    sizeof(st.edit_name));
-        ImGui::InputText("Value",    st.edit_value,   sizeof(st.edit_value));
-        ImGui::InputText("Domain",   st.edit_domain,  sizeof(st.edit_domain));
-        ImGui::InputText("Path",     st.edit_path,    sizeof(st.edit_path));
-        ImGui::InputText("Expires",  st.edit_expires, sizeof(st.edit_expires));
-        ImGui::Checkbox("Secure",    &st.edit_secure);
-        ImGui::SameLine();
-        ImGui::Checkbox("HttpOnly",  &st.edit_http_only);
-        const char* ss_labels[] = {"Unset", "Lax", "Strict", "None"};
-        ImGui::Combo("SameSite",  &st.edit_same_site, ss_labels, 4);
-
-        if (ImGui::Button("Save", ImVec2(96.f, 24.f))) {
+    if (aida::ui::design::begin_dialog_exact("Edit cookie##burp_cookie_edit",
+        ImVec2(560.f, 480.f), ImVec2(420.f, 340.f), &st.show_edit)) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Save");
+        if (aida::ui::design::begin_dialog_body("cookie_edit_body", footer)) {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("Host",     st.edit_host,    sizeof(st.edit_host));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("Name",     st.edit_name,    sizeof(st.edit_name));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("Value",    st.edit_value,   sizeof(st.edit_value));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("Domain",   st.edit_domain,  sizeof(st.edit_domain));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("Path",     st.edit_path,    sizeof(st.edit_path));
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("Expires",  st.edit_expires, sizeof(st.edit_expires));
+            ImGui::Checkbox("Secure",    &st.edit_secure);
+            ImGui::SameLine();
+            ImGui::Checkbox("HttpOnly",  &st.edit_http_only);
+            const char* ss_labels[] = {"Unset", "Lax", "Strict", "None"};
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::Combo("SameSite",  &st.edit_same_site, ss_labels, 4);
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "cookie_edit_footer", "Save", true, false);
+        if (result.confirmed) {
             parsed_cookie_t c;
             c.name      = st.edit_name;
             c.value     = st.edit_value;
@@ -927,8 +942,7 @@ void render(float pos_x, float pos_y, float width, float height,
             st.show_edit = false;
             ImGui::CloseCurrentPopup();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(96.f, 24.f))) {
+        if (result.cancelled) {
             st.show_edit = false;
             ImGui::CloseCurrentPopup();
         }

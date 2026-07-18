@@ -20,9 +20,13 @@ enum class capability_kind_t : std::uint8_t {
     workspace_symbols,
     diagnostics,
     definition,
+    declaration,
+    implementation,
+    type_definition,
     references,
     semantic_rename,
     formatting,
+    range_formatting,
     code_actions
 };
 
@@ -125,6 +129,8 @@ struct query_t {
     std::string text;
     std::string replacement_text;
     std::string directory;
+    text_range_t selection;
+    bool has_selection = false;
     std::size_t maximum_results = 512;
 };
 

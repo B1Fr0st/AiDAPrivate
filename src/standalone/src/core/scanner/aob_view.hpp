@@ -30,6 +30,7 @@
 #include "../ai/entity_evidence_handoff.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/transition.hpp"
 #include "../ui/empty_state.hpp"
@@ -1633,11 +1634,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::OpenPopup("AOB Generation Refused##aob_no_address_modal");
 		gen.show_no_address_modal = false;
 	}
-	ImVec2 modal_center = ImGui::GetMainViewport()->GetCenter();
-	ImGui::SetNextWindowPos(modal_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowSize(ImVec2(420.f, 0.f), ImGuiCond_Appearing);
-	if (ImGui::BeginPopupModal("AOB Generation Refused##aob_no_address_modal",
-		nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+	if (aida::ui::design::begin_dialog_exact(
+		"AOB Generation Refused##aob_no_address_modal", ImVec2(480.f, 320.f),
+		ImVec2(360.f, 240.f))) {
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"OK", nullptr);
+		aida::ui::design::begin_dialog_body("aob_no_address_modal_body",
+			footer_height);
 		std::string modal_msg;
 		{
 			std::lock_guard<std::mutex> lk(gen.mutex);
@@ -1648,11 +1651,10 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		ImGui::TextColored(ImVec4(1.f, 0.55f, 0.55f, 1.f), "Cannot generate signature");
 		ImGui::Separator();
 		ImGui::TextWrapped("%s", modal_msg.c_str());
-		ImGui::Spacing();
-		float modal_w = ImGui::GetContentRegionAvail().x;
-		float btn_w = 120.f;
-		ImGui::SetCursorPosX((modal_w - btn_w) * 0.5f + ImGui::GetCursorPosX());
-		if (ImGui::Button("OK", ImVec2(btn_w, 0.f))) {
+		aida::ui::design::end_dialog_body();
+		const auto footer = aida::ui::design::dialog_footer(
+			"aob_no_address_modal_footer", "OK", true, false, nullptr);
+		if (footer.confirmed || footer.cancelled) {
 			ImGui::CloseCurrentPopup();
 		}
 		ImGui::EndPopup();

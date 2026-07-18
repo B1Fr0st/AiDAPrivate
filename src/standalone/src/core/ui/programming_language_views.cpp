@@ -2,6 +2,10 @@
 
 #include "application_ui_runtime.hpp"
 #include "design_system.hpp"
+#include "output_views.hpp"
+#include "task_center.hpp"
+#include "../../helpers/globals.h"
+#include "../debugger/source_debug_service.hpp"
 #include "../editor/programming_language_service.hpp"
 #include "imgui/imgui.h"
 
@@ -535,12 +539,17 @@ void render_rename_dialog()
     auto& dialog = rename_dialog_state();
     if (dialog.requested) {
         dialog.requested = false;
-        ImGui::OpenPopup("Semantic Rename###programming.language.rename.dialog");
+        design::open_dialog("programming.language.rename.dialog",
+            "Semantic Rename");
     }
-    ImGui::SetNextWindowSizeConstraints(ImVec2(360.0f, 0.0f), ImVec2(680.0f, 420.0f));
-    if (!ImGui::BeginPopupModal("Semantic Rename###programming.language.rename.dialog",
-            nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    if (!design::begin_dialog("programming.language.rename.dialog",
+            "Semantic Rename", ImVec2(560.0f, 350.0f),
+            ImVec2(380.0f, 290.0f)))
         return;
+    const float footer_height = design::dialog_footer_reserve_height(
+        "Request Reviewed Edits", "Cancel");
+    design::begin_dialog_body("programming_language_rename_body",
+        footer_height);
     ImGui::TextUnformatted("Provider-reviewed semantic rename");
     ImGui::TextDisabled("The provider must return revision-bound proposed edits. AiDA does not apply them automatically.");
     ImGui::Separator();
@@ -558,13 +567,16 @@ void render_rename_dialog()
         dialog.replacement, sizeof(dialog.replacement), ImGuiInputTextFlags_EnterReturnsTrue);
     if (!dialog.error.empty())
         ImGui::TextColored(ImVec4(0.95f, 0.38f, 0.35f, 1.0f), "%s", dialog.error.c_str());
-    ImGui::Separator();
-    if (ImGui::Button("Cancel")) {
+    design::end_dialog_body();
+    const auto footer = design::dialog_footer(
+        "programming_language_rename_footer", "Request Reviewed Edits",
+        true, false);
+    if (footer.cancelled) {
         dialog.error.clear();
         ImGui::CloseCurrentPopup();
     }
-    ImGui::SameLine();
-    const bool request_edits = ImGui::Button("Request reviewed edits") || submitted;
+    const bool request_edits = !footer.cancelled &&
+        (footer.confirmed || submitted);
     if (request_edits) {
         const std::string identifier(dialog.identifier);
         const std::string replacement(dialog.replacement);
@@ -665,8 +677,12 @@ void render_references()
         language::capability_kind_t::hover,
         language::capability_kind_t::signature_help,
         language::capability_kind_t::diagnostics,
+        language::capability_kind_t::declaration,
+        language::capability_kind_t::implementation,
+        language::capability_kind_t::type_definition,
         language::capability_kind_t::semantic_rename,
         language::capability_kind_t::formatting,
+        language::capability_kind_t::range_formatting,
         language::capability_kind_t::code_actions});
     const design::header_t header{"programming.references.header", "Programming References",
         "Programming / Provider Results",
@@ -728,6 +744,132 @@ void render_references()
         render_code_action_rows(snapshot);
     }
     application_ui::render_programming_result_context_menu();
+}
+
+void render_source_debug_console()
+{
+    const auto source = source_debug_service::snapshot();
+    const auto tasks = task_center::snapshot();
+    const bool target_available = source && !source->target_key.empty();
+    const bool current_location = source && source->current.valid;
+    const design::header_t header{"programming.source_debug.header",
+        "Source Debug Console", "Programming / Debug",
+        target_available ? source->target_key.c_str() : "No debug target",
+        "Ctrl+Shift+D", source && !source->error.empty()
+            ? design::semantic_t::error
+            : source && source->operation_pending
+                ? design::semantic_t::warning
+                : target_available ? design::semantic_t::success
+                                   : design::semantic_t::neutral};
+    static_cast<void>(design::render_view_header(header));
+
+    const auto action_button = [](const char* action_id, const char* label) {
+        const auto action = application_ui::present_action(action_id);
+        ImGui::BeginDisabled(!action.enabled);
+        const bool clicked = ImGui::SmallButton(label);
+        ImGui::EndDisabled();
+        if (!action.enabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", action.disabled_reason.c_str());
+        if (clicked)
+            static_cast<void>(application_ui::execute_action(action_id,
+                action_invocation_source_t::toolbar));
+    };
+    action_button("debug.source.open_mixed", "Mixed Source / Assembly");
+    ImGui::SameLine();
+    action_button("debug.source.rebind", "Rebind");
+    ImGui::SameLine();
+    action_button("programming.show_problems", "Problems");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Output"))
+        static_cast<void>(application_views::open_or_focus(
+            stable_view_id_t("view.output")));
+
+    if (!source) {
+        design::state_presentation_t unavailable;
+        unavailable.stable_id = "programming.source_debug.unavailable";
+        unavailable.state = design::view_state_t::disconnected;
+        unavailable.title = "Source-debug state is unavailable";
+        unavailable.message = "The source-debug service has not published a usable snapshot.";
+        static_cast<void>(design::render_state(unavailable,
+            ImVec2(ImGui::GetContentRegionAvail().x, 92.0f)));
+    } else {
+        ImGui::TextDisabled("PID %u  |  %zu breakpoint%s  |  generation %llu",
+            source->target_pid, source->definitions.size(),
+            source->definitions.size() == 1 ? "" : "s",
+            static_cast<unsigned long long>(source->generation));
+        if (source->operation_pending) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.24f, 1.0f), "%s",
+                source->operation_label.empty() ? "Source-debug operation running"
+                                                : source->operation_label.c_str());
+        }
+        if (!source->error.empty())
+            ImGui::TextWrapped("Source debugger: %s", source->error.c_str());
+        if (current_location) {
+            ImGui::Text("Stopped at %s:%u  |  %s+0x%llX  |  0x%llX",
+                source->current.file_path.c_str(), source->current.line,
+                source->current.module_name.c_str(),
+                static_cast<unsigned long long>(source->current.module_rva),
+                static_cast<unsigned long long>(source->current.address));
+            if (!source->current.detail.empty())
+                ImGui::TextDisabled("%s", source->current.detail.c_str());
+        } else if (!target_available) {
+            ImGui::TextDisabled("Open an analysis workspace or attach a process to bind source breakpoints.");
+        }
+    }
+
+    const float available_height = ImGui::GetContentRegionAvail().y;
+    const float task_height = (std::max)(82.0f, (std::min)(180.0f,
+        available_height * 0.42f));
+    if (ImGui::BeginChild("##source_debug_tasks", ImVec2(0.0f, task_height), true,
+            ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::TextUnformatted("Source-debug tasks");
+        ImGui::Separator();
+        std::vector<const task_center::task_snapshot_t*> source_tasks;
+        if (tasks) {
+            for (const auto& task : tasks->tasks)
+                if (task.owner == "source_debug" || task.source == "Source Debugger" ||
+                    task.id.compare(0, 13, "source.debug.") == 0)
+                    source_tasks.push_back(&task);
+        }
+        if (source_tasks.empty()) {
+            ImGui::TextDisabled("No source-debug task has run in this session.");
+        } else if (ImGui::BeginTable("##source_debug_task_table", 4,
+                ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY,
+                ImVec2(0.0f, ImGui::GetContentRegionAvail().y))) {
+            ImGui::TableSetupColumn("Operation", ImGuiTableColumnFlags_WidthStretch, 1.5f);
+            ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+            ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+            ImGui::TableHeadersRow();
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(source_tasks.size()));
+            while (clipper.Step()) {
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                    const auto& task = *source_tasks[static_cast<std::size_t>(row)];
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(task.label.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(task.stage.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(task.target.c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    if (task.progress >= 0.0f)
+                        ImGui::Text("%.0f%%", task.progress * 100.0f);
+                    else
+                        ImGui::TextUnformatted("active");
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::EndChild();
+
+    if (ImGui::GetContentRegionAvail().y >= 68.0f)
+        output_views::render(bottom_tab_t::output,
+            "view.programming.source_debug_console", "embedded.output");
 }
 
 }

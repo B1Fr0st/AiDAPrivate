@@ -44,7 +44,7 @@
 namespace aida::ui::programming_tasks {
 namespace {
 
-enum class configuration_kind_t : std::uint8_t { task, launch };
+enum class configuration_kind_t : std::uint8_t { task, launch, test };
 enum class configuration_origin_t : std::uint8_t { user, project };
 
 std::filesystem::path path_from_utf8(std::string_view value) {
@@ -234,7 +234,12 @@ int matcher_index(const std::string& value) {
 }
 
 std::string kind_name(configuration_kind_t value) {
-    return value == configuration_kind_t::launch ? "launch" : "task";
+    switch (value) {
+    case configuration_kind_t::launch: return "launch";
+    case configuration_kind_t::test: return "test";
+    case configuration_kind_t::task: return "task";
+    }
+    return "task";
 }
 
 std::optional<resolved_configuration_t> resolve_configuration(const configuration_t& config,
@@ -281,7 +286,8 @@ std::optional<resolved_configuration_t> resolve_configuration(const configuratio
     return result;
 }
 
-std::string file_run_unavailable_reason(const std::string& path, bool launch) {
+std::string file_run_unavailable_reason(const std::string& path,
+        configuration_kind_t required) {
     ensure_initialized();
     if (path.empty()) return "Select a file in Project Explorer first";
     if (path.size() > 32768 || !control_free(path))
@@ -294,16 +300,14 @@ std::string file_run_unavailable_reason(const std::string& path, bool launch) {
     }
     if (state().configuration_loading) return "Programming configurations are loading";
     const configuration_t* config = selected_configuration();
+    const char* required_name = required == configuration_kind_t::launch
+        ? "Launch" : required == configuration_kind_t::test ? "Test" : "Task";
     if (!config)
-        return launch
-            ? "Select an explicit Launch configuration before debugging this file"
-            : "Select an explicit Task configuration before running this file";
-    const configuration_kind_t required = launch
-        ? configuration_kind_t::launch : configuration_kind_t::task;
+        return std::string("Select an explicit ") + required_name +
+            " configuration before targeting this file";
     if (config->kind != required)
-        return launch
-            ? "The selected programming configuration is a Task; select a Launch configuration"
-            : "The selected programming configuration is a Launch; select a Task configuration";
+        return "The selected programming configuration is a " + kind_name(config->kind) +
+            "; select an explicit " + required_name + " configuration";
     if (config->command.find("${file}") == std::string::npos)
         return "The selected configuration command does not bind the exact target with ${file}";
     std::unique_lock<std::mutex> lock(state().mutex, std::try_to_lock);
@@ -341,11 +345,12 @@ bool parse_configuration(const nlohmann::json& item, configuration_origin_t orig
     }
     result.problem_matcher = item.value("problem_matcher", std::string("none"));
     const std::string kind = item.value("kind", std::string("task"));
-    if (kind != "task" && kind != "launch") {
-        error = "Configuration kind must be task or launch";
+    if (kind != "task" && kind != "launch" && kind != "test") {
+        error = "Configuration kind must be task, launch, or test";
         return false;
     }
-    result.kind = kind == "launch" ? configuration_kind_t::launch : configuration_kind_t::task;
+    result.kind = kind == "launch" ? configuration_kind_t::launch :
+        kind == "test" ? configuration_kind_t::test : configuration_kind_t::task;
     result.origin = origin;
     if (!safe_identifier(result.source_id) || result.name.empty() || trim(result.command).empty() ||
         !control_free(result.name) || !control_free(result.command) || !control_free(result.cwd) ||
@@ -1168,7 +1173,8 @@ operation_result_t start_run(const resolved_configuration_t& configuration) {
     registration.id = run->id;
     registration.source = "programming.config";
     registration.owner = configuration.source.kind == configuration_kind_t::launch
-        ? "Programming Launch" : "Programming Task";
+        ? "Programming Launch" : configuration.source.kind == configuration_kind_t::test
+            ? "Programming Test" : "Programming Task";
     registration.owner_view = "view.output";
     registration.owner_action = "programming.task.run";
     registration.project = file_browser::current_dir;
@@ -1275,7 +1281,8 @@ void load_editor(int index) {
     std::snprintf(editor.command.data(), editor.command.size(), "%s", config.command.c_str());
     std::snprintf(editor.cwd.data(), editor.cwd.size(), "%s", config.cwd.c_str());
     std::snprintf(editor.channel.data(), editor.channel.size(), "%s", config.output_channel.c_str());
-    editor.kind = config.kind == configuration_kind_t::launch ? 1 : 0;
+    editor.kind = config.kind == configuration_kind_t::launch ? 1 :
+        config.kind == configuration_kind_t::test ? 2 : 0;
     editor.matcher = matcher_index(config.problem_matcher);
 }
 
@@ -1339,7 +1346,8 @@ bool save_editor() {
     config.command = bounded(command, 8192);
     config.cwd = bounded(trim(editor.cwd.data()), 1024);
     config.output_channel = channel;
-    config.kind = editor.kind == 1 ? configuration_kind_t::launch : configuration_kind_t::task;
+    config.kind = editor.kind == 1 ? configuration_kind_t::launch :
+        editor.kind == 2 ? configuration_kind_t::test : configuration_kind_t::task;
     config.problem_matcher = matcher_name(editor.matcher);
     store.selected_id = config.id;
     editor.dirty = true;
@@ -1435,8 +1443,8 @@ void render_configuration_editor() {
     editor.dirty |= ImGui::InputText("Working directory", editor.cwd.data(), editor.cwd.size());
     ImGui::SetNextItemWidth(-1.0f);
     editor.dirty |= ImGui::InputText("Output channel", editor.channel.data(), editor.channel.size());
-    const char* kinds[] = {"Task", "Launch"};
-    editor.dirty |= ImGui::Combo("Kind", &editor.kind, kinds, 2);
+    const char* kinds[] = {"Task", "Launch", "Test"};
+    editor.dirty |= ImGui::Combo("Kind", &editor.kind, kinds, 3);
     const char* matchers[] = {"None", "MSVC", "GCC/Clang", "Generic file:line:column"};
     editor.dirty |= ImGui::Combo("Problem matcher", &editor.matcher, matchers, 4);
     ImGui::TextDisabled("Variables: ${workspaceFolder}, ${file}, ${fileDirname}");
@@ -1454,17 +1462,47 @@ void render_configuration_editor() {
     }
     ImGui::EndDisabled();
     ImGui::EndChild();
-    if (editor.delete_requested) ImGui::OpenPopup("Delete Task Configuration");
-    if (ImGui::BeginPopupModal("Delete Task Configuration", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("Delete this user task configuration?");
-        ImGui::TextDisabled("This removes only the saved configuration. Existing output and diagnostics remain.");
-        if (ImGui::Button("Delete", ImVec2(110.0f, 0.0f))) {
+    constexpr const char* delete_popup =
+        "Delete Task Configuration###programming.task.configuration.delete";
+    if (editor.delete_requested && !ImGui::IsPopupOpen(delete_popup))
+        design::open_dialog("programming.task.configuration.delete",
+            "Delete Task Configuration");
+    if (design::begin_dialog("programming.task.configuration.delete",
+            "Delete Task Configuration", ImVec2(520.0f, 270.0f),
+            ImVec2(400.0f, 230.0f))) {
+        const bool selected_user = editor.selected >= 0 &&
+            editor.selected < static_cast<int>(store.configurations.size()) &&
+            store.configurations[static_cast<std::size_t>(editor.selected)].origin ==
+                configuration_origin_t::user;
+        const float footer_height = design::dialog_footer_reserve_height(
+            "Delete Configuration", "Cancel");
+        design::begin_dialog_body("programming_task_configuration_delete_body",
+            footer_height);
+        design::text(design::text_role_t::title,
+            "Delete this user task configuration?");
+        ImGui::TextWrapped("This removes only the saved configuration. Existing output and diagnostics remain.");
+        if (!editor.validation_error.empty())
+            design::text(design::text_role_t::caption,
+                editor.validation_error.c_str());
+        design::end_dialog_body();
+        const auto footer = design::dialog_footer(
+            "programming_task_configuration_delete_footer",
+            "Delete Configuration", selected_user && !editor.save_in_flight, true);
+        if (footer.confirmed) {
+            const std::string retained_id = selected_user
+                ? store.configurations[static_cast<std::size_t>(editor.selected)].id
+                : std::string{};
             delete_selected_configuration();
-            editor.delete_requested = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+            const bool removed = !retained_id.empty() &&
+                std::none_of(store.configurations.begin(), store.configurations.end(),
+                    [&](const configuration_t& configuration) {
+                        return configuration.id == retained_id;
+                    });
+            if (removed) {
+                editor.delete_requested = false;
+                ImGui::CloseCurrentPopup();
+            }
+        } else if (footer.cancelled) {
             editor.delete_requested = false;
             ImGui::CloseCurrentPopup();
         }
@@ -1556,14 +1594,18 @@ void render_modals() {
     ensure_initialized();
     auto& store = state();
     if (store.configure_open) {
-        ImGui::OpenPopup("Programming Task Configurations");
+        design::open_dialog("programming.task.configurations",
+            "Programming Task Configurations");
         store.configure_open = false;
     }
-    const ImVec2 work = ImGui::GetMainViewport()->WorkSize;
-    ImGui::SetNextWindowSize(ImVec2((std::min)(860.0f, work.x * 0.94f),
-        (std::min)(540.0f, work.y * 0.9f)), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("Programming Task Configurations", nullptr,
-            ImGuiWindowFlags_NoSavedSettings)) {
+    if (design::begin_dialog("programming.task.configurations",
+            "Programming Task Configurations", ImVec2(860.0f, 540.0f),
+            ImVec2(620.0f, 420.0f))) {
+        const bool can_close = !store.editor.dirty && !store.editor.save_in_flight;
+        const float footer_height = design::dialog_footer_reserve_height(
+            "Close", nullptr);
+        design::begin_dialog_body("programming_task_configurations_body",
+            footer_height);
         ImGui::TextUnformatted("Explicit Programming Tasks and Launches");
         ImGui::TextDisabled("AiDA runs only configurations you define here or in .aida/tasks.json. This does not invoke RE Run Target.");
         ImGui::Separator();
@@ -1575,27 +1617,39 @@ void render_modals() {
             std::string error;
             if (!schedule_configuration_reload(true, error)) store.configuration_error = std::move(error);
         }
-        ImGui::SameLine();
-        ImGui::BeginDisabled(store.editor.dirty || store.editor.save_in_flight);
-        if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
-        ImGui::EndDisabled();
-        if ((store.editor.dirty || store.editor.save_in_flight) &&
-            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Save or delete the edited user configuration before closing");
+        if (!can_close)
+            ImGui::TextDisabled("Save, revert, or delete the edited user configuration before closing.");
+        design::end_dialog_body();
+        const auto footer = design::dialog_footer(
+            "programming_task_configurations_footer", "Close",
+            can_close, false, nullptr);
+        if ((footer.confirmed || footer.cancelled) && can_close)
+            ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
     if (store.run_review_open && store.pending_run) {
-        ImGui::OpenPopup("Review Programming Run");
+        design::open_dialog("programming.task.run.review",
+            "Review Programming Run");
         store.run_review_open = false;
     }
-    ImGui::SetNextWindowSize(ImVec2((std::min)(680.0f, work.x * 0.94f), 0.0f), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("Review Programming Run", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    if (design::begin_dialog("programming.task.run.review",
+            "Review Programming Run", ImVec2(680.0f, 390.0f),
+            ImVec2(500.0f, 320.0f))) {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+        const bool can_run = false;
+#else
+        const bool can_run = static_cast<bool>(store.pending_run);
+#endif
+        const float footer_height = design::dialog_footer_reserve_height(
+            "Run", "Cancel");
+        design::begin_dialog_body("programming_task_run_review_body",
+            footer_height);
         if (!store.pending_run) {
             ImGui::TextUnformatted("The selected configuration is no longer available.");
         } else {
             const auto& pending = *store.pending_run;
-            ImGui::Text("%s: %s", pending.source.kind == configuration_kind_t::launch ? "Launch" : "Task",
+            ImGui::Text("%s: %s", pending.source.kind == configuration_kind_t::launch
+                ? "Launch" : pending.source.kind == configuration_kind_t::test ? "Test" : "Task",
                 pending.source.name.c_str());
             ImGui::Separator();
             ImGui::TextWrapped("Command: %s", pending.command.c_str());
@@ -1609,25 +1663,23 @@ void render_modals() {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
             ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1.0f),
                 "External process execution is disabled in the Studio compatibility runtime.");
-            ImGui::BeginDisabled();
 #endif
-            if (ImGui::Button("Run", ImVec2(120.0f, 0.0f))) {
-                const auto result = start_run(pending);
-                if (result.succeeded) {
-                    store.pending_run.reset();
-                    ImGui::CloseCurrentPopup();
-                } else {
-                    store.configuration_error = result.detail;
-                }
-            }
-#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-            ImGui::EndDisabled();
-#endif
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) {
+        }
+        design::end_dialog_body();
+        const auto footer = design::dialog_footer(
+            "programming_task_run_review_footer", "Run", can_run, false);
+        if (footer.confirmed && store.pending_run) {
+            const auto pending = *store.pending_run;
+            const auto result = start_run(pending);
+            if (result.succeeded) {
                 store.pending_run.reset();
                 ImGui::CloseCurrentPopup();
+            } else {
+                store.configuration_error = result.detail;
             }
+        } else if (footer.cancelled) {
+            store.pending_run.reset();
+            ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
     }
@@ -1672,12 +1724,31 @@ operation_result_t request_run_selected() {
 }
 
 operation_result_t request_run_selected_for_file(const std::string& path, bool launch) {
-    const std::string unavailable = file_run_unavailable_reason(path, launch);
+    const configuration_kind_t required = launch
+        ? configuration_kind_t::launch : configuration_kind_t::task;
+    const std::string unavailable = file_run_unavailable_reason(path, required);
     if (!unavailable.empty()) return {false, unavailable};
     const configuration_t* config = selected_configuration();
     if (!config) return {false, launch
         ? "Select an explicit Launch configuration before debugging this file"
         : "Select an explicit Task configuration before running this file"};
+    std::string error;
+    auto resolved = resolve_configuration(*config, error, path);
+    if (!resolved) return {false, error};
+    state().configuration_error.clear();
+    state().pending_run = std::move(*resolved);
+    state().run_review_open = true;
+    static_cast<void>(application_views::open_or_focus(stable_view_id_t("view.output")));
+    return {true, {}};
+}
+
+operation_result_t request_test_selected_for_file(const std::string& path) {
+    const std::string unavailable = file_run_unavailable_reason(
+        path, configuration_kind_t::test);
+    if (!unavailable.empty()) return {false, unavailable};
+    const configuration_t* config = selected_configuration();
+    if (!config)
+        return {false, "Select an explicit Test configuration before testing this file"};
     std::string error;
     auto resolved = resolve_configuration(*config, error, path);
     if (!resolved) return {false, error};
@@ -1786,7 +1857,12 @@ std::string run_unavailable_reason() {
 }
 
 std::string run_for_file_unavailable_reason(const std::string& path, bool launch) {
-    return file_run_unavailable_reason(path, launch);
+    return file_run_unavailable_reason(path, launch
+        ? configuration_kind_t::launch : configuration_kind_t::task);
+}
+
+std::string test_for_file_unavailable_reason(const std::string& path) {
+    return file_run_unavailable_reason(path, configuration_kind_t::test);
 }
 
 std::string cancel_unavailable_reason() {

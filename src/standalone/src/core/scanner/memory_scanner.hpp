@@ -150,6 +150,7 @@ void shutdown();
 
 bool first_scan(const scan_config_t& config);
 bool next_scan(scan_mode_t mode, const std::string& value_text, const std::string& value_text2 = "");
+bool cancel_scan();
 void undo_scan();
 void reset_scan();
 

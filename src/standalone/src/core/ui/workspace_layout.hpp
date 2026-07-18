@@ -19,6 +19,13 @@ enum class dock_role_t {
     bottom
 };
 
+enum class dock_split_direction_t {
+    left,
+    right,
+    up,
+    down
+};
+
 struct dock_nodes_t {
     ImGuiID root = 0;
     ImGuiID navigator = 0;
@@ -84,11 +91,15 @@ enum class workspace_request_result_t {
 
 bool initialize(ImGuiID root_dockspace_id) noexcept;
 void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexcept;
+bool surfaces_ready() noexcept;
+void render_global_dock_navigator() noexcept;
 void settle_default_selection() noexcept;
 ImGuiID node_id(dock_role_t role) noexcept;
 window_placement_state_t inspect_window_placement(std::string_view window_name) noexcept;
 workspace_request_result_t float_window(std::string_view window_name) noexcept;
 workspace_request_result_t dock_window(std::string_view window_name, dock_role_t role) noexcept;
+workspace_request_result_t split_window(std::string_view window_name,
+    std::string_view anchor_window_name, dock_split_direction_t direction) noexcept;
 void persist_if_requested() noexcept;
 void shutdown() noexcept;
 const workspace_preset_descriptor_t* presets(std::size_t& count) noexcept;

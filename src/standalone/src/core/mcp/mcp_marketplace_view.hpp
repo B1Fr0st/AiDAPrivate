@@ -24,6 +24,7 @@
 #include "../ui/brand.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/empty_state.hpp"
 #include "../ui/fonts.hpp"
 #include "../ui/motion.hpp"
@@ -762,22 +763,17 @@ namespace aida::mcp_marketplace_view {
 
 		const auto& th = aida::ui::resolved();
 		bool open = true;
-		const ImGuiViewport* vp = ImGui::GetMainViewport();
-		const ImVec2 work_pos = vp ? vp->WorkPos : ImVec2(0.f, 0.f);
-		const ImVec2 work_size = vp ? vp->WorkSize : ImGui::GetIO().DisplaySize;
-		float modal_w = (std::min)(560.f, (std::max)(280.f, work_size.x - 32.f));
-		float modal_h = (std::min)(520.f, (std::max)(360.f, work_size.y - 48.f));
-		modal_w = (std::min)(modal_w, (std::max)(180.f, work_size.x - 16.f));
-		modal_h = (std::min)(modal_h, (std::max)(260.f, work_size.y - 16.f));
-		ImGui::SetNextWindowSize(ImVec2(modal_w, modal_h), ImGuiCond_Always);
-		ImGui::SetNextWindowPos(ImVec2(work_pos.x + work_size.x * 0.5f,
-			work_pos.y + work_size.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-		if (ImGui::BeginPopupModal("Review MCP Install##mcp_market_install_confirm",
-				&open,
-				ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+		if (aida::ui::design::begin_dialog_exact(
+				"Review MCP Install##mcp_market_install_confirm",
+				ImVec2(560.f, 520.f), ImVec2(360.f, 300.f), &open)) {
 			const auto& p = s.pending_install;
 			::mcp_marketplace::installed_server_t preview =
 				::mcp_marketplace::preview_install(p);
+			const bool installing =
+				::mcp_marketplace::get_install_state() == ::mcp_marketplace::install_state_t::installing;
+			const char* confirm_label = installing ? "Installing" : "Install Disabled";
+			const float footer_height = aida::ui::design::dialog_footer_reserve_height(confirm_label);
+			aida::ui::design::begin_dialog_body("mcp_market_install_confirm_body", footer_height);
 			const float content_w = (std::max)(120.f, ImGui::GetContentRegionAvail().x);
 			ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + content_w - 4.f);
 			ImGui::PushFont(aida::ui::fonts::h2());
@@ -831,29 +827,14 @@ namespace aida::mcp_marketplace_view {
 			ImGui::PopTextWrapPos();
 			ImGui::Dummy(ImVec2(0.f, 14.f));
 
-			const bool installing =
-				::mcp_marketplace::get_install_state() == ::mcp_marketplace::install_state_t::installing;
-			const float action_avail = (std::max)(96.f, ImGui::GetContentRegionAvail().x);
-			const float install_w = (std::min)(154.f, (std::max)(118.f, action_avail));
-			if (aida::ui::button(installing ? "Installing" : "Install Disabled",
-					aida::ui::button_kind_t::primary,
-					aida::ui::size_t_::md,
-					ImVec2(install_w, 36.f),
-					false, nullptr, installing)) {
-				if (!installing) {
-					start_confirmed_install(p);
-					s.install_confirm_open = false;
-					ImGui::CloseCurrentPopup();
-				}
-			}
-			if (action_avail >= install_w + 104.f)
-				ImGui::SameLine(0.f, 8.f);
-			else
-				ImGui::Dummy(ImVec2(0.f, 4.f));
-			if (aida::ui::button("Cancel",
-					aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::md,
-					ImVec2(96.f, 36.f))) {
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"mcp_market_install_confirm_footer", confirm_label, !installing, false);
+			if (footer.confirmed && !installing) {
+				start_confirmed_install(p);
+				s.install_confirm_open = false;
+				ImGui::CloseCurrentPopup();
+			} else if (footer.cancelled) {
 				s.install_confirm_open = false;
 				ImGui::CloseCurrentPopup();
 			}

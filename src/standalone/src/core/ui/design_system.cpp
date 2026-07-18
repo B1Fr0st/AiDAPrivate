@@ -844,10 +844,13 @@ bool form_input_int(const char* field_id, const char* label, int& value,
     return changed;
 }
 
-bool begin_dialog(const char* popup_id, const char* title, ImVec2 desired_size, ImVec2 minimum_size) {
+bool begin_dialog_exact(const char* popup_label, ImVec2 desired_size,
+    ImVec2 minimum_size, bool* open, ImGuiWindowFlags flags) {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     const ImVec2 work = viewport ? viewport->WorkSize : ImGui::GetIO().DisplaySize;
-    const ImVec2 position = viewport ? viewport->GetWorkCenter() : ImVec2(work.x * 0.5f, work.y * 0.5f);
+    const ImVec2 work_position = viewport ? viewport->WorkPos : ImVec2(0.f, 0.f);
+    const ImVec2 position(work_position.x + work.x * 0.5f,
+        work_position.y + work.y * 0.5f);
     const float scale = metrics().scale;
     const float margin = aida::ui::scale_px(32.f, scale);
     const ImVec2 available((std::max)(1.f, work.x - margin * 2.f),
@@ -865,11 +868,15 @@ bool begin_dialog(const char* popup_id, const char* title, ImVec2 desired_size, 
     ImGui::SetNextWindowPos(position, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(desired_size, ImGuiCond_Appearing);
     ImGui::SetNextWindowSizeConstraints(effective_minimum, available);
+    return ImGui::BeginPopupModal(safe(popup_label), open,
+        flags | ImGuiWindowFlags_NoSavedSettings);
+}
+
+bool begin_dialog(const char* popup_id, const char* title, ImVec2 desired_size, ImVec2 minimum_size) {
     std::string popup = safe(title);
     popup += "###";
     popup += safe(popup_id);
-    return ImGui::BeginPopupModal(popup.c_str(), nullptr,
-        ImGuiWindowFlags_NoSavedSettings);
+    return begin_dialog_exact(popup.c_str(), desired_size, minimum_size);
 }
 
 void open_dialog(const char* popup_id, const char* title) {
@@ -879,34 +886,70 @@ void open_dialog(const char* popup_id, const char* title) {
     ImGui::OpenPopup(popup.c_str());
 }
 
+float dialog_footer_reserve_height(const char* confirm_label, const char* cancel_label) {
+    const auto m = metrics();
+    const float available_width = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
+    const bool has_cancel = cancel_label && *cancel_label;
+    const float cancel_width = has_cancel
+        ? ImGui::CalcTextSize(cancel_label).x + m.spacing_lg * 2.f : 0.f;
+    const float confirm_width = ImGui::CalcTextSize(safe(confirm_label)).x + m.spacing_lg * 2.f;
+    return m.dialog_footer_height +
+        (has_cancel && cancel_width + confirm_width + m.spacing_sm > available_width
+            ? m.control_height + m.spacing_sm : 0.f);
+}
+
+bool begin_dialog_body(const char* stable_id, float footer_reserve_height) {
+    const float available_height = (std::max)(1.f, ImGui::GetContentRegionAvail().y);
+    const float reserve = (std::clamp)(footer_reserve_height, 0.f, available_height - 1.f);
+    return ImGui::BeginChild(safe(stable_id),
+        ImVec2(0.f, (std::max)(1.f, available_height - reserve)),
+        ImGuiChildFlags_None, ImGuiWindowFlags_NoSavedSettings);
+}
+
+void end_dialog_body() {
+    ImGui::EndChild();
+}
+
 dialog_result_t dialog_footer(const char* stable_id, const char* confirm_label,
-    bool confirm_enabled, bool destructive, const char* cancel_label) {
+    bool confirm_enabled, bool destructive, const char* cancel_label,
+    bool cancel_enabled) {
     dialog_result_t result;
     const auto m = metrics();
     ImGui::PushID(safe(stable_id));
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0.f, m.spacing_xs));
     const float available_width = (std::max)(1.f, ImGui::GetContentRegionAvail().x);
-    const float desired_cancel_width = ImGui::CalcTextSize(safe(cancel_label)).x + m.spacing_lg * 2.f;
+    const bool has_cancel = cancel_label && *cancel_label;
+    const float desired_cancel_width = has_cancel
+        ? ImGui::CalcTextSize(cancel_label).x + m.spacing_lg * 2.f : 0.f;
     const float desired_confirm_width = ImGui::CalcTextSize(safe(confirm_label)).x + m.spacing_lg * 2.f;
-    const bool stacked = desired_cancel_width + desired_confirm_width + m.spacing_sm > available_width;
+    const bool stacked = has_cancel &&
+        desired_cancel_width + desired_confirm_width + m.spacing_sm > available_width;
     const float cancel_width = stacked ? available_width : desired_cancel_width;
     const float confirm_width = stacked ? available_width : desired_confirm_width;
     if (!stacked)
         ImGui::SetCursorPosX((std::max)(ImGui::GetCursorPosX(), ImGui::GetCursorPosX() +
-            available_width - cancel_width - confirm_width - m.spacing_sm));
-    if (components::button(safe(cancel_label), components::button_kind_t::secondary,
-        components::size_t_::sm, ImVec2(cancel_width, m.control_height))) result.cancelled = true;
-    draw_focus_ring_for_last_item();
-    if (!stacked)
-        ImGui::SameLine(0.f, m.spacing_sm);
+            available_width - cancel_width - confirm_width - (has_cancel ? m.spacing_sm : 0.f)));
+    if (has_cancel) {
+        if (components::button(cancel_label, components::button_kind_t::secondary,
+            components::size_t_::sm, ImVec2(cancel_width, m.control_height),
+            !cancel_enabled)) result.cancelled = true;
+        draw_focus_ring_for_last_item();
+        if (cancel_enabled && (destructive || !confirm_enabled)) ImGui::SetItemDefaultFocus();
+        if (!stacked)
+            ImGui::SameLine(0.f, m.spacing_sm);
+    }
     const auto kind = destructive ? components::button_kind_t::destructive : components::button_kind_t::primary;
     if (components::button(safe(confirm_label), kind, components::size_t_::sm,
         ImVec2(confirm_width, m.control_height), !confirm_enabled)) result.confirmed = true;
     draw_focus_ring_for_last_item();
-    if (!destructive && confirm_enabled && ImGui::IsKeyPressed(ImGuiKey_Enter) &&
+    if (!destructive && confirm_enabled) ImGui::SetItemDefaultFocus();
+    if (!destructive && confirm_enabled &&
+        (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) &&
         !ImGui::GetIO().WantTextInput) result.confirmed = true;
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) result.cancelled = true;
+    if (cancel_enabled && ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        result.cancelled = true;
     ImGui::PopID();
     return result;
 }

@@ -3682,6 +3682,53 @@ bool remove_watch(int index) {
 	return true;
 }
 
+expression_evaluation_t evaluate_expression(const std::string& expression) {
+	expression_evaluation_t result;
+	if (expression.empty()) {
+		result.error = "empty expression";
+		return result;
+	}
+	if (expression.size() > 96) {
+		result.error = "expression exceeds the 96-byte debugger limit";
+		return result;
+	}
+	const auto regs = get_registers();
+	expression_eval::context_t context = build_eval_context(regs);
+	const auto evaluated = expression_eval::evaluate(expression, context);
+	if (!evaluated.ok) {
+		result.error = evaluated.error.empty()
+			? "the debugger expression evaluator rejected the expression"
+			: evaluated.error;
+		return result;
+	}
+	char rendered[20]{};
+	std::snprintf(rendered, sizeof(rendered), "0x%016" PRIX64, evaluated.value);
+	result.succeeded = true;
+	result.value = evaluated.value;
+	result.rendered_value = rendered;
+	result.type = "uint64";
+	return result;
+}
+
+bool publish_watch_evaluation(int index, const std::string& expected_expression,
+		const expression_evaluation_t& evaluation) {
+	auto& state = g_state;
+	std::lock_guard<std::mutex> lock(state.watch_mutex);
+	if (index < 0 || index >= static_cast<int>(state.watches.size()))
+		return false;
+	auto& watch = state.watches[static_cast<std::size_t>(index)];
+	const std::string& retained = watch.persistent_expression.empty()
+		? watch.expression : watch.persistent_expression;
+	if (retained != expected_expression)
+		return false;
+	watch.value = evaluation.succeeded ? evaluation.rendered_value : std::string{};
+	watch.type = evaluation.succeeded ? evaluation.type : std::string{};
+	watch.error = evaluation.succeeded ? std::string{} : evaluation.error;
+	watch.valid = evaluation.succeeded;
+	state.watches_generation.fetch_add(1, std::memory_order_release);
+	return true;
+}
+
 void refresh_watches() {
 	auto& st = g_state;
 	diag::log_tagged_fmt("dbg_engine", "refresh_watches: entry watch_count=%zu", st.watches.size());

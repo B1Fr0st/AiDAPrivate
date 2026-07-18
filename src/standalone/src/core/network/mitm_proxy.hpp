@@ -264,6 +264,7 @@ std::vector<http_exchange> get_history(size_t max_count = 0);
 std::vector<http_exchange> get_history_by_ids(const std::vector<uint64_t>& ids);
 const http_exchange* find_exchange(uint64_t id);
 void clear_history();
+bool clear_history_if_exact(const std::vector<uint64_t>& reviewed_ids);
 size_t history_count();
 bool append_history(const std::vector<http_exchange>& exchanges, bool preserve_ids = true);
 bool set_exchange_tags(uint64_t id, const std::vector<std::string>& tags);

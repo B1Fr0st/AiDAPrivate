@@ -10,6 +10,7 @@
 #include "ui/motion.hpp"
 #include "ui/transition.hpp"
 #include "ui/components.hpp"
+#include "ui/design_system.hpp"
 #include "ui/empty_state.hpp"
 #include "ui/blur_layer.hpp"
 #include "ui/responsive.hpp"
@@ -776,12 +777,23 @@ inline void render_write_review_modal() {
 	}
 	if (!g_write_review.visible)
 		return;
-	ImGui::SetNextWindowSize(ImVec2(650.0f, 0.0f), ImGuiCond_Appearing);
-	if (!ImGui::BeginPopupModal("Review Structure Field Write##structure_write_review",
-		nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+	if (!aida::ui::design::begin_dialog_exact(
+		"Review Structure Field Write##structure_write_review",
+		ImVec2(700.0f, 620.0f), ImVec2(440.0f, 360.0f)))
 		return;
 	const bool active = g_write_review.status == write_review_status_t::queued ||
 		g_write_review.status == write_review_status_t::running;
+	const bool can_stage_undo = !active &&
+		((g_write_review.status == write_review_status_t::succeeded &&
+		g_write_review.error.empty()) || g_write_review.mutation_may_remain);
+	const char* confirm_label = g_write_review.status == write_review_status_t::review
+		? "Apply and verify" : active ? "Cancel operation" :
+		can_stage_undo ? "Stage undo" : "Close";
+	const char* cancel_label = g_write_review.status == write_review_status_t::review
+		? "Cancel" : can_stage_undo ? "Close" : nullptr;
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		confirm_label, cancel_label);
+	aida::ui::design::begin_dialog_body("structure_write_review_body", footer_height);
 	ImGui::TextUnformatted("Review the exact process mutation before it is submitted.");
 	ImGui::Separator();
 	ImGui::Text("Target PID");
@@ -837,26 +849,23 @@ inline void render_write_review_modal() {
 			g_write_review.status == write_review_status_t::succeeded
 				? aida::ui::status_kind_t::warning : aida::ui::status_kind_t::error);
 	}
-	ImGui::Separator();
+	aida::ui::design::end_dialog_body();
+	const auto footer = aida::ui::design::dialog_footer("structure_write_review_footer",
+		confirm_label, true, g_write_review.status == write_review_status_t::review,
+		cancel_label);
 	if (g_write_review.status == write_review_status_t::review) {
-		if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::md)) {
+		if (footer.cancelled) {
 			g_write_review.visible = false;
 			ImGui::CloseCurrentPopup();
 		}
-		ImGui::SameLine();
-		if (aida::ui::button("Apply and verify", aida::ui::button_kind_t::destructive,
-				aida::ui::size_t_::md))
+		if (footer.confirmed)
 			submit_write_review();
 	} else if (active) {
-		if (aida::ui::button("Cancel operation", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::md) && g_write_review.cancellation)
+		if (footer.confirmed && g_write_review.cancellation)
 			g_write_review.cancellation->store(true, std::memory_order_release);
 	} else {
-		if ((g_write_review.status == write_review_status_t::succeeded &&
-			g_write_review.error.empty()) || g_write_review.mutation_may_remain) {
-			if (aida::ui::button("Stage undo", aida::ui::button_kind_t::secondary,
-					aida::ui::size_t_::md)) {
+		if (can_stage_undo) {
+			if (footer.confirmed) {
 				std::swap(g_write_review.old_bytes, g_write_review.new_bytes);
 				g_write_review.serial = g_write_serial.fetch_add(1,
 					std::memory_order_acq_rel) + 1;
@@ -864,10 +873,8 @@ inline void render_write_review_modal() {
 				g_write_review.error.clear();
 				g_write_review.cancellation.reset();
 			}
-			ImGui::SameLine();
 		}
-		if (aida::ui::button("Close", aida::ui::button_kind_t::secondary,
-				aida::ui::size_t_::md)) {
+		if (footer.cancelled || (!can_stage_undo && footer.confirmed)) {
 			g_write_review.visible = false;
 			ImGui::CloseCurrentPopup();
 		}
@@ -2517,18 +2524,25 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::OpenPopup("##sd_confirm_remove_field");
 		}
 
-		if (ImGui::BeginPopupModal("##sd_confirm_remove_field", nullptr,
-			ImGuiWindowFlags_AlwaysAutoResize)) {
+		if (aida::ui::design::begin_dialog_exact("##sd_confirm_remove_field",
+			ImVec2(500.0f, 300.0f), ImVec2(360.0f, 240.0f), nullptr,
+			ImGuiWindowFlags_NoTitleBar)) {
+			const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+				"Remove", "Cancel");
+			aida::ui::design::begin_dialog_body("sd_confirm_remove_field_body",
+				footer_height);
 			ImGui::TextUnformatted("Remove this field from the structure definition?");
 			ImGui::TextDisabled("This backend has no field-removal undo journal.");
-			if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"sd_confirm_remove_field_footer", "Remove", true, true, "Cancel");
+			if (footer.cancelled) {
 				ui.pending_remove_structure_id = 0;
 				ui.pending_remove_structure_revision = 0;
 				ui.pending_remove_field_id = 0;
 				ImGui::CloseCurrentPopup();
 			}
-			ImGui::SameLine();
-			if (ImGui::Button("Remove", ImVec2(110.f, 0.f))) {
+			if (footer.confirmed) {
 				int structure_index = -1;
 				int target = -1;
 				const auto pending_remove_field_id = ui.pending_remove_field_id;

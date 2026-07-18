@@ -2467,6 +2467,29 @@ bool code_editor_widget::can_redo() { bind_focused_document(); return !s_redo.em
 bool code_editor_widget::can_paste() { bind_focused_document(); return !clipboard_paste().empty(); }
 bool code_editor_widget::has_selection() { bind_focused_document(); return s_sel.has_selection(); }
 
+std::string code_editor_widget::selected_text(std::size_t maximum_bytes) {
+    bind_focused_document();
+    if (maximum_bytes == 0 || !s_sel.has_selection())
+        return {};
+    std::string result = get_selected_text();
+    if (result.size() > maximum_bytes)
+        result.resize(maximum_bytes);
+    return result;
+}
+
+bool code_editor_widget::selected_range(int& start_line, int& start_column,
+        int& end_line, int& end_column) {
+    bind_focused_document();
+    if (!s_sel.has_selection())
+        return false;
+    selection_ordered(start_line, start_column, end_line, end_column);
+    start_line = clamp_line(start_line);
+    end_line = clamp_line(end_line);
+    start_column = clamp_col(start_line, start_column);
+    end_column = clamp_col(end_line, end_column);
+    return true;
+}
+
 std::string code_editor_widget::last_error() {
     bind_focused_document();
     return s_last_error;
@@ -3143,7 +3166,7 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
     }
 
     if (diff_active) {
-        std::lock_guard<std::mutex> lk(s_diff_mtx);
+        std::unique_lock<std::mutex> lk(s_diff_mtx);
         s_scroll_x = 0.f;
 
         const float hdr_h = 40.f;
@@ -3486,16 +3509,20 @@ void code_editor_widget::render(float pos_x, float pos_y, float width, float hei
 
         s_diff_hover_hunk = new_hover_hunk;
 
+        lk.unlock();
         for (int hi : accept_clicked)
-            if (hi >= 0 && static_cast<size_t>(hi) < s_diff.hunks.size())
-                s_diff.hunks[static_cast<size_t>(hi)].state = code_editor_widget::diff_hunk_state_t::accepted;
+            aida::ui::application_ui::execute_editor_hunk_action(hi,
+                "editor.ai.accept_hunk", aida::ui::action_invocation_source_t::context_menu);
         for (int hi : reject_clicked)
-            if (hi >= 0 && static_cast<size_t>(hi) < s_diff.hunks.size())
-                s_diff.hunks[static_cast<size_t>(hi)].state = code_editor_widget::diff_hunk_state_t::rejected;
+            aida::ui::application_ui::execute_editor_hunk_action(hi,
+                "editor.ai.reject_hunk", aida::ui::action_invocation_source_t::context_menu);
         if (want_accept_all)
-            for (auto& h : s_diff.hunks) h.state = code_editor_widget::diff_hunk_state_t::accepted;
+            aida::ui::application_ui::execute_action(
+                "editor.ai.accept_all", aida::ui::action_invocation_source_t::context_menu);
         if (want_reject_all)
-            for (auto& h : s_diff.hunks) h.state = code_editor_widget::diff_hunk_state_t::rejected;
+            aida::ui::application_ui::execute_action(
+                "editor.ai.reject_all", aida::ui::action_invocation_source_t::context_menu);
+        lk.lock();
 
         {
             char buf[160];

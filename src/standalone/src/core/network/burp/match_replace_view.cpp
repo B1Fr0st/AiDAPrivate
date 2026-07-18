@@ -19,6 +19,7 @@
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/components.hpp"
+#include "../../ui/design_system.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_services.hpp"
 #else
@@ -492,23 +493,29 @@ void render(float pos_x, float pos_y, float width, float height,
         }
         ImGui::EndDisabled();
 
-        if (ImGui::BeginPopupModal("Review Match and Replace mutation", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (aida::ui::design::begin_dialog_exact("Review Match and Replace mutation",
+            ImVec2(560.f, 300.f), ImVec2(420.f, 240.f))) {
             const bool clear_all = st.review_operation == 5;
-            ImGui::TextUnformatted(clear_all ? "Permanently clear all Match and Replace rules?"
-                                             : "Permanently delete the selected rule?");
-            ImGui::Text("Affected rules: %zu", clear_all ? st.reviewed_rules.size() : 1U);
-            ImGui::TextWrapped("The exact reviewed catalog will be revalidated before persistence.");
-            if (aida::ui::button(clear_all ? "Clear all rules" : "Delete rule",
-                aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+            const char* confirm = clear_all ? "Clear all rules" : "Delete rule";
+            const float footer = aida::ui::design::dialog_footer_reserve_height(confirm);
+            if (aida::ui::design::begin_dialog_body("match_replace_mutation_review_body", footer)) {
+                ImGui::TextUnformatted(clear_all ? "Permanently clear all Match and Replace rules?"
+                                                 : "Permanently delete the selected rule?");
+                ImGui::Text("Affected rules: %zu", clear_all ? st.reviewed_rules.size() : 1U);
+                ImGui::TextWrapped("The exact reviewed catalog will be revalidated before persistence.");
+            }
+            aida::ui::design::end_dialog_body();
+            const bool retained_target = clear_all ? !st.reviewed_rules.empty() : st.reviewed_rule.id != 0;
+            const auto result = aida::ui::design::dialog_footer(
+                "match_replace_mutation_review_footer", confirm,
+                retained_target && !st.operation.pending(), true);
+            if (result.confirmed) {
                 submit_rule_change(st.review_operation, st.reviewed_rule,
                     st.reviewed_rules);
                 st.review_operation = 0;
                 ImGui::CloseCurrentPopup();
             }
-            ImGui::SameLine();
-            if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
-                aida::ui::size_t_::sm)) {
+            if (result.cancelled) {
                 st.review_operation = 0;
                 ImGui::CloseCurrentPopup();
             }

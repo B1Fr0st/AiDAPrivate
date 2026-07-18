@@ -108,6 +108,14 @@ namespace aida::preview
 
 	void initialize_shell_fixture(const ImVec2& display_size)
 	{
+		const ImGuiViewport* viewport = ImGui::GetMainViewport();
+		const float dpi_scale = viewport && viewport->DpiScale > 0.0f
+			? viewport->DpiScale : 1.0f;
+		globals::ui::dpi_scale = dpi_scale;
+		if (aida::ui::dpi_scale() != dpi_scale) {
+			aida::ui::set_dpi_scale(dpi_scale);
+			aida::ui::apply_imgui_style(aida::ui::resolved());
+		}
 		globals::ui::bg_init_done = &fixture_ready;
 		globals::ui::bg_init_step.store(globals::ui::bg_init_total.load(std::memory_order_acquire), std::memory_order_release);
 		globals::ui::window_w = display_size.x > 0.f ? display_size.x : 1280.f;

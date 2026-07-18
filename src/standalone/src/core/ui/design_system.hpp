@@ -296,9 +296,17 @@ bool form_input_int(const char* field_id, const char* label, int& value,
     form_state_t& form, int step = 1);
 bool begin_dialog(const char* popup_id, const char* title, ImVec2 desired_size,
     ImVec2 minimum_size = ImVec2(360.f, 220.f));
+bool begin_dialog_exact(const char* popup_label, ImVec2 desired_size,
+    ImVec2 minimum_size = ImVec2(360.f, 220.f), bool* open = nullptr,
+    ImGuiWindowFlags flags = ImGuiWindowFlags_None);
 void open_dialog(const char* popup_id, const char* title);
+float dialog_footer_reserve_height(const char* confirm_label,
+    const char* cancel_label = "Cancel");
+bool begin_dialog_body(const char* stable_id, float footer_reserve_height);
+void end_dialog_body();
 dialog_result_t dialog_footer(const char* stable_id, const char* confirm_label,
-    bool confirm_enabled, bool destructive, const char* cancel_label = "Cancel");
+    bool confirm_enabled, bool destructive, const char* cancel_label = "Cancel",
+    bool cancel_enabled = true);
 dialog_result_t confirmation_dialog(const char* stable_id, const confirmation_t& confirmation);
 bool tiny_view_required(ImVec2 available, ImVec2 logical_minimum);
 ImVec2 minimum_logical_size(view_size_class_t size_class);

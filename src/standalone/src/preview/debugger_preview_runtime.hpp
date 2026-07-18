@@ -6,6 +6,7 @@
 #include "../core/disasm/zydis_disasm.hpp"
 #include "ui_task_executor.hpp"
 #include "../core/debugger/debugger_engine.hpp"
+#include "../core/editor/expression_eval.hpp"
 #include "../core/runtime/standalone_driver.hpp"
 #include "../core/analysis/stealth_engine.hpp"
 
@@ -252,6 +253,56 @@ inline std::vector<memory_region_t> get_memory_map() { aida::preview::debugger::
 inline int add_watch(const std::string& expression) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); g_state.watches.push_back({expression, "00007FF7A4C16A32", "uint64_t", "", true, expression, "", 0, 0, false, true}); aida::preview::debugger::record("add_watch", expression); return static_cast<int>(g_state.watches.size() - 1); }
 inline bool remove_watch(int index) { std::lock_guard<std::mutex> lock(g_state.watch_mutex); if (index < 0 || index >= static_cast<int>(g_state.watches.size())) return false; g_state.watches.erase(g_state.watches.begin() + index); return true; }
 inline void refresh_watches() { aida::preview::debugger::record("refresh_watches"); }
+inline expression_evaluation_t evaluate_expression(const std::string& expression) {
+	aida::preview::debugger::initialize_fixture();
+	expression_evaluation_t result;
+	if (expression.empty() || expression.size() > 96) {
+		result.error = expression.empty() ? "empty expression" : "expression exceeds the 96-byte debugger limit";
+		return result;
+	}
+	const auto registers = g_state.cached_regs;
+	expression_eval::context_t context;
+	context.rax = registers.rax; context.rbx = registers.rbx; context.rcx = registers.rcx; context.rdx = registers.rdx;
+	context.rsi = registers.rsi; context.rdi = registers.rdi; context.rbp = registers.rbp; context.rsp = registers.rsp;
+	context.r8 = registers.r8; context.r9 = registers.r9; context.r10 = registers.r10; context.r11 = registers.r11;
+	context.r12 = registers.r12; context.r13 = registers.r13; context.r14 = registers.r14; context.r15 = registers.r15;
+	context.rip = registers.rip; context.rflags = registers.rflags;
+	context.read_mem = [](std::uint64_t address, std::size_t size, void* output) {
+		if (!output || size == 0) return false;
+		const auto bytes = aida::preview::debugger::bytes_for(address, size);
+		if (bytes.size() < size) return false;
+		std::memcpy(output, bytes.data(), size);
+		return true;
+	};
+	const auto evaluated = expression_eval::evaluate(expression, context);
+	if (!evaluated.ok) {
+		result.error = evaluated.error;
+		return result;
+	}
+	char rendered[20]{};
+	std::snprintf(rendered, sizeof(rendered), "0x%016llX",
+		static_cast<unsigned long long>(evaluated.value));
+	result.succeeded = true;
+	result.value = evaluated.value;
+	result.rendered_value = rendered;
+	result.type = "uint64";
+	return result;
+}
+inline bool publish_watch_evaluation(int index, const std::string& expected_expression,
+		const expression_evaluation_t& evaluation) {
+	std::lock_guard<std::mutex> lock(g_state.watch_mutex);
+	if (index < 0 || index >= static_cast<int>(g_state.watches.size())) return false;
+	auto& watch = g_state.watches[static_cast<std::size_t>(index)];
+	const std::string& retained = watch.persistent_expression.empty() ? watch.expression : watch.persistent_expression;
+	if (retained != expected_expression) return false;
+	watch.value = evaluation.succeeded ? evaluation.rendered_value : std::string{};
+	watch.type = evaluation.succeeded ? evaluation.type : std::string{};
+	watch.error = evaluation.succeeded ? std::string{} : evaluation.error;
+	watch.valid = evaluation.succeeded;
+	g_state.watches_generation.fetch_add(1, std::memory_order_release);
+	aida::preview::debugger::record("evaluate_watch", expected_expression);
+	return true;
+}
 inline bool start_trace(int) { g_state.tracing.store(true); aida::preview::debugger::record("trace", "recording"); return true; }
 inline bool stop_trace() { g_state.tracing.store(false); aida::preview::debugger::record("trace", "stopped"); return true; }
 inline void toggle_bookmark(std::uint64_t address) { auto it = std::find(g_state.bookmarks.begin(), g_state.bookmarks.end(), address); if (it == g_state.bookmarks.end()) g_state.bookmarks.push_back(address); else g_state.bookmarks.erase(it); aida::preview::debugger::record("bookmark", std::to_string(address)); }

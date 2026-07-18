@@ -2587,6 +2587,9 @@ void helpers::render_title()
 	application_callbacks.toggle_maximize = [] { shell_toggle_maximize(); };
 	application_callbacks.decompile_or_focus_pseudocode_capability =
 		[active_workspace_handle, active_workspace_context] {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			return aida::ui::capability_state_t::available();
+#endif
 			if (active_workspace_handle &&
 				active_workspace_handle->identity().target_kind() ==
 					aida::analysis::target_kind_t::static_file) {
@@ -2624,6 +2627,14 @@ void helpers::render_title()
 		};
 	application_callbacks.decompile_or_focus_pseudocode =
 		[active_workspace_handle, active_workspace_context] {
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+			const auto opened = aida::ui::application_views::open_or_focus(
+				aida::ui::stable_view_id_t("document.pseudocode"));
+			return opened.ok()
+				? aida::ui::action_handler_result_t::completed()
+				: aida::ui::action_handler_result_t::failed(
+					"The Pseudocode document could not be activated");
+#endif
 			if (active_workspace_handle &&
 				active_workspace_handle->identity().target_kind() ==
 					aida::analysis::target_kind_t::static_file) {
@@ -5121,8 +5132,6 @@ void helpers::render_title()
 			else if (ImGui::IsKeyPressed(ImGuiKey_I, false)) keyboard_menu_request = 11;
 			else if (ImGui::IsKeyPressed(ImGuiKey_H, false)) keyboard_menu_request = 12;
 		}
-		if (!menu_io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Menu, false))
-			keyboard_menu_request = menu_bar::open_menu >= 0 ? menu_bar::open_menu : 0;
 		if (compact_menu && keyboard_menu_request >= 4 && keyboard_menu_request <= 12) {
 			compact_section_request = keyboard_menu_request;
 			keyboard_menu_request = 13;
@@ -5210,13 +5219,25 @@ void helpers::render_title()
 
 
 			if (is_open) {
+				ImFont* popup_menu_font = aida::ui::fonts::lg();
+				if (!popup_menu_font) popup_menu_font = aida::ui::fonts::body();
+				if (!popup_menu_font) popup_menu_font = ImGui::GetFont();
+				const float popup_menu_font_size = aida::ui::fonts::size_or(
+					popup_menu_font, metrics.menu_font);
+				const float popup_native_row_height = (std::max)(
+					aida::ui::scale_px(34.f, metrics.scale),
+					popup_menu_font_size + aida::ui::scale_px(12.f, metrics.scale));
+				const float popup_native_spacing_y = (std::max)(0.f,
+					popup_native_row_height - popup_menu_font_size);
 				ImGui::SetNextWindowPos(ImVec2(bmin.x, my1 + gap));
 				ImGui::SetNextWindowBgAlpha(1.0f);
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, metrics.corner_radius);
 				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(gap * 1.5f, gap * 2.f));
-				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
+				ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+					ImVec2(0.f, popup_native_spacing_y));
 				ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th_mb.panel_bg, 1.f)));
 				ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0,0,0,0));
+				ImGui::PushFont(popup_menu_font, popup_menu_font_size);
 
 				char popup_id[32];
 				snprintf(popup_id, sizeof(popup_id), "##menu_%d", i);
@@ -5275,8 +5296,10 @@ void helpers::render_title()
 						ImGui::PushID(label);
 						if (!enabled)
 							ImGui::BeginDisabled();
+						ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
 						const bool activated = ImGui::InvisibleButton(
 							"##mi", ImVec2(mw, item_h));
+						ImGui::PopStyleVar();
 						if (!enabled)
 							ImGui::EndDisabled();
 						bool mhov = enabled && ImGui::IsItemHovered();
@@ -5287,7 +5310,7 @@ void helpers::render_title()
 							const std::string semantic_id = aida::preview::semantics::stable_id(
 								"aida.menu.action", semantic_action_id);
 							aida::preview::semantics::register_last_item(
-								semantic_id, "application-menu-action", false, !enabled);
+								semantic_id, "application-menu-action", true, !enabled);
 						}
 #endif
 						ImGui::PopID();
@@ -5321,7 +5344,9 @@ void helpers::render_title()
 						ImGui::GetWindowDrawList()->AddLine(
 							ImVec2(cp.x + 12.f, cp.y + 6.f), ImVec2(cp.x + mw - 12.f, cp.y + 6.f),
 							aida::ui::with_alpha(th_p.border_subtle, 1.f));
+						ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.f, 0.f));
 						ImGui::Dummy(ImVec2(mw, 12.f));
+						ImGui::PopStyleVar();
 					};
 
 					auto action_menu_item = [&](const char* action_id,
@@ -5344,6 +5369,24 @@ void helpers::render_title()
 							static_cast<void>(aida::ui::application_ui::execute_action(
 								action_id, aida::ui::action_invocation_source_t::application_menu));
 						return selected;
+					};
+
+					auto begin_native_menu = [&](const char* label) -> bool {
+						ImGui::SetNextWindowSizeConstraints(
+							ImVec2(0.f, 0.f), ImVec2(FLT_MAX, popup_max_height));
+						return ImGui::BeginMenu(label);
+					};
+
+					auto begin_semantic_menu = [&](const char* label,
+						const char* semantic_key) -> bool {
+						const bool opened = begin_native_menu(label);
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+						const std::string semantic_id = aida::preview::semantics::stable_id(
+							"aida.menu.submenu", semantic_key);
+						aida::preview::semantics::register_last_item(
+							semantic_id, "application-menu-submenu", true, false);
+#endif
+						return opened;
 					};
 
 					auto render_view_category = [&](aida::ui::view_category_t category) {
@@ -5372,7 +5415,7 @@ void helpers::render_title()
 						const std::string semantic_id = aida::preview::semantics::stable_id(
 							"aida.menu.action", action_id);
 						aida::preview::semantics::register_last_item(
-							semantic_id, "application-menu-action", false, !enabled);
+							semantic_id, "application-menu-action", true, !enabled);
 #endif
 						if (!enabled && ImGui::IsItemHovered(
 							ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -5391,7 +5434,98 @@ void helpers::render_title()
 						}
 					};
 
-					auto render_network_category = [&]() {
+						struct menu_view_group_t {
+							const char* label;
+							const char* semantic_key;
+							const char* const* ids;
+							std::size_t count;
+						};
+
+						auto render_grouped_view_category = [&](aida::ui::view_category_t category,
+							const menu_view_group_t* groups, std::size_t group_count,
+							const char* other_label, const char* other_semantic_key) {
+							std::vector<aida::ui::application_views::menu_entry_t> entries;
+							aida::ui::application_views::for_each_menu_entry(
+								[&](const aida::ui::application_views::menu_entry_t& entry) {
+									if (entry.category == category) entries.push_back(entry);
+								});
+							auto find_entry = [&](const char* id) {
+								return std::find_if(entries.begin(), entries.end(),
+									[&](const auto& entry) { return entry.id.value() == id; });
+							};
+							auto grouped = [&](const std::string& id) {
+								for (std::size_t group_index = 0; group_index < group_count; ++group_index)
+									for (std::size_t index = 0; index < groups[group_index].count; ++index)
+										if (id == groups[group_index].ids[index]) return true;
+								return false;
+							};
+							for (std::size_t group_index = 0; group_index < group_count; ++group_index) {
+								const auto& group = groups[group_index];
+								if (begin_semantic_menu(group.label, group.semantic_key)) {
+									for (std::size_t index = 0; index < group.count; ++index) {
+										const auto found = find_entry(group.ids[index]);
+										if (found != entries.end()) render_native_view_entry(*found);
+									}
+									ImGui::EndMenu();
+								}
+							}
+							const bool has_other = std::any_of(entries.begin(), entries.end(),
+								[&](const auto& entry) { return !grouped(entry.id.value()); });
+							if (has_other && begin_semantic_menu(other_label, other_semantic_key)) {
+								for (const auto& entry : entries)
+									if (!grouped(entry.id.value())) render_native_view_entry(entry);
+								ImGui::EndMenu();
+							}
+						};
+
+						auto render_analysis_view_groups = [&]() {
+							static const char* core_lists[] = {
+								"view.analysis.functions", "view.analysis.imports", "view.analysis.exports",
+								"view.analysis.names", "view.analysis.strings", "view.analysis.segments",
+								"view.analysis.segment_registers", "view.analysis.local_types"
+							};
+							static const char* navigation_relationships[] = {
+								"view.analysis.binary_map", "view.analysis.references", "view.analysis.proximity",
+								"view.navigator", "view.inspector"
+							};
+							static const char* advanced_analysis[] = {
+								"view.analysis.symbolic", "view.analysis.taint", "view.analysis.deobfuscation",
+								"view.analysis.fuzzer", "view.analysis.protection"
+							};
+							static const menu_view_group_t groups[] = {
+								{"Core Lists", "analysis.views.core-lists", core_lists, sizeof(core_lists) / sizeof(core_lists[0])},
+								{"Navigation and Relationships", "analysis.views.navigation-relationships", navigation_relationships, sizeof(navigation_relationships) / sizeof(navigation_relationships[0])},
+								{"Advanced Analysis", "analysis.views.advanced-analysis", advanced_analysis, sizeof(advanced_analysis) / sizeof(advanced_analysis[0])}
+							};
+							render_grouped_view_category(aida::ui::view_category_t::analysis,
+								groups, sizeof(groups) / sizeof(groups[0]),
+								"Other Analysis Views", "analysis.views.other");
+						};
+
+						auto render_debugger_view_groups = [&]() {
+							static const char* execution[] = {
+								"view.debug.cpu", "view.debug.breakpoints", "view.debug.threads",
+								"view.debug.call_stack", "view.debug.watches", "view.debug.source",
+								"view.debug.trace"
+							};
+							static const char* memory_system[] = {
+								"view.debug.memory_map", "view.debug.modules", "view.debug.handles",
+								"view.debug.seh", "view.debug.patches"
+							};
+							static const char* supporting[] = {
+								"view.debug.bookmarks", "view.debug.strings", "view.debug.cfg"
+							};
+							static const menu_view_group_t groups[] = {
+								{"Execution", "debugger.views.execution", execution, sizeof(execution) / sizeof(execution[0])},
+								{"Memory and System", "debugger.views.memory-system", memory_system, sizeof(memory_system) / sizeof(memory_system[0])},
+								{"Supporting Views", "debugger.views.supporting", supporting, sizeof(supporting) / sizeof(supporting[0])}
+							};
+							render_grouped_view_category(aida::ui::view_category_t::debugger,
+								groups, sizeof(groups) / sizeof(groups[0]),
+								"Other Debugger Views", "debugger.views.other");
+						};
+
+						auto render_network_category = [&]() {
 						std::vector<aida::ui::application_views::menu_entry_t> entries;
 						aida::ui::application_views::for_each_menu_entry(
 							[&](const aida::ui::application_views::menu_entry_t& entry) {
@@ -5445,7 +5579,9 @@ void helpers::render_title()
 							return false;
 						};
 						for (const auto& group : groups) {
-							if (ImGui::BeginMenu(group.label)) {
+							std::string semantic_key = "network.";
+							semantic_key.append(group.label);
+							if (begin_semantic_menu(group.label, semantic_key.c_str())) {
 								for (std::size_t index = 0; index < group.count; ++index) {
 									const auto found = find_entry(group.ids[index]);
 									if (found != entries.end()) render_native_view_entry(*found);
@@ -5455,11 +5591,111 @@ void helpers::render_title()
 						}
 						const bool has_other = std::any_of(entries.begin(), entries.end(),
 							[&](const auto& entry) { return !grouped(entry.id.value()); });
-						if (has_other && ImGui::BeginMenu("Other Network Views")) {
+						if (has_other && begin_semantic_menu(
+							"Other Network Views", "network.other-views")) {
 							for (const auto& entry : entries)
 								if (!grouped(entry.id.value())) render_native_view_entry(entry);
 							ImGui::EndMenu();
 						}
+					};
+
+					auto render_network_menu = [&]() {
+						action_menu_item("network.capture.start");
+						action_menu_item("network.capture.stop");
+						action_menu_item("network.proxy.start");
+						action_menu_item("network.proxy.stop");
+						const auto intercept_state = network_view::operational_command_capability(
+							network_view::operational_command_t::intercept_toggle);
+						action_menu_item("network.intercept.toggle_enabled", "",
+							intercept_state.checked ? "Disable Intercept" : "Enable Intercept");
+						if (begin_semantic_menu("Traffic Policy and Trust", "network.traffic-policy-trust")) {
+							action_menu_item("network.proxy.history.clear");
+							action_menu_item("network.proxy.ca_trust_repair");
+							menu_sep();
+							action_menu_item("network.filters.add");
+							action_menu_item("network.filters.remove_selected");
+							action_menu_item("network.filters.clear");
+							ImGui::EndMenu();
+						}
+						if (begin_semantic_menu("TLS Key Logging", "network.tls-key-logging")) {
+							action_menu_item("network.keylog.launch");
+							action_menu_item("network.keylog.watch");
+							action_menu_item("network.keylog.stop");
+							action_menu_item("network.keylog.clear");
+							ImGui::EndMenu();
+						}
+						menu_sep();
+						if (begin_semantic_menu("Network Views", "network.views")) {
+							render_network_category();
+							ImGui::EndMenu();
+						}
+					};
+
+					auto render_analysis_menu = [&]() {
+						action_menu_item("tools.load_binary");
+						action_menu_item("analysis.decompile_or_focus_pseudocode");
+						action_menu_item("analysis.toggle_graph_text");
+						action_menu_item("analysis.navigate.follow");
+						action_menu_item("analysis.navigate.xrefs");
+						menu_sep();
+						if (begin_semantic_menu("Modify Selection", "analysis.modify-selection")) {
+							action_menu_item("analysis.modify.rename");
+							action_menu_item("analysis.modify.retype");
+							action_menu_item("analysis.modify.comment");
+							action_menu_item("analysis.modify.bookmark");
+							action_menu_item("analysis.modify.rebase");
+							ImGui::EndMenu();
+						}
+						if (begin_semantic_menu("Debug Selection", "analysis.debug-selection")) {
+							action_menu_item("analysis.debug.run_to_cursor");
+							action_menu_item("analysis.debug.breakpoint");
+							ImGui::EndMenu();
+						}
+						if (begin_semantic_menu("Overlay History", "analysis.overlay-history")) {
+							action_menu_item("analysis.overlay.undo");
+							action_menu_item("analysis.overlay.redo");
+							ImGui::EndMenu();
+						}
+						if (begin_semantic_menu("Patching", "analysis.patching")) {
+							action_menu_item("analysis.modify.patch");
+							action_menu_item("analysis.modify.nop");
+							action_menu_item("analysis.modify.assemble");
+							ImGui::EndMenu();
+						}
+						action_menu_item("analysis.export.listing");
+						menu_sep();
+						if (begin_semantic_menu("Analysis Views", "analysis.views")) {
+							render_analysis_view_groups();
+							ImGui::EndMenu();
+						}
+					};
+
+					auto render_debugger_menu = [&]() {
+						action_menu_item("debugger.launch");
+						action_menu_item("tools.attach_process");
+						action_menu_item("debugger.run_continue", "F5");
+						action_menu_item("debugger.pause", "F6");
+						action_menu_item("debugger.step_over", "F10");
+						action_menu_item("debugger.step_into", "F11");
+						action_menu_item("debugger.step_out", "Shift+F11");
+						action_menu_item("debugger.restart", "Ctrl+Shift+F5");
+						action_menu_item("debugger.detach", "Ctrl+F2");
+						action_menu_item("debugger.stop", "Shift+F5");
+						menu_sep();
+						if (begin_semantic_menu("Debugger Views", "debugger.views")) {
+							render_debugger_view_groups();
+							ImGui::EndMenu();
+						}
+					};
+
+					auto render_memory_menu = [&]() {
+						action_menu_item("memory.first_scan", "Ctrl+Alt+F");
+						action_menu_item("memory.next_scan", "Ctrl+Alt+N");
+						action_menu_item("memory.stop_scan", "Shift+Escape");
+						action_menu_item("memory.undo_scan", "Ctrl+Alt+Z");
+						action_menu_item("memory.new_scan", "Ctrl+Alt+R");
+						menu_sep();
+						render_view_category(aida::ui::view_category_t::memory);
 					};
 
 					switch (i) {
@@ -5537,7 +5773,7 @@ void helpers::render_title()
 								aida::ui::application_views::category_label(category);
 							category_name.append("  (").append(std::to_string(open_count))
 								.append("/").append(std::to_string(category_count)).append(")");
-							if (ImGui::BeginMenu(category_name.c_str())) {
+							if (begin_native_menu(category_name.c_str())) {
 								auto render_view_entry = [&](std::size_t entry_index) {
 									const auto& entry = view_entries[entry_index];
 									const std::string action_id =
@@ -5554,7 +5790,7 @@ void helpers::render_title()
 										aida::preview::semantics::stable_id(
 											"aida.menu.action", action_id);
 									aida::preview::semantics::register_last_item(
-										view_semantic_id, "application-menu-action", false, !enabled);
+										view_semantic_id, "application-menu-action", true, !enabled);
 #endif
 									if (!enabled && ImGui::IsItemHovered(
 										ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -5587,7 +5823,7 @@ void helpers::render_title()
 										std::string page_label = "Views ";
 										page_label.append(std::to_string(first)).append("-")
 											.append(std::to_string(last));
-										if (ImGui::BeginMenu(page_label.c_str())) {
+										if (begin_native_menu(page_label.c_str())) {
 											for (std::size_t entry_index = page_begin;
 												entry_index < page_end; ++entry_index)
 												render_view_entry(entry_index);
@@ -5624,49 +5860,17 @@ void helpers::render_title()
 					}
 					case 4:
 					{
-						action_menu_item("tools.load_binary");
-						action_menu_item("analysis.decompile_or_focus_pseudocode");
-						action_menu_item("analysis.toggle_graph_text");
-						action_menu_item("analysis.navigate.follow");
-						action_menu_item("analysis.navigate.xrefs");
-						action_menu_item("analysis.modify.rename");
-						action_menu_item("analysis.modify.retype");
-						action_menu_item("analysis.modify.comment");
-						action_menu_item("analysis.modify.bookmark");
-						action_menu_item("analysis.modify.rebase");
-						action_menu_item("analysis.debug.run_to_cursor");
-						action_menu_item("analysis.debug.breakpoint");
-						menu_sep();
-						action_menu_item("analysis.overlay.undo");
-						action_menu_item("analysis.overlay.redo");
-						menu_sep();
-						action_menu_item("analysis.modify.patch");
-						action_menu_item("analysis.modify.nop");
-						action_menu_item("analysis.modify.assemble");
-						action_menu_item("analysis.export.listing");
-						menu_sep();
-						render_view_category(aida::ui::view_category_t::analysis);
+						render_analysis_menu();
 						break;
 					}
 					case 5:
 					{
-						action_menu_item("debugger.launch");
-						action_menu_item("tools.attach_process");
-						action_menu_item("debugger.run_continue", "F5");
-						action_menu_item("debugger.pause", "F6");
-						action_menu_item("debugger.step_over", "F10");
-						action_menu_item("debugger.step_into", "F11");
-						action_menu_item("debugger.step_out", "Shift+F11");
-						action_menu_item("debugger.restart", "Ctrl+Shift+F5");
-						action_menu_item("debugger.detach", "Ctrl+F2");
-						action_menu_item("debugger.stop", "Shift+F5");
-						menu_sep();
-						render_view_category(aida::ui::view_category_t::debugger);
+						render_debugger_menu();
 						break;
 					}
 					case 6:
 					{
-						render_view_category(aida::ui::view_category_t::memory);
+						render_memory_menu();
 						break;
 					}
 					case 7:
@@ -5676,7 +5880,7 @@ void helpers::render_title()
 					}
 					case 8:
 					{
-						render_network_category();
+						render_network_menu();
 						break;
 					}
 					case 9:
@@ -5707,7 +5911,7 @@ void helpers::render_title()
 						action_menu_item("workspace.lock", "", aida::ui::workspace_layout::layout_locked() ? "Unlock Layout" : "Lock Layout");
 						action_menu_item("workspace.save_active");
 						action_menu_item("workspace.save_as");
-						const bool saved_workspaces_open = ImGui::BeginMenu("Saved Workspaces");
+						const bool saved_workspaces_open = begin_native_menu("Saved Workspaces");
 						register_workspace_semantic("aida.workspace.menu.saved-workspaces",
 							"workspace-saved-menu");
 						if (saved_workspaces_open) {
@@ -5763,7 +5967,7 @@ void helpers::render_title()
 						action_menu_item("programming.task.configure");
 						action_menu_item("programming.task.reload");
 						action_menu_item("programming.show_problems");
-						if (ImGui::BeginMenu("Language Services")) {
+						if (begin_native_menu("Language Services")) {
 							action_menu_item("programming.language.completion", "Ctrl+Space");
 							action_menu_item("programming.language.hover");
 							action_menu_item("programming.language.signature_help");
@@ -5806,49 +6010,21 @@ void helpers::render_title()
 							const bool requested = compact_section_request == section;
 							if (requested)
 								ImGui::OpenPopup(label);
-							const bool opened = ImGui::BeginMenu(label);
+							const bool opened = begin_native_menu(label);
 							if (opened && requested)
 								ImGui::SetKeyboardFocusHere();
 							return opened;
 						};
 						if (begin_compact_section("Analysis", 4)) {
-							action_menu_item("tools.load_binary");
-							action_menu_item("analysis.decompile_or_focus_pseudocode");
-							action_menu_item("analysis.toggle_graph_text");
-							action_menu_item("analysis.navigate.follow");
-							action_menu_item("analysis.navigate.xrefs");
-							action_menu_item("analysis.modify.rename");
-							action_menu_item("analysis.modify.retype");
-							action_menu_item("analysis.modify.comment");
-							action_menu_item("analysis.modify.bookmark");
-							action_menu_item("analysis.modify.rebase");
-							action_menu_item("analysis.debug.run_to_cursor");
-							action_menu_item("analysis.debug.breakpoint");
-							action_menu_item("analysis.overlay.undo");
-							action_menu_item("analysis.overlay.redo");
-							action_menu_item("analysis.modify.patch");
-							action_menu_item("analysis.modify.nop");
-							action_menu_item("analysis.modify.assemble");
-							action_menu_item("analysis.export.listing");
-							render_view_category(aida::ui::view_category_t::analysis);
+							render_analysis_menu();
 							ImGui::EndMenu();
 						}
 						if (begin_compact_section("Debugger", 5)) {
-							action_menu_item("debugger.launch");
-							action_menu_item("tools.attach_process");
-							action_menu_item("debugger.run_continue", "F5");
-							action_menu_item("debugger.pause", "F6");
-							action_menu_item("debugger.step_over", "F10");
-							action_menu_item("debugger.step_into", "F11");
-							action_menu_item("debugger.step_out", "Shift+F11");
-							action_menu_item("debugger.restart", "Ctrl+Shift+F5");
-							action_menu_item("debugger.detach", "Ctrl+F2");
-							action_menu_item("debugger.stop", "Shift+F5");
-							render_view_category(aida::ui::view_category_t::debugger);
+							render_debugger_menu();
 							ImGui::EndMenu();
 						}
 						if (begin_compact_section("Memory", 6)) {
-							render_view_category(aida::ui::view_category_t::memory);
+							render_memory_menu();
 							ImGui::EndMenu();
 						}
 						if (begin_compact_section("Types and Structures", 7)) {
@@ -5856,7 +6032,7 @@ void helpers::render_title()
 							ImGui::EndMenu();
 						}
 						if (begin_compact_section("Network", 8)) {
-							render_network_category();
+							render_network_menu();
 							ImGui::EndMenu();
 						}
 						if (begin_compact_section("Workspace", 9)) {
@@ -5887,7 +6063,7 @@ void helpers::render_title()
 								aida::ui::workspace_layout::layout_locked() ? "Unlock Layout" : "Lock Layout");
 							action_menu_item("workspace.save_active");
 							action_menu_item("workspace.save_as");
-							const bool saved_workspaces_open = ImGui::BeginMenu("Saved Workspaces");
+							const bool saved_workspaces_open = begin_native_menu("Saved Workspaces");
 							register_workspace_semantic("aida.workspace.compact.saved-workspaces",
 								"workspace-saved-menu");
 							if (saved_workspaces_open) {
@@ -5940,7 +6116,7 @@ void helpers::render_title()
 							action_menu_item("programming.task.configure");
 							action_menu_item("programming.task.reload");
 							action_menu_item("programming.show_problems");
-							if (ImGui::BeginMenu("Language Services")) {
+							if (begin_native_menu("Language Services")) {
 								action_menu_item("programming.language.completion", "Ctrl+Space");
 								action_menu_item("programming.language.hover");
 								action_menu_item("programming.language.signature_help");
@@ -5982,6 +6158,7 @@ void helpers::render_title()
 					menu_bar::open_menu = -1;
 					menu_bar::any_open = false;
 				}
+				ImGui::PopFont();
 				ImGui::PopStyleColor(2);
 				ImGui::PopStyleVar(3);
 			}
@@ -6002,6 +6179,7 @@ void helpers::render_title()
 	ImGui::PopStyleVar();
 	aida::ui::ide_shell::end_global_chrome_surface();
 	aida::ui::ide_shell::render_primary_surfaces();
+	aida::ui::application_ui::render_action_confirmation();
 	debugger_view::render_global_target_dialog();
 	g_render_section = "popups_workspace_management";
 	render_workspace_dialogs();

@@ -97,6 +97,7 @@ struct retained_entity_context_t {
 
 void configure_shell_callbacks(shell_callbacks_t callbacks);
 void begin_frame();
+void render_action_confirmation();
 void process_global_shortcuts();
 void set_editor_focus(bool focused, bool text_input_active);
 void process_editor_shortcuts();
@@ -118,6 +119,10 @@ shortcut_edit_result_t reset_all_shortcut_overrides();
 std::string view_action_id(const stable_view_id_t& view);
 action_execution_result_t execute_action(const char* action_id,
                                          action_invocation_source_t source);
+action_execution_result_t execute_editor_hunk_action(int hunk_index,
+    const char* action_id, action_invocation_source_t source);
+action_execution_result_t execute_editor_tab_action(int tab_index,
+    const char* action_id, action_invocation_source_t source);
 action_execution_result_t execute_retained_entity_action(
     const char* action_id, action_invocation_source_t source,
     const retained_entity_context_t& context);

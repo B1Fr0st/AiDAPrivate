@@ -28,6 +28,7 @@
 #include "debugger_interaction_context.hpp"
 #include "../scanner/memory_interaction_context.hpp"
 #include "../ui/task_center.hpp"
+#include "../ui/design_system.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/debugger_preview_runtime.hpp"
 #endif
@@ -993,7 +994,13 @@ inline void render(float pos_x, float pos_y, float width, float height,
 
 	if (g_ui.change_protect_open && !ImGui::IsPopupOpen("Change Protection"))
 		ImGui::OpenPopup("Change Protection");
-	if (ImGui::BeginPopupModal("Change Protection", &g_ui.change_protect_open, ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (aida::ui::design::begin_dialog_exact("Change Protection",
+		ImVec2(600.0f, 460.0f), ImVec2(400.0f, 320.0f),
+		&g_ui.change_protect_open)) {
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Apply", "Cancel");
+		aida::ui::design::begin_dialog_body("debugger_memory_map_protection_body",
+			footer_height);
 		ImGui::Text("Address: %016llX", static_cast<unsigned long long>(g_ui.change_protect_addr));
 		ImGui::Text("Size:    %llu bytes", static_cast<unsigned long long>(g_ui.change_protect_size));
 		ImGui::Text("Current: 0x%X", g_ui.change_protect_old);
@@ -1022,11 +1029,12 @@ inline void render(float pos_x, float pos_y, float width, float height,
 		if (!protect_gate.enabled)
 			ImGui::TextWrapped("Unavailable: %s", protect_gate.disabled_reason);
 
-		ImGui::Separator();
+		aida::ui::design::end_dialog_body();
 		const bool protect_pending = g_ui.protect_pending.load(std::memory_order_acquire);
-		if (!protect_gate.enabled || protect_pending)
-			ImGui::BeginDisabled();
-		if (ImGui::Button("Apply", ImVec2(100.f, 0.f))) {
+		const auto footer = aida::ui::design::dialog_footer(
+			"debugger_memory_map_protection_footer", "Apply",
+			protect_gate.enabled && !protect_pending, true, "Cancel");
+		if (footer.confirmed) {
 			uint32_t new_protect = values[g_ui.change_protect_choice];
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 			uint32_t old_protect = 0;
@@ -1154,10 +1162,7 @@ inline void render(float pos_x, float pos_y, float width, float height,
 			ImGui::CloseCurrentPopup();
 #endif
 		}
-		if (!protect_gate.enabled || protect_pending)
-			ImGui::EndDisabled();
-		ImGui::SameLine();
-		if (ImGui::Button("Cancel", ImVec2(100.f, 0.f))) {
+		if (footer.cancelled || !g_ui.change_protect_open) {
 			g_ui.change_protect_open = false;
 			ImGui::CloseCurrentPopup();
 		}

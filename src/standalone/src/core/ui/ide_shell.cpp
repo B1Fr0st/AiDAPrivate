@@ -412,6 +412,7 @@ enum class activity_glyph_t : std::uint8_t {
     explorer,
     search,
     recent,
+    more,
     settings
 };
 
@@ -515,6 +516,11 @@ void draw_activity_glyph(ImDrawList* draw, activity_glyph_t glyph, ImVec2 center
         draw->AddLine(center, ImVec2(center.x, center.y - 5.0f * unit), color, stroke);
         draw->AddLine(center, ImVec2(center.x + 4.5f * unit, center.y + 2.5f * unit), color, stroke);
         break;
+    case activity_glyph_t::more:
+        for (float offset : {-6.0f, 0.0f, 6.0f})
+            draw->AddCircleFilled(ImVec2(center.x + offset * unit, center.y),
+                1.6f * unit, color, 12);
+        break;
     case activity_glyph_t::settings:
         draw->AddCircle(center, 4.0f * unit, color, 20, stroke);
         draw->AddCircle(center, 8.0f * unit, color, 20, stroke);
@@ -528,13 +534,15 @@ void draw_activity_glyph(ImDrawList* draw, activity_glyph_t glyph, ImVec2 center
     }
 }
 
-void render_activity_button(const char* stable_id, const char* action_id,
+bool render_activity_button(const char* stable_id, const char* action_id,
     const char* tooltip, activity_glyph_t glyph, bool active,
     ImVec2 size, float scale) noexcept
 {
     ImGui::PushID(stable_id);
     const auto& theme = aida::ui::resolved();
-    const auto capability = application_ui::action_capability(action_id);
+    const auto capability = action_id
+        ? application_ui::action_capability(action_id)
+        : capability_state_t::available();
     const bool enabled = capability.visible && capability.enabled;
     const ImVec2 minimum = ImGui::GetCursorScreenPos();
     ImGui::PushStyleColor(ImGuiCol_Button, active
@@ -567,6 +575,33 @@ void render_activity_button(const char* stable_id, const char* action_id,
     design::tooltip_for_last_item(enabled || capability.disabled_reason.empty()
         ? tooltip : capability.disabled_reason.c_str());
     design::draw_focus_ring_for_last_item();
+    if (invoked && action_id)
+        static_cast<void>(application_ui::execute_action(
+            action_id, action_invocation_source_t::activity_bar));
+    ImGui::PopID();
+    return invoked;
+}
+
+void render_activity_overflow_action(const char* stable_id, const char* label,
+    const char* action_id, bool selected, float scale) noexcept
+{
+    const auto capability = application_ui::action_capability(action_id);
+    const bool enabled = capability.visible && capability.enabled;
+    ImGui::PushID(stable_id);
+    if (!enabled)
+        ImGui::BeginDisabled();
+    const bool invoked = ImGui::Selectable(label, selected,
+        ImGuiSelectableFlags_None, ImVec2(0.0f, 30.0f * scale));
+    if (!enabled)
+        ImGui::EndDisabled();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    aida::preview::semantics::register_last_item(
+        aida::preview::semantics::stable_id("aida.activity.overflow", stable_id),
+        "activity-overflow-action", true, !enabled);
+#endif
+    design::tooltip_for_last_item(enabled || capability.disabled_reason.empty()
+        ? label : capability.disabled_reason.c_str());
+    design::draw_focus_ring_for_last_item();
     if (invoked)
         static_cast<void>(application_ui::execute_action(
             action_id, action_invocation_source_t::activity_bar));
@@ -588,9 +623,6 @@ void render_activity_bar() noexcept
     const float activity_height = (std::max)(1.0f,
         viewport->WorkSize.y - chrome_height - status_height);
     const float button_height = 34.0f * scale;
-    const float activity_content_minimum =
-        11.0f * button_height + 10.0f * 2.0f * scale + 24.0f * scale;
-    const bool activity_scroll_required = activity_content_minimum > activity_height;
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + chrome_height), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(width, activity_height), ImGuiCond_Always);
     ImGui::SetNextWindowViewport(viewport->ID);
@@ -601,36 +633,37 @@ void render_activity_bar() noexcept
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus;
-    if (activity_scroll_required)
-        flags |= ImGuiWindowFlags_AlwaysVerticalScrollbar;
+    flags |= ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     if (ImGui::Begin("Activity###aida.shell.activity", nullptr, flags)) {
         struct workspace_entry_t {
             const char* id;
             const char* action;
+            const char* label;
             const char* tooltip;
             workspace_layout::workspace_preset_t preset;
             activity_glyph_t glyph;
         };
         constexpr workspace_entry_t workspaces[] = {
-            {"workspace.analysis", "workspace.switch.analysis", "Analysis workspace", workspace_layout::workspace_preset_t::analysis, activity_glyph_t::analysis},
-            {"workspace.debugging", "workspace.switch.debugging", "Debugging workspace", workspace_layout::workspace_preset_t::debugging, activity_glyph_t::debugging},
-            {"workspace.memory", "workspace.switch.memory", "Memory workspace", workspace_layout::workspace_preset_t::memory, activity_glyph_t::memory},
-            {"workspace.types", "workspace.switch.types-structures", "Types and Structures workspace", workspace_layout::workspace_preset_t::types_structures, activity_glyph_t::types},
-            {"workspace.network", "workspace.switch.network", "Network workspace", workspace_layout::workspace_preset_t::network, activity_glyph_t::network},
-            {"workspace.programming", "workspace.switch.programming", "Programming workspace", workspace_layout::workspace_preset_t::programming, activity_glyph_t::programming},
-            {"workspace.automation", "workspace.switch.automation-ai", "Automation and AI workspace", workspace_layout::workspace_preset_t::automation_ai, activity_glyph_t::automation}
+            {"workspace.analysis", "workspace.switch.analysis", "Analysis", "Analysis workspace", workspace_layout::workspace_preset_t::analysis, activity_glyph_t::analysis},
+            {"workspace.debugging", "workspace.switch.debugging", "Debugging", "Debugging workspace", workspace_layout::workspace_preset_t::debugging, activity_glyph_t::debugging},
+            {"workspace.memory", "workspace.switch.memory", "Memory", "Memory workspace", workspace_layout::workspace_preset_t::memory, activity_glyph_t::memory},
+            {"workspace.types", "workspace.switch.types-structures", "Types and Structures", "Types and Structures workspace", workspace_layout::workspace_preset_t::types_structures, activity_glyph_t::types},
+            {"workspace.network", "workspace.switch.network", "Network", "Network workspace", workspace_layout::workspace_preset_t::network, activity_glyph_t::network},
+            {"workspace.programming", "workspace.switch.programming", "Programming", "Programming workspace", workspace_layout::workspace_preset_t::programming, activity_glyph_t::programming},
+            {"workspace.automation", "workspace.switch.automation-ai", "Automation and AI", "Automation and AI workspace", workspace_layout::workspace_preset_t::automation_ai, activity_glyph_t::automation}
         };
         struct utility_entry_t {
             const char* id;
             const char* action;
+            const char* label;
             const char* tooltip;
             const char* view;
             activity_glyph_t glyph;
         };
         constexpr utility_entry_t utilities[] = {
-            {"utility.explorer", "view.focus.view.project_explorer", "Project Explorer", "view.project_explorer", activity_glyph_t::explorer},
-            {"utility.search", "view.focus.view.workspace_search", "Workspace Search", "view.workspace_search", activity_glyph_t::search},
-            {"utility.recent", "view.focus.view.recent", "Recent files and sessions", "view.recent", activity_glyph_t::recent}
+            {"utility.explorer", "view.focus.view.project_explorer", "Project Explorer", "Project Explorer", "view.project_explorer", activity_glyph_t::explorer},
+            {"utility.search", "view.focus.view.workspace_search", "Workspace Search", "Workspace Search", "view.workspace_search", activity_glyph_t::search},
+            {"utility.recent", "view.focus.view.recent", "Recent", "Recent files and sessions", "view.recent", activity_glyph_t::recent}
         };
         const ImVec2 size((std::max)(18.0f * scale, ImGui::GetContentRegionAvail().x),
             button_height);
@@ -639,7 +672,33 @@ void render_activity_bar() noexcept
         const bool utility_focused = focused_view == "view.project_explorer" ||
             focused_view == "view.workspace_search" || focused_view == "view.recent" ||
             focused_view == "view.settings";
-        for (const auto& entry : workspaces) {
+        const float stride = button_height + ImGui::GetStyle().ItemSpacing.y;
+        const float decoration_height = 12.0f * scale;
+        const float available_buttons = (std::max)(0.0f,
+            ImGui::GetContentRegionAvail().y - decoration_height);
+        const std::size_t maximum_slots = (std::max)(std::size_t{3},
+            static_cast<std::size_t>(available_buttons / (std::max)(stride, 1.0f)));
+        const bool overflow_required = maximum_slots <
+            std::size(workspaces) + std::size(utilities) + 1;
+        const std::size_t direct_workspace_capacity = overflow_required
+            ? (std::min)(std::size(workspaces), maximum_slots > 2 ? maximum_slots - 2 : 1)
+            : std::size(workspaces);
+        std::array<bool, std::size(workspaces)> direct_workspaces{};
+        for (std::size_t index = 0; index < direct_workspace_capacity; ++index)
+            direct_workspaces[index] = true;
+        const auto active_preset = workspace_layout::active_preset();
+        std::size_t active_workspace_index = 0;
+        for (std::size_t index = 0; index < std::size(workspaces); ++index)
+            if (workspaces[index].preset == active_preset)
+                active_workspace_index = index;
+        if (overflow_required && !direct_workspaces[active_workspace_index]) {
+            direct_workspaces[direct_workspace_capacity - 1] = false;
+            direct_workspaces[active_workspace_index] = true;
+        }
+        for (std::size_t index = 0; index < std::size(workspaces); ++index) {
+            if (!direct_workspaces[index])
+                continue;
+            const auto& entry = workspaces[index];
             const bool active = !utility_focused && workspace_layout::active_preset() == entry.preset;
             render_activity_button(entry.id, entry.action, entry.tooltip,
                 entry.glyph, active, size, scale);
@@ -647,16 +706,44 @@ void render_activity_bar() noexcept
         ImGui::Dummy(ImVec2(0.0f, 3.0f * scale));
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0.0f, 3.0f * scale));
-        for (const auto& entry : utilities) {
-            const bool active = focused_view == entry.view;
-            render_activity_button(entry.id, entry.action, entry.tooltip,
-                entry.glyph, active, size, scale);
+        if (!overflow_required) {
+            for (const auto& entry : utilities) {
+                const bool active = focused_view == entry.view;
+                render_activity_button(entry.id, entry.action, entry.tooltip,
+                    entry.glyph, active, size, scale);
+            }
+        } else {
+            const bool overflow_active = utility_focused && focused_view != "view.settings";
+            if (render_activity_button("utility.more", nullptr, "More workspaces and tools",
+                    activity_glyph_t::more, overflow_active, size, scale))
+                ImGui::OpenPopup("More Activities###aida.activity.more.popup");
+            ImGui::SetNextWindowSizeConstraints(ImVec2(210.0f * scale, 0.0f),
+                ImVec2(320.0f * scale, activity_height * 0.88f));
+            if (ImGui::BeginPopup("More Activities###aida.activity.more.popup")) {
+                bool has_hidden_workspace = false;
+                for (bool direct : direct_workspaces)
+                    has_hidden_workspace |= !direct;
+                if (has_hidden_workspace) {
+                    ImGui::TextDisabled("WORKSPACES");
+                    for (std::size_t index = 0; index < std::size(workspaces); ++index) {
+                        if (direct_workspaces[index])
+                            continue;
+                        const auto& entry = workspaces[index];
+                        render_activity_overflow_action(entry.id, entry.label, entry.action,
+                            !utility_focused && active_preset == entry.preset, scale);
+                    }
+                    ImGui::Separator();
+                }
+                ImGui::TextDisabled("TOOLS");
+                for (const auto& entry : utilities)
+                    render_activity_overflow_action(entry.id, entry.label, entry.action,
+                        focused_view == entry.view, scale);
+                ImGui::EndPopup();
+            }
         }
-        if (!activity_scroll_required) {
-            const float settings_y = ImGui::GetWindowHeight() - size.y - 10.0f * scale;
-            if (ImGui::GetCursorPosY() < settings_y)
-                ImGui::SetCursorPosY(settings_y);
-        }
+        const float settings_y = ImGui::GetWindowHeight() - size.y - 10.0f * scale;
+        if (ImGui::GetCursorPosY() < settings_y)
+            ImGui::SetCursorPosY(settings_y);
         render_activity_button("utility.settings", "view.focus.view.settings", "Settings",
             activity_glyph_t::settings, focused_view == "view.settings", size, scale);
     }
@@ -744,6 +831,8 @@ void begin_frame() noexcept
     ImGui::PopStyleVar(3);
     ImGui::SetCursorScreenPos(dock_position);
     workspace_layout::prepare_root(dockspace, dock_position, dock_size);
+    application_views::synchronize_workspace_visibility(
+        workspace_layout::active_preset());
     ImGui::DockSpace(dockspace, dock_size, ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::End();
 #else
@@ -758,6 +847,7 @@ void end_frame() noexcept
     if (!current.initialized || ImGui::GetCurrentContext() == nullptr)
         return;
     render_primary_surfaces();
+    workspace_layout::render_global_dock_navigator();
     workspace_layout::settle_default_selection();
     workspace_layout::persist_if_requested();
 }
@@ -770,10 +860,12 @@ void render_primary_surfaces() noexcept
     const int frame = ImGui::GetFrameCount();
     if (current.primary_surfaces_frame == frame)
         return;
-    application_views::render_registry_owned_windows();
-    explorer_views::render_global_file_operation_dialogs();
-    disasm_view::render_static_patch_workflow();
-    debugger_view::render_global_dialogs();
+    if (workspace_layout::surfaces_ready()) {
+        application_views::render_registry_owned_windows();
+        explorer_views::render_global_file_operation_dialogs();
+        disasm_view::render_static_patch_workflow();
+        debugger_view::render_global_dialogs();
+    }
     render_activity_bar();
     render_status_bar();
     current.primary_surfaces_frame = frame;

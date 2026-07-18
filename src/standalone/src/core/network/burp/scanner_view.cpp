@@ -24,6 +24,8 @@
 #endif
 
 #include "../../ui/components.hpp"
+#include "../../ui/design_system.hpp"
+#include "../../ui/responsive.hpp"
 #include "../../scanner/scanner_async_io.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
 #include "../../../preview/network_preview_services.hpp"
@@ -84,6 +86,24 @@ view_state_t& vs()
 {
     static view_state_t s;
     return s;
+}
+
+float toolbar_button_width(const char* label)
+{
+    const auto size = aida::ui::size_t_::sm;
+    const ImVec2 padding = aida::ui::components::control_padding(size);
+    return aida::ui::components::display_text_width(
+        ImGui::GetFont(), aida::ui::components::control_font_size(size), label) +
+        padding.x * 2.f + 4.f;
+}
+
+bool continue_toolbar_line(float next_width, float spacing = 6.f)
+{
+    const float content_right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+    if (ImGui::GetItemRectMax().x + spacing + next_width > content_right)
+        return false;
+    ImGui::SameLine(0.f, spacing);
+    return true;
 }
 
 void submit_initialization()
@@ -348,7 +368,6 @@ void render_audits_pane(float w, float h, float alpha)
 {
     auto& s = vs();
     const auto& th = aida::ui::resolved();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     ImGui::BeginChild("##burp_audits", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
@@ -356,56 +375,93 @@ void render_audits_pane(float w, float h, float alpha)
     ImGui::Spacing();
 
     auto audits = active_scanner::list_audits();
-    float row_h = 60.f;
-    float list_h = h - 48.f;
-    ImGui::BeginChild("##burp_audit_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
+    const bool compact_rows = w < 400.f;
+    const float line_h = ImGui::GetTextLineHeight();
+    const float primary_y = 4.f;
+    const float url_y = primary_y + line_h + 2.f;
+    const float progress_y = url_y + line_h + 5.f;
+    const float status_y = progress_y + 10.f;
+    const float row_h = compact_rows
+        ? std::max(76.f, status_y + line_h + 4.f)
+        : std::max(60.f, progress_y + line_h + 2.f);
+    const float list_h = std::max(1.f, h - 48.f);
+    ImGui::BeginChild("##burp_audit_list", ImVec2(std::max(1.f, w - 4.f), list_h),
+        false, ImGuiWindowFlags_NoBackground);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 lo = ImGui::GetWindowPos();
-    for (size_t i = 0; i < audits.size(); ++i) {
+    ImGuiListClipper audit_clipper;
+    audit_clipper.Begin(static_cast<int>(audits.size()), row_h + 4.f);
+    while (audit_clipper.Step()) {
+    for (int row = audit_clipper.DisplayStart; row < audit_clipper.DisplayEnd; ++row) {
+        const size_t i = static_cast<size_t>(row);
         const auto& a = audits[i];
         float ry = ImGui::GetCursorPosY();
         float abs_ry = ImGui::GetCursorScreenPos().y;
-        bool hovered = ImGui::IsMouseHoveringRect(ImVec2(lo.x, abs_ry), ImVec2(lo.x + w, abs_ry + row_h), false);
+        const float row_content_w = std::max(1.f, ImGui::GetContentRegionAvail().x);
+        bool hovered = ImGui::IsMouseHoveringRect(
+            ImVec2(lo.x, abs_ry), ImVec2(lo.x + row_content_w, abs_ry + row_h), false);
         bool selected = (s.selected_audit_id == a.id);
         if (selected) {
-            dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + w, abs_ry + row_h),
+            dl->AddRectFilled(
+                ImVec2(lo.x, abs_ry), ImVec2(lo.x + row_content_w, abs_ry + row_h),
                               aida::ui::with_alpha(th.selection, alpha), 4.f);
             dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + 3.f, abs_ry + row_h),
                               aida::ui::with_alpha(th.accent_u32, alpha));
         } else if (hovered) {
-            dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + w, abs_ry + row_h),
+            dl->AddRectFilled(
+                ImVec2(lo.x, abs_ry), ImVec2(lo.x + row_content_w, abs_ry + row_h),
                               aida::ui::with_alpha(th.hover_wash, alpha), 4.f);
         }
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) s.selected_audit_id = a.id;
 
+        const bool show_cancel = selected && a.running;
+        const float primary_w = std::max(1.f,
+            row_content_w - 24.f - (show_cancel ? 84.f : 0.f));
         char buf[512];
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
             "#%llu  %s:%u  %s",
             static_cast<unsigned long long>(a.id), a.host.c_str(), a.port,
             a.tls ? "https" : "http");
-        dl->AddText(ImVec2(lo.x + 12.f, abs_ry + 4.f),
-                    aida::ui::with_alpha(th.text_primary, alpha), buf);
+        const std::string primary = aida::ui::responsive::ellipsize_end(
+            buf, ImGui::GetFont(), ImGui::GetFontSize(), primary_w);
+        dl->AddText(ImVec2(lo.x + 12.f, abs_ry + primary_y),
+                    aida::ui::with_alpha(th.text_primary, alpha), primary.c_str());
 
-        std::string url_clip = a.url;
-        if (url_clip.size() > 80) url_clip = url_clip.substr(0, 77) + "...";
-        dl->AddText(ImVec2(lo.x + 12.f, abs_ry + 22.f),
+        const std::string url_clip = aida::ui::responsive::ellipsize_middle(
+            a.url, ImGui::GetFont(), ImGui::GetFontSize(),
+            primary_w);
+        dl->AddText(ImVec2(lo.x + 12.f, abs_ry + url_y),
                     aida::ui::with_alpha(th.text_secondary, alpha), url_clip.c_str());
+        if (hovered && (primary != buf || url_clip != a.url))
+            ImGui::SetTooltip("%s\n%s", buf, a.url.c_str());
 
         float frac = (a.total_probes > 0)
             ? static_cast<float>(a.completed_probes) / static_cast<float>(a.total_probes) : 0.f;
-        ImVec2 pb_pos(lo.x + 12.f, abs_ry + 42.f);
-        aida::ui::render_progress_bar(pb_pos, w - 130.f, 6.f, frac, false, a.running);
-
         _snprintf_s(buf, sizeof(buf), _TRUNCATE,
             "%zu/%zu  %zu issues  %s",
             a.completed_probes, a.total_probes, a.issues_found,
             a.running ? "Running" : (a.cancelled ? "Cancelled" : "Done"));
-        dl->AddText(ImVec2(lo.x + w - 110.f, abs_ry + 40.f),
-                    aida::ui::with_alpha(a.running ? th.warning : th.text_dim, alpha), buf);
-
-        ImGui::SetCursorPosY(ry + row_h + 4.f);
+        if (compact_rows) {
+            aida::ui::render_progress_bar(ImVec2(lo.x + 12.f, abs_ry + progress_y),
+                std::max(1.f, row_content_w - 24.f), 6.f, frac, false, a.running);
+            const std::string status = aida::ui::responsive::ellipsize_end(
+                buf, ImGui::GetFont(), ImGui::GetFontSize(),
+                std::max(1.f, row_content_w - 24.f));
+            dl->AddText(ImVec2(lo.x + 12.f, abs_ry + status_y),
+                aida::ui::with_alpha(a.running ? th.warning : th.text_dim, alpha),
+                status.c_str());
+        } else {
+            aida::ui::render_progress_bar(ImVec2(lo.x + 12.f, abs_ry + progress_y),
+                std::max(1.f, row_content_w - 130.f), 6.f, frac, false, a.running);
+            const std::string status = aida::ui::responsive::ellipsize_end(
+                buf, ImGui::GetFont(), ImGui::GetFontSize(), 106.f);
+            dl->AddText(ImVec2(lo.x + row_content_w - 110.f, abs_ry + progress_y - 2.f),
+                aida::ui::with_alpha(a.running ? th.warning : th.text_dim, alpha),
+                status.c_str());
+        }
 
         if (selected) {
-            float bx = lo.x + w - 80.f;
+            float bx = std::max(lo.x + 8.f, lo.x + row_content_w - 80.f);
             float by = abs_ry + 4.f;
             ImGui::SetCursorScreenPos(ImVec2(bx, by));
             if (a.running) {
@@ -416,6 +472,8 @@ void render_audits_pane(float w, float h, float alpha)
                 }
             }
         }
+        ImGui::SetCursorPosY(ry + row_h + 4.f);
+    }
     }
     ImGui::Dummy(ImVec2(0.f, 0.f));
     if (audits.empty()) {
@@ -430,32 +488,48 @@ void render_issues_pane(float w, float h, float alpha)
 {
     auto& s = vs();
     const auto& th = aida::ui::resolved();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     ImGui::BeginChild("##burp_issues", ImVec2(w, h), false, ImGuiWindowFlags_NoBackground);
 
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Issues");
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 20.f);
+    const float filter_width = std::max(1.f, ImGui::GetContentRegionAvail().x);
+    const float filter_gap = 6.f;
+    const float density_scale = std::max(1.f, ImGui::GetFontSize() / 16.f);
+    const float sev_label_w = ImGui::CalcTextSize("Sev:").x;
+    const float sev_combo_preferred = std::max(110.f,
+        ImGui::CalcTextSize("Critical").x + ImGui::GetStyle().FramePadding.x * 2.f);
+    const float sev_combo_w = std::min(sev_combo_preferred,
+        std::max(1.f, filter_width - sev_label_w - filter_gap));
+    continue_toolbar_line(sev_label_w + filter_gap + sev_combo_w, filter_gap);
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                        "Sev:");
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, filter_gap);
     const char* sev_items[] = { "Any", "Info", "Low", "Medium", "High", "Critical" };
-    ImGui::SetNextItemWidth(110.f);
+    ImGui::SetNextItemWidth(sev_combo_w);
     ImGui::Combo("##bs_sev", &s.filter_sev, sev_items, 6);
-    ImGui::SameLine();
+    const float conf_label_w = ImGui::CalcTextSize("Conf:").x;
+    const float conf_combo_preferred = std::max(110.f,
+        ImGui::CalcTextSize("Tentative").x + ImGui::GetStyle().FramePadding.x * 2.f);
+    const float conf_combo_w = std::min(conf_combo_preferred,
+        std::max(1.f, filter_width - conf_label_w - filter_gap));
+    continue_toolbar_line(conf_label_w + filter_gap + conf_combo_w, filter_gap);
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
                        "Conf:");
-    ImGui::SameLine();
+    ImGui::SameLine(0.f, filter_gap);
     const char* conf_items[] = { "Any", "Tentative", "Firm", "Certain" };
-    ImGui::SetNextItemWidth(110.f);
+    ImGui::SetNextItemWidth(conf_combo_w);
     ImGui::Combo("##bs_conf", &s.filter_conf, conf_items, 4);
-    ImGui::SameLine();
+    const float host_filter_w = std::min(160.f * density_scale, filter_width);
+    continue_toolbar_line(host_filter_w, filter_gap);
     aida::ui::input_text("##bs_host", s.filter_host, sizeof(s.filter_host),
-                          "Host filter", false, ImVec2(160.f, 28.f));
-    ImGui::SameLine();
+                          "Host filter", false, ImVec2(host_filter_w, 28.f));
+    const float type_filter_w = std::min(180.f * density_scale, filter_width);
+    continue_toolbar_line(type_filter_w, filter_gap);
     aida::ui::input_text("##bs_type", s.filter_type, sizeof(s.filter_type),
-                          "Type filter (e.g. sqli)", false, ImVec2(180.f, 28.f));
+                          "Type filter (e.g. sqli)", false, ImVec2(type_filter_w, 28.f));
 
     ImGui::Spacing();
 
@@ -476,27 +550,58 @@ void render_issues_pane(float w, float h, float alpha)
     }
     const auto issues = std::atomic_load_explicit(&s.issues, std::memory_order_acquire);
 
-    float top_used = 70.f;
-    float list_h = (h - top_used) * 0.55f;
+    const float content_top = ImGui::GetCursorPosY();
+    const float remaining_h = std::max(1.f, h - content_top);
+    const float list_h = std::max(72.f, remaining_h * 0.55f);
 
-    ImGui::BeginChild("##burp_issue_list", ImVec2(w - 4.f, list_h), false, ImGuiWindowFlags_NoBackground);
+    ImGui::BeginChild("##burp_issue_list", ImVec2(std::max(1.f, w - 4.f), list_h),
+        false, ImGuiWindowFlags_NoBackground);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 lo = ImGui::GetWindowPos();
-    float row_h = 22.f;
+    const float row_h = std::max(22.f, ImGui::GetTextLineHeight() + 8.f);
     const float text_oy = (row_h - ImGui::GetTextLineHeight()) * 0.5f;
-    float col_sev = 80.f, col_conf = 70.f, col_host = 220.f, col_param = 140.f;
-    float col_type = (w - 8.f - col_sev - col_conf - col_host - col_param - 16.f);
-    if (col_type < 120.f) col_type = 120.f;
+    const float table_w = std::max(1.f, ImGui::GetContentRegionAvail().x);
+    const float usable_w = std::max(1.f, table_w - 12.f);
+    const bool show_host = usable_w >= 260.f * density_scale;
+    const bool show_conf = usable_w >= 440.f * density_scale;
+    const bool show_param = usable_w >= 600.f * density_scale;
+    const float severity_header_w = ImGui::CalcTextSize("Severity").x + 8.f;
+    const float col_sev = usable_w < 110.f * density_scale
+        ? std::max(1.f, usable_w * 0.44f)
+        : std::min(usable_w * 0.45f,
+            std::max(severity_header_w, usable_w * 0.18f));
+    const float col_conf = show_conf
+        ? std::max(70.f * density_scale, ImGui::CalcTextSize("Certain").x + 8.f) : 0.f;
+    const float col_host = show_host
+        ? std::min(220.f * density_scale,
+            std::max(96.f * density_scale, usable_w * 0.28f)) : 0.f;
+    const float col_param = show_param
+        ? std::min(140.f * density_scale,
+            std::max(92.f * density_scale, usable_w * 0.18f)) : 0.f;
+    const float col_type = std::max(1.f,
+        usable_w - col_sev - col_conf - col_host - col_param);
 
     {
         float hy = ImGui::GetCursorScreenPos().y;
-        dl->AddRectFilled(ImVec2(lo.x, hy), ImVec2(lo.x + w, hy + row_h),
+        dl->AddRectFilled(ImVec2(lo.x, hy), ImVec2(lo.x + table_w, hy + row_h),
                           aida::ui::with_alpha(th.panel_header, alpha));
         float cx = lo.x + 8.f;
         ImU32 hc = aida::ui::with_alpha(th.text_secondary, alpha);
-        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Severity"); cx += col_sev;
-        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Conf.");    cx += col_conf;
-        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Host");     cx += col_host;
-        dl->AddText(ImVec2(cx, hy + text_oy), hc, "Param");    cx += col_param;
+        dl->AddText(ImVec2(cx, hy + text_oy), hc,
+            usable_w < 110.f * density_scale ? "Sev" : "Severity");
+        cx += col_sev;
+        if (show_conf) {
+            dl->AddText(ImVec2(cx, hy + text_oy), hc, "Conf.");
+            cx += col_conf;
+        }
+        if (show_host) {
+            dl->AddText(ImVec2(cx, hy + text_oy), hc, "Host");
+            cx += col_host;
+        }
+        if (show_param) {
+            dl->AddText(ImVec2(cx, hy + text_oy), hc, "Param");
+            cx += col_param;
+        }
         dl->AddText(ImVec2(cx, hy + text_oy), hc, "Type");
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + row_h + 4.f);
     }
@@ -508,29 +613,48 @@ void render_issues_pane(float w, float h, float alpha)
         const auto& it = (*issues)[static_cast<std::size_t>(row)];
         float ry = ImGui::GetCursorPosY();
         float abs_ry = ImGui::GetCursorScreenPos().y;
-        bool hovered = ImGui::IsMouseHoveringRect(ImVec2(lo.x, abs_ry), ImVec2(lo.x + w, abs_ry + row_h), false);
+        bool hovered = ImGui::IsMouseHoveringRect(
+            ImVec2(lo.x, abs_ry), ImVec2(lo.x + table_w, abs_ry + row_h), false);
         bool selected = (s.selected_issue_id == it.id);
         if (selected) {
-            dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + w, abs_ry + row_h),
-                              aida::ui::with_alpha(th.selection, alpha), 4.f);
+            dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + table_w, abs_ry + row_h),
+                               aida::ui::with_alpha(th.selection, alpha), 4.f);
             dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + 3.f, abs_ry + row_h),
                               sev_color(it.severity, alpha));
         } else if (hovered) {
-            dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + w, abs_ry + row_h),
-                              aida::ui::with_alpha(th.hover_wash, alpha), 4.f);
+            dl->AddRectFilled(ImVec2(lo.x, abs_ry), ImVec2(lo.x + table_w, abs_ry + row_h),
+                               aida::ui::with_alpha(th.hover_wash, alpha), 4.f);
         }
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) s.selected_issue_id = it.id;
 
         float cx = lo.x + 8.f;
         dl->AddText(ImVec2(cx, abs_ry + text_oy), sev_color(it.severity, alpha), severity_label(it.severity)); cx += col_sev;
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), conf_color(it.confidence, alpha), confidence_label(it.confidence)); cx += col_conf;
-        std::string host = it.host;
-        if (host.size() > 32) host = host.substr(0, 29) + "...";
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_primary, alpha), host.c_str()); cx += col_host;
-        std::string param = it.parameter;
-        if (param.size() > 18) param = param.substr(0, 15) + "...";
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_secondary, alpha), param.c_str()); cx += col_param;
-        dl->AddText(ImVec2(cx, abs_ry + text_oy), aida::ui::with_alpha(th.text_primary, alpha), it.type_key.c_str());
+        if (show_conf) {
+            dl->AddText(ImVec2(cx, abs_ry + text_oy), conf_color(it.confidence, alpha),
+                confidence_label(it.confidence));
+            cx += col_conf;
+        }
+        if (show_host) {
+            const std::string host = aida::ui::responsive::ellipsize_middle(
+                it.host, ImGui::GetFont(), ImGui::GetFontSize(),
+                std::max(1.f, col_host - 6.f));
+            dl->AddText(ImVec2(cx, abs_ry + text_oy),
+                aida::ui::with_alpha(th.text_primary, alpha), host.c_str());
+            cx += col_host;
+        }
+        if (show_param) {
+            const std::string param = aida::ui::responsive::ellipsize_end(
+                it.parameter, ImGui::GetFont(), ImGui::GetFontSize(),
+                std::max(1.f, col_param - 6.f));
+            dl->AddText(ImVec2(cx, abs_ry + text_oy),
+                aida::ui::with_alpha(th.text_secondary, alpha), param.c_str());
+            cx += col_param;
+        }
+        const std::string type = aida::ui::responsive::ellipsize_end(
+            it.type_key, ImGui::GetFont(), ImGui::GetFontSize(),
+            std::max(1.f, col_type - 4.f));
+        dl->AddText(ImVec2(cx, abs_ry + text_oy),
+            aida::ui::with_alpha(th.text_primary, alpha), type.c_str());
 
         ImGui::SetCursorPosY(ry + row_h);
     }
@@ -540,31 +664,44 @@ void render_issues_pane(float w, float h, float alpha)
 
     ImGui::Spacing();
 
-    float detail_h = h - top_used - list_h - 16.f;
-    if (detail_h < 60.f) detail_h = 60.f;
-    ImGui::BeginChild("##burp_issue_detail", ImVec2(w - 4.f, detail_h), false, ImGuiWindowFlags_NoBackground);
+    const float detail_h = std::max(80.f, remaining_h - list_h - 16.f);
+    ImGui::BeginChild("##burp_issue_detail", ImVec2(std::max(1.f, w - 4.f), detail_h),
+        false, ImGuiWindowFlags_NoBackground);
     const auto selected_it = std::find_if(issues->begin(), issues->end(),
         [&](const auto& issue) { return issue.id == s.selected_issue_id; });
     if (s.selected_issue_id != 0 && selected_it != issues->end()) {
         const auto& selected = *selected_it;
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(sev_color(selected.severity, alpha)),
                            "%s", severity_label(selected.severity));
-        ImGui::SameLine();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
-                           "%s", selected.name.c_str());
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                           "%s://%s:%u%s   param=%s   ip=%s",
-                           selected.scheme.c_str(), selected.host.c_str(), selected.port,
-                           selected.path.c_str(), selected.parameter.c_str(),
-                           selected.insertion_point.c_str());
+        if (ImGui::GetContentRegionAvail().x >= 400.f)
+            ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)));
+        ImGui::TextWrapped("%s", selected.name.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)));
+        ImGui::TextWrapped("%s://%s:%u%s   param=%s   ip=%s",
+            selected.scheme.c_str(), selected.host.c_str(), selected.port,
+            selected.path.c_str(), selected.parameter.c_str(),
+            selected.insertion_point.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
+        ImGui::TextWrapped(
+            "Confidence: %s   Type: %s", confidence_label(selected.confidence),
+            selected.type_key.c_str());
+        ImGui::PopStyleColor();
         if (!selected.cwe.empty()) {
             std::string cwe;
             for (size_t i = 0; i < selected.cwe.size(); ++i) {
                 if (i) cwe += ", ";
                 cwe += selected.cwe[i];
             }
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                               "CWE: %s", cwe.c_str());
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)));
+            ImGui::TextWrapped("CWE: %s", cwe.c_str());
+            ImGui::PopStyleColor();
         }
         ImGui::Spacing();
         if (ImGui::CollapsingHeader("Description", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -576,8 +713,11 @@ void render_issues_pane(float w, float h, float alpha)
         if (!selected.evidence.empty() && ImGui::CollapsingHeader("Evidence", ImGuiTreeNodeFlags_DefaultOpen)) {
             for (size_t i = 0; i < selected.evidence.size(); ++i) {
                 const auto& ev = selected.evidence[i];
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_secondary, alpha)),
-                                   "Evidence #%zu  marker=%s", i + 1, ev.marker.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImGui::ColorConvertU32ToFloat4(
+                        aida::ui::with_alpha(th.text_secondary, alpha)));
+                ImGui::TextWrapped("Evidence #%zu  marker=%s", i + 1, ev.marker.c_str());
+                ImGui::PopStyleColor();
                 render_evidence_artifact(selected, i, false, alpha);
                 render_evidence_artifact(selected, i, true, alpha);
                 ImGui::Spacing();
@@ -819,20 +959,21 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::SetCursorPos(ImVec2(pos_x, pos_y));
     ImGui::BeginChild("##burp_scanner_root", ImVec2(width, height), false, ImGuiWindowFlags_NoBackground);
 
+    ImGui::AlignTextToFramePadding();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.accent_u32, alpha)),
                        "Scanner");
     if (!vs().initialized.load(std::memory_order_acquire) && operation_completion &&
         !operation_completion->result.success && !vs().operation.pending()) {
-        ImGui::SameLine();
+        continue_toolbar_line(toolbar_button_width("Retry initialization"));
         if (aida::ui::button("Retry initialization", aida::ui::button_kind_t::secondary,
             aida::ui::size_t_::sm))
             submit_initialization();
     }
-    ImGui::SameLine();
+    continue_toolbar_line(toolbar_button_width("New Audit"));
     if (aida::ui::button("New Audit", aida::ui::button_kind_t::primary, aida::ui::size_t_::sm)) {
         vs().new_open = true;
     }
-    ImGui::SameLine();
+    continue_toolbar_line(toolbar_button_width("Export Issues"));
     ImGui::BeginDisabled(vs().operation.pending() ||
         !vs().initialized.load(std::memory_order_acquire));
     if (aida::ui::button("Export Issues", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
@@ -842,7 +983,7 @@ void render(float pos_x, float pos_y, float width, float height,
 #endif
         submit_issue_export();
     }
-    ImGui::SameLine();
+    continue_toolbar_line(toolbar_button_width("Clear Issues"));
     if (aida::ui::button("Clear Issues", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
         const auto issues = std::atomic_load_explicit(&vs().issues, std::memory_order_acquire);
         vs().reviewed_issue_identity.clear();
@@ -852,24 +993,8 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::OpenPopup("Review Scanner issue clearing");
     }
     ImGui::EndDisabled();
-    if (ImGui::BeginPopupModal("Review Scanner issue clearing", nullptr,
-        ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("Permanently clear all Scanner issues?");
-        ImGui::Text("Affected issues: %zu", vs().reviewed_issue_identity.size());
-        ImGui::TextWrapped("The exact reviewed issue identities and timestamps will be revalidated before persistence.");
-        if (aida::ui::button("Clear issues", aida::ui::button_kind_t::destructive,
-            aida::ui::size_t_::sm)) {
-            submit_reviewed_issue_clear(vs().reviewed_issue_identity);
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
-            aida::ui::size_t_::sm)) {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-    ImGui::SameLine();
+    const float passive_width = 42.f + 6.f + ImGui::CalcTextSize("Passive").x;
+    continue_toolbar_line(passive_width);
     const bool passive_before = passive_scanner::is_enabled();
     bool passive = passive_before;
     ImGui::BeginDisabled(vs().operation.pending());
@@ -881,29 +1006,72 @@ void render(float pos_x, float pos_y, float width, float height,
                        "Passive");
 
     auto pstats = passive_scanner::get_stats();
-    ImGui::SameLine();
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_dim, alpha)),
-                       "  scanned=%llu  issues=%zu  modules=%zu",
-                       static_cast<unsigned long long>(pstats.exchanges_scanned),
-                       issue_store::count(),
-                       scanner::count());
+    char scanned[64]{};
+    char issues[64]{};
+    char modules[64]{};
+    std::snprintf(scanned, sizeof(scanned), "Scanned %llu",
+        static_cast<unsigned long long>(pstats.exchanges_scanned));
+    std::snprintf(issues, sizeof(issues), "Issues %zu", issue_store::count());
+    std::snprintf(modules, sizeof(modules), "Modules %zu", scanner::count());
+    const ImVec4 stats_color = ImGui::ColorConvertU32ToFloat4(
+        aida::ui::with_alpha(th.text_dim, alpha));
+    continue_toolbar_line(ImGui::CalcTextSize(scanned).x);
+    ImGui::TextColored(stats_color, "%s", scanned);
+    continue_toolbar_line(ImGui::CalcTextSize(issues).x);
+    ImGui::TextColored(stats_color, "%s", issues);
+    continue_toolbar_line(ImGui::CalcTextSize(modules).x);
+    ImGui::TextColored(stats_color, "%s", modules);
 
-    ImGui::Spacing();
+    const float panes_y = ImGui::GetCursorPosY() + 6.f;
+    const float panes_h = std::max(1.f, height - panes_y);
+    const float density_scale = std::max(1.f, ImGui::GetFontSize() / 16.f);
+    const float pane_gap = std::max(8.f, ImGui::GetStyle().ItemSpacing.x);
+    const bool stack_panes = width < 760.f * density_scale;
+    const float pane_w = std::max(1.f, width);
+    const float left_w = stack_panes
+        ? pane_w : std::max(1.f, width * 0.36f - pane_gap);
+    const float right_w = stack_panes
+        ? pane_w : std::max(1.f, width - left_w - pane_gap * 2.f);
+    const float left_h = stack_panes
+        ? std::min(240.f * density_scale,
+            std::max(160.f * density_scale, panes_h * 0.32f)) : panes_h;
+    const float right_h = stack_panes
+        ? std::max(220.f * density_scale, panes_h - left_h - pane_gap) : panes_h;
 
-    float split = 0.36f;
-    float left_w = width * split - 8.f;
-    float right_w = width - left_w - 16.f;
-    float panes_h = height - 60.f;
-
-    ImGui::SetCursorPos(ImVec2(0.f, 50.f));
-    ImGui::BeginChild("##burp_left", ImVec2(left_w, panes_h), false, ImGuiWindowFlags_NoBackground);
-    render_audits_pane(left_w, panes_h, alpha);
+    ImGui::SetCursorPos(ImVec2(0.f, panes_y));
+    ImGui::BeginChild("##burp_left", ImVec2(left_w, left_h), false, ImGuiWindowFlags_NoBackground);
+    render_audits_pane(left_w, left_h, alpha);
     ImGui::EndChild();
 
-    ImGui::SetCursorPos(ImVec2(left_w + 8.f, 50.f));
-    ImGui::BeginChild("##burp_right", ImVec2(right_w, panes_h), false, ImGuiWindowFlags_NoBackground);
-    render_issues_pane(right_w, panes_h, alpha);
+    const ImVec2 right_pos = stack_panes
+        ? ImVec2(0.f, panes_y + left_h + pane_gap)
+        : ImVec2(left_w + pane_gap, panes_y);
+    ImGui::SetCursorPos(right_pos);
+    ImGui::BeginChild("##burp_right", ImVec2(right_w, right_h), false, ImGuiWindowFlags_NoBackground);
+    render_issues_pane(right_w, right_h, alpha);
     ImGui::EndChild();
+
+    if (aida::ui::design::begin_dialog_exact("Review Scanner issue clearing",
+        ImVec2(540.f, 300.f), ImVec2(420.f, 240.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Clear issues");
+        if (aida::ui::design::begin_dialog_body("scanner_issue_clear_review_body", footer)) {
+            ImGui::TextUnformatted("Permanently clear all Scanner issues?");
+            ImGui::Text("Affected issues: %zu", vs().reviewed_issue_identity.size());
+            ImGui::TextWrapped("The exact reviewed issue identities and timestamps will be revalidated before persistence.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "scanner_issue_clear_review_footer", "Clear issues",
+            !vs().reviewed_issue_identity.empty() && !vs().operation.pending(), true);
+        if (result.confirmed) {
+            submit_reviewed_issue_clear(vs().reviewed_issue_identity);
+            ImGui::CloseCurrentPopup();
+        }
+        if (result.cancelled) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 
     render_new_audit_dialog(alpha);
 

@@ -39,7 +39,7 @@ std::string path_to_utf8(const std::filesystem::path& value)
 #endif
 }
 
-constexpr std::size_t k_capability_count = 11;
+constexpr std::size_t k_capability_count = 15;
 constexpr std::size_t k_maximum_query_results = 4096;
 constexpr std::size_t k_maximum_document_snapshot_bytes = 1024U * 1024U;
 constexpr std::size_t k_maximum_result_text_bytes = 64U * 1024U;
@@ -59,9 +59,13 @@ const char* capability_action_id(capability_kind_t kind) noexcept
     case capability_kind_t::workspace_symbols: return "programming.language.workspace_symbols";
     case capability_kind_t::diagnostics: return "programming.language.diagnostics";
     case capability_kind_t::definition: return "programming.language.definition";
+    case capability_kind_t::declaration: return "programming.language.declaration";
+    case capability_kind_t::implementation: return "programming.language.implementation";
+    case capability_kind_t::type_definition: return "programming.language.type_definition";
     case capability_kind_t::references: return "programming.language.references";
     case capability_kind_t::semantic_rename: return "programming.language.rename";
     case capability_kind_t::formatting: return "programming.language.format";
+    case capability_kind_t::range_formatting: return "programming.language.format_selection";
     case capability_kind_t::code_actions: return "programming.language.code_actions";
     }
     return "programming.language.query";
@@ -355,10 +359,18 @@ public:
             return {false, "Workspace Text Index does not provide signature help"};
         case capability_kind_t::diagnostics:
             return {false, "Workspace Text Index does not generate compiler or language diagnostics"};
+        case capability_kind_t::declaration:
+            return {false, "Workspace Text Index cannot distinguish declarations from definitions; register a semantic language provider"};
+        case capability_kind_t::implementation:
+            return {false, "Workspace Text Index cannot prove implementation ownership; register a semantic language provider"};
+        case capability_kind_t::type_definition:
+            return {false, "Workspace Text Index does not resolve semantic type definitions; register a semantic language provider"};
         case capability_kind_t::semantic_rename:
             return {false, "Workspace Text Index cannot prove semantic rename safety; use explicit text edits or a registered semantic provider"};
         case capability_kind_t::formatting:
             return {false, "Workspace Text Index does not provide document formatting"};
+        case capability_kind_t::range_formatting:
+            return {false, "Workspace Text Index does not provide selection formatting"};
         case capability_kind_t::code_actions:
             return {false, "Workspace Text Index does not provide code actions"};
         default:
@@ -699,9 +711,13 @@ std::string capability_name(capability_kind_t kind)
     case capability_kind_t::workspace_symbols: return "Workspace Symbols";
     case capability_kind_t::diagnostics: return "Language Diagnostics";
     case capability_kind_t::definition: return "Go to Definition";
+    case capability_kind_t::declaration: return "Go to Declaration";
+    case capability_kind_t::implementation: return "Go to Implementation";
+    case capability_kind_t::type_definition: return "Go to Type Definition";
     case capability_kind_t::references: return "Find References";
     case capability_kind_t::semantic_rename: return "Semantic Rename";
     case capability_kind_t::formatting: return "Format Document";
+    case capability_kind_t::range_formatting: return "Format Selection";
     case capability_kind_t::code_actions: return "Code Actions";
     }
     return "Language Capability";

@@ -28,6 +28,7 @@
 #include "../ui/blur_layer.hpp"
 #include "../ui/ide_shell.hpp"
 #include "../ui/workspace_layout.hpp"
+#include "../ui/design_system.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/win32_dialog.hpp"
 #endif
@@ -367,9 +368,11 @@ inline void render_remote_pdb(const disasm_view::workspace_context_t& context,
 	const std::string popup = "Debug information available##" +
 		context.workspace->identity().binary_id().to_hex();
 	ImGui::OpenPopup(popup.c_str());
-	ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
-	if (!ImGui::BeginPopupModal(popup.c_str(), nullptr,
-		ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+	if (!aida::ui::design::begin_dialog_exact(popup.c_str(), ImVec2(620.0f, 420.0f),
+		ImVec2(400.0f, 300.0f))) return;
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		"Yes, download", "No, skip");
+	aida::ui::design::begin_dialog_body("remote_pdb_prompt_body", footer_height);
 	ImGui::PushFont(aida::ui::fonts::h2());
 	ImGui::TextUnformatted("Debug information available");
 	ImGui::PopFont();
@@ -386,8 +389,11 @@ inline void render_remote_pdb(const disasm_view::workspace_context_t& context,
 	if (!state->pdb_error.empty()) ImGui::TextWrapped("%s", state->pdb_error.c_str());
 	aida::ui::toggle_switch("Load types", &state->load_types, aida::ui::size_t_::md);
 	aida::ui::toggle_switch("Load names", &state->load_names, aida::ui::size_t_::md);
-	if (aida::ui::button("Yes, download", aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::md, ImVec2(), !state->load_types && !state->load_names)) {
+	aida::ui::design::end_dialog_body();
+	const bool download_enabled = state->load_types || state->load_names;
+	const auto footer = aida::ui::design::dialog_footer("remote_pdb_prompt_footer",
+		"Yes, download", download_enabled, false, "No, skip");
+	if (footer.confirmed) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		auto accepted = aida::preview::initial_analysis::approve_remote_pdb(
 			context.workspace, state->load_types, state->load_names);
@@ -403,9 +409,7 @@ inline void render_remote_pdb(const disasm_view::workspace_context_t& context,
 				accepted.error().message;
 		}
 	}
-	ImGui::SameLine();
-	if (aida::ui::button("No, skip", aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::md) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+	if (footer.cancelled) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		auto declined = aida::preview::initial_analysis::decline_remote_pdb(
 			context.workspace);
@@ -441,9 +445,11 @@ inline void render_local_pdb(const disasm_view::workspace_context_t& context,
 	const std::string popup = "Locate local PDB##" +
 		context.workspace->identity().binary_id().to_hex();
 	ImGui::OpenPopup(popup.c_str());
-	ImGui::SetNextWindowSize(ImVec2(620.0f, 0.0f), ImGuiCond_Appearing);
-	if (!ImGui::BeginPopupModal(popup.c_str(), nullptr,
-		ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) return;
+	if (!aida::ui::design::begin_dialog_exact(popup.c_str(), ImVec2(620.0f, 460.0f),
+		ImVec2(400.0f, 320.0f))) return;
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		"Load this PDB", "No, skip");
+	aida::ui::design::begin_dialog_body("local_pdb_prompt_body", footer_height);
 	ImGui::PushFont(aida::ui::fonts::h2());
 	ImGui::TextUnformatted("Locate local debug symbols");
 	ImGui::PopFont();
@@ -458,7 +464,10 @@ inline void render_local_pdb(const disasm_view::workspace_context_t& context,
 	if (!state->pdb_error.empty()) ImGui::TextWrapped("%s", state->pdb_error.c_str());
 	aida::ui::toggle_switch("Load types", &state->load_types, aida::ui::size_t_::md);
 	aida::ui::toggle_switch("Load names", &state->load_names, aida::ui::size_t_::md);
-	ImGui::InputText("PDB path", state->local_pdb_path.data(), state->local_pdb_path.size());
+	if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+	const bool path_submitted = ImGui::InputText("PDB path",
+		state->local_pdb_path.data(), state->local_pdb_path.size(),
+		ImGuiInputTextFlags_EnterReturnsTrue);
 	if (aida::ui::button("Browse...", aida::ui::button_kind_t::secondary,
 		aida::ui::size_t_::md)) {
 		const std::string selected = browse_for_pdb(context,
@@ -469,11 +478,12 @@ inline void render_local_pdb(const disasm_view::workspace_context_t& context,
 				state->local_pdb_path.size() - 1);
 		}
 	}
-	ImGui::SameLine();
 	const bool valid = state->local_pdb_path[0] != '\0';
-	if (aida::ui::button("Load this PDB", aida::ui::button_kind_t::primary,
-		aida::ui::size_t_::md, ImVec2(), !valid ||
-			(!state->load_types && !state->load_names))) {
+	aida::ui::design::end_dialog_body();
+	const bool load_enabled = valid && (state->load_types || state->load_names);
+	const auto footer = aida::ui::design::dialog_footer("local_pdb_prompt_footer",
+		"Load this PDB", load_enabled, false, "No, skip");
+	if (footer.confirmed || (path_submitted && load_enabled)) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		auto accepted = aida::preview::initial_analysis::approve_local_pdb(
 			context.workspace, state->local_pdb_path.data(), state->load_types,
@@ -490,9 +500,7 @@ inline void render_local_pdb(const disasm_view::workspace_context_t& context,
 				accepted.error().message;
 		}
 	}
-	ImGui::SameLine();
-	if (aida::ui::button("No, skip", aida::ui::button_kind_t::secondary,
-		aida::ui::size_t_::md) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+	if (footer.cancelled) {
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 		auto declined = aida::preview::initial_analysis::decline_local_pdb(
 			context.workspace);

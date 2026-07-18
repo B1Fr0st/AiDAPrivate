@@ -71,6 +71,38 @@ struct intercept_command_capability_t {
 intercept_command_capability_t intercept_command_capability(intercept_command_t command);
 bool execute_intercept_command(intercept_command_t command, std::string* error = nullptr);
 
+enum class operational_command_t : std::uint8_t {
+    capture_start,
+    capture_stop,
+    proxy_start,
+    proxy_stop,
+    proxy_history_clear,
+    proxy_ca_trust_repair,
+    filter_add,
+    filter_remove_selected,
+    filter_clear,
+    intercept_toggle,
+    keylog_launch,
+    keylog_watch,
+    keylog_stop,
+    keylog_clear
+};
+
+struct operational_command_capability_t {
+    bool enabled = false;
+    bool checked = false;
+    std::string disabled_reason;
+    std::string target_summary;
+};
+
+operational_command_capability_t operational_command_capability(
+    operational_command_t command);
+bool prepare_operational_command_confirmation(operational_command_t command,
+                                              std::string* error = nullptr);
+void cancel_operational_command_confirmation(operational_command_t command) noexcept;
+bool execute_operational_command(operational_command_t command,
+                                 std::string* error = nullptr);
+
 
 struct connection_entry_t {
     uint32_t pid = 0;

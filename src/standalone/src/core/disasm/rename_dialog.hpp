@@ -1,6 +1,7 @@
 #pragma once
 
 #include "disasm_view.hpp"
+#include "../ui/design_system.hpp"
 #include "imgui/imgui.h"
 
 #include <algorithm>
@@ -70,17 +71,24 @@ inline void render() {
         value.open_requested = false;
     }
     bool keep_open = true;
-    if (!ImGui::BeginPopupModal("Rename item##workspace_rename", &keep_open,
-            ImGuiWindowFlags_AlwaysAutoResize))
+    if (!aida::ui::design::begin_dialog_exact("Rename item##workspace_rename",
+            ImVec2(460.0f, 300.0f), ImVec2(360.0f, 240.0f), &keep_open))
         return;
+    const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+        "Apply", "Cancel");
+    aida::ui::design::begin_dialog_body("workspace_rename_body", footer_height);
     const auto runtime = disasm_view::runtime_address(value.context, value.address);
     ImGui::Text("Address: 0x%016llX",
         static_cast<unsigned long long>(runtime.value_or(value.address.value)));
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     const bool submitted = ImGui::InputText("##rename_text", value.name.data(),
         value.name.size(), ImGuiInputTextFlags_EnterReturnsTrue);
     if (!value.error.empty())
         ImGui::TextWrapped("%s", value.error.c_str());
-    const bool apply = ImGui::Button("Apply", ImVec2(110.0f, 0.0f)) || submitted;
+    aida::ui::design::end_dialog_body();
+    const auto footer = aida::ui::design::dialog_footer("workspace_rename_footer",
+        "Apply", true, false, "Cancel");
+    const bool apply = footer.confirmed || submitted;
     if (apply) {
         const std::string proposed(value.name.data());
         if (!valid_name(proposed)) {
@@ -91,8 +99,7 @@ inline void render() {
             value.error = "The workspace is unavailable or closing.";
         }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f)))
+    if (footer.cancelled || !keep_open)
         ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }

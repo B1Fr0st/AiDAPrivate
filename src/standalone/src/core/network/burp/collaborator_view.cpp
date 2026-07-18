@@ -24,6 +24,7 @@
 #include "../../ui/ui_anim.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/components.hpp"
+#include "../../ui/design_system.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -350,24 +351,29 @@ void render(float pos_x, float pos_y, float width, float height,
     }
     ImGui::EndDisabled();
 
-    if (ImGui::BeginPopupModal("Review Collaborator operation", nullptr,
-        ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (aida::ui::design::begin_dialog_exact("Review Collaborator operation",
+        ImVec2(540.f, 300.f), ImVec2(420.f, 240.f))) {
         const bool stop = g_view_state.review_operation == 1;
-        ImGui::TextUnformatted(stop ? "Stop all Collaborator listeners?"
-                                    : "Permanently clear Collaborator interactions?");
-        ImGui::Text("Target: %s", g_view_state.reviewed_status.public_host.c_str());
-        ImGui::Text("Interactions: %zu", g_view_state.reviewed_status.interaction_count);
-        ImGui::TextWrapped("The exact reviewed listener and interaction state will be revalidated before the operation runs.");
-        if (aida::ui::button(stop ? "Stop listeners" : "Clear interactions",
-            aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+        const char* confirm = stop ? "Stop listeners" : "Clear interactions";
+        const float footer = aida::ui::design::dialog_footer_reserve_height(confirm);
+        if (aida::ui::design::begin_dialog_body("collaborator_operation_review_body", footer)) {
+            ImGui::TextUnformatted(stop ? "Stop all Collaborator listeners?"
+                                        : "Permanently clear Collaborator interactions?");
+            ImGui::Text("Target: %s", g_view_state.reviewed_status.public_host.c_str());
+            ImGui::Text("Interactions: %zu", g_view_state.reviewed_status.interaction_count);
+            ImGui::TextWrapped("The exact reviewed listener and interaction state will be revalidated before the operation runs.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "collaborator_operation_review_footer", confirm,
+            g_view_state.review_operation != 0 && !g_view_state.operation.pending(), true);
+        if (result.confirmed) {
             submit_reviewed_operation(g_view_state.review_operation,
                 g_view_state.reviewed_status);
             g_view_state.review_operation = 0;
             ImGui::CloseCurrentPopup();
         }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
-            aida::ui::size_t_::sm)) {
+        if (result.cancelled) {
             g_view_state.review_operation = 0;
             ImGui::CloseCurrentPopup();
         }

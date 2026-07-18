@@ -20,6 +20,7 @@
 #endif
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
+#include "../../ui/design_system.hpp"
 #include "../../ui/empty_state.hpp"
 #include "../../ui/fonts.hpp"
 #include "../../ui/application_ui_runtime.hpp"
@@ -368,20 +369,26 @@ void render(float pos_x, float pos_y, float width, float height,
         ImGui::OpenPopup("Remove API Collection");
         s_remove_collection_dialog_requested = false;
     }
-    if (ImGui::BeginPopupModal("Remove API Collection", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (aida::ui::design::begin_dialog_exact("Remove API Collection",
+            ImVec2(540.f, 300.f), ImVec2(420.f, 240.f))) {
         const auto live = api_definition::list_collections();
         const auto retained = std::find_if(live.begin(), live.end(), [](const auto& item) {
             return item.id == s_pending_remove_collection &&
                 item.name == s_pending_remove_collection_name;
         });
         const bool current = retained != live.end();
-        ImGui::TextWrapped("Remove '%s' and every request template in this collection?",
-            s_pending_remove_collection_name.c_str());
-        ImGui::TextDisabled("Scope: API definition catalog only. Captured traffic and proxy history are unchanged.");
-        ImGui::TextDisabled("This operation cannot be undone after confirmation.");
-        ImGui::BeginDisabled(!current);
-        if (ImGui::Button("Remove Collection")) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Remove Collection");
+        if (aida::ui::design::begin_dialog_body("api_collection_remove_body", footer)) {
+            ImGui::TextWrapped("Remove '%s' and every request template in this collection?",
+                s_pending_remove_collection_name.c_str());
+            ImGui::TextDisabled("Scope: API definition catalog only. Captured traffic and proxy history are unchanged.");
+            ImGui::TextDisabled("This operation cannot be undone after confirmation.");
+            if (!current) ImGui::TextWrapped("The collection changed after review. Cancel and select it again.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "api_collection_remove_footer", "Remove Collection", current, true);
+        if (result.confirmed) {
             const auto id = s_pending_remove_collection;
             const auto name = s_pending_remove_collection_name;
             ::diag::log_tagged_fmt("api_v", "collection_remove_queued id=%llu name='%s'",
@@ -405,10 +412,7 @@ void render(float pos_x, float pos_y, float width, float height,
             s_pending_remove_collection_name.clear();
             ImGui::CloseCurrentPopup();
         }
-        ImGui::EndDisabled();
-        if (!current) ImGui::TextWrapped("The collection changed after review. Close this dialog and select it again.");
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel")) {
+        if (result.cancelled) {
             s_pending_remove_collection = 0;
             s_pending_remove_collection_name.clear();
             ImGui::CloseCurrentPopup();

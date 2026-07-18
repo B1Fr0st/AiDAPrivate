@@ -1398,24 +1398,29 @@ namespace settings_overlay {
 					aida::ui::stable_view_id_t("view.ai.mcp_marketplace"));
 			}
 
-			if (ImGui::BeginPopupModal("Remove MCP server##mcp_remove_confirm",
-					nullptr,
-					ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+			if (aida::ui::design::begin_dialog_exact(
+					"Remove MCP server##mcp_remove_confirm", ImVec2(480.f, 280.f),
+					ImVec2(360.f, 230.f))) {
 				std::string remove_name = "selected server";
-				if (s_remove_index >= 0 && s_remove_index < static_cast<int>(servers.size()))
+				const bool remove_current = s_remove_index >= 0 &&
+					s_remove_index < static_cast<int>(servers.size());
+				if (remove_current)
 					remove_name = servers[static_cast<std::size_t>(s_remove_index)].name;
+				const float footer_height = aida::ui::design::dialog_footer_reserve_height("Remove");
+				aida::ui::design::begin_dialog_body("mcp_remove_confirm_body", footer_height);
 				const float modal_wrap_w = (std::min)(420.f, (std::max)(180.f, ImGui::GetContentRegionAvail().x));
 				ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + modal_wrap_w);
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(th.text_primary),
 					"Remove %s?", remove_name.c_str());
 				ImGui::TextWrapped("%s",
 					"Removal is staged as a draft. Apply Changes will disconnect and remove this server from the MCP client configuration.");
+				if (!remove_current)
+					ImGui::TextDisabled("The reviewed server no longer exists; cancel and select it again.");
 				ImGui::PopTextWrapPos();
-				ImGui::Dummy(ImVec2(0.f, 10.f));
-				if (aida::ui::button("Remove",
-						aida::ui::button_kind_t::destructive,
-						aida::ui::size_t_::md,
-						ImVec2(104.f, 34.f))) {
+				aida::ui::design::end_dialog_body();
+				const auto footer = aida::ui::design::dialog_footer(
+					"mcp_remove_confirm_footer", "Remove", remove_current, true);
+				if (footer.confirmed && remove_current) {
 					if (s_remove_index >= 0 && s_remove_index < static_cast<int>(servers.size())) {
 						servers.erase(servers.begin() + static_cast<std::ptrdiff_t>(s_remove_index));
 						if (servers.empty()) s_sel_index = -1;
@@ -1425,12 +1430,7 @@ namespace settings_overlay {
 					}
 					s_remove_index = -1;
 					ImGui::CloseCurrentPopup();
-				}
-				ImGui::SameLine(0.f, 8.f);
-				if (aida::ui::button("Cancel",
-						aida::ui::button_kind_t::secondary,
-						aida::ui::size_t_::md,
-						ImVec2(96.f, 34.f))) {
+				} else if (footer.cancelled) {
 					s_remove_index = -1;
 					ImGui::CloseCurrentPopup();
 				}

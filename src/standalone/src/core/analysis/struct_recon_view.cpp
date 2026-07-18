@@ -1125,16 +1125,20 @@ void render(float pos_x, float pos_y, float width, float height,
 		});
 		add_action("types.reconstruction.field.rename", false,
 			"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction",
-			[] { return aida::ui::action_handler_result_t::completed(); });
+			[] { return aida::ui::action_handler_result_t::failed(
+				"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction"); });
 		add_action("types.reconstruction.field.set_type", false,
 			"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction",
-			[] { return aida::ui::action_handler_result_t::completed(); });
+			[] { return aida::ui::action_handler_result_t::failed(
+				"The reconstruction backend exposes inferred snapshots but no revisioned field-edit transaction"); });
 		add_action("types.reconstruction.field.edit_live", false,
 			"The reconstruction view has no target-session-bound write and readback provider",
-			[] { return aida::ui::action_handler_result_t::completed(); });
+			[] { return aida::ui::action_handler_result_t::failed(
+				"The reconstruction view has no target-session-bound write and readback provider"); });
 		add_action("types.reconstruction.field.send_ai", false,
 			"No evidence-review adapter currently accepts reconstruction field snapshots",
-			[] { return aida::ui::action_handler_result_t::completed(); });
+			[] { return aida::ui::action_handler_result_t::failed(
+				"No evidence-review adapter currently accepts reconstruction field snapshots"); });
 		aida::ui::application_ui::open_retained_entity_context_menu(
 			std::move(retained), pointer_context_request
 				? aida::ui::context_menu_open_origin_t::pointer

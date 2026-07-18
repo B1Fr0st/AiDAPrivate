@@ -33,6 +33,7 @@
 
 #include "imgui/imgui.h"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/fonts.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
@@ -1060,25 +1061,22 @@ inline void render() {
 	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(tk.panel_bg));
 	ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.text_primary));
 
-	ImVec2 viewport_center = ImGui::GetMainViewport()->GetCenter();
-	ImGui::SetNextWindowPos(viewport_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-	ImGui::SetNextWindowSizeConstraints(ImVec2(620.f, 0.f), ImVec2(620.f, FLT_MAX));
-	ImGui::SetNextWindowSize(ImVec2(620.f, 0.f), ImGuiCond_Appearing);
-
 	bool open_flag_local = true;
 	const bool bridge_modal_pending = detail::custom_bridge_pending();
 	bool launch_now = false;
 	bool cancel_now = false;
 	bool close_parent_after_host_confirm = false;
 
-	if (ImGui::BeginPopupModal("Malware Lab Run###aida_spawn_target_dialog",
-	                           bridge_modal_pending ? nullptr : &open_flag_local,
-	                           ImGuiWindowFlags_NoSavedSettings |
-	                           ImGuiWindowFlags_NoResize)) {
+	if (aida::ui::design::begin_dialog_exact(
+		"Malware Lab Run###aida_spawn_target_dialog", ImVec2(760.f, 760.f),
+		ImVec2(520.f, 360.f), bridge_modal_pending ? nullptr : &open_flag_local)) {
 
 		ImFont* title_font = aida::ui::fonts::h1();
 		ImFont* body_font  = aida::ui::fonts::body();
 		ImFont* caption    = aida::ui::fonts::caption();
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Activate", "Cancel activation");
+		aida::ui::design::begin_dialog_body("spawn_target_dialog_body", footer_height);
 
 		if (title_font) ImGui::PushFont(title_font);
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.text_primary),
@@ -1365,34 +1363,24 @@ inline void render() {
 				ImGui::TextDisabled("The reviewed configuration remains editable after this operation reaches a terminal state.");
 			ImGui::Dummy(ImVec2(0.f, 4.f));
 		}
+		aida::ui::design::end_dialog_body();
 		bool launch_disabled =
 			(detail::run_mode_choice() == 0 && (exe_trim.empty() || !detail::cached_capabilities().has_windows_sandbox))
 			|| (detail::run_mode_choice() == 1 && (custom_bridge_trim.empty() || custom_guest_bridge_trim.empty() || bridge_pending))
 			|| (detail::run_mode_choice() == 2 && exe_trim.empty());
 
-		float total_w = ImGui::GetContentRegionAvail().x;
-		float btn_w = 130.f;
-		float gap = 10.f;
-		float row_w = btn_w * 2.f + gap;
-		float row_x_offset = total_w - row_w;
-		if (row_x_offset < 0.f) row_x_offset = 0.f;
-		ImGui::Dummy(ImVec2(row_x_offset, 0.f));
-		ImGui::SameLine();
-
 		const char* cancel_label = bridge_pending ? "Cancel activation" : "Cancel";
-		if (aida::ui::button(cancel_label, aida::ui::button_kind_t::secondary,
-		                     aida::ui::size_t_::md,
-		                     ImVec2(btn_w, 40.f), false, nullptr, false)) {
+		const char* launch_label = detail::run_mode_choice() == 0 ? "Open VM" :
+			(detail::run_mode_choice() == 1 ? "Activate" : "Run Host");
+		const auto footer = aida::ui::design::dialog_footer("spawn_target_dialog_footer",
+			launch_label, !launch_disabled, false, cancel_label);
+		if (footer.cancelled) {
 			if (bridge_pending)
 				static_cast<void>(detail::request_custom_bridge_cancel());
 			else
 				cancel_now = true;
 		}
-		ImGui::SameLine(0.f, gap);
-		const char* launch_label = detail::run_mode_choice() == 0 ? "Open VM" : (detail::run_mode_choice() == 1 ? "Activate" : "Run Host");
-		if (aida::ui::button(launch_label, aida::ui::button_kind_t::primary,
-		                     aida::ui::size_t_::md,
-		                     ImVec2(btn_w, 40.f), launch_disabled, nullptr, false)) {
+		if (footer.confirmed) {
 			launch_now = true;
 		}
 		if (launch_disabled && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -1407,12 +1395,6 @@ inline void render() {
 		}
 
 		ImGuiIO& io = ImGui::GetIO();
-		if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-			if (bridge_pending)
-				static_cast<void>(detail::request_custom_bridge_cancel());
-			else
-				cancel_now = true;
-		}
 		if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Enter, false) && !launch_disabled)
 			launch_now = true;
 
@@ -1435,12 +1417,14 @@ inline void render() {
 		}
 
 		if (detail::host_confirm_open()) {
-			ImGui::SetNextWindowSize(ImVec2(520.f, 0.f), ImGuiCond_Appearing);
 			bool confirm_open = true;
-			if (ImGui::BeginPopupModal("Confirm Host Run###aida_spawn_host_confirm",
-			                           &confirm_open,
-			                           ImGuiWindowFlags_NoSavedSettings |
-			                           ImGuiWindowFlags_NoResize)) {
+			if (aida::ui::design::begin_dialog_exact(
+				"Confirm Host Run###aida_spawn_host_confirm", ImVec2(560.f, 380.f),
+				ImVec2(400.f, 300.f), &confirm_open)) {
+				const float confirm_footer_height =
+					aida::ui::design::dialog_footer_reserve_height("Run in Host", "Cancel");
+				aida::ui::design::begin_dialog_body("spawn_host_confirm_body",
+					confirm_footer_height);
 				if (title_font) ImGui::PushFont(title_font);
 				ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(tk.warning),
 				                   "Run in Host?");
@@ -1449,24 +1433,14 @@ inline void render() {
 				ImGui::TextWrapped("This will execute the selected binary on your real desktop, not inside the VM.");
 				ImGui::TextWrapped("Cancel unless the file is trusted. Host mode can expose your PC, credentials, kernel, files, and drivers to the sample.");
 				if (caption) ImGui::PopFont();
-				ImGui::Dummy(ImVec2(0.f, 8.f));
-				float cw = ImGui::GetContentRegionAvail().x;
-				float cbw = 150.f;
-				float cgap = 10.f;
-				float cx = cw - cbw * 2.f - cgap;
-				if (cx < 0.f) cx = 0.f;
-				ImGui::Dummy(ImVec2(cx, 0.f));
-				ImGui::SameLine();
-				if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
-				                     aida::ui::size_t_::md,
-				                     ImVec2(cbw, 40.f), false, nullptr, false)) {
+				aida::ui::design::end_dialog_body();
+				const auto confirm_footer = aida::ui::design::dialog_footer(
+					"spawn_host_confirm_footer", "Run in Host", true, true, "Cancel");
+				if (confirm_footer.cancelled) {
 					detail::host_confirm_open() = false;
 					ImGui::CloseCurrentPopup();
 				}
-				ImGui::SameLine(0.f, cgap);
-				if (aida::ui::button("Run in Host", aida::ui::button_kind_t::destructive,
-				                     aida::ui::size_t_::md,
-				                     ImVec2(cbw, 40.f), false, nullptr, false)) {
+				if (confirm_footer.confirmed) {
 					if (detail::prepare_launch_result(true)) {
 						detail::host_confirm_open() = false;
 						ImGui::CloseCurrentPopup();

@@ -22,6 +22,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/ui_anim.hpp"
+#include "../../ui/design_system.hpp"
 #include "../../ui/application_ui_runtime.hpp"
 #include "../../infra/event_bus.hpp"
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
@@ -1161,6 +1162,36 @@ void render(float pos_x, float pos_y, float width, float height,
 
     const float content_y = pos_y + 34.f;
     const float content_h = height - 38.f;
+    if (total == 0) {
+        ImGui::SetCursorPos(ImVec2(pos_x + 2.f, content_y));
+        const float empty_width = std::max(1.f, width - 4.f);
+        ImGui::BeginChild("##sitemap_left", ImVec2(empty_width, content_h), false,
+            ImGuiWindowFlags_NoBackground);
+        ImGui::PushID("##burp_sitemap_tree");
+        const float state_width = std::max(1.f, ImGui::GetContentRegionAvail().x);
+        ImGui::SetNextItemWidth(std::min(360.f, state_width));
+        ImGui::InputTextWithHint("##sitemap_filter", "Filter host or path...",
+            st.tree_filter, sizeof(st.tree_filter));
+        ImGui::PopID();
+        ImGui::Spacing();
+        const float empty_height = std::max(1.f, ImGui::GetContentRegionAvail().y);
+        aida::ui::design::state_presentation_t empty;
+        empty.stable_id = "view.network.site_map.empty";
+        empty.state = aida::ui::design::view_state_t::empty;
+        empty.title = "No captured traffic";
+        empty.message = "Requests from Proxy, Repeater, Scanner, and API tools are organized here by host and path.";
+        empty.hint = "Start the proxy or send a request to populate the site map.";
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+        aida::ui::design::render_state(empty, ImVec2(state_width, empty_height));
+        ImGui::PopStyleVar();
+        aida::ui::application_ui::render_retained_entity_context_menu(
+            "network.site_map.path");
+        aida::ui::application_ui::render_retained_entity_context_menu(
+            "network.site_map.host");
+        ImGui::EndChild();
+        ImGui::EndChild();
+        return;
+    }
     const float split_w = std::clamp(st.split_left, 0.20f, 0.65f);
     const float left_w  = width * split_w;
     const float gap     = 6.f;

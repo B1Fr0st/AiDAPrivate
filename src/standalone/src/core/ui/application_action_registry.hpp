@@ -142,6 +142,8 @@ struct action_execution_result_t {
 using action_capability_fn_t = std::function<capability_state_t(const interaction_context_t&)>;
 using action_check_fn_t = std::function<action_check_state_t(const interaction_context_t&)>;
 using action_handler_fn_t = std::function<action_handler_result_t(const action_invocation_t&)>;
+using action_confirmation_prepare_fn_t = std::function<action_handler_result_t(const action_invocation_t&)>;
+using action_confirmation_cancel_fn_t = std::function<void()>;
 
 struct application_action_descriptor_t {
     stable_action_id_t id;
@@ -154,6 +156,8 @@ struct application_action_descriptor_t {
     action_consequence_t consequence;
     action_capability_fn_t capability;
     action_check_fn_t checked;
+    action_confirmation_prepare_fn_t prepare_confirmation;
+    action_confirmation_cancel_fn_t cancel_confirmation;
     action_handler_fn_t invoke;
     bool undoable = false;
     bool reviewable = false;

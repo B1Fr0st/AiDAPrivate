@@ -102,6 +102,7 @@ constexpr catalog_entry_t k_catalog[] = {
     AIDA_VIEW("view.terminal", "Terminal", programming, bottom_panel, registry, none, 0, 420, 180, false, true, false),
     AIDA_VIEW("view.programming.outline", "Programming Outline", programming, tool_window, registry, none, 0, 280, 220, false, true, false),
     AIDA_VIEW("view.programming.references", "Programming References", programming, bottom_panel, registry, none, 0, 420, 180, false, true, false),
+    AIDA_VIEW("view.programming.source_debug_console", "Source Debug Console", programming, bottom_panel, registry, none, 0, 440, 200, false, true, false),
     AIDA_VIEW("document.code", "Code Editor", programming, document, registry, none, 0, 480, 300, false, true, false),
     AIDA_VIEW("document.disassembly", "Disassembly", document, document, registry, none, 0, 480, 300, false, true, true),
     AIDA_VIEW("document.hex", "Hex", document, document, registry, none, 0, 480, 300, false, true, true),
@@ -283,6 +284,30 @@ stable_view_id_t canonical_view_id(const stable_view_id_t& id) {
     if (id.value() == "view.ai.mcp_activity")
         return stable_view_id_t("view.mcp_log");
     return id;
+}
+
+ImGuiID default_dock_node(const view_descriptor_t& descriptor) noexcept {
+    switch (descriptor.role) {
+    case view_presentation_role_t::document:
+        return workspace_layout::node_id(workspace_layout::dock_role_t::documents);
+    case view_presentation_role_t::inspector:
+        return workspace_layout::node_id(workspace_layout::dock_role_t::inspector);
+    case view_presentation_role_t::bottom_panel:
+        return workspace_layout::node_id(workspace_layout::dock_role_t::bottom);
+    case view_presentation_role_t::shell_surface:
+        return workspace_layout::node_id(workspace_layout::dock_role_t::navigator);
+    case view_presentation_role_t::tool_window: {
+        const std::string& id = descriptor.id.value();
+        if (id == "view.ai_chat")
+            return workspace_layout::node_id(workspace_layout::dock_role_t::inspector);
+        if (descriptor.category == view_category_t::explorer ||
+            id == "view.navigator" || id == "view.analysis.functions" ||
+            id == "view.programming.outline")
+            return workspace_layout::node_id(workspace_layout::dock_role_t::navigator);
+        return workspace_layout::node_id(workspace_layout::dock_role_t::documents);
+    }
+    }
+    return 0;
 }
 
 std::string workspace_preset_key(workspace_layout::workspace_preset_t preset) {
@@ -666,17 +691,20 @@ void render_code_group(const view_render_context_t& context) {
             ImGui::TextDisabled("Loading %s asynchronously...", selected_tab.filename.c_str());
             ImGui::TextWrapped("The editor remains responsive while this bounded file read completes.");
             if (ImGui::Button("Cancel Load"))
-                file_tabs::cancel_document_load(selected_tab.document_id);
+                application_ui::execute_editor_tab_action(selected, "tab.load.cancel",
+                    action_invocation_source_t::toolbar);
         } else {
             ImGui::TextUnformatted("Document could not be loaded");
             ImGui::TextWrapped("%s", selected_tab.load_error.empty()
                 ? "The file is unavailable or the load did not start."
                 : selected_tab.load_error.c_str());
             if (ImGui::Button("Retry"))
-                file_tabs::load_tab_into_editor(selected);
+                application_ui::execute_editor_tab_action(selected, "tab.load.retry",
+                    action_invocation_source_t::toolbar);
             ImGui::SameLine();
             if (ImGui::Button("Close"))
-                request_code_tab_close(selected);
+                application_ui::execute_editor_tab_action(selected, "tab.close",
+                    action_invocation_source_t::toolbar);
         }
         ImGui::EndChild();
         return;
@@ -707,11 +735,9 @@ void render_code_group(const view_render_context_t& context) {
                 ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::TextWrapped("Recovery storage: %s", selected_tab.recovery_error.c_str());
             ImGui::SameLine();
-            if (ImGui::SmallButton("Retry Recovery Check")) {
-                selected_tab.recovery_error.clear();
-                selected_tab.recovery_probe_completed = false;
-                file_tabs::request_recovery_probe(selected);
-            }
+            if (ImGui::SmallButton("Retry Recovery Check"))
+                application_ui::execute_editor_tab_action(selected,
+                    "tab.recovery.retry_probe", action_invocation_source_t::toolbar);
         }
         ImGui::EndChild();
     }
@@ -729,17 +755,20 @@ void render_code_group(const view_render_context_t& context) {
                 selected_tab.recovery.metadata.text.eol.c_str());
             ImGui::BeginDisabled(selected_tab.recovery_operation_pending || selected_tab.dirty);
             if (ImGui::SmallButton("Recover Unsaved Content"))
-                file_tabs::recover_from_journal(selected);
+                application_ui::execute_editor_tab_action(selected,
+                    "tab.recovery.recover", action_invocation_source_t::toolbar);
             ImGui::EndDisabled();
             if (selected_tab.dirty && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("Compare first or save the current editor changes; recovery will not overwrite newer unsaved work");
             ImGui::SameLine();
             ImGui::BeginDisabled(selected_tab.recovery_operation_pending);
             if (ImGui::SmallButton("Compare"))
-                file_tabs::compare_with_journal(selected);
+                application_ui::execute_editor_tab_action(selected,
+                    "tab.recovery.compare", action_invocation_source_t::toolbar);
             ImGui::SameLine();
             if (ImGui::SmallButton("Discard Recovery"))
-                file_tabs::request_recovery_discard(selected);
+                application_ui::execute_editor_tab_action(selected,
+                    "tab.recovery.discard", action_invocation_source_t::toolbar);
             ImGui::EndDisabled();
             if (!selected_tab.recovery_error.empty()) {
                 ImGui::SameLine();
@@ -757,9 +786,9 @@ void render_code_group(const view_render_context_t& context) {
     }
     if (file_tabs::pending_recovery_discard_document == selected_tab.document_id &&
         !ImGui::IsPopupOpen("Discard Recovery###aida.editor.recovery.discard"))
-        ImGui::OpenPopup("Discard Recovery###aida.editor.recovery.discard");
-    if (ImGui::BeginPopupModal("Discard Recovery###aida.editor.recovery.discard", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        design::open_dialog("aida.editor.recovery.discard", "Discard Recovery");
+    if (design::begin_dialog("aida.editor.recovery.discard", "Discard Recovery",
+            ImVec2(640.0f, 370.0f), ImVec2(460.0f, 300.0f))) {
         const int target_index = file_tabs::find_document(
             file_tabs::pending_recovery_discard_document);
         const bool target_current = file_tabs::is_valid_tab_index(target_index) &&
@@ -768,24 +797,31 @@ void render_code_group(const view_render_context_t& context) {
             ? (file_tabs::tabs[file_tabs::tab_index(target_index)].filename.empty()
                 ? "Untitled document" : file_tabs::tabs[file_tabs::tab_index(target_index)].filename)
             : "Unavailable document";
-        aida::ui::design::confirmation_t confirmation;
-        confirmation.verb = "Discard";
-        confirmation.target = target.c_str();
-        confirmation.scope = "The current and retained last-good recovery journals for this document";
-        confirmation.effect = "Permanently removes the verified unsaved recovery content; the open editor buffer and disk file are unchanged.";
-        confirmation.reversibility = "The discarded recovery journals cannot be reconstructed after confirmation.";
-        confirmation.prerequisite = target_current ? nullptr
-            : "The document or its verified recovery identity changed before confirmation.";
-        confirmation.confirm_label = "Permanently Discard Recovery";
-        confirmation.destructive = true;
-        confirmation.confirm_enabled = target_current;
-        const auto result = aida::ui::design::confirmation_dialog(
-            "editor.recovery.discard.confirmation", confirmation);
-        if (result.confirmed && target_current) {
-            file_tabs::discard_recovery(target_index);
-            file_tabs::pending_recovery_discard_document = 0;
-            ImGui::CloseCurrentPopup();
-        } else if (result.cancelled) {
+        const float footer_height = design::dialog_footer_reserve_height(
+            "Permanently Discard Recovery", "Cancel");
+        design::begin_dialog_body("editor_recovery_discard_body", footer_height);
+        const std::string discard_title = "Discard recovery for " + target + "?";
+        design::text(design::text_role_t::title,
+            discard_title.c_str());
+        ImGui::TextWrapped("Scope: The current and retained last-good recovery journals for this document.");
+        ImGui::TextWrapped("Effect: Permanently removes the verified unsaved recovery content; the open editor buffer and disk file are unchanged.");
+        ImGui::TextWrapped("Recovery: The discarded recovery journals cannot be reconstructed after confirmation.");
+        if (!target_current)
+            ImGui::TextWrapped("Required before continuing: The document or its verified recovery identity changed before confirmation.");
+        design::end_dialog_body();
+        const auto footer = design::dialog_footer(
+            "editor_recovery_discard_footer", "Permanently Discard Recovery",
+            target_current, true);
+        if (footer.confirmed && target_current) {
+            const auto discarded = file_tabs::discard_recovery(target_index);
+            if (discarded.succeeded) {
+                file_tabs::pending_recovery_discard_document = 0;
+                ImGui::CloseCurrentPopup();
+            } else if (file_tabs::is_valid_tab_index(target_index)) {
+                file_tabs::tabs[file_tabs::tab_index(target_index)].recovery_error =
+                    discarded.detail;
+            }
+        } else if (footer.cancelled) {
             file_tabs::pending_recovery_discard_document = 0;
             ImGui::CloseCurrentPopup();
         }
@@ -796,9 +832,14 @@ void render_code_group(const view_render_context_t& context) {
         if (ImGui::BeginChild("##aida_external_change", ImVec2(0.f, 48.f), true)) {
             ImGui::TextUnformatted("The file changed on disk. AiDA will not overwrite it without your decision.");
             ImGui::SameLine();
+            if (ImGui::SmallButton("Compare"))
+                application_ui::execute_editor_tab_action(selected,
+                    "tab.compare_disk", action_invocation_source_t::toolbar);
+            ImGui::SameLine();
             ImGui::BeginDisabled(selected_tab.dirty);
             if (ImGui::SmallButton("Reload from Disk"))
-                file_tabs::reload_external(selected);
+                application_ui::execute_editor_tab_action(selected,
+                    "tab.external.reload", action_invocation_source_t::toolbar);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
             const std::string reload_semantic_id = aida::preview::semantics::stable_id(
                 "aida.editor.external", "reload-document-" + std::to_string(selected_tab.document_id));
@@ -810,7 +851,8 @@ void render_code_group(const view_render_context_t& context) {
                 ImGui::SetTooltip("Save your editor changes elsewhere or explicitly keep the editor version first");
             ImGui::SameLine();
             if (ImGui::SmallButton("Keep Editor Version"))
-                file_tabs::keep_editor_version(selected);
+                application_ui::execute_editor_tab_action(selected,
+                    "tab.external.keep_editor", action_invocation_source_t::toolbar);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
             const std::string keep_semantic_id = aida::preview::semantics::stable_id(
                 "aida.editor.external", "keep-document-" + std::to_string(selected_tab.document_id));
@@ -988,6 +1030,10 @@ void initialize() {
         else if (std::strcmp(entry.id, "view.programming.references") == 0)
             descriptor.render = [](const view_render_context_t&) {
                 programming_language_views::render_references();
+            };
+        else if (std::strcmp(entry.id, "view.programming.source_debug_console") == 0)
+            descriptor.render = [](const view_render_context_t&) {
+                programming_language_views::render_source_debug_console();
             };
         else if (std::strcmp(entry.id, "document.code") == 0)
             descriptor.render = [](const view_render_context_t& context) {
@@ -1647,6 +1693,13 @@ void render_registry_owned_windows() noexcept {
             continue;
         const std::string& window_name = current.registry.window_name(id);
         ImGuiWindow* previous_window = ImGui::FindWindowByName(window_name.c_str());
+        const ImGuiWindowSettings* previous_settings = ImGui::FindWindowSettingsByID(
+            ImHashStr(window_name.c_str()));
+        if (!previous_window && !previous_settings) {
+            const ImGuiID target_dock = default_dock_node(*descriptor);
+            if (target_dock != 0 && ImGui::DockBuilderGetNode(target_dock) != nullptr)
+                ImGui::SetNextWindowDockID(target_dock, ImGuiCond_Appearing);
+        }
         if (!previous_window || previous_window->DockId == 0) {
             const ImGuiViewport* placement_viewport = previous_window && previous_window->Viewport
                 ? previous_window->Viewport : ImGui::GetMainViewport();

@@ -21,6 +21,7 @@
 #include "ui_anim.hpp"
 #include "../ui/theme.hpp"
 #include "../ui/components.hpp"
+#include "../ui/design_system.hpp"
 #include "../ui/clock.hpp"
 #include "../ui/transition.hpp"
 #include "../ui/empty_state.hpp"
@@ -946,105 +947,60 @@ void render_toolbar(ImDrawList* dl, float ox, float oy, float w, float a) {
 		cx += pill_w + 14.f;
 	}
 
-	bool scanning = sc.scanning.load();
+	const bool scanning = sc.scanning.load(std::memory_order_acquire);
+	bool has_initial_scan = false;
+	std::size_t total_found = 0;
+	{
+		std::lock_guard<std::mutex> lock(sc.results_mutex);
+		has_initial_scan = sc.has_initial_scan;
+		total_found = sc.total_found;
+	}
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-	bool attached = true;
-	bool static_pe = true;
+	const bool attached = true;
+	const bool static_pe = true;
 #else
-	bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
-	bool static_pe = function_index::detail::static_pe_active();
+	const bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+	const bool static_pe = function_index::detail::static_pe_active();
 #endif
-	bool any_target = attached;
+	const auto render_action_button = [&](const char* action_id,
+		aida::ui::button_kind_t kind) {
+		const auto presentation = aida::ui::application_ui::present_action(action_id);
+		const bool clicked = aida::ui::button(presentation.label.c_str(), kind,
+			aida::ui::size_t_::md, ImVec2(0.f, 0.f), !presentation.enabled);
+		if (!presentation.enabled &&
+			ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&
+			!presentation.disabled_reason.empty())
+			ImGui::SetTooltip("%s", presentation.disabled_reason.c_str());
+		if (clicked)
+			static_cast<void>(aida::ui::application_ui::execute_action(action_id,
+				aida::ui::action_invocation_source_t::toolbar));
+	};
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
 	if (scanning) {
-		if (aida::ui::button("Stop", aida::ui::button_kind_t::destructive,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f))) {
-			diag_log("toolbar stop_button");
-			sc.scanning.store(false);
-		}
+		render_action_button("memory.stop_scan", aida::ui::button_kind_t::destructive);
 		cx += 96.f;
-	} else if (!sc.has_initial_scan) {
-		if (aida::ui::button("First Scan", aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !any_target)) {
-			diag_logf("toolbar first_scan val='%s' val2='%s' vtype=%s mode=%s any_target=%d",
-				ui.value_buf, ui.value_buf2,
-				memory_scanner::value_type_name(sc.config.value_type),
-				memory_scanner::scan_mode_name(sc.config.scan_mode),
-				static_cast<int>(any_target));
-			anti_tamper::webhook::write_log("scan_audit",
-				"[scan_audit] memory_scanner first_scan invoked");
-			sc.config.value_text = ui.value_buf;
-			sc.config.value_text2 = ui.value_buf2;
-			if (memory_scanner::first_scan(sc.config)) {
-				ui.selected_result = -1;
-				ui.result_multi_sel.clear();
-				ui.last_result_anchor = -1;
-				ui.result_sb.scroll_y = 0.f;
-				ui.result_sb.target_scroll_y = 0.f;
-				ui.user_scrolled_up = false;
-				request_region_refresh();
-				invalidate_sort();
-			} else {
-				toast_notification::push("Cannot start scan: attach a target first.",
-					toast_notification::toast_type_t::warning, 4.f);
-			}
-		}
+	} else if (!has_initial_scan) {
+		render_action_button("memory.first_scan", aida::ui::button_kind_t::primary);
 		cx += 132.f;
 	} else {
-		if (aida::ui::button("Next Scan", aida::ui::button_kind_t::primary,
-				aida::ui::size_t_::md, ImVec2(0.f, 0.f), !any_target)) {
-			diag_logf("toolbar next_scan mode=%s val='%s'",
-				memory_scanner::scan_mode_name(sc.config.scan_mode),
-				ui.value_buf);
-			anti_tamper::webhook::write_log("scan_audit",
-				"[scan_audit] memory_scanner next_scan invoked");
-			if (memory_scanner::next_scan(sc.config.scan_mode,
-				std::string(ui.value_buf), std::string(ui.value_buf2)))
-			{
-				request_region_refresh();
-				invalidate_sort();
-			} else {
-				toast_notification::push("Cannot run Next Scan.",
-					toast_notification::toast_type_t::warning, 3.f);
-			}
-		}
+		render_action_button("memory.next_scan", aida::ui::button_kind_t::primary);
 		cx += 122.f;
 	}
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	bool undo_disabled = scanning || !sc.has_initial_scan;
-	if (aida::ui::button("Undo", aida::ui::button_kind_t::secondary,
-			aida::ui::size_t_::md, ImVec2(0.f, 0.f), undo_disabled)) {
-		diag_log("toolbar undo_button");
-		memory_scanner::undo_scan();
-		invalidate_sort();
-		ui.selected_result = -1;
-		ui.result_multi_sel.clear();
-		ui.last_result_anchor = -1;
-	}
+	render_action_button("memory.undo_scan", aida::ui::button_kind_t::secondary);
 	cx += 86.f;
 
 	ImGui::SetCursorScreenPos(ImVec2(cx, cy));
-	bool reset_disabled = scanning || !sc.has_initial_scan;
-	if (aida::ui::button("New Scan", aida::ui::button_kind_t::ghost,
-			aida::ui::size_t_::md, ImVec2(0.f, 0.f), reset_disabled)) {
-		diag_log("toolbar new_scan_button");
-		memory_scanner::reset_scan();
-		invalidate_sort();
-		ui.selected_result = -1;
-		ui.result_multi_sel.clear();
-		ui.last_result_anchor = -1;
-		ui.result_sb.scroll_y = 0.f;
-		ui.result_sb.target_scroll_y = 0.f;
-	}
+	render_action_button("memory.new_scan", aida::ui::button_kind_t::ghost);
 	cx += 108.f;
 
 	float right_cx = ox + w - pad;
 
 	{
 		char count_buf[64];
-		snprintf(count_buf, sizeof(count_buf), "%zu found", sc.total_found);
+		snprintf(count_buf, sizeof(count_buf), "%zu found", total_found);
 		ImFont* body_fn = aida::ui::fonts::body();
 		const float body_fs = aida::ui::fonts::size_or(body_fn, ImGui::GetFontSize());
 		ImVec2 cts = body_fn->CalcTextSizeA(body_fs, FLT_MAX, 0.f, count_buf);
@@ -2268,11 +2224,14 @@ void process_add_dialog() {
 	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
-	ImGui::SetNextWindowSize(ImVec2(400.f, 0.f), ImGuiCond_Always);
-	if (ImGui::BeginPopupModal("##value_scan_add_dialog", nullptr,
-		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
+	if (aida::ui::design::begin_dialog_exact("##value_scan_add_dialog",
+		ImVec2(500.f, 440.f), ImVec2(360.f, 300.f), nullptr,
+		ImGuiWindowFlags_NoTitleBar))
 	{
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Add", "Cancel");
+		aida::ui::design::begin_dialog_body("value_scan_add_dialog_body",
+			footer_height);
 		ImFont* h_fn = aida::ui::fonts::h2();
 		ImGui::PushFont(h_fn);
 		ImGui::TextUnformatted("Add to address list");
@@ -2291,7 +2250,8 @@ void process_add_dialog() {
 		ImGui::SetNextItemWidth(-1.f);
 		bool focus_now = ImGui::IsWindowAppearing();
 		if (focus_now) ImGui::SetKeyboardFocusHere();
-		ImGui::InputText("##add_desc", ui.desc_edit.buf, sizeof(ui.desc_edit.buf));
+		const bool enter_submit = ImGui::InputText("##add_desc", ui.desc_edit.buf,
+			sizeof(ui.desc_edit.buf), ImGuiInputTextFlags_EnterReturnsTrue);
 
 		ImGui::Spacing();
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(t.text_dim), "Type");
@@ -2310,31 +2270,13 @@ void process_add_dialog() {
 			ImGui::EndCombo();
 		}
 
-		ImGui::Spacing();
-		ImGui::Dummy(ImVec2(0.f, 8.f));
-
-		bool enter_submit = ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-			ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
-		bool esc_cancel = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-
-		float btn_w = 110.f;
-		float spacing = 8.f;
-		float total_btn_w = btn_w * 2.f + spacing;
-		float region_w = ImGui::GetContentRegionAvail().x;
-		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + region_w - total_btn_w);
-
-		bool cancel_clicked = aida::ui::button("Cancel",
-			aida::ui::button_kind_t::ghost, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-		ImGui::SameLine(0.f, spacing);
-		bool add_clicked = aida::ui::button("Add",
-			aida::ui::button_kind_t::primary, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-
-		if (cancel_clicked || esc_cancel) {
+		aida::ui::design::end_dialog_body();
+		const auto footer = aida::ui::design::dialog_footer(
+			"value_scan_add_dialog_footer", "Add", true, false, "Cancel");
+		if (footer.cancelled) {
 			diag_log("dialog add_cancel");
 			ImGui::CloseCurrentPopup();
-		} else if (add_clicked || enter_submit) {
+		} else if (footer.confirmed || enter_submit) {
 			std::string desc(ui.desc_edit.buf);
 			memory_scanner::add_address(
 				ui.desc_edit.pending_add_address, desc,
@@ -2381,11 +2323,14 @@ void process_edit_description_dialog() {
 	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
-	ImGui::SetNextWindowSize(ImVec2(420.f, 0.f), ImGuiCond_Always);
-	if (ImGui::BeginPopupModal("##value_scan_edit_desc", nullptr,
-		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
+	if (aida::ui::design::begin_dialog_exact("##value_scan_edit_desc",
+		ImVec2(520.f, 380.f), ImVec2(360.f, 280.f), nullptr,
+		ImGuiWindowFlags_NoTitleBar))
 	{
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Save", "Cancel");
+		aida::ui::design::begin_dialog_body("value_scan_edit_desc_body",
+			footer_height);
 		ImFont* h_fn = aida::ui::fonts::h2();
 		ImGui::PushFont(h_fn);
 		ImGui::TextUnformatted("Edit description");
@@ -2411,35 +2356,19 @@ void process_edit_description_dialog() {
 		ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(t.text_dim), "Description");
 		ImGui::SetNextItemWidth(-1.f);
 		if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-		ImGui::InputText("##edit_desc_in", ui.desc_edit.buf, sizeof(ui.desc_edit.buf));
+		const bool enter_submit = ImGui::InputText("##edit_desc_in",
+			ui.desc_edit.buf, sizeof(ui.desc_edit.buf),
+			ImGuiInputTextFlags_EnterReturnsTrue);
+		aida::ui::design::end_dialog_body();
+		const auto footer = aida::ui::design::dialog_footer(
+			"value_scan_edit_desc_footer", "Save", true, false, "Cancel");
 
-		ImGui::Spacing();
-		ImGui::Dummy(ImVec2(0.f, 6.f));
-
-		bool enter_submit = ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-			ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
-		bool esc_cancel = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-
-		float btn_w = 110.f;
-		float spacing = 8.f;
-		float total_btn_w = btn_w * 2.f + spacing;
-		float region_w = ImGui::GetContentRegionAvail().x;
-		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + region_w - total_btn_w);
-
-		bool cancel_clicked = aida::ui::button("Cancel",
-			aida::ui::button_kind_t::ghost, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-		ImGui::SameLine(0.f, spacing);
-		bool save_clicked = aida::ui::button("Save",
-			aida::ui::button_kind_t::primary, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-
-		if (cancel_clicked || esc_cancel) {
+		if (footer.cancelled) {
 			diag_log("dialog edit_desc_cancel");
 			ImGui::CloseCurrentPopup();
 			ui.desc_edit.active = false;
 			s_ed_was_open = false;
-		} else if (save_clicked || enter_submit) {
+		} else if (footer.confirmed || enter_submit) {
 			std::string val(ui.desc_edit.buf);
 			{
 				std::lock_guard<std::mutex> lk(sc.address_mutex);
@@ -2502,11 +2431,15 @@ void process_edit_value_dialog() {
 	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
-	ImGui::SetNextWindowSize(ImVec2(380.f, 0.f), ImGuiCond_Always);
-	if (ImGui::BeginPopupModal("##value_scan_edit_value", nullptr,
-		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
+	if (aida::ui::design::begin_dialog_exact("##value_scan_edit_value",
+		ImVec2(520.f, 440.f), ImVec2(360.f, 300.f), nullptr,
+		ImGuiWindowFlags_NoTitleBar))
 	{
+		const bool write_pending = s_value_write_pending.load(std::memory_order_acquire);
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Write", "Cancel");
+		aida::ui::design::begin_dialog_body("value_scan_edit_value_body",
+			footer_height);
 		if (s_value_write_close_requested) {
 			s_value_write_close_requested = false;
 			s_pending_edit_value_index.store(-1);
@@ -2539,38 +2472,18 @@ void process_edit_value_dialog() {
 		ImGui::SetNextItemWidth(-1.f);
 		if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
 		ImGui::InputText("##edit_value_in", s_edit_value_buf, sizeof(s_edit_value_buf));
-
-		ImGui::Spacing();
-		ImGui::Dummy(ImVec2(0.f, 6.f));
-
-		bool enter_submit = ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-			ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
-		bool esc_cancel = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-
-		float btn_w = 110.f;
-		float spacing = 8.f;
-		float total_btn_w = btn_w * 2.f + spacing;
-		float region_w = ImGui::GetContentRegionAvail().x;
-		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + region_w - total_btn_w);
-
-		const bool write_pending = s_value_write_pending.load(std::memory_order_acquire);
-		if (write_pending) ImGui::BeginDisabled();
-		bool cancel_clicked = aida::ui::button("Cancel",
-			aida::ui::button_kind_t::ghost, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-		ImGui::SameLine(0.f, spacing);
-		bool write_clicked = aida::ui::button("Write",
-			aida::ui::button_kind_t::primary, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-		if (write_pending) ImGui::EndDisabled();
 		if (write_pending) ImGui::TextDisabled("Writing, verifying, and retaining rollback bytes...");
+		aida::ui::design::end_dialog_body();
+		const auto footer = aida::ui::design::dialog_footer(
+			"value_scan_edit_value_footer", "Write", !write_pending, true,
+			"Cancel", !write_pending);
 
-		if (!write_pending && (cancel_clicked || esc_cancel)) {
+		if (footer.cancelled) {
 			diag_log("dialog edit_value_cancel");
 			ImGui::CloseCurrentPopup();
 			s_pending_edit_value_index.store(-1);
 			s_ev_was_open = false;
-		} else if (!write_pending && (write_clicked || enter_submit)) {
+		} else if (footer.confirmed) {
 			std::string text(s_edit_value_buf);
 			const auto runtime = runtime_snapshot();
 			const auto context = memory_interaction::capture_address(runtime,
@@ -2634,11 +2547,14 @@ void process_change_type_dialog() {
 	ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 12.f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.f, 16.f));
 
-	ImGui::SetNextWindowSize(ImVec2(380.f, 0.f), ImGuiCond_Always);
-	if (ImGui::BeginPopupModal("##value_scan_change_type", nullptr,
-		ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
+	if (aida::ui::design::begin_dialog_exact("##value_scan_change_type",
+		ImVec2(500.f, 360.f), ImVec2(360.f, 260.f), nullptr,
+		ImGuiWindowFlags_NoTitleBar))
 	{
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Apply", "Cancel");
+		aida::ui::design::begin_dialog_body("value_scan_change_type_body",
+			footer_height);
 		ImFont* h_fn = aida::ui::fonts::h2();
 		ImGui::PushFont(h_fn);
 		ImGui::TextUnformatted("Change type");
@@ -2661,30 +2577,16 @@ void process_change_type_dialog() {
 			ImGui::EndCombo();
 		}
 
-		ImGui::Spacing();
-		ImGui::Dummy(ImVec2(0.f, 8.f));
+		aida::ui::design::end_dialog_body();
+		const auto footer = aida::ui::design::dialog_footer(
+			"value_scan_change_type_footer", "Apply", true, false, "Cancel");
 
-		float btn_w = 110.f;
-		float spacing = 8.f;
-		float total_btn_w = btn_w * 2.f + spacing;
-		float region_w = ImGui::GetContentRegionAvail().x;
-		ImGui::SetCursorPosX(ImGui::GetCursorPosX() + region_w - total_btn_w);
-
-		bool cancel_clicked = aida::ui::button("Cancel",
-			aida::ui::button_kind_t::ghost, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-		ImGui::SameLine(0.f, spacing);
-		bool save_clicked = aida::ui::button("Apply",
-			aida::ui::button_kind_t::primary, aida::ui::size_t_::md,
-			ImVec2(btn_w, 0.f));
-		bool esc_cancel = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-
-		if (cancel_clicked || esc_cancel) {
+		if (footer.cancelled) {
 			diag_log("dialog change_type_cancel");
 			ImGui::CloseCurrentPopup();
 			s_pending_change_type_index.store(-1);
 			s_ct_was_open = false;
-		} else if (save_clicked) {
+		} else if (footer.confirmed) {
 			{
 				std::lock_guard<std::mutex> lk(sc.address_mutex);
 				if (idx >= 0 && idx < static_cast<int>(sc.address_list.size())) {
@@ -2966,6 +2868,157 @@ void process_address_context_menu() {
 
 }
 
+scan_command_state_t scan_command_capability(scan_command_t command) {
+	auto& state = memory_scanner::g_state;
+	const bool scanning = state.scanning.load(std::memory_order_acquire);
+	bool has_initial_scan = false;
+	bool has_undo_history = false;
+	{
+		std::lock_guard<std::mutex> lock(state.results_mutex);
+		has_initial_scan = state.has_initial_scan;
+		has_undo_history = !state.scan_history.empty();
+	}
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+	const bool attached = true;
+#else
+	const bool attached = driver_bridge::is_loaded() && driver_bridge::attached_pid() != 0;
+#endif
+	const auto requires_value = [](memory_scanner::scan_mode_t mode) {
+		return mode == memory_scanner::scan_mode_t::exact ||
+			mode == memory_scanner::scan_mode_t::bigger_than ||
+			mode == memory_scanner::scan_mode_t::smaller_than ||
+			mode == memory_scanner::scan_mode_t::value_between;
+	};
+	const auto configured_value_capability = [&]() -> scan_command_state_t {
+		if (state.config.value_type == memory_scanner::value_type_t::all_types)
+			return {false, "Choose a concrete value type; All Types has no value-scan provider"};
+		const bool variable_length =
+			state.config.value_type == memory_scanner::value_type_t::string_ascii ||
+			state.config.value_type == memory_scanner::value_type_t::string_utf16 ||
+			state.config.value_type == memory_scanner::value_type_t::byte_array;
+		if (variable_length &&
+			(state.config.scan_mode == memory_scanner::scan_mode_t::bigger_than ||
+			 state.config.scan_mode == memory_scanner::scan_mode_t::smaller_than ||
+			 state.config.scan_mode == memory_scanner::scan_mode_t::value_between ||
+			 state.config.scan_mode == memory_scanner::scan_mode_t::increased ||
+			 state.config.scan_mode == memory_scanner::scan_mode_t::decreased))
+			return {false, "Choose Exact, Changed, Unchanged, or Unknown Initial for variable-length values"};
+		if (requires_value(state.config.scan_mode) && g_ui.value_buf[0] == '\0')
+			return {false, "Enter the scan value first"};
+		if (state.config.scan_mode == memory_scanner::scan_mode_t::value_between &&
+			g_ui.value_buf2[0] == '\0')
+			return {false, "Enter the upper value for the Between scan first"};
+		return {true, {}};
+	};
+
+	switch (command) {
+	case scan_command_t::first_scan:
+		if (scanning)
+			return {false, "A memory scan is already running"};
+		if (has_initial_scan)
+			return {false, "Start a New Scan before running another First Scan"};
+		if (!attached)
+			return {false, "Attach to a live process before starting a memory scan"};
+		if (state.config.scan_mode == memory_scanner::scan_mode_t::changed ||
+			state.config.scan_mode == memory_scanner::scan_mode_t::unchanged ||
+			state.config.scan_mode == memory_scanner::scan_mode_t::increased ||
+			state.config.scan_mode == memory_scanner::scan_mode_t::decreased)
+			return {false, "Choose an initial comparison or Unknown Initial scan mode"};
+		return configured_value_capability();
+	case scan_command_t::next_scan:
+		if (scanning)
+			return {false, "Wait for the active memory scan to finish or stop it first"};
+		if (!has_initial_scan)
+			return {false, "Run First Scan before refining results"};
+		if (!attached)
+			return {false, "The scanned live process is no longer attached"};
+		if (state.config.scan_mode == memory_scanner::scan_mode_t::unknown_initial)
+			return {false, "Choose a refinement scan mode before running Next Scan"};
+		return configured_value_capability();
+	case scan_command_t::stop_scan:
+		return scanning ? scan_command_state_t{true, {}}
+			: scan_command_state_t{false, "No memory scan is running"};
+	case scan_command_t::undo_scan:
+		if (scanning)
+			return {false, "Wait for the active memory scan to finish or stop it first"};
+		return has_undo_history ? scan_command_state_t{true, {}}
+			: scan_command_state_t{false, "No completed refinement scan is available to undo"};
+	case scan_command_t::new_scan:
+		if (scanning)
+			return {false, "Stop the active memory scan before starting a new scan"};
+		return has_initial_scan ? scan_command_state_t{true, {}}
+			: scan_command_state_t{false, "The scanner is already ready for a First Scan"};
+	}
+	return {false, "The memory scan command is invalid"};
+}
+
+scan_command_result_t execute_scan_command(scan_command_t command) {
+	const auto capability = scan_command_capability(command);
+	if (!capability.enabled)
+		return {false, capability.disabled_reason};
+	auto& state = memory_scanner::g_state;
+	auto& ui = g_ui;
+	switch (command) {
+	case scan_command_t::first_scan:
+		diag_logf("action first_scan val='%s' val2='%s' vtype=%s mode=%s",
+			ui.value_buf, ui.value_buf2,
+			memory_scanner::value_type_name(state.config.value_type),
+			memory_scanner::scan_mode_name(state.config.scan_mode));
+		anti_tamper::webhook::write_log("scan_audit",
+			"[scan_audit] memory_scanner first_scan invoked");
+		state.config.value_text = ui.value_buf;
+		state.config.value_text2 = ui.value_buf2;
+		if (!memory_scanner::first_scan(state.config))
+			return {false, "The memory scan engine rejected First Scan; the target or worker admission changed"};
+		ui.selected_result = -1;
+		ui.result_multi_sel.clear();
+		ui.last_result_anchor = -1;
+		ui.result_sb.scroll_y = 0.f;
+		ui.result_sb.target_scroll_y = 0.f;
+		ui.user_scrolled_up = false;
+		request_region_refresh();
+		invalidate_sort();
+		return {true, "Initial memory scan started"};
+	case scan_command_t::next_scan:
+		diag_logf("action next_scan mode=%s val='%s' val2='%s'",
+			memory_scanner::scan_mode_name(state.config.scan_mode),
+			ui.value_buf, ui.value_buf2);
+		anti_tamper::webhook::write_log("scan_audit",
+			"[scan_audit] memory_scanner next_scan invoked");
+		if (!memory_scanner::next_scan(state.config.scan_mode,
+			std::string(ui.value_buf), std::string(ui.value_buf2)))
+			return {false, "The memory scan engine rejected Next Scan; the target, scan generation, or worker admission changed"};
+		request_region_refresh();
+		invalidate_sort();
+		return {true, "Memory scan refinement started"};
+	case scan_command_t::stop_scan:
+		diag_log("action stop_scan");
+		return memory_scanner::cancel_scan()
+			? scan_command_result_t{true, "Memory scan cancellation requested"}
+			: scan_command_result_t{false, "The memory scan completed before cancellation was requested"};
+	case scan_command_t::undo_scan:
+		diag_log("action undo_scan");
+		memory_scanner::undo_scan();
+		invalidate_sort();
+		ui.selected_result = -1;
+		ui.result_multi_sel.clear();
+		ui.last_result_anchor = -1;
+		return {true, "Previous memory scan result set restored"};
+	case scan_command_t::new_scan:
+		diag_log("action new_scan");
+		memory_scanner::reset_scan();
+		invalidate_sort();
+		ui.selected_result = -1;
+		ui.result_multi_sel.clear();
+		ui.last_result_anchor = -1;
+		ui.result_sb.scroll_y = 0.f;
+		ui.result_sb.target_scroll_y = 0.f;
+		ui.user_scrolled_up = false;
+		return {true, "Memory scanner reset for a new scan"};
+	}
+	return {false, "The memory scan command is invalid"};
+}
+
 void render(float pos_x, float pos_y, float width, float height,
             float alpha, float, float, float)
 {
@@ -2974,6 +3027,7 @@ void render(float pos_x, float pos_y, float width, float height,
 	if (!seeded) {
 		memory_scanner::scan_config_t config;
 		config.value_text = "1337";
+		std::snprintf(g_ui.value_buf, sizeof(g_ui.value_buf), "%s", config.value_text.c_str());
 		memory_scanner::first_scan(config);
 		memory_scanner::add_address(0x00007FF7A4C42030ULL, "player_health", memory_scanner::value_type_t::int32_val);
 		memory_scanner::add_address(0x00007FF7A4C42108ULL, "session_flags", memory_scanner::value_type_t::int32_val);

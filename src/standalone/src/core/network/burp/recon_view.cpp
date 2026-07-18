@@ -25,6 +25,7 @@
 #include "imgui/imgui_internal.h"
 #include "../../ui/theme.hpp"
 #include "../../ui/components.hpp"
+#include "../../ui/design_system.hpp"
 #include "../../ui/toast_notification.hpp"
 #include "../../ui/application_view_registry.hpp"
 #include "../../ui/task_center.hpp"
@@ -1343,34 +1344,44 @@ void render(float pos_x, float pos_y, float width, float height,
         }
     }
 
-    if (ImGui::BeginPopupModal("Review Recon removal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Remove Recon run %llu?", static_cast<unsigned long long>(s.reviewed_id));
-        ImGui::TextUnformatted("The selected run and its retained results will be removed.");
-        ImGui::BeginDisabled(s.operation.pending());
-        if (aida::ui::button("Remove", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+    if (aida::ui::design::begin_dialog_exact("Review Recon removal",
+        ImVec2(520.f, 280.f), ImVec2(400.f, 230.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Remove");
+        if (aida::ui::design::begin_dialog_body("recon_removal_review_body", footer)) {
+            ImGui::Text("Remove Recon run %llu?", static_cast<unsigned long long>(s.reviewed_id));
+            ImGui::TextWrapped("The selected run and its retained results will be removed after exact identity revalidation.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "recon_removal_review_footer", "Remove",
+            s.reviewed_id != 0 && !s.operation.pending(), true);
+        if (result.confirmed) {
             s.awaiting_remove_completion = submit_reviewed_remove(
                 s.review_domain, s.reviewed_id, s.reviewed_started_ms);
             ImGui::CloseCurrentPopup();
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm))
+        if (result.cancelled)
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 
-    if (ImGui::BeginPopupModal("Review payload set removal", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Remove payload set '%s'?", s.reviewed_payload_id.c_str());
-        ImGui::TextUnformatted("The custom payload set and its persisted file will be removed.");
-        ImGui::BeginDisabled(s.operation.pending());
-        if (aida::ui::button("Remove set", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+    if (aida::ui::design::begin_dialog_exact("Review payload set removal",
+        ImVec2(520.f, 280.f), ImVec2(400.f, 230.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Remove set");
+        if (aida::ui::design::begin_dialog_body("payload_set_removal_review_body", footer)) {
+            ImGui::Text("Remove payload set '%s'?", s.reviewed_payload_id.c_str());
+            ImGui::TextWrapped("The custom payload set and its persisted file will be removed after exact identity revalidation.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "payload_set_removal_review_footer", "Remove set",
+            !s.reviewed_payload_id.empty() && !s.operation.pending(), true);
+        if (result.confirmed) {
             s.awaiting_payload_remove_completion = submit_payload_remove(
                 s.reviewed_payload_id, s.reviewed_payload_builtin);
             ImGui::CloseCurrentPopup();
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel##payload", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        if (result.cancelled) {
             s.reviewed_payload_id.clear();
             ImGui::CloseCurrentPopup();
         }

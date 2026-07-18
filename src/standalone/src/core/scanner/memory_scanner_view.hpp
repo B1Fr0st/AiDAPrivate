@@ -11,6 +11,24 @@
 
 namespace memory_scanner_view {
 
+enum class scan_command_t : std::uint8_t {
+	first_scan,
+	next_scan,
+	stop_scan,
+	undo_scan,
+	new_scan
+};
+
+struct scan_command_state_t {
+	bool enabled = false;
+	std::string disabled_reason;
+};
+
+struct scan_command_result_t {
+	bool succeeded = false;
+	std::string detail;
+};
+
 enum class result_sort_t : int {
 	by_index = 0,
 	by_address,
@@ -101,6 +119,9 @@ struct ui_state_t {
 };
 
 inline ui_state_t g_ui;
+
+scan_command_state_t scan_command_capability(scan_command_t command);
+scan_command_result_t execute_scan_command(scan_command_t command);
 
 void render(float pos_x, float pos_y, float width, float height,
 			float alpha, float accent_r, float accent_g, float accent_b);

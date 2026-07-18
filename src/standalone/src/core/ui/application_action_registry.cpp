@@ -207,12 +207,30 @@ action_execution_result_t application_action_registry_t::execute(
 
     if (descriptor->consequence.confirmation == confirmation_requirement_t::review &&
         !invocation.review_completed) {
+        if (descriptor->prepare_confirmation) {
+            const auto prepared = descriptor->prepare_confirmation(invocation);
+            if (!prepared.success) {
+                result.status = action_execution_status_t::failed;
+                result.message = prepared.message.empty()
+                    ? "The action review could not be prepared" : prepared.message;
+                return result;
+            }
+        }
         result.status = action_execution_status_t::review_required;
         result.message = "Review is required before this action can run";
         return result;
     }
     if (descriptor->consequence.confirmation == confirmation_requirement_t::explicit_confirmation &&
         !invocation.confirmation_granted) {
+        if (descriptor->prepare_confirmation) {
+            const auto prepared = descriptor->prepare_confirmation(invocation);
+            if (!prepared.success) {
+                result.status = action_execution_status_t::failed;
+                result.message = prepared.message.empty()
+                    ? "The action confirmation could not be prepared" : prepared.message;
+                return result;
+            }
+        }
         result.status = action_execution_status_t::confirmation_required;
         result.message = "Explicit confirmation is required before this action can run";
         return result;

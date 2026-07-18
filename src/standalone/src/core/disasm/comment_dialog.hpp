@@ -1,9 +1,11 @@
 #pragma once
 
 #include "disasm_view.hpp"
+#include "../ui/design_system.hpp"
 #include "imgui/imgui.h"
 
 #include <array>
+#include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -53,17 +55,27 @@ inline void render() {
         value.open_requested = false;
     }
     bool keep_open = true;
-    if (!ImGui::BeginPopupModal("Edit comment##workspace_comment", &keep_open,
-            ImGuiWindowFlags_AlwaysAutoResize))
+    if (!aida::ui::design::begin_dialog_exact("Edit comment##workspace_comment",
+            ImVec2(620.0f, 420.0f), ImVec2(400.0f, 300.0f), &keep_open))
         return;
+    const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+        "Apply", "Cancel");
+    aida::ui::design::begin_dialog_body("workspace_comment_body", footer_height);
     const auto runtime = disasm_view::runtime_address(value.context, value.address);
     ImGui::Text("Address: 0x%016llX",
         static_cast<unsigned long long>(runtime.value_or(value.address.value)));
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
     ImGui::InputTextMultiline("##comment_text", value.text.data(), value.text.size(),
-        ImVec2(520.0f, 150.0f));
+        ImVec2(-FLT_MIN, (std::max)(150.0f, ImGui::GetContentRegionAvail().y)));
     if (!value.error.empty())
         ImGui::TextWrapped("%s", value.error.c_str());
-    if (ImGui::Button("Apply", ImVec2(110.0f, 0.0f))) {
+    aida::ui::design::end_dialog_body();
+    const auto footer = aida::ui::design::dialog_footer("workspace_comment_footer",
+        "Apply", true, false, "Cancel");
+    const bool submitted = ImGui::GetIO().KeyCtrl &&
+        (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+         ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
+    if (footer.confirmed || submitted) {
         if (disasm_view::queue_comment(value.context, value.address,
                 std::string(value.text.data()))) {
             ImGui::CloseCurrentPopup();
@@ -71,8 +83,7 @@ inline void render() {
             value.error = "The workspace is unavailable or closing.";
         }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f)))
+    if (footer.cancelled || !keep_open)
         ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
 }

@@ -2,6 +2,7 @@
 #include "core/ui/application_view_registry.hpp"
 
 #include "imgui/imgui_internal.h"
+#include "../../preview/studio_semantics.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -159,9 +160,10 @@ void select_docked_window(ImGuiID node_id, const char* stable_id) noexcept
     const ImGuiID selected = window ? window->TabId : ImHashStr(window_name.c_str());
     node->SelectedTabId = selected;
     if (node->TabBar) {
-        node->TabBar->SelectedTabId = selected;
-        node->TabBar->NextSelectedTabId = selected;
-        node->TabBar->VisibleTabId = selected;
+        if (ImGuiTabItem* tab = ImGui::TabBarFindTabByID(node->TabBar, selected))
+            ImGui::TabBarQueueFocus(node->TabBar, tab);
+        else
+            node->TabBar->NextSelectedTabId = selected;
         if (window)
             ImGui::FocusWindow(window);
     }
@@ -177,6 +179,320 @@ void open_builtin_default_views(workspace_preset_t preset) noexcept
     });
 }
 #endif
+
+#if defined(IMGUI_HAS_DOCK)
+
+struct dock_navigator_target_t {
+    const char* label = nullptr;
+    const char* window_name = nullptr;
+    const char* semantic_id = nullptr;
+    ImGuiDockNode* node = nullptr;
+    ImRect card;
+    ImRect preview;
+    ImGuiDir split_direction = ImGuiDir_None;
+    float split_ratio = 0.0f;
+    bool split_outer = false;
+    bool available = false;
+};
+
+ImGuiDockNode* dock_tree_root(ImGuiDockNode* node) noexcept
+{
+    while (node && node->ParentNode)
+        node = node->ParentNode;
+    return node;
+}
+
+bool dock_tree_contains(const ImGuiDockNode* ancestor, const ImGuiDockNode* node) noexcept
+{
+    while (node) {
+        if (node == ancestor)
+            return true;
+        node = node->ParentNode;
+    }
+    return false;
+}
+
+bool dock_window_class_compatible(const ImGuiWindowClass& host,
+    const ImGuiWindowClass& payload) noexcept
+{
+    if (host.ClassId == payload.ClassId)
+        return true;
+    if (host.ClassId != 0 && host.DockingAllowUnclassed && payload.ClassId == 0)
+        return true;
+    return payload.ClassId != 0 && payload.DockingAllowUnclassed && host.ClassId == 0;
+}
+
+bool dock_payload_class_compatible(const ImGuiWindowClass& host, ImGuiWindow* payload,
+    ImGuiDockNode* payload_node) noexcept
+{
+    if (!payload_node)
+        return payload && dock_window_class_compatible(host, payload->WindowClass);
+    bool found_window = false;
+    for (ImGuiWindow* window : payload_node->Windows) {
+        if (window) {
+            found_window = true;
+            if (dock_window_class_compatible(host, window->WindowClass))
+                return true;
+        }
+    }
+    const bool child_compatible =
+        (payload_node->ChildNodes[0] && dock_payload_class_compatible(
+            host, payload, payload_node->ChildNodes[0])) ||
+        (payload_node->ChildNodes[1] && dock_payload_class_compatible(
+            host, payload, payload_node->ChildNodes[1]));
+    return child_compatible || (!found_window && payload &&
+        dock_window_class_compatible(host, payload->WindowClass));
+}
+
+bool dock_split_available(ImGuiDockNode* root, ImGuiWindow* payload,
+    ImGuiDockNode* payload_node, const ImGuiIO& io) noexcept
+{
+    if (!root || !payload || io.ConfigDockingNoSplit || dock_tree_contains(payload_node, root))
+        return false;
+    const ImGuiDockNodeFlags source_flags = payload_node
+        ? payload_node->MergedFlags
+        : payload->WindowClass.DockNodeFlagsOverrideSet;
+    if ((root->MergedFlags & ImGuiDockNodeFlags_NoDockingSplit) != 0 ||
+        (source_flags & ImGuiDockNodeFlags_NoDockingSplitOther) != 0)
+        return false;
+    ImGuiDockNode* target_root = dock_tree_root(root);
+    return target_root && dock_payload_class_compatible(
+        target_root->WindowClass, payload, payload_node);
+}
+
+ImRect dock_split_card(const ImRect& root, ImGuiDir direction, float scale) noexcept
+{
+    const float margin = 12.0f * scale;
+    const float long_side = 104.0f * scale;
+    const float short_side = 40.0f * scale;
+    const ImVec2 center = root.GetCenter();
+    if (direction == ImGuiDir_Left)
+        return ImRect(root.Min.x + margin, center.y - short_side * 0.5f,
+            root.Min.x + margin + long_side, center.y + short_side * 0.5f);
+    if (direction == ImGuiDir_Right)
+        return ImRect(root.Max.x - margin - long_side, center.y - short_side * 0.5f,
+            root.Max.x - margin, center.y + short_side * 0.5f);
+    if (direction == ImGuiDir_Up)
+        return ImRect(center.x - long_side * 0.5f, root.Min.y + margin,
+            center.x + long_side * 0.5f, root.Min.y + margin + short_side);
+    return ImRect(center.x - long_side * 0.5f, root.Max.y - margin - short_side,
+        center.x + long_side * 0.5f, root.Max.y - margin);
+}
+
+ImRect dock_split_preview(const ImRect& root, ImGuiDir direction, float ratio) noexcept
+{
+    const bool horizontal = direction == ImGuiDir_Left || direction == ImGuiDir_Right;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float root_extent = horizontal ? root.GetWidth() : root.GetHeight();
+    const float minimum_extent = horizontal
+        ? style.WindowMinSize.x * 2.0f
+        : style.WindowMinSize.y * 2.0f;
+    const float available = (std::max)(
+        root_extent - style.DockingSeparatorSize, minimum_extent);
+    const bool leading = direction == ImGuiDir_Left || direction == ImGuiDir_Up;
+    const float split_ratio = leading ? ratio : 1.0f - ratio;
+    const float payload_extent = (std::min)(root_extent,
+        leading
+            ? IM_TRUNC(available * split_ratio)
+            : IM_TRUNC(available - IM_TRUNC(available * split_ratio)));
+    if (direction == ImGuiDir_Left)
+        return ImRect(root.Min, ImVec2(root.Min.x + payload_extent, root.Max.y));
+    if (direction == ImGuiDir_Right)
+        return ImRect(ImVec2(root.Max.x - payload_extent, root.Min.y), root.Max);
+    if (direction == ImGuiDir_Up)
+        return ImRect(root.Min, ImVec2(root.Max.x, root.Min.y + payload_extent));
+    return ImRect(ImVec2(root.Min.x, root.Max.y - payload_extent), root.Max);
+}
+
+float dock_split_size_ratio(const ImRect& root, ImGuiDir direction,
+    const ImGuiWindow* payload) noexcept
+{
+    const bool horizontal = direction == ImGuiDir_Left || direction == ImGuiDir_Right;
+    const float root_extent = horizontal ? root.GetWidth() : root.GetHeight();
+    const float payload_extent = payload
+        ? (horizontal ? payload->SizeFull.x : payload->SizeFull.y)
+        : 0.0f;
+    if (root_extent <= 0.0f)
+        return 0.22f;
+    return (std::clamp)(payload_extent / root_extent, 0.18f, 0.38f);
+}
+
+void draw_global_dock_target(ImDrawList* draw_list,
+    const dock_navigator_target_t& target, bool active, float scale) noexcept
+{
+    if (!draw_list || target.card.GetWidth() <= 0.0f || target.card.GetHeight() <= 0.0f)
+        return;
+    const ImU32 preview = ImGui::GetColorU32(ImGuiCol_DockingPreview,
+        active ? 0.82f : (target.available ? 0.50f : 0.16f));
+    const ImU32 zone = ImGui::GetColorU32(ImGuiCol_DockingPreview,
+        active ? 0.20f : 0.0f);
+    const ImU32 surface = ImGui::GetColorU32(ImGuiCol_WindowBg,
+        active ? 0.94f : 0.86f);
+    const ImU32 text = ImGui::GetColorU32(target.available
+        ? ImGuiCol_Text
+        : ImGuiCol_TextDisabled);
+    if (active && target.preview.GetWidth() > 0.0f && target.preview.GetHeight() > 0.0f) {
+        draw_list->AddRectFilled(target.preview.Min, target.preview.Max, zone);
+        draw_list->AddRect(target.preview.Min, target.preview.Max, preview,
+            3.0f * scale, 0, 2.0f * scale);
+    }
+    draw_list->AddRectFilled(target.card.Min, target.card.Max, surface, 5.0f * scale);
+    draw_list->AddRect(target.card.Min, target.card.Max, preview, 5.0f * scale, 0,
+        active ? 2.5f * scale : 1.5f * scale);
+    const ImVec2 text_size = ImGui::CalcTextSize(target.label);
+    const ImVec2 text_position(
+        target.card.GetCenter().x - text_size.x * 0.5f,
+        target.card.GetCenter().y - text_size.y * 0.5f);
+    draw_list->PushClipRect(target.card.Min, target.card.Max, true);
+    draw_list->AddText(text_position, text, target.label);
+    draw_list->PopClipRect();
+}
+
+bool render_global_dock_target(dock_navigator_target_t& target, ImGuiWindow* payload,
+    ImGuiContext& context, const ImGuiViewport& viewport, ImDrawList* draw_list,
+    float scale) noexcept
+{
+    if (!target.window_name || !target.semantic_id ||
+        target.card.GetWidth() <= 0.0f || target.card.GetHeight() <= 0.0f)
+        return false;
+    ImGui::SetNextWindowPos(target.card.Min, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(target.card.GetSize(), ImGuiCond_Always);
+    ImGui::SetNextWindowViewport(viewport.ID);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    constexpr ImGuiWindowFlags marker_flags =
+        ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoNavInputs |
+        ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoBackground;
+    ImGui::Begin(target.window_name, nullptr, marker_flags);
+    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+    ImGui::PopStyleVar(3);
+    ImGui::SetCursorScreenPos(target.card.Min);
+    ImGui::InvisibleButton("##dock-target", target.card.GetSize());
+    const ImGuiID target_id = ImGui::GetItemID();
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+    aida::preview::semantics::register_last_item(target.semantic_id,
+        "dock-outer-target", false, !target.available);
+#endif
+    bool active = false;
+    if (target.available && target_id != 0 &&
+        ImGui::BeginDragDropTargetCustom(target.card, target_id)) {
+        const ImGuiPayload* accepted = ImGui::AcceptDragDropPayload(
+            IMGUI_PAYLOAD_TYPE_WINDOW,
+            ImGuiDragDropFlags_AcceptBeforeDelivery |
+                ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
+        active = accepted != nullptr;
+        if (accepted && accepted->IsDelivery()) {
+            ImGui::DockContextQueueDock(&context, nullptr, target.node, payload,
+                target.split_direction, target.split_ratio, target.split_outer);
+            context.IO.WantSaveIniSettings = true;
+        }
+        ImGui::EndDragDropTarget();
+    }
+    ImGui::End();
+    draw_global_dock_target(draw_list, target, active, scale);
+    return active;
+}
+
+#endif
+
+}
+
+void render_global_dock_navigator() noexcept
+{
+#if defined(IMGUI_HAS_DOCK)
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    if (!context || !surfaces_ready() || layout_locked() || operation_pending() ||
+        (context->IO.ConfigFlags & ImGuiConfigFlags_DockingEnable) == 0 ||
+        !context->DragDropActive)
+        return;
+    const ImGuiPayload& drag_payload = context->DragDropPayload;
+    if (!drag_payload.IsDataType(IMGUI_PAYLOAD_TYPE_WINDOW) ||
+        drag_payload.Data == nullptr ||
+        drag_payload.DataSize != static_cast<int>(sizeof(ImGuiWindow*)))
+        return;
+    ImGuiWindow* payload = *static_cast<ImGuiWindow**>(drag_payload.Data);
+    if (!payload || (payload->Flags & ImGuiWindowFlags_NoDocking) != 0)
+        return;
+    const ImGuiID root_id = node_id(dock_role_t::root);
+    ImGuiDockNode* root = ImGui::DockBuilderGetNode(root_id);
+    if (!root || root->LastFrameAlive != context->FrameCount)
+        return;
+    ImGuiDockNode* payload_node = payload->DockNodeAsHost
+        ? payload->DockNodeAsHost
+        : payload->DockNode;
+    ImGuiViewport* viewport = root->HostWindow && root->HostWindow->Viewport
+        ? root->HostWindow->Viewport
+        : ImGui::GetMainViewport();
+    if (!viewport)
+        return;
+    const float scale = viewport->DpiScale > 0.0f ? viewport->DpiScale : 1.0f;
+    ImDrawList* draw_list = ImGui::GetForegroundDrawList(viewport);
+    const ImRect root_rect = root->Rect();
+    if (root_rect.GetWidth() <= 0.0f || root_rect.GetHeight() <= 0.0f)
+        return;
+    static ImGuiContext* submitted_context = nullptr;
+    static int submitted_frame = -1;
+    if (submitted_context == context && submitted_frame == context->FrameCount)
+        return;
+    submitted_context = context;
+    submitted_frame = context->FrameCount;
+
+    constexpr std::array<ImGuiDir, 4> directions{
+        ImGuiDir_Left, ImGuiDir_Right, ImGuiDir_Up, ImGuiDir_Down
+    };
+    constexpr std::array<const char*, 4> split_labels{
+        "Split left", "Split right", "Split top", "Split bottom"
+    };
+    constexpr std::array<const char*, 4> split_windows{
+        "##aida.dock-navigator.outer-left",
+        "##aida.dock-navigator.outer-right",
+        "##aida.dock-navigator.outer-top",
+        "##aida.dock-navigator.outer-bottom"
+    };
+    constexpr std::array<const char*, 4> split_semantics{
+        "aida.dock.outer-left",
+        "aida.dock.outer-right",
+        "aida.dock.outer-top",
+        "aida.dock.outer-bottom"
+    };
+    const bool split_available = dock_split_available(root, payload,
+        payload_node, context->IO);
+    for (std::size_t index = 0; index < directions.size(); ++index) {
+        const float size_ratio = dock_split_size_ratio(root_rect,
+            directions[index], payload);
+        dock_navigator_target_t target;
+        target.label = split_labels[index];
+        target.window_name = split_windows[index];
+        target.semantic_id = split_semantics[index];
+        target.node = root;
+        target.card = dock_split_card(root_rect, directions[index], scale);
+        target.preview = dock_split_preview(root_rect, directions[index], size_ratio);
+        target.split_direction = directions[index];
+        target.split_ratio = directions[index] == ImGuiDir_Left ||
+            directions[index] == ImGuiDir_Up
+            ? size_ratio
+            : 1.0f - size_ratio;
+        target.split_outer = true;
+        target.available = split_available;
+        static_cast<void>(render_global_dock_target(target, payload, *context,
+            *viewport, draw_list, scale));
+    }
+#endif
+}
+
+namespace {
 
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 void open_builtin_default_documents(workspace_preset_t preset) noexcept
@@ -225,8 +541,8 @@ void select_builtin_default_tabs(workspace_preset_t preset, ImGuiID left, ImGuiI
         select_docked_window(center, "view.ai_chat");
     } else if (preset == workspace_preset_t::programming) {
         select_docked_window(left, "view.project_explorer");
-        select_docked_window(right, "view.ai_chat");
-        select_docked_window(bottom, "view.output");
+        select_docked_window(right, "view.inspector");
+        select_docked_window(bottom, "view.programming.source_debug_console");
         select_docked_window(center, "document.code");
     } else {
         select_docked_window(left, "view.project_explorer");
@@ -312,8 +628,9 @@ bool preset_default_opens_view(workspace_preset_t preset,
     case workspace_preset_t::programming:
         return matches({"view.project_explorer", "view.programming.outline", "view.sessions",
             "view.workspace_search", "document.code", "document.disassembly",
-            "view.analysis.references", "view.ai_chat", "view.output", "view.terminal",
-            "view.programming.references", "view.background_tasks"});
+            "view.inspector", "view.analysis.references", "view.ai_chat", "view.output",
+            "view.terminal", "view.programming.references",
+            "view.programming.source_debug_console", "view.background_tasks"});
     case workspace_preset_t::safe:
         return matches({"view.project_explorer", "view.sessions", "view.recent",
             "document.code", "view.ai_chat", "view.diagnostics", "view.output"});
@@ -341,7 +658,9 @@ struct preview_state_t {
     dock_nodes_t nodes;
     std::string in_memory_layout;
     std::array<std::string, kPresetDescriptors.size()> layouts;
+    std::array<dock_nodes_t, kPresetDescriptors.size()> layout_nodes;
     std::map<std::string, std::string> user_layouts;
+    std::map<std::string, dock_nodes_t> user_layout_nodes;
     std::map<std::string, workspace_preset_t> user_presets;
     std::string active_user;
     std::uint64_t user_generation = 0;
@@ -349,6 +668,7 @@ struct preview_state_t {
     workspace_preset_t pending = workspace_preset_t::analysis;
     bool locked = false;
     bool rebuild = false;
+    std::uint8_t surface_realize_frames = 0;
     std::uint8_t select_defaults_after_realize_frames = 0;
 };
 
@@ -394,11 +714,13 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
         return;
 #if defined(IMGUI_HAS_DOCK)
     if (!current.root_prepared || current.rebuild) {
+        current.surface_realize_frames = 1;
         current.active = current.pending;
         application_views::synchronize_workspace_visibility(current.pending);
         if (!current.rebuild && !current.layouts[preset_index(current.pending)].empty()) {
             const std::string& saved = current.layouts[preset_index(current.pending)];
             ImGui::LoadIniSettingsFromMemory(saved.data(), saved.size());
+            current.nodes = current.layout_nodes[preset_index(current.pending)];
             current.select_defaults_after_realize_frames = 0;
         } else {
             open_builtin_default_documents(current.pending);
@@ -416,9 +738,17 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
     apply_preview_lock(ImGui::DockBuilderGetNode(root_dockspace_id), current.locked);
 }
 
+bool surfaces_ready() noexcept
+{
+    const preview_state_t& current = preview_state();
+    return current.initialized && current.root_prepared && current.surface_realize_frames == 0;
+}
+
 void settle_default_selection() noexcept
 {
     preview_state_t& current = preview_state();
+    if (current.surface_realize_frames != 0)
+        --current.surface_realize_frames;
     if (current.select_defaults_after_realize_frames == 0)
         return;
     --current.select_defaults_after_realize_frames;
@@ -500,8 +830,8 @@ void build_preview_recipe(preview_state_t& current, ImGuiID root_dockspace_id,
     } else if (preset == workspace_preset_t::programming) {
         dock(left, {"view.project_explorer", "view.programming.outline", "view.sessions", "view.workspace_search"});
         dock(center, {"view.start_center", "document.code", "document.disassembly", "document.pseudocode"});
-        dock(right, {"view.analysis.references", "view.ai_chat"});
-        dock(bottom, {"view.output", "view.terminal", "view.programming.references", "view.background_tasks", "view.diagnostics"});
+        dock(right, {"view.inspector", "view.analysis.references", "view.ai_chat"});
+        dock(bottom, {"view.programming.source_debug_console", "view.output", "view.terminal", "view.programming.references", "view.background_tasks", "view.diagnostics"});
     } else {
         dock(left, {"view.project_explorer", "view.sessions", "view.recent"});
         dock(center, {"view.start_center", "document.code"});
@@ -597,6 +927,42 @@ workspace_request_result_t dock_window(std::string_view window_name, dock_role_t
     return workspace_request_result_t::completed;
 }
 
+workspace_request_result_t split_window(std::string_view window_name,
+    std::string_view anchor_window_name, dock_split_direction_t direction) noexcept
+{
+    preview_state_t& current = preview_state();
+    if (!current.initialized || !current.root_prepared || current.locked ||
+        window_name.empty() || anchor_window_name.empty())
+        return workspace_request_result_t::unavailable;
+    const std::string anchor_name(anchor_window_name);
+    ImGuiWindow* anchor = ImGui::FindWindowByName(anchor_name.c_str());
+    if (!anchor || anchor->DockId == 0 || !ImGui::DockBuilderGetNode(anchor->DockId))
+        return workspace_request_result_t::unavailable;
+    const ImGuiDir imgui_direction = direction == dock_split_direction_t::left
+        ? ImGuiDir_Left : direction == dock_split_direction_t::right
+        ? ImGuiDir_Right : direction == dock_split_direction_t::up
+        ? ImGuiDir_Up : ImGuiDir_Down;
+    const ImGuiID anchor_node = anchor->DockId;
+    ImGuiID split_node = 0;
+    ImGuiID retained_node = 0;
+    ImGui::DockBuilderSplitNode(anchor_node, imgui_direction, 0.5f,
+        &split_node, &retained_node);
+    if (split_node == 0 || retained_node == 0)
+        return workspace_request_result_t::failed;
+    const std::string name(window_name);
+    ImGui::DockBuilderDockWindow(name.c_str(), split_node);
+    auto retain_role = [&](ImGuiID& node) {
+        if (node == anchor_node) node = retained_node;
+    };
+    retain_role(current.nodes.navigator);
+    retain_role(current.nodes.documents);
+    retain_role(current.nodes.inspector);
+    retain_role(current.nodes.bottom);
+    ImGui::DockBuilderFinish(current.nodes.root);
+    ImGui::GetIO().WantSaveIniSettings = true;
+    return workspace_request_result_t::completed;
+}
+
 void persist_if_requested() noexcept
 {
     preview_state_t& current = preview_state();
@@ -614,6 +980,7 @@ void persist_if_requested() noexcept
             current.in_memory_layout.assign(payload, payload_size);
         if (!current.in_memory_layout.empty())
             current.layouts[preset_index(current.active)] = current.in_memory_layout;
+        current.layout_nodes[preset_index(current.active)] = current.nodes;
     } catch (...) {
         current.in_memory_layout.clear();
     }
@@ -696,6 +1063,7 @@ workspace_request_result_t save_user_layout(std::string_view name, bool overwrit
             return workspace_request_result_t::already_exists;
         const std::string previous_identity = identity_key(current.active, current.active_user);
         current.user_layouts[saved_name] = current.in_memory_layout;
+        current.user_layout_nodes[saved_name] = current.nodes;
         current.user_presets[saved_name] = current.active;
         current.active_user = saved_name;
         application_views::clone_persisted_workspace_visibility(previous_identity,
@@ -724,14 +1092,17 @@ workspace_request_result_t load_user_layout(std::string_view name) noexcept
         if (found == current.user_layouts.end())
             return workspace_request_result_t::not_found;
         const auto preset = current.user_presets.find(found->first);
-        if (preset == current.user_presets.end())
+        const auto nodes = current.user_layout_nodes.find(found->first);
+        if (preset == current.user_presets.end() || nodes == current.user_layout_nodes.end())
             return workspace_request_result_t::failed;
         ImGui::LoadIniSettingsFromMemory(found->second.data(), found->second.size());
         current.in_memory_layout = found->second;
+        current.nodes = nodes->second;
         current.active = preset->second;
         current.pending = preset->second;
         current.active_user = found->first;
         current.root_prepared = true;
+        current.surface_realize_frames = 1;
     } catch (...) {
         return workspace_request_result_t::failed;
     }
@@ -755,8 +1126,13 @@ workspace_request_result_t rename_user_layout(std::string_view current_name,
         if (current.user_layouts.find(new_value) != current.user_layouts.end())
             return workspace_request_result_t::already_exists;
         const workspace_preset_t preset = current.user_presets.at(old_value);
+        const auto nodes = current.user_layout_nodes.find(old_value);
+        if (nodes == current.user_layout_nodes.end())
+            return workspace_request_result_t::failed;
         current.user_layouts.emplace(new_value, std::move(found->second));
         current.user_layouts.erase(found);
+        current.user_layout_nodes.emplace(new_value, nodes->second);
+        current.user_layout_nodes.erase(nodes);
         current.user_presets.erase(old_value);
         current.user_presets.emplace(new_value, preset);
         application_views::rename_persisted_workspace_visibility(
@@ -780,6 +1156,7 @@ workspace_request_result_t delete_user_layout(std::string_view name) noexcept
         const auto preset = current.user_presets.find(value);
         if (current.user_layouts.erase(value) == 0)
             return workspace_request_result_t::not_found;
+        current.user_layout_nodes.erase(value);
         if (preset != current.user_presets.end())
             application_views::remove_persisted_workspace_visibility(
                 identity_key(preset->second, value));
@@ -798,6 +1175,7 @@ workspace_request_result_t restore_builtin(workspace_preset_t preset) noexcept
     preview_state_t& current = preview_state();
     current.active_user.clear();
     current.layouts[preset_index(preset)].clear();
+    current.layout_nodes[preset_index(preset)] = {};
     application_views::reset_persisted_workspace_visibility(preset, false);
     current.pending = preset;
     current.rebuild = true;
@@ -812,7 +1190,10 @@ workspace_request_result_t reset_all() noexcept
     preview_state_t& current = preview_state();
     for (auto& layout : current.layouts)
         layout.clear();
+    for (auto& nodes : current.layout_nodes)
+        nodes = {};
     current.user_layouts.clear();
+    current.user_layout_nodes.clear();
     current.user_presets.clear();
     current.active_user.clear();
     application_views::reset_persisted_workspace_visibility(
@@ -898,6 +1279,7 @@ struct state_t {
     workspace_preset_t pending = workspace_preset_t::analysis;
     bool rebuild_requested = false;
     bool locked = false;
+    std::uint8_t surface_realize_frames = 0;
     std::uint8_t select_defaults_after_realize_frames = 0;
     ImVec2 last_position{0.0f, 0.0f};
     ImVec2 last_size{0.0f, 0.0f};
@@ -1745,8 +2127,8 @@ void dock_named_windows(workspace_preset_t preset, ImGuiID left, ImGuiID center,
     } else if (preset == workspace_preset_t::programming) {
         dock(left, {"view.project_explorer", "view.programming.outline", "view.sessions", "view.workspace_search"});
         dock(center, {"view.start_center", "document.code", "document.disassembly", "document.pseudocode"});
-        dock(right, {"view.analysis.references", "view.ai_chat"});
-        dock(bottom, {"view.output", "view.terminal", "view.programming.references", "view.background_tasks", "view.diagnostics"});
+        dock(right, {"view.inspector", "view.analysis.references", "view.ai_chat"});
+        dock(bottom, {"view.programming.source_debug_console", "view.output", "view.terminal", "view.programming.references", "view.background_tasks", "view.diagnostics"});
     } else {
         dock(left, {"view.project_explorer", "view.sessions", "view.recent"});
         dock(center, {"view.start_center", "document.code"});
@@ -2664,6 +3046,7 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
     current.last_position = position;
     current.last_size = ImVec2((std::max)(size.x, 320.0f), (std::max)(size.y, 240.0f));
     if (!current.root_prepared) {
+        current.surface_realize_frames = 1;
         if (current.needs_default || ImGui::DockBuilderGetNode(root_dockspace_id) == nullptr) {
             const bool recovery = !current.needs_default;
             build_default_layout(root_dockspace_id, position, size, current.pending);
@@ -2697,9 +3080,17 @@ void prepare_root(ImGuiID root_dockspace_id, ImVec2 position, ImVec2 size) noexc
     }
 }
 
+bool surfaces_ready() noexcept
+{
+    const state_t& current = state();
+    return current.initialized && current.root_prepared && current.surface_realize_frames == 0;
+}
+
 void settle_default_selection() noexcept
 {
     state_t& current = state();
+    if (current.surface_realize_frames != 0)
+        --current.surface_realize_frames;
     if (current.select_defaults_after_realize_frames == 0)
         return;
     --current.select_defaults_after_realize_frames;
@@ -2784,6 +3175,44 @@ workspace_request_result_t dock_window(std::string_view window_name, dock_role_t
             ImGui::DockBuilderGetNode(target), window, ImGuiDir_None, 0.0f, false);
     else
         ImGui::DockBuilderDockWindow(name.c_str(), target);
+    ImGui::GetIO().WantSaveIniSettings = true;
+    return workspace_request_result_t::completed;
+}
+
+workspace_request_result_t split_window(std::string_view window_name,
+    std::string_view anchor_window_name, dock_split_direction_t direction) noexcept
+{
+    state_t& current = state();
+    if (!current.initialized || !current.root_prepared || current.locked ||
+        window_name.empty() || anchor_window_name.empty())
+        return workspace_request_result_t::unavailable;
+    if (operation_runtime().pending.load(std::memory_order_acquire))
+        return workspace_request_result_t::busy;
+    const std::string anchor_name(anchor_window_name);
+    ImGuiWindow* anchor = ImGui::FindWindowByName(anchor_name.c_str());
+    if (!anchor || anchor->DockId == 0 || !ImGui::DockBuilderGetNode(anchor->DockId))
+        return workspace_request_result_t::unavailable;
+    const ImGuiDir imgui_direction = direction == dock_split_direction_t::left
+        ? ImGuiDir_Left : direction == dock_split_direction_t::right
+        ? ImGuiDir_Right : direction == dock_split_direction_t::up
+        ? ImGuiDir_Up : ImGuiDir_Down;
+    const ImGuiID anchor_node = anchor->DockId;
+    ImGuiID split_node = 0;
+    ImGuiID retained_node = 0;
+    ImGui::DockBuilderSplitNode(anchor_node, imgui_direction, 0.5f,
+        &split_node, &retained_node);
+    if (split_node == 0 || retained_node == 0)
+        return workspace_request_result_t::failed;
+    const std::string name(window_name);
+    ImGui::DockBuilderDockWindow(name.c_str(), split_node);
+    auto retain_role = [&](ImGuiID& node) {
+        if (node == anchor_node) node = retained_node;
+    };
+    retain_role(current.nodes.navigator);
+    retain_role(current.nodes.documents);
+    retain_role(current.nodes.inspector);
+    retain_role(current.nodes.bottom);
+    ImGui::DockBuilderFinish(current.nodes.root);
     ImGui::GetIO().WantSaveIniSettings = true;
     return workspace_request_result_t::completed;
 }

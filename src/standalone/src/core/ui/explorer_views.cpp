@@ -45,6 +45,7 @@ namespace aida::ui::explorer_views {
 namespace {
 
 std::string path_key(const std::string& path);
+std::vector<std::string> s_workspace_search_scope;
 
 std::filesystem::path path_from_utf8(const std::string& value) {
 #if defined(__cpp_char8_t)
@@ -1019,10 +1020,26 @@ void open_search_result(const workspace_search::match_result_t& result) {
 }
 
 void start_workspace_search() {
-    if (!file_browser::roots.empty())
+    if (!s_workspace_search_scope.empty())
+        workspace_search::start_search(s_workspace_search_scope);
+    else if (!file_browser::roots.empty())
         workspace_search::start_search(file_browser::roots);
     else
         workspace_search::start_search(file_browser::current_dir);
+}
+
+file_operation_result_t request_search_scope_impl(const std::string& path, bool directory) {
+    if (path.empty())
+        return {false, "Select a Project Explorer file or folder first"};
+    const std::filesystem::path selected = path_from_utf8(path);
+    const std::filesystem::path scope = directory ? selected : selected.parent_path();
+    if (scope.empty() || !path_inside_root(scope, true))
+        return {false, "The retained search scope is outside the open Project Explorer roots"};
+    s_workspace_search_scope.assign(1, path_to_utf8(scope.lexically_normal()));
+    const auto opened = application_views::open_or_focus(
+        stable_view_id_t("view.workspace_search"));
+    return opened.ok() ? file_operation_result_t{true, {}}
+        : file_operation_result_t{false, opened.detail};
 }
 
 void request_recent_open(const std::string& path) {
@@ -1185,6 +1202,10 @@ file_operation_capability_t file_operation_capability(file_operation_t operation
     } catch (...) {
         return {false, "The selected path could not be converted to a native filesystem path"};
     }
+}
+
+file_operation_result_t request_search_scope(const std::string& path, bool directory) {
+    return request_search_scope_impl(path, directory);
 }
 
 file_operation_result_t request_file_operation(file_operation_t operation,
@@ -1922,6 +1943,12 @@ void render_project_explorer() {
 
 void render_workspace_search() {
     g_render_section = "registry_workspace_search";
+    if (!s_workspace_search_scope.empty()) {
+        ImGui::TextDisabled("Scope: %s", s_workspace_search_scope.front().c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Scope"))
+            s_workspace_search_scope.clear();
+    }
     ImGui::SetNextItemWidth(-1.0f);
     const bool submitted = ImGui::InputTextWithHint("##workspace_search_query", "Search workspace",
         workspace_search::g_search.query_buf, sizeof(workspace_search::g_search.query_buf),

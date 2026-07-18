@@ -28,6 +28,7 @@
 #include "fonts.hpp"
 #include "ui_anim.hpp"
 #include "../core/ui/application_view_registry.hpp"
+#include "../core/ui/design_system.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../core/infra/executor.hpp"
 #include "../core/infra/taskflow_runtime.hpp"
@@ -1469,10 +1470,6 @@ void render_pending_confirm_modal()
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(tk.text_primary));
     ImGui::SetNextWindowBgAlpha(1.0f);
 
-    ImVec2 viewport_center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(viewport_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(460.f, 0.f), ImGuiCond_Appearing);
-
     bool open_flag_local = true;
     bool open_now    = false;
     bool switch_now  = false;
@@ -1481,11 +1478,14 @@ void render_pending_confirm_modal()
     bool already_open = analysis_session::find_session_by_path(
         file_browser::pending_open_path, &existing_idx);
 
-    if (ImGui::BeginPopupModal("Load file?###aida_open_binary_confirm",
-                               &open_flag_local,
-                               ImGuiWindowFlags_NoSavedSettings
-                               | ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGuiIO& io = ImGui::GetIO();
+    if (aida::ui::design::begin_dialog_exact(
+            "Load file?###aida_open_binary_confirm", ImVec2(460.f, 300.f),
+            ImVec2(360.f, 240.f), &open_flag_local)) {
+        const char* confirm_label = already_open ? "Switch" : "Load";
+        const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+            confirm_label);
+        aida::ui::design::begin_dialog_body(
+            "aida_open_binary_confirm_body", footer_height);
 
         std::string fname = file_browser::pending_open_filename;
         if (fname.empty()) {
@@ -1527,34 +1527,14 @@ void render_pending_confirm_modal()
             ImGui::PopStyleColor();
         }
 
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) cancel_now = true;
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false)
-            || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+        aida::ui::design::end_dialog_body();
+        const auto footer = aida::ui::design::dialog_footer(
+            "aida_open_binary_confirm_footer", confirm_label, true, false);
+        cancel_now = footer.cancelled || !open_flag_local;
+        if (footer.confirmed) {
             if (already_open) switch_now = true;
-            else              open_now = true;
+            else open_now = true;
         }
-        (void)io;
-
-        if (already_open) {
-            if (aida::ui::button("Switch", aida::ui::button_kind_t::primary,
-                                 aida::ui::size_t_::md, ImVec2(150.f, 0.f),
-                                 false, nullptr, false))
-                switch_now = true;
-        } else {
-            if (aida::ui::button("Load", aida::ui::button_kind_t::primary,
-                                 aida::ui::size_t_::md, ImVec2(160.f, 0.f),
-                                 false, nullptr, false))
-                open_now = true;
-        }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
-                             aida::ui::size_t_::md, ImVec2(110.f, 0.f),
-                             false, nullptr, false))
-            cancel_now = true;
 
         if (open_now && !already_open) {
             std::string path_copy = file_browser::pending_open_path;
@@ -1576,7 +1556,7 @@ void render_pending_confirm_modal()
             file_browser::pending_open_modal_visible = false;
             file_browser::pending_open_path.clear();
             file_browser::pending_open_filename.clear();
-        } else if (cancel_now || !open_flag_local) {
+        } else if (cancel_now) {
             ImGui::CloseCurrentPopup();
             file_browser::pending_open_modal_visible = false;
             file_browser::pending_open_path.clear();

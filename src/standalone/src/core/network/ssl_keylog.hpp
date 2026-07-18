@@ -32,6 +32,11 @@ struct keylog_entry {
     uint64_t    timestamp = 0;
 };
 
+struct retained_set_token {
+    uint64_t generation = 0;
+    size_t count = 0;
+};
+
 
 struct state_t {
     std::string                keylog_path;
@@ -43,11 +48,23 @@ struct state_t {
 
 
     std::unordered_map<std::string, std::vector<keylog_entry>> by_client_random;
+    uint64_t                   retained_generation = 1;
 
     size_t                     file_pos = 0;
 };
 
 inline state_t g_state;
+
+inline void advance_retained_generation_locked(state_t& state) {
+    ++state.retained_generation;
+    if (state.retained_generation == 0) ++state.retained_generation;
+}
+
+inline void rebuild_client_random_index_locked(state_t& state) {
+    state.by_client_random.clear();
+    for (const auto& entry : state.entries)
+        state.by_client_random[entry.client_random_hex].push_back(entry);
+}
 
 
 struct launch_result {
@@ -158,7 +175,6 @@ inline void process_new_lines(state_t& state, const std::string& content) {
         if (parse_keylog_line(line, entry)) {
             entry.timestamp = now;
 
-            state.by_client_random[entry.client_random_hex].push_back(entry);
             state.entries.push_back(std::move(entry));
             ++added;
 
@@ -167,6 +183,8 @@ inline void process_new_lines(state_t& state, const std::string& content) {
         }
     }
     if (added > 0) {
+        rebuild_client_random_index_locked(state);
+        advance_retained_generation_locked(state);
         diag::log_tagged_fmt("network", "ssl_keylog_entries_parsed added=%zu total=%zu",
             added, state.entries.size());
     }
@@ -270,10 +288,28 @@ inline size_t entry_count() {
     return g_state.entries.size();
 }
 
+inline retained_set_token retained_token() {
+    std::lock_guard<std::mutex> lock(g_state.entries_mutex);
+    return {g_state.retained_generation, g_state.entries.size()};
+}
+
 inline void clear_entries() {
     std::lock_guard<std::mutex> lock(g_state.entries_mutex);
+    if (g_state.entries.empty()) return;
     g_state.entries.clear();
     g_state.by_client_random.clear();
+    advance_retained_generation_locked(g_state);
+}
+
+inline bool clear_entries_if_exact(retained_set_token reviewed) {
+    std::lock_guard<std::mutex> lock(g_state.entries_mutex);
+    if (g_state.retained_generation != reviewed.generation ||
+        g_state.entries.size() != reviewed.count)
+        return false;
+    g_state.entries.clear();
+    g_state.by_client_random.clear();
+    advance_retained_generation_locked(g_state);
+    return true;
 }
 
 inline bool is_watching() {

@@ -6510,19 +6510,17 @@ void render_tool_approval_dialog()
 
     ImGui::OpenPopup("##tool_approval");
 
-    float ww = globals::ui::window_w;
-    float wh = globals::ui::window_h;
-    float pw = 440.f, ph = 280.f;
-    ImGui::SetNextWindowPos(ImVec2((ww - pw) * 0.5f, (wh - ph) * 0.5f), ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(pw, ph), ImGuiCond_Always);
-
     ImGui::PushStyleColor(ImGuiCol_PopupBg, aida::ui::resolved().bg_elevated);
     ImGui::PushStyleColor(ImGuiCol_Border, aida::ui::resolved().border_strong);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.f, 12.f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.f);
 
-    if (ImGui::BeginPopupModal("##tool_approval", nullptr,
-            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+    if (aida::ui::design::begin_dialog_exact("##tool_approval",
+            ImVec2(500.0f, 360.0f), ImVec2(360.0f, 280.0f), nullptr,
+            ImGuiWindowFlags_NoTitleBar)) {
+        const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+            "Allow", "Deny");
+        aida::ui::design::begin_dialog_body("tool_approval_body", footer_height);
 
         float ax = globals::ui::accent.x;
         float ay = globals::ui::accent.y;
@@ -6547,30 +6545,34 @@ void render_tool_approval_dialog()
             ImGui::PopStyleColor();
         }
 
-        ImGui::Spacing();
-        ImGui::Spacing();
-
-        float btn_w = 100.f;
-        float total = btn_w * 2 + 12.f;
-        ImGui::SetCursorPosX((pw - total) * 0.5f);
-
-        if (aida::ui::components::button("Allow",
+        aida::ui::design::end_dialog_body();
+        ImGui::Separator();
+        const float gap = ImGui::GetStyle().ItemSpacing.x;
+        const float available = ImGui::GetContentRegionAvail().x;
+        const float button_width = (std::min)(140.0f,
+            (std::max)(96.0f, (available - gap) * 0.5f));
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+            (std::max)(0.0f, available - button_width * 2.0f - gap));
+        const bool allow = aida::ui::components::button("Allow",
             aida::ui::components::button_kind_t::primary,
             aida::ui::components::size_t_::md,
-            ImVec2(btn_w, 28.f))) {
+            ImVec2(button_width, 0.0f));
+
+        ImGui::SameLine(0.0f, gap);
+        const bool deny = aida::ui::components::button("Deny",
+            aida::ui::components::button_kind_t::destructive,
+            aida::ui::components::size_t_::md,
+            ImVec2(button_width, 0.0f)) ||
+            ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+        ImGui::SetItemDefaultFocus();
+
+        if (allow) {
             std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
             s_tool_approval.approved = true;
             s_tool_approval.answered = true;
             s_tool_approval.cv.notify_one();
             ImGui::CloseCurrentPopup();
-        }
-
-        ImGui::SameLine(0, 12.f);
-
-        if (aida::ui::components::button("Deny",
-            aida::ui::components::button_kind_t::destructive,
-            aida::ui::components::size_t_::md,
-            ImVec2(btn_w, 28.f))) {
+        } else if (deny) {
             std::lock_guard<std::mutex> lk(s_tool_approval.mtx);
             s_tool_approval.approved = false;
             s_tool_approval.answered = true;

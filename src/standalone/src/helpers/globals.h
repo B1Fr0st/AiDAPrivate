@@ -1978,6 +1978,116 @@ namespace file_tabs {
 		return request_recovery_load(idx, recovery_load_mode_t::compare);
 	}
 
+	inline save_result_t compare_with_disk(int idx) {
+		if (!is_valid_tab_index(idx)) return {false, "The document is no longer open."};
+		if (idx != active_tab) switch_to(idx);
+		auto& tab = tabs[tab_index(idx)];
+		observe_recovery_dispatch_failure(idx);
+		if (tab.filepath.empty() || !tab.buffer_loaded)
+			return {false, "Open a path-backed text document before comparing with disk."};
+		if (tab.recovery_operation_pending)
+			return {false, "Another document comparison or recovery operation is still running."};
+		snapshot_active_to_tab();
+		const std::uint64_t document_id = tab.document_id;
+		const std::uint64_t revision = tab.revision;
+		const std::uint64_t content_hash = tab.content_hash;
+		const std::uint64_t generation = ++tab.recovery_operation_generation;
+		const std::string path = tab.filepath;
+		auto dispatch_failed = std::make_shared<std::atomic<bool>>(false);
+		tab.recovery_dispatch_failed = dispatch_failed;
+		tab.recovery_operation_pending = true;
+		tab.recovery_operation_label = "Preparing disk comparison";
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+		static_cast<void>(document_id);
+		static_cast<void>(revision);
+		static_cast<void>(content_hash);
+		static_cast<void>(generation);
+		static_cast<void>(path);
+		static_cast<void>(dispatch_failed);
+		tab.recovery_operation_pending = false;
+		tab.recovery_operation_label.clear();
+		tab.recovery_dispatch_failed.reset();
+		return {false, "Disk comparison is intentionally unavailable in deterministic Preview."};
+#else
+		aida::infra::executor::submission_t sub;
+		sub.owner_subsystem = "file_tabs";
+		sub.label = "file_tabs.disk_compare";
+		sub.thread_class = "blocking_file_io";
+		sub.domain = aida::infra::executor::domain_t::feature_worker;
+		sub.priority = 2;
+		sub.generation = generation;
+		sub.body = [document_id, revision, content_hash, generation, path,
+			dispatch_failed]() mutable {
+			std::string content;
+			std::string error;
+			std::error_code ec;
+			const auto size = std::filesystem::file_size(path, ec);
+			if (ec)
+				error = "The disk file size could not be read: " + ec.message();
+			else if (size > aida::editor::programming_documents::maximum_editable_document_bytes)
+				error = "Disk comparison is limited to the 1 MiB bounded editable text model.";
+			else {
+				std::ifstream input(path, std::ios::binary);
+				if (!input.is_open())
+					error = "The disk file could not be opened for comparison.";
+				else {
+					content.resize(static_cast<std::size_t>(size));
+					if (!content.empty())
+						input.read(content.data(), static_cast<std::streamsize>(content.size()));
+					if ((!content.empty() && input.gcount() !=
+							static_cast<std::streamsize>(content.size())) || input.bad())
+						error = "The complete disk file could not be read for comparison.";
+				}
+			}
+			if (error.empty()) {
+				auto decoded = aida::editor::programming_documents::decode_file_bytes(content);
+				if (!decoded.succeeded)
+					error = std::move(decoded.detail);
+				else
+					content = std::move(decoded.text);
+			}
+			const bool posted = aida::ui_thread::post(
+				[document_id, revision, content_hash, generation,
+				 content = std::move(content), error = std::move(error)]() mutable {
+					const int current = find_document(document_id);
+					if (!is_valid_tab_index(current)) return;
+					auto& target = tabs[tab_index(current)];
+					if (target.recovery_operation_generation != generation) return;
+					target.recovery_operation_pending = false;
+					target.recovery_operation_label.clear();
+					target.recovery_dispatch_failed.reset();
+					if (!error.empty()) {
+						target.recovery_error = std::move(error);
+						return;
+					}
+					if (target.revision != revision || target.content_hash != content_hash ||
+						current != active_tab) {
+						target.recovery_error = "The editor changed or lost focus while disk content was loading; activate it and retry.";
+						return;
+					}
+					if (!code_editor_widget::propose_document_content(target.document_id,
+							target.revision, target.content_hash, target.buffer,
+							content, "Disk comparison")) {
+						target.recovery_error = "The disk comparison could not be bound to the current document revision.";
+						return;
+					}
+					target.proposal_pending = true;
+				}, "file_tabs", "disk_compare_result", "worker_result");
+			if (!posted)
+				dispatch_failed->store(true, std::memory_order_release);
+		};
+		const auto submitted = aida::infra::executor::submit(std::move(sub));
+		if (!submitted.submitted) {
+			tab.recovery_operation_pending = false;
+			tab.recovery_operation_label.clear();
+			tab.recovery_dispatch_failed.reset();
+			tab.recovery_error = "Disk comparison scheduling failed: " + submitted.reject_reason;
+			return {false, tab.recovery_error};
+		}
+		return {true, {}};
+#endif
+	}
+
 	inline save_result_t discard_recovery(int idx) {
 		if (!is_valid_tab_index(idx)) return {false, "The document is no longer open."};
 		auto& tab = tabs[tab_index(idx)];

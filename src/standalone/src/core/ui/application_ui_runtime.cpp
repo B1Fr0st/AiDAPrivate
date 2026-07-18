@@ -7,12 +7,15 @@
 #include "output_views.hpp"
 #include "programming_tasks.hpp"
 #include "programming_language_views.hpp"
+#include "task_center.hpp"
 #include "toast_notification.hpp"
+#include "ui_thread_dispatcher.hpp"
 #include "workspace_layout.hpp"
 #include "../../helpers/globals.h"
 #include "../editor/code_editor.hpp"
 #include "../editor/programming_language_service.hpp"
 #include "../debugger/source_debug_service.hpp"
+#include "../debugger/debugger_engine.hpp"
 #include "../infra/executor.hpp"
 #include "../session/analysis_session.hpp"
 #include "../settings/standalone_settings.hpp"
@@ -29,18 +32,22 @@
 #include "../ai/standalone_chat.hpp"
 #include "../debugger/debugger_view.hpp"
 #include "../network/network_view.hpp"
+#include "../scanner/memory_scanner_view.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
 
 #include "imgui/imgui.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string_view>
@@ -85,6 +92,7 @@ constexpr const char* k_debugger_scope = "scope.debugger";
 constexpr const char* k_disassembly_scope = "scope.document.disassembly";
 constexpr const char* k_terminal_scope = "scope.terminal";
 constexpr const char* k_network_intercept_scope = "scope.view.network.intercept";
+constexpr const char* k_memory_scan_scope = "scope.view.memory.value_scan";
 constexpr std::size_t k_maximum_keybinding_overrides = 512;
 constexpr std::size_t k_maximum_keybinding_payload_bytes = 64U * 1024U;
 
@@ -155,6 +163,16 @@ struct retained_entity_runtime_context_t {
     }
 };
 
+struct pending_action_confirmation_t {
+    bool active = false;
+    bool open_requested = false;
+    std::string action;
+    std::string label;
+    std::string description;
+    std::string consequence;
+    action_invocation_source_t source = action_invocation_source_t::command_palette;
+};
+
 struct runtime_t {
     application_action_registry_t actions;
     shortcut_resolver_t shortcuts;
@@ -195,10 +213,12 @@ struct runtime_t {
     bool initialized = false;
     bool editor_focused = false;
     bool editor_text_input = false;
+    int editor_hunk_index = -1;
     bool shortcut_capture_active = false;
     std::string retained_entity_executed_owner;
     std::string retained_entity_executed_id;
     std::string retained_entity_executed_action;
+    pending_action_confirmation_t pending_confirmation;
 };
 
 runtime_t& runtime() {
@@ -277,6 +297,13 @@ action_handler_result_t request_language_query(
         query.document.file_path.clear();
     query.text = use_identifier
         ? aida::editor::language_service::active_query_text() : std::string{};
+    if (kind == aida::editor::language_service::capability_kind_t::range_formatting) {
+        query.has_selection = code_editor_widget::selected_range(
+            query.selection.start.line, query.selection.start.column,
+            query.selection.end.line, query.selection.end.column);
+        if (!query.has_selection)
+            return action_handler_result_t::failed("Select a source range to format");
+    }
     query.maximum_results = 4096;
     const auto requested = aida::editor::language_service::request(std::move(query));
     if (!requested.accepted)
@@ -352,6 +379,38 @@ void register_action(runtime_t& rt,
     descriptor.capability = std::move(capability);
     descriptor.checked = std::move(checked);
     descriptor.undoable = undoable;
+    rt.actions.register_action(std::move(descriptor));
+}
+
+void register_action_with_consequence(runtime_t& rt,
+                     const char* id,
+                     const char* label,
+                     const char* description,
+                     action_surface_t surfaces,
+                     action_handler_fn_t invoke,
+                     action_capability_fn_t capability,
+                     action_check_fn_t checked,
+                     action_effect_t effects,
+                     confirmation_requirement_t confirmation,
+                     const char* consequence_summary,
+                     std::function<std::string(const interaction_context_t&)> target_summary,
+                     action_confirmation_prepare_fn_t prepare_confirmation = {},
+                     action_confirmation_cancel_fn_t cancel_confirmation = {}) {
+    application_action_descriptor_t descriptor;
+    descriptor.id = action_id(id);
+    descriptor.label = label;
+    descriptor.description = description;
+    descriptor.category = {"category.network", "Network"};
+    descriptor.surfaces = surfaces;
+    descriptor.invoke = std::move(invoke);
+    descriptor.capability = std::move(capability);
+    descriptor.checked = std::move(checked);
+    descriptor.consequence.effects = effects;
+    descriptor.consequence.confirmation = confirmation;
+    descriptor.consequence.summary = consequence_summary ? consequence_summary : "";
+    descriptor.consequence.target_summary = std::move(target_summary);
+    descriptor.prepare_confirmation = std::move(prepare_confirmation);
+    descriptor.cancel_confirmation = std::move(cancel_confirmation);
     rt.actions.register_action(std::move(descriptor));
 }
 
@@ -1026,6 +1085,204 @@ action_handler_result_t send_programming_path_to_ai(const std::string& path,
     return action_handler_result_t::completed();
 }
 
+action_handler_result_t send_editor_selection_to_ai(const char* instruction) {
+    const auto editor = code_editor_widget::document_state();
+    const std::string selection = code_editor_widget::selected_text(16U * 1024U);
+    if (!editor.active || selection.empty())
+        return action_handler_result_t::failed("Select source text first");
+    const auto opened = application_views::open_or_focus(stable_view_id_t("view.ai_chat"));
+    if (!opened.ok())
+        return action_handler_result_t::failed(opened.detail);
+    std::string payload = instruction && *instruction ? instruction : "Review this source selection";
+    payload.append("\n\nSource: ").append(bounded_context_value(editor.filepath.empty()
+        ? editor.filename : editor.filepath));
+    payload.append("\nCaret: ").append(std::to_string(editor.caret_line + 1))
+        .append(":").append(std::to_string(editor.caret_column + 1));
+    payload.append("\n\n```\n").append(selection).append("\n```");
+    chat_inject::post(payload);
+    return action_handler_result_t::completed();
+}
+
+std::atomic<std::uint64_t>& debugger_expression_generation() {
+    static std::atomic<std::uint64_t> generation{0};
+    return generation;
+}
+
+bool expression_fence_matches(const source_debug_service::snapshot_ptr& snapshot,
+        std::uint32_t pid, std::uint64_t publication_generation,
+        std::uint64_t stop_generation, const std::string& target_key) {
+    return snapshot && snapshot->target_pid == pid && snapshot->target_key == target_key &&
+        snapshot->generation == publication_generation &&
+        snapshot->stop_generation == stop_generation &&
+        debugger_engine::g_state.status.load(std::memory_order_acquire) ==
+            debugger_engine::dbg_status_t::paused;
+}
+
+action_handler_result_t schedule_debugger_expression_evaluation(
+        std::string expression, int persistent_watch_index,
+        const char* owner_action, const char* label) {
+    if (expression.empty() || expression.size() > 96 ||
+        expression.find('\n') != std::string::npos ||
+        expression.find('\r') != std::string::npos)
+        return action_handler_result_t::failed(
+            "Select one single-line debugger expression no longer than 96 bytes");
+    const auto retained = source_debug_service::snapshot();
+    if (!retained || retained->target_pid == 0 || retained->target_key.empty())
+        return action_handler_result_t::failed(
+            "The source-debug target context is unavailable; wait for debugger context publication");
+    if (debugger_engine::g_state.status.load(std::memory_order_acquire) !=
+            debugger_engine::dbg_status_t::paused)
+        return action_handler_result_t::failed(
+            "Pause the debugger before evaluating a source expression");
+    const std::uint64_t request_generation =
+        debugger_expression_generation().fetch_add(1, std::memory_order_acq_rel) + 1;
+    const std::uint32_t pid = retained->target_pid;
+    const std::uint64_t publication_generation = retained->generation;
+    const std::uint64_t stop_generation = retained->stop_generation;
+    const std::string target_key = retained->target_key;
+    const std::string task_id = "source.debug.expression." +
+        std::to_string(request_generation);
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    aida::infra::executor::submission_t submission;
+    submission.owner_subsystem = "source_debug";
+    submission.label = persistent_watch_index >= 0
+        ? "source_debug.evaluate_watch" : "source_debug.evaluate_selection";
+    submission.thread_class = "target_read";
+    submission.domain = aida::infra::executor::domain_t::feature_worker;
+    submission.priority = 3;
+    submission.target_pid = pid;
+    submission.generation = request_generation;
+    submission.cancel_hook = [cancelled] {
+        cancelled->store(true, std::memory_order_release);
+    };
+    submission.body = [expression, persistent_watch_index, pid,
+        publication_generation, stop_generation, target_key, task_id,
+        cancelled]() mutable {
+        debugger_engine::expression_evaluation_t evaluation;
+        std::string fence_error;
+        const auto before = source_debug_service::snapshot();
+        if (!expression_fence_matches(before, pid, publication_generation,
+                stop_generation, target_key))
+            fence_error = "Debugger target or stop generation changed before evaluation began";
+        else if (cancelled->load(std::memory_order_acquire))
+            fence_error = "Debugger expression evaluation was cancelled";
+        else
+            evaluation = debugger_engine::evaluate_expression(expression);
+        const auto after = source_debug_service::snapshot();
+        if (fence_error.empty() && !expression_fence_matches(after, pid,
+                publication_generation, stop_generation, target_key))
+            fence_error = "Debugger target or stop generation changed during evaluation; the stale result was discarded";
+        if (fence_error.empty() && cancelled->load(std::memory_order_acquire))
+            fence_error = "Debugger expression evaluation was cancelled; the result was discarded";
+        const bool posted = aida::ui_thread::post(
+            [expression = std::move(expression), persistent_watch_index, pid,
+             publication_generation, stop_generation, target_key = std::move(target_key),
+             task_id, evaluation = std::move(evaluation),
+             fence_error = std::move(fence_error)]() mutable {
+                const auto current = source_debug_service::snapshot();
+                if (fence_error.empty() && !expression_fence_matches(current, pid,
+                        publication_generation, stop_generation, target_key))
+                    fence_error = "Debugger target or stop generation changed before result publication; the stale result was discarded";
+                if (!fence_error.empty()) {
+                    static_cast<void>(task_center::update_task(task_id,
+                        task_center::task_state_t::cancelled, 1.0f,
+                        "Result discarded by debugger generation fence", fence_error));
+                    return;
+                }
+                if (persistent_watch_index >= 0 &&
+                    !debugger_engine::publish_watch_evaluation(
+                        persistent_watch_index, expression, evaluation)) {
+                    static_cast<void>(task_center::update_task(task_id,
+                        task_center::task_state_t::partial, 1.0f,
+                        "Watch changed before result publication",
+                        "The persistent watch remains authoritative; no stale result was applied"));
+                    return;
+                }
+                const std::string result = evaluation.succeeded
+                    ? expression + " = " + evaluation.rendered_value
+                    : expression + ": " + evaluation.error;
+                const std::string diagnostic_id = evaluation.succeeded ? std::string{}
+                    : "diagnostic.source_debug.expression." + task_id;
+                static_cast<void>(task_center::update_task(task_id,
+                    evaluation.succeeded ? task_center::task_state_t::completed
+                                         : task_center::task_state_t::failed,
+                    1.0f, result, result, diagnostic_id));
+                if (!evaluation.succeeded) {
+                    task_center::diagnostic_registration_t diagnostic;
+                    diagnostic.id = diagnostic_id;
+                    diagnostic.task_id = task_id;
+                    diagnostic.owner = "Source Debugger";
+                    diagnostic.target = expression;
+                    diagnostic.summary = "Debugger expression evaluation failed";
+                    diagnostic.details = evaluation.error;
+                    diagnostic.severity = task_center::diagnostic_severity_t::error;
+                    diagnostic.callbacks.focus = [] {
+                        static_cast<void>(application_views::open_or_focus(
+                            stable_view_id_t("view.programming.source_debug_console")));
+                    };
+                    static_cast<void>(task_center::raise_diagnostic(
+                        std::move(diagnostic)));
+                }
+            }, "source_debug", "expression_evaluation_result", "worker_result");
+        if (!posted) {
+            static_cast<void>(task_center::update_task(task_id,
+                task_center::task_state_t::failed, 1.0f,
+                "Result publication failed",
+                "The debugger expression result could not return to the UI owner"));
+            task_center::diagnostic_registration_t diagnostic;
+            diagnostic.id = "diagnostic.source_debug.expression.dispatch." + task_id;
+            diagnostic.task_id = task_id;
+            diagnostic.owner = "Source Debugger";
+            diagnostic.target = "PID " + std::to_string(pid);
+            diagnostic.summary = "Debugger expression result publication failed";
+            diagnostic.details = "The worker completed, but its result could not return to the UI owner";
+            diagnostic.severity = task_center::diagnostic_severity_t::error;
+            diagnostic.callbacks.focus = [] {
+                static_cast<void>(application_views::open_or_focus(
+                    stable_view_id_t("view.programming.source_debug_console")));
+            };
+            static_cast<void>(task_center::raise_diagnostic(std::move(diagnostic)));
+        }
+    };
+    const auto submitted = aida::infra::executor::submit(std::move(submission));
+    if (!submitted.submitted)
+        return action_handler_result_t::failed(
+            "Debugger expression evaluation scheduling failed: " +
+            submitted.reject_reason);
+    task_center::task_registration_t registration;
+    registration.id = task_id;
+    registration.owner = "source_debug";
+    registration.owner_view = persistent_watch_index >= 0
+        ? "view.debug.watches" : "view.programming.source_debug_console";
+    registration.owner_action = owner_action ? owner_action : "debug.selection.evaluate";
+    registration.target = "PID " + std::to_string(pid);
+    registration.label = label ? label : "Evaluate debugger expression";
+    registration.stage = "Queued against stop generation " +
+        std::to_string(stop_generation);
+    registration.affected_entity = expression;
+    registration.cancellation_is_safe = true;
+    registration.callbacks.cancel = [cancelled, task = submitted.task_id] {
+        cancelled->store(true, std::memory_order_release);
+        return aida::infra::executor::cancel(task);
+    };
+    registration.callbacks.focus = [persistent = persistent_watch_index >= 0] {
+        static_cast<void>(application_views::open_or_focus(stable_view_id_t(
+            persistent ? "view.debug.watches"
+                       : "view.programming.source_debug_console")));
+    };
+    if (!task_center::try_register_executor_job(
+            submitted.task_id, std::move(registration))) {
+        cancelled->store(true, std::memory_order_release);
+        static_cast<void>(aida::infra::executor::cancel(submitted.task_id));
+        return action_handler_result_t::failed(
+            "Task Center rejected debugger expression evaluation ownership");
+    }
+    return action_handler_result_t::completed(
+        persistent_watch_index >= 0
+            ? "Watch persisted; authoritative evaluation queued"
+            : "One-shot debugger evaluation queued");
+}
+
 std::optional<view_instance_id_t> code_group_instance(int tab_index) {
     if (!file_tabs::is_valid_tab_index(tab_index))
         return std::nullopt;
@@ -1559,6 +1816,18 @@ void initialize(runtime_t& rt) {
         "Resolve the identifier under the caret through the selected provider",
         aida::editor::language_service::capability_kind_t::definition, true,
         "view.programming.references");
+    register_language_query("programming.language.declaration", "Go to Declaration",
+        "Resolve the declaration of the identifier under the caret through a semantic provider",
+        aida::editor::language_service::capability_kind_t::declaration, true,
+        "view.programming.references");
+    register_language_query("programming.language.implementation", "Go to Implementation",
+        "Resolve concrete implementations of the identifier under the caret through a semantic provider",
+        aida::editor::language_service::capability_kind_t::implementation, true,
+        "view.programming.references");
+    register_language_query("programming.language.type_definition", "Go to Type Definition",
+        "Resolve the semantic type definition of the identifier under the caret",
+        aida::editor::language_service::capability_kind_t::type_definition, true,
+        "view.programming.references");
     register_language_query("programming.language.references", "Find Programming References",
         "Find bounded lexical or semantic references through the selected provider",
         aida::editor::language_service::capability_kind_t::references, true,
@@ -1581,6 +1850,19 @@ void initialize(runtime_t& rt) {
         "Request document formatting from the selected provider",
         aida::editor::language_service::capability_kind_t::formatting, false,
         "view.programming.references");
+    register_action(rt, "programming.language.format_selection", "Format Selection",
+        "Request revision-bound formatting for the selected source range from the selected provider",
+        language_surfaces,
+        [](const action_invocation_t&) {
+            return request_language_query(
+                aida::editor::language_service::capability_kind_t::range_formatting,
+                false, "view.programming.references");
+        }, [](const interaction_context_t&) {
+            const auto selected = editor_selection();
+            if (!selected.enabled) return selected;
+            return language_capability(
+                aida::editor::language_service::capability_kind_t::range_formatting, false);
+        }, false, {}, "category.programming.language", "Programming / Language Services");
     register_language_query("programming.language.code_actions", "Code Actions",
         "Request reviewed code actions from the selected provider",
         aida::editor::language_service::capability_kind_t::code_actions, false,
@@ -1607,6 +1889,195 @@ void initialize(runtime_t& rt) {
             }
             return capability_state_t::unavailable("No language query is running");
         }, false, {}, "category.programming.language", "Programming / Language Services");
+
+    const auto register_file_target = [&](const char* id, const char* label,
+            const char* description, int kind) {
+        register_action(rt, id, label, description, language_surfaces,
+            [kind](const action_invocation_t&) {
+                const auto document = code_editor_widget::document_state();
+                const auto result = kind == 2
+                    ? programming_tasks::request_test_selected_for_file(document.filepath)
+                    : programming_tasks::request_run_selected_for_file(
+                        document.filepath, kind == 1);
+                return result.succeeded ? action_handler_result_t::completed()
+                    : action_handler_result_t::failed(result.detail);
+            }, [kind](const interaction_context_t&) {
+                const auto document = code_editor_widget::document_state();
+                if (!document.active || document.filepath.empty())
+                    return capability_state_t::unavailable(
+                        "Open a path-backed source document first");
+                const std::string reason = kind == 2
+                    ? programming_tasks::test_for_file_unavailable_reason(document.filepath)
+                    : programming_tasks::run_for_file_unavailable_reason(
+                        document.filepath, kind == 1);
+                return reason.empty() ? capability_state_t::available()
+                    : capability_state_t::unavailable(reason);
+            }, false, {}, "category.programming.tasks", "Programming / Run and Debug");
+    };
+    register_file_target("programming.run.file", "Run Current File...",
+        "Review and run the selected Task configuration bound to this exact file", 0);
+    register_file_target("programming.debug.file", "Debug Current File...",
+        "Review and run the selected Launch configuration bound to this exact file", 1);
+    register_file_target("programming.test.file", "Test Current File...",
+        "Review and run the selected Test configuration bound to this exact file", 2);
+    const auto selection_runner_capability = [](const interaction_context_t&) {
+        const auto selected = editor_selection();
+        if (!selected.enabled) return selected;
+        return capability_state_t::unavailable(
+            "Programming commands do not interpolate source text into a shell command; configure a file-bound Task, Launch, or Test target instead");
+    };
+    for (const auto& action : std::array<std::array<const char*, 3>, 3>{{
+            {{"programming.run.selection", "Run Selection", "Run the selected source through a registered non-shell selection provider"}},
+            {{"programming.debug.selection", "Debug Selection", "Debug the selected source through a registered non-shell selection provider"}},
+            {{"programming.test.selection", "Test Selection", "Test the selected source through a registered non-shell selection provider"}}}}) {
+        register_action(rt, action[0], action[1], action[2], language_surfaces,
+            [](const action_invocation_t&) {
+                return action_handler_result_t::failed(
+                    "No bounded non-shell programming selection provider is registered");
+            }, selection_runner_capability, false, {}, "category.programming.tasks",
+            "Programming / Run and Debug");
+    }
+    const auto watch_capability = [](const interaction_context_t&) {
+        const auto selected = editor_selection();
+        if (!selected.enabled) return selected;
+        const std::string expression = code_editor_widget::selected_text(97);
+        if (expression.empty() || expression.size() > 96)
+            return capability_state_t::unavailable(
+                "Select one debugger expression no longer than 96 bytes");
+        if (expression.find('\n') != std::string::npos || expression.find('\r') != std::string::npos)
+            return capability_state_t::unavailable(
+                "Select one single-line debugger expression");
+        if (debugger_engine::g_state.target_pid == 0)
+            return capability_state_t::unavailable("Attach the debugger to a process first");
+        if (debugger_engine::g_state.status.load(std::memory_order_acquire) !=
+                debugger_engine::dbg_status_t::paused)
+            return capability_state_t::unavailable(
+                "Pause the debugger before evaluating a source expression");
+        const auto source = source_debug_service::snapshot();
+        if (!source || source->target_pid != debugger_engine::g_state.target_pid ||
+            source->target_key.empty())
+            return capability_state_t::unavailable(
+                "Wait for the source-debug target context to match the attached process");
+        return capability_state_t::available();
+    };
+    register_action(rt, "debug.selection.watch", "Add Selection to Watch",
+        "Persist the bounded selected expression, queue authoritative evaluation, and open Watches",
+        language_surfaces,
+        [](const action_invocation_t&) {
+            const std::string expression = code_editor_widget::selected_text(97);
+            const int index = debugger_engine::add_watch(expression);
+            if (index < 0)
+                return action_handler_result_t::failed(
+                    "The debugger rejected the selected watch expression");
+            const auto scheduled = schedule_debugger_expression_evaluation(
+                expression, index, "debug.selection.watch", "Evaluate persistent watch");
+            if (!scheduled.success) {
+                static_cast<void>(debugger_engine::remove_watch(index));
+                return scheduled;
+            }
+            const auto opened = application_views::open_or_focus(
+                stable_view_id_t("view.debug.watches"));
+            if (!opened.ok())
+                return action_handler_result_t::failed(opened.detail);
+            return scheduled;
+        }, watch_capability, true, {}, "category.programming.debug",
+        "Programming / Source Debugging");
+    register_action(rt, "debug.selection.evaluate", "Evaluate Selection",
+        "Queue an ephemeral one-shot debugger evaluation without creating a persistent watch",
+        language_surfaces,
+        [](const action_invocation_t&) {
+            const std::string expression = code_editor_widget::selected_text(97);
+            const auto scheduled = schedule_debugger_expression_evaluation(
+                expression, -1, "debug.selection.evaluate", "Evaluate source selection");
+            if (!scheduled.success)
+                return scheduled;
+            const auto opened = application_views::open_or_focus(
+                stable_view_id_t("view.programming.source_debug_console"));
+            return opened.ok() ? scheduled
+                : action_handler_result_t::failed(opened.detail);
+        }, watch_capability, false, {}, "category.programming.debug",
+        "Programming / Source Debugging");
+
+    const auto register_ai_selection = [&](const char* id, const char* label,
+            const char* instruction) {
+        register_action(rt, id, label, instruction, language_surfaces,
+            [instruction](const action_invocation_t&) {
+                return send_editor_selection_to_ai(instruction);
+            }, [](const interaction_context_t&) { return editor_selection(); },
+            false, {}, "category.programming.ai", "Programming / AI");
+    };
+    register_ai_selection("editor.ai.explain", "AI: Explain Selection",
+        "Explain this source selection, including behavior, assumptions, edge cases, and security implications.");
+    register_ai_selection("editor.ai.refactor", "AI: Refactor Selection",
+        "Propose a production-grade refactor for this source selection. Return changes for reviewed editor hunks; do not apply them directly.");
+    register_ai_selection("editor.ai.fix", "AI: Fix Selection",
+        "Find concrete defects in this source selection and propose a minimal production-grade fix for reviewed editor hunks.");
+    register_ai_selection("editor.ai.generate_tests", "AI: Generate Tests for Selection",
+        "Generate comprehensive tests for this source selection, covering success, boundary, failure, cancellation, and concurrency behavior where applicable.");
+
+    const auto pending_hunk_capability = [&rt](const interaction_context_t&) {
+        if (!code_editor_widget::has_pending_diff())
+            return capability_state_t::unavailable("No reviewed AI diff is active");
+        const auto& diff = code_editor_widget::pending_diff();
+        int index = rt.editor_hunk_index;
+        if (index < 0) {
+            const auto found = std::find_if(diff.hunks.begin(), diff.hunks.end(),
+                [](const code_editor_widget::diff_hunk_t& hunk) {
+                    return hunk.state == code_editor_widget::diff_hunk_state_t::pending;
+                });
+            index = found == diff.hunks.end() ? -1
+                : static_cast<int>(std::distance(diff.hunks.begin(), found));
+        }
+        return index >= 0 && index < static_cast<int>(diff.hunks.size()) &&
+            diff.hunks[static_cast<std::size_t>(index)].state ==
+                code_editor_widget::diff_hunk_state_t::pending
+            ? capability_state_t::available()
+            : capability_state_t::unavailable("The selected AI hunk is already resolved");
+    };
+    const auto register_hunk_action = [&](const char* id, const char* label, bool accept) {
+        register_action(rt, id, label,
+            accept ? "Accept the retained revision-bound AI hunk"
+                   : "Reject the retained revision-bound AI hunk",
+            language_surfaces,
+            [&rt, accept](const action_invocation_t&) {
+                const auto& diff = code_editor_widget::pending_diff();
+                int index = rt.editor_hunk_index;
+                if (index < 0) {
+                    const auto found = std::find_if(diff.hunks.begin(), diff.hunks.end(),
+                        [](const code_editor_widget::diff_hunk_t& hunk) {
+                            return hunk.state == code_editor_widget::diff_hunk_state_t::pending;
+                        });
+                    index = found == diff.hunks.end() ? -1
+                        : static_cast<int>(std::distance(diff.hunks.begin(), found));
+                }
+                const bool changed = accept ? code_editor_widget::accept_hunk(index)
+                                            : code_editor_widget::reject_hunk(index);
+                return changed ? action_handler_result_t::completed()
+                    : action_handler_result_t::failed(
+                        "The retained AI hunk changed before the review action executed");
+            }, pending_hunk_capability, true, {}, "category.programming.ai",
+            "Programming / AI Review");
+    };
+    register_hunk_action("editor.ai.accept_hunk", "Accept AI Hunk", true);
+    register_hunk_action("editor.ai.reject_hunk", "Reject AI Hunk", false);
+    register_action(rt, "editor.ai.accept_all", "Accept All AI Hunks",
+        "Accept every pending hunk in the active revision-bound AI proposal",
+        language_surfaces,
+        [](const action_invocation_t&) {
+            code_editor_widget::accept_all();
+            return action_handler_result_t::completed();
+        }, [pending_hunk_capability](const interaction_context_t& context) {
+            return pending_hunk_capability(context);
+        }, true, {}, "category.programming.ai", "Programming / AI Review");
+    register_action(rt, "editor.ai.reject_all", "Reject All AI Hunks",
+        "Reject every pending hunk in the active revision-bound AI proposal",
+        language_surfaces,
+        [](const action_invocation_t&) {
+            code_editor_widget::reject_all();
+            return action_handler_result_t::completed();
+        }, [pending_hunk_capability](const interaction_context_t& context) {
+            return pending_hunk_capability(context);
+        }, true, {}, "category.programming.ai", "Programming / AI Review");
 
     auto source_breakpoint_capability = [](const interaction_context_t&) {
 		const auto document = code_editor_widget::document_state();
@@ -2744,6 +3215,160 @@ void initialize(runtime_t& rt) {
             return shell_capability(rt.shell.attach_process, "Process attachment is unavailable");
         }, false, {}, "category.tools", "Tools");
 
+    const auto network_surfaces = action_surface_t::application_menu |
+        action_surface_t::toolbar | action_surface_t::command_palette |
+        action_surface_t::accessibility;
+    const auto register_network_operation = [&rt, network_surfaces](
+        const char* id, const char* label, const char* description,
+        network_view::operational_command_t command, action_effect_t effects,
+        confirmation_requirement_t confirmation, const char* consequence) {
+        action_confirmation_prepare_fn_t prepare;
+        action_confirmation_cancel_fn_t cancel;
+        if (confirmation != confirmation_requirement_t::none) {
+            prepare = [command](const action_invocation_t&) {
+                std::string error;
+                return network_view::prepare_operational_command_confirmation(command, &error)
+                    ? action_handler_result_t::completed()
+                    : action_handler_result_t::failed(error.empty()
+                        ? "The Network confirmation target could not be retained" : error);
+            };
+            cancel = [command] { network_view::cancel_operational_command_confirmation(command); };
+        }
+        register_action_with_consequence(rt, id, label, description, network_surfaces,
+            [command](const action_invocation_t&) {
+                std::string error;
+                return network_view::execute_operational_command(command, &error)
+                    ? action_handler_result_t::completed("Network operation queued")
+                    : action_handler_result_t::failed(error.empty()
+                        ? "The Network operation was rejected" : error);
+            }, [command](const interaction_context_t&) {
+                const auto state = network_view::operational_command_capability(command);
+                return state.enabled ? capability_state_t::available()
+                    : capability_state_t::unavailable(state.disabled_reason.empty()
+                        ? "The Network operation is unavailable" : state.disabled_reason);
+            }, [command](const interaction_context_t&) {
+                if (command != network_view::operational_command_t::intercept_toggle)
+                    return action_check_state_t::not_checkable;
+                return network_view::operational_command_capability(command).checked
+                    ? action_check_state_t::checked : action_check_state_t::unchecked;
+            }, effects, confirmation, consequence,
+            [command](const interaction_context_t&) {
+                return network_view::operational_command_capability(command).target_summary;
+            }, std::move(prepare), std::move(cancel));
+    };
+    register_network_operation("network.capture.start", "Start Packet Capture",
+        "Start driver-backed packet capture with the current PID, port, and protocol filters",
+        network_view::operational_command_t::capture_start,
+        action_effect_t::network_activity | action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Starts driver-backed traffic collection");
+    register_network_operation("network.capture.stop", "Stop Packet Capture",
+        "Stop driver-backed packet capture without clearing retained packets",
+        network_view::operational_command_t::capture_stop,
+        action_effect_t::network_activity | action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Stops traffic collection and preserves retained packets");
+    register_network_operation("network.proxy.start", "Start Interception Proxy",
+        "Start the configured local interception Proxy listener",
+        network_view::operational_command_t::proxy_start,
+        action_effect_t::network_activity | action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Starts a local interception listener");
+    register_network_operation("network.proxy.stop", "Stop Interception Proxy",
+        "Stop the active local interception Proxy listener",
+        network_view::operational_command_t::proxy_stop,
+        action_effect_t::network_activity | action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Stops the local interception listener");
+    register_network_operation("network.proxy.history.clear", "Clear Proxy History...",
+        "Review permanently clearing the complete retained Proxy exchange history",
+        network_view::operational_command_t::proxy_history_clear,
+        action_effect_t::application_state | action_effect_t::destructive,
+        confirmation_requirement_t::explicit_confirmation,
+        "Permanently removes retained requests, responses, annotations, and evidence");
+    register_network_operation("network.proxy.ca_trust_repair", "Repair AiDA CA Trust...",
+        "Review repairing the AiDA interception CA in the current-user trust store",
+        network_view::operational_command_t::proxy_ca_trust_repair,
+        action_effect_t::file_system | action_effect_t::security_sensitive,
+        confirmation_requirement_t::explicit_confirmation,
+        "Installs the AiDA interception root CA for controlled Camoufox traffic");
+    register_network_operation("network.filters.add", "Add Network Filter Rule...",
+        "Review applying the current filter draft to live driver-backed traffic policy",
+        network_view::operational_command_t::filter_add,
+        action_effect_t::network_activity | action_effect_t::security_sensitive,
+        confirmation_requirement_t::explicit_confirmation, "Applies a live kernel traffic policy rule");
+    register_network_operation("network.filters.remove_selected", "Remove Selected Filter Rule...",
+        "Review removing the exact retained network filter rule",
+        network_view::operational_command_t::filter_remove_selected,
+        action_effect_t::network_activity | action_effect_t::security_sensitive |
+            action_effect_t::destructive,
+        confirmation_requirement_t::explicit_confirmation,
+        "Removes the retained live kernel traffic policy rule");
+    register_network_operation("network.filters.clear", "Clear All Filter Rules...",
+        "Review removing the exact retained set of network filter rules",
+        network_view::operational_command_t::filter_clear,
+        action_effect_t::network_activity | action_effect_t::security_sensitive |
+            action_effect_t::destructive,
+        confirmation_requirement_t::explicit_confirmation,
+        "Removes every retained live kernel traffic policy rule");
+    register_network_operation("network.intercept.toggle_enabled", "Enable / Disable Intercept",
+        "Toggle interception of new Proxy exchanges while preserving held exchanges",
+        network_view::operational_command_t::intercept_toggle,
+        action_effect_t::network_activity | action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Changes interception for newly observed Proxy exchanges");
+    register_network_operation("network.keylog.launch", "Launch Target with TLS Key Logging",
+        "Launch the configured executable and watch its bounded SSLKEYLOGFILE output",
+        network_view::operational_command_t::keylog_launch,
+        action_effect_t::live_process | action_effect_t::file_system |
+            action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Launches the configured target with SSLKEYLOGFILE enabled");
+    register_network_operation("network.keylog.watch", "Watch TLS Keylog File",
+        "Watch the configured SSLKEYLOGFILE without launching a process",
+        network_view::operational_command_t::keylog_watch,
+        action_effect_t::file_system | action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Reads appended TLS secrets from the configured file");
+    register_network_operation("network.keylog.stop", "Stop TLS Keylog Watcher",
+        "Stop the active SSLKEYLOGFILE watcher without clearing retained secrets",
+        network_view::operational_command_t::keylog_stop,
+        action_effect_t::application_state | action_effect_t::security_sensitive,
+        confirmation_requirement_t::none, "Stops watching and preserves retained TLS secrets");
+    register_network_operation("network.keylog.clear", "Clear Captured TLS Secrets...",
+        "Review permanently clearing the exact retained TLS secret set",
+        network_view::operational_command_t::keylog_clear,
+        action_effect_t::application_state | action_effect_t::security_sensitive |
+            action_effect_t::destructive,
+        confirmation_requirement_t::explicit_confirmation,
+        "Permanently removes retained TLS secrets used for later traffic decryption");
+
+	const auto register_memory_scan_action = [&rt](const char* id, const char* label,
+		const char* description, memory_scanner_view::scan_command_t command) {
+		register_action(rt, id, label, description,
+			action_surface_t::application_menu | action_surface_t::toolbar |
+			action_surface_t::command_palette | action_surface_t::shortcut |
+			action_surface_t::accessibility,
+			[command](const action_invocation_t&) {
+				const auto result = memory_scanner_view::execute_scan_command(command);
+				return result.succeeded
+					? action_handler_result_t::completed(result.detail)
+					: action_handler_result_t::failed(result.detail);
+			}, [command](const interaction_context_t&) {
+				const auto state = memory_scanner_view::scan_command_capability(command);
+				return state.enabled ? capability_state_t::available()
+					: capability_state_t::unavailable(state.disabled_reason);
+			}, false, {}, "category.memory", "Memory");
+	};
+	register_memory_scan_action("memory.first_scan", "First Scan",
+		"Start an initial value scan using the current type, mode, value, range, and live target",
+		memory_scanner_view::scan_command_t::first_scan);
+	register_memory_scan_action("memory.next_scan", "Next Scan",
+		"Refine the current value-scan result generation using the configured comparison",
+		memory_scanner_view::scan_command_t::next_scan);
+	register_memory_scan_action("memory.stop_scan", "Stop Scan",
+		"Request safe cancellation of the active value-scan task without discarding completed state",
+		memory_scanner_view::scan_command_t::stop_scan);
+	register_memory_scan_action("memory.undo_scan", "Undo Scan",
+		"Restore the previous completed value-scan result generation",
+		memory_scanner_view::scan_command_t::undo_scan);
+	register_memory_scan_action("memory.new_scan", "New Scan",
+		"Clear scan results and history while preserving the address list and current scan configuration",
+		memory_scanner_view::scan_command_t::new_scan);
+
 	const auto register_debugger_action = [&rt](const char* id, const char* label,
 		const char* description, debugger_view::execution_command_t command) {
 		register_action(rt, id, label, description,
@@ -2961,6 +3586,17 @@ void initialize(runtime_t& rt) {
         [](const action_invocation_t&) {
             const auto result = application_views::open_or_focus(stable_view_id_t("view.workspace_search"));
             return result.ok() ? action_handler_result_t::completed() : action_handler_result_t::failed(result.detail);
+        });
+    register_action(rt, "explorer.search_here", "Search Here",
+        "Scope Workspace Search to the retained Project Explorer folder or selected file's containing folder",
+        context_surfaces,
+        [&rt](const action_invocation_t&) {
+            const auto result = explorer_views::request_search_scope(
+                rt.explorer.path, rt.explorer.directory);
+            return result.accepted ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(result.detail);
+        }, [&rt](const interaction_context_t&) {
+            return single_explorer_selection(rt.explorer);
         });
     register_action(rt, "explorer.refresh", "Refresh", "Refresh Explorer", context_surfaces,
         [](const action_invocation_t&) { file_browser::needs_refresh = true; return action_handler_result_t::completed(); });
@@ -3275,6 +3911,104 @@ void initialize(runtime_t& rt) {
                     "The file changed on disk; resolve the editor conflict before saving")
                 : capability_state_t::available();
         });
+    register_action(rt, "tab.compare_disk", "Compare with Disk",
+        "Load the bounded current disk version asynchronously and open a revision-bound reviewed comparison",
+        context_surfaces,
+        [&rt](const action_invocation_t&) {
+            const auto result = file_tabs::compare_with_disk(rt.tab.index);
+            return result.succeeded ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(result.detail);
+        }, [&rt](const interaction_context_t&) {
+            if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                return capability_state_t::unavailable("The tab is no longer open");
+            const auto& tab = file_tabs::tabs[file_tabs::tab_index(rt.tab.index)];
+            if (tab.filepath.empty() || !tab.buffer_loaded)
+                return capability_state_t::unavailable(
+                    "Open a path-backed text document before comparing with disk");
+            return tab.recovery_operation_pending
+                ? capability_state_t::unavailable(
+                    "Another document comparison or recovery operation is still running")
+                : capability_state_t::available();
+        });
+    register_action(rt, "tab.load.cancel", "Cancel Load",
+        "Cancel the asynchronous bounded read for this editor document", context_surfaces,
+        [&rt](const action_invocation_t&) {
+            if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                return action_handler_result_t::failed("The tab is no longer open");
+            file_tabs::cancel_document_load(
+                file_tabs::tabs[file_tabs::tab_index(rt.tab.index)].document_id);
+            return action_handler_result_t::completed();
+        }, [&rt](const interaction_context_t&) {
+            return file_tabs::is_valid_tab_index(rt.tab.index) &&
+                file_tabs::tabs[file_tabs::tab_index(rt.tab.index)].load_in_progress
+                ? capability_state_t::available()
+                : capability_state_t::unavailable("This document is not loading");
+        });
+    register_action(rt, "tab.load.retry", "Retry Load",
+        "Retry the asynchronous bounded read for this editor document", context_surfaces,
+        [&rt](const action_invocation_t&) {
+            if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                return action_handler_result_t::failed("The tab is no longer open");
+            file_tabs::load_tab_into_editor(rt.tab.index);
+            return action_handler_result_t::completed();
+        }, [&rt](const interaction_context_t&) {
+            if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                return capability_state_t::unavailable("The tab is no longer open");
+            const auto& tab = file_tabs::tabs[file_tabs::tab_index(rt.tab.index)];
+            return !tab.buffer_loaded && !tab.load_in_progress
+                ? capability_state_t::available()
+                : capability_state_t::unavailable("This document does not have a failed load to retry");
+        });
+    register_action(rt, "tab.recovery.retry_probe", "Retry Recovery Check",
+        "Retry the asynchronous verified recovery-journal probe", context_surfaces,
+        [&rt](const action_invocation_t&) {
+            if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                return action_handler_result_t::failed("The tab is no longer open");
+            auto& tab = file_tabs::tabs[file_tabs::tab_index(rt.tab.index)];
+            tab.recovery_error.clear();
+            tab.recovery_probe_completed = false;
+            file_tabs::request_recovery_probe(rt.tab.index);
+            return action_handler_result_t::completed();
+        }, [&rt](const interaction_context_t&) {
+            if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                return capability_state_t::unavailable("The tab is no longer open");
+            const auto& tab = file_tabs::tabs[file_tabs::tab_index(rt.tab.index)];
+            return !tab.recovery_operation_pending && tab.recovery_probe_completed &&
+                !tab.recovery_error.empty()
+                ? capability_state_t::available()
+                : capability_state_t::unavailable("No failed recovery check is available to retry");
+        });
+    register_action(rt, "tab.external.reload", "Reload from Disk",
+        "Replace the unmodified editor buffer with the newer retained disk version", context_surfaces,
+        [&rt](const action_invocation_t&) {
+            return file_tabs::reload_external(rt.tab.index)
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(
+                    "The retained disk-conflict state changed before reload executed");
+        }, [&rt](const interaction_context_t&) {
+            if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                return capability_state_t::unavailable("The tab is no longer open");
+            const auto& tab = file_tabs::tabs[file_tabs::tab_index(rt.tab.index)];
+            if (!tab.external_conflict)
+                return capability_state_t::unavailable("The file has no unresolved disk conflict");
+            return tab.dirty ? capability_state_t::unavailable(
+                "Save the editor changes elsewhere or keep the editor version first")
+                : capability_state_t::available();
+        });
+    register_action(rt, "tab.external.keep_editor", "Keep Editor Version",
+        "Approve the retained editor version for the next explicit save over the newer disk version",
+        context_surfaces,
+        [&rt](const action_invocation_t&) {
+            return file_tabs::keep_editor_version(rt.tab.index)
+                ? action_handler_result_t::completed()
+                : action_handler_result_t::failed(
+                    "The retained disk-conflict state changed before approval executed");
+        }, [&rt](const interaction_context_t&) {
+            return file_tabs::is_valid_tab_index(rt.tab.index) &&
+                file_tabs::tabs[file_tabs::tab_index(rt.tab.index)].external_conflict
+                ? capability_state_t::available()
+                : capability_state_t::unavailable("The file has no unresolved disk conflict");
+        });
     const auto recovery_capability = [&rt](bool allow_dirty) {
         if (!file_tabs::is_valid_tab_index(rt.tab.index))
             return capability_state_t::unavailable("The tab is no longer open");
@@ -3461,6 +4195,72 @@ void initialize(runtime_t& rt) {
                 ? capability_state_t::available()
                 : capability_state_t::unavailable("The tab is no longer open");
         });
+    struct editor_split_action_t {
+        const char* id;
+        const char* label;
+        workspace_layout::dock_split_direction_t direction;
+    };
+    for (const auto& split : std::array<editor_split_action_t, 4>{{
+            {"tab.split_left", "Split Editor Left", workspace_layout::dock_split_direction_t::left},
+            {"tab.split_right", "Split Editor Right", workspace_layout::dock_split_direction_t::right},
+            {"tab.split_up", "Split Editor Up", workspace_layout::dock_split_direction_t::up},
+            {"tab.split_down", "Split Editor Down", workspace_layout::dock_split_direction_t::down}}}) {
+        register_action(rt, split.id, split.label,
+            "Move this document into a new dockable editor group in the explicit direction",
+            context_surfaces,
+            [&rt, direction = split.direction](const action_invocation_t&) {
+                if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                    return action_handler_result_t::failed("The tab is no longer open");
+                const auto anchor_instance = code_group_instance(rt.tab.index);
+                if (!anchor_instance)
+                    return action_handler_result_t::failed("The editor group is no longer available");
+                const std::string anchor_window =
+                    application_views::registry().window_name(*anchor_instance);
+                const std::uint32_t original_group = file_tabs::tabs[
+                    file_tabs::tab_index(rt.tab.index)].group_id;
+                if (file_tabs::create_group_for_tab(rt.tab.index) == 0)
+                    return action_handler_result_t::failed("The tab is no longer open");
+                file_tabs::switch_to(rt.tab.index);
+                const auto opened = application_views::open_or_focus(
+                    stable_view_id_t("document.code"));
+                const auto split_instance = code_group_instance(rt.tab.index);
+                if (!opened.ok() || !split_instance) {
+                    file_tabs::move_to_group(rt.tab.index, original_group);
+                    return action_handler_result_t::failed(opened.ok()
+                        ? "The new editor group was not registered" : opened.detail);
+                }
+                const std::string split_window_name =
+                    application_views::registry().window_name(*split_instance);
+                const auto result = workspace_layout::split_window(
+                    split_window_name, anchor_window, direction);
+                if (result != workspace_layout::workspace_request_result_t::completed &&
+                    result != workspace_layout::workspace_request_result_t::queued &&
+                    result != workspace_layout::workspace_request_result_t::unchanged) {
+                    file_tabs::move_to_group(rt.tab.index, original_group);
+                    return action_handler_result_t::failed(
+                        "The workspace could not create the requested directional editor split");
+                }
+                return action_handler_result_t::completed();
+            }, [&rt](const interaction_context_t&) {
+                if (!file_tabs::is_valid_tab_index(rt.tab.index))
+                    return capability_state_t::unavailable("The tab is no longer open");
+                if (workspace_layout::operation_pending())
+                    return capability_state_t::unavailable(
+                        "A workspace layout transaction is already in progress");
+                if (workspace_layout::layout_locked())
+                    return capability_state_t::unavailable(
+                        "Unlock the workspace layout before splitting editor groups");
+                const auto instance = code_group_instance(rt.tab.index);
+                if (!instance)
+                    return capability_state_t::unavailable(
+                        "The editor group is no longer available");
+                const auto placement = workspace_layout::inspect_window_placement(
+                    application_views::registry().window_name(*instance));
+                return placement.docked ? capability_state_t::available()
+                    : capability_state_t::unavailable(
+                        "Dock this editor group before creating a directional split");
+            });
+    }
     register_action(rt, "tab.move_primary_group", "Move into Primary Group",
         "Move this document back into the primary editor group", context_surfaces,
         [&rt](const action_invocation_t&) {
@@ -3647,6 +4447,16 @@ void initialize(runtime_t& rt) {
     register_global_shortcut(rt, "binding.global.network", "view.network", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_N, "Ctrl+Shift+N");
     register_global_shortcut(rt, "binding.global.debugger", "view.debugger", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_D, "Ctrl+Shift+D");
     register_global_shortcut(rt, "binding.global.scan", "view.scan", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_M, "Ctrl+Shift+M");
+	register_widget_shortcut(rt, "binding.memory.first_scan", "memory.first_scan",
+		ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_F, "Ctrl+Alt+F", k_memory_scan_scope, 50);
+	register_widget_shortcut(rt, "binding.memory.next_scan", "memory.next_scan",
+		ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_N, "Ctrl+Alt+N", k_memory_scan_scope, 50);
+	register_widget_shortcut(rt, "binding.memory.stop_scan", "memory.stop_scan",
+		ImGuiMod_Shift | ImGuiKey_Escape, "Shift+Escape", k_memory_scan_scope, 50);
+	register_widget_shortcut(rt, "binding.memory.undo_scan", "memory.undo_scan",
+		ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_Z, "Ctrl+Alt+Z", k_memory_scan_scope, 50);
+	register_widget_shortcut(rt, "binding.memory.new_scan", "memory.new_scan",
+		ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_R, "Ctrl+Alt+R", k_memory_scan_scope, 50);
     register_global_shortcut(rt, "binding.global.binary_map", "view.binary_map", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_B, "Ctrl+Shift+B");
     register_global_shortcut(rt, "binding.global.command_palette", "view.command_palette", ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_P, "Ctrl+Shift+P");
     register_global_shortcut(rt, "binding.global.new_chat", "ai.new_chat", ImGuiMod_Ctrl | ImGuiKey_L, "Ctrl+L");
@@ -4341,14 +5151,18 @@ void initialize(runtime_t& rt) {
              menu_action("edit.goto_line", 2)}),
         menu_section("section.editor.language", context_menu_group_t::inspect_relate, 4,
             {menu_action("programming.language.definition", 0),
-             menu_action("programming.language.references", 1),
-             menu_action("programming.language.completion", 2),
-             menu_action("programming.language.hover", 3),
-             menu_action("programming.language.signature_help", 4),
-             menu_action("programming.language.rename", 5),
-             menu_action("programming.language.format", 6),
-             menu_action("programming.language.code_actions", 7),
-             menu_action("programming.language.document_symbols", 8)}),
+             menu_action("programming.language.declaration", 1),
+             menu_action("programming.language.implementation", 2),
+             menu_action("programming.language.type_definition", 3),
+             menu_action("programming.language.references", 4),
+             menu_action("programming.language.completion", 5),
+             menu_action("programming.language.hover", 6),
+             menu_action("programming.language.signature_help", 7),
+             menu_action("programming.language.rename", 8),
+             menu_action("programming.language.format_selection", 9),
+             menu_action("programming.language.format", 10),
+             menu_action("programming.language.code_actions", 11),
+             menu_action("programming.language.document_symbols", 12)}),
         menu_section("section.editor.diagnostics", context_menu_group_t::inspect_relate, 5,
             {menu_action("programming.task.run", 0), menu_action("programming.task.cancel", 1),
              menu_action("programming.show_problems", 2), menu_action("programming.task.configure", 3),
@@ -4356,9 +5170,25 @@ void initialize(runtime_t& rt) {
 		menu_section("section.editor.source_debug", context_menu_group_t::modify_run, 6,
 			{menu_action("debug.source.toggle_breakpoint", 0),
 			 menu_action("debug.source.open_mixed", 1),
-			 menu_action("debug.source.rebind", 2)}),
+			 menu_action("debug.source.rebind", 2),
+             menu_action("programming.run.selection", 3),
+             menu_action("programming.debug.selection", 4),
+             menu_action("programming.test.selection", 5),
+             menu_action("programming.run.file", 6),
+             menu_action("programming.debug.file", 7),
+             menu_action("programming.test.file", 8),
+             menu_action("debug.selection.watch", 9),
+             menu_action("debug.selection.evaluate", 10)}),
         menu_section("section.editor.ai", context_menu_group_t::ai_evidence, 7,
-            {menu_action("editor.add_to_chat", 0)}),
+            {menu_action("editor.ai.explain", 0),
+             menu_action("editor.ai.refactor", 1),
+             menu_action("editor.ai.fix", 2),
+             menu_action("editor.ai.generate_tests", 3),
+             menu_action("editor.add_to_chat", 4),
+             menu_action("editor.ai.accept_hunk", 5),
+             menu_action("editor.ai.reject_hunk", 6),
+             menu_action("editor.ai.accept_all", 7),
+             menu_action("editor.ai.reject_all", 8)}),
         menu_section("section.editor.file", context_menu_group_t::modify_run, 8,
             {menu_action("file.quick_open", 0), menu_action("file.save", 1),
              menu_action("file.save_as", 2), menu_action("file.save_all", 3),
@@ -4368,14 +5198,17 @@ void initialize(runtime_t& rt) {
         menu_section("section.tab.reopen", context_menu_group_t::open_navigate, 0,
             {menu_action("file.reopen_closed_document", 0)}),
         menu_section("section.tab.file", context_menu_group_t::modify_run, 0,
-            {menu_action("tab.save", 0), menu_action("tab.close", 1),
-             menu_action("tab.close_others", 2), menu_action("tab.close_right", 3),
-             menu_action("tab.close_saved", 4)}),
+            {menu_action("tab.save", 0), menu_action("file.save_all", 1),
+             menu_action("tab.compare_disk", 2), menu_action("tab.close", 3),
+             menu_action("tab.close_others", 4), menu_action("tab.close_right", 5),
+             menu_action("tab.close_saved", 6)}),
         menu_section("section.tab.group", context_menu_group_t::open_navigate, 1,
             {menu_action("tab.toggle_pin", 0), menu_action("tab.move_new_group", 1),
-             menu_action("tab.move_primary_group", 2), menu_action("tab.float_group", 3),
-             menu_action("tab.history_back", 4), menu_action("tab.history_forward", 5),
-             menu_action("tab.reveal_in_explorer", 6)}),
+             menu_action("tab.split_left", 2), menu_action("tab.split_right", 3),
+             menu_action("tab.split_up", 4), menu_action("tab.split_down", 5),
+             menu_action("tab.move_primary_group", 6), menu_action("tab.float_group", 7),
+             menu_action("tab.history_back", 8), menu_action("tab.history_forward", 9),
+             menu_action("tab.reveal_in_explorer", 10)}),
         menu_section("section.tab.copy", context_menu_group_t::copy_export, 2,
             {menu_action("tab.copy_path", 0), menu_action("tab.copy_relative_path", 1),
              menu_action("tab.copy_name", 2)}),
@@ -4393,7 +5226,7 @@ void initialize(runtime_t& rt) {
         menu_section("section.explorer.open", context_menu_group_t::open_navigate, 0,
             {menu_action("explorer.open", 0), menu_action("explorer.open_with", 1),
              menu_action("explorer.analyze_binary", 2), menu_action("explorer.terminal_here", 3),
-             menu_action("explorer.set_workspace_root", 4), menu_action("explorer.search", 5)}),
+             menu_action("explorer.set_workspace_root", 4), menu_action("explorer.search_here", 5)}),
         menu_section("section.explorer.modify", context_menu_group_t::modify_run, 1,
             {menu_action("explorer.new_file", 0), menu_action("explorer.new_folder", 1),
              menu_action("explorer.rename", 2), menu_action("explorer.cut", 3),
@@ -4881,6 +5714,65 @@ std::uint64_t now_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+void cancel_action_confirmation(runtime_t& rt);
+
+bool queue_action_confirmation(runtime_t& rt, const char* id,
+                               action_invocation_source_t source,
+                               const action_execution_result_t& result) {
+    if (result.status != action_execution_status_t::confirmation_required &&
+        result.status != action_execution_status_t::review_required)
+        return false;
+    if (rt.pending_confirmation.active)
+        cancel_action_confirmation(rt);
+    const auto* descriptor = rt.actions.find(action_id(id));
+    if (!descriptor)
+        return false;
+    rt.pending_confirmation = {};
+    rt.pending_confirmation.active = true;
+    rt.pending_confirmation.open_requested = true;
+    rt.pending_confirmation.action = id;
+    rt.pending_confirmation.label = descriptor->label;
+    rt.pending_confirmation.description = descriptor->description;
+    rt.pending_confirmation.consequence = result.consequence_summary;
+    rt.pending_confirmation.source = source;
+    return true;
+}
+
+void cancel_action_confirmation(runtime_t& rt) {
+    if (!rt.pending_confirmation.active)
+        return;
+    const std::string pending_id = rt.pending_confirmation.action;
+    const auto* descriptor = rt.actions.find(
+        action_id(pending_id.c_str()));
+    const auto cleanup = descriptor ? descriptor->cancel_confirmation
+                                    : action_confirmation_cancel_fn_t{};
+    rt.pending_confirmation = {};
+    try {
+        if (cleanup)
+            cleanup();
+    } catch (const std::exception& exception) {
+        design::notification_t diagnostic;
+        diagnostic.stable_id = "diagnostic.ui.confirmation.cleanup";
+        diagnostic.owner = "application.ui";
+        diagnostic.target = pending_id.c_str();
+        diagnostic.summary = "Action confirmation cleanup failed";
+        diagnostic.details = exception.what();
+        diagnostic.semantic = design::semantic_t::error;
+        diagnostic.attention_required = true;
+        static_cast<void>(design::publish_notification(std::move(diagnostic)));
+    } catch (...) {
+        design::notification_t diagnostic;
+        diagnostic.stable_id = "diagnostic.ui.confirmation.cleanup";
+        diagnostic.owner = "application.ui";
+        diagnostic.target = pending_id.c_str();
+        diagnostic.summary = "Action confirmation cleanup failed";
+        diagnostic.details = "The cleanup callback raised an unknown exception";
+        diagnostic.semantic = design::semantic_t::error;
+        diagnostic.attention_required = true;
+        static_cast<void>(design::publish_notification(std::move(diagnostic)));
+    }
+}
+
 bool execute_resolution(runtime_t& rt, const shortcut_resolution_t& resolution) {
     if (!resolution.resolved())
         return resolution.status != shortcut_resolution_status_t::none;
@@ -4888,8 +5780,10 @@ bool execute_resolution(runtime_t& rt, const shortcut_resolution_t& resolution) 
     invocation.source = action_invocation_source_t::shortcut;
     invocation.invocation_id = rt.invocation++;
     const auto result = rt.actions.execute(resolution.action, invocation);
-    publish_action_execution_failure(resolution.action.c_str(), result,
-        action_invocation_source_t::shortcut);
+    if (!queue_action_confirmation(rt, resolution.action.c_str(),
+            action_invocation_source_t::shortcut, result))
+        publish_action_execution_failure(resolution.action.c_str(), result,
+            action_invocation_source_t::shortcut);
     return true;
 }
 
@@ -4914,6 +5808,90 @@ void begin_frame() {
     rt.editor_text_input = false;
     rt.editor.focused = rt.editor_focused;
     rt.current = active_context(rt);
+}
+
+void render_action_confirmation() {
+    auto& rt = runtime();
+    initialize(rt);
+    if (!rt.pending_confirmation.active)
+        return;
+    constexpr const char* popup_label =
+        "Confirm Action###aida_global_action_confirmation";
+    if (rt.pending_confirmation.open_requested) {
+        design::open_dialog("aida_global_action_confirmation", "Confirm Action");
+        rt.pending_confirmation.open_requested = false;
+    }
+    bool keep_open = true;
+    if (design::begin_dialog_exact(popup_label, ImVec2(560.0f, 350.0f),
+            ImVec2(420.0f, 280.0f), &keep_open)) {
+        rt.current = active_context(rt);
+        const std::string pending_id = rt.pending_confirmation.action;
+        const auto pending_source = rt.pending_confirmation.source;
+        const auto state = rt.actions.evaluate(action_id(pending_id.c_str()), rt.current);
+        const auto* descriptor = rt.actions.find(action_id(pending_id.c_str()));
+        const action_effect_t high_consequence_effects =
+            action_effect_t::destructive | action_effect_t::security_sensitive |
+            action_effect_t::live_process | action_effect_t::file_system |
+            action_effect_t::network_activity | action_effect_t::memory_mutation |
+            action_effect_t::debugger_execution;
+        const bool high_consequence = descriptor &&
+            any(descriptor->consequence.effects & high_consequence_effects);
+        const float footer_height = design::dialog_footer_reserve_height(
+            "Confirm", "Cancel");
+        design::begin_dialog_body("aida_global_action_confirmation_body",
+            footer_height);
+        design::text(design::text_role_t::title,
+            rt.pending_confirmation.label.c_str());
+        if (!rt.pending_confirmation.description.empty())
+            ImGui::TextWrapped("%s", rt.pending_confirmation.description.c_str());
+        if (!rt.pending_confirmation.consequence.empty()) {
+            ImGui::Spacing();
+            ImGui::TextWrapped("Consequence: %s", rt.pending_confirmation.consequence.c_str());
+        }
+        if (!state.capability.enabled && !state.capability.disabled_reason.empty())
+            ImGui::TextWrapped("Unavailable: %s", state.capability.disabled_reason.c_str());
+        design::end_dialog_body();
+        const auto dialog_result = design::dialog_footer(
+            "aida_global_action_confirmation_footer", "Confirm",
+            state.capability.enabled, high_consequence);
+        if (!descriptor || !state.capability.enabled) {
+            action_execution_result_t unavailable;
+            unavailable.status = action_execution_status_t::unavailable;
+            unavailable.action = action_id(pending_id.c_str());
+            unavailable.message = !descriptor ? "The retained action is no longer registered"
+                : state.capability.disabled_reason.empty()
+                    ? "The retained action became unavailable before confirmation"
+                    : state.capability.disabled_reason;
+            cancel_action_confirmation(rt);
+            ImGui::CloseCurrentPopup();
+            publish_action_execution_failure(pending_id.c_str(), unavailable,
+                pending_source);
+        } else if (dialog_result.confirmed) {
+            action_invocation_t invocation{rt.current};
+            invocation.source = pending_source;
+            invocation.invocation_id = rt.invocation++;
+            invocation.review_completed = true;
+            invocation.confirmation_granted = true;
+            const auto result = rt.actions.execute(
+                action_id(pending_id.c_str()), invocation);
+            if (result.executed())
+                rt.pending_confirmation = {};
+            else
+                cancel_action_confirmation(rt);
+            ImGui::CloseCurrentPopup();
+            publish_action_execution_failure(pending_id.c_str(), result,
+                pending_source);
+        } else if (dialog_result.cancelled) {
+            cancel_action_confirmation(rt);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (!keep_open)
+        cancel_action_confirmation(rt);
+    else if (rt.pending_confirmation.active &&
+             !ImGui::IsPopupOpen(popup_label))
+        cancel_action_confirmation(rt);
 }
 
 void process_global_shortcuts() {
@@ -5361,6 +6339,48 @@ action_execution_result_t execute_action(const char* id, action_invocation_sourc
     auto& rt = runtime();
     initialize(rt);
     rt.current = active_context(rt);
+    action_invocation_t invocation{rt.current};
+    invocation.source = source;
+    invocation.invocation_id = rt.invocation++;
+    auto result = rt.actions.execute(action_id(id), invocation);
+    if (!queue_action_confirmation(rt, id, source, result))
+        publish_action_execution_failure(id, result, source);
+    return result;
+}
+
+action_execution_result_t execute_editor_hunk_action(int hunk_index,
+        const char* id, action_invocation_source_t source) {
+    auto& rt = runtime();
+    initialize(rt);
+    rt.editor_hunk_index = hunk_index;
+    rt.current = editor_context(rt);
+    action_invocation_t invocation{rt.current};
+    invocation.source = source;
+    invocation.invocation_id = rt.invocation++;
+    auto result = rt.actions.execute(action_id(id), invocation);
+    rt.editor_hunk_index = -1;
+    publish_action_execution_failure(id, result, source);
+    return result;
+}
+
+action_execution_result_t execute_editor_tab_action(int tab_index,
+        const char* id, action_invocation_source_t source) {
+    auto& rt = runtime();
+    initialize(rt);
+    if (!file_tabs::is_valid_tab_index(tab_index)) {
+        action_execution_result_t result;
+        result.status = action_execution_status_t::unavailable;
+        result.action = action_id(id);
+        result.message = "The editor tab is no longer open";
+        publish_action_execution_failure(id, result, source);
+        return result;
+    }
+    const auto& tab = file_tabs::tabs[file_tabs::tab_index(tab_index)];
+    rt.tab = {tab_index, tab.filepath, tab.filename};
+    rt.current = {};
+    rt.current.active_view = stable_view_id_t("document.code");
+    rt.current.payload = typed_context_ref_t::from(context_type(k_tab_context_type), rt.tab);
+    rt.current.generation = ++rt.generation;
     action_invocation_t invocation{rt.current};
     invocation.source = source;
     invocation.invocation_id = rt.invocation++;

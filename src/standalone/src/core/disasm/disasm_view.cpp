@@ -9,6 +9,7 @@
 #include "../analysis/types_hub_view.hpp"
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../preview/disasm_preview_adapter.hpp"
+#include "../../preview/studio_semantics.hpp"
 #else
 #include "../analysis/source_reconstruct_view.hpp"
 #endif
@@ -1034,9 +1035,12 @@ void render_xref_popup(const workspace_context_t& context) {
     }
     if (open)
         ImGui::OpenPopup("Cross references##workspace_xrefs");
-    if (!ImGui::BeginPopupModal("Cross references##workspace_xrefs", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize))
+    if (!aida::ui::design::begin_dialog_exact("Cross references##workspace_xrefs",
+            ImVec2(720.0f, 560.0f), ImVec2(420.0f, 320.0f)))
         return;
+    const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+        "Close", nullptr);
+    aida::ui::design::begin_dialog_body("workspace_xrefs_body", footer_height);
     std::vector<xref_popup_entry_t> entries;
     bool scanning = false;
     {
@@ -1046,12 +1050,12 @@ void render_xref_popup(const workspace_context_t& context) {
     }
     static_cast<void>(aida::ui::search_field("xref_filter",
         context.view->xref_popup_filter, sizeof(context.view->xref_popup_filter),
-        "Filter by name or address", 620.0f));
+        "Filter by name or address", ImGui::GetContentRegionAvail().x));
     if (scanning)
         aida::ui::inline_notice("xref_scanning", "Searching cross references",
             "Querying the workspace index for matching callers and targets.",
             aida::ui::status_kind_t::info);
-    ImGui::BeginChild("##xref_rows", ImVec2(620.0f, 320.0f), true);
+    ImGui::BeginChild("##xref_rows", ImVec2(0.0f, ImGui::GetContentRegionAvail().y), true);
     const bool rows_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     const std::string filter(context.view->xref_popup_filter);
     std::vector<std::size_t> visible_indices;
@@ -1126,13 +1130,10 @@ void render_xref_popup(const workspace_context_t& context) {
         context.view->xref_popup_open = false;
         ImGui::CloseCurrentPopup();
     }
-    const bool escape = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-    if (aida::ui::button("Close", aida::ui::button_kind_t::secondary,
-            aida::ui::size_t_::sm, ImVec2(110.0f, 28.0f))) {
-        std::lock_guard<std::mutex> lock(context.view->mutex);
-        context.view->xref_popup_open = false;
-        ImGui::CloseCurrentPopup();
-    } else if (escape) {
+    aida::ui::design::end_dialog_body();
+    const auto footer = aida::ui::design::dialog_footer("workspace_xrefs_footer",
+        "Close", true, false, nullptr);
+    if (footer.confirmed || footer.cancelled) {
         std::lock_guard<std::mutex> lock(context.view->mutex);
         context.view->xref_popup_open = false;
         ImGui::CloseCurrentPopup();
@@ -3031,22 +3032,24 @@ void render(float, float, float width, float height,
         !ImGui::IsPopupOpen("Rebase###disasm_rebase_modal"))
         ImGui::OpenPopup("Rebase###disasm_rebase_modal");
     if (context.view->rebase_popup_open &&
-        ImGui::BeginPopupModal("Rebase###disasm_rebase_modal", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        aida::ui::design::begin_dialog_exact("Rebase###disasm_rebase_modal",
+            ImVec2(460.0f, 300.0f), ImVec2(360.0f, 240.0f))) {
+        const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+            "Apply", "Cancel");
+        aida::ui::design::begin_dialog_body("disasm_rebase_body", footer_height);
         ImGui::TextUnformatted("Image base");
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
         const bool enter = ImGui::InputTextWithHint("##rebase_image_base", "0x140000000",
             context.view->rebase_buf, sizeof(context.view->rebase_buf),
             ImGuiInputTextFlags_EnterReturnsTrue);
         if (!context.view->rebase_error.empty())
             aida::ui::inline_notice("rebase_error", "Invalid image base",
                 context.view->rebase_error.c_str(), aida::ui::status_kind_t::error);
-        const bool apply = aida::ui::button("Apply", aida::ui::button_kind_t::primary,
-            aida::ui::size_t_::sm) || enter;
-        ImGui::SameLine(0.0f, aida::ui::metrics::spacing::sm);
-		const bool escape_pressed = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
-        const bool cancel = aida::ui::button("Cancel", aida::ui::button_kind_t::secondary,
-            aida::ui::size_t_::sm) ||
-			escape_pressed;
+        aida::ui::design::end_dialog_body();
+        const auto footer = aida::ui::design::dialog_footer("disasm_rebase_footer",
+            "Apply", true, false, "Cancel");
+        const bool apply = footer.confirmed || enter;
+        const bool cancel = footer.cancelled;
         if (apply) {
             const auto base = parse_address_text(context, context.view->rebase_buf);
             if (!base || *base == 0 || context.image->image_size() >
@@ -3066,7 +3069,7 @@ void render(float, float, float width, float height,
                 ImGui::CloseCurrentPopup();
             }
         } else if (cancel) {
-			escape_consumed = escape_pressed;
+			escape_consumed = ImGui::IsKeyPressed(ImGuiKey_Escape, false);
             std::lock_guard<std::mutex> lock(context.view->mutex);
             context.view->rebase_error.clear();
             context.view->rebase_popup_open = false;
@@ -3390,17 +3393,39 @@ void render(float, float, float width, float height,
                     std::lock_guard<std::mutex> lock(context.view->mutex);
                     selected_banner = context.view->banner_selected_all;
                 }
-                if (ImGui::Selectable("##metadata", selected_banner,
-                        ImGuiSelectableFlags_SpanAllColumns, ImVec2(0.0f, row_height))) {
+                ImGui::InvisibleButton("##metadata",
+                    ImVec2((std::max)(1.0f, ImGui::GetContentRegionAvail().x), row_height),
+                    ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+                const bool metadata_left_clicked =
+                    ImGui::IsItemClicked(ImGuiMouseButton_Left);
+                const bool metadata_right_clicked =
+                    ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                const bool metadata_hovered = ImGui::IsItemHovered();
+                if (metadata_left_clicked) {
                     std::lock_guard<std::mutex> lock(context.view->mutex);
                     context.view->banner_selected_all = true;
                     context.view->banner_selected_line = virtual_index;
                     context.view->selection.reset();
                     selection.reset();
                 }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+                if (ImGui::IsItemVisible()) {
+                    const std::string metadata_semantic_id =
+                        aida::preview::semantics::stable_id(
+                            "aida.disassembly.metadata-row",
+                            "row-" + std::to_string(virtual_index));
+                    aida::preview::semantics::register_last_item(
+                        metadata_semantic_id, "disassembly-metadata-row");
+                }
+#endif
                 const ImVec2 minimum = ImGui::GetItemRectMin();
                 const ImVec2 maximum = ImGui::GetItemRectMax();
                 ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                if (selected_banner || metadata_hovered) {
+                    draw_list->AddRectFilled(minimum, maximum,
+                        ImGui::GetColorU32(selected_banner
+                            ? ImGuiCol_Header : ImGuiCol_HeaderHovered));
+                }
                 const float prefix_x = minimum.x + gutter_width + char_width * 0.5f;
                 const float text_x = prefix_x + prefix_width + char_width * 1.5f;
                 const float text_y = minimum.y + (row_height - code_size) * 0.5f;
@@ -3433,7 +3458,7 @@ void render(float, float, float width, float height,
                 draw_list->AddText(code_font, code_size, ImVec2(text_x, text_y),
                     aida::ui::with_alpha(line_color, alpha), line.text.c_str(), nullptr,
                     0.0f, &clip_rect);
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                if (metadata_right_clicked) {
                     {
                         std::lock_guard<std::mutex> lock(context.view->mutex);
                         context.view->banner_selected_line = virtual_index;
@@ -3484,6 +3509,16 @@ void render(float, float, float width, float height,
                     }
                 }
             }
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+            if (ImGui::IsItemVisible()) {
+                const std::string instruction_semantic_id =
+                    aida::preview::semantics::stable_id(
+                        "aida.disassembly.instruction-row",
+                        "address-" + std::to_string(instruction.address.value));
+                aida::preview::semantics::register_last_item(
+                    instruction_semantic_id, "disassembly-instruction-row");
+            }
+#endif
             const bool typed_pointer_request =
                 ImGui::IsItemClicked(ImGuiMouseButton_Right);
             if (typed_pointer_request && (!selection || *selection != instruction.address)) {

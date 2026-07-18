@@ -1584,9 +1584,13 @@ void render_context_mutation_confirmation() {
 		ImGui::OpenPopup("Confirm Debugger Mutation##context");
 		g_pending_context_mutation_open = false;
 	}
-	if (!ImGui::BeginPopupModal("Confirm Debugger Mutation##context", nullptr,
-		ImGuiWindowFlags_AlwaysAutoResize))
+	if (!aida::ui::design::begin_dialog_exact(
+		"Confirm Debugger Mutation##context", ImVec2(620.0f, 460.0f),
+		ImVec2(400.0f, 300.0f)))
 		return;
+	const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+		"Confirm", "Cancel");
+	aida::ui::design::begin_dialog_body("debugger_context_mutation_body", footer_height);
 
 	const auto context = g_pending_context;
 	const char* scope = "the selected debugger item";
@@ -1656,11 +1660,11 @@ void render_context_mutation_confirmation() {
 		ImGui::TextWrapped("Unavailable: the selected debugger item changed; select a current row.");
 	else if (!gate.enabled)
 		ImGui::TextWrapped("Unavailable: %s", gate.disabled_reason);
-	ImGui::Separator();
-
-	if (!gate.enabled || !retained)
-		ImGui::BeginDisabled();
-	if (ImGui::Button("Confirm", ImVec2(140.f, 0.f))) {
+	aida::ui::design::end_dialog_body();
+	const auto footer = aida::ui::design::dialog_footer(
+		"debugger_context_mutation_footer", "Confirm", gate.enabled && retained,
+		true, "Cancel");
+	if (footer.confirmed) {
 		const auto mutation = g_pending_context_mutation;
 		const bool advances = mutation != pending_context_mutation_t::remove_watch &&
 			mutation != pending_context_mutation_t::remove_bookmark;
@@ -1777,10 +1781,7 @@ void render_context_mutation_confirmation() {
 		g_pending_context = {};
 		ImGui::CloseCurrentPopup();
 	}
-	if (!gate.enabled || !retained)
-		ImGui::EndDisabled();
-	ImGui::SameLine();
-	if (ImGui::Button("Cancel", ImVec2(140.f, 0.f))) {
+	if (footer.cancelled) {
 		g_pending_context_mutation = pending_context_mutation_t::none;
 		g_pending_context = {};
 		ImGui::CloseCurrentPopup();
@@ -3650,27 +3651,34 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 		diag::log_tagged_fmt("cpu_view", "edit_modal_open idx=%d",
 			ui.cpu_edit_reg_idx);
 	}
-	if (ImGui::BeginPopupModal("Edit Register##cpu", nullptr,
-		ImGuiWindowFlags_AlwaysAutoResize)) {
-		if (ui.cpu_edit_reg_idx >= 0 && ui.cpu_edit_reg_idx < rows_n) {
+	if (aida::ui::design::begin_dialog_exact("Edit Register##cpu",
+		ImVec2(520.0f, 360.0f), ImVec2(360.0f, 260.0f))) {
+		const bool valid_edit = ui.cpu_edit_reg_idx >= 0 && ui.cpu_edit_reg_idx < rows_n;
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			valid_edit ? "Apply" : "Close", valid_edit ? "Cancel" : nullptr);
+		aida::ui::design::begin_dialog_body("debugger_register_edit_body", footer_height);
+		if (valid_edit) {
 			const auto& er = rows[static_cast<size_t>(ui.cpu_edit_reg_idx)];
 			ImGui::Text("Register: %s", er.name);
 			ImGui::Text("Current:  0x%016llX",
 				static_cast<unsigned long long>(er.value));
 			ImGui::Separator();
-			ImGui::SetNextItemWidth(220.f);
-			ImGui::InputText("##cpu_edit_val", ui.cpu_edit_value_buf,
+			ImGui::SetNextItemWidth(-FLT_MIN);
+			if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+			const bool submitted = ImGui::InputText("##cpu_edit_val", ui.cpu_edit_value_buf,
 				sizeof(ui.cpu_edit_value_buf),
 				ImGuiInputTextFlags_CharsHexadecimal |
-				ImGuiInputTextFlags_AutoSelectAll);
+				ImGuiInputTextFlags_AutoSelectAll |
+				ImGuiInputTextFlags_EnterReturnsTrue);
 			const auto edit_gate = debugger_interaction::evaluate(
 				debugger_interaction::capability_t::edit_register, ui.cpu_edit_context);
 			if (!edit_gate.enabled)
 				ImGui::TextWrapped("Unavailable: %s", edit_gate.disabled_reason);
-			ImGui::Separator();
-			if (!edit_gate.enabled)
-				ImGui::BeginDisabled();
-			if (ImGui::Button("Apply", ImVec2(110.f, 0.f))) {
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"debugger_register_edit_footer", "Apply", edit_gate.enabled,
+				false, "Cancel");
+			if (footer.confirmed || (submitted && edit_gate.enabled)) {
 				uint64_t new_val = parse_hex_address(ui.cpu_edit_value_buf);
 				std::string lname = cpu_view_detail::lowercase_reg_name(er.name);
 				const auto edit_context = ui.cpu_edit_context;
@@ -3691,11 +3699,17 @@ static void render_cpu(ImDrawList* dl, float ox, float oy, float w, float h, flo
 				ui.cpu_edit_reg_idx = -1;
 				ImGui::CloseCurrentPopup();
 			}
-			if (!edit_gate.enabled)
-				ImGui::EndDisabled();
-			ImGui::SameLine();
-			if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
+			if (footer.cancelled) {
 				diag::log_tagged_fmt("cpu_view", "edit_modal_cancel");
+				ui.cpu_edit_reg_idx = -1;
+				ImGui::CloseCurrentPopup();
+			}
+		} else {
+			ImGui::TextUnformatted("The selected register is no longer available.");
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"debugger_register_edit_stale_footer", "Close", true, false, nullptr);
+			if (footer.confirmed || footer.cancelled) {
 				ui.cpu_edit_reg_idx = -1;
 				ImGui::CloseCurrentPopup();
 			}
@@ -4359,10 +4373,14 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 		ImGui::OpenPopup("Edit Breakpoint##bp");
 		ui.bp_edit_popup_open = false;
 	}
-	if (ImGui::BeginPopupModal("Edit Breakpoint##bp", nullptr,
-		ImGuiWindowFlags_AlwaysAutoResize)) {
-		if (ui.bp_edit_idx >= 0 &&
-			ui.bp_edit_idx < static_cast<int>(snapshot.size())) {
+	if (aida::ui::design::begin_dialog_exact("Edit Breakpoint##bp",
+		ImVec2(620.0f, 460.0f), ImVec2(400.0f, 300.0f))) {
+		const bool valid_edit = ui.bp_edit_idx >= 0 &&
+			ui.bp_edit_idx < static_cast<int>(snapshot.size());
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			valid_edit ? "Apply" : "Close", valid_edit ? "Cancel" : nullptr);
+		aida::ui::design::begin_dialog_body("debugger_breakpoint_edit_body", footer_height);
+		if (valid_edit) {
 			auto& bp_edit = snapshot[static_cast<size_t>(ui.bp_edit_idx)];
 			ImGui::Text("Address: 0x%016llX",
 				static_cast<unsigned long long>(bp_edit.address));
@@ -4374,16 +4392,22 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 				: "Memory");
 			ImGui::Separator();
 			ImGui::Text("Condition (evaluated when hit, 0 = skip):");
-			ImGui::SetNextItemWidth(360.f);
+			ImGui::SetNextItemWidth(-FLT_MIN);
+			if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
 			ImGui::InputText("##bp_cond_edit", ui.bp_edit_condition_buf,
 				sizeof(ui.bp_edit_condition_buf));
 			ImGui::Text("Log message (use {RAX}, {[RSP+8]} placeholders):");
-			ImGui::SetNextItemWidth(360.f);
+			ImGui::SetNextItemWidth(-FLT_MIN);
 			ImGui::InputText("##bp_log_edit", ui.bp_edit_log_buf,
 				sizeof(ui.bp_edit_log_buf));
 			ImGui::Checkbox("Auto-continue after log", &ui.bp_edit_auto_continue);
-			ImGui::Separator();
-			if (ImGui::Button("Apply", ImVec2(110.f, 0.f))) {
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"debugger_breakpoint_edit_footer", "Apply", true, false, "Cancel");
+			const bool submitted = ImGui::GetIO().KeyCtrl &&
+				(ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+				 ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
+			if (footer.confirmed || submitted) {
 				const int edit_index = ui.bp_edit_idx;
 				const std::string condition(ui.bp_edit_condition_buf);
 				const std::string log_text(ui.bp_edit_log_buf);
@@ -4406,14 +4430,16 @@ static void render_breakpoints(ImDrawList* dl, float ox, float oy, float w, floa
 				ui.bp_edit_idx = -1;
 				ImGui::CloseCurrentPopup();
 			}
-			ImGui::SameLine();
-			if (ImGui::Button("Cancel", ImVec2(110.f, 0.f))) {
+			if (footer.cancelled) {
 				ui.bp_edit_idx = -1;
 				ImGui::CloseCurrentPopup();
 			}
 		} else {
 			ImGui::Text("Selection no longer valid.");
-			if (ImGui::Button("Close", ImVec2(110.f, 0.f))) {
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"debugger_breakpoint_edit_stale_footer", "Close", true, false, nullptr);
+			if (footer.confirmed || footer.cancelled) {
 				ui.bp_edit_idx = -1;
 				ImGui::CloseCurrentPopup();
 			}
@@ -4929,8 +4955,12 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 		ImGui::OpenPopup("Terminate Thread##th");
 		ui.thread_kill_popup_open = false;
 	}
-	if (ImGui::BeginPopupModal("Terminate Thread##th", nullptr,
-		ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (aida::ui::design::begin_dialog_exact("Terminate Thread##th",
+		ImVec2(560.0f, 360.0f), ImVec2(380.0f, 280.0f))) {
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Terminate", "Cancel");
+		aida::ui::design::begin_dialog_body("debugger_terminate_thread_body",
+			footer_height);
 		ImGui::TextWrapped(
 			"Terminate thread %u with exit code 0xDEAD?",
 			static_cast<unsigned>(ui.thread_kill_tid));
@@ -4939,10 +4969,11 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 			ui.thread_kill_context);
 		if (!terminate_gate.enabled)
 			ImGui::TextWrapped("Unavailable: %s", terminate_gate.disabled_reason);
-		ImGui::Separator();
-		if (!terminate_gate.enabled)
-			ImGui::BeginDisabled();
-		if (ImGui::Button("Terminate", ImVec2(130.f, 0.f))) {
+		aida::ui::design::end_dialog_body();
+		const auto footer = aida::ui::design::dialog_footer(
+			"debugger_terminate_thread_footer", "Terminate", terminate_gate.enabled,
+			true, "Cancel");
+		if (footer.confirmed) {
 			const std::uint32_t target_tid = ui.thread_kill_tid;
 			const auto context = ui.thread_kill_context;
 			static_cast<void>(queue_debugger_mutation("Terminate thread",
@@ -4963,10 +4994,7 @@ static void render_threads(ImDrawList* dl, float ox, float oy, float w, float h,
 			ui.thread_kill_tid = 0;
 			ImGui::CloseCurrentPopup();
 		}
-		if (!terminate_gate.enabled)
-			ImGui::EndDisabled();
-		ImGui::SameLine();
-		if (ImGui::Button("Cancel", ImVec2(130.f, 0.f))) {
+		if (footer.cancelled) {
 			ui.thread_kill_idx = -1;
 			ui.thread_kill_tid = 0;
 			ImGui::CloseCurrentPopup();
@@ -6089,8 +6117,11 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 		ImGui::OpenPopup("Close Handle##hd");
 		ui.handle_close_popup_open = false;
 	}
-	if (ImGui::BeginPopupModal("Close Handle##hd", nullptr,
-		ImGuiWindowFlags_AlwaysAutoResize)) {
+	if (aida::ui::design::begin_dialog_exact("Close Handle##hd",
+		ImVec2(580.0f, 380.0f), ImVec2(400.0f, 280.0f))) {
+		const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+			"Close Handle", "Cancel");
+		aida::ui::design::begin_dialog_body("debugger_close_handle_body", footer_height);
 		ImGui::TextWrapped(
 			"Close handle 0x%X (%s) in target process?\nName: %s",
 			static_cast<unsigned>(ui.handle_close_value),
@@ -6101,10 +6132,11 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 			ui.handle_close_context);
 		if (!close_gate.enabled)
 			ImGui::TextWrapped("Unavailable: %s", close_gate.disabled_reason);
-		ImGui::Separator();
-		if (!close_gate.enabled)
-			ImGui::BeginDisabled();
-		if (ImGui::Button("Close Handle", ImVec2(140.f, 0.f))) {
+		aida::ui::design::end_dialog_body();
+		const auto footer = aida::ui::design::dialog_footer(
+			"debugger_close_handle_footer", "Close Handle", close_gate.enabled,
+			true, "Cancel");
+		if (footer.confirmed) {
 			const std::uint64_t value = ui.handle_close_value;
 			const auto context = ui.handle_close_context;
 			static_cast<void>(queue_debugger_mutation("Close target handle",
@@ -6124,10 +6156,7 @@ static void render_handles(ImDrawList* dl, float ox, float oy, float w, float h,
 			ui.handle_close_name.clear();
 			ImGui::CloseCurrentPopup();
 		}
-		if (!close_gate.enabled)
-			ImGui::EndDisabled();
-		ImGui::SameLine();
-		if (ImGui::Button("Cancel", ImVec2(140.f, 0.f))) {
+		if (footer.cancelled) {
 			ui.handle_close_idx = -1;
 			ui.handle_close_value = 0;
 			ui.handle_close_type.clear();

@@ -19,6 +19,7 @@
 #include "../ui/theme.hpp"
 #include "../ui/application_view_registry.hpp"
 #include "../ui/application_ui_runtime.hpp"
+#include "../ui/design_system.hpp"
 #include "../workbench/workbench_shell_integration.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/win32_dialog.hpp"
@@ -30,6 +31,7 @@
 #include <atomic>
 #include <charconv>
 #include <cctype>
+#include <cfloat>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -1311,19 +1313,27 @@ inline void render(float, float, float width, float height,
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
     if (state->pdb_dialog_open)
         ImGui::OpenPopup("Select PDB file##types_hub_view");
-    if (ImGui::BeginPopupModal("Select PDB file##types_hub_view", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (aida::ui::design::begin_dialog_exact("Select PDB file##types_hub_view",
+            ImVec2(580.0f, 300.0f), ImVec2(360.0f, 240.0f))) {
+        const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+            "Open", "Cancel");
+        aida::ui::design::begin_dialog_body("types_hub_pdb_body", footer_height);
         ImGui::TextUnformatted("Program Database (*.pdb)");
-        ImGui::SetNextItemWidth(460.0f);
-        ImGui::InputText("##pdb_path", state->pdb_dialog_path.data(),
-            state->pdb_dialog_path.size());
-        if (ImGui::Button("Open", ImVec2(96.0f, 0.0f))) {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        const bool submitted = ImGui::InputText("##pdb_path",
+            state->pdb_dialog_path.data(), state->pdb_dialog_path.size(),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        aida::ui::design::end_dialog_body();
+        const auto footer = aida::ui::design::dialog_footer("types_hub_pdb_footer",
+            "Open", state->pdb_dialog_path[0] != '\0', false, "Cancel");
+        if (footer.confirmed ||
+            (submitted && state->pdb_dialog_path[0] != '\0')) {
             request_pdb_load(context, state, state->pdb_dialog_path.data());
             state->pdb_dialog_open = false;
             ImGui::CloseCurrentPopup();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(96.0f, 0.0f))) {
+        if (footer.cancelled) {
             state->pdb_dialog_open = false;
             aida::preview::re_hubs::action(aida::preview::re_hubs::domain_t::types,
                 static_cast<int>(active), "cancel_pdb_dialog");

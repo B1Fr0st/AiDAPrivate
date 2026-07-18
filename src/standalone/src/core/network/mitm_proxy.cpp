@@ -3457,6 +3457,22 @@ void clear_history() {
     diag::log_tagged_fmt("mitm", "clear_history complete cleared=%zu", was);
 }
 
+bool clear_history_if_exact(const std::vector<uint64_t>& reviewed_ids) {
+    std::lock_guard<std::mutex> lock(g_state.history_mutex);
+    if (g_state.history.size() != reviewed_ids.size())
+        return false;
+    std::size_t index = 0;
+    for (const auto& exchange : g_state.history) {
+        if (!exchange || exchange->id != reviewed_ids[index++])
+            return false;
+    }
+    const std::size_t cleared = g_state.history.size();
+    g_state.history.clear();
+    g_state.next_id.store(1, std::memory_order_release);
+    diag::log_tagged_fmt("mitm", "clear_history_exact complete cleared=%zu", cleared);
+    return true;
+}
+
 size_t history_count() {
     std::lock_guard<std::mutex> lock(g_state.history_mutex);
     return g_state.history.size();

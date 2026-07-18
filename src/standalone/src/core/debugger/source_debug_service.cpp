@@ -901,6 +901,7 @@ void begin_frame()
 	static bool initialized = false;
 	if (!initialized) {
 		initialized = true;
+		static_cast<void>(debugger_engine::cached_registers());
 		std::lock_guard<std::mutex> lock(rt.operation_mutex);
 		definition_t definition;
 		definition.id = definition_id("c:/aida/preview/sample.cpp", 28);
@@ -912,7 +913,7 @@ void begin_frame()
 		definition.locations = {{"AiDA_Target", 0x12C0, 0x1400012C0, 0, true}};
 		rt.definitions = {std::move(definition)};
 		rt.target_key = "preview-debugger-fixture";
-		rt.target_pid = 4242;
+		rt.target_pid = debugger_engine::g_state.target_pid;
 		current_location_t current;
 		current.valid = true;
 		current.file_path = "C:/AiDA/Preview/sample.cpp";

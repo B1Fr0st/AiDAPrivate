@@ -12,6 +12,7 @@
 #include "../ui/task_center.hpp"
 #include "../ui/application_view_registry.hpp"
 #include "../ui/application_ui_runtime.hpp"
+#include "../ui/design_system.hpp"
 #include "../ai/standalone_chat.hpp"
 #include "standalone_driver.hpp"
 #ifndef AIDA_IMGUI_STUDIO_PREVIEW
@@ -264,6 +265,29 @@ static std::uint64_t network_now_ms() {
 #else
     return static_cast<std::uint64_t>(GetTickCount64());
 #endif
+}
+
+struct operational_review_binding_t {
+    bool prepared = false;
+    operational_command_t command = operational_command_t::capture_start;
+    std::size_t retained_count = 0;
+    filter_entry_t retained_rule;
+    std::vector<std::uint32_t> retained_rule_ids;
+    std::vector<std::uint64_t> retained_exchange_ids;
+    ssl_keylog::retained_set_token retained_keylog_token;
+    int filter_action = 0;
+    int filter_direction = 0;
+    int filter_protocol = 0;
+    std::string filter_pid;
+    std::string filter_port;
+    std::string filter_ip;
+};
+
+static operational_review_binding_t s_operational_review;
+
+static bool invoke_global_network_action(const char* action_id) {
+    return aida::ui::application_ui::execute_action(
+        action_id, aida::ui::action_invocation_source_t::toolbar).executed();
 }
 
 static bool enqueue_ui_completion(std::function<void()> completion) {
@@ -2655,12 +2679,12 @@ static void render_capture(state_t& state, float x, float y, float w, float h,
             diag::log_tagged_fmt("network", "start_capture_clicked filter_pid=%u filter_port=%u filter_proto=%u drv_ok=%d",
                 state.cap_filter_pid, state.cap_filter_port, state.cap_filter_protocol,
                 driver_ok ? 1 : 0);
-            request_capture_start(state);
+            invoke_global_network_action("network.capture.start");
         }
     } else {
         if (aida::ui::button("Stop Capture", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
             diag::log_tagged("network", "stop_capture_clicked");
-            request_capture_stop(state);
+            invoke_global_network_action("network.capture.stop");
         }
     }
 
@@ -3596,7 +3620,8 @@ static void request_proxy_control(state_t& state, bool start) {
     }
 }
 
-static void request_proxy_history_clear(std::size_t reviewed_count) {
+static void request_proxy_history_clear(std::size_t reviewed_count,
+                                        std::vector<std::uint64_t> reviewed_ids) {
     bool expected = false;
     if (!s_proxy_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         return;
@@ -3606,14 +3631,14 @@ static void request_proxy_history_clear(std::size_t reviewed_count) {
         std::to_string(reviewed_count) + " reviewed exchanges");
     const bool posted = post_network_task(
         "proxy_history_clear", aida::infra::executor::domain_t::diagnostics, "bounded_task",
-        [serial, reviewed_count, task_id]() {
+        [serial, reviewed_count, reviewed_ids = std::move(reviewed_ids), task_id]() {
             bool success = true;
             std::string error;
             try {
-                mitm_proxy::clear_history();
-                success = mitm_proxy::history_count() == 0;
-                if (!success)
-                    error = "Proxy history remained non-empty after clear";
+                success = mitm_proxy::clear_history_if_exact(reviewed_ids);
+                if (!success) {
+                    error = "Proxy history changed after confirmation; review the current retained exchanges again";
+                }
             } catch (const std::exception& exception) {
                 success = false;
                 error = exception.what();
@@ -3626,7 +3651,9 @@ static void request_proxy_history_clear(std::size_t reviewed_count) {
             enqueue_ui_completion([serial, success, error = std::move(error)]() {
                 if (s_proxy_operation_serial.load(std::memory_order_acquire) != serial)
                     return;
-                if (!success)
+                if (success)
+                    g_state.proxy_selected = -1;
+                else
                     toast_notification::push(error.empty() ? "Proxy history clear failed" : error,
                         toast_notification::toast_type_t::error);
                 s_proxy_operation_pending.store(false, std::memory_order_release);
@@ -3645,7 +3672,7 @@ static void request_ca_trust_repair() {
         return;
     const std::uint64_t serial = s_proxy_operation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
     const std::string task_id = register_network_operation(
-        "network.proxy.ca.repair", "Repair AiDA interception CA trust", "view.network.proxy",
+        "network.proxy.ca_trust_repair", "Repair AiDA interception CA trust", "view.network.proxy",
         "current user trust store");
     const bool posted = post_network_task(
         "proxy_ca_repair", aida::infra::executor::domain_t::diagnostics, "bounded_task",
@@ -3882,7 +3909,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                              ImVec2(0.f, 0.f), proxy_pending)) {
             diag::log_tagged_fmt("network", "proxy_start_clicked bind=%s:%u decode_tls=%d",
                 state.proxy_bind_addr, state.proxy_port, state.proxy_decode_tls ? 1 : 0);
-            request_proxy_control(state, true);
+            invoke_global_network_action("network.proxy.start");
         }
     } else {
         const auto& stats = proxy_snapshot->stats;
@@ -3921,12 +3948,12 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
                              aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm,
                              ImVec2(0.f, 0.f), proxy_pending)) {
             diag::log_tagged("network", "proxy_stop_clicked");
-            request_proxy_control(state, false);
+            invoke_global_network_action("network.proxy.stop");
         }
         same_line_if_fits(112.f);
         if (aida::ui::button("Clear History", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
                              ImVec2(0.f, 0.f), proxy_pending || proxy_snapshot->history.empty())) {
-            ImGui::OpenPopup("Review Proxy History Clear");
+            invoke_global_network_action("network.proxy.history.clear");
         }
     }
 
@@ -3934,23 +3961,6 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     aida::ui::input_text("##proxy_filter", state.proxy_filter_text, sizeof(state.proxy_filter_text),
                           "Filter requests...", false, ImVec2(220.f, 28.f));
     ImGui::PopID();
-
-    if (ImGui::BeginPopupModal("Review Proxy History Clear", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        const std::size_t reviewed_count = proxy_snapshot ? proxy_snapshot->history.size() : 0;
-        ImGui::Text("Permanently clear %zu captured proxy exchanges?", reviewed_count);
-        ImGui::TextUnformatted("Requests, responses, annotations, and evidence in this bounded history will be removed.");
-        ImGui::Spacing();
-        if (aida::ui::button("Confirm Clear", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            request_proxy_history_clear(reviewed_count);
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-
 
     ImGui::Spacing();
     const bool ca_installed = proxy_snapshot && proxy_snapshot->ca_installed;
@@ -3997,7 +4007,7 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
     if (aida::ui::button(proxy_pending ? "Repairing...##ca_repair" : "Repair trust##ca_repair",
                          aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
                          ImVec2(0.f, 0.f), proxy_pending))
-        request_ca_trust_repair();
+        invoke_global_network_action("network.proxy.ca_trust_repair");
     same_line_if_fits(154.f);
     if (aida::ui::button("Open Camoufox controls", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
         state.prev_tab = state.active_tab;
@@ -4018,17 +4028,22 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
         }
     }
 
-    if (ImGui::BeginPopupModal("Review Legacy Patch Reversion", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Revert %zu live certificate bypass patches?", s_bypass_review_count);
-        ImGui::TextUnformatted("The worker will restore reviewed process memory and verify that no bypass remains active.");
-        ImGui::Spacing();
-        if (aida::ui::button("Confirm Revert", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+    if (aida::ui::design::begin_dialog_exact("Review Legacy Patch Reversion",
+        ImVec2(520.f, 260.f), ImVec2(400.f, 220.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Confirm Revert");
+        if (aida::ui::design::begin_dialog_body("legacy_patch_reversion_body", footer)) {
+            ImGui::Text("Revert %zu live certificate bypass patches?", s_bypass_review_count);
+            ImGui::TextWrapped("The worker will restore reviewed process memory and verify that no bypass remains active.");
+        }
+        aida::ui::design::end_dialog_body();
+        const auto result = aida::ui::design::dialog_footer(
+            "legacy_patch_reversion_footer", "Confirm Revert", s_bypass_review_count != 0, true);
+        if (result.confirmed) {
             request_legacy_bypass_revert(s_bypass_review_count);
             s_bypass_review_count = 0;
             ImGui::CloseCurrentPopup();
         }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        if (result.cancelled) {
             s_bypass_review_count = 0;
             ImGui::CloseCurrentPopup();
         }
@@ -4363,16 +4378,6 @@ static void render_proxy(state_t& state, float x, float y, float w, float h,
 }
 
 
-enum class filter_review_action_t : std::uint8_t { none, clear_all, remove_one };
-
-struct filter_review_state_t {
-    filter_review_action_t action = filter_review_action_t::none;
-    std::uint32_t rule_id = 0;
-    std::size_t rule_count = 0;
-};
-
-static filter_review_state_t s_filter_review;
-
 static std::string driver_failure_text(const char* fallback) {
 #ifdef AIDA_IMGUI_STUDIO_PREVIEW
     return fallback ? fallback : "Driver operation failed";
@@ -4496,9 +4501,10 @@ static void request_filter_clear(state_t& state) {
             enqueue_ui_completion([serial, success, error = std::move(error)]() {
                 if (g_state.filter_mutation_serial.load(std::memory_order_acquire) != serial)
                     return;
-                if (success)
+                if (success) {
                     g_state.filters.clear();
-                else
+                    g_state.filter_selected = -1;
+                } else
                     toast_notification::push(error.empty() ? "Failed to clear filter rules" : error,
                         toast_notification::toast_type_t::error);
                 g_state.filter_mutation_pending.store(false, std::memory_order_release);
@@ -4516,7 +4522,7 @@ static void request_filter_remove(state_t& state, std::uint32_t rule_id) {
         return;
     const std::uint64_t serial = state.filter_mutation_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
     const std::string task_id = register_network_operation(
-        "network.filters.remove", "Remove network filter rule", "view.network.filters",
+        "network.filters.remove_selected", "Remove network filter rule", "view.network.filters",
         "rule #" + std::to_string(rule_id));
     const bool posted = post_network_task(
         "filter_remove", aida::infra::executor::domain_t::feature_worker, "bounded_task",
@@ -4541,6 +4547,7 @@ static void request_filter_remove(state_t& state, std::uint32_t rule_id) {
                     g_state.filters.erase(std::remove_if(g_state.filters.begin(), g_state.filters.end(),
                         [rule_id](const filter_entry_t& entry) { return entry.rule_id == rule_id; }),
                         g_state.filters.end());
+                    g_state.filter_selected = -1;
                 } else {
                     toast_notification::push(error.empty() ? "Failed to remove filter rule" : error,
                         toast_notification::toast_type_t::error);
@@ -4603,14 +4610,11 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
     if (!driver_ok || mutation_pending) ImGui::BeginDisabled();
     if (aida::ui::button(mutation_pending ? "Applying...##filter_add" : "Add Rule##filter_add",
                          aida::ui::button_kind_t::primary, aida::ui::size_t_::sm))
-        request_filter_add(state);
+        invoke_global_network_action("network.filters.add");
 
     ImGui::SameLine();
-    if (aida::ui::button("Clear All", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-        s_filter_review.action = filter_review_action_t::clear_all;
-        s_filter_review.rule_count = state.filters.size();
-        ImGui::OpenPopup("Review Filter Mutation");
-    }
+    if (aida::ui::button("Clear All", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm))
+        invoke_global_network_action("network.filters.clear");
     if (!driver_ok || mutation_pending) ImGui::EndDisabled();
 
     ImGui::Spacing();
@@ -4645,44 +4649,16 @@ static void render_filters(state_t& state, float x, float y, float w, float h,
         ImGui::SameLine();
         ImGui::PushID(i);
         ImGui::BeginDisabled(mutation_pending);
-        if (aida::ui::button("Remove", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm))
+        if (aida::ui::button("Remove", aida::ui::button_kind_t::ghost, aida::ui::size_t_::sm)) {
+            state.filter_selected = i;
             remove_rule_id = f.rule_id;
+        }
         ImGui::EndDisabled();
         ImGui::PopID();
     }
     }
     if (remove_rule_id != 0) {
-        s_filter_review.action = filter_review_action_t::remove_one;
-        s_filter_review.rule_id = remove_rule_id;
-        s_filter_review.rule_count = 1;
-        ImGui::OpenPopup("Review Filter Mutation");
-    }
-
-    if (ImGui::BeginPopupModal("Review Filter Mutation", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        if (s_filter_review.action == filter_review_action_t::clear_all) {
-            ImGui::Text("Clear all %zu active network filter rules?", s_filter_review.rule_count);
-            ImGui::TextUnformatted("This immediately changes live kernel traffic policy and cannot be undone automatically.");
-        } else {
-            ImGui::Text("Remove active network filter rule #%u?", s_filter_review.rule_id);
-            ImGui::TextUnformatted("Traffic matching this rule will immediately stop receiving its current policy.");
-        }
-        ImGui::Spacing();
-        if (aida::ui::button(s_filter_review.action == filter_review_action_t::clear_all
-                                 ? "Confirm Clear" : "Confirm Remove",
-                             aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            if (s_filter_review.action == filter_review_action_t::clear_all)
-                request_filter_clear(state);
-            else if (s_filter_review.action == filter_review_action_t::remove_one)
-                request_filter_remove(state, s_filter_review.rule_id);
-            s_filter_review = {};
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            s_filter_review = {};
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
+        invoke_global_network_action("network.filters.remove_selected");
     }
 
     ImGui::EndChild();
@@ -5276,7 +5252,7 @@ static bool request_intercept_operation(intercept_operation_t operation, bool en
                                           : "exchange " + std::to_string(exchange_id);
     switch (operation) {
     case intercept_operation_t::set_enabled:
-        action = enabled ? "network.intercept.enable" : "network.intercept.disable";
+        action = "network.intercept.toggle_enabled";
         label = enabled ? "Enable request interception" : "Disable request interception";
         target = enabled ? "interception enabled" : "interception disabled";
         break;
@@ -5514,8 +5490,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
     if (intercept_changed) {
         diag::log_tagged_fmt("network", "intercept_enabled_toggled new=%d",
             requested_intercept_enabled ? 1 : 0);
-        request_intercept_operation(intercept_operation_t::set_enabled, requested_intercept_enabled,
-                                    0, {}, 0);
+        invoke_global_network_action("network.intercept.toggle_enabled");
     }
     ImGui::SameLine();
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(aida::ui::with_alpha(th.text_primary, alpha)),
@@ -5592,15 +5567,23 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
         s_intercept_drop_review.open = false;
         ImGui::OpenPopup("Review Intercept Drop");
     }
-    if (ImGui::BeginPopupModal("Review Intercept Drop", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        if (s_intercept_drop_review.all)
-            ImGui::Text("Drop all %zu currently held exchanges?", s_intercept_drop_review.reviewed_count);
-        else
-            ImGui::Text("Drop held exchange %llu?",
-                static_cast<unsigned long long>(s_intercept_drop_review.exchange_id));
-        ImGui::TextUnformatted("Dropped exchanges are not forwarded to their upstream destination.");
-        ImGui::Spacing();
-        if (aida::ui::button("Confirm Drop", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
+    if (aida::ui::design::begin_dialog_exact("Review Intercept Drop",
+        ImVec2(520.f, 260.f), ImVec2(400.f, 220.f))) {
+        const float footer = aida::ui::design::dialog_footer_reserve_height("Confirm Drop");
+        if (aida::ui::design::begin_dialog_body("intercept_drop_review_body", footer)) {
+            if (s_intercept_drop_review.all)
+                ImGui::Text("Drop all %zu currently held exchanges?", s_intercept_drop_review.reviewed_count);
+            else
+                ImGui::Text("Drop held exchange %llu?",
+                    static_cast<unsigned long long>(s_intercept_drop_review.exchange_id));
+            ImGui::TextWrapped("Dropped exchanges are not forwarded to their upstream destination.");
+        }
+        aida::ui::design::end_dialog_body();
+        const bool retained_target = s_intercept_drop_review.reviewed_publication &&
+            s_intercept_drop_review.reviewed_count != 0;
+        const auto result = aida::ui::design::dialog_footer(
+            "intercept_drop_review_footer", "Confirm Drop", retained_target, true);
+        if (result.confirmed) {
             const bool accepted = request_intercept_operation(
                 s_intercept_drop_review.all ? intercept_operation_t::drop_all : intercept_operation_t::drop_one,
                 false, s_intercept_drop_review.exchange_id, {}, s_intercept_drop_review.reviewed_count,
@@ -5613,8 +5596,7 @@ static void render_intercept(state_t& state, float x, float y, float w, float h,
                     toast_notification::toast_type_t::error);
             }
         }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
+        if (result.cancelled) {
             s_intercept_drop_review = {};
             ImGui::CloseCurrentPopup();
         }
@@ -5884,7 +5866,6 @@ static std::atomic<bool> s_keylog_snapshot_pending{false};
 static std::atomic<std::uint64_t> s_keylog_snapshot_requested_ms{0};
 static std::atomic<bool> s_keylog_operation_pending{false};
 static std::atomic<std::uint64_t> s_keylog_operation_serial{0};
-static std::size_t s_keylog_clear_review_count = 0;
 
 static void publish_keylog_runtime_snapshot(const std::string& known_path = {}) {
     auto snapshot = std::make_shared<keylog_runtime_snapshot_t>();
@@ -5928,7 +5909,8 @@ static void request_keylog_runtime_snapshot(bool force = false) {
 }
 
 static void request_keylog_operation(keylog_operation_t operation, std::string path,
-                                     std::string arguments, std::size_t reviewed_count) {
+                                     std::string arguments, std::size_t reviewed_count,
+                                     ssl_keylog::retained_set_token reviewed_token = {}) {
     bool expected = false;
     if (!s_keylog_operation_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         return;
@@ -5961,7 +5943,7 @@ static void request_keylog_operation(keylog_operation_t operation, std::string p
             : aida::infra::executor::domain_t::feature_worker,
         "bounded_task",
         [serial, operation, path = std::move(path), arguments = std::move(arguments),
-         reviewed_count, task_id]() mutable {
+         reviewed_count, reviewed_token, task_id]() mutable {
             bool success = false;
             std::string effective_path = path;
             std::string error;
@@ -5992,9 +5974,13 @@ static void request_keylog_operation(keylog_operation_t operation, std::string p
                     if (!success) error = "TLS keylog watcher did not stop";
                     break;
                 case keylog_operation_t::clear_entries:
-                    ssl_keylog::clear_entries();
-                    success = ssl_keylog::entry_count() == 0;
-                    if (!success) error = "Captured TLS keys remained after clear";
+                    if (reviewed_token.count != reviewed_count ||
+                        !ssl_keylog::clear_entries_if_exact(reviewed_token)) {
+                        error = "TLS secrets changed after confirmation; review the current retained set again";
+                    } else {
+                        success = ssl_keylog::entry_count() == 0;
+                        if (!success) error = "Captured TLS keys remained after clear";
+                    }
                     break;
                 }
                 publish_keylog_runtime_snapshot(success ? effective_path : std::string());
@@ -6015,6 +6001,8 @@ static void request_keylog_operation(keylog_operation_t operation, std::string p
                                    error = std::move(error)]() mutable {
                 if (s_keylog_operation_serial.load(std::memory_order_acquire) != serial)
                     return;
+                if (success && operation == keylog_operation_t::clear_entries)
+                    g_state.kl_selected = -1;
                 if (success && operation == keylog_operation_t::launch_and_watch)
                     toast_notification::push("Process launched; TLS keylog watcher is active",
                         toast_notification::toast_type_t::info);
@@ -6029,6 +6017,396 @@ static void request_keylog_operation(keylog_operation_t operation, std::string p
         s_keylog_operation_pending.store(false, std::memory_order_release);
         finish_network_operation(task_id, false, "Rejected", "Executor rejected TLS keylog operation");
     }
+}
+
+static std::string filter_draft_error(const state_t& state) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long pid = state.nf_pid[0] ? std::strtoul(state.nf_pid, &end, 10) : 0;
+    if (errno != 0 || (state.nf_pid[0] && (!end || *end != '\0')) || pid > UINT32_MAX)
+        return "PID must be an unsigned 32-bit integer";
+    end = nullptr;
+    errno = 0;
+    const unsigned long port = state.nf_port[0] ? std::strtoul(state.nf_port, &end, 10) : 0;
+    if (errno != 0 || (state.nf_port[0] && (!end || *end != '\0')) || port > UINT16_MAX)
+        return "Port must be between 0 and 65535";
+    std::array<std::uint8_t, 16> bytes{};
+    if (state.nf_ip[0] && inet_pton(AF_INET, state.nf_ip, bytes.data()) != 1)
+        return "Filter IP address is not valid IPv4";
+    if (state.nf_action < 0 || state.nf_action > 1)
+        return "Choose Block or Allow for the filter action";
+    if (state.nf_direction < 0 || state.nf_direction > 2)
+        return "Choose In, Out, or Both for the filter direction";
+    if (state.nf_protocol != 0 && state.nf_protocol != 6 && state.nf_protocol != 17)
+        return "Choose Any, TCP, or UDP for the filter protocol";
+    return {};
+}
+
+static std::string filter_rule_summary(const filter_entry_t& rule) {
+    std::string summary = "rule #" + std::to_string(rule.rule_id) + " " +
+        (rule.action == 0 ? "BLOCK" : "ALLOW") + " " +
+        (rule.direction == 0 ? "IN" : rule.direction == 1 ? "OUT" : "BOTH") + " " +
+        (rule.protocol == 6 ? "TCP" : rule.protocol == 17 ? "UDP" : "ANY") +
+        " PID " + std::to_string(rule.pid) + " port " + std::to_string(rule.port);
+    if (!rule.ip_addr.empty()) summary.append(" IP ").append(rule.ip_addr);
+    return summary;
+}
+
+static bool command_requires_confirmation(operational_command_t command) noexcept {
+    return command == operational_command_t::proxy_history_clear ||
+        command == operational_command_t::proxy_ca_trust_repair ||
+        command == operational_command_t::filter_add ||
+        command == operational_command_t::filter_remove_selected ||
+        command == operational_command_t::filter_clear ||
+        command == operational_command_t::keylog_clear;
+}
+
+operational_command_capability_t operational_command_capability(
+    operational_command_t command) {
+    operational_command_capability_t capability;
+    capability.checked = false;
+    if (!g_state.active) {
+        capability.disabled_reason = "The Network runtime is not initialized";
+        return capability;
+    }
+    const bool capture_pending = g_state.cap_start_pending.load(std::memory_order_acquire) ||
+        g_state.cap_stop_pending.load(std::memory_order_acquire);
+    const bool capture_running = g_state.cap_running.load(std::memory_order_acquire);
+    const bool proxy_pending = s_proxy_operation_pending.load(std::memory_order_acquire);
+    const bool filter_pending = g_state.filter_mutation_pending.load(std::memory_order_acquire);
+    const bool keylog_pending = s_keylog_operation_pending.load(std::memory_order_acquire);
+    const auto proxy = std::atomic_load_explicit(&s_proxy_runtime_snapshot, std::memory_order_acquire);
+    const auto intercept = std::atomic_load_explicit(&s_intercept_runtime_snapshot, std::memory_order_acquire);
+    const auto keylog = std::atomic_load_explicit(&s_keylog_runtime_snapshot, std::memory_order_acquire);
+    switch (command) {
+    case operational_command_t::capture_start:
+        request_driver_available_snapshot();
+        if (capture_pending) capability.disabled_reason = "A capture state change is already in progress";
+        else if (capture_running) capability.disabled_reason = "Packet capture is already running";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
+            capability.disabled_reason = "Authorized driver-backed packet capture is unavailable";
+        else capability.enabled = true;
+        capability.target_summary = "PID " + std::to_string(g_state.cap_filter_pid) +
+            ", port " + std::to_string(g_state.cap_filter_port) +
+            ", protocol " + std::to_string(g_state.cap_filter_protocol);
+        break;
+    case operational_command_t::capture_stop:
+        if (capture_pending) capability.disabled_reason = "A capture state change is already in progress";
+        else if (!capture_running) capability.disabled_reason = "Packet capture is not running";
+        else capability.enabled = true;
+        capability.target_summary = "the active driver-backed packet capture";
+        break;
+    case operational_command_t::proxy_start:
+        if (proxy_pending) capability.disabled_reason = "A Proxy state change is already in progress";
+        else if (mitm_proxy::is_running()) capability.disabled_reason = "The interception Proxy is already running";
+        else if (g_state.proxy_bind_addr[0] == '\0') capability.disabled_reason = "Enter a Proxy bind address first";
+        else if (g_state.proxy_port < 1 || g_state.proxy_port > 65535) capability.disabled_reason = "Proxy port must be between 1 and 65535";
+        else capability.enabled = true;
+        capability.target_summary = std::string(g_state.proxy_bind_addr) + ":" +
+            std::to_string(g_state.proxy_port) +
+            (g_state.proxy_decode_tls ? " with TLS interception" : " without TLS interception");
+        break;
+    case operational_command_t::proxy_stop:
+        if (proxy_pending) capability.disabled_reason = "A Proxy state change is already in progress";
+        else if (!mitm_proxy::is_running()) capability.disabled_reason = "The interception Proxy is not running";
+        else capability.enabled = true;
+        capability.target_summary = "the active interception Proxy listener";
+        break;
+    case operational_command_t::proxy_history_clear:
+        request_proxy_runtime_snapshot();
+        if (proxy_pending) capability.disabled_reason = "A Proxy operation is already in progress";
+        else if (!proxy) capability.disabled_reason = "Proxy history is still loading";
+        else if (proxy->history.empty()) capability.disabled_reason = "Proxy history is already empty";
+        else capability.enabled = true;
+        capability.target_summary = proxy
+            ? std::to_string(proxy->history.size()) + " retained exchanges, including requests, responses, annotations, and evidence"
+            : "the retained Proxy history";
+        break;
+    case operational_command_t::proxy_ca_trust_repair:
+        request_proxy_runtime_snapshot();
+        if (proxy_pending) capability.disabled_reason = "A Proxy operation is already in progress";
+        else if (!proxy) capability.disabled_reason = "CA trust status is still loading";
+        else if (proxy->ca_installed) capability.disabled_reason = "The AiDA interception CA is already trusted for the current user";
+        else capability.enabled = true;
+        capability.target_summary = "the current-user root trust store for controlled Camoufox interception";
+        break;
+    case operational_command_t::filter_add: {
+        request_driver_available_snapshot();
+        const std::string validation = filter_draft_error(g_state);
+        if (filter_pending) capability.disabled_reason = "A network filter mutation is already in progress";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
+            capability.disabled_reason = "Authorized driver-backed filter control is unavailable";
+        else if (!validation.empty()) capability.disabled_reason = validation;
+        else capability.enabled = true;
+        capability.target_summary = std::string(g_state.nf_action == 0 ? "BLOCK" : "ALLOW") + " " +
+            (g_state.nf_direction == 0 ? "IN" : g_state.nf_direction == 1 ? "OUT" : "BOTH") + " " +
+            (g_state.nf_protocol == 6 ? "TCP" : g_state.nf_protocol == 17 ? "UDP" : "ANY") +
+            " PID " + (g_state.nf_pid[0] ? g_state.nf_pid : "0") + " port " +
+            (g_state.nf_port[0] ? g_state.nf_port : "0") +
+            (g_state.nf_ip[0] ? std::string(" IP ") + g_state.nf_ip : std::string());
+        break;
+    }
+    case operational_command_t::filter_remove_selected:
+        request_driver_available_snapshot();
+        if (filter_pending) capability.disabled_reason = "A network filter mutation is already in progress";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
+            capability.disabled_reason = "Authorized driver-backed filter control is unavailable";
+        else if (g_state.filter_selected < 0 ||
+                 g_state.filter_selected >= static_cast<int>(g_state.filters.size()))
+            capability.disabled_reason = "Select a retained network filter rule first";
+        else capability.enabled = true;
+        capability.target_summary = capability.enabled
+            ? filter_rule_summary(g_state.filters[static_cast<std::size_t>(g_state.filter_selected)])
+            : "the selected retained network filter rule";
+        break;
+    case operational_command_t::filter_clear:
+        request_driver_available_snapshot();
+        if (filter_pending) capability.disabled_reason = "A network filter mutation is already in progress";
+        else if (!s_driver_available_snapshot.load(std::memory_order_acquire) || !standalone_license::is_valid())
+            capability.disabled_reason = "Authorized driver-backed filter control is unavailable";
+        else if (g_state.filters.empty()) capability.disabled_reason = "There are no retained network filter rules to clear";
+        else capability.enabled = true;
+        capability.target_summary = std::to_string(g_state.filters.size()) + " retained live kernel traffic rules";
+        break;
+    case operational_command_t::intercept_toggle:
+        request_intercept_runtime_snapshot();
+        if (g_state.intercept_operation_pending.load(std::memory_order_acquire))
+            capability.disabled_reason = "An Intercept operation is already in progress";
+        else if (!intercept) capability.disabled_reason = "Intercept state is still loading";
+        else capability.enabled = true;
+        capability.checked = intercept && intercept->enabled;
+        capability.target_summary = capability.checked
+            ? "disable request interception while preserving held exchanges"
+            : "enable request interception for new Proxy exchanges";
+        break;
+    case operational_command_t::keylog_launch:
+        request_keylog_runtime_snapshot();
+        if (keylog_pending) capability.disabled_reason = "A TLS keylog operation is already in progress";
+        else if (keylog && keylog->watching) capability.disabled_reason = "A TLS keylog source is already being watched";
+        else if (g_state.kl_exe_path[0] == '\0') capability.disabled_reason = "Choose an executable to launch first";
+        else capability.enabled = true;
+        capability.target_summary = std::string(g_state.kl_exe_path) +
+            (g_state.kl_args[0] ? std::string(" ") + g_state.kl_args : std::string());
+        break;
+    case operational_command_t::keylog_watch:
+        request_keylog_runtime_snapshot();
+        if (keylog_pending) capability.disabled_reason = "A TLS keylog operation is already in progress";
+        else if (keylog && keylog->watching) capability.disabled_reason = "A TLS keylog source is already being watched";
+        else if (g_state.kl_watch_path[0] == '\0') capability.disabled_reason = "Choose or enter a TLS keylog file first";
+        else capability.enabled = true;
+        capability.target_summary = g_state.kl_watch_path;
+        break;
+    case operational_command_t::keylog_stop:
+        request_keylog_runtime_snapshot();
+        if (keylog_pending) capability.disabled_reason = "A TLS keylog operation is already in progress";
+        else if (!keylog || !keylog->watching) capability.disabled_reason = "No TLS keylog source is being watched";
+        else capability.enabled = true;
+        capability.target_summary = keylog && !keylog->path.empty()
+            ? keylog->path : "the active TLS keylog source";
+        break;
+    case operational_command_t::keylog_clear:
+        request_keylog_runtime_snapshot();
+        {
+        const auto token = ssl_keylog::retained_token();
+        if (keylog_pending) capability.disabled_reason = "A TLS keylog operation is already in progress";
+        else if (token.count == 0) capability.disabled_reason = "There are no captured TLS secrets to clear";
+        else capability.enabled = true;
+        capability.target_summary = std::to_string(token.count) + " retained TLS secrets";
+        }
+        break;
+    }
+    return capability;
+}
+
+bool prepare_operational_command_confirmation(operational_command_t command,
+                                              std::string* error) {
+    if (error) error->clear();
+    if (!command_requires_confirmation(command)) {
+        if (error) *error = "This Network command does not require confirmation";
+        return false;
+    }
+    const auto capability = operational_command_capability(command);
+    if (!capability.enabled) {
+        if (error) *error = capability.disabled_reason;
+        return false;
+    }
+    operational_review_binding_t binding;
+    binding.prepared = true;
+    binding.command = command;
+    if (command == operational_command_t::proxy_history_clear) {
+        const auto proxy = std::atomic_load_explicit(&s_proxy_runtime_snapshot, std::memory_order_acquire);
+        if (!proxy) {
+            if (error) *error = "Proxy history changed before review could be prepared";
+            return false;
+        }
+        binding.retained_count = proxy->history.size();
+        binding.retained_exchange_ids.reserve(proxy->history.size());
+        for (const auto& exchange : proxy->history)
+            binding.retained_exchange_ids.push_back(exchange.id);
+    } else if (command == operational_command_t::filter_add) {
+        binding.filter_action = g_state.nf_action;
+        binding.filter_direction = g_state.nf_direction;
+        binding.filter_protocol = g_state.nf_protocol;
+        binding.filter_pid = g_state.nf_pid;
+        binding.filter_port = g_state.nf_port;
+        binding.filter_ip = g_state.nf_ip;
+    } else if (command == operational_command_t::filter_remove_selected) {
+        binding.retained_rule = g_state.filters[static_cast<std::size_t>(g_state.filter_selected)];
+    } else if (command == operational_command_t::filter_clear) {
+        binding.retained_count = g_state.filters.size();
+        binding.retained_rule_ids.reserve(g_state.filters.size());
+        for (const auto& rule : g_state.filters)
+            binding.retained_rule_ids.push_back(rule.rule_id);
+    } else if (command == operational_command_t::keylog_clear) {
+        const auto keylog = std::atomic_load_explicit(&s_keylog_runtime_snapshot, std::memory_order_acquire);
+        if (!keylog) {
+            if (error) *error = "TLS keylog state changed before review could be prepared";
+            return false;
+        }
+        binding.retained_keylog_token = ssl_keylog::retained_token();
+        binding.retained_count = binding.retained_keylog_token.count;
+        if (binding.retained_count == 0) {
+            if (error) *error = "There are no captured TLS secrets to clear";
+            return false;
+        }
+    }
+    s_operational_review = std::move(binding);
+    return true;
+}
+
+void cancel_operational_command_confirmation(operational_command_t command) noexcept {
+    if (s_operational_review.prepared && s_operational_review.command == command)
+        s_operational_review = {};
+}
+
+bool execute_operational_command(operational_command_t command, std::string* error) {
+    if (error) error->clear();
+    const auto capability = operational_command_capability(command);
+    if (!capability.enabled) {
+        if (error) *error = capability.disabled_reason;
+        return false;
+    }
+    if (command_requires_confirmation(command) &&
+        (!s_operational_review.prepared || s_operational_review.command != command)) {
+        if (error) *error = "The reviewed Network target is unavailable; review the command again";
+        return false;
+    }
+    if (command == operational_command_t::proxy_history_clear) {
+        const auto proxy = std::atomic_load_explicit(&s_proxy_runtime_snapshot, std::memory_order_acquire);
+        std::vector<std::uint64_t> current;
+        if (proxy) {
+            current.reserve(proxy->history.size());
+            for (const auto& exchange : proxy->history) current.push_back(exchange.id);
+        }
+        if (!proxy || current != s_operational_review.retained_exchange_ids) {
+            s_operational_review = {};
+            if (error) *error = "Proxy history changed after review; review the current retained exchanges again";
+            return false;
+        }
+        const std::size_t count = s_operational_review.retained_count;
+        auto reviewed_ids = std::move(s_operational_review.retained_exchange_ids);
+        s_operational_review = {};
+        request_proxy_history_clear(count, std::move(reviewed_ids));
+        return s_proxy_operation_pending.load(std::memory_order_acquire);
+    }
+    if (command == operational_command_t::filter_add) {
+        const bool unchanged = s_operational_review.filter_action == g_state.nf_action &&
+            s_operational_review.filter_direction == g_state.nf_direction &&
+            s_operational_review.filter_protocol == g_state.nf_protocol &&
+            s_operational_review.filter_pid == g_state.nf_pid &&
+            s_operational_review.filter_port == g_state.nf_port &&
+            s_operational_review.filter_ip == g_state.nf_ip;
+        s_operational_review = {};
+        if (!unchanged) {
+            if (error) *error = "The network filter draft changed after review; review the current rule again";
+            return false;
+        }
+        request_filter_add(g_state);
+        return g_state.filter_mutation_pending.load(std::memory_order_acquire);
+    }
+    if (command == operational_command_t::filter_remove_selected) {
+        const filter_entry_t reviewed = s_operational_review.retained_rule;
+        const auto found = std::find_if(g_state.filters.begin(), g_state.filters.end(),
+            [&reviewed](const filter_entry_t& rule) {
+                return rule.rule_id == reviewed.rule_id && rule.action == reviewed.action &&
+                    rule.direction == reviewed.direction && rule.protocol == reviewed.protocol &&
+                    rule.pid == reviewed.pid && rule.port == reviewed.port &&
+                    rule.ip_addr == reviewed.ip_addr && rule.active == reviewed.active;
+            });
+        s_operational_review = {};
+        if (found == g_state.filters.end()) {
+            if (error) *error = "The retained network filter rule changed after review; select it again";
+            return false;
+        }
+        request_filter_remove(g_state, reviewed.rule_id);
+        return g_state.filter_mutation_pending.load(std::memory_order_acquire);
+    }
+    if (command == operational_command_t::filter_clear) {
+        std::vector<std::uint32_t> current;
+        current.reserve(g_state.filters.size());
+        for (const auto& rule : g_state.filters) current.push_back(rule.rule_id);
+        if (current != s_operational_review.retained_rule_ids) {
+            s_operational_review = {};
+            if (error) *error = "The retained network filter set changed after review; review it again";
+            return false;
+        }
+        s_operational_review = {};
+        request_filter_clear(g_state);
+        return g_state.filter_mutation_pending.load(std::memory_order_acquire);
+    }
+    if (command == operational_command_t::keylog_clear) {
+        const auto current_token = ssl_keylog::retained_token();
+        const auto reviewed_token = s_operational_review.retained_keylog_token;
+        if (current_token.generation != reviewed_token.generation ||
+            current_token.count != reviewed_token.count) {
+            s_operational_review = {};
+            if (error) *error = "The retained TLS secret set changed after review; review it again";
+            return false;
+        }
+        const std::size_t count = s_operational_review.retained_count;
+        s_operational_review = {};
+        request_keylog_operation(keylog_operation_t::clear_entries, {}, {}, count,
+            reviewed_token);
+        return s_keylog_operation_pending.load(std::memory_order_acquire);
+    }
+    if (command == operational_command_t::proxy_ca_trust_repair) {
+        s_operational_review = {};
+        request_ca_trust_repair();
+        return s_proxy_operation_pending.load(std::memory_order_acquire);
+    }
+    switch (command) {
+    case operational_command_t::capture_start: request_capture_start(g_state); return g_state.cap_start_pending.load(std::memory_order_acquire);
+    case operational_command_t::capture_stop: request_capture_stop(g_state); return g_state.cap_stop_pending.load(std::memory_order_acquire);
+    case operational_command_t::proxy_start: request_proxy_control(g_state, true); return s_proxy_operation_pending.load(std::memory_order_acquire);
+    case operational_command_t::proxy_stop: request_proxy_control(g_state, false); return s_proxy_operation_pending.load(std::memory_order_acquire);
+    case operational_command_t::intercept_toggle: {
+        const auto intercept = std::atomic_load_explicit(&s_intercept_runtime_snapshot, std::memory_order_acquire);
+        if (!intercept) {
+            if (error) *error = "Intercept state is no longer retained";
+            return false;
+        }
+        request_intercept_operation(intercept_operation_t::set_enabled, !intercept->enabled, 0, {}, 0);
+        return g_state.intercept_operation_pending.load(std::memory_order_acquire);
+    }
+    case operational_command_t::keylog_launch:
+        request_keylog_operation(keylog_operation_t::launch_and_watch,
+            g_state.kl_exe_path, g_state.kl_args, 0);
+        return s_keylog_operation_pending.load(std::memory_order_acquire);
+    case operational_command_t::keylog_watch:
+        request_keylog_operation(keylog_operation_t::watch_file,
+            g_state.kl_watch_path, {}, 0);
+        return s_keylog_operation_pending.load(std::memory_order_acquire);
+    case operational_command_t::keylog_stop: {
+        const auto keylog = std::atomic_load_explicit(&s_keylog_runtime_snapshot, std::memory_order_acquire);
+        request_keylog_operation(keylog_operation_t::stop_watching,
+            keylog ? keylog->path : std::string(), {}, keylog ? keylog->entry_count : 0);
+        return s_keylog_operation_pending.load(std::memory_order_acquire);
+    }
+    default:
+        break;
+    }
+    if (error) *error = "The Network command could not be dispatched";
+    return false;
 }
 
 static void render_keylog(state_t& state, float x, float y, float w, float h,
@@ -6091,8 +6469,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
                              ImVec2(0.f, 0.f), keylog_pending || !can_launch)) {
             diag::log_tagged_fmt("network", "keylog_launch_clicked exe='%s' args='%s'",
                 state.kl_exe_path, state.kl_args);
-            request_keylog_operation(keylog_operation_t::launch_and_watch,
-                state.kl_exe_path, state.kl_args, 0);
+            invoke_global_network_action("network.keylog.launch");
         }
         ImGui::SameLine();
         if (aida::ui::button("Watch File...", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
@@ -6110,7 +6487,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
                 diag::log_tagged_fmt("network", "keylog_watch_dialog_pick path='%s'", path_buf);
                 anti_tamper::webhook::write_log("net_audit",
                     (std::string("[net_audit] keylog watch dialog path='") + path_buf + "'").c_str());
-                request_keylog_operation(keylog_operation_t::watch_file, path_buf, {}, 0);
+                invoke_global_network_action("network.keylog.watch");
             } else {
                 diag::log_tagged("network", "keylog_watch_dialog_cancelled");
             }
@@ -6125,7 +6502,7 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
             diag::log_tagged_fmt("network", "keylog_watch_typed path='%s'", state.kl_watch_path);
             anti_tamper::webhook::write_log("net_audit",
                 (std::string("[net_audit] keylog watch typed path='") + state.kl_watch_path + "'").c_str());
-            request_keylog_operation(keylog_operation_t::watch_file, state.kl_watch_path, {}, 0);
+            invoke_global_network_action("network.keylog.watch");
         }
     } else {
         char watch_buf[640];
@@ -6138,32 +6515,13 @@ static void render_keylog(state_t& state, float x, float y, float w, float h,
                              ImVec2(0.f, 0.f), keylog_pending)) {
             diag::log_tagged_fmt("network", "keylog_stop_watching path='%s' entries=%zu",
                 keylog_snapshot->path.c_str(), keylog_entry_count);
-            request_keylog_operation(keylog_operation_t::stop_watching,
-                keylog_snapshot->path, {}, keylog_entry_count);
+            invoke_global_network_action("network.keylog.stop");
         }
         ImGui::SameLine();
         if (aida::ui::button("Clear", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm,
                              ImVec2(0.f, 0.f), keylog_pending || keylog_entry_count == 0)) {
-            s_keylog_clear_review_count = keylog_entry_count;
-            ImGui::OpenPopup("Review TLS Key Clear");
+            invoke_global_network_action("network.keylog.clear");
         }
-    }
-
-    if (ImGui::BeginPopupModal("Review TLS Key Clear", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Permanently clear %zu captured TLS secrets?", s_keylog_clear_review_count);
-        ImGui::TextUnformatted("Cleared key material cannot be used for later traffic decryption.");
-        ImGui::Spacing();
-        if (aida::ui::button("Confirm Clear", aida::ui::button_kind_t::destructive, aida::ui::size_t_::sm)) {
-            request_keylog_operation(keylog_operation_t::clear_entries, {}, {}, s_keylog_clear_review_count);
-            s_keylog_clear_review_count = 0;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (aida::ui::button("Cancel", aida::ui::button_kind_t::secondary, aida::ui::size_t_::sm)) {
-            s_keylog_clear_review_count = 0;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
     }
 
     ImGui::Spacing();
@@ -9784,9 +10142,9 @@ void render(float pos_x, float pos_y, float width, float height,
     ImGui::PopStyleVar();
     if (header.primary_clicked) {
         if (capture_running)
-            request_capture_stop(g_state);
+            invoke_global_network_action("network.capture.stop");
         else
-            request_capture_start(g_state);
+            invoke_global_network_action("network.capture.start");
     }
     if (header.secondary_clicked) {
         g_state.prev_tab = g_state.active_tab;

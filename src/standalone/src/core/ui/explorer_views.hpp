@@ -49,6 +49,7 @@ file_operation_capability_t file_operation_capability(file_operation_t operation
     const std::vector<file_operation_target_t>& targets);
 file_operation_result_t request_file_operation(file_operation_t operation,
     const std::vector<file_operation_target_t>& targets);
+file_operation_result_t request_search_scope(const std::string& path, bool directory);
 void render_global_file_operation_dialogs();
 
 }

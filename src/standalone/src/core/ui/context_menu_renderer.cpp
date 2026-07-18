@@ -4,6 +4,9 @@
 #include "imgui/imgui.h"
 #include "../../preview/studio_semantics.hpp"
 
+#include <algorithm>
+#include <cfloat>
+
 namespace aida::ui {
 
 context_menu_render_result_t render_context_menu_popup(
@@ -14,6 +17,14 @@ context_menu_render_result_t render_context_menu_popup(
     context_menu_render_result_t result;
     if (!popup_id || !*popup_id)
         return result;
+    const ImGuiViewport* viewport = ImGui::GetWindowViewport();
+    const float dpi = viewport ? (std::max)(1.0f, viewport->DpiScale) : 1.0f;
+    const float available_height = viewport
+        ? (std::max)(1.0f, viewport->WorkSize.y - 16.0f * dpi)
+        : 720.0f * dpi;
+    const float maximum_height = (std::min)(720.0f * dpi, available_height);
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(0.0f, 0.0f), ImVec2(FLT_MAX, maximum_height));
     if (!ImGui::BeginPopup(popup_id))
         return result;
 
@@ -45,10 +56,12 @@ context_menu_render_result_t render_context_menu_popup(
                 checkable ? checked : false,
                 action.enabled);
 #if defined(AIDA_IMGUI_STUDIO_PREVIEW)
-            const std::string semantic_id = aida::preview::semantics::stable_id(
-                "aida.context", request.menu.value() + "." + action.action.value());
-            aida::preview::semantics::register_last_item(
-                semantic_id, "context-menu-action", false, !action.enabled);
+            if (ImGui::IsItemVisible()) {
+                const std::string semantic_id = aida::preview::semantics::stable_id(
+                    "aida.context", request.menu.value() + "." + action.action.value());
+                aida::preview::semantics::register_last_item(
+                    semantic_id, "context-menu-action", true, !action.enabled);
+            }
 #endif
             if (!action.enabled) {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) &&

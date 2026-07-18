@@ -10,6 +10,7 @@
 #include "../ui/application_view_registry.hpp"
 #include "../ui/task_center.hpp"
 #include "../ui/application_ui_runtime.hpp"
+#include "../ui/design_system.hpp"
 #include "../../helpers/helpers.h"
 #include "binary_map.hpp"
 #include "../editor/hex_view.hpp"
@@ -4252,7 +4253,13 @@ namespace binary_map_view {
 			ImGui::OpenPopup("Change Protection");
 		}
 
-		if (ImGui::BeginPopupModal("Change Protection", &s.change_protect_open, ImGuiWindowFlags_AlwaysAutoResize)) {
+		if (aida::ui::design::begin_dialog_exact("Change Protection",
+			ImVec2(600.0f, 460.0f), ImVec2(400.0f, 320.0f),
+			&s.change_protect_open)) {
+			const float footer_height = aida::ui::design::dialog_footer_reserve_height(
+				"Apply", "Cancel");
+			aida::ui::design::begin_dialog_body("binary_map_change_protection_body",
+				footer_height);
 			ImGui::Text("Address: %016llX", static_cast<unsigned long long>(s.change_protect_addr));
 			ImGui::Text("Size:    %llu bytes", static_cast<unsigned long long>(s.change_protect_size));
 			ImGui::Text("Current: 0x%X", s.change_protect_old);
@@ -4274,10 +4281,12 @@ namespace binary_map_view {
 			if (s.change_protect_choice < 0) s.change_protect_choice = 0;
 			if (s.change_protect_choice >= val_count) s.change_protect_choice = val_count - 1;
 			ImGui::Combo("##bm_new_protect", &s.change_protect_choice, labels_arr, val_count);
-			ImGui::Separator();
 			const bool protection_pending = s.change_protect_pending.load(std::memory_order_acquire);
-			ImGui::BeginDisabled(protection_pending);
-			if (ImGui::Button("Apply", ImVec2(100.f, 0.f))) {
+			aida::ui::design::end_dialog_body();
+			const auto footer = aida::ui::design::dialog_footer(
+				"binary_map_change_protection_footer", "Apply", !protection_pending,
+				true, "Cancel");
+			if (footer.confirmed) {
 				const uint32_t new_protect = values_arr[s.change_protect_choice];
 				diag::log_tagged_critical_fmt("binary_map",
 					"change_protect_request addr=0x%llx size=%llu new=0x%X",
@@ -4301,11 +4310,9 @@ namespace binary_map_view {
 				s.change_protect_open = false;
 				ImGui::CloseCurrentPopup();
 			}
-			ImGui::EndDisabled();
 			if (protection_pending && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
 				ImGui::SetTooltip("A reviewed protection change is already running");
-			ImGui::SameLine();
-			if (ImGui::Button("Cancel", ImVec2(100.f, 0.f))) {
+			if (footer.cancelled || !s.change_protect_open) {
 				s.change_protect_open = false;
 				ImGui::CloseCurrentPopup();
 			}

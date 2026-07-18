@@ -8,6 +8,8 @@
 #include "../infra/executor.hpp"
 #if !defined(AIDA_IMGUI_STUDIO_PREVIEW)
 #include "../../helpers/diag_log.hpp"
+#else
+#include "../../preview/studio_semantics.hpp"
 #endif
 #include "ui/theme.hpp"
 #include "ui/clock.hpp"
@@ -171,6 +173,25 @@ namespace functions_panel {
 			auto pos = s.find('!');
 			if (pos == std::string::npos) return s;
 			return s.substr(pos + 1);
+		}
+
+		inline std::string normalize_function_name(std::string name) {
+			name = strip_module_prefix(name);
+			const auto first = std::find_if(name.begin(), name.end(), [](unsigned char value) {
+				return !std::isspace(value);
+			});
+			const auto last = std::find_if(name.rbegin(), name.rend(), [](unsigned char value) {
+				return !std::isspace(value);
+			}).base();
+			if (first >= last) return {};
+			name = std::string(first, last);
+			if (name.size() > 2 && name[0] == '0' &&
+				(name[1] == 'x' || name[1] == 'X') &&
+				std::all_of(name.begin() + 2, name.end(), [](unsigned char value) {
+					return std::isxdigit(value) != 0;
+				}))
+				return {};
+			return name;
 		}
 
 		inline void refresh_from_workspace(
@@ -374,6 +395,7 @@ namespace functions_panel {
 						const auto found = symbols.find(*function->symbol_id);
 						if (found != symbols.end()) entry.name = found->second;
 					}
+					entry.name = normalize_function_name(std::move(entry.name));
 					entry.synthetic_name = entry.name.empty();
 					if (entry.synthetic_name) entry.name = make_synthetic_name(entry.address);
 					if (image && have_function_rva) {
@@ -491,20 +513,16 @@ namespace functions_panel {
 				int c = 0;
 				switch (column) {
 					case 0:
-						if (a.address < b.address) c = -1;
-						else if (a.address > b.address) c = 1;
-						break;
-					case 1:
 						c = compare_case_insensitive(a.name, b.name);
 						break;
-					case 2:
+					case 1:
 						if (a.size < b.size) c = -1;
 						else if (a.size > b.size) c = 1;
 						break;
-					case 3:
+					case 2:
 						c = compare_case_insensitive(a.section, b.section);
 						break;
-					case 4: {
+					case 3: {
 						uint64_t ax = static_cast<uint64_t>(a.calls_in)
 							+ static_cast<uint64_t>(a.calls_out);
 						uint64_t bx = static_cast<uint64_t>(b.calls_in)
@@ -514,8 +532,7 @@ namespace functions_panel {
 						break;
 					}
 					default:
-						if (a.address < b.address) c = -1;
-						else if (a.address > b.address) c = 1;
+						c = compare_case_insensitive(a.name, b.name);
 						break;
 				}
 				if (c == 0) {
@@ -692,7 +709,7 @@ namespace functions_panel {
 			return;
 		}
 
-		const bool compact = (w < 220.f);
+		const bool compact = (w < 420.f);
 
 		detail::launch_build_if_needed(s);
 
@@ -889,14 +906,30 @@ namespace functions_panel {
 		ImVec2 outer = ImVec2(content_size.x, content_size.y);
 		ImGui::SetCursorScreenPos(content_pos);
 		bool ctx_menu_request = false;
+		const float list_header_height = (std::max)(22.f, fs_fp_base * 0.92f + 7.f);
 
 		if (compact) {
-			ImGui::SetCursorScreenPos(content_pos);
-			ImGui::BeginChild("##fn_compact", content_size, false,
+			ImFont* compact_header_font = aida::ui::fonts::body_em();
+			if (!compact_header_font) compact_header_font = body_font;
+			const float compact_header_size = fs_fp_base * 0.92f;
+			const ImVec2 compact_header_max(content_pos.x + content_size.x,
+				content_pos.y + list_header_height);
+			dl->AddRectFilled(content_pos, compact_header_max, th.panel_header);
+			dl->AddLine(ImVec2(content_pos.x, compact_header_max.y - 1.f),
+				ImVec2(compact_header_max.x, compact_header_max.y - 1.f),
+				th.border_subtle);
+			dl->AddText(compact_header_font, compact_header_size,
+				ImVec2(content_pos.x + 7.f,
+					content_pos.y + (list_header_height - compact_header_size) * 0.5f),
+				th.text_primary, "Function");
+			ImGui::SetCursorScreenPos(ImVec2(content_pos.x, compact_header_max.y));
+			ImGui::BeginChild("##fn_compact",
+				ImVec2(content_size.x,
+					(std::max)(1.f, content_size.y - list_header_height)), false,
 				ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
 
 			ImDrawList* cdl = ImGui::GetWindowDrawList();
-			const float row_h = (std::max)(34.f, fs_fp_base * 2.15f);
+			const float row_h = (std::max)(24.f, fs_fp_base * 1.55f);
 
 			ImGuiListClipper clipper;
 			clipper.Begin(row_view ? static_cast<int>(row_view->sorted_indices.size()) : 0,
@@ -917,6 +950,16 @@ namespace functions_panel {
 					char btn_label[40];
 					std::snprintf(btn_label, sizeof(btn_label), "##fn_cb_%d", row_idx);
 					ImGui::InvisibleButton(btn_label, ImVec2(content_size.x, row_h));
+
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					if (ImGui::IsItemVisible()) {
+						const std::string function_semantic_id =
+							aida::preview::semantics::stable_id(
+								"aida.functions.row", "address-" + std::to_string(e.address));
+						aida::preview::semantics::register_last_item(
+							function_semantic_id, "analysis-function-row");
+					}
+#endif
 
 					bool is_selected = (s.selected_addr != 0 && s.selected_addr == e.address);
 					bool hovered = ImGui::IsItemHovered();
@@ -963,8 +1006,7 @@ namespace functions_panel {
 
 					const float text_x = row_min.x + 22.f;
 					const float name_fs = fs_fp_base * 0.92f;
-					const float line1_y = row_min.y + 4.f;
-					const float line2_y = row_min.y + name_fs + 8.f;
+					const float line1_y = row_min.y + (row_h - name_fs) * 0.5f;
 					const float text_w_avail = content_size.x - 22.f - 6.f;
 
 					ImU32 name_col = e.synthetic_name ? th.text_dim : th.text_primary;
@@ -984,57 +1026,6 @@ namespace functions_panel {
 					}
 					cdl->AddText(code_font, name_fs,
 						ImVec2(text_x, line1_y), name_col, name_disp.c_str());
-
-					char addr_buf[32];
-					std::snprintf(addr_buf, sizeof(addr_buf), "0x%llX",
-						static_cast<unsigned long long>(e.address));
-					const float meta_fs = fs_fp_base * 0.82f;
-					ImVec2 addr_size = code_font->CalcTextSizeA(meta_fs, FLT_MAX, 0.f, addr_buf);
-					float cursor_x = text_x;
-					cdl->AddText(code_font, meta_fs,
-						ImVec2(cursor_x, line2_y), th.text_address, addr_buf);
-					cursor_x += addr_size.x + 5.f;
-
-					ImVec2 dot_size = code_font->CalcTextSizeA(meta_fs, FLT_MAX, 0.f, "\xc2\xb7");
-					cdl->AddText(code_font, meta_fs,
-						ImVec2(cursor_x, line2_y), th.text_dim, "\xc2\xb7");
-					cursor_x += dot_size.x + 5.f;
-
-					const char* sec_txt = e.section.empty() ? "\xe2\x80\x94" : e.section.c_str();
-					ImVec2 sec_size = code_font->CalcTextSizeA(meta_fs, FLT_MAX, 0.f, sec_txt);
-					cdl->AddText(code_font, meta_fs,
-						ImVec2(cursor_x, line2_y), th.text_secondary, sec_txt);
-					cursor_x += sec_size.x + 5.f;
-
-					cdl->AddText(code_font, meta_fs,
-						ImVec2(cursor_x, line2_y), th.text_dim, "\xc2\xb7");
-					cursor_x += dot_size.x + 5.f;
-
-					char size_buf[24];
-					if (e.size == 0) {
-						std::snprintf(size_buf, sizeof(size_buf), "-");
-					}
-					else if (e.size < 1024) {
-						std::snprintf(size_buf, sizeof(size_buf), "%uB", e.size);
-					}
-					else {
-						std::snprintf(size_buf, sizeof(size_buf), "%.1fK",
-							static_cast<double>(e.size) / 1024.0);
-					}
-					ImVec2 size_text_size = code_font->CalcTextSizeA(meta_fs, FLT_MAX, 0.f, size_buf);
-					cdl->AddText(code_font, meta_fs,
-						ImVec2(cursor_x, line2_y), th.text_secondary, size_buf);
-					cursor_x += size_text_size.x + 5.f;
-
-					cdl->AddText(code_font, meta_fs,
-						ImVec2(cursor_x, line2_y), th.text_dim, "\xc2\xb7");
-					cursor_x += dot_size.x + 5.f;
-
-					char calls_buf[32];
-					std::snprintf(calls_buf, sizeof(calls_buf), "%u/%u",
-						e.calls_in, e.calls_out);
-					cdl->AddText(code_font, meta_fs,
-						ImVec2(cursor_x, line2_y), th.text_dim, calls_buf);
 
 					if (clicked) {
 						s.selected_row = row_idx;
@@ -1059,13 +1050,21 @@ namespace functions_panel {
 
 			ImGui::EndChild();
 		}
-		else if (ImGui::BeginTable("##fn_table", 5, tflags, outer)) {
+		else {
+			const bool show_size = w >= 520.f;
+			const bool show_section = w >= 640.f;
+			const bool show_calls = w >= 760.f;
+			const int table_column_count = 1 + (show_size ? 1 : 0) +
+				(show_section ? 1 : 0) + (show_calls ? 1 : 0);
+			if (ImGui::BeginTable("##fn_table", table_column_count, tflags, outer)) {
 			ImGui::TableSetupScrollFreeze(0, 1);
-			ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 132.f);
-			ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-			ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.f);
-			ImGui::TableSetupColumn("Section", ImGuiTableColumnFlags_WidthFixed, 88.f);
-			ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 72.f);
+			ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthStretch, 1.0f, 0);
+			if (show_size)
+				ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 76.f, 1);
+			if (show_section)
+				ImGui::TableSetupColumn("Section", ImGuiTableColumnFlags_WidthFixed, 88.f, 2);
+			if (show_calls)
+				ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 72.f, 3);
 
 			ImGui::PushFont(aida::ui::fonts::body_em() ? aida::ui::fonts::body_em() : body_font);
 			ImGui::TableHeadersRow();
@@ -1073,7 +1072,7 @@ namespace functions_panel {
 
 			if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs()) {
 				if (sort_specs->SpecsDirty && sort_specs->SpecsCount > 0) {
-					int col = sort_specs->Specs[0].ColumnIndex;
+					int col = static_cast<int>(sort_specs->Specs[0].ColumnUserID);
 					bool asc = sort_specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending;
 					if (col != s.sort_column || asc != s.sort_ascending) {
 						{
@@ -1125,6 +1124,16 @@ namespace functions_panel {
 						}
 					}
 
+#if defined(AIDA_IMGUI_STUDIO_PREVIEW)
+					if (ImGui::IsItemVisible()) {
+						const std::string function_semantic_id =
+							aida::preview::semantics::stable_id(
+								"aida.functions.row", "address-" + std::to_string(e.address));
+						aida::preview::semantics::register_last_item(
+							function_semantic_id, "analysis-function-row");
+					}
+#endif
+
 					if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
 						s.ctx_row = row_idx;
 						s.ctx_addr = e.address;
@@ -1147,17 +1156,6 @@ namespace functions_panel {
 
 					ImGui::SameLine();
 					ImGui::PushFont(code_font);
-					char addr_str[32];
-					std::snprintf(addr_str, sizeof(addr_str), "0x%llX",
-						static_cast<unsigned long long>(e.address));
-					ImGui::PushStyleColor(ImGuiCol_Text,
-						ImGui::ColorConvertU32ToFloat4(th.text_address));
-					ImGui::TextUnformatted(addr_str);
-					ImGui::PopStyleColor();
-					ImGui::PopFont();
-
-					ImGui::TableSetColumnIndex(1);
-					ImGui::PushFont(code_font);
 					ImU32 name_col = e.synthetic_name ? th.text_dim : th.text_primary;
 					ImGui::PushStyleColor(ImGuiCol_Text,
 						ImGui::ColorConvertU32ToFloat4(name_col));
@@ -1175,61 +1173,69 @@ namespace functions_panel {
 						ImGui::PopStyleVar();
 					}
 
-					ImGui::TableSetColumnIndex(2);
-					ImGui::PushFont(code_font);
-					if (e.size > 0) {
-						char size_buf[24];
-						if (e.size >= 1024) {
-							std::snprintf(size_buf, sizeof(size_buf), "%u (%.1fK)",
-								e.size, static_cast<double>(e.size) / 1024.0);
+					int optional_column = 1;
+					if (show_size) {
+						ImGui::TableSetColumnIndex(optional_column++);
+						ImGui::PushFont(code_font);
+						if (e.size > 0) {
+							char size_buf[24];
+							if (e.size >= 1024) {
+								std::snprintf(size_buf, sizeof(size_buf), "%u (%.1fK)",
+									e.size, static_cast<double>(e.size) / 1024.0);
+							}
+							else {
+								std::snprintf(size_buf, sizeof(size_buf), "%u", e.size);
+							}
+							ImGui::PushStyleColor(ImGuiCol_Text,
+								ImGui::ColorConvertU32ToFloat4(th.text_secondary));
+							ImGui::TextUnformatted(size_buf);
+							ImGui::PopStyleColor();
 						}
 						else {
-							std::snprintf(size_buf, sizeof(size_buf), "%u", e.size);
+							ImGui::PushStyleColor(ImGuiCol_Text,
+								ImGui::ColorConvertU32ToFloat4(th.text_dim));
+							ImGui::TextUnformatted("-");
+							ImGui::PopStyleColor();
 						}
-						ImGui::PushStyleColor(ImGuiCol_Text,
-							ImGui::ColorConvertU32ToFloat4(th.text_secondary));
-						ImGui::TextUnformatted(size_buf);
-						ImGui::PopStyleColor();
-					}
-					else {
-						ImGui::PushStyleColor(ImGuiCol_Text,
-							ImGui::ColorConvertU32ToFloat4(th.text_dim));
-						ImGui::TextUnformatted("-");
-						ImGui::PopStyleColor();
-					}
-					ImGui::PopFont();
-
-					ImGui::TableSetColumnIndex(3);
-					if (e.section.empty()) {
-						ImGui::PushStyleColor(ImGuiCol_Text,
-							ImGui::ColorConvertU32ToFloat4(th.text_dim));
-						ImGui::TextUnformatted("-");
-						ImGui::PopStyleColor();
-					}
-					else {
-						ImGui::PushFont(code_font);
-						ImGui::PushStyleColor(ImGuiCol_Text,
-							ImGui::ColorConvertU32ToFloat4(th.text_secondary));
-						ImGui::TextUnformatted(e.section.c_str());
-						ImGui::PopStyleColor();
 						ImGui::PopFont();
 					}
 
-					ImGui::TableSetColumnIndex(4);
-					ImGui::PushFont(code_font);
-					char calls_buf[32];
-					std::snprintf(calls_buf, sizeof(calls_buf), "%u/%u",
-						e.calls_in, e.calls_out);
-					ImGui::PushStyleColor(ImGuiCol_Text,
-						ImGui::ColorConvertU32ToFloat4(th.text_dim));
-					ImGui::TextUnformatted(calls_buf);
-					ImGui::PopStyleColor();
-					ImGui::PopFont();
+					if (show_section) {
+						ImGui::TableSetColumnIndex(optional_column++);
+						if (e.section.empty()) {
+							ImGui::PushStyleColor(ImGuiCol_Text,
+								ImGui::ColorConvertU32ToFloat4(th.text_dim));
+							ImGui::TextUnformatted("-");
+							ImGui::PopStyleColor();
+						}
+						else {
+							ImGui::PushFont(code_font);
+							ImGui::PushStyleColor(ImGuiCol_Text,
+								ImGui::ColorConvertU32ToFloat4(th.text_secondary));
+							ImGui::TextUnformatted(e.section.c_str());
+							ImGui::PopStyleColor();
+							ImGui::PopFont();
+						}
+					}
+
+					if (show_calls) {
+						ImGui::TableSetColumnIndex(optional_column);
+						ImGui::PushFont(code_font);
+						char calls_buf[32];
+						std::snprintf(calls_buf, sizeof(calls_buf), "%u/%u",
+							e.calls_in, e.calls_out);
+						ImGui::PushStyleColor(ImGuiCol_Text,
+							ImGui::ColorConvertU32ToFloat4(th.text_dim));
+						ImGui::TextUnformatted(calls_buf);
+						ImGui::PopStyleColor();
+						ImGui::PopFont();
+					}
 				}
 			}
 			clipper.End();
 
 			ImGui::EndTable();
+			}
 		}
 
 		ImGui::PopStyleColor(5);
@@ -1408,22 +1414,26 @@ namespace functions_panel {
 		comment_dialog::render();
 
 		if (ready && !building && total_count == 0) {
-			ImVec2 cp = ImVec2(wp.x + pad, wp.y + header_h + 8.f);
+			ImVec2 cp = ImVec2(content_pos.x, content_pos.y + list_header_height);
+			const ImVec2 empty_size(content_size.x,
+				(std::max)(1.f, content_size.y - list_header_height));
 			aida::ui::empty_state::config_t cfg;
 			cfg.glyph = aida::ui::empty_state::glyph_t::binary_file;
 			cfg.title = "No analyzed functions yet";
 			cfg.body = "Open a binary or attach to a running process to populate the symbol list.";
 			cfg.max_width = std::min(content_size.x - 32.f, 360.f);
-			aida::ui::empty_state::render(cp, content_size, cfg);
+			aida::ui::empty_state::render(cp, empty_size, cfg);
 		}
 		else if (ready && shown_count == 0 && total_count > 0) {
-			ImVec2 cp = ImVec2(wp.x + pad, wp.y + header_h + 8.f);
+			ImVec2 cp = ImVec2(content_pos.x, content_pos.y + list_header_height);
+			const ImVec2 empty_size(content_size.x,
+				(std::max)(1.f, content_size.y - list_header_height));
 			aida::ui::empty_state::config_t cfg;
 			cfg.glyph = aida::ui::empty_state::glyph_t::search;
 			cfg.title = "No matches";
 			cfg.body = "Nothing matches the current filter. Try a shorter query.";
 			cfg.max_width = std::min(content_size.x - 32.f, 360.f);
-			aida::ui::empty_state::render(cp, content_size, cfg);
+			aida::ui::empty_state::render(cp, empty_size, cfg);
 		}
 
 		ImGui::PopFont();

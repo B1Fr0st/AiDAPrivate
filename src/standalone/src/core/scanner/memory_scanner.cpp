@@ -1477,10 +1477,9 @@ bool first_scan(const scan_config_t& config) {
 			return false;
 		}
 		scanner_task_center::register_executor_task(submitted,
-			"view.memory.scanner", "memory.first_scan", "Initial memory scan",
+			"view.memory.value_scan", "memory.first_scan", "Initial memory scan",
 			driver_bridge::attached_pid(), true, []() {
-				g_state.scanning.store(false, std::memory_order_release);
-				return true;
+				return !g_state.scanning.load(std::memory_order_acquire) || cancel_scan();
 			});
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-RELEASE first_scan_dispatch token=%llu reason=dispatched",
@@ -1571,10 +1570,9 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 			return false;
 		}
 		scanner_task_center::register_executor_task(submitted,
-			"view.memory.scanner", "memory.next_scan", "Refine memory scan",
+			"view.memory.value_scan", "memory.next_scan", "Refine memory scan",
 			driver_bridge::attached_pid(), true, []() {
-				g_state.scanning.store(false, std::memory_order_release);
-				return true;
+				return !g_state.scanning.load(std::memory_order_acquire) || cancel_scan();
 			});
 		diag::log_tagged_fmt("mem_scanner",
 			"FEATURE-WORKER-GROUP-RELEASE next_scan_dispatch token=%llu reason=dispatched",
@@ -1591,6 +1589,19 @@ bool next_scan(scan_mode_t mode, const std::string& value_text, const std::strin
 		st.scanning.store(false);
 		return false;
 	}
+	return true;
+}
+
+bool cancel_scan() {
+	auto& st = g_state;
+	bool expected = true;
+	if (!st.scanning.compare_exchange_strong(expected, false,
+		std::memory_order_acq_rel, std::memory_order_acquire)) {
+		diag::log_tagged("mem_scanner", "cancel_scan refused no_active_scan");
+		return false;
+	}
+	diag::log_tagged_fmt("mem_scanner", "cancel_scan signalled progress=%.3f",
+		static_cast<double>(st.scan_progress.load(std::memory_order_acquire)));
 	return true;
 }
 

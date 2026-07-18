@@ -125,6 +125,13 @@ inline bool next_scan(scan_mode_t mode, const std::string&, const std::string& =
 	return true;
 }
 
+inline bool cancel_scan()
+{
+	bool expected = true;
+	return g_state.scanning.compare_exchange_strong(expected, false,
+		std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
 inline void undo_scan()
 {
 	std::lock_guard<std::mutex> lock(g_state.results_mutex);
